@@ -6,4 +6,3 @@ dependencies:
   - sqlalchemy
   - ipykernel
   - black
-prefix: /Users/shan/miniconda3/envs/casp
