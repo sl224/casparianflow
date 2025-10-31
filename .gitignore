@@ -212,3 +212,6 @@ __marimo__/
 *.db
 *.csv
 *.feather
+
+# Mac OS
+.DS_Store

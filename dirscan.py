@@ -1,85 +1,108 @@
 #%%
 import os
 from pathlib import Path
+import pathspec  # <--- Import pathspec
+from casp_sa_base import Base
 
-# Set the current working directory to the directory of this script.
-# This is useful when running from a different directory (e.g., in a Jupyter cell or IDE).
+# Set the current working directory
 try:
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 except NameError:
-    # This is expected in some interactive environments like Jupyter
     pass
 
 from sqlalchemy import (
     create_engine,
-    inspect,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 
-# 1. Define a declarative base with the new to_dict method
-class Base(DeclarativeBase):
-    def to_dict(self, exclude_pk=True):
-        """
-        Return a dictionary representation of the object's mapped columns.
-        
-        Excludes the internal SQLAlchemy state.
-        By default, it also excludes primary key columns.
-        """
-        mapper = inspect(self.__class__)
-        
-        dict_rep = {}
-        for c in mapper.column_attrs:
-            if exclude_pk and c.columns[0].primary_key:
-                continue
-            dict_rep[c.key] = getattr(self, c.key)
-            
-        return dict_rep
-
-    @classmethod
-    def insert(cls):
-        return cls.__table__.insert()
-
-# 2. Define the ORM class, which is the single source of truth for the table schema.
 class FileRecord(Base):
     __tablename__ = "file"
-
     file_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    file_path: Mapped[str] = mapped_column(unique=True) # Good practice to ensure paths are unique
+    file_path: Mapped[str] = mapped_column(unique=True)
     filesize_bytes: Mapped[int]
 
-# Using sets for faster lookups
-skip_dirs = set()
-skip_files = set()
+# --- New Scan Function ---
+def load_pathspec(ignore_file_path):
+    """Loads the .scanignore file and returns a compiled PathSpec object."""
+    try:
+        with open(ignore_file_path, 'r') as f:
+            lines = f.readlines()
+        # Use 'gitwildmatch' to get the exact .gitignore syntax
+        return pathspec.PathSpec.from_lines('gitwildmatch', lines)
+    except FileNotFoundError:
+        print(f"Warning: Ignore file '{ignore_file_path}' not found. Scanning all files.")
+        return None
 
-def is_skip_dir(check_dir):
-    return check_dir in skip_dirs
-
-def is_skip_file(check_file):
-    return check_file in skip_files
-
-def scan(dirname):
+def scan(dirname, ignore_file_name=".scanignore"):
     engine = create_engine("sqlite:///./test.db")
     Base.metadata.create_all(engine)
 
-    file_records = []
-    for cur_dir, dirs, files in os.walk(dirname):
-        # Prune directories in-place to prevent os.walk from descending into them
-        dirs[:] = [d for d in dirs if not is_skip_dir(os.path.join(cur_dir, d))]
+    # Convert dirname to an absolute path for robust relative-path calculations
+    scan_root = Path(dirname).resolve()
+    ignore_file_path = scan_root / ignore_file_name
 
+    # 1. Load the ignore spec ONCE
+    spec = load_pathspec(ignore_file_path)
+    
+    file_records = []
+    
+    # We must use the absolute path for os.walk
+    for cur_dir, dirs, files in os.walk(scan_root, topdown=True):
+        
+        # We need paths relative to the scan_root for matching
+        # Example: /home/user/project -> .
+        #          /home/user/project/src -> src
+        current_rel_dir = Path(cur_dir).relative_to(scan_root)
+
+        # 2. PRUNE DIRECTORIES (This is the most important optimization)
+        # We modify 'dirs' IN-PLACE to stop os.walk from descending
+        if spec:
+            # Check dirs against the spec
+            # We use .as_posix() for consistent cross-platform / separators
+            dirs_to_check = [
+                (d, (current_rel_dir / d).as_posix()) for d in dirs
+            ]
+            
+            # Keep only the dirs that DO NOT match the ignore spec
+            # We must also check if the path is a directory (add trailing /)
+            dirs[:] = [
+                d for d, rel_path in dirs_to_check
+                if not spec.match_file(rel_path) and not spec.match_file(rel_path + '/')
+            ]
+
+        # 3. SKIP FILES
         for file in files:
-            if is_skip_file(file): continue
             cur_path = Path(cur_dir) / file
+            
+            # Get the relative path for matching
+            rel_path = cur_path.relative_to(scan_root).as_posix()
+            
+            # Also check the ignore file itself
+            if rel_path == ignore_file_name:
+                continue
+                
+            if spec and spec.match_file(rel_path):
+                continue
+
+            # If we're here, the file is not ignored
             try:
                 stat_result = cur_path.stat()
-                file_records.append(FileRecord(file_path=str(cur_path), filesize_bytes=stat_result.st_size))
+                file_records.append(
+                    FileRecord(
+                        file_path=str(cur_path), # Store the full path
+                        filesize_bytes=stat_result.st_size
+                    )
+                )
             except FileNotFoundError:
                 print(f"Warning: {cur_path} was listed but not found. Skipping.")
+            except OSError as e:
+                print(f"Error stating file {cur_path}: {e}. Skipping.")
+
 
     if not file_records:
         print("No files found to insert.")
         return
 
-    # 3. Use the new to_dict() method to prepare data for the high-speed insert.
     rows_to_insert = [rec.to_dict() for rec in file_records]
 
     with engine.begin() as conn:
@@ -91,6 +114,6 @@ if __name__ == '__main__':
     if os.path.exists(db_path):
         os.remove(db_path)
         print(f"Successfully deleted existing db: {db_path}")
+    
+    # Scan the current directory
     scan('.')
-
-# %%
