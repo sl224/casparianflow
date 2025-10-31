@@ -1,41 +1,55 @@
 #%%
-import sqlite3
 import os
+from pathlib import Path
 
 # Set the current working directory to the directory of this script.
 # This is useful when running from a different directory (e.g., in a Jupyter cell or IDE).
 try:
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 except NameError:
-    print("Could not change directory. '__file__' not defined. This is expected in some interactive environments.")
+    # This is expected in some interactive environments like Jupyter
+    pass
 
 from sqlalchemy import (
     create_engine,
-    Table, 
-    Column,
-    MetaData,
-    Integer,
-    Text,
+    inspect,
 )
-from pathlib import Path
-from dataclasses import dataclass
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-FileTable = Table(
-    "file",
-    MetaData(),
-    Column("file_id", Integer, primary_key=True, autoincrement=True),
-    Column("file_path", Text),
-    Column("filesize_bytes", Integer),
-)
+# 1. Define a declarative base with the new to_dict method
+class Base(DeclarativeBase):
+    def to_dict(self, exclude_pk=True):
+        """
+        Return a dictionary representation of the object's mapped columns.
+        
+        Excludes the internal SQLAlchemy state.
+        By default, it also excludes primary key columns.
+        """
+        mapper = inspect(self.__class__)
+        
+        dict_rep = {}
+        for c in mapper.column_attrs:
+            if exclude_pk and c.columns[0].primary_key:
+                continue
+            dict_rep[c.key] = getattr(self, c.key)
+            
+        return dict_rep
 
-@dataclass
-class FileRecord:
-    file_path: str 
-    filesize_bytes:int
+    @classmethod
+    def insert(cls):
+        return cls.__table__.insert()
 
+# 2. Define the ORM class, which is the single source of truth for the table schema.
+class FileRecord(Base):
+    __tablename__ = "file"
 
-skip_dirs = {}
-skip_files = {}
+    file_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    file_path: Mapped[str] = mapped_column(unique=True) # Good practice to ensure paths are unique
+    filesize_bytes: Mapped[int]
+
+# Using sets for faster lookups
+skip_dirs = set()
+skip_files = set()
 
 def is_skip_dir(check_dir):
     return check_dir in skip_dirs
@@ -45,37 +59,38 @@ def is_skip_file(check_file):
 
 def scan(dirname):
     engine = create_engine("sqlite:///./test.db")
-    FileTable.metadata.create_all(engine)
+    Base.metadata.create_all(engine)
 
-    rows = []
+    file_records = []
     for cur_dir, dirs, files in os.walk(dirname):
-        if is_skip_dir(cur_dir): continue
+        # Prune directories in-place to prevent os.walk from descending into them
+        dirs[:] = [d for d in dirs if not is_skip_dir(os.path.join(cur_dir, d))]
+
         for file in files:
             if is_skip_file(file): continue
             cur_path = Path(cur_dir) / file
-            if not cur_path.exists():
-                print(f'{cur_path} does not exist...skipping')
-                continue
-            stat_result = cur_path.stat()
-            rec = { 
-                "file_path": str(cur_path),
-                "filesize_bytes": stat_result.st_size
-            }
-            rows.append(rec)
+            try:
+                stat_result = cur_path.stat()
+                file_records.append(FileRecord(file_path=str(cur_path), filesize_bytes=stat_result.st_size))
+            except FileNotFoundError:
+                print(f"Warning: {cur_path} was listed but not found. Skipping.")
 
-    with engine.begin() as conn: 
-        result = conn.execute(FileTable.insert(), rows)
+    if not file_records:
+        print("No files found to insert.")
+        return
+
+    # 3. Use the new to_dict() method to prepare data for the high-speed insert.
+    rows_to_insert = [rec.to_dict() for rec in file_records]
+
+    with engine.begin() as conn:
+        result = conn.execute(FileRecord.insert(), rows_to_insert)
         print(f"Successfully inserted {result.rowcount} rows into test.db.")
 
-
 if __name__ == '__main__':
-    # print(os.getcwd())
-    # print('hello')
     db_path = 'test.db'
-    try:
+    if os.path.exists(db_path):
         os.remove(db_path)
-        print(f"Deleted existing db: {db_path}")
-    except Exception as e:
-        print(e)
+        print(f"Successfully deleted existing db: {db_path}")
     scan('.')
-        
+
+# %%
