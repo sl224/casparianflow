@@ -3,7 +3,12 @@ from sqlalchemy import inspect
 
 class Base(DeclarativeBase):
     def to_dict(self, exclude_pk=True):
-
+        """
+        Return a dictionary representation of the object's mapped columns.
+        
+        Excludes the internal SQLAlchemy state.
+        By default, it also excludes primary key columns.
+        """
         mapper = inspect(self.__class__)
         
         dict_rep = {}
@@ -13,3 +18,7 @@ class Base(DeclarativeBase):
             dict_rep[c.key] = getattr(self, c.key)
             
         return dict_rep
+
+    @classmethod
+    def insert(cls):
+        return cls.__table__.insert()
