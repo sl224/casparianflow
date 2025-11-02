@@ -2,29 +2,20 @@
 import os
 from pathlib import Path
 import pathspec 
-from casp_sa_base import Base
 
-# Set the current working directory
 try:
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 except NameError:
     pass
 
-from sqlalchemy.orm import Mapped, mapped_column
+from metadata_tables import FolderRecord, FileRecord, Base 
+from sqlalchemy import insert, ForeignKey 
 
 # Internal
 import sql_io
-from global_config import settings # <--- ADDED: Import settings instance
+from global_config import settings 
 
-class FileRecord(Base):
-    __tablename__ = "file"
-    file_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    file_path: Mapped[str] = mapped_column(unique=True)
-    filesize_bytes: Mapped[int]
-    # remove for prod
-    __table_args__ = {'extend_existing': True}
 
-# --- New Scan Function ---
 def load_pathspec(ignore_file_path, ignore_file_name):
     """
     Loads the ignore file, adds the ignore file itself to the patterns,
@@ -38,24 +29,26 @@ def load_pathspec(ignore_file_path, ignore_file_name):
         print(f"Warning: Ignore file '{ignore_file_path}' not found. Scanning all files.")
     
     lines.append(ignore_file_name)
-    # Also ignore the config file
     lines.append('global_config.yaml')
-    return pathspec.PathSpec.from_lines('gitwildmatch', lines)
+
+    return pathspec.GitIgnoreSpec.from_lines('gitwildmatch', lines)
 
 def scan(dirname, ignore_file_name=".scanignore"):
     engine = sql_io.get_engine()
     scan_root = Path(dirname).resolve()
+    print("scanning... ", scan_root)
     ignore_file_path = scan_root / ignore_file_name
-
     spec = load_pathspec(ignore_file_path, ignore_file_name)
     Base.metadata.create_all(engine)
     
-    # --- MODIFICATION: Build dicts directly ---
     rows_to_insert = []
+    folders_to_insert = []
+    file_parents_map = {}
     
     for cur_dir, dirs, files in os.walk(scan_root, topdown=True):
-        
         current_rel_dir = Path(cur_dir).relative_to(scan_root)
+        phash = hash(current_rel_dir)
+        folders_to_insert.append({'folder_path': str(current_rel_dir)})
 
         if spec:
             dirs_to_check = [
@@ -68,18 +61,21 @@ def scan(dirname, ignore_file_name=".scanignore"):
             ]
 
         for file in files:
+
             cur_path = Path(cur_dir) / file
             rel_path = cur_path.relative_to(scan_root).as_posix()
+            file_parents_map[hash(cur_path)] = phash 
             
             if spec.match_file(rel_path):
+                print(f"Skipping File: {rel_path}")
                 continue
 
             try:
                 stat_result = cur_path.stat()
-                # --- MODIFICATION: Append dict directly ---
                 rows_to_insert.append(
                     {
                         "file_path": str(cur_path),
+                        "file_name": file,
                         "filesize_bytes": stat_result.st_size
                     }
                 )
@@ -95,26 +91,34 @@ def scan(dirname, ignore_file_name=".scanignore"):
 
     with engine.begin() as conn:
         # This now correctly receives the list of dicts
+        folder_ins_stmt = (
+            insert(FolderRecord)
+            .values(folders_to_insert)
+            .returning(
+                FolderRecord.folder_id,
+                FolderRecord.folder_path
+            ) 
+        )
+        result = conn.execute(folder_ins_stmt)
+        print(f"Successfully inserted {result.rowcount} rows into folder")
+        path_id_map = {hash(Path(fpath)): fid for fid, fpath in result.all()}
+        for row in rows_to_insert:
+            parent_hash = file_parents_map[hash(row['file_path'])]
+            row['folder_id'] = path_id_map[parent_hash]
+
         result = conn.execute(FileRecord.insert(), rows_to_insert)
         print(f"Successfully inserted {result.rowcount} rows into {settings.db.db_location}.")
 
-#%%
 if __name__ == '__main__':
 
     # The config file points duckdb to 'test.db', so this path is correct
     settings.load('global_config.yaml')
     db_path = settings.db.db_location
-    print(f"using {db_path}")
-
+    print(f"Using DB: {db_path}")
     if os.path.exists(db_path):
         os.remove(db_path)
         print(f"Successfully deleted existing db: {db_path}")
-    # if os.path.exists(f"{db_path}.wal"): # DuckDB creates a WAL file
-    #     os.remove(f"{db_path}")
-        # print(f"Successfully deleted existing db WAL: {db_path}.wal")
 
-    # --- ADDED: Load configuration from file ---
-    # This MUST be called before get_engine() is first used.
-    
-    # Scan the current directory
-    # scan('.')
+    scan_dir = '.'
+    print(f"Running scan on {scan_dir}")
+    scan(scan_dir)

@@ -9,16 +9,16 @@ database:
     in_memory: false
 
   # Specific settings for mssql
-  mssql:
-    server_name: 'YOUR_SERVER_NAME'
-    db_name: 'YOUR_DATABASE_NAME'
-    driver: '{ODBC Driver 17 for SQL Server}'
-    trusted_connection: 'yes'
+  # mssql:
+  #   server_name: 'YOUR_SERVER_NAME'
+  #   db_name: 'YOUR_DATABASE_NAME'
+  #   driver: '{ODBC Driver 17 for SQL Server}'
+  #   trusted_connection: 'yes'
 
   # Specific settings for duckdb  <--- ADDED
-  duckdb:
-    db_location: './caspary.duckdb' # Set to match your main script
-    in_memory: false
+  # duckdb:
+  #   db_location: './caspary.duckdb' # Set to match your main script
+  #   in_memory: false
 
 # Top-level section for logging
 logging:

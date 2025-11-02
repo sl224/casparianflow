@@ -214,6 +214,10 @@ __marimo__/
 *.feather
 *.duckdb
 *.sqlite3
+*.txt
 
 # Mac OS
 .DS_Store
+
+# Exclusions
+!todo.txt

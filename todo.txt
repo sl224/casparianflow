@@ -1,0 +1,10 @@
+MVP features: 
+
+- scan results to table
+    - 
+
+- tag files 
+
+- run py scripts on tagged
+    - pipeline results are captured
+
