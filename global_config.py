@@ -82,7 +82,6 @@ class Config:
             raise Exception("Empty configuration fiel")
 
         db_config = config_data.get('database', {})
-        print(db_config)
         self._load_database_settings(db_config)
         
         # self._populate_config_object(config_data.get('logging', {}), self.logging)
@@ -93,7 +92,6 @@ class Config:
         """
         # 1. Determine which database type is being used
         db_type_str = db_config['type'].lower()
-        print("Type: ", db_type_str)
         try:
             self.db_type = supported_databases[db_type_str]
         except KeyError:
@@ -103,15 +101,7 @@ class Config:
         if self.db_type == supported_databases.sqlite3:
             self.db = SQLiteConfig()
             self._populate_config_object(db_config.get('sqlite3', {}), self.db)
-        
-        elif self.db_type == supported_databases.mssql:
-            self.db = MSSQLConfig()
-            self._populate_config_object(db_config.get('mssql', {}), self.db)
-            
-        elif self.db_type == supported_databases.duckdb: # <--- ADDED BLOCK
-            self.db = DuckDBConfig()
-            self._populate_config_object(db_config.get('duckdb', {}), self.db)
-            
+
         else:
             print(f"Error: Unhandled database type '{self.db_type}'. Using defaults.")
             self.db = DuckDBConfig() # <--- CHANGED FALLBACK
@@ -132,6 +122,5 @@ class Config:
                 setattr(config_obj, key, value)
             else:
                 print(f"Warning: Unknown config key '{key}' in section '{config_obj.__class__.__name__}'. Ignoring.")
-
 
 settings = Config()
