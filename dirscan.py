@@ -2,18 +2,63 @@
 import os
 from pathlib import Path
 import pathspec 
+from datetime import datetime
 
 try:
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 except NameError:
     pass
 
-from metadata_tables import FolderRecord, FileRecord, Base 
-from sqlalchemy import insert, ForeignKey 
+from metadata_tables import FolderRecord, FileRecord, Base, ProcessingLog
+from sqlalchemy import insert, update
 
 # Internal
 import sql_io
 from global_config import settings 
+
+
+class JobUpdater:
+    def __init__(self, eng):
+        self.status= "QUEUED"
+        self.pid = None
+        self.eng = eng
+
+
+    def init_status(self):
+        rec = ProcessingLog(
+            processing_start = datetime.now(),
+            processing_end = None, 
+            process_status = "QUEUED",
+            status_updated_at = datetime.now(),
+        )
+
+        with self.eng.begin() as conn:
+            result = conn.execute(ProcessingLog.insert(), rec.to_dict())
+            if result.rowcount == 0:
+                raise Exception("Error could not insert status in to processing table")
+            self.pid = result.inserted_primary_key[0]
+            print(f"Successfully inserted {result.rowcount} rows into processing status.")
+
+    def update_status(self, status, end=None):
+        rec = ProcessingLog(
+            processing_start = datetime.now(),
+            processing_end = end, 
+            process_status = status,
+            status_updated_at = datetime.now(),
+        )
+
+        with self.eng.begin() as conn:
+            stmt = (
+                update(ProcessingLog)
+                .where(ProcessingLog.process_id == self.pid)
+                .values(process_status=status)
+            )
+            result = conn.execute(stmt)
+            if result.rowcount == 0:
+                raise Exception("Error could not insert status in to processing table")
+            # print(f"Successfully updated {result.rowcount} rows into processing status.")
+
+
 
 
 def load_pathspec(ignore_file_path, ignore_file_name):
@@ -33,19 +78,19 @@ def load_pathspec(ignore_file_path, ignore_file_name):
 
     return pathspec.GitIgnoreSpec.from_lines('gitwildmatch', lines)
 
-def scan(dirname, ignore_file_name=".scanignore"):
-    engine = sql_io.get_engine()
+def scan(engine, j, dirname, ignore_file_name=".scanignore"):
     scan_root = Path(dirname).resolve()
     print("scanning... ", scan_root)
     ignore_file_path = scan_root / ignore_file_name
     spec = load_pathspec(ignore_file_path, ignore_file_name)
-    Base.metadata.create_all(engine)
     
     rows_to_insert = []
     folders_to_insert = []
     file_parents_map = {}
+    j.init_status()
     
     for cur_dir, dirs, files in os.walk(scan_root, topdown=True):
+        j.update_status("PROCESSING")
         current_rel_dir = Path(cur_dir).relative_to(scan_root)
         phash = hash(current_rel_dir)
         folders_to_insert.append({'folder_path': str(current_rel_dir)})
@@ -108,6 +153,7 @@ def scan(dirname, ignore_file_name=".scanignore"):
 
         result = conn.execute(FileRecord.insert(), rows_to_insert)
         print(f"Successfully inserted {result.rowcount} rows into {settings.db.db_location}.")
+    j.update_status(status="COMPLETE", end=datetime.now())
 
 if __name__ == '__main__':
 
@@ -119,6 +165,10 @@ if __name__ == '__main__':
         os.remove(db_path)
         print(f"Successfully deleted existing db: {db_path}")
 
+    engine = sql_io.get_engine()
+    Base.metadata.create_all(engine)
+
+    j = JobUpdater(engine)
     scan_dir = '.'
     print(f"Running scan on {scan_dir}")
-    scan(scan_dir)
+    scan(engine, j, scan_dir)
