@@ -22,3 +22,6 @@ class Base(DeclarativeBase):
     @classmethod
     def insert(cls):
         return cls.__table__.insert()
+
+    # Remove for prod
+    __table_args__ = {'extend_existing':True}
