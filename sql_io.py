@@ -2,12 +2,13 @@ from global_config import settings, supported_databases
 from sqlalchemy import create_engine
 from sqlalchemy import URL
 
+
 def get_engine(fast_executemany=True, echo=False):
     engine_args = {"echo": echo}
-    
+
     match settings.db_type:
         case supported_databases.mssql:
-            mssql_settings = settings.db 
+            mssql_settings = settings.db
             url_object = URL.create(
                 drivername="mssql+pyodbc",
                 host=mssql_settings.server_name,
@@ -18,7 +19,7 @@ def get_engine(fast_executemany=True, echo=False):
                 },
             )
             engine_args["fast_executemany"] = fast_executemany
-            
+
         case supported_databases.sqlite3:
             sqlite_settings = settings.db
             if sqlite_settings.in_memory:
@@ -26,7 +27,7 @@ def get_engine(fast_executemany=True, echo=False):
             else:
                 url_object = f"sqlite:///{sqlite_settings.db_location}"
 
-        case supported_databases.duckdb: # <--- ADDED BLOCK
+        case supported_databases.duckdb:  # <--- ADDED BLOCK
             duckdb_settings = settings.db
             if duckdb_settings.in_memory:
                 url_object = "duckdb:///:memory:"
