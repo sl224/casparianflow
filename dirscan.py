@@ -159,7 +159,7 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
     if not rows_to_insert:
         # --- MODIFIED ---
         logger.warning("No files found to insert. Ending job.")
-        j.update_status(status="COMPLETE_NO_FILES", end=datetime.now()) # <-- Use a more specific status
+        j.update_status(status="COMPLETE_NO_FILES") # <-- Use a more specific status
         return
 
     try:
@@ -178,14 +178,14 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
             
             path_id_map = {hash(Path(fpath)): fid for fid, fpath in result.all()}
             for row in rows_to_insert:
-                parent_hash = file_parents_map[hash(row['file_path'])]
+                parent_hash = file_parents_map[hash(Path(row['file_path']))]
                 row['folder_id'] = path_id_map[parent_hash]
 
             result = conn.execute(FileRecord.insert(), rows_to_insert)
             # --- MODIFIED ---
             logger.info(f"Successfully inserted {result.rowcount} file rows into {settings.db.db_location}.")
         
-        j.update_status(status="COMPLETE", end=datetime.now())
+        j.update_status(status="COMPLETE")
         logger.info(f"Scan for process_id {j.pid} completed successfully.")
     
     except Exception as e:
@@ -202,7 +202,7 @@ if __name__ == '__main__':
     
     # --- NEW: Call the setup function ONCE ---
     setup_logging(settings)
-    
+
     db_path = settings.db.db_location
     logger.info(f"Using DB: {db_path}") # <-- Use logger
     if os.path.exists(db_path):
@@ -218,7 +218,7 @@ if __name__ == '__main__':
         Base.metadata.create_all(engine)
 
         j = JobUpdater(engine)
-        scan_dir = '/Users/shan' 
+        scan_dir = '.' 
         logger.info(f"Running scan on {scan_dir}") # <-- Use logger
         scan(engine, j, scan_dir)
 
