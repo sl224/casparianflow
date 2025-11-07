@@ -37,7 +37,12 @@ ActiveDBConfig = Union[SQLiteConfig, MSSQLConfig, DuckDBConfig] # <--- UPDATED
 class LoggingConfig:
     """Configuration for application logging."""
     level: str = "INFO"
-    file: str | None = None # e.g., "app.log"
+    # --- MODIFIED & ADDED ---
+    log_to_file: bool = False
+    log_file: str = "scan_job.log" # Renamed from 'file' to match your YAML
+    rotation_size_mb: int = 10
+    rotation_backup_count: int = 5
+    format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 class Config:
     """
@@ -83,6 +88,10 @@ class Config:
 
         db_config = config_data.get('database', {})
         self._load_database_settings(db_config)
+
+        self.logging = LoggingConfig() 
+        logging_dict = config_data.get('logging', {}) 
+        self._populate_config_object(logging_dict, self.logging)
         
         # self._populate_config_object(config_data.get('logging', {}), self.logging)
 

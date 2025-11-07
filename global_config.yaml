@@ -22,5 +22,10 @@ database:
 
 # Top-level section for logging
 logging:
-  level: 'DEBUG'
-  file: 'application.log'
+  level: "INFO"                 # Default level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_to_file: true             # Whether to write to a file
+  log_file: "scan_job.log"      # The file to write to
+  rotation_size_mb: 10          # Rotate log file after it reaches 10MB
+  rotation_backup_count: 5      # Keep 5 old log files
+  # Format for the log messages
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

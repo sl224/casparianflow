@@ -215,6 +215,7 @@ __marimo__/
 *.duckdb
 *.sqlite3
 *.txt
+*.log*
 
 # Mac OS
 .DS_Store
