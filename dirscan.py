@@ -30,7 +30,7 @@ class JobUpdater:
         self.eng = eng
         # --- NEW ---
         # Get a logger for this class/module
-        self.logger = logging.getLogger(__name__) 
+        self.logger = logging.getLogger("JobUpdater") 
 
 
     def init_status(self):
@@ -219,7 +219,6 @@ if __name__ == '__main__':
 
         j = JobUpdater(engine)
         scan_dir = '.' 
-        logger.info(f"Running scan on {scan_dir}") # <-- Use logger
         scan(engine, j, scan_dir)
 
     except Exception as e:
