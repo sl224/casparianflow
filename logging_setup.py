@@ -4,6 +4,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+
 def setup_logging(config):
     """
     Configures the root logger based on the settings object.
@@ -19,7 +20,7 @@ def setup_logging(config):
     # Create logger
     # Get the root logger
     logger = logging.getLogger()
-    logger.setLevel(log_settings.level.upper()) # Set the lowest level to process
+    logger.setLevel(log_settings.level.upper())  # Set the lowest level to process
 
     # Clear existing handlers
     if logger.hasHandlers():
@@ -39,15 +40,15 @@ def setup_logging(config):
     # This logs to a file if configured
     if log_settings.log_to_file:
         log_file_path = Path(log_settings.log_file)
-        
+
         # Ensure the log directory exists
-        log_file_path.parent.mkdir(parents=True, exist_ok=True) 
+        log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Use RotatingFileHandler for log rotation
         file_handler = RotatingFileHandler(
             log_file_path,
-            maxBytes=log_settings.rotation_size_mb * 1024 * 1024, # in bytes
-            backupCount=log_settings.rotation_backup_count
+            maxBytes=log_settings.rotation_size_mb * 1024 * 1024,  # in bytes
+            backupCount=log_settings.rotation_backup_count,
         )
         file_handler.setLevel(log_settings.level.upper())
         file_handler.setFormatter(formatter)

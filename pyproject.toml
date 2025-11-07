@@ -1,15 +1,19 @@
 [project]
 name = "casparianflow"
 version = "0.1.0"
-description = "Add your description here"
+description = "Bringing dark data online"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "ipykernel>=7.1.0",
-    "nuitka>=2.8.4",
     "numpy>=2.3.4",
     "pathspec>=0.12.1",
-    "pyyaml>=6.0.3",
     "sqlalchemy>=2.0.44",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "nuitka>=2.8.4",
+    "ruff>=0.14.4",
     "tqdm>=4.67.1",
 ]
