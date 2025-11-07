@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import pathspec 
 from datetime import datetime
-import logging # <-- Import logging
+import logging 
 
 try:
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
@@ -16,7 +16,7 @@ from sqlalchemy import insert, update
 # Internal
 import sql_io
 from global_config import settings 
-from logging_setup import setup_logging # <-- Import the setup function
+from logging_setup import setup_logging
 
 # --- NEW ---
 # Get a logger for this specific module
@@ -43,11 +43,9 @@ class JobUpdater:
         with self.eng.begin() as conn:
             result = conn.execute(ProcessingLog.insert(), rec)
             if result.rowcount == 0:
-                # --- MODIFIED ---
                 self.logger.error("Could not insert initial status in to processing table")
                 raise Exception("Error could not insert status in to processing table")
             self.pid = result.inserted_primary_key[0]
-            # --- MODIFIED ---
             self.logger.info(f"Successfully inserted status for new process_id: {self.pid}")
 
     def update_status(self, status):
@@ -56,15 +54,13 @@ class JobUpdater:
 
             stmt = (
                 update(ProcessingLog)
-                .where(ProcessingLog.process_id == self.pid)
-                .values(**stmt_values) # <-- Use updated values
+                .where(ProcessingLog.id == self.pid)
+                .values(**stmt_values) 
             )
             result = conn.execute(stmt)
             if result.rowcount == 0:
-                # --- MODIFIED ---
                 self.logger.error(f"Could not update status for process_id: {self.pid}")
                 raise Exception("Error could not update status in to processing table")
-            # --- MODIFIED (use debug for verbose info) ---
             self.logger.debug(f"Successfully updated status to {status} for process_id: {self.pid}")
 
 def load_pathspec(ignore_file_path, ignore_file_name):
@@ -77,7 +73,6 @@ def load_pathspec(ignore_file_path, ignore_file_name):
         with open(ignore_file_path, 'r') as f:
             lines = f.readlines()
     except FileNotFoundError:
-        # --- MODIFIED ---
         logger.warning(f"Ignore file '{ignore_file_path}' not found. Scanning all files.")
     
     lines.append(ignore_file_name)
@@ -88,7 +83,7 @@ def load_pathspec(ignore_file_path, ignore_file_name):
 def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
     scan_root = Path(dirname).resolve()
     # --- MODIFIED ---
-    logger.info(f"Starting scan on: {scan_root}")
+    logger.info(f"Scanning: {scan_root}")
     ignore_file_path = scan_root / ignore_file_name
     spec = load_pathspec(ignore_file_path, ignore_file_name)
     
@@ -150,10 +145,8 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
                     }
                 )
             except FileNotFoundError:
-                # --- MODIFIED ---
                 logger.warning(f"{cur_path} was listed but not found. Skipping.")
             except OSError as e:
-                # --- MODIFIED ---
                 logger.error(f"Error stating file {cur_path}: {e}. Skipping.")
 
     if not rows_to_insert:
@@ -168,7 +161,7 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
                 insert(FolderRecord)
                 .values(folders_to_insert)
                 .returning(
-                    FolderRecord.folder_id,
+                    FolderRecord.id,
                     FolderRecord.folder_path
                 ) 
             )
@@ -197,18 +190,16 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
 
 
 if __name__ == '__main__':
-    
-    settings.load('global_config.yaml')
-    
-    # --- NEW: Call the setup function ONCE ---
-    setup_logging(settings)
 
+    # Program Init 
+    settings.load('global_config.yaml')
+    setup_logging(settings)
     db_path = settings.db.db_location
-    logger.info(f"Using DB: {db_path}") # <-- Use logger
     if os.path.exists(db_path):
         os.remove(db_path)
-        logger.info(f"Successfully deleted existing db: {db_path}") # <-- Use logger
+        logger.debug(f"Successfully deleted existing db: {db_path}") # <-- Use logger
 
+    logger.debug(f"Using DB: {db_path}") # <-- Use logger
     # --- NEW: Add a top-level try/except block ---
     # This catches any unhandled crashes
     engine = None
@@ -226,6 +217,6 @@ if __name__ == '__main__':
         if j and j.pid:
             logger.error(f"Attempting to mark job {j.pid} as FAILED.")
             try:
-                j.update_status(status="FAILED_UNHANDLED", end=datetime.now())
+                j.update_status(status="FAILED_UNHANDLED")
             except Exception as final_e:
                 logger.error(f"Could not even update status to FAILED.", exc_info=final_e)
