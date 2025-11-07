@@ -53,4 +53,4 @@ def setup_logging(config):
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-    logger.info("Logging configured.")
+    logger.debug("Logging configured.")

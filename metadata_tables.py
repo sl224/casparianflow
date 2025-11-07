@@ -12,23 +12,23 @@ extend_existing = True
 
 class FolderRecord(Base):
     __tablename__ = "folder"
-    process_id: Mapped[int] = mapped_column(ForeignKey("processing_status.process_id"))
-    folder_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    process_id: Mapped[int] = mapped_column(ForeignKey("processing_status.id"))
     folder_path: Mapped[str] = mapped_column(unique=True)
     inserted_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 class FileRecord(Base):
     __tablename__ = "file"
-    process_id: Mapped[int] = mapped_column(ForeignKey("processing_status.process_id"))
-    folder_id: Mapped[int] = mapped_column(ForeignKey("folder.folder_id"))
-    file_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    process_id: Mapped[int] = mapped_column(ForeignKey("processing_status.id"))
+    folder_id: Mapped[int] = mapped_column(ForeignKey("folder.id"))
     file_name: Mapped[str] 
     filesize_bytes: Mapped[int]
     inserted_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 class ProcessingLog(Base):
     __tablename__ = "processing_status"
-    process_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     processing_start: Mapped[datetime] 
     status_updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(),

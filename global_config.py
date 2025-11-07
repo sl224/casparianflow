@@ -3,9 +3,8 @@ from enum import Enum, auto
 from pathlib import Path
 from dataclasses import dataclass, fields
 from typing import Set, Union
-import tomllib  # Standard library in Python 3.11+
+import tomllib 
 
-# --- UPDATED: Added all supported DBs ---
 class supported_databases(Enum):
     """Enumeration for supported database types."""
     sqlite3 = auto()
@@ -18,7 +17,6 @@ class SQLiteConfig:
     db_location: str = "./caspary.sqlite3"
     in_memory: bool = False
 
-# --- NEW: Added MSSQLConfig ---
 @dataclass
 class MSSQLConfig:
     """Configuration specific to MSSQL."""
@@ -27,7 +25,6 @@ class MSSQLConfig:
     driver: str = "{ODBC Driver 17 for SQL Server}"
     trusted_connection: str = "yes"
 
-# --- NEW: Added DuckDBConfig ---
 @dataclass
 class DuckDBConfig:
     """Configuration specific to DuckDB."""
