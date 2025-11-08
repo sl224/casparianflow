@@ -5,34 +5,22 @@ import pathspec
 from datetime import datetime
 import logging
 
-# --- TQDM IMPORT ---
 from tqdm import tqdm
 
-# --- Import the logging redirect context manager ---
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 try:
-    # Get the directory of the currently executing script
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
     print(f"Changed working directory to: {script_dir}")
 except NameError:
-    # __file__ is not defined, likely running in an interactive
-    # environment like Jupyter or an IDE's REPL
     pass
 
-# Assuming these are in a local file metadata_tables.py
-# Make sure you have this file in the same directory.
 from metadata_tables import FolderRecord, FileRecord, Base, ProcessingLog
 from sqlalchemy import insert, update
 
-# --- FIXED IMPORTS ---
-# Import the get_engine function from db_utils
 from sql_io import get_engine
-# Import the pydantic settings *instance*
 from global_config import settings
-# --- REMOVED: No longer need logging_setup ---
-
 
 # Get a logger for this specific module
 logger = logging.getLogger(__name__)
@@ -101,7 +89,6 @@ def load_pathspec(ignore_file_path, ignore_file_name):
         )
 
     lines.append(ignore_file_name)
-    # --- FIXED: Point to the correct config file name ---
     lines.append("global_config.toml")
 
     return pathspec.GitIgnoreSpec.from_lines("gitwildmatch", lines)
@@ -140,7 +127,7 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
                 )
 
             current_rel_dir = Path(cur_dir).relative_to(scan_root)
-            
+
             # Use as_posix() for a consistent path separator
             phash = hash(current_rel_dir)
             folders_to_insert.append(
@@ -177,8 +164,7 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
                     rows_to_insert.append(
                         {
                             "process_id": j.pid,
-                            # Store the full, resolved path
-                            "file_path": str(cur_path), 
+                            "file_path": str(cur_path),
                             "file_name": file,
                             "filesize_bytes": stat_result.st_size,
                         }
@@ -197,11 +183,6 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
 
     try:
         with engine.begin() as conn:
-            folder_bar.set_description("Inserting Folders")
-            folder_bar.set_postfix_str("")  # Clear postfix
-            file_bar.set_description("")
-            file_bar.set_postfix_str("")
-
             folder_ins_stmt = (
                 insert(FolderRecord)
                 .values(folders_to_insert)
@@ -212,24 +193,20 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
                 f"Successfully inserted {len(returned_rows)} rows into the folder table"
             )
 
-            folder_bar.set_description("Mapping file paths")
-
-            # Use as_posix() for consistent hashing
-            path_id_map = {hash(Path(fpath).as_posix()): fid for fid, fpath in returned_rows}
+            path_id_map = {
+                hash(Path(fpath).as_posix()): fid for fid, fpath in returned_rows
+            }
 
             for row in rows_to_insert:
-                # Use the same hash key as when building file_parents_map
                 parent_hash = file_parents_map[hash(Path(row["file_path"]))]
                 row["folder_id"] = path_id_map[parent_hash]
 
-            folder_bar.set_description("Inserting Files")
             result = conn.execute(insert(FileRecord), rows_to_insert)
             logger.info(
                 f"Successfully inserted {result.rowcount} rows into the file table"
             )
 
         j.update_status(status="COMPLETE")
-        folder_bar.set_description("Scan Complete!")
         logger.info(f"Scan for process_id {j.pid} completed successfully.")
 
     except Exception as e:
@@ -245,9 +222,6 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
 
 
 def main():
-    # --- REMOVED: settings.load() ---
-    # The settings object is loaded automatically when imported.
-
     # --- Use basicConfig instead of setup_logging ---
     log_level = settings.logging.level.upper()
     logging.basicConfig(
@@ -263,18 +237,19 @@ def main():
             logger.debug(f"Successfully deleted existing db: {db_path}")
         logger.debug(f"Using DB: {db_path}")
     else:
-        logger.debug(f"Using DB: {settings.database.type} on {settings.database.server_name}")
-
+        logger.debug(
+            f"Using DB: {settings.database.type} on {settings.database.server_name}"
+        )
 
     engine = None
     j = None
     try:
         # --- FIXED: Use imported get_engine ---
-        engine = get_engine()
+        engine = get_engine(settings.database)
         Base.metadata.create_all(engine)
 
         j = JobUpdater(engine, "Folder Scan")
-        scan_dir = settings.scan.dir or '/'
+        scan_dir = settings.scan.dir or "/"
         scan(engine, j, scan_dir)
 
     except Exception as e:
