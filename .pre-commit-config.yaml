@@ -4,7 +4,9 @@ repos:
     hooks:
       # This runs the formatter (`ruff format`)
       - id: ruff-format
+        types: [python]
       # This runs the linter (`ruff check --fix`)
       - id: ruff
+        types: [python]
         # Enable auto-fixing
         args: [--fix]
