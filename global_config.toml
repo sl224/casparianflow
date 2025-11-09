@@ -1,35 +1,21 @@
-# Top-level section for database settings
+# --- Database Settings ---
+# Pydantic's discriminated union loader expects all keys
+# for the selected 'type' to be flat inside this section.
 [database]
-# type can be 'sqlite', 'mssql', or 'duckdb'
-type = "sqlite3" # <-- Use the key for the section below
-
-# Specific settings for sqlite
-[database.sqlite3]
+type = "sqlite3"
 db_location = "./caspary.sqlite3"
 in_memory = false
 
-# Specific settings for mssql
-# [database.mssql]
-# server_name = "YOUR_SERVER_NAME"
-# db_name = "YOUR_DATABASE_NAME"
-# driver = "{ODBC Driver 17 for SQL Server}"
-# trusted_connection = "yes"
-
-# Specific settings for duckdb
-# [database.duckdb]
-# db_location = "./caspary.duckdb"
-# in_memory = false
-
-# Top-level section for logging
+# --- Logging Settings ---
+# This section was already correct!
 [logging]
-level = "INFO"               # Default level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-log_to_file = true           # Whether to write to a file
-log_file = "scan_job.log"    # The file to write to
-rotation_size_mb = 10        # Rotate log file after it reaches 10MB
-rotation_backup_count = 5    # Keep 5 old log files
-# Format for the og messages
+level = "INFO"
+log_to_file = true
+log_file = "scan_job.log"
+rotation_size_mb = 10
+rotation_backup_count = 5
 format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
-# Pipeline configs
+# --- Scan Settings ---
 [scan]
 dir = "/"

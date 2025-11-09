@@ -3,7 +3,6 @@ from casp_sa_base import Base
 from sqlalchemy import ForeignKey
 from sqlalchemy.sql import func
 from datetime import datetime
-from typing import Optional
 
 
 # disable for prod -- for allowing jupyter cells

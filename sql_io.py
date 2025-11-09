@@ -1,4 +1,3 @@
-from global_config import settings
 from sqlalchemy import create_engine
 from sqlalchemy import URL
 
@@ -38,7 +37,7 @@ def get_engine(db_settings, fast_executemany=True, echo=False):
 
         case _:
             raise ValueError(
-                f"Pydantic should have thrown an error for unsupported DB types"
+                "Pydantic should have thrown an error for unsupported DB types"
             )
 
     if url_object is None:

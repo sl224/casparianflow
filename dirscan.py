@@ -82,14 +82,11 @@ def load_pathspec(ignore_file_path, ignore_file_name):
     lines = []
     try:
         with open(ignore_file_path, "r") as f:
-            lines = f.readlines()
+            lines = [str(Path(line)) for line in f.readlines()]
     except FileNotFoundError:
         logger.warning(
             f"Ignore file '{ignore_file_path}' not found. Scanning all files."
         )
-
-    lines.append(ignore_file_name)
-    lines.append("global_config.toml")
 
     return pathspec.GitIgnoreSpec.from_lines("gitwildmatch", lines)
 
@@ -97,7 +94,7 @@ def load_pathspec(ignore_file_path, ignore_file_name):
 def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
     scan_root = Path(dirname).resolve()
     logger.info(f"Starting scan: {scan_root}")
-    ignore_file_path = scan_root / ignore_file_name
+    ignore_file_path = ignore_file_name
     spec = load_pathspec(ignore_file_path, ignore_file_name)
 
     rows_to_insert = []
@@ -106,9 +103,9 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
 
     try:
         j.init_status()
-    except Exception as e:
+    except Exception:
         logger.critical(
-            f"Failed to initialize job status. Aborting scan.", exc_info=True
+            "Failed to initialize job status. Aborting scan.", exc_info=True
         )
         return
 
@@ -121,9 +118,9 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
         for cur_dir, dirs, files in os.walk(scan_root, topdown=True):
             try:
                 j.update_status("PROCESSING")
-            except Exception as e:
+            except Exception:
                 logger.error(
-                    f"Failed to update job status to PROCESSING.", exc_info=True
+                    "Failed to update job status to PROCESSING.", exc_info=True
                 )
 
             current_rel_dir = Path(cur_dir).relative_to(scan_root)
@@ -138,12 +135,10 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
                 dirs_to_check = [(d, (current_rel_dir / d).as_posix()) for d in dirs]
                 fil_dirs = []
                 for d, rel_path in dirs_to_check:
-                    if not spec.match_file(rel_path) and not spec.match_file(
-                        rel_path + "/"
-                    ):
+                    if not spec.match_file(rel_path):
                         fil_dirs.append(d)
                     else:
-                        logger.debug(f"Skipping directory: {rel_path}")
+                        logger.info(f"Skipping directory: {rel_path}")
                 dirs[:] = fil_dirs
 
             for file in files:
@@ -155,8 +150,8 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
                 # Use the consistent relative path hash for the map key
                 file_parents_map[hash(cur_path)] = phash
 
-                if spec.match_file(rel_path):
-                    logger.debug(f"Skipping ignored file: {rel_path}")
+                if spec.match_file(str(rel_path)):
+                    logger.info(f"File matches .scanignore...skipping: {rel_path}")
                     continue
 
                 try:
@@ -209,7 +204,7 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
         j.update_status(status="COMPLETE")
         logger.info(f"Scan for process_id {j.pid} completed successfully.")
 
-    except Exception as e:
+    except Exception:
         logger.critical(
             f"Failed during database insert for process_id {j.pid}.", exc_info=True
         )
@@ -217,7 +212,7 @@ def scan(engine, j: JobUpdater, dirname, ignore_file_name=".scanignore"):
             j.update_status(status="FAILED_DB_INSERT")
         except Exception as update_e:
             logger.error(
-                f"Failed to update status to FAILED after DB error.", exc_info=update_e
+                "Failed to update status to FAILED after DB error.", exc_info=update_e
             )
 
 
@@ -252,7 +247,7 @@ def main():
         scan_dir = settings.scan.dir or "/"
         scan(engine, j, scan_dir)
 
-    except Exception as e:
+    except Exception:
         logger.critical("Scan job failed with an unhandled exception.", exc_info=True)
         if j and j.pid:
             logger.error(f"Attempting to mark job {j.pid} as FAILED.")
