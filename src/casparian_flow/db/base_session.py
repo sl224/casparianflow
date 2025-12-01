@@ -1,9 +1,9 @@
 from sqlalchemy.orm import declarative_base, sessionmaker
-from etude_core.config import settings
+from casparian_flow.config import settings
 
 # Conditionally set a default schema for MSSQL to keep tables organized.
 if settings.database.type == "mssql":
-    DEFAULT_SCHEMA = "etude_core"
+    DEFAULT_SCHEMA = "casparian_flow"
 
     class EtudeCoreBase:
         __table_args__ = {"schema": DEFAULT_SCHEMA}
@@ -19,7 +19,7 @@ def schema_fkey(key: str) -> str:
     Returns a schema-qualified foreign key string if a schema is defined,
     otherwise returns the simple key.
 
-    - MSSQL: "etude_core.table.column"
+    - MSSQL: "casparian_flow.table.column"
     - SQLite: "table.column"
     """
     if DEFAULT_SCHEMA:

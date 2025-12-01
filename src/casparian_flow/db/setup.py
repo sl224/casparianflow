@@ -2,12 +2,12 @@ import logging
 import sqlalchemy as sa
 from sqlalchemy.schema import CreateSchema
 
-from etude_core.config import settings
-from etude_core.db.base_session import Base
+from casparian_flow.config import settings
+from casparian_flow.db.base_session import Base
 
 # Import models to populate `Base.metadata` with table definitions
-import etude_core.db.models  # noqa: F401
-from etude_core.db.models import FolderMetadata
+import casparian_flow.db.models  # noqa: F401
+from casparian_flow.db.models import FolderMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ def initialize_database(eng: sa.Engine, reset_tables: bool = False):
     """
     # 1. Schema Creation (MSSQL-specific)
     if settings.database.type == "mssql":
-        from etude_core.db.base_session import DEFAULT_SCHEMA
+        from casparian_flow.db.base_session import DEFAULT_SCHEMA
 
         if not DEFAULT_SCHEMA:
             logger.error("MSSQL is selected but DEFAULT_SCHEMA is not set. Exiting.")

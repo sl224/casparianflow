@@ -1,9 +1,9 @@
 import logging
 from typing import Protocol, runtime_checkable
 
-from etude_core.pipelines.protocols import PipelineJob
-from etude_core.pipelines.scanner import MetadataScanHandler, FileToProcess
-from etude_core.pipelines.base import FileHandler
+from casparian_flow.pipelines.protocols import PipelineJob
+from casparian_flow.pipelines.scanner import MetadataScanHandler, FileToProcess
+from casparian_flow.pipelines.base import FileHandler
 
 logger = logging.getLogger(__name__)
 

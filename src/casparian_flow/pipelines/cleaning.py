@@ -3,7 +3,7 @@ import logging
 from typing import Dict, Type
 from datetime import datetime
 
-from etude_core.db.base_session import Base
+from casparian_flow.db.base_session import Base
 
 logger = logging.getLogger(__name__)
 
