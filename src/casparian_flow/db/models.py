@@ -46,6 +46,28 @@ class FileMetadata(Base):
     root = relationship("SourceRoot", back_populates="files")
     hash_info = relationship("FileHashRegistry")
 
+class WorkerNode(Base):
+    """
+    The 'Yellow Pages' of the Swarm.
+    Tracks who is online and what they can do.
+    """
+    __tablename__ = "cf_worker_registry"
+
+    hostname = Column(String(100), primary_key=True)
+    ip_address = Column(String(50), nullable=True)
+    required_env = Column(String(100), nullable=True, index=True)
+    
+    # "Packaged Env" Identifier (e.g. "v2.1.0-gpu" or "standard-cpu-v1")
+    env_signature = Column(String(100), nullable=False, index=True)
+    
+    # JSON list of loaded plugins (e.g. ["RsmParser", "FlightLogParser"])
+    capabilities = Column(Text, nullable=True)
+    
+    first_seen = Column(DateTime, server_default=func.now())
+    last_heartbeat = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    
+    status = Column(String(20), default="ONLINE") # ONLINE, DRAINING, OFFLINE
+
 class ProcessingJob(Base):
     """
     The Distributed Queue Unit.
