@@ -37,5 +37,5 @@
 Run the ETL pipeline using `uv`:
 
 ```powershell
-uv run -m etude_core.main
+uv run -m casparian_flow.main
 ```

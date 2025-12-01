@@ -1,4 +1,4 @@
--- Danger: This script irreversibly removes all objects in the 'etude_core' schema.
+-- Danger: This script irreversibly removes all objects in the 'casparian_flow' schema.
 -- Confirm you're connected to the intended database and have reliable backups.
 -- Intended for controlled maintenance; obtain approvals before executing.
 USE [AnalyticsDataMart];
@@ -14,7 +14,7 @@ SELECT @sql += N'ALTER TABLE '
 FROM sys.foreign_keys AS fk
 INNER JOIN sys.tables AS t ON fk.parent_object_id = t.object_id
 INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-WHERE s.name = 'etude_core';
+WHERE s.name = 'casparian_flow';
 
 -- Print and execute the DROP CONSTRAINT statements
 PRINT @sql;
@@ -29,11 +29,11 @@ SELECT @sql += N'DROP TABLE '
     + N';' + CHAR(13)
 FROM sys.tables AS t
 INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-WHERE s.name = 'etude_core';
+WHERE s.name = 'casparian_flow';
 
 -- Print and execute the DROP TABLE statements
 PRINT @sql;
 EXEC sp_executesql @sql;
 GO
 
-PRINT 'All tables in schema etude_core have been dropped. Confirm expected outcome and restore from backup if necessary.';
+PRINT 'All tables in schema casparian_flow have been dropped. Confirm expected outcome and restore from backup if necessary.';

@@ -16,9 +16,9 @@ from typing import (
 import pandas as pd
 import sqlalchemy as sa
 
-from etude_core.orchestration.managers import JobManager
-from etude_core.db import access as sql_io
-from etude_core.db.models import Base  # Import your Base
+from casparian_flow.orchestration.managers import JobManager
+from casparian_flow.db import access as sql_io
+from casparian_flow.db.models import Base  # Import your Base
 
 logger = logging.getLogger(__name__)
 

@@ -6,10 +6,10 @@ import sqlalchemy as sa
 from sqlalchemy import bindparam, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
-from etude_core.services.fs_scanner import scan_directory
-from etude_core.db.models import FileMetadata, FileHashRegistry
-from etude_core.services.zip_io import FileType, file_type_patterns
-from etude_core.orchestration.managers import JobManager
+from casparian_flow.services.fs_scanner import scan_directory
+from casparian_flow.db.models import FileMetadata, FileHashRegistry
+from casparian_flow.services.zip_io import FileType, file_type_patterns
+from casparian_flow.orchestration.managers import JobManager
 
 logger = logging.getLogger(__name__)
 

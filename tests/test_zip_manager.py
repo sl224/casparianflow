@@ -2,7 +2,7 @@
 from pathlib import Path
 import pytest
 
-from etude_core.services.zip_io import UnzipContext, FileType
+from casparian_flow.services.zip_io import UnzipContext, FileType
 
 
 STATIC_ASSETS_ROOT = Path("tests/static_assets")

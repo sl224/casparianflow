@@ -5,14 +5,14 @@ from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
 # Import models used for queries
-from etude_core.db.models import (
+from casparian_flow.db.models import (
     ProcessingSession,
     ProcessingJob,
     StatusEnum,
     FileMetadata,
 )
-from etude_core.pipelines.scanner import MetadataScanHandler
-from etude_core.registry import HANDLER_REGISTRY
+from casparian_flow.pipelines.scanner import MetadataScanHandler
+from casparian_flow.registry import HANDLER_REGISTRY
 
 logger = logging.getLogger(__name__)
 
