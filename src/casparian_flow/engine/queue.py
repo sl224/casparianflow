@@ -22,22 +22,20 @@ class JobQueue:
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
 
-    def pop_job(self) -> Optional[ProcessingJob]:
+    def pop_job(self, my_env_signature: str) -> Optional[ProcessingJob]:
         """
-        Atomically finds, locks, and updates the next available job.
-        Returns the Job object or None if queue is empty.
+        Pop a job, respecting Environment requirements.
         """
-        # MSSQL Atomic Pop Query
-        # 1. CTE selects top 1 pending job, ordering by priority
-        # 2. WITH (UPDLOCK, READPAST) ensures we skip locked rows and lock this one
-        # 3. UPDATE marks it running and assigns it to this worker
-        # 4. OUTPUT returns the ID so we can fetch the full ORM object
+        # Logic:
+        # 1. Job has NO requirement (NULL) -> Anyone can take it.
+        # 2. Job has requirement -> Must match my_env_signature.
         
         sql = """
         WITH cte AS (
             SELECT TOP(1) *
             FROM cf_processing_queue WITH (ROWLOCK, READPAST, UPDLOCK)
             WHERE status = :pending_status
+              AND (required_env IS NULL OR required_env = :my_env) -- The Filter
             ORDER BY priority DESC, id ASC
         )
         UPDATE cte
@@ -45,10 +43,10 @@ class JobQueue:
             status = :running_status,
             worker_host = :host,
             worker_pid = :pid,
+            worker_version = :my_env,
             claim_time = SYSDATETIME()
         OUTPUT inserted.id;
-        """
-        
+        """ 
         try:
             with self.engine.begin() as conn:
                 result = conn.execute(

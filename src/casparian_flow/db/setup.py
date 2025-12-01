@@ -2,15 +2,15 @@ import logging
 import sqlalchemy as sa
 from sqlalchemy.schema import CreateSchema
 
+# FIX: Import from casparian_flow, not etude_core
 from casparian_flow.config import settings
 from casparian_flow.db.base_session import Base
 
-# Import models to populate `Base.metadata` with table definitions
+# FIX: Import the NEW models to ensure they are registered with Base.metadata
 import casparian_flow.db.models  # noqa: F401
-from casparian_flow.db.models import FolderMetadata
+from casparian_flow.db.models import SourceRoot
 
 logger = logging.getLogger(__name__)
-
 
 def initialize_database(eng: sa.Engine, reset_tables: bool = False):
     """
@@ -19,11 +19,9 @@ def initialize_database(eng: sa.Engine, reset_tables: bool = False):
     """
     # 1. Schema Creation (MSSQL-specific)
     if settings.database.type == "mssql":
-        from casparian_flow.db.base_session import DEFAULT_SCHEMA
-
-        if not DEFAULT_SCHEMA:
-            logger.error("MSSQL is selected but DEFAULT_SCHEMA is not set. Exiting.")
-            exit(1)
+        # FIX: Hardcode or read from config, don't rely on deleted constant if possible
+        # Or ensure DEFAULT_SCHEMA is in base_session.py
+        DEFAULT_SCHEMA = "casparian_core" 
 
         logger.info(f"Ensuring MSSQL schema '{DEFAULT_SCHEMA}' exists...")
         with eng.connect() as conn:
@@ -35,36 +33,36 @@ def initialize_database(eng: sa.Engine, reset_tables: bool = False):
     # 2. Table Creation / Reset
     if reset_tables:
         logger.info("Resetting and creating database tables...")
-        # Base.metadata knows about all tables thanks to the import
         Base.metadata.drop_all(eng)
         Base.metadata.create_all(eng)
     else:
-        # This is safer for production runs, as it's idempotent.
         logger.info("Ensuring all tables exist (create if not present)...")
         Base.metadata.create_all(eng)
 
-
-def get_or_create_folder(eng: sa.Engine, folder_id: int, folder_path: str) -> bool:
+def get_or_create_sourceroot(eng: sa.Engine, path: str, tags: str = None) -> int:
     """
-    Ensures the parent FolderMetadata row exists before processing.
-    Returns True on success, False on failure.
+    Idempotently registers a SourceRoot (formerly FolderMetadata).
+    Returns the ID.
     """
+    from sqlalchemy import select
+    
     with eng.connect() as conn:
+        # Check exist
+        stmt = select(SourceRoot.id).where(SourceRoot.path == path)
+        existing_id = conn.execute(stmt).scalar()
+        
+        if existing_id:
+            return existing_id
+            
+        # Create
         try:
-            conn.execute(
-                FolderMetadata.__table__.insert(),
-                # Use model column names for insert: 'FolderID' and 'FolderPath'
-                {"FolderID": folder_id, "FolderPath": folder_path},
+            result = conn.execute(
+                SourceRoot.__table__.insert().values(path=path, tags=tags)
             )
             conn.commit()
-            logger.debug(f"Created new FolderID {folder_id}")
-            return True
+            # In MSSQL with pyodbc, result.inserted_primary_key might behave differently.
+            # Safe fallback: re-query
+            return conn.execute(stmt).scalar()
         except sa.exc.IntegrityError:
-            # This handles the case where the folder already exists.
             conn.rollback()
-            logger.debug(f"FolderID {folder_id} already exists.")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to create FolderID {folder_id} in database: {e}")
-            conn.rollback()
-            return False
+            return conn.execute(stmt).scalar()

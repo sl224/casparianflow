@@ -1,66 +1,52 @@
 import logging
-from tqdm import tqdm
+import sys
 from pathlib import Path
 
-# --- Core ETL Imports ---
-from casparian_flow.context import EtlContext
-
-# Renamed import:
-from casparian_flow.orchestration.workflow import process_zip
-
-from casparian_flow.db import access as sql_io
+# FIX: New Imports
 from casparian_flow.config import settings
-from casparian_flow.db.setup import initialize_database, get_or_create_folder
+from casparian_flow.db import access as sql_io
+from casparian_flow.db.setup import initialize_database
+from casparian_flow.engine.worker import CasparianWorker
 
-# --- Setup ---
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-
-# --- Entry Point ---
-
 if __name__ == "__main__":
-    logger.info(f"Connecting to database type: {settings.database.type}")
-    eng = sql_io.get_engine(settings.database)
+    logger.info("Starting Casparian Flow Worker Node...")
+    
+    # 1. Initialize DB Connection
+    try:
+        # We need the connection string from settings
+        # (Assuming settings.database has a connection_string property or we build it)
+        # For now, we reuse the existing get_engine logic implicitly inside the Worker?
+        # Actually, the Worker expects a 'config' dict. Let's provide it.
+        
+        # Build a config dict that the Worker expects
+        worker_config = {
+            "database": {
+                "connection_string": str(sql_io.get_engine(settings.database).url) 
+            },
+            "storage": {
+                "parquet_root": "data/parquet"
+            },
+            "plugins": {
+                "dir": "src/casparian_flow/plugins" # Make sure this exists!
+            }
+        }
+        
+        # 2. Init DB Tables (Safe to run on startup)
+        eng = sql_io.get_engine(settings.database)
+        initialize_database(eng, reset_tables=False)
+        eng.dispose() # Worker creates its own engine
 
-    # 1. Initialize DB
-    # We set reset_tables=True because this is a dev/test script.
-    # For production, this would be `reset_tables=False`.
-    initialize_database(eng, reset_tables=True)
+        # 3. Run Worker
+        worker = CasparianWorker(worker_config)
+        worker.run()
 
-    # 2. Capture Context
-    ctx = EtlContext.capture()
-    logger.info(f"Execution Context: {ctx}")
-
-    # 3. Setup Test Data
-    STATIC_ASSETS_ROOT = Path("tests/static_assets")
-    test_zip = (
-        STATIC_ASSETS_ROOT / "zips/169069_20250203_004745_025_TransportRSM.fpkg.e2d.zip"
-    )
-
-    # Use a list of (folder_id, path_to_zip) tuples for deterministic ordering
-    id_paths = [(i, p) for i, p in enumerate(STATIC_ASSETS_ROOT.glob("**/zips/*.zip"))]
-    logger.info(f"Found {len(id_paths)} folders to process.")
-
-    # 4. Main Processing Loop
-    for folder_id, zip_path_str in tqdm(id_paths, desc="Overall Progress"):
-        zip_path = Path(zip_path_str)
-
-        if not zip_path.exists():
-            logger.warning(f"Zip path does not exist, skipping: {zip_path}")
-            continue
-
-        # Ensure the parent folder exists before processing
-        if not get_or_create_folder(eng, folder_id, str(zip_path)):
-            logger.warning(f"Skipping folder {folder_id} due to parent creation error.")
-            continue
-
-        # Call the main orchestration logic
-        process_zip(
-            eng=eng,
-            folder_id=folder_id,
-            zip_path=zip_path,
-            context=ctx,
-        )
+    except KeyboardInterrupt:
+        logger.info("Worker stopped by user.")
+    except Exception as e:
+        logger.critical(f"Worker failed: {e}", exc_info=True)
+        sys.exit(1)
