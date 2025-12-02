@@ -37,8 +37,10 @@ class FileMetadata(Base):
     """Instance of a file found during Discovery."""
     __tablename__ = "cf_file_metadata"
     id = Column(Integer, primary_key=True)
-    root_id = Column(Integer, ForeignKey("cf_source_root.id"), nullable=False, index=True)
-    hash_id = Column(Integer, ForeignKey("cf_hash_registry.id"), nullable=False, index=True)
+    root_id = Column(Integer, ForeignKey(SourceRoot.id), nullable=False, index=True)
+    hash_id = Column(Integer, ForeignKey(FileHashRegistry.id), nullable=False, index=True)
+    # root_id = Column(Integer, ForeignKey("cf_source_root.id"), nullable=False, index=True)
+    # hash_id = Column(Integer, ForeignKey("cf_hash_registry.id"), nullable=False, index=True)
     relative_path = Column(String(500), nullable=False)
     file_size_bytes = Column(Integer)
     file_type = Column(String(50), index=True)
@@ -77,7 +79,8 @@ class ProcessingJob(Base):
     id = Column(Integer, primary_key=True)
     
     # Input
-    file_id = Column(Integer, ForeignKey("cf_file_metadata.id"), nullable=False)
+    # file_id = Column(Integer, ForeignKey("cf_file_metadata.id"), nullable=False)
+    file_id = Column(Integer, ForeignKey(FileMetadata.id), nullable=False)
     plugin_name = Column(String(100), nullable=False)
     plugin_config = Column(Text, nullable=True) 
 
