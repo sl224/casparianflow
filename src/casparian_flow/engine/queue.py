@@ -33,9 +33,8 @@ class JobQueue:
         sql = """
         WITH cte AS (
             SELECT TOP(1) *
-            FROM cf_processing_queue WITH (ROWLOCK, READPAST, UPDLOCK)
+            FROM casp.cf_processing_queue WITH (ROWLOCK, READPAST, UPDLOCK)
             WHERE status = :pending_status
-              AND (required_env IS NULL OR required_env = :my_env) -- The Filter
             ORDER BY priority DESC, id ASC
         )
         UPDATE cte
@@ -43,7 +42,6 @@ class JobQueue:
             status = :running_status,
             worker_host = :host,
             worker_pid = :pid,
-            worker_version = :my_env,
             claim_time = SYSDATETIME()
         OUTPUT inserted.id;
         """ 
@@ -56,7 +54,6 @@ class JobQueue:
                         "running_status": StatusEnum.RUNNING.name,
                         "host": self.hostname,
                         "pid": self.pid,
-                        "my_env": my_env
                     }
                 ).scalar()
                 
@@ -104,7 +101,7 @@ class JobQueue:
                  sink_type: str,
                  sink_config: Dict[str, Any],
                  priority: int = 0, 
-                 plugin_config: Dict[str, Any] = None):
+                ):
         """
         Registers a new job into the queue (Used by The Scout).
         """
@@ -112,9 +109,7 @@ class JobQueue:
             new_job = ProcessingJob(
                 file_id=file_id,
                 plugin_name=plugin_name,
-                plugin_config=json.dumps(plugin_config) if plugin_config else None,
                 sink_type=sink_type,
-                sink_config=json.dumps(sink_config),
                 status=StatusEnum.QUEUED,
                 priority=priority
             )
