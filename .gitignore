@@ -31,3 +31,5 @@ tests/static_assets/
 
 # DB
 *.sqlite*
+
+global_config.toml

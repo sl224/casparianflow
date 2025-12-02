@@ -14,7 +14,7 @@ SELECT @sql += N'ALTER TABLE '
 FROM sys.foreign_keys AS fk
 INNER JOIN sys.tables AS t ON fk.parent_object_id = t.object_id
 INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-WHERE s.name = 'casparian_flow';
+WHERE s.name = 'casp';
 
 -- Print and execute the DROP CONSTRAINT statements
 PRINT @sql;
@@ -29,7 +29,7 @@ SELECT @sql += N'DROP TABLE '
     + N';' + CHAR(13)
 FROM sys.tables AS t
 INNER JOIN sys.schemas AS s ON t.schema_id = s.schema_id
-WHERE s.name = 'casparian_flow';
+WHERE s.name = 'casp';
 
 -- Print and execute the DROP TABLE statements
 PRINT @sql;
