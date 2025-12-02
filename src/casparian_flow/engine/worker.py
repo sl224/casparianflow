@@ -11,14 +11,16 @@ from casparian_flow.plugins.loader import PluginRegistry
 from casparian_flow.engine.context import WorkerContext
 from casparian_flow.db.models import FileMetadata
 from typing import Dict
-
+from casparian_flow.db import access as sql_io
 logger = logging.getLogger(__name__)
+
+from casparian_flow.config import settings
 
 class CasparianWorker:
     def __init__(self, config: Dict):
         # 1. Setup Infrastructure
-        self.db_url = config["database"]["connection_string"]
-        self.engine = create_engine(self.db_url, pool_size=10, pool_pre_ping=True)
+        # self.db_url = config["database"]["connection_string"]
+        self.engine = sql_io.get_engine(settings.database)
         
         # 2. Setup Storage Roots
         self.parquet_root = Path(config.get("storage", {}).get("parquet_root", "data/parquet"))

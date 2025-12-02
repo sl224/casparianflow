@@ -14,12 +14,15 @@ class BadParameter(ValueError):
 # from sqlalchemy import create_engine
 # from sqlalchemy.engine import URL
 
-def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False):
+def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False, pool_size=10, pool_pre_ping=True):
     """
     Creates and returns a SQLAlchemy engine based on the loaded pydantic settings.
     Supports both Windows Auth (Trusted) and SQL Auth (User/Pass).
     """
     engine_args = {"echo": echo}
+    engine_args["pool_size"] = pool_size
+    engine_args["pool_pre_ping"] = pool_pre_ping
+
     url_object = None
 
     match db_settings.type:

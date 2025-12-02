@@ -77,14 +77,11 @@ class ProcessingJob(Base):
     id = Column(Integer, primary_key=True)
     
     # Input
-    # file_id = Column(Integer, ForeignKey("cf_file_metadata.id"), nullable=False)
     file_id = Column(Integer, ForeignKey(FileMetadata.id), nullable=False)
     plugin_name = Column(String(100), nullable=False)
-    plugin_config = Column(Text, nullable=True) 
 
     # Output (Sink Pattern)
     sink_type = Column(String(50), nullable=False) 
-    sink_config = Column(Text, nullable=True) 
 
     # State
     status = Column(Enum(StatusEnum), default=StatusEnum.PENDING, index=True)
