@@ -10,6 +10,7 @@ from casparian_flow.engine.queue import JobQueue
 from casparian_flow.plugins.loader import PluginRegistry
 from casparian_flow.engine.context import WorkerContext
 from casparian_flow.db.models import FileMetadata
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ class CasparianWorker:
         
         while self.active:
             # Atomic Pop
-            job = self.queue.pop_job()
+            job = self.queue.pop_job('test_signature')
             
             if not job:
                 time.sleep(1)

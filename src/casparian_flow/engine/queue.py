@@ -22,7 +22,7 @@ class JobQueue:
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
 
-    def pop_job(self, my_env_signature: str) -> Optional[ProcessingJob]:
+    def pop_job(self, my_env: str) -> Optional[ProcessingJob]:
         """
         Pop a job, respecting Environment requirements.
         """
@@ -55,7 +55,8 @@ class JobQueue:
                         "pending_status": StatusEnum.QUEUED.name,
                         "running_status": StatusEnum.RUNNING.name,
                         "host": self.hostname,
-                        "pid": self.pid
+                        "pid": self.pid,
+                        "my_env": my_env
                     }
                 ).scalar()
                 
