@@ -11,24 +11,47 @@ class BadParameter(ValueError):
     pass
 
 
+# from sqlalchemy import create_engine
+# from sqlalchemy.engine import URL
+
 def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False):
     """
     Creates and returns a SQLAlchemy engine based on the loaded pydantic settings.
+    Supports both Windows Auth (Trusted) and SQL Auth (User/Pass).
     """
     engine_args = {"echo": echo}
     url_object = None
 
     match db_settings.type:
         case "mssql":
+            # 1. Base query parameters always require the driver
+            query_params = {"driver": db_settings.driver}
+            
+            # 2. Determine Authentication Method
+            # Check if trusted_connection is explicitly "yes" (Windows behavior)
+            is_trusted = str(getattr(db_settings, "trusted_connection", "no")).lower() == "yes"
+
+            if is_trusted:
+                # Windows Authentication
+                query_params["trusted_connection"] = "yes"
+                db_user = None
+                db_pass = None
+            else:
+                # SQL Authentication (Mac/Linux)
+                # Ensure we DO NOT pass 'trusted_connection' in query params here
+                db_user = db_settings.username
+                db_pass = db_settings.password
+
+            # 3. Create URL Object
             url_object = URL.create(
                 drivername="mssql+pyodbc",
+                username=db_user,      # SQL Alchemy handles None gracefully here
+                password=db_pass,      # SQL Alchemy handles None gracefully here
                 host=db_settings.server_name,
                 database=db_settings.db_name,
-                query={
-                    "driver": db_settings.driver,
-                    "trusted_connection": db_settings.trusted_connection,
-                },
+                query=query_params,
             )
+            
             engine_args["fast_executemany"] = fast_executemany
 
         case "sqlite3":
@@ -39,7 +62,7 @@ def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False):
 
         case _:
             raise ValueError(
-                "Pydantic should have thrown an error for unsupported DB types"
+                f"Unsupported DB type: {db_settings.type}"
             )
 
     if url_object is None:

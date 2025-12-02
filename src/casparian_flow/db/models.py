@@ -4,10 +4,10 @@ from sqlalchemy import (
     Column, Integer, String, ForeignKey, DateTime, Enum, 
     Index, VARBINARY, Text, func
 )
-from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.mssql import DATETIME2
 
-from casparian_flow.db.base_session import Base
+from casparian_flow.db.base_session import Base, DEFAULT_SCHEMA
 
 class StatusEnum(PyEnum):
     PENDING = "PENDING"
@@ -39,8 +39,6 @@ class FileMetadata(Base):
     id = Column(Integer, primary_key=True)
     root_id = Column(Integer, ForeignKey(SourceRoot.id), nullable=False, index=True)
     hash_id = Column(Integer, ForeignKey(FileHashRegistry.id), nullable=False, index=True)
-    # root_id = Column(Integer, ForeignKey("cf_source_root.id"), nullable=False, index=True)
-    # hash_id = Column(Integer, ForeignKey("cf_hash_registry.id"), nullable=False, index=True)
     relative_path = Column(String(500), nullable=False)
     file_size_bytes = Column(Integer)
     file_type = Column(String(50), index=True)
@@ -107,4 +105,5 @@ class ProcessingJob(Base):
 
     __table_args__ = (
         Index("ix_queue_pop", "status", "priority", "id"),
+        {'schema': DEFAULT_SCHEMA}
     )
