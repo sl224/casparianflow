@@ -13,85 +13,79 @@ class WorkerContext:
     def __init__(self, 
                  sql_engine: Engine, 
                  parquet_root: Path, 
-                 topic_map: Dict[str, str] = None, 
+                 topic_config: Dict[str, Any] = None, 
                  inspect_mode: bool = False):
         
         self.sql_engine = sql_engine
         self.parquet_root = parquet_root
+        self.topic_config = topic_config or {} 
         
-        # The Map from UI: {"sales": "mssql://prod/Sales"}
-        self.topic_map = topic_map or {} 
-        
-        self.sinks: List[DataSink] = []
+        self.sinks: List[Dict[str, Any]] = []
         self.topic_names: List[str] = []
         
-        # Inspection State
         self.inspect_mode = inspect_mode
         self.rows_processed = 0
-        self.INSPECT_LIMIT = 50 # Stop after 50 rows to be safe
+        self.INSPECT_LIMIT = 50 
         self.captured_schemas: Dict[str, Any] = {} 
 
     def register_topic(self, topic: str, default_uri: str = None) -> int:
-        """
-        Resolves a logical topic to a physical URI.
-        """
         self.topic_names.append(topic)
 
-        # 1. UI Mapping (Priority)
-        uri = self.topic_map.get(topic)
-        
-        # 2. Code Default / Fallback
+        # 1. Get Config
+        t_conf = self.topic_config.get(topic, {})
+        uri = t_conf.get("uri")
         if not uri:
             uri = default_uri or f"parquet://{topic}.parquet"
 
-        # Create Sink
+        # 2. Create Physical Sink
         sink = SinkFactory.create(uri, self.sql_engine, self.parquet_root)
-        self.sinks.append(sink)
+        
+        # 3. Store sink + validation rules
+        self.sinks.append({
+            "sink": sink,
+            "mode": t_conf.get("validation_mode", "infer"), # 'strict' or 'infer'
+            "schema": t_conf.get("schema", None)
+        })
         
         return len(self.sinks) - 1
 
     def publish(self, handle: int, data: Any):
-        """
-        Dispatches data. Intercepts for Inspection if needed.
-        """
+        channel = self.sinks[handle]
+
+        # Scenario A: Inspection Mode (The "Interrupt")
         if self.inspect_mode:
             self._handle_inspection(handle, data)
             return
 
-        try:
-            self.sinks[handle].write(data)
-        except IndexError:
-            raise ValueError(f"Invalid topic handle: {handle}")
+        # Scenario B: Strict Enforcement
+        if channel["mode"] == "strict" and channel["schema"]:
+            self._validate_schema(data, channel["schema"])
+
+        # Write
+        channel["sink"].write(data)
 
     def _handle_inspection(self, handle: int, data: Any):
-        """
-        Captures schema and halts execution.
-        """
         topic_name = self.topic_names[handle]
-
-        # Capture Schema if we haven't already for this topic
         if topic_name not in self.captured_schemas:
             schema_info = {}
-            
-            # Prefer Arrow Schema
-            if hasattr(data, "schema"):
-                # Convert Arrow schema to simple JSON-able dict
+            if hasattr(data, "schema"): # Arrow
                 schema_info = {n: str(t) for n, t in zip(data.schema.names, data.schema.types)}
-            
-            # Fallback to Pandas dtypes
-            elif hasattr(data, "dtypes"):
+            elif hasattr(data, "dtypes"): # Pandas
                 schema_info = data.dtypes.astype(str).to_dict()
-                
             self.captured_schemas[topic_name] = schema_info
 
-        # Count rows to enforce limit
         count = len(data) if hasattr(data, "__len__") else 1
         self.rows_processed += count
         
         if self.rows_processed >= self.INSPECT_LIMIT:
             raise InspectionInterrupt("Inspection limit reached.")
 
+    def _validate_schema(self, data, required_schema):
+        # TODO: Implement actual validation logic here
+        # raising ValueError("Schema Mismatch") if columns fail
+        pass
+
     def close_all(self):
         for s in self.sinks:
-            s.close()
+            s["sink"].close()
         self.sinks.clear()

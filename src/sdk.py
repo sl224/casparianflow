@@ -1,33 +1,44 @@
-# src/casparian_sdk/base.py
+# src/casparian_flow/sdk.py
 from typing import Dict, Any, Optional
-# from casparian_sdk.interface import CaspContext (assuming split package)
 
 class BasePlugin:
     def __init__(self):
-        # User Zone: They can put whatever they want here.
-        # It runs FIRST.
+        """
+        The User's Constructor.
+        The user can override this freely. 
+        They do NOT need to call super().__init__().
+        """
         pass
 
     def configure(self, ctx: Any, config: Dict[str, Any]):
-        # System Zone: The Worker calls this. 
-        # It runs SECOND.
-        # We mark it final/internal by convention (users shouldn't override this).
+        """
+        The System's Constructor.
+        The Worker calls this to inject the infrastructure.
+        User code should never touch this.
+        """
         self._ctx = ctx
         self._config = config
         self._handles: Dict[str, int] = {} 
 
     def publish(self, topic: str, data: Any):
-        # Lazy check to ensure they didn't break the lifecycle
+        # 1. Lifecycle Check: Did the Worker do its job?
         if not hasattr(self, '_ctx') or self._ctx is None:
-             raise RuntimeError("Plugin not configured! Did the Worker call .configure()?")
-        
+             raise RuntimeError(
+                 "Plugin infrastructure not loaded! "
+                 "Ensure you are running this via the Casparian Engine "
+                 "and not just 'python my_script.py'."
+             )
+
+        # 2. Lazy Registration (The "Handshake")
         if topic not in self._handles:
             self._handles[topic] = self._ctx.register_topic(topic)
             
-        # 2. Dispatch
-        handle = self._handles[topic]
-        self._ctx.publish(handle, data)
+        # 3. Dispatch
+        self._ctx.publish(self._handles[topic], data)
 
     @property
     def config(self):
+        # Safety check for config access too
+        if not hasattr(self, '_config'):
+             raise RuntimeError("Config not loaded! Plugin not configured.")
         return self._config
