@@ -20,6 +20,7 @@ dependencies = [
     "pyodbc>=5.0.0",
     "tqdm>=4.67.1",
     "pytest>=9.0.1",
+    "pyarrow>=22.0.0",
 ]
 
 [dependency-groups]

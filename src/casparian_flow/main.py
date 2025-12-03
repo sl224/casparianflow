@@ -37,9 +37,9 @@ if __name__ == "__main__":
         }
         
         # 2. Init DB Tables (Safe to run on startup)
-        eng = sql_io.get_engine(settings.database)
-        initialize_database(eng, reset_tables=True)
-        eng.dispose() # Worker creates its own engine
+        # eng = sql_io.get_engine(settings.database)
+        # initialize_database(eng, reset_tables=True)
+        # eng.dispose() # Worker creates its own engine
 
         # 3. Run Worker
         worker = CasparianWorker(worker_config)

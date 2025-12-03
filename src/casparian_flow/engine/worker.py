@@ -73,13 +73,11 @@ class CasparianWorker:
         
         # 3. Load Plugin
         plugin_cls = self.plugins.get_plugin(job.plugin_name)
-        plugin = plugin_cls()
         
         # 4. Plugin Init (Cold Path - Allocations allowed here)
         # The plugin registers its sinks and gets integer handles back.
         job_config = json.loads(job.plugin_config) if job.plugin_config else {}
-        plugin.init(ctx, job_config)
-
+        plugin = plugin_cls(ctx, job_config)
         try:
             # 5. Plugin Execute (Hot Path - Speed is key)
             # The plugin calls ctx.push(handle, df) internally.
