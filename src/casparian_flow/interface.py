@@ -32,7 +32,7 @@ class CaspContext(Protocol):
 
 @runtime_checkable
 class CaspPlugin(Protocol):
-    def init(self, ctx: CaspContext, config: Dict[str, Any]):
+    def configure(self, ctx: CaspContext, config: Dict[str, Any]):
         """
         Register your topics here.
         Example:
