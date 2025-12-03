@@ -1,7 +1,7 @@
 # src/casparian_flow/interface.py
 from typing import Any, Protocol, runtime_checkable, Dict, Union
 
-# We use Any for data to avoid hard dependencies on Pandas/Arrow in the interface definition
+# Forward reference to avoid hard dependency on pandas/arrow here
 DataFrameLike = Any 
 
 @runtime_checkable
@@ -13,14 +13,7 @@ class CaspContext(Protocol):
     def register_topic(self, topic: str, default_uri: str = None) -> int:
         """
         Declares that this plugin will publish data to a specific logical topic.
-        
-        Args:
-            topic: The logical name of the stream (e.g., "sales", "logs").
-            default_uri: A fallback destination if the UI/Config doesn't provide one.
-                         (e.g., "parquet://scans/sales.parquet")
-                         
-        Returns:
-            int: A handle (index) to use in the publish() loop.
+        Returns a handle (integer) to use for publishing.
         """
         ...
 
@@ -34,17 +27,14 @@ class CaspContext(Protocol):
 class CaspPlugin(Protocol):
     def configure(self, ctx: CaspContext, config: Dict[str, Any]):
         """
-        Register your topics here.
-        Example:
-            self.sales_h = ctx.register_topic("sales")
+        Framework Hook.
+        Called by the Worker immediately after instantiation to inject dependencies.
+        DO NOT override this unless you are building a custom SDK.
         """
         ...
 
     def execute(self, file_path: str):
         """
         Run the processing loop.
-        Example:
-            df = pd.read_csv(file_path)
-            ctx.publish(self.sales_h, df)
         """
         ...
