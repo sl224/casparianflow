@@ -1,53 +1,50 @@
-from typing import Any, Protocol, runtime_checkable, Dict
-from enum import StrEnum
+# src/casparian_flow/interface.py
+from typing import Any, Protocol, runtime_checkable, Dict, Union
 
-class SinkType(StrEnum):
-    MSSQL = "MSSQL"
-    PARQUET = "PARQUET"
-    ICEBERG = "ICEBERG"
-    BLOB = "BLOB"
+# We use Any for data to avoid hard dependencies on Pandas/Arrow in the interface definition
+DataFrameLike = Any 
 
 @runtime_checkable
-class HostContext(Protocol):
+class CaspContext(Protocol):
     """
-    The 'pointer' the Plugin uses to talk to the engine.
-    Implements the Immediate Mode pattern.
+    The runtime context for the Plugin.
+    Implements the Topic-Based Publish Pattern.
     """
-    def register_sink(self, sink_type: str, target: str, options: Dict[str, Any] = None) -> int:
+    def register_topic(self, topic: str, default_uri: str = None) -> int:
         """
-        Call this ONCE in init().
+        Declares that this plugin will publish data to a specific logical topic.
         
         Args:
-            sink_type: "MSSQL", "PARQUET", etc.
-            target: The destination name (Table Name or File Path).
-            options: Configuration (e.g. {"mode": "append", "schema": "analytics"}).
-            
+            topic: The logical name of the stream (e.g., "sales", "logs").
+            default_uri: A fallback destination if the UI/Config doesn't provide one.
+                         (e.g., "parquet://scans/sales.parquet")
+                         
         Returns:
-            int: A handle (index) to use in the push() loop.
+            int: A handle (index) to use in the publish() loop.
         """
         ...
 
-    def push(self, handle: int, data: Any):
+    def publish(self, handle: int, data: DataFrameLike):
         """
-        The Hot Loop call.
-        Dispatches data directly to the pre-resolved sink.
+        Dispatches data to the sink associated with the topic handle.
         """
         ...
 
 @runtime_checkable
-class CasparianPlugin(Protocol):
-    """
-    The implementation contract for your Logic.
-    """
-    def init(self, ctx: HostContext, config: Dict[str, Any]):
+class CaspPlugin(Protocol):
+    def init(self, ctx: CaspContext, config: Dict[str, Any]):
         """
-        Pre-calculate everything here. Resolve handles.
+        Register your topics here.
+        Example:
+            self.sales_h = ctx.register_topic("sales")
         """
         ...
 
     def execute(self, file_path: str):
         """
-        Run the processing loop. 
-        MUST NOT allocate complex objects or do string lookups here.
+        Run the processing loop.
+        Example:
+            df = pd.read_csv(file_path)
+            ctx.publish(self.sales_h, df)
         """
         ...
