@@ -5,7 +5,7 @@ from sqlalchemy import (
     Index, VARBINARY, Text, func
 )
 from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.mssql import DATETIME2
+# from sqlalchemy.dialects.mssql import DATETIME2
 from casparian_flow.db.base_session import Base, DEFAULT_SCHEMA
 
 class StatusEnum(PyEnum):
@@ -16,6 +16,23 @@ class StatusEnum(PyEnum):
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
 
+class RoutingRule(Base):
+    """
+    User-defined rules mapping file patterns to Tags.
+    Managed via UI.
+    """
+    __tablename__ = "cf_routing_rule"
+    id = Column(Integer, primary_key=True)
+    
+    # The Glob Pattern (e.g., "sales/**/*.csv")
+    pattern = Column(String(200), nullable=False)
+    
+    # The Tag to apply (e.g., "finance_data")
+    tag = Column(String(50), nullable=False)
+    
+    # Priority allows overriding (e.g. "exclude_me" rule runs first)
+    priority = Column(Integer, default=0) 
+
 class PluginConfig(Base):
     """
     Persistent configuration for a Plugin.
@@ -23,6 +40,10 @@ class PluginConfig(Base):
     __tablename__ = "cf_plugin_config"
     
     plugin_name = Column(String(100), primary_key=True)
+    
+    # Comma-separated list of tags this plugin subscribes to
+    # e.g., "finance_data, raw_csv"
+    subscription_tags = Column(String(500), default="") 
     
     # Operational toggles (e.g., {"skip_rows": 2})
     default_parameters = Column(Text, nullable=True, default="{}")
@@ -129,6 +150,10 @@ class FileVersion(Base):
     
     # When this version was detected by Scout
     detected_at = Column(DateTime, server_default=func.now())
+
+    # Store the tags applied to this specific version for lineage
+    # Stored as comma-separated string e.g. "finance,csv,region_us"
+    applied_tags = Column(Text, default="")
     
     location = relationship("FileLocation", foreign_keys=[location_id])
     hash_registry = relationship("FileHashRegistry")

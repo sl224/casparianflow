@@ -4,7 +4,7 @@ from typing import Any, Protocol, Dict, Union
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 import pandas as pd
-from sqlalchemy import Engine
+from sqlalchemy import Engine, create_engine
 
 # Graceful degradation if pyarrow is missing
 try:
@@ -59,6 +59,38 @@ class MssqlSink:
     def close(self):
         pass
 
+class SqliteSink:
+    """
+    URI Example: sqlite://database.db/table_name?mode=append
+    Useful for local testing and lightweight deployments.
+    """
+    def __init__(self, db_path: str, table_name: str, options: Dict):
+        # Create a dedicated engine for this sink
+        self.engine = create_engine(f"sqlite:///{db_path}")
+        self.table_name = table_name
+        self.if_exists = options.get("mode", ["append"])[0]
+        self.chunksize = int(options.get("chunksize", [10000])[0])
+
+    def write(self, data: Any):
+        if HAS_ARROW and isinstance(data, (pa.Table, pa.RecordBatch)):
+            data = data.to_pandas()
+            
+        if not isinstance(data, pd.DataFrame):
+            logger.warning(f"SqliteSink expected DataFrame, got {type(data)}")
+            return
+
+        with self.engine.begin() as conn:
+            data.to_sql(
+                name=self.table_name,
+                con=conn,
+                if_exists=self.if_exists,
+                index=False,
+                chunksize=self.chunksize
+            )
+
+    def close(self):
+        self.engine.dispose()
+
 class ParquetSink:
     """
     URI Example: parquet://folder/subfolder?compression=snappy
@@ -94,38 +126,6 @@ class ParquetSink:
         if self.writer:
             self.writer.close()
 
-class SqliteSink:
-    """
-    URI Example: sqlite://database.db/table_name?mode=append
-    For testing and lightweight deployments.
-    """
-    def __init__(self, engine: Engine, db_path: str, table_name: str, options: Dict):
-        self.engine = engine
-        self.table_name = table_name
-        self.if_exists = options.get("mode", ["append"])[0]
-        self.chunksize = int(options.get("chunksize", [10000])[0])
-
-    def write(self, data: Any):
-        # Normalize Arrow -> Pandas for SQLAlchemy compatibility
-        if HAS_ARROW and isinstance(data, (pa.Table, pa.RecordBatch)):
-            data = data.to_pandas()
-            
-        if not isinstance(data, pd.DataFrame):
-            logger.warning(f"SqliteSink expected DataFrame, got {type(data)}")
-            return
-
-        with self.engine.begin() as conn:
-            data.to_sql(
-                name=self.table_name,
-                con=conn,
-                if_exists=self.if_exists,
-                index=False,
-                chunksize=self.chunksize
-            )
-
-    def close(self):
-        pass
-
 class SinkFactory:
     @staticmethod
     def create(uri: str, sql_engine: Engine, parquet_root: Path) -> DataSink:
@@ -134,24 +134,27 @@ class SinkFactory:
         """
         parsed = urlparse(uri)
         scheme = parsed.scheme
-        path = parsed.netloc + parsed.path 
+        
+        # Parse query options
         options = parse_qs(parsed.query)
 
         if scheme == "mssql":
+            # netloc + path usually = schema.table
+            path = parsed.netloc + parsed.path 
             return MssqlSink(sql_engine, path, options)
-        elif scheme == "sqlite":
-            # URI format: sqlite://database.db/table_name
-            # Parse database path and table name
-            parts = path.split("/", 1)
-            db_path = parts[0] if parts else "output.db"
-            table_name = parts[1] if len(parts) > 1 else "output_table"
             
-            # Create SQLite engine if not using the provided one
-            from sqlalchemy import create_engine
-            sqlite_engine = create_engine(f"sqlite:///{db_path}")
-            return SqliteSink(sqlite_engine, db_path, table_name, options)
+        elif scheme == "sqlite":
+            # URI: sqlite://output.db/table_name
+            # netloc: output.db
+            # path: /table_name
+            db_path = parsed.netloc
+            table_name = parsed.path.lstrip("/")
+            return SqliteSink(db_path, table_name, options)
+            
         elif scheme == "parquet":
+            path = parsed.netloc + parsed.path 
             clean_path = path.lstrip("/") 
             return ParquetSink(parquet_root, clean_path, options)
+            
         else:
             raise ValueError(f"Unsupported sink scheme: {scheme}")

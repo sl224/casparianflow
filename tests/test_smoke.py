@@ -1,6 +1,6 @@
 """
 Smoke tests for Casparian Flow end-to-end pipeline.
-Tests file versioning and processing with different sink backends.
+Tests file versioning, tagging, and routing logic.
 """
 import pytest
 import time
@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 from sqlalchemy import create_engine, text
 from casparian_flow.db.models import (
-    FileLocation, FileVersion, ProcessingJob, TopicConfig, SourceRoot
+    FileLocation, FileVersion, ProcessingJob, TopicConfig, SourceRoot, RoutingRule, PluginConfig
 )
 from casparian_flow.services.scout import Scout
 
@@ -28,14 +28,29 @@ def test_end_to_end_pipeline(
     test_plugin_config
 ):
     """
-    Test complete pipeline: Scout → Queue → Worker → Sink
-    Validates file versioning when files are modified.
+    Test complete pipeline: Scout -> Queue -> Worker -> Sink
+    Validates:
+    1. RoutingRules tag the file.
+    2. Plugin subscribes to that tag.
+    3. Job is queued only because of the tag match.
+    4. Versioning works.
     """
     # 1. Create test file
     test_file = temp_test_dir / "data.csv"
     test_file.write_text("col1,col2\n1,2\n3,4")
     
-    # 2. Configure topic
+    # 2. Configure Tagging & Routing
+    # A) Define a Rule: *.csv -> 'raw_csv'
+    rule = RoutingRule(pattern="*.csv", tag="raw_csv", priority=10)
+    test_db_session.add(rule)
+    
+    # B) Update Plugin to subscribe to 'raw_csv'
+    # (test_plugin_config fixture creates the plugin, we just update it)
+    test_plugin_config.subscription_tags = "raw_csv, other_tag"
+    test_db_session.add(test_plugin_config)
+    test_db_session.commit()
+    
+    # 3. Configure topic
     topic = TopicConfig(
         plugin_name="test_plugin",
         topic_name="test",
@@ -45,12 +60,12 @@ def test_end_to_end_pipeline(
     test_db_session.add(topic)
     test_db_session.commit()
     
-    # 3. Run Scout (first scan)
+    # 4. Run Scout (first scan)
     scout = Scout(test_db_session)
     root = test_db_session.query(SourceRoot).get(test_source_root)
     scout.scan_source(root)
     
-    # 4. Verify initial state
+    # 5. Verify initial state
     locations = test_db_session.query(FileLocation).all()
     versions = test_db_session.query(FileVersion).all()
     jobs = test_db_session.query(ProcessingJob).all()
@@ -62,17 +77,20 @@ def test_end_to_end_pipeline(
     version1 = versions[0]
     job1 = jobs[0]
     
+    # Verify Tags
+    assert "raw_csv" in version1.applied_tags, f"Expected 'raw_csv' tag, got {version1.applied_tags}"
+    
     assert job1.file_version_id == version1.id
     assert job1.plugin_name == "test_plugin"
     
-    # 5. Modify file (test versioning)
+    # 6. Modify file (test versioning)
     time.sleep(0.1)  # Ensure different timestamp
     test_file.write_text("col1,col2\n5,6\n7,8\n9,10")
     
-    # 6. Run Scout again
+    # 7. Run Scout again
     scout.scan_source(root)
     
-    # 7. Verify version tracking
+    # 8. Verify version tracking
     locations = test_db_session.query(FileLocation).all()
     versions = test_db_session.query(FileVersion).order_by(FileVersion.detected_at).all()
     jobs = test_db_session.query(ProcessingJob).order_by(ProcessingJob.id).all()
@@ -90,11 +108,48 @@ def test_end_to_end_pipeline(
 
 
 @pytest.mark.smoke
+def test_no_routing_match(temp_test_dir, test_db_engine, test_db_session, test_source_root, test_plugin_config):
+    """Test that jobs are NOT queued if tags don't match."""
+    # 1. Create a file
+    test_file = temp_test_dir / "skip_me.txt"
+    test_file.write_text("ignore")
+    
+    # 2. Rule: *.txt -> 'text_file'
+    rule = RoutingRule(pattern="*.txt", tag="text_file")
+    test_db_session.add(rule)
+    
+    # 3. Plugin subscribes to 'raw_csv' ONLY
+    test_plugin_config.subscription_tags = "raw_csv"
+    test_db_session.add(test_plugin_config)
+    test_db_session.commit()
+    
+    # 4. Scout
+    scout = Scout(test_db_session)
+    root = test_db_session.query(SourceRoot).get(test_source_root)
+    scout.scan_source(root)
+    
+    # 5. Verify
+    jobs = test_db_session.query(ProcessingJob).all()
+    versions = test_db_session.query(FileVersion).all()
+    
+    assert len(versions) == 1
+    assert "text_file" in versions[0].applied_tags
+    assert len(jobs) == 0, "Should not queue job because plugin does not subscribe to 'text_file'"
+
+
+@pytest.mark.smoke
 def test_parquet_output_verification(temp_test_dir, test_db_engine, test_db_session, test_source_root, test_plugin_config):
     """Test that parquet output is created and readable."""
     from casparian_flow.engine.worker import CasparianWorker
     from casparian_flow.engine.config import WorkerConfig, DatabaseConfig
     
+    # Setup Routing
+    rule = RoutingRule(pattern="*.csv", tag="test_tag")
+    test_db_session.add(rule)
+    test_plugin_config.subscription_tags = "test_tag"
+    test_db_session.add(test_plugin_config)
+    test_db_session.commit()
+
     # Create test file
     test_file = temp_test_dir / "data.csv"
     test_file.write_text("col1,col2\n1,2\n3,4")
@@ -143,6 +198,13 @@ def test_sqlite_output_verification(temp_test_dir, test_db_engine, test_db_sessi
     """Test that SQLite output is created and queryable."""
     from casparian_flow.engine.worker import CasparianWorker
     
+    # Setup Routing
+    rule = RoutingRule(pattern="*.csv", tag="test_tag")
+    test_db_session.add(rule)
+    test_plugin_config.subscription_tags = "test_tag"
+    test_db_session.add(test_plugin_config)
+    test_db_session.commit()
+
     # Create test file
     test_file = temp_test_dir / "data.csv"
     test_file.write_text("col1,col2\n1,2\n3,4")
@@ -202,6 +264,13 @@ def test_sqlite_output_verification(temp_test_dir, test_db_engine, test_db_sessi
 @pytest.mark.smoke
 def test_version_lineage_query(temp_test_dir, test_db_engine, test_db_session, test_source_root, test_plugin_config):
     """Test that we can query version lineage correctly."""
+    # Setup Routing
+    rule = RoutingRule(pattern="*.csv", tag="lineage_tag")
+    test_db_session.add(rule)
+    test_plugin_config.subscription_tags = "lineage_tag"
+    test_db_session.add(test_plugin_config)
+    test_db_session.commit()
+
     # Create and modify file
     test_file = temp_test_dir / "lineage_test.csv"
     test_file.write_text("a,b\n1,2")
@@ -237,6 +306,7 @@ def test_version_lineage_query(temp_test_dir, test_db_engine, test_db_session, t
         assert version is not None, f"Version not found for job {job.id}"
         assert location is not None, f"Location not found for version {version.id}"
         assert location.rel_path == "lineage_test.csv"
+        assert "lineage_tag" in version.applied_tags
         
         # Verify job 0 has original hash
         if i == 0:
