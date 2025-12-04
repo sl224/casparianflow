@@ -18,23 +18,15 @@ if __name__ == "__main__":
     
     # 1. Initialize DB Connection
     try:
-        # We need the connection string from settings
-        # (Assuming settings.database has a connection_string property or we build it)
-        # For now, we reuse the existing get_engine logic implicitly inside the Worker?
-        # Actually, the Worker expects a 'config' dict. Let's provide it.
+        from casparian_flow.engine.config import WorkerConfig, DatabaseConfig
         
-        # Build a config dict that the Worker expects
-        worker_config = {
-            "database": {
-                "connection_string": str(sql_io.get_engine(settings.database).url) 
-            },
-            "storage": {
-                "parquet_root": "data/parquet"
-            },
-            "plugins": {
-                "dir": "src/casparian_flow/plugins" # Make sure this exists!
-            }
-        }
+        # Build typed configuration
+        worker_config = WorkerConfig(
+            database=DatabaseConfig(
+                connection_string=str(sql_io.get_engine(settings.database).url)
+            )
+            # storage and plugins use defaults from WorkerConfig
+        )
         
         # 2. Init DB Tables (Safe to run on startup)
         # eng = sql_io.get_engine(settings.database)

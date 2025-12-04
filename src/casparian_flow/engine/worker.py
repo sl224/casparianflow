@@ -4,24 +4,24 @@ import json
 import logging
 import traceback
 from pathlib import Path
-from typing import Dict
 from sqlalchemy.orm import Session
 
 from casparian_flow.engine.queue import JobQueue
 from casparian_flow.plugins.loader import PluginRegistry
 from casparian_flow.engine.context import WorkerContext, InspectionInterrupt
-from casparian_flow.db.models import FileMetadata, PluginConfig
+from casparian_flow.engine.config import WorkerConfig
+from casparian_flow.db.models import FileVersion, FileLocation, PluginConfig, TopicConfig
 from casparian_flow.db import access as sql_io
 from casparian_flow.config import settings
 
 logger = logging.getLogger(__name__)
 
 class CasparianWorker:
-    def __init__(self, config: Dict):
+    def __init__(self, config: WorkerConfig):
         self.engine = sql_io.get_engine(settings.database)
-        self.parquet_root = Path(config.get("storage", {}).get("parquet_root", "data/parquet"))
+        self.parquet_root = config.storage.parquet_root
         self.queue = JobQueue(self.engine)
-        self.plugins = PluginRegistry(Path(config["plugins"]["dir"]))
+        self.plugins = PluginRegistry(config.plugins.dir)
         self.plugins.discover()
         self.active = True
 
@@ -45,7 +45,7 @@ class CasparianWorker:
                 self.queue.fail_job(job.id, error=str(e) + "\n" + traceback.format_exc())
 
     def _execute_job(self, job):
-        full_path = self._resolve_file_path(job.file_id)
+        full_path = self._resolve_file_path(job.file_version_id)
         
         # 1. Fetch Persistent Config & Params
         topic_config = {}
@@ -54,8 +54,16 @@ class CasparianWorker:
         with Session(self.engine) as session:
             p_conf = session.get(PluginConfig, job.plugin_name)
             if p_conf:
-                topic_config = json.loads(p_conf.topic_config)
                 plugin_params = json.loads(p_conf.default_parameters)
+                
+                # Query TopicConfig table for this plugin
+                topics = session.query(TopicConfig).filter_by(plugin_name=job.plugin_name).all()
+                for topic in topics:
+                    topic_config[topic.topic_name] = {
+                        "uri": topic.uri,
+                        "mode": topic.mode,
+                        "schema": json.loads(topic.schema_json) if topic.schema_json else None
+                    }
 
         # 2. Check for Job-Specific Overrides (e.g. "Inspect Mode")
         # The job table might contain overrides in a column, or we can use 'result_summary' 
@@ -92,9 +100,16 @@ class CasparianWorker:
         finally:
             ctx.close_all()
 
-    def _resolve_file_path(self, file_id):
+    def _resolve_file_path(self, file_version_id):
+        """Resolve the full file path from a FileVersion ID."""
         with Session(self.engine) as session:
-            fmeta = session.get(FileMetadata, file_id)
-            if not fmeta:
-                raise ValueError(f"FileMetadata {file_id} not found!")
-            return Path(fmeta.source_root.path) / fmeta.rel_path
+            # Navigate FileVersion -> FileLocation -> SourceRoot
+            file_version = session.get(FileVersion, file_version_id)
+            if not file_version:
+                raise ValueError(f"FileVersion {file_version_id} not found!")
+            
+            file_location = session.get(FileLocation, file_version.location_id)
+            if not file_location:
+                raise ValueError(f"FileLocation {file_version.location_id} not found!")
+            
+            return Path(file_location.source_root.path) / file_location.rel_path

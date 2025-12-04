@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from sqlalchemy.orm import Session
-from casparian_flow.db.models import FileMetadata, FileHashRegistry, ProcessingJob, SourceRoot, StatusEnum
+from casparian_flow.db.models import FileLocation, FileVersion, FileHashRegistry, ProcessingJob, SourceRoot, StatusEnum
 from casparian_flow.services.fs_engine import ParallelFileScanner
 from casparian_flow.db.base_session import SessionLocal
 
@@ -51,12 +51,17 @@ class Scout:
         self.db.commit()
 
     def _register_file(self, filepath: Path, source_root: SourceRoot):
+        """
+        Register a file using the versioning scheme.
+        Creates immutable FileVersion records instead of updating in place.
+        """
         # 1. Calculate Hash
         content_hash = calculate_file_hash(filepath)
         if not content_hash:
             return
 
         stat = filepath.stat()
+        rel_path = str(filepath.relative_to(source_root.path))
         
         # 2. Register Hash (Deduplication)
         hash_entry = self.db.query(FileHashRegistry).filter_by(content_hash=content_hash).first()
@@ -66,74 +71,94 @@ class Scout:
                 size_bytes=stat.st_size
             )
             self.db.add(hash_entry)
-            self.db.flush() # Ensure it's available for FK
+            self.db.flush()
 
-        # 3. Register/Update FileMetadata
-        rel_path = str(filepath.relative_to(source_root.path))
-        
-        file_meta = self.db.query(FileMetadata).filter_by(
+        # 3. Get or Create FileLocation (The Container)
+        location = self.db.query(FileLocation).filter_by(
             source_root_id=source_root.id,
             rel_path=rel_path
         ).first()
 
-        is_new_content = False
-
-        if not file_meta:
-            file_meta = FileMetadata(
+        if not location:
+            location = FileLocation(
                 source_root_id=source_root.id,
                 rel_path=rel_path,
-                filename=filepath.name,
-                size_bytes=stat.st_size,
-                modified_time=datetime.fromtimestamp(stat.st_mtime),
-                content_hash=content_hash
+                filename=filepath.name
             )
-            self.db.add(file_meta)
-            is_new_content = True
+            self.db.add(location)
+            self.db.flush()
+            logger.debug(f"Created new FileLocation for {rel_path}")
+
+        # 4. Check Current Version
+        current_version = None
+        if location.current_version_id:
+            current_version = self.db.query(FileVersion).get(location.current_version_id)
+
+        # 5. Detect Change (new file or content changed)
+        needs_new_version = False
+        if not current_version:
+            needs_new_version = True
+            logger.debug(f"New file detected: {rel_path}")
+        elif current_version.content_hash != content_hash:
+            needs_new_version = True
+            logger.info(f"File content changed: {rel_path} (old hash: {current_version.content_hash[:8]}..., new hash: {content_hash[:8]}...)")
+
+        # 6. Create New Version if needed
+        if needs_new_version:
+            new_version = FileVersion(
+                location_id=location.id,
+                content_hash=content_hash,
+                size_bytes=stat.st_size,
+                modified_time=datetime.fromtimestamp(stat.st_mtime)
+            )
+            self.db.add(new_version)
+            self.db.flush()
+
+            # Update pointer to latest version
+            location.current_version_id = new_version.id
+            location.last_seen_time = datetime.now()
+
+            # Queue job for this SPECIFIC version
+            self._queue_job(new_version)
         else:
-            # Check if content changed
-            if file_meta.content_hash != content_hash:
-                file_meta.content_hash = content_hash
-                file_meta.size_bytes = stat.st_size
-                file_meta.modified_time = datetime.fromtimestamp(stat.st_mtime)
-                is_new_content = True
-            
-            file_meta.last_seen_time = datetime.now()
+            # Same content, just update last_seen
+            location.last_seen_time = datetime.now()
 
-        self.db.flush()
-
-        # 4. Queue Job if new content
-        if is_new_content:
-            self._queue_job(file_meta)
-
-    def _queue_job(self, file_meta: FileMetadata):
-        # For now, we queue for ALL plugins that are "wired" (or just a default one for now)
-        # The user said "Push new files to ProcessingJob table"
-        # We need a plugin name. Let's assume a default or look up configuration.
-        # For the smoke test, we might need a dummy plugin.
-        
-        # Let's check if there are any PluginConfigs.
-        # If not, we might skip or log.
-        # For now, I'll query all PluginConfigs and create a job for each.
-        
-        # If no plugins configured, maybe we can't queue?
-        # The user said "Refine Wiring: Currently, plugins might default to .parquet files."
-        
-        # I'll fetch all active plugins from PluginConfig.
+    def _queue_job(self, file_version: FileVersion):
+        """
+        Queue processing jobs for a specific file version.
+        Jobs link to the immutable version, not the mutable location.
+        """
         from casparian_flow.db.models import PluginConfig
         plugins = self.db.query(PluginConfig).all()
         
         if not plugins:
-            logger.warning(f"No plugins configured. File {file_meta.filename} registered but not queued.")
+            logger.warning(f"No plugins configured. File version {file_version.id} registered but not queued.")
             return
 
         for plugin in plugins:
             job = ProcessingJob(
-                file_id=file_meta.id,
+                file_version_id=file_version.id,
                 plugin_name=plugin.plugin_name,
                 status=StatusEnum.QUEUED
             )
             self.db.add(job)
-            logger.info(f"Queued job for {file_meta.filename} -> {plugin.plugin_name}")
+            
+            # Get filename from location for logging
+            location = self.db.query(FileLocation).get(file_version.location_id)
+            logger.info(f"Queued job for {location.filename} (version {file_version.id}) -> {plugin.plugin_name}")
+
+if __name__ == "__main__":
+    # Standalone run for testing
+    logging.basicConfig(level=logging.INFO)
+    db = SessionLocal()
+    scout = Scout(db)
+    
+    # Example usage:
+    # root = db.query(SourceRoot).first()
+    # if root:
+    #     scout.scan_source(root)
+
 
 if __name__ == "__main__":
     # Standalone run for testing
