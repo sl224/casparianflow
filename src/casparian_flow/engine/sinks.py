@@ -94,6 +94,38 @@ class ParquetSink:
         if self.writer:
             self.writer.close()
 
+class SqliteSink:
+    """
+    URI Example: sqlite://database.db/table_name?mode=append
+    For testing and lightweight deployments.
+    """
+    def __init__(self, engine: Engine, db_path: str, table_name: str, options: Dict):
+        self.engine = engine
+        self.table_name = table_name
+        self.if_exists = options.get("mode", ["append"])[0]
+        self.chunksize = int(options.get("chunksize", [10000])[0])
+
+    def write(self, data: Any):
+        # Normalize Arrow -> Pandas for SQLAlchemy compatibility
+        if HAS_ARROW and isinstance(data, (pa.Table, pa.RecordBatch)):
+            data = data.to_pandas()
+            
+        if not isinstance(data, pd.DataFrame):
+            logger.warning(f"SqliteSink expected DataFrame, got {type(data)}")
+            return
+
+        with self.engine.begin() as conn:
+            data.to_sql(
+                name=self.table_name,
+                con=conn,
+                if_exists=self.if_exists,
+                index=False,
+                chunksize=self.chunksize
+            )
+
+    def close(self):
+        pass
+
 class SinkFactory:
     @staticmethod
     def create(uri: str, sql_engine: Engine, parquet_root: Path) -> DataSink:
@@ -107,6 +139,17 @@ class SinkFactory:
 
         if scheme == "mssql":
             return MssqlSink(sql_engine, path, options)
+        elif scheme == "sqlite":
+            # URI format: sqlite://database.db/table_name
+            # Parse database path and table name
+            parts = path.split("/", 1)
+            db_path = parts[0] if parts else "output.db"
+            table_name = parts[1] if len(parts) > 1 else "output_table"
+            
+            # Create SQLite engine if not using the provided one
+            from sqlalchemy import create_engine
+            sqlite_engine = create_engine(f"sqlite:///{db_path}")
+            return SqliteSink(sqlite_engine, db_path, table_name, options)
         elif scheme == "parquet":
             clean_path = path.lstrip("/") 
             return ParquetSink(parquet_root, clean_path, options)

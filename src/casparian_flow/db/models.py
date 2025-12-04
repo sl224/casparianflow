@@ -5,7 +5,7 @@ from sqlalchemy import (
     Index, VARBINARY, Text, func
 )
 from sqlalchemy.orm import relationship
-# from sqlalchemy.dialects.mssql import DATETIME2
+from sqlalchemy.dialects.mssql import DATETIME2
 from casparian_flow.db.base_session import Base, DEFAULT_SCHEMA
 
 class StatusEnum(PyEnum):
@@ -19,52 +19,44 @@ class StatusEnum(PyEnum):
 class PluginConfig(Base):
     """
     Persistent configuration for a Plugin.
-    Defines the 'Wiring' of topics to physical URIs.
     """
     __tablename__ = "cf_plugin_config"
     
     plugin_name = Column(String(100), primary_key=True)
     
-    # Stores the wiring map: 
-    # {"sales": {"uri": "mssql://...", "mode": "strict", "schema": {...}}}
-    topic_config = Column(Text, nullable=False, default="{}") 
-    
     # Operational toggles (e.g., {"skip_rows": 2})
     default_parameters = Column(Text, nullable=True, default="{}")
     
     last_updated = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    
+    # Relationship to topics
+    topics = relationship("TopicConfig", back_populates="plugin", cascade="all, delete-orphan")
 
-class ProcessingJob(Base):
-    __tablename__ = "cf_processing_queue"
-
+class TopicConfig(Base):
+    """
+    Configuration for a plugin's output topic/sink.
+    Defines where and how data should be written.
+    """
+    __tablename__ = "cf_topic_config"
+    
     id = Column(Integer, primary_key=True)
-    file_id = Column(Integer, ForeignKey("cf_file_metadata.id"), nullable=False)
+    plugin_name = Column(String(100), ForeignKey("cf_plugin_config.plugin_name"), nullable=False)
+    topic_name = Column(String(100), nullable=False)
     
-    # Link to the Config table
-    plugin_name = Column(String(100), ForeignKey(PluginConfig.plugin_name), nullable=False)
-
-    status = Column(Enum(StatusEnum), default=StatusEnum.PENDING, index=True)
-    priority = Column(Integer, default=0, index=True)
+    # Sink configuration
+    uri = Column(String(500), nullable=False)  # "parquet://./output", "mssql://table"
+    mode = Column(String(50), default="append")  # "append", "strict", "infer"
     
-    worker_host = Column(String(100), nullable=True)
-    worker_pid = Column(Integer, nullable=True)
-    claim_time = Column(DateTime, nullable=True)
-    end_time = Column(DateTime, nullable=True)
+    # Optional schema validation (JSON for complex schemas)
+    schema_json = Column(Text, nullable=True)
     
-    result_summary = Column(Text, nullable=True) 
-    error_message = Column(Text, nullable=True)
-    retry_count = Column(Integer, default=0)
-
-    file = relationship("FileMetadata")
-
+    # Relationship back to plugin
+    plugin = relationship("PluginConfig", back_populates="topics")
+    
     __table_args__ = (
-        Index("ix_queue_pop", "status", "priority", "id"),
+        Index("ix_topic_lookup", "plugin_name", "topic_name"),
         {'schema': DEFAULT_SCHEMA}
     )
-
-# ... (Keep FileMetadata, FileHashRegistry, SourceRoot, WorkerNode as they were) ...
-# Note: Ensure you import FileMetadata etc. if you split this file, 
-# or keep them in the same file as you had before.
 
 class SourceRoot(Base):
     """
@@ -90,33 +82,92 @@ class FileHashRegistry(Base):
     first_seen = Column(DateTime, server_default=func.now())
     size_bytes = Column(Integer, nullable=False)
 
-class FileMetadata(Base):
+class FileLocation(Base):
     """
-    Represents a physical file found by the Scout.
+    Represents the persistent path/existence of a file.
+    The container that holds different versions of content over time.
     """
-    __tablename__ = "cf_file_metadata"
-
-    id = Column(Integer, primary_key=True)
+    __tablename__ = "cf_file_location"
     
+    id = Column(Integer, primary_key=True)
     source_root_id = Column(Integer, ForeignKey("cf_source_root.id"), nullable=False)
     
     # Relative path from the source root
     rel_path = Column(String(1000), nullable=False)
     filename = Column(String(255), nullable=False)
     
-    # Physical attributes
-    size_bytes = Column(Integer, nullable=False)
-    modified_time = Column(DateTime, nullable=False)
-    
-    # Content Identity
-    content_hash = Column(String(64), ForeignKey("cf_file_hash_registry.content_hash"), nullable=True)
+    # Pointer to the current/latest version
+    current_version_id = Column(Integer, ForeignKey("cf_file_version.id"), nullable=True)
     
     # Tracking
     discovered_time = Column(DateTime, server_default=func.now())
     last_seen_time = Column(DateTime, server_default=func.now())
-
+    
     source_root = relationship("SourceRoot")
+    
+    __table_args__ = (
+        Index("ix_file_location_lookup", "source_root_id", "rel_path"),
+        {'schema': DEFAULT_SCHEMA}
+    )
+
+class FileVersion(Base):
+    """
+    Immutable record of a file's state at a point in time.
+    Each file modification creates a new version.
+    """
+    __tablename__ = "cf_file_version"
+    
+    id = Column(Integer, primary_key=True)
+    location_id = Column(Integer, ForeignKey("cf_file_location.id"), nullable=False)
+    
+    # Content Identity
+    content_hash = Column(String(64), ForeignKey("cf_file_hash_registry.content_hash"), nullable=False)
+    
+    # Physical attributes at time of detection
+    size_bytes = Column(Integer, nullable=False)
+    modified_time = Column(DateTime, nullable=False)
+    
+    # When this version was detected by Scout
+    detected_at = Column(DateTime, server_default=func.now())
+    
+    location = relationship("FileLocation", foreign_keys=[location_id])
     hash_registry = relationship("FileHashRegistry")
+    
+    __table_args__ = (
+        Index("ix_file_version_lookup", "location_id", "content_hash"),
+        {'schema': DEFAULT_SCHEMA}
+    )
+
+class ProcessingJob(Base):
+    __tablename__ = "cf_processing_queue"
+
+    id = Column(Integer, primary_key=True)
+    
+    # Link to the SPECIFIC VERSION processed, not the mutable location
+    # This freezes history: Job 101 processed Version 5 forever
+    file_version_id = Column(Integer, ForeignKey("cf_file_version.id"), nullable=False)
+    
+    # Link to the Config table
+    plugin_name = Column(String(100), ForeignKey(PluginConfig.plugin_name), nullable=False)
+
+    status = Column(Enum(StatusEnum), default=StatusEnum.PENDING, index=True)
+    priority = Column(Integer, default=0, index=True)
+    
+    worker_host = Column(String(100), nullable=True)
+    worker_pid = Column(Integer, nullable=True)
+    claim_time = Column(DateTime, nullable=True)
+    end_time = Column(DateTime, nullable=True)
+    
+    result_summary = Column(Text, nullable=True) 
+    error_message = Column(Text, nullable=True)
+    retry_count = Column(Integer, default=0)
+
+    file_version = relationship("FileVersion")
+
+    __table_args__ = (
+        Index("ix_queue_pop", "status", "priority", "id"),
+        {'schema': DEFAULT_SCHEMA}
+    )
 
 class WorkerNode(Base):
     """
@@ -126,6 +177,9 @@ class WorkerNode(Base):
     
     hostname = Column(String(100), primary_key=True)
     pid = Column(Integer, primary_key=True)
+    
+    ip_address = Column(String(50), nullable=True)
+    env_signature = Column(String(100), nullable=True)
     
     started_at = Column(DateTime, server_default=func.now())
     last_heartbeat = Column(DateTime, server_default=func.now())
