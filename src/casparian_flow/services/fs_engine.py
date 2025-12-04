@@ -1,105 +1,96 @@
+# src/casparian_flow/services/fs_engine.py
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, List, TypeVar, Any, Dict
-from tqdm import tqdm
+from typing import Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
-T = TypeVar("T")
-
 class ParallelFileScanner:
     """
-    High-Performance Filesystem Walker.
+    Decoupled Producer-Consumer Scanner.
     
-    Architecture:
-    - Uses a single ThreadPoolExecutor for both Traversal (IO) and Processing (CPU/IO).
-    - Dynamic Work Injection: Discovering a directory immediately schedules a new scan task.
-    - Backpressure: Implicitly managed by the ThreadPoolExecutor's queue.
+    - Producer: Walks directories using a thread pool.
+    - Output: Yields Paths via a generator.
+    
+    This ensures that slow I/O or DB operations in the consumer (Scout)
+    do not block the traversal logic.
     """
 
-    def __init__(self, max_workers: int = 64):
+    def __init__(self, max_workers: int = 16):
         self.max_workers = max_workers
+        self.queue = queue.Queue(maxsize=10000) # Backpressure limit
+        self._sentinel = object()
 
-    def walk(
-        self,
-        root_path: Path,
-        filter_func: Callable[[os.DirEntry], bool],
-        action_func: Callable[[Path], T],
-    ) -> List[T]:
+    def walk(self, root_path: Path, filter_func: Callable[[os.DirEntry], bool]) -> Iterator[Path]:
         """
-        Recursively scans root_path.
+        Generator that yields paths as they are discovered.
         """
-        futures: Dict[Any, str] = {}
-        results: List[T] = []
+        # Start the background walker thread
+        walker_thread = threading.Thread(
+            target=self._run_walker, 
+            args=(root_path, filter_func)
+        )
+        walker_thread.start()
+
+        # Yield items from the queue until Sentinel is found
+        while True:
+            item = self.queue.get()
+            if item is self._sentinel:
+                break
+            yield item
+            
+        walker_thread.join()
+
+    def _run_walker(self, root: Path, filter_func: Callable):
+        """
+        Orchestrates the directory walk using a ThreadPool.
+        """
+        pending_dirs = {str(root)}
+        active_futures = set()
         
-        dirs_scanned = 0
-        files_found = 0
-
-        logger.info(f"Starting parallel scan of {root_path} ({self.max_workers} workers)")
-
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Bootstrapping
-            root_future = executor.submit(self._scan_dir, str(root_path), filter_func)
-            futures[root_future] = "SCAN"
+            # Bootstrap
+            active_futures.add(executor.submit(self._scan_dir, str(root), filter_func))
+            
+            while active_futures:
+                # Wait for any future to complete (busy wait loop with sleep is simple/robust here)
+                # Ideally use as_completed, but we need to submit NEW tasks dynamically
+                done_futures = []
+                for f in list(active_futures):
+                    if f.done():
+                        done_futures.append(f)
+                
+                if not done_futures:
+                    import time
+                    time.sleep(0.01)
+                    continue
+                
+                for f in done_futures:
+                    active_futures.remove(f)
+                    try:
+                        subdirs, files = f.result()
+                        
+                        # 1. Enqueue Files for Consumption
+                        for file_path in files:
+                            self.queue.put(Path(file_path))
+                            
+                        # 2. Schedule Subdirectories
+                        for d in subdirs:
+                            active_futures.add(executor.submit(self._scan_dir, d, filter_func))
+                            
+                    except Exception as e:
+                        logger.error(f"Scan error: {e}")
 
-            # Initialize TQDM with 1 known directory (root)
-            with tqdm(total=1, desc="Scanning Directories", unit="dir") as pbar:
-                while futures:
-                    # Wait for at least one task to finish
-                    done, _ = wait(futures.keys(), return_when=FIRST_COMPLETED)
+        # Signal completion
+        self.queue.put(self._sentinel)
 
-                    for f in done:
-                        task_type = futures.pop(f)
-
-                        try:
-                            if task_type == "SCAN":
-                                dirs_scanned += 1
-                                subdirs, matching_files = f.result()
-
-                                # 1. Dynamic Total Adjustment
-                                if subdirs:
-                                    pbar.total += len(subdirs)
-                                    pbar.refresh() # Force redraw to show correct %
-
-                                # 2. Fan-Out: Schedule Subdirectories
-                                for d in subdirs:
-                                    nf = executor.submit(self._scan_dir, d, filter_func)
-                                    futures[nf] = "SCAN"
-
-                                # 3. Schedule Actions
-                                for p in matching_files:
-                                    files_found += 1
-                                    nf = executor.submit(action_func, Path(p))
-                                    futures[nf] = "ACTION"
-                                
-                                # Update Progress
-                                pbar.update(1)
-                                pbar.set_postfix(files=files_found)
-
-                            elif task_type == "ACTION":
-                                res = f.result()
-                                if res is not None:
-                                    results.append(res)
-
-                        except Exception as e:
-                            logger.error(f"Task failed: {e}")
-                            # Ensure progress bar doesn't stall on error
-                            if task_type == "SCAN":
-                                pbar.update(1)
-
-        logger.info(f"Scan complete. Scanned {dirs_scanned} dirs, processed {len(results)} files.")
-        return results
-
-    def _scan_dir(self, path: str, filter_func: Callable[[os.DirEntry], bool]):
-        """
-        Unit of Work: Scans a single directory.
-        Returns: (list_of_subdir_paths, list_of_file_paths)
-        """
+    def _scan_dir(self, path: str, filter_func: Callable):
         subdirs = []
         files = []
-
         try:
             with os.scandir(path) as it:
                 for entry in it:
@@ -108,8 +99,7 @@ class ParallelFileScanner:
                     elif entry.is_file(follow_symlinks=False):
                         if filter_func(entry):
                             files.append(entry.path)
-                            
         except (PermissionError, OSError) as e:
-            logger.debug(f"Access denied or error: {path} [{e}]")
-
+            logger.debug(f"Access denied: {path}")
+            
         return subdirs, files

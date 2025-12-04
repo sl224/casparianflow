@@ -1,39 +1,30 @@
+# src/casparian_flow/engine/queue.py
 import logging
 import socket
 import os
-import json
 from datetime import datetime
 from typing import Optional, Dict, Any
 from sqlalchemy import text, Engine
 from sqlalchemy.orm import Session
-
-# Note: This imports the NEW model structure.
-# You must complete the Phase 1 Model Refactor for this to import correctly.
 from casparian_flow.db.models import ProcessingJob, StatusEnum
 
 logger = logging.getLogger(__name__)
 
 class JobQueue:
-    """
-    MSSQL-backed Distributed Job Queue using atomic Skip-Locked pattern.
-    """
     def __init__(self, engine: Engine):
         self.engine = engine
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
 
     def pop_job(self, my_env: str) -> Optional[ProcessingJob]:
-        """
-        Pop a job, respecting Environment requirements.
-        """
         if self.engine.dialect.name == "sqlite":
             return self._pop_job_sqlite()
         else:
             return self._pop_job_mssql()
 
     def _pop_job_sqlite(self) -> Optional[ProcessingJob]:
+        # Lock-free pop for SQLite (Dev/Test only)
         with Session(self.engine) as session:
-            # Simple lock-free pop for SQLite (single worker assumed or race conditions accepted for dev)
             job = session.query(ProcessingJob).filter(
                 ProcessingJob.status == StatusEnum.QUEUED
             ).order_by(ProcessingJob.priority.desc(), ProcessingJob.id.asc()).first()
@@ -50,6 +41,7 @@ class JobQueue:
         return None
 
     def _pop_job_mssql(self) -> Optional[ProcessingJob]:
+        # Optimized: Single Round-Trip Atomic Pop
         sql = """
         WITH cte AS (
             SELECT TOP(1) *
@@ -63,11 +55,12 @@ class JobQueue:
             worker_host = :host,
             worker_pid = :pid,
             claim_time = SYSDATETIME()
-        OUTPUT inserted.id;
+        OUTPUT inserted.*; 
         """ 
         try:
             with self.engine.begin() as conn:
-                result = conn.execute(
+                # Returns the full row as a Row object
+                row = conn.execute(
                     text(sql),
                     {
                         "pending_status": StatusEnum.QUEUED.name,
@@ -75,10 +68,22 @@ class JobQueue:
                         "host": self.hostname,
                         "pid": self.pid,
                     }
-                ).scalar()
+                ).fetchone()
                 
-                if result:
-                    return self._fetch_job_orm(result)
+                if row:
+                    # Manually construct object to avoid ORM overhead/round-trip
+                    # Note: We map the row dictionary to the Model attributes
+                    job_data = row._mapping
+                    return ProcessingJob(
+                        id=job_data['id'],
+                        file_version_id=job_data['file_version_id'],
+                        plugin_name=job_data['plugin_name'],
+                        status=StatusEnum(job_data['status']),
+                        priority=job_data['priority'],
+                        worker_host=job_data['worker_host'],
+                        worker_pid=job_data['worker_pid'],
+                        claim_time=job_data['claim_time']
+                    )
                     
         except Exception as e:
             logger.error(f"Queue Pop Failed: {e}")
@@ -86,15 +91,7 @@ class JobQueue:
             
         return None
 
-    def _fetch_job_orm(self, job_id: int) -> ProcessingJob:
-        """Helper to get the full job object after locking."""
-        with Session(self.engine) as session:
-            job = session.get(ProcessingJob, job_id)
-            session.expunge(job) # Detach so it can be used outside this short session
-            return job
-
     def complete_job(self, job_id: int, summary: str = None):
-        """Marks a job as COMPLETED."""
         with Session(self.engine) as session:
             job = session.get(ProcessingJob, job_id)
             if job:
@@ -105,7 +102,6 @@ class JobQueue:
                 logger.info(f"Job {job_id} marked COMPLETED.")
 
     def fail_job(self, job_id: int, error: str):
-        """Marks a job as FAILED with error message."""
         with Session(self.engine) as session:
             job = session.get(ProcessingJob, job_id)
             if job:
@@ -115,21 +111,11 @@ class JobQueue:
                 session.commit()
                 logger.error(f"Job {job_id} marked FAILED.")
 
-    def push_job(self, 
-                 file_id: int, 
-                 plugin_name: str, 
-                 sink_type: str,
-                 sink_config: Dict[str, Any],
-                 priority: int = 0, 
-                ):
-        """
-        Registers a new job into the queue (Used by The Scout).
-        """
+    def push_job(self, file_id: int, plugin_name: str, priority: int = 0):
         with Session(self.engine) as session:
             new_job = ProcessingJob(
-                file_id=file_id,
+                file_version_id=file_id,
                 plugin_name=plugin_name,
-                sink_type=sink_type,
                 status=StatusEnum.QUEUED,
                 priority=priority
             )
