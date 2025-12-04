@@ -66,9 +66,6 @@ class Scout:
             if path_obj.match(rule.pattern):
                 tags.add(rule.tag)
         
-        # Always add extension as a default tag? Optional, but useful.
-        # tags.add(path_obj.suffix.lstrip("."))
-        
         return ",".join(sorted(list(tags)))
 
     def _register_file(self, filepath: Path, source_root: SourceRoot):
@@ -113,7 +110,7 @@ class Scout:
         # 4. Check Current Version
         current_version = None
         if location.current_version_id:
-            current_version = self.db.query(FileVersion).get(location.current_version_id)
+            current_version = self.db.get(FileVersion, location.current_version_id)
 
         # 5. Detect Change (new file or content changed)
         needs_new_version = False
@@ -122,7 +119,7 @@ class Scout:
             logger.debug(f"New file detected: {rel_path}")
         elif current_version.content_hash != content_hash:
             needs_new_version = True
-            logger.info(f"File content changed: {rel_path} (old hash: {current_version.content_hash[:8]}..., new hash: {content_hash[:8]}...)")
+            logger.info(f"File content changed: {rel_path}")
 
         # 6. Create New Version if needed
         if needs_new_version:
@@ -168,13 +165,11 @@ class Scout:
 
         queued_count = 0
         for plugin in plugins:
-            # Parse plugin subscriptions
             if not plugin.subscription_tags:
                 continue
                 
             sub_tags = set([t.strip() for t in plugin.subscription_tags.split(",")])
             
-            # Intersection: If file has tag 'A' and plugin wants 'A', match!
             if file_tags.intersection(sub_tags):
                 job = ProcessingJob(
                     file_version_id=file_version.id,
@@ -185,14 +180,13 @@ class Scout:
                 queued_count += 1
                 
                 # Get filename from location for logging
-                location = self.db.query(FileLocation).get(file_version.location_id)
-                logger.info(f"Queued job for {location.filename} -> {plugin.plugin_name} (Tags: {tags_str} matched {plugin.subscription_tags})")
+                location = self.db.get(FileLocation, file_version.location_id)
+                logger.info(f"Queued job for {location.filename} -> {plugin.plugin_name} (Tags match)")
 
         if queued_count == 0:
             logger.debug(f"No plugins matched tags {tags_str} for version {file_version.id}")
 
 if __name__ == "__main__":
-    # Standalone run for testing
     logging.basicConfig(level=logging.INFO)
     db = SessionLocal()
     scout = Scout(db)
