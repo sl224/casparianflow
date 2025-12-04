@@ -26,10 +26,30 @@ class JobQueue:
         """
         Pop a job, respecting Environment requirements.
         """
-        # Logic:
-        # 1. Job has NO requirement (NULL) -> Anyone can take it.
-        # 2. Job has requirement -> Must match my_env_signature.
-        
+        if self.engine.dialect.name == "sqlite":
+            return self._pop_job_sqlite()
+        else:
+            return self._pop_job_mssql()
+
+    def _pop_job_sqlite(self) -> Optional[ProcessingJob]:
+        with Session(self.engine) as session:
+            # Simple lock-free pop for SQLite (single worker assumed or race conditions accepted for dev)
+            job = session.query(ProcessingJob).filter(
+                ProcessingJob.status == StatusEnum.QUEUED
+            ).order_by(ProcessingJob.priority.desc(), ProcessingJob.id.asc()).first()
+            
+            if job:
+                job.status = StatusEnum.RUNNING
+                job.worker_host = self.hostname
+                job.worker_pid = self.pid
+                job.claim_time = datetime.now()
+                session.commit()
+                session.refresh(job)
+                session.expunge(job)
+                return job
+        return None
+
+    def _pop_job_mssql(self) -> Optional[ProcessingJob]:
         sql = """
         WITH cte AS (
             SELECT TOP(1) *

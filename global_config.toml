@@ -1,0 +1,7 @@
+[logging]
+level = "INFO"
+
+[database]
+type = "sqlite3"
+db_location = "casparian_flow.sqlite3"
+in_memory = false

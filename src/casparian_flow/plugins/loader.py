@@ -3,14 +3,14 @@ import logging
 import sys
 from pathlib import Path
 from typing import Dict, Type, Any
-from casparian_flow.interface import CasparianPlugin
+from casparian_flow.interface import CaspPlugin
 
 logger = logging.getLogger(__name__)
 
 class PluginRegistry:
     def __init__(self, plugin_dir: Path):
         self.plugin_dir = plugin_dir
-        self._cache: Dict[str, Type[CasparianPlugin]] = {}
+        self._cache: Dict[str, Type[CaspPlugin]] = {}
 
     def discover(self):
         """
@@ -52,7 +52,7 @@ class PluginRegistry:
             except Exception as e:
                 logger.error(f"Failed to load plugin {module_name}: {e}", exc_info=True)
 
-    def get_plugin(self, name: str) -> Type[CasparianPlugin]:
+    def get_plugin(self, name: str) -> Type[CaspPlugin]:
         if name not in self._cache:
             # Auto-reload attempt? Or just fail.
             raise ValueError(f"Plugin '{name}' not found. loaded: {list(self._cache.keys())}")

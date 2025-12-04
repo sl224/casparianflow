@@ -4,6 +4,7 @@ import json
 import logging
 import traceback
 from pathlib import Path
+from typing import Dict
 from sqlalchemy.orm import Session
 
 from casparian_flow.engine.queue import JobQueue
@@ -96,4 +97,4 @@ class CasparianWorker:
             fmeta = session.get(FileMetadata, file_id)
             if not fmeta:
                 raise ValueError(f"FileMetadata {file_id} not found!")
-            return Path(fmeta.root.path) / fmeta.relative_path
+            return Path(fmeta.source_root.path) / fmeta.rel_path
