@@ -5,6 +5,7 @@ import logging
 import traceback
 from pathlib import Path
 from sqlalchemy.orm import Session
+from sqlalchemy import create_engine
 
 from casparian_flow.engine.queue import JobQueue
 from casparian_flow.plugins.loader import PluginRegistry
@@ -18,7 +19,12 @@ logger = logging.getLogger(__name__)
 
 class CasparianWorker:
     def __init__(self, config: WorkerConfig):
-        self.engine = sql_io.get_engine(settings.database)
+        # FIX: Use the connection string from config if provided, else fallback to settings
+        if config.database and config.database.connection_string:
+            self.engine = create_engine(config.database.connection_string)
+        else:
+            self.engine = sql_io.get_engine(settings.database)
+            
         self.parquet_root = config.storage.parquet_root
         self.queue = JobQueue(self.engine)
         self.plugins = PluginRegistry(config.plugins.dir)
@@ -66,9 +72,6 @@ class CasparianWorker:
                     }
 
         # 2. Check for Job-Specific Overrides (e.g. "Inspect Mode")
-        # The job table might contain overrides in a column, or we can use 'result_summary' 
-        # or a temp column to flag 'inspection'. Assuming job.priority or similar implies it for now,
-        # or we add a 'mode' column to ProcessingJob later.
         # For MVP, let's assume if plugin_params has "mode": "inspect", we inspect.
         is_inspection = plugin_params.get("mode") == "inspect"
 

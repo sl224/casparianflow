@@ -1,7 +1,7 @@
 """
 Worker configuration models.
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from pathlib import Path
 
 
@@ -34,6 +34,4 @@ class WorkerConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     plugins: PluginsConfig = Field(default_factory=PluginsConfig)
     
-    class Config:
-        """Pydantic config."""
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
