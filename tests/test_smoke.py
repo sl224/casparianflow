@@ -4,6 +4,7 @@ Tests file versioning, tagging, and routing logic.
 """
 import pytest
 import time
+import shutil
 from pathlib import Path
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -120,6 +121,10 @@ def test_parquet_output_verification(temp_test_dir, test_db_engine, test_db_sess
     from casparian_flow.engine.worker import CasparianWorker
     from casparian_flow.engine.config import WorkerConfig, DatabaseConfig
     
+    # Cleanup previous run
+    if Path("data/parquet/test_parquet_output").exists():
+        shutil.rmtree("data/parquet/test_parquet_output")
+
     rule = RoutingRule(pattern="*.csv", tag="test_tag")
     test_db_session.add(rule)
     test_plugin_config.subscription_tags = "test_tag"
@@ -158,8 +163,12 @@ def test_parquet_output_verification(temp_test_dir, test_db_engine, test_db_sess
     output_path = Path("data/parquet/test_parquet_output")
     assert output_path.exists()
     
+    # ParquetSink now creates a directory. Read contents.
     df = pd.read_parquet(output_path)
     assert len(df) > 0
+    # Check for lineage injection
+    assert "_job_id" in df.columns
+    assert "_file_version_id" in df.columns
 
 
 @pytest.mark.smoke
@@ -178,6 +187,9 @@ def test_sqlite_output_verification(temp_test_dir, test_db_engine, test_db_sessi
     test_file.write_text("col1,col2\n1,2\n3,4")
     
     sqlite_db = "test_sink_output.db"
+    if Path(sqlite_db).exists():
+        Path(sqlite_db).unlink()
+
     topic = TopicConfig(
         plugin_name="test_plugin",
         topic_name="test",
@@ -211,8 +223,16 @@ def test_sqlite_output_verification(temp_test_dir, test_db_engine, test_db_sessi
         result = conn.execute(text("SELECT COUNT(*) FROM test_results"))
         count = result.scalar()
         assert count > 0
+        
+        # Verify Lineage injection
+        cols = conn.execute(text("PRAGMA table_info(test_results)")).fetchall()
+        col_names = [c[1] for c in cols]
+        assert "_job_id" in col_names
+        assert "_file_version_id" in col_names
     
-    sqlite_path.unlink()
+    verify_engine.dispose()
+    if sqlite_path.exists():
+        sqlite_path.unlink()
 
 
 @pytest.mark.smoke

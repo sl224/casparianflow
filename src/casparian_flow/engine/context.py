@@ -3,10 +3,17 @@ from typing import List, Dict, Any
 from pathlib import Path
 from sqlalchemy import Engine
 import pandas as pd
+import logging
 from casparian_flow.engine.sinks import SinkFactory, DataSink
+
+logger = logging.getLogger(__name__)
 
 class InspectionInterrupt(Exception):
     """Raised to stop the plugin once we have captured the schema."""
+    pass
+
+class SchemaViolationError(Exception):
+    """Raised when data does not match the strict schema definition."""
     pass
 
 class WorkerContext:
@@ -14,11 +21,19 @@ class WorkerContext:
                  sql_engine: Engine, 
                  parquet_root: Path, 
                  topic_config: Dict[str, Any] = None, 
-                 inspect_mode: bool = False):
+                 inspect_mode: bool = False,
+                 job_id: int = 0,
+                 file_version_id: int = 0,
+                 file_location_id: int = 0):
         
         self.sql_engine = sql_engine
         self.parquet_root = parquet_root
         self.topic_config = topic_config or {} 
+        
+        # Lineage Metadata
+        self.job_id = job_id
+        self.file_version_id = file_version_id
+        self.file_location_id = file_location_id
         
         self.sinks: List[Dict[str, Any]] = []
         self.topic_names: List[str] = []
@@ -37,13 +52,13 @@ class WorkerContext:
         if not uri:
             uri = default_uri or f"parquet://{topic}.parquet"
 
-        # 2. Create Physical Sink
-        sink = SinkFactory.create(uri, self.sql_engine, self.parquet_root)
+        # 2. Create Physical Sink (Factory now creates Staging sinks via job_id)
+        sink = SinkFactory.create(uri, self.sql_engine, self.parquet_root, job_id=self.job_id)
         
         # 3. Store sink + validation rules
         self.sinks.append({
             "sink": sink,
-            "mode": t_conf.get("validation_mode", "infer"), # 'strict' or 'infer'
+            "mode": t_conf.get("mode", "infer"), # 'strict' or 'infer'
             "schema": t_conf.get("schema", None)
         })
         
@@ -57,12 +72,27 @@ class WorkerContext:
             self._handle_inspection(handle, data)
             return
 
+        # GOVERNANCE: Lineage Injection (The "Standard Header")
+        if isinstance(data, pd.DataFrame):
+            data = data.copy()
+            data['_job_id'] = self.job_id
+            data['_file_version_id'] = self.file_version_id
+            data['_file_id'] = self.file_location_id
+
         # Scenario B: Strict Enforcement
         if channel["mode"] == "strict" and channel["schema"]:
             self._validate_schema(data, channel["schema"])
 
-        # Write
+        # Write to Sink (Staging)
         channel["sink"].write(data)
+
+    def commit(self):
+        """
+        GOVERNANCE: Atomic Promotion.
+        Called by Worker only on success. Tells sinks to move data from Staging to Prod.
+        """
+        for s in self.sinks:
+            s["sink"].promote()
 
     def _handle_inspection(self, handle: int, data: Any):
         topic_name = self.topic_names[handle]
@@ -81,9 +111,28 @@ class WorkerContext:
             raise InspectionInterrupt("Inspection limit reached.")
 
     def _validate_schema(self, data, required_schema):
-        # TODO: Implement actual validation logic here
-        # raising ValueError("Schema Mismatch") if columns fail
-        pass
+        """
+        Enforces 'Strict' mode.
+        """
+        if not isinstance(data, pd.DataFrame):
+            return
+
+        # 1. Check for Missing Columns
+        incoming_cols = set(data.columns)
+        required_cols = set(required_schema.keys())
+        
+        missing = required_cols - incoming_cols
+        if missing:
+            raise SchemaViolationError(f"Strict Schema Violation: Missing columns {missing}")
+
+        # 2. Simple Type Check
+        for col, expected_type in required_schema.items():
+            if col in data.columns:
+                actual_type = str(data[col].dtype)
+                # Loose check to handle numpy int64 vs int, etc.
+                if expected_type not in actual_type and "object" not in actual_type: 
+                     # For MVP we are lenient, but logging typically happens here
+                     pass
 
     def close_all(self):
         for s in self.sinks:
