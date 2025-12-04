@@ -18,7 +18,11 @@ def initialize_database(eng: sa.Engine, reset_tables: bool = False):
     and optionally resets all tables.
     """
     # 1. Schema Creation (MSSQL-specific)
-    if settings.database.type == "mssql" and DEFAULT_SCHEMA:
+    if settings.database.type == "mssql":
+        # FIX: Hardcode or read from config, don't rely on deleted constant if possible
+        # Or ensure DEFAULT_SCHEMA is in base_session.py
+        DEFAULT_SCHEMA = "casparian_core" 
+
         logger.info(f"Ensuring MSSQL schema '{DEFAULT_SCHEMA}' exists...")
         with eng.connect() as conn:
             if not conn.dialect.has_schema(conn, DEFAULT_SCHEMA):

@@ -51,7 +51,8 @@ class CasparianWorker:
                 self.queue.fail_job(job.id, error=str(e) + "\n" + traceback.format_exc())
 
     def _execute_job(self, job):
-        full_path = self._resolve_file_path(job.file_version_id)
+        # Resolve path and IDs for Lineage
+        full_path, location_id = self._resolve_file_details(job.file_version_id)
         
         # 1. Fetch Persistent Config & Params
         topic_config = {}
@@ -75,12 +76,15 @@ class CasparianWorker:
         # For MVP, let's assume if plugin_params has "mode": "inspect", we inspect.
         is_inspection = plugin_params.get("mode") == "inspect"
 
-        # 3. Init Context
+        # 3. Init Context with Lineage Info
         ctx = WorkerContext(
-            self.engine, 
-            self.parquet_root, 
+            sql_engine=self.engine, 
+            parquet_root=self.parquet_root, 
             topic_config=topic_config,
-            inspect_mode=is_inspection
+            inspect_mode=is_inspection,
+            job_id=job.id,
+            file_version_id=job.file_version_id,
+            file_location_id=location_id
         )
         
         # 4. Load & Configure Plugin
@@ -96,6 +100,10 @@ class CasparianWorker:
             # If we finish execution in inspection mode without interrupt (small file)
             if is_inspection:
                 self.queue.complete_job(job.id, summary=json.dumps(ctx.captured_schemas))
+            else:
+                # GOVERNANCE: Atomic Promotion (Blue/Green Deployment)
+                # Only commit (swap staging -> prod) if execution succeeded
+                ctx.commit()
                 
         except InspectionInterrupt:
             logger.info(f"Inspection Halt for Job {job.id}")
@@ -103,8 +111,8 @@ class CasparianWorker:
         finally:
             ctx.close_all()
 
-    def _resolve_file_path(self, file_version_id):
-        """Resolve the full file path from a FileVersion ID."""
+    def _resolve_file_details(self, file_version_id):
+        """Resolve the full file path and location ID from a FileVersion ID."""
         with Session(self.engine) as session:
             # Navigate FileVersion -> FileLocation -> SourceRoot
             file_version = session.get(FileVersion, file_version_id)
@@ -115,4 +123,4 @@ class CasparianWorker:
             if not file_location:
                 raise ValueError(f"FileLocation {file_version.location_id} not found!")
             
-            return Path(file_location.source_root.path) / file_location.rel_path
+            return Path(file_location.source_root.path) / file_location.rel_path, file_location.id
