@@ -51,11 +51,11 @@ class MSSQLConfig(BaseModel):
     server_name: str = "YOUR_SERVER_NAME"
     db_name: str = "YOUR_DATABASE_NAME"
     driver: str = "{ODBC Driver 17 for SQL Server}"
-    trusted_connection: str = "no" 
-    
+    trusted_connection: str = "no"
+
     # New fields (Optional, because Windows users won't need them)
     username: Optional[str] = None
-    password: Optional[str] = None   
+    password: Optional[str] = None
 
 
 # A type that can be any of the supported database configurations.
