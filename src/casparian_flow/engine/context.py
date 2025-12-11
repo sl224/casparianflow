@@ -44,6 +44,15 @@ class WorkerContext:
         self.captured_schemas: Dict[str, Any] = {} 
 
     def register_topic(self, topic: str, default_uri: str = None) -> int:
+        # SECURITY: Validate topic name to prevent SQL injection
+        import re
+        TOPIC_PATTERN = re.compile(r'^[a-zA-Z][a-zA-Z0-9_]{0,99}$')
+        if not TOPIC_PATTERN.match(topic):
+            raise ValueError(
+                f"Invalid topic name '{topic}'. Must be alphanumeric, "
+                "start with letter, max 100 chars."
+            )
+        
         self.topic_names.append(topic)
 
         # 1. Get Config
