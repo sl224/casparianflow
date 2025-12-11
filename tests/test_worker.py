@@ -68,7 +68,7 @@ class TestWorker:
         worker.plugins._cache["test_plugin"] = CrashingPlugin
 
         # 4. Run Execution Manually
-        popped_job = worker.queue.pop_job("test_worker")
+        popped_job = worker.queue.pop_job()
         assert popped_job is not None
         
         # Execute - Simulate the Worker's run loop exception handling

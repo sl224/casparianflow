@@ -91,6 +91,42 @@ def test_end_to_end_pipeline(
 
 
 @pytest.mark.smoke
+def test_qos_priority_assignment(temp_test_dir, test_db_engine, test_db_session, test_source_root, test_plugin_config):
+    """Test that recently modified files get higher priority (QoS)."""
+    # Create a new file (should be <24h old -> priority 100)
+    test_file = temp_test_dir / "recent.csv"
+    test_file.write_text("col1,col2\n1,2")
+    
+    # Configure routing
+    rule = RoutingRule(pattern="*.csv", tag="csv_tag", priority=10)
+    test_db_session.add(rule)
+    
+    test_plugin_config.subscription_tags = "csv_tag"
+    test_db_session.add(test_plugin_config)
+    test_db_session.commit()
+    
+    topic = TopicConfig(
+        plugin_name="test_plugin",
+        topic_name="test",
+        uri="parquet://./test_qos_output",
+        mode="append"
+    )
+    test_db_session.add(topic)
+    test_db_session.commit()
+    
+    # Run Scout
+    scout = Scout(test_db_session)
+    root = test_db_session.get(SourceRoot, test_source_root)
+    scout.scan_source(root)
+    
+    # Verify high priority was assigned
+    job = test_db_session.query(ProcessingJob).first()
+    assert job is not None
+    # Files modified <24h ago should get priority 100
+    assert job.priority == 100, f"Expected priority 100 for recent file, got {job.priority}"
+
+
+@pytest.mark.smoke
 def test_no_routing_match(temp_test_dir, test_db_engine, test_db_session, test_source_root, test_plugin_config):
     """Test that jobs are NOT queued if tags don't match."""
     test_file = temp_test_dir / "skip_me.txt"
@@ -122,8 +158,12 @@ def test_parquet_output_verification(temp_test_dir, test_db_engine, test_db_sess
     from casparian_flow.engine.config import WorkerConfig, DatabaseConfig
     
     # Cleanup previous run
-    if Path("data/parquet/test_parquet_output").exists():
-        shutil.rmtree("data/parquet/test_parquet_output")
+    parquet_cleanup_path = Path("data/parquet/test_parquet_output")
+    if parquet_cleanup_path.exists():
+        if parquet_cleanup_path.is_dir():
+            shutil.rmtree(parquet_cleanup_path)
+        else:
+            parquet_cleanup_path.unlink()
 
     rule = RoutingRule(pattern="*.csv", tag="test_tag")
     test_db_session.add(rule)
@@ -154,7 +194,7 @@ def test_parquet_output_verification(temp_test_dir, test_db_engine, test_db_sess
     
     worker = CasparianWorker(worker_config)
     
-    job = worker.queue.pop_job('test_signature')
+    job = worker.queue.pop_job()
     assert job is not None, "No job found in queue"
     
     worker._execute_job(job)
@@ -209,7 +249,7 @@ def test_sqlite_output_verification(temp_test_dir, test_db_engine, test_db_sessi
     
     worker = CasparianWorker(worker_config)
     
-    job = worker.queue.pop_job('test_signature')
+    job = worker.queue.pop_job()
     assert job is not None, "No job found in queue"
     
     worker._execute_job(job)

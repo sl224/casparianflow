@@ -16,7 +16,7 @@ class JobQueue:
         self.hostname = socket.gethostname()
         self.pid = os.getpid()
 
-    def pop_job(self, my_env: str) -> Optional[ProcessingJob]:
+    def pop_job(self) -> Optional[ProcessingJob]:
         if self.engine.dialect.name == "sqlite":
             return self._pop_job_sqlite()
         else:
