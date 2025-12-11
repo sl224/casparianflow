@@ -1,10 +1,11 @@
 # src/casparian_flow/services/scout.py
 import hashlib
 import logging
+import time
 from pathlib import Path, PurePath
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select, insert, text
@@ -16,19 +17,35 @@ from casparian_flow.services.fs_engine import ParallelFileScanner
 
 logger = logging.getLogger(__name__)
 
-def calculate_hash_and_stat(filepath: Path) -> Tuple[Path, str, int, float, str]:
+# Configurable stability delay for detecting files in transit
+STABILITY_DELAY_SECONDS = 0.1
+
+
+def calculate_hash_and_stat(filepath: Path) -> Optional[Tuple[Path, str, int, float, str]]:
     """
     Worker function. Returns (original_path_obj, hash, size, mtime, filename_str).
-    Returns None if file cannot be read.
+    Returns None if file cannot be read or is still being written.
+    
+    CRITICAL FIX: Implements stability check to detect files in transit.
+    If a file's mtime or size changes between two checks, it's being written.
     """
     try:
-        stat = filepath.stat()
+        # Stability check: compare stat twice to detect in-transit files
+        stat1 = filepath.stat()
+        time.sleep(STABILITY_DELAY_SECONDS)
+        stat2 = filepath.stat()
+        
+        if stat1.st_mtime != stat2.st_mtime or stat1.st_size != stat2.st_size:
+            logger.debug(f"Skipping in-transit file: {filepath}")
+            return None
+        
+        # File is stable, proceed with hashing
         hasher = hashlib.sha256()
         # Use a larger buffer (64KB) for faster network reads
         with open(filepath, "rb") as f:
             while chunk := f.read(65536): 
                 hasher.update(chunk)
-        return (filepath, hasher.hexdigest(), stat.st_size, stat.st_mtime, filepath.name)
+        return (filepath, hasher.hexdigest(), stat2.st_size, stat2.st_mtime, filepath.name)
     except Exception as e:
         logger.warning(f"Skipping {filepath}: {e}")
         return None

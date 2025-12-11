@@ -28,6 +28,9 @@ class ParallelFileScanner:
     def walk(self, root_path: Path, filter_func: Callable[[os.DirEntry], bool]) -> Iterator[Path]:
         """
         Generator that yields paths as they are discovered.
+        
+        NOTE: Internally uses batching to reduce lock contention, but yields
+        individual paths to maintain API compatibility.
         """
         # Start the background walker thread
         walker_thread = threading.Thread(
@@ -41,7 +44,11 @@ class ParallelFileScanner:
             item = self.queue.get()
             if item is self._sentinel:
                 break
-            yield item
+            # Flatten batches: yield each path individually
+            if isinstance(item, list):
+                yield from item
+            else:
+                yield item
             
         walker_thread.join()
 
@@ -74,9 +81,12 @@ class ParallelFileScanner:
                     try:
                         subdirs, files = f.result()
                         
-                        # 1. Enqueue Files for Consumption
-                        for file_path in files:
-                            self.queue.put(Path(file_path))
+                        # 1. Enqueue Files in BATCH (reduces lock contention)
+                        # CRITICAL FIX: Instead of 1 lock per file, 1 lock per directory
+                        if files:
+                            # Convert to Path objects and put as batch
+                            file_batch = [Path(fp) for fp in files]
+                            self.queue.put(file_batch)
                             
                         # 2. Schedule Subdirectories
                         for d in subdirs:
