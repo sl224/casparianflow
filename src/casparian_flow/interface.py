@@ -2,7 +2,8 @@
 from typing import Any, Protocol, runtime_checkable, Dict, Union
 
 # Forward reference to avoid hard dependency on pandas/arrow here
-DataFrameLike = Any 
+DataFrameLike = Any
+
 
 @runtime_checkable
 class CaspContext(Protocol):
@@ -10,6 +11,7 @@ class CaspContext(Protocol):
     The runtime context for the Plugin.
     Implements the Topic-Based Publish Pattern.
     """
+
     def register_topic(self, topic: str, default_uri: str = None) -> int:
         """
         Declares that this plugin will publish data to a specific logical topic.
@@ -22,6 +24,7 @@ class CaspContext(Protocol):
         Dispatches data to the sink associated with the topic handle.
         """
         ...
+
 
 @runtime_checkable
 class CaspPlugin(Protocol):

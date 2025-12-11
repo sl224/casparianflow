@@ -14,7 +14,14 @@ class BadParameter(ValueError):
 # from sqlalchemy import create_engine
 # from sqlalchemy.engine import URL
 
-def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False, pool_size=10, pool_pre_ping=True):
+
+def get_engine(
+    db_settings,
+    fast_executemany: bool = True,
+    echo: bool = False,
+    pool_size=10,
+    pool_pre_ping=True,
+):
     """
     Creates and returns a SQLAlchemy engine based on the loaded pydantic settings.
     Supports both Windows Auth (Trusted) and SQL Auth (User/Pass).
@@ -29,10 +36,12 @@ def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False, p
         case "mssql":
             # 1. Base query parameters always require the driver
             query_params = {"driver": db_settings.driver}
-            
+
             # 2. Determine Authentication Method
             # Check if trusted_connection is explicitly "yes" (Windows behavior)
-            is_trusted = str(getattr(db_settings, "trusted_connection", "no")).lower() == "yes"
+            is_trusted = (
+                str(getattr(db_settings, "trusted_connection", "no")).lower() == "yes"
+            )
 
             if is_trusted:
                 # Windows Authentication
@@ -48,13 +57,13 @@ def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False, p
             # 3. Create URL Object
             url_object = URL.create(
                 drivername="mssql+pyodbc",
-                username=db_user,      # SQL Alchemy handles None gracefully here
-                password=db_pass,      # SQL Alchemy handles None gracefully here
+                username=db_user,  # SQL Alchemy handles None gracefully here
+                password=db_pass,  # SQL Alchemy handles None gracefully here
                 host=db_settings.server_name,
                 database=db_settings.db_name,
                 query=query_params,
             )
-            
+
             engine_args["fast_executemany"] = fast_executemany
 
         case "sqlite3":
@@ -64,9 +73,7 @@ def get_engine(db_settings, fast_executemany: bool = True, echo: bool = False, p
                 url_object = f"sqlite:///{db_settings.db_location}"
 
         case _:
-            raise ValueError(
-                f"Unsupported DB type: {db_settings.type}"
-            )
+            raise ValueError(f"Unsupported DB type: {db_settings.type}")
 
     if url_object is None:
         raise ValueError("Database URL object was not created. Check configuration.")
