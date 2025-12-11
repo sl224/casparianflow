@@ -34,7 +34,7 @@ class CasparianWorker:
     def run(self):
         logger.info("Worker Online. Waiting for jobs...")
         while self.active:
-            job = self.queue.pop_job('test_signature')
+            job = self.queue.pop_job()
             if not job:
                 time.sleep(1)
                 continue

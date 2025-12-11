@@ -2,7 +2,7 @@
 import hashlib
 import logging
 from pathlib import Path, PurePath
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple, Set
 
@@ -32,6 +32,29 @@ def calculate_hash_and_stat(filepath: Path) -> Tuple[Path, str, int, float, str]
     except Exception as e:
         logger.warning(f"Skipping {filepath}: {e}")
         return None
+
+def calculate_priority_from_mtime(mtime: float) -> int:
+    """
+    QoS Priority Assignment based on file recency.
+    
+    Priority Tiers:
+    - 100: Real-time (files modified < 24 hours ago)
+    - 50:  Recent (files modified < 7 days ago) 
+    - 10:  Historical backlog (older files)
+    
+    Higher priority jobs are processed first by the Worker.
+    """
+    now = datetime.now()
+    file_dt = datetime.fromtimestamp(mtime)
+    age = now - file_dt
+    
+    if age < timedelta(days=1):
+        return 100  # Real-time / SLA-critical
+    elif age < timedelta(days=7):
+        return 50   # Recent
+    else:
+        return 10   # Historical backlog
+
 
 class Scout:
     def __init__(self, db: Session):
@@ -198,13 +221,21 @@ class Scout:
                     "content_hash": item['hash'],
                     "size_bytes": item['size'],
                     "modified_time": datetime.fromtimestamp(item['mtime']),
-                    "applied_tags": tags
+                    "applied_tags": tags,
+                    "_mtime": item['mtime']  # Keep raw mtime for priority calc
                 })
 
         # --- Step D: Insert Versions & Queue Jobs ---
         if new_versions:
+            # Build location_id -> mtime map for priority calculation
+            loc_to_mtime = {v["location_id"]: v["_mtime"] for v in new_versions}
+            
+            # Strip internal _mtime field before DB insert
+            versions_for_db = [{k: v for k, v in ver.items() if not k.startswith("_")} 
+                               for ver in new_versions]
+            
             # Insert and GET IDs back
-            stmt = insert(FileVersion).values(new_versions).returning(
+            stmt = insert(FileVersion).values(versions_for_db).returning(
                 FileVersion.id, 
                 FileVersion.location_id, 
                 FileVersion.applied_tags
@@ -212,19 +243,21 @@ class Scout:
             inserted_versions = self.db.execute(stmt).fetchall()
             
             # 1. Update Locations to point to new versions
-            # Note: Bulk update via mappings is cleaner but raw SQL is often faster for simple PK updates
-            # We use a loop here for simplicity in this "Correctness" pass
             for row in inserted_versions:
                 self.db.execute(
                     text("UPDATE cf_file_location SET current_version_id = :vid, last_seen_time = :now WHERE id = :lid"),
                     {"vid": row.id, "lid": row.location_id, "now": datetime.now()}
                 )
 
-            # 2. Queue Jobs
+            # 2. Queue Jobs with QoS Priority
             jobs_to_queue = []
             for row in inserted_versions:
-                vid, tags = row.id, row.applied_tags
+                vid, loc_id, tags = row.id, row.location_id, row.applied_tags
                 if not tags: continue
+                
+                # Calculate priority from mtime
+                mtime = loc_to_mtime.get(loc_id, 0)
+                priority = calculate_priority_from_mtime(mtime)
                 
                 file_tags = set(tags.split(","))
                 for plugin in self.plugins:
@@ -236,7 +269,7 @@ class Scout:
                             "file_version_id": vid,
                             "plugin_name": plugin.plugin_name,
                             "status": StatusEnum.QUEUED,
-                            "priority": 0
+                            "priority": priority
                         })
             
             if jobs_to_queue:

@@ -57,19 +57,19 @@ class TestJobQueue:
         # Pop jobs and verify priority order
         queue = JobQueue(test_db_engine)
         
-        job1 = queue.pop_job("test_worker")
+        job1 = queue.pop_job()
         assert job1.priority == 10, "Should pop highest priority first"
         
-        job2 = queue.pop_job("test_worker")
+        job2 = queue.pop_job()
         assert job2.priority == 5, "Should pop medium priority second"
         
-        job3 = queue.pop_job("test_worker")
+        job3 = queue.pop_job()
         assert job3.priority == 1, "Should pop lowest priority last"
     
     def test_pop_job_returns_none_when_empty(self, test_db_engine):
         """Test that pop_job returns None when queue is empty."""
         queue = JobQueue(test_db_engine)
-        job = queue.pop_job("test_worker")
+        job = queue.pop_job()
         assert job is None, "Should return None when no jobs available"
     
     def test_complete_job(self, test_db_engine, test_db_session, test_source_root, test_plugin_config):
@@ -181,9 +181,9 @@ class TestJobQueue:
         queue = JobQueue(test_db_engine)
         
         # Pop once
-        job1 = queue.pop_job("worker1")
+        job1 = queue.pop_job()
         assert job1 is not None
         
         # Try to pop again - should return None
-        job2 = queue.pop_job("worker2")
+        job2 = queue.pop_job()
         assert job2 is None, "Already claimed job should not be popped again"

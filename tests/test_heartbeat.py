@@ -79,7 +79,7 @@ class TestWorker:
 
         # 4. Run Execution Manually
         # Pop job (simulating the queue loop)
-        popped_job = worker.queue.pop_job("test_worker")
+        popped_job = worker.queue.pop_job()
         assert popped_job is not None
         
         # Execute (should raise the ValueError from our mock)
