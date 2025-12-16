@@ -94,11 +94,12 @@ class ZmqWorker:
         # Locate built-in system deployer
         # It now lives in src/casparian_flow/builtins/system_deployer.py
         import casparian_flow.builtins.system_deployer as sys_deployer_module
-        
+
         deployer_path = Path(sys_deployer_module.__file__)
         logger.info(f"Starting System Plugin: {deployer_path}")
-        
+
         import os
+        import sys
         env = os.environ.copy()
         # Add src/ to PYTHONPATH to ensure casparian_flow is importable
         # if run from project root, src is needed.
@@ -108,7 +109,7 @@ class ZmqWorker:
         try:
             proc = subprocess.Popen(
                 [
-                    "python",
+                    sys.executable,
                     "-m",
                     "casparian_flow.sidecar",
                     "--plugin",
@@ -395,6 +396,7 @@ class ZmqWorker:
                 plugin_path.write_text(plugin.source_code, encoding="utf-8")
                 logger.info(f"Wrote plugin to disk: {plugin_path}")
 
+                import sys
                 env = os.environ.copy()
                 src_path = str(Path(os.getcwd()) / "src")
                 env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
@@ -403,7 +405,7 @@ class ZmqWorker:
                 try:
                     proc = subprocess.Popen(
                         [
-                            "python",
+                            sys.executable,
                             "-m",
                             "casparian_flow.sidecar",
                             "--plugin",

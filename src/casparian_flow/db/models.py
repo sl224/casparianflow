@@ -192,4 +192,73 @@ class PluginManifest(Base):
     )
 
 
+class PhaseEnum(PyEnum):
+    """Surveyor Agent protocol phase states."""
+    IDLE = "IDLE"
+    PHASE_1_RECONNAISSANCE = "PHASE_1_RECONNAISSANCE"
+    PHASE_2_ENVIRONMENT = "PHASE_2_ENVIRONMENT"
+    PHASE_3_CONSTRUCTION = "PHASE_3_CONSTRUCTION"
+    PHASE_4_WIRING = "PHASE_4_WIRING"
+    PHASE_5_VERIFICATION = "PHASE_5_VERIFICATION"
+    PHASE_6_TEST_GENERATION = "PHASE_6_TEST_GENERATION"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class LibraryWhitelist(Base):
+    """Allowed Python libraries for plugin generation."""
+    __tablename__ = "cf_library_whitelist"
+
+    id = Column(Integer, primary_key=True)
+    library_name = Column(String(100), nullable=False, unique=True)
+    version_constraint = Column(String(50), nullable=True)
+    description = Column(Text, nullable=True)
+    added_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = ({"schema": DEFAULT_SCHEMA},)
+
+
+class SurveyorSession(Base):
+    """Tracks Surveyor Agent execution sessions."""
+    __tablename__ = "cf_surveyor_session"
+
+    id = Column(Integer, primary_key=True)
+    source_root_id = Column(Integer, ForeignKey("cf_source_root.id"), nullable=False)
+    current_phase = Column(Enum(PhaseEnum), default=PhaseEnum.IDLE)
+    started_at = Column(DateTime, server_default=func.now())
+    completed_at = Column(DateTime, nullable=True)
+    error_message = Column(Text, nullable=True)
+
+    # Phase-specific state (JSON blob for flexibility)
+    phase_data = Column(Text, default="{}")
+
+    source_root = relationship("SourceRoot")
+    decisions = relationship("SurveyorDecision", back_populates="session", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("ix_surveyor_session_lookup", "source_root_id", "current_phase"),
+        {"schema": DEFAULT_SCHEMA},
+    )
+
+
+class SurveyorDecision(Base):
+    """Audit trail of Surveyor Agent decisions."""
+    __tablename__ = "cf_surveyor_decision"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("cf_surveyor_session.id"), nullable=False)
+    phase = Column(Enum(PhaseEnum), nullable=False)
+    timestamp = Column(DateTime, server_default=func.now())
+    decision_type = Column(String(50), nullable=False)
+    decision_data = Column(Text, nullable=False)  # JSON
+    reasoning = Column(Text, nullable=True)
+
+    session = relationship("SurveyorSession", back_populates="decisions")
+
+    __table_args__ = (
+        Index("ix_surveyor_decision_lookup", "session_id", "phase"),
+        {"schema": DEFAULT_SCHEMA},
+    )
+
+
 

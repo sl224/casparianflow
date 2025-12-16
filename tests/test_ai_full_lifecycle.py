@@ -15,6 +15,7 @@ from datetime import datetime
 from casparian_flow.services.inspector import profile_file
 from casparian_flow.db.models import PluginManifest, PluginStatusEnum, ProcessingJob, StatusEnum, FileVersion, FileLocation, FileHashRegistry
 from casparian_flow.security.signing import Signer
+from casparian_flow.security.gatekeeper import generate_signature
 import socket
 import logging
 
@@ -55,7 +56,7 @@ class MockProvider:
         # We don't care about the prompt, we just return the code.
         # The Generator expects specific responses for specific steps.
         last_msg = messages[-1]["content"]
-        
+
         if "Analyze this file profile" in last_msg:
             # Step 1: Proposal
             return json.dumps({
@@ -65,7 +66,7 @@ class MockProvider:
                 "columns": [{"name": "col1", "target_type": "int64"}],
                 "reasoning": "It looks like a CSV"
             })
-        elif "Generate the Python code" in last_msg:
+        elif "Write the complete" in last_msg or "Generate the Python code" in last_msg:
             # Step 2: Code
             return f"```python\n{GENERATED_PLUGIN_CODE}\n```"
         return "{}"
@@ -82,7 +83,7 @@ def setup_environment(tmp_path, test_db_engine):
     config = WorkerConfig(
         database=DatabaseConfig(connection_string=str(test_db_engine.url)),
         storage=StorageConfig(parquet_root=parquet_dir),
-        plugins=PluginsConfig(directory=plugins_dir)
+        plugins=PluginsConfig(dir=plugins_dir)
     )
     return config, plugins_dir, parquet_dir
 
@@ -109,9 +110,9 @@ def test_full_ai_lifecycle(setup_environment, test_db_session, unique_zmq_addr):
     # Write to disk + Sign (Simulate User Approval)
     target_path = plugins_dir / "generated_processor.py"
     target_path.write_text(plugin_code.source_code, encoding="utf-8")
-    
+
     sig_path = plugins_dir / "generated_processor.py.sig"
-    sig_path.write_text(Signer.sign(plugin_code.source_code), encoding="utf-8")
+    sig_path.write_text(generate_signature(plugin_code.source_code, "default-secret-key-change-me"), encoding="utf-8")
     
     assert target_path.exists()
     assert sig_path.exists()
@@ -183,7 +184,7 @@ def test_full_ai_lifecycle(setup_environment, test_db_session, unique_zmq_addr):
                 if manifest.status == PluginStatusEnum.ACTIVE:
                     deployed = True
                     break
-                elif manifest.status in [PluginStatusEnum.REJECTED, PluginStatusEnum.FAILED]:
+                elif manifest.status == PluginStatusEnum.REJECTED:
                      print(f"Deployment rejected: {manifest.validation_error}")
                      assert False, f"Deployment rejected: {manifest.validation_error}"
 
@@ -195,9 +196,13 @@ def test_full_ai_lifecycle(setup_environment, test_db_session, unique_zmq_addr):
                  assert False, f"Deployment Job Failed: {j.error_message}"
 
             time.sleep(0.5)
-            
+
         assert deployed, "Plugin failed to deploy within timeout"
-        
+
+        # Give reload_plugins() some time to spawn the sidecar and register
+        time.sleep(1)
+        print(f"Plugin registry after deployment: {list(worker.plugin_registry.keys())}")
+
         # 4. Verification: Submit a Job
         # We need to manually inject the job since we bypassed the Scout
         
@@ -210,8 +215,8 @@ def test_full_ai_lifecycle(setup_environment, test_db_session, unique_zmq_addr):
         
         h_reg = FileHashRegistry(content_hash="abc", size_bytes=100)
         test_db_session.add(h_reg)
-        
-        fv = FileVersion(location_id=fl.id, content_hash="abc", size_bytes=100)
+
+        fv = FileVersion(location_id=fl.id, content_hash="abc", size_bytes=100, modified_time=datetime.now())
         test_db_session.add(fv)
         test_db_session.flush()
         
@@ -233,8 +238,11 @@ def test_full_ai_lifecycle(setup_environment, test_db_session, unique_zmq_addr):
             if j.status in [StatusEnum.COMPLETED, StatusEnum.FAILED]:
                 break
             time.sleep(0.5)
-            
-        assert j.status == StatusEnum.COMPLETED
+
+        if j.status == StatusEnum.FAILED:
+            print(f"Job failed with error: {j.error_message}")
+
+        assert j.status == StatusEnum.COMPLETED, f"Job failed: {j.error_message if j.status == StatusEnum.FAILED else 'Unknown'}"
         
         # Check if output exists (Parquet or SQLite? Defaults to ParquetSink?)
         # BasePlugin.publish goes to context.publish -> Sinks.
