@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import create_engine
 
 from casparian_flow.engine.queue import JobQueue
-from casparian_flow.plugins.loader import PluginRegistry
+from casparian_flow.engine.loader import PluginRegistry
 from casparian_flow.engine.context import WorkerContext, InspectionInterrupt
 from casparian_flow.engine.config import WorkerConfig
 from casparian_flow.db.models import (

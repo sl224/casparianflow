@@ -19,7 +19,8 @@ import logging
 import importlib.util
 import traceback
 from pathlib import Path
-from typing import Callable, Generator, Any
+from typing import Callable, Generator, Any, Type
+from dataclasses import dataclass, field
 
 import zmq
 import pyarrow as pa
@@ -34,17 +35,46 @@ from casparian_flow.protocol import (
     msg_data,
     msg_done,
     msg_error,
+    msg_heartbeat,
+    msg_deploy,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def load_plugin(plugin_path: str) -> Callable:
+@dataclass
+class SidecarContext:
     """
-    Dynamically load a plugin and return its execute function.
+    Context provided to plugins running in the Sidecar.
+    Mimics WorkerContext but tailored for the isolated process.
+    """
+    outbox: list = field(default_factory=list)
 
-    The plugin must define an `execute(filepath)` function that yields
-    pandas DataFrames or PyArrow RecordBatches.
+    def send_deploy(self, plugin_name: str, version: str, source_code: str, signature: str):
+        """
+        Queue a deployment message to be sent to the Router.
+        """
+        self.outbox.append({
+            "type": OpCode.DEPLOY,
+            "plugin_name": plugin_name,
+            "source_code": source_code,
+            "signature": signature
+        })
+
+    def register_topic(self, topic: str):
+        # No-op for now in sidecar, or store to send REG updates?
+        pass
+
+    def publish(self, topic: str, data: Any):
+        # For legacy compatibility, we might support this.
+        # But prefer yielding from execute().
+        pass
+
+
+def load_plugin_handler(plugin_path: str) -> Type:
+    """
+    Dynamically load a plugin module and return the Handler class.
+    Fallback to 'execute' function if no Handler class found (Legacy).
     """
     path = Path(plugin_path)
     if not path.exists():
@@ -57,10 +87,16 @@ def load_plugin(plugin_path: str) -> Callable:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    if not hasattr(module, "execute"):
-        raise AttributeError(f"Plugin must define 'execute' function: {plugin_path}")
-
-    return module.execute
+    if hasattr(module, "Handler"):
+        return module.Handler
+    elif hasattr(module, "execute"):
+        # Legacy: Wrap simple function in a pseudo-Handler
+        class LegacyHandler:
+            def configure(self, ctx, config): pass
+            def execute(self, fpath): return module.execute(fpath)
+        return LegacyHandler
+    else:
+        raise AttributeError(f"Plugin must define 'Handler' class or 'execute' function: {plugin_path}")
 
 
 def serialize_batch(batch: Any) -> bytes:
@@ -93,15 +129,9 @@ def serialize_batch(batch: Any) -> bytes:
 def run_sidecar(plugin_path: str, socket_addr: str):
     """
     Main sidecar loop.
-
-    1. Load plugin
-    2. Connect to Worker
-    3. Register plugin name
-    4. Wait for EXEC messages
-    5. Stream DATA back, send DONE/ERR
     """
-    # Load plugin once at startup
-    execute_fn = load_plugin(plugin_path)
+    # Load plugin class
+    HandlerClass = load_plugin_handler(plugin_path)
     plugin_name = Path(plugin_path).stem
 
     logger.info(f"Sidecar starting: plugin={plugin_name}, connect={socket_addr}")
@@ -116,14 +146,38 @@ def run_sidecar(plugin_path: str, socket_addr: str):
     sock.send_multipart(reg_frames)
     logger.info(f"Registered plugin: {plugin_name}")
 
+    # Create Sidecar Context
+    sidecar_ctx = SidecarContext()
+    
+    # Instantiate Handler
+    # We pass empty config for now. Real implementations might fetch config from Router via REG response?
+    # For now, we assume stateless or default config.
+    handler = HandlerClass()
+    if hasattr(handler, "configure"):
+        handler.configure(sidecar_ctx, {})
+
     # Main loop
     try:
         while True:
-            frames = sock.recv_multipart()
+            # 1. Drain Outbox (Control Messages from Plugin)
+            while sidecar_ctx.outbox:
+                msg = sidecar_ctx.outbox.pop(0)
+                if msg["type"] == OpCode.DEPLOY:
+                    logger.info(f"Sending DEPLOY for {msg['plugin_name']}")
+                    frames = msg_deploy(
+                        msg["plugin_name"], 
+                        msg["source_code"], 
+                        msg["signature"]
+                    )
+                    sock.send_multipart(frames)
 
-            if len(frames) < 1:
-                logger.warning("Empty message received")
-                continue
+            # 2. Receive Messages (Non-blocking check could be better, but we stick to blocking for simplicity)
+            # To allow outbox draining, we might need a poller if plugins are chatty.
+            # But currently, plugins only act when triggered by EXEC.
+            # So blocking receive is fine. 'send_deploy' happens during 'execute'.
+            
+            frames = sock.recv_multipart()
+            if len(frames) < 1: continue
 
             # Validate header
             err = validate_header(frames[0])
@@ -131,12 +185,15 @@ def run_sidecar(plugin_path: str, socket_addr: str):
                 logger.warning(f"Invalid header: {err}")
                 continue
 
-            op, job_id, meta_len = unpack_header(frames[0])
+            # Protocol v2
+            op, job_id, meta_len, content_type, compressed = unpack_header(frames[0])
 
-            if op == OpCode.EXEC:
-                # Get filepath from frame 1
+            if op == OpCode.HEARTBEAT:
+                sock.send_multipart(msg_heartbeat())
+                continue
+
+            elif op == OpCode.EXEC:
                 if len(frames) < 2:
-                    logger.error(f"EXEC missing filepath frame: job_id={job_id}")
                     sock.send_multipart(msg_error(job_id, "Missing filepath"))
                     continue
 
@@ -144,21 +201,30 @@ def run_sidecar(plugin_path: str, socket_addr: str):
                 logger.info(f"Executing job {job_id}: {filepath}")
 
                 try:
-                    # Execute plugin - expect generator yielding batches
-                    result = execute_fn(filepath)
+                    result = handler.execute(filepath)
 
-                    # Handle both generator and direct return
+                    # Handle Generator
                     if hasattr(result, "__iter__") and hasattr(result, "__next__"):
-                        # Generator - stream batches
                         for batch in result:
+                            # Check if plugin queued control messages during iteration
+                            while sidecar_ctx.outbox:
+                                msg = sidecar_ctx.outbox.pop(0)
+                                if msg["type"] == OpCode.DEPLOY:
+                                    sock.send_multipart(msg_deploy(msg["plugin_name"], msg["source_code"], msg["signature"]))
+                            
                             payload = serialize_batch(batch)
                             sock.send_multipart(msg_data(job_id, payload))
+
                     elif result is not None:
-                        # Single result - wrap and send
                         payload = serialize_batch(result)
                         sock.send_multipart(msg_data(job_id, payload))
+                    
+                    # Check outbox again after completion
+                    while sidecar_ctx.outbox:
+                        msg = sidecar_ctx.outbox.pop(0)
+                        if msg["type"] == OpCode.DEPLOY:
+                             sock.send_multipart(msg_deploy(msg["plugin_name"], msg["source_code"], msg["signature"]))
 
-                    # Signal completion
                     sock.send_multipart(msg_done(job_id))
                     logger.info(f"Job {job_id} completed")
 
@@ -171,6 +237,8 @@ def run_sidecar(plugin_path: str, socket_addr: str):
 
     except KeyboardInterrupt:
         logger.info("Sidecar shutting down")
+    except Exception as e:
+        logger.critical(f"Sidecar fatal error: {e}", exc_info=True)
     finally:
         sock.close()
         ctx.term()

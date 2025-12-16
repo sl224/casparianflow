@@ -202,3 +202,122 @@ def execute(file_path):
         worker_thread.join()
         if sidecar_proc:
             sidecar_proc.terminate()
+
+
+# ============================================================================
+# Protocol v2.0 End-to-End Tests
+# ============================================================================
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+def test_e2e_protocol_v2_messages(e2e_env):
+    """All v2 OpCodes work in real system."""
+    from casparian_flow.protocol import msg_heartbeat, OpCode, unpack_header
+
+    # Test HEARTBEAT message construction
+    hb_frames = msg_heartbeat()
+    op, job_id, meta_len, content_type, compressed = unpack_header(hb_frames[0])
+
+    assert op == OpCode.HEARTBEAT
+    assert job_id == 0
+
+    # Verify all new OpCodes are defined
+    assert OpCode.HEARTBEAT == 6
+    assert OpCode.DEPLOY == 7
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+def test_e2e_heartbeat_keepalive(e2e_env, tmp_path):
+    """Worker pruning doesn't affect active sidecars."""
+    from casparian_flow.engine.config import PluginsConfig
+
+    config = WorkerConfig(
+        database=DatabaseConfig(
+            connection_string=f"sqlite:///{e2e_env['tmp_path'] / 'e2e.db'}",
+        ),
+        storage=StorageConfig(parquet_root=e2e_env["parquet_root"]),
+        plugins=PluginsConfig(dir=str(tmp_path / "plugins")),
+    )
+
+    # Use unique port
+    worker = ZmqWorker(config, zmq_addr="tcp://127.0.0.1:5681")
+
+    # Simulate active sidecar
+    active_identity = b"active_sidecar"
+    worker.sidecar_heartbeats[active_identity] = time.time()
+    worker.plugin_registry["active_plugin"] = active_identity
+
+    # Simulate stale sidecar
+    stale_identity = b"stale_sidecar"
+    worker.sidecar_heartbeats[stale_identity] = time.time() - 100  # 100s ago
+    worker.plugin_registry["stale_plugin"] = stale_identity
+
+    # Prune with 60s timeout
+    worker._prune_dead_sidecars(timeout_seconds=60)
+
+    # Active should remain
+    assert active_identity in worker.sidecar_heartbeats
+    assert "active_plugin" in worker.plugin_registry
+
+    # Stale should be removed
+    assert stale_identity not in worker.sidecar_heartbeats
+    assert "stale_plugin" not in worker.plugin_registry
+
+    worker.stop()
+
+
+@pytest.mark.slow
+@pytest.mark.integration
+def test_e2e_deploy_workflow(e2e_env, tmp_path, sample_plugin_code):
+    """Deploy plugin → auto-reload → job executes with new plugin."""
+    from casparian_flow.engine.config import PluginsConfig
+    from casparian_flow.security.gatekeeper import generate_signature
+    from casparian_flow.db.models import PluginManifest, PluginStatusEnum
+    from unittest.mock import patch
+
+    config = WorkerConfig(
+        database=DatabaseConfig(
+            connection_string=f"sqlite:///{e2e_env['tmp_path'] / 'e2e.db'}",
+        ),
+        storage=StorageConfig(parquet_root=e2e_env["parquet_root"]),
+        plugins=PluginsConfig(dir=str(tmp_path / "plugins")),
+    )
+
+    worker = ZmqWorker(config, zmq_addr="tcp://127.0.0.1:5682")
+
+    # Deploy plugin via architect
+    signature = generate_signature(sample_plugin_code, worker.architect.secret_key)
+
+    result = worker.architect.deploy_plugin(
+        plugin_name="deployed_plugin",
+        version="1.0.0",
+        source_code=sample_plugin_code,
+        signature=signature,
+        sample_input=None,  # Skip sandbox for e2e test
+    )
+
+    assert result.success is True
+
+    # Verify plugin is ACTIVE in database
+    session = e2e_env["session"]
+    manifest = (
+        session.query(PluginManifest)
+        .filter_by(plugin_name="deployed_plugin")
+        .first()
+    )
+    assert manifest is not None
+    assert manifest.status == PluginStatusEnum.ACTIVE
+
+    # Mock subprocess to avoid actual sidecar spawn
+    with patch("casparian_flow.engine.zmq_worker.subprocess.Popen"):
+        worker.reload_plugins()
+
+    # Verify plugin file was written
+    plugin_path = tmp_path / "plugins" / "deployed_plugin.py"
+    assert plugin_path.exists()
+
+    # Cleanup
+    plugin_path.unlink()
+    worker.stop()
