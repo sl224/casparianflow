@@ -1,0 +1,510 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.9, pytest-9.0.1, pluggy-1.6.0 -- C:\Users\shan\workspace\casparianflow\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\shan\workspace\casparianflow
+configfile: pytest.ini
+collecting ... collected 8 items
+
+tests/test_zmq_worker_v2.py::TestHeartbeatMonitoring::test_heartbeat_tracking PASSED [ 12%]
+tests/test_zmq_worker_v2.py::TestHeartbeatMonitoring::test_heartbeat_response PASSED [ 25%]
+tests/test_zmq_worker_v2.py::TestHeartbeatMonitoring::test_prune_dead_sidecars PASSED [ 37%]
+tests/test_zmq_worker_v2.py::TestHotReload::test_reload_writes_source_to_disk FAILED [ 50%]
+tests/test_zmq_worker_v2.py::TestHotReload::test_reload_spawns_sidecar_processes FAILED [ 62%]
+tests/test_zmq_worker_v2.py::TestDEPLOYHandler::test_deploy_triggers_reload FAILED [ 75%]
+tests/test_zmq_worker_v2.py::TestProtocolV2Compatibility::test_unpack_header_v2 PASSED [ 87%]
+tests/test_zmq_worker_v2.py::TestProtocolV2Compatibility::test_content_type_handling PASSED [100%]
+
+================================== FAILURES ===================================
+_______________ TestHotReload.test_reload_writes_source_to_disk _______________
+
+self = <sqlalchemy.engine.base.Connection object at 0x0000018D7F5F2D50>
+dialect = <sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite object at 0x0000018D7F616520>
+context = <sqlalchemy.dialects.sqlite.base.SQLiteExecutionContext object at 0x0000018D7F5F2F90>
+statement = <sqlalchemy.dialects.sqlite.base.SQLiteCompiler object at 0x0000018D7FA78D50>
+parameters = [('ACTIVE',)]
+
+    def _exec_single_context(
+        self,
+        dialect: Dialect,
+        context: ExecutionContext,
+        statement: Union[str, Compiled],
+        parameters: Optional[_AnyMultiExecuteParams],
+    ) -> CursorResult[Any]:
+        """continue the _execute_context() method for a single DBAPI
+        cursor.execute() or cursor.executemany() call.
+    
+        """
+        if dialect.bind_typing is BindTyping.SETINPUTSIZES:
+            generic_setinputsizes = context._prepare_set_input_sizes()
+    
+            if generic_setinputsizes:
+                try:
+                    dialect.do_set_input_sizes(
+                        context.cursor, generic_setinputsizes, context
+                    )
+                except BaseException as e:
+                    self._handle_dbapi_exception(
+                        e, str(statement), parameters, None, context
+                    )
+    
+        cursor, str_statement, parameters = (
+            context.cursor,
+            context.statement,
+            context.parameters,
+        )
+    
+        effective_parameters: Optional[_AnyExecuteParams]
+    
+        if not context.executemany:
+            effective_parameters = parameters[0]
+        else:
+            effective_parameters = parameters
+    
+        if self._has_events or self.engine._has_events:
+            for fn in self.dispatch.before_cursor_execute:
+                str_statement, effective_parameters = fn(
+                    self,
+                    cursor,
+                    str_statement,
+                    effective_parameters,
+                    context,
+                    context.executemany,
+                )
+    
+        if self._echo:
+            self._log_info(str_statement)
+    
+            stats = context._get_cache_stats()
+    
+            if not self.engine.hide_parameters:
+                self._log_info(
+                    "[%s] %r",
+                    stats,
+                    sql_util._repr_params(
+                        effective_parameters,
+                        batches=10,
+                        ismulti=context.executemany,
+                    ),
+                )
+            else:
+                self._log_info(
+                    "[%s] [SQL parameters hidden due to hide_parameters=True]",
+                    stats,
+                )
+    
+        evt_handled: bool = False
+        try:
+            if context.execute_style is ExecuteStyle.EXECUTEMANY:
+                effective_parameters = cast(
+                    "_CoreMultiExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_executemany:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_executemany(
+                        cursor,
+                        str_statement,
+                        effective_parameters,
+                        context,
+                    )
+            elif not effective_parameters and context.no_parameters:
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute_no_params:
+                        if fn(cursor, str_statement, context):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_execute_no_params(
+                        cursor, str_statement, context
+                    )
+            else:
+                effective_parameters = cast(
+                    "_CoreSingleExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+>                   self.dialect.do_execute(
+                        cursor, str_statement, effective_parameters, context
+                    )
+
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1967: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite object at 0x0000018D7F616520>
+cursor = <sqlite3.Cursor object at 0x0000018D7FAC4640>
+statement = 'SELECT cf_plugin_manifest.id AS cf_plugin_manifest_id, cf_plugin_manifest.plugin_name AS cf_plugin_manifest_plugin_na...manifest.deployed_at AS cf_plugin_manifest_deployed_at \nFROM cf_plugin_manifest \nWHERE cf_plugin_manifest.status = ?'
+parameters = ('ACTIVE',)
+context = <sqlalchemy.dialects.sqlite.base.SQLiteExecutionContext object at 0x0000018D7F5F2F90>
+
+    def do_execute(self, cursor, statement, parameters, context=None):
+>       cursor.execute(statement, parameters)
+E       sqlite3.OperationalError: no such table: cf_plugin_manifest
+
+.venv\Lib\site-packages\sqlalchemy\engine\default.py:951: OperationalError
+
+The above exception was the direct cause of the following exception:
+
+self = <test_zmq_worker_v2.TestHotReload object at 0x0000018D7F5279D0>
+mock_popen = <MagicMock name='Popen' id='1707239254608'>
+worker_config = WorkerConfig(database=DatabaseConfig(connection_string='sqlite:///C:\\Users\\shan\\AppData\\Local\\Temp\\pytest-of-sha...st-17/test_reload_writes_source_to_d0/parquet')), plugins=PluginsConfig(dir=WindowsPath('src/casparian_flow/plugins')))
+test_db_session = <sqlalchemy.orm.session.Session object at 0x0000018D7F63A270>
+sample_plugin_code = '\nfrom casparian_flow.sdk import BasePlugin\nimport pandas as pd\n\nclass Handler(BasePlugin):\n    def execute(self, file_path: str):\n        df = pd.DataFrame({"test": [1, 2, 3]})\n        self.publish("output", df)\n'
+unique_zmq_addr = 'tcp://127.0.0.1:63686'
+
+    @patch("casparian_flow.engine.zmq_worker.subprocess.Popen")
+    def test_reload_writes_source_to_disk(
+        self, mock_popen, worker_config, test_db_session, sample_plugin_code, unique_zmq_addr
+    ):
+        """Verify plugin files created in plugins/ directory."""
+        worker = ZmqWorker(worker_config, zmq_addr=unique_zmq_addr)
+    
+        # Create ACTIVE plugin in database
+        manifest = PluginManifest(
+            plugin_name="reload_test_plugin",
+            version="1.0.0",
+            source_code=sample_plugin_code,
+            source_hash="hash123",
+            status=PluginStatusEnum.ACTIVE,
+        )
+        test_db_session.add(manifest)
+        test_db_session.commit()
+    
+        # Mock Popen to avoid actual subprocess
+        mock_popen.return_value = Mock()
+    
+        # Call reload
+>       worker.reload_plugins()
+
+tests\test_zmq_worker_v2.py:142: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src\casparian_flow\engine\zmq_worker.py:305: in reload_plugins
+    .all()
+     ^^^^^
+.venv\Lib\site-packages\sqlalchemy\orm\query.py:2704: in all
+    return self._iter().all()  # type: ignore
+           ^^^^^^^^^^^^
+.venv\Lib\site-packages\sqlalchemy\orm\query.py:2857: in _iter
+    result: Union[ScalarResult[_T], Result[_T]] = self.session.execute(
+.venv\Lib\site-packages\sqlalchemy\orm\session.py:2351: in execute
+    return self._execute_internal(
+.venv\Lib\site-packages\sqlalchemy\orm\session.py:2249: in _execute_internal
+    result: Result[Any] = compile_state_cls.orm_execute_statement(
+.venv\Lib\site-packages\sqlalchemy\orm\context.py:306: in orm_execute_statement
+    result = conn.execute(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1419: in execute
+    return meth(
+.venv\Lib\site-packages\sqlalchemy\sql\elements.py:526: in _execute_on_connection
+    return connection._execute_clauseelement(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1641: in _execute_clauseelement
+    ret = self._execute_context(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1846: in _execute_context
+    return self._exec_single_context(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1986: in _exec_single_context
+    self._handle_dbapi_exception(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:2355: in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1967: in _exec_single_context
+    self.dialect.do_execute(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite object at 0x0000018D7F616520>
+cursor = <sqlite3.Cursor object at 0x0000018D7FAC4640>
+statement = 'SELECT cf_plugin_manifest.id AS cf_plugin_manifest_id, cf_plugin_manifest.plugin_name AS cf_plugin_manifest_plugin_na...manifest.deployed_at AS cf_plugin_manifest_deployed_at \nFROM cf_plugin_manifest \nWHERE cf_plugin_manifest.status = ?'
+parameters = ('ACTIVE',)
+context = <sqlalchemy.dialects.sqlite.base.SQLiteExecutionContext object at 0x0000018D7F5F2F90>
+
+    def do_execute(self, cursor, statement, parameters, context=None):
+>       cursor.execute(statement, parameters)
+E       sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table: cf_plugin_manifest
+E       [SQL: SELECT cf_plugin_manifest.id AS cf_plugin_manifest_id, cf_plugin_manifest.plugin_name AS cf_plugin_manifest_plugin_name, cf_plugin_manifest.version AS cf_plugin_manifest_version, cf_plugin_manifest.source_code AS cf_plugin_manifest_source_code, cf_plugin_manifest.source_hash AS cf_plugin_manifest_source_hash, cf_plugin_manifest.status AS cf_plugin_manifest_status, cf_plugin_manifest.signature AS cf_plugin_manifest_signature, cf_plugin_manifest.validation_error AS cf_plugin_manifest_validation_error, cf_plugin_manifest.created_at AS cf_plugin_manifest_created_at, cf_plugin_manifest.deployed_at AS cf_plugin_manifest_deployed_at 
+E       FROM cf_plugin_manifest 
+E       WHERE cf_plugin_manifest.status = ?]
+E       [parameters: ('ACTIVE',)]
+E       (Background on this error at: https://sqlalche.me/e/20/e3q8)
+
+.venv\Lib\site-packages\sqlalchemy\engine\default.py:951: OperationalError
+_____________ TestHotReload.test_reload_spawns_sidecar_processes ______________
+
+self = <sqlalchemy.engine.base.Connection object at 0x0000018D7F5F3890>
+dialect = <sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite object at 0x0000018D7F615CD0>
+context = <sqlalchemy.dialects.sqlite.base.SQLiteExecutionContext object at 0x0000018D7F5F31D0>
+statement = <sqlalchemy.dialects.sqlite.base.SQLiteCompiler object at 0x0000018D7FA7A150>
+parameters = [('ACTIVE',)]
+
+    def _exec_single_context(
+        self,
+        dialect: Dialect,
+        context: ExecutionContext,
+        statement: Union[str, Compiled],
+        parameters: Optional[_AnyMultiExecuteParams],
+    ) -> CursorResult[Any]:
+        """continue the _execute_context() method for a single DBAPI
+        cursor.execute() or cursor.executemany() call.
+    
+        """
+        if dialect.bind_typing is BindTyping.SETINPUTSIZES:
+            generic_setinputsizes = context._prepare_set_input_sizes()
+    
+            if generic_setinputsizes:
+                try:
+                    dialect.do_set_input_sizes(
+                        context.cursor, generic_setinputsizes, context
+                    )
+                except BaseException as e:
+                    self._handle_dbapi_exception(
+                        e, str(statement), parameters, None, context
+                    )
+    
+        cursor, str_statement, parameters = (
+            context.cursor,
+            context.statement,
+            context.parameters,
+        )
+    
+        effective_parameters: Optional[_AnyExecuteParams]
+    
+        if not context.executemany:
+            effective_parameters = parameters[0]
+        else:
+            effective_parameters = parameters
+    
+        if self._has_events or self.engine._has_events:
+            for fn in self.dispatch.before_cursor_execute:
+                str_statement, effective_parameters = fn(
+                    self,
+                    cursor,
+                    str_statement,
+                    effective_parameters,
+                    context,
+                    context.executemany,
+                )
+    
+        if self._echo:
+            self._log_info(str_statement)
+    
+            stats = context._get_cache_stats()
+    
+            if not self.engine.hide_parameters:
+                self._log_info(
+                    "[%s] %r",
+                    stats,
+                    sql_util._repr_params(
+                        effective_parameters,
+                        batches=10,
+                        ismulti=context.executemany,
+                    ),
+                )
+            else:
+                self._log_info(
+                    "[%s] [SQL parameters hidden due to hide_parameters=True]",
+                    stats,
+                )
+    
+        evt_handled: bool = False
+        try:
+            if context.execute_style is ExecuteStyle.EXECUTEMANY:
+                effective_parameters = cast(
+                    "_CoreMultiExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_executemany:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_executemany(
+                        cursor,
+                        str_statement,
+                        effective_parameters,
+                        context,
+                    )
+            elif not effective_parameters and context.no_parameters:
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute_no_params:
+                        if fn(cursor, str_statement, context):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_execute_no_params(
+                        cursor, str_statement, context
+                    )
+            else:
+                effective_parameters = cast(
+                    "_CoreSingleExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+>                   self.dialect.do_execute(
+                        cursor, str_statement, effective_parameters, context
+                    )
+
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1967: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite object at 0x0000018D7F615CD0>
+cursor = <sqlite3.Cursor object at 0x0000018D7FAC44C0>
+statement = 'SELECT cf_plugin_manifest.id AS cf_plugin_manifest_id, cf_plugin_manifest.plugin_name AS cf_plugin_manifest_plugin_na...manifest.deployed_at AS cf_plugin_manifest_deployed_at \nFROM cf_plugin_manifest \nWHERE cf_plugin_manifest.status = ?'
+parameters = ('ACTIVE',)
+context = <sqlalchemy.dialects.sqlite.base.SQLiteExecutionContext object at 0x0000018D7F5F31D0>
+
+    def do_execute(self, cursor, statement, parameters, context=None):
+>       cursor.execute(statement, parameters)
+E       sqlite3.OperationalError: no such table: cf_plugin_manifest
+
+.venv\Lib\site-packages\sqlalchemy\engine\default.py:951: OperationalError
+
+The above exception was the direct cause of the following exception:
+
+self = <test_zmq_worker_v2.TestHotReload object at 0x0000018D7F527C50>
+mock_popen = <MagicMock name='Popen' id='1707239253600'>
+worker_config = WorkerConfig(database=DatabaseConfig(connection_string='sqlite:///C:\\Users\\shan\\AppData\\Local\\Temp\\pytest-of-sha...st-17/test_reload_spawns_sidecar_pro0/parquet')), plugins=PluginsConfig(dir=WindowsPath('src/casparian_flow/plugins')))
+test_db_session = <sqlalchemy.orm.session.Session object at 0x0000018D7F625D10>
+sample_plugin_code = '\nfrom casparian_flow.sdk import BasePlugin\nimport pandas as pd\n\nclass Handler(BasePlugin):\n    def execute(self, file_path: str):\n        df = pd.DataFrame({"test": [1, 2, 3]})\n        self.publish("output", df)\n'
+unique_zmq_addr = 'tcp://127.0.0.1:63695'
+
+    @patch("casparian_flow.engine.zmq_worker.subprocess.Popen")
+    def test_reload_spawns_sidecar_processes(
+        self, mock_popen, worker_config, test_db_session, sample_plugin_code, unique_zmq_addr
+    ):
+        """Check subprocess.Popen called for each ACTIVE plugin."""
+        worker = ZmqWorker(worker_config, zmq_addr=unique_zmq_addr)
+    
+        # Create multiple ACTIVE plugins
+        for i in range(3):
+            manifest = PluginManifest(
+                plugin_name=f"plugin_{i}",
+                version="1.0.0",
+                source_code=sample_plugin_code + f"\n# Plugin {i}",
+                source_hash=f"hash_{i}",
+                status=PluginStatusEnum.ACTIVE,
+            )
+            test_db_session.add(manifest)
+        test_db_session.commit()
+    
+        mock_popen.return_value = Mock()
+    
+>       worker.reload_plugins()
+
+tests\test_zmq_worker_v2.py:173: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src\casparian_flow\engine\zmq_worker.py:305: in reload_plugins
+    .all()
+     ^^^^^
+.venv\Lib\site-packages\sqlalchemy\orm\query.py:2704: in all
+    return self._iter().all()  # type: ignore
+           ^^^^^^^^^^^^
+.venv\Lib\site-packages\sqlalchemy\orm\query.py:2857: in _iter
+    result: Union[ScalarResult[_T], Result[_T]] = self.session.execute(
+.venv\Lib\site-packages\sqlalchemy\orm\session.py:2351: in execute
+    return self._execute_internal(
+.venv\Lib\site-packages\sqlalchemy\orm\session.py:2249: in _execute_internal
+    result: Result[Any] = compile_state_cls.orm_execute_statement(
+.venv\Lib\site-packages\sqlalchemy\orm\context.py:306: in orm_execute_statement
+    result = conn.execute(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1419: in execute
+    return meth(
+.venv\Lib\site-packages\sqlalchemy\sql\elements.py:526: in _execute_on_connection
+    return connection._execute_clauseelement(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1641: in _execute_clauseelement
+    ret = self._execute_context(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1846: in _execute_context
+    return self._exec_single_context(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1986: in _exec_single_context
+    self._handle_dbapi_exception(
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:2355: in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+.venv\Lib\site-packages\sqlalchemy\engine\base.py:1967: in _exec_single_context
+    self.dialect.do_execute(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <sqlalchemy.dialects.sqlite.pysqlite.SQLiteDialect_pysqlite object at 0x0000018D7F615CD0>
+cursor = <sqlite3.Cursor object at 0x0000018D7FAC44C0>
+statement = 'SELECT cf_plugin_manifest.id AS cf_plugin_manifest_id, cf_plugin_manifest.plugin_name AS cf_plugin_manifest_plugin_na...manifest.deployed_at AS cf_plugin_manifest_deployed_at \nFROM cf_plugin_manifest \nWHERE cf_plugin_manifest.status = ?'
+parameters = ('ACTIVE',)
+context = <sqlalchemy.dialects.sqlite.base.SQLiteExecutionContext object at 0x0000018D7F5F31D0>
+
+    def do_execute(self, cursor, statement, parameters, context=None):
+>       cursor.execute(statement, parameters)
+E       sqlalchemy.exc.OperationalError: (sqlite3.OperationalError) no such table: cf_plugin_manifest
+E       [SQL: SELECT cf_plugin_manifest.id AS cf_plugin_manifest_id, cf_plugin_manifest.plugin_name AS cf_plugin_manifest_plugin_name, cf_plugin_manifest.version AS cf_plugin_manifest_version, cf_plugin_manifest.source_code AS cf_plugin_manifest_source_code, cf_plugin_manifest.source_hash AS cf_plugin_manifest_source_hash, cf_plugin_manifest.status AS cf_plugin_manifest_status, cf_plugin_manifest.signature AS cf_plugin_manifest_signature, cf_plugin_manifest.validation_error AS cf_plugin_manifest_validation_error, cf_plugin_manifest.created_at AS cf_plugin_manifest_created_at, cf_plugin_manifest.deployed_at AS cf_plugin_manifest_deployed_at 
+E       FROM cf_plugin_manifest 
+E       WHERE cf_plugin_manifest.status = ?]
+E       [parameters: ('ACTIVE',)]
+E       (Background on this error at: https://sqlalche.me/e/20/e3q8)
+
+.venv\Lib\site-packages\sqlalchemy\engine\default.py:951: OperationalError
+________________ TestDEPLOYHandler.test_deploy_triggers_reload ________________
+
+self = <test_zmq_worker_v2.TestDEPLOYHandler object at 0x0000018D7F527D90>
+mock_popen = <MagicMock name='Popen' id='1707239247888'>
+worker_config = WorkerConfig(database=DatabaseConfig(connection_string='sqlite:///C:\\Users\\shan\\AppData\\Local\\Temp\\pytest-of-sha...ytest-17/test_deploy_triggers_reload0/parquet')), plugins=PluginsConfig(dir=WindowsPath('src/casparian_flow/plugins')))
+test_db_session = <sqlalchemy.orm.session.Session object at 0x0000018D7F626490>
+sample_plugin_code = '\nfrom casparian_flow.sdk import BasePlugin\nimport pandas as pd\n\nclass Handler(BasePlugin):\n    def execute(self, file_path: str):\n        df = pd.DataFrame({"test": [1, 2, 3]})\n        self.publish("output", df)\n'
+unique_zmq_addr = 'tcp://127.0.0.1:63704'
+
+    @patch("casparian_flow.engine.zmq_worker.subprocess.Popen")
+    def test_deploy_triggers_reload(
+        self, mock_popen, worker_config, test_db_session, sample_plugin_code, unique_zmq_addr
+    ):
+        """Successful deploy calls reload_plugins()."""
+        worker = ZmqWorker(worker_config, zmq_addr=unique_zmq_addr)
+        mock_popen.return_value = Mock()
+    
+        # Spy on reload_plugins
+        with patch.object(worker, "reload_plugins") as mock_reload:
+            signature = generate_signature(sample_plugin_code, worker.architect.secret_key)
+    
+            import json
+    
+            payload = {
+                "plugin_name": "deploy_test",
+                "version": "1.0.0",
+                "source_code": sample_plugin_code,
+                "signature": signature,
+            }
+            payload_bytes = json.dumps(payload).encode("utf-8")
+    
+            # Simulate DEPLOY message handling
+            from casparian_flow.services.architect import handle_deploy_message
+    
+            result = handle_deploy_message(worker.architect, payload_bytes)
+    
+            if result.success:
+                worker.reload_plugins()
+    
+            # Verify reload was called
+>           assert mock_reload.called
+E           AssertionError: assert False
+E            +  where False = <MagicMock name='reload_plugins' id='1707239245200'>.called
+

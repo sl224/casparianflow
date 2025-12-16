@@ -1,3 +1,6 @@
+Here is the complete, updated `ARCHITECTURE.md` incorporating the ZeroMQ process isolation architecture.
+
+````markdown
 # Casparian Flow Architecture Guide
 
 A mental model for understanding the entire codebase.
@@ -11,13 +14,13 @@ Casparian Flow is a **file-to-database pipeline** that watches directories, dete
 ```mermaid
 graph LR
     A[File System] -->|Scout| B[Job Queue]
-    B -->|Worker| C[Plugin]
-    C -->|Sink| D[Output DB/Parquet]
-```
+    B -->|ZmqWorker| C[Sidecar Process]
+    C -->|Plugin| D[Output DB/Parquet]
+````
 
 **Core principle**: Files flow through the system immutably. Every file version is tracked, every job is auditable.
 
----
+-----
 
 ## Directory Structure
 
@@ -28,13 +31,16 @@ src/casparian_flow/
 ├── sdk.py             # BasePlugin class for user plugins
 ├── interface.py       # CaspPlugin protocol definition
 ├── main.py            # Entry point
+├── protocol.py        # Binary wire protocol definitions (OpCodes, Headers) [NEW]
+├── sidecar.py         # Isolated plugin execution process [NEW]
 ├── db/
 │   ├── models.py      # SQLAlchemy data models (THE HEART)
 │   ├── base_session.py# SessionLocal factory
 │   ├── access.py      # Engine creation, bulk upload
 │   └── setup.py       # DB initialization, schema fingerprinting
 ├── engine/
-│   ├── worker.py      # Job processor (Worker loop)
+│   ├── worker.py      # Legacy In-Process Job processor
+│   ├── zmq_worker.py  # ZMQ-based Router Worker [NEW]
 │   ├── queue.py       # JobQueue (pop/complete/fail)
 │   ├── context.py     # WorkerContext (lineage injection)
 │   ├── sinks.py       # Parquet/SQLite/MSSQL outputs
@@ -43,12 +49,70 @@ src/casparian_flow/
 ├── services/
 │   ├── scout.py       # File scanner (CORE LOGIC)
 │   └── fs_engine.py   # Parallel file walker
-└── plugins/
-    ├── loader.py      # PluginRegistry discovery
-    └── test_plugin.py # Sample plugin
+├── engine/
+│   ├── loader.py      # PluginRegistry discovery (Moved from plugins/)
+...
+└── builtins/          # Compiled-in System Plugins
+    └── system_deployer.py 
+plugins/               # User-generated Runtime Plugins
+    └── generated_plugin.py
 ```
 
----
+-----
+
+## Process Architecture (ZMQ Isolation & Data-Oriented Design)
+
+To ensure system stability and high throughput, Casparian Flow uses a **Split Architecture** that decouples the engine from user code, optimized with **Data-Oriented Design** principles.
+
+### The Topology
+
+```mermaid
+sequenceDiagram
+    participant Queue as Database Queue
+    participant Router as ZmqWorker (Router)
+    participant Sidecar as Sidecar (Dealer)
+    
+    Sidecar->>Router: REG (I can handle 'csv_parser')
+    Router->>Queue: Pop Job
+    Queue-->>Router: Job #123 (Plugin: 'csv_parser')
+    Router->>Sidecar: EXEC (Job #123, File: /data/file.csv)
+    Sidecar->>Router: DATA (Arrow IPC Stream)
+    Note over Router: ZERO-COPY ROUTING
+    Router->>Sink: write(pa.Table)
+    Sidecar->>Router: DONE
+    Router->>Queue: Complete Job #123
+```
+
+### Components
+
+1.  **ZmqWorker (The Router)**
+
+      * Binds to a TCP or IPC socket.
+      * **Routing Table**: Caches plugin configurations (`TopicConfig`) in memory to avoid DB lookups in the hot path.
+      * **Zero-Copy Routing**: Forwards Arrow IPC buffers from Sidecars directly to Sinks without unpacking/deserializing them into Pandas.
+      * **Mechanism over Policy**: separating the plumbing (moving bytes) from policy (DB config).
+
+2.  **Sidecar (The Dealer)**
+
+      * A separate OS process (Python interpreter).
+      * Loads **one** specific plugin and runs it in a loop.
+      * **Isolation**: If this process dies, the Worker detects the disconnect and marks the job as FAILED.
+
+3.  **The Protocol (v2)**
+
+      * Defined in `src/casparian_flow/protocol.py`.
+      * **Header**: Fixed 16-byte binary header `!BBHIQ` (Version, OpCode, Flags, MetaLength, JobID).
+      * **Zero-Copy Payload**: Uses Apache Arrow IPC streams.
+      * **OpCodes**:
+          * `REG (1)`: Registration handshake.
+          * `EXEC (2)`: Command to process a file.
+          * `DATA (3)`: Stream of Arrow batches.
+          * `ERR (4)`: Exception info.
+          * `DONE (5)`: Job success signal.
+          * `HEARTBEAT (6)`: Keep-alive ping.
+          * `DEPLOY (7)`: Hot deployment payload.
+
+-----
 
 ## The Data Models (The Heart)
 
@@ -96,107 +160,50 @@ When file changes:
 
 **Why?** Audit trail. Every job permanently references the exact file content it processed.
 
----
+-----
 
-## The Scout (File Discovery)
+## Services Layer
 
-`src/casparian_flow/services/scout.py` is the **entry point** for data into the system.
+The `src/casparian_flow/services/` directory contains the core logic that operates outside the ZMQ Worker's hot loop.
 
-### Scan Flow
+### 1. The Scout (`scout.py`)
+Responsible for **File Discovery and Ingestion**.
+- Uses `fs_engine.py` for parallel directory walking.
+- Detects file changes (SHA-256).
+- Manages `FileHashRegistry` and `FileVersion` immutability.
+- **Output**: Pushes `ProcessingJob`s to the Database Queue.
 
-```mermaid
-sequenceDiagram
-    participant FS as File System
-    participant Scanner as ParallelFileScanner
-    participant Scout as Scout._flush_batch
-    participant DB as Database
-    
-    FS->>Scanner: Walk directories
-    Scanner->>Scout: Yield (path, hash, size, mtime)
-    Scout->>DB: Upsert FileHashRegistry
-    Scout->>DB: Upsert FileLocation
-    Scout->>DB: Check version drift
-    Scout->>DB: Insert FileVersion (if changed)
-    Scout->>DB: Insert ProcessingJob (with priority)
-```
+### 2. The Architect (`architect.py`) [NEW in v2]
+Responsible for **Plugin Governance and Deployment**.
+- Handles `DEPLOY` OpCodes.
+- Verifies HMAC signatures of new plugin code.
+- Persists valid code to `PluginManifest` table.
+- Orchestrates the "Hot Reload" of sidecars.
 
-### Key Operations
+-----
 
-1. **Hash Calculation**: SHA-256 of file content (64KB streaming)
-2. **Version Drift Detection**: Compare `active_hashes[current_version_id]` vs new hash
-3. **Tag Assignment**: Pattern matching via `RoutingRule` (glob syntax)
-4. **QoS Priority**: Recent files (<24h) → priority 100, older → 10
+## Contexts: The Two Truths
 
-### Scanner Architecture
+The system maintains two distinct types of context, often confused but serving different scopes.
 
-`src/casparian_flow/services/fs_engine.py` uses a **producer-consumer pattern**:
+| Context | Class | File | Scope | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| **Environmental** | `EtlContext` | `src/casparian_flow/context.py` | Process | Captures Git Hash, Hostname, User. Used by `Heartbeat` to identify the worker node's version/location. |
+| **Execution** | `WorkerContext` | `src/casparian_flow/engine/context.py` | Job | Captures JobID, FileVersionID. Injects lineage into data streams. Manages Sinks. |
 
-```python
-# Producer (background thread)
-ThreadPool walks dirs → pushes to queue
-
-# Consumer (generator)
-Scout.scan_source() yields from queue
-```
-
-Backpressure limit: 10,000 items in queue.
-
----
-
-## The Worker (Job Processing)
-
-`src/casparian_flow/engine/worker.py` processes jobs from the queue.
-
-### Worker Loop
-
-```python
-while active:
-    job = queue.pop_job()  # Atomic claim
-    if job:
-        execute_job(job)   # Load plugin, run, commit
-```
-
-### Job Execution Flow
-
-```mermaid
-sequenceDiagram
-    participant Worker
-    participant Queue as JobQueue
-    participant Plugin
-    participant Context as WorkerContext
-    participant Sink
-    
-    Worker->>Queue: pop_job()
-    Queue-->>Worker: Job (RUNNING)
-    Worker->>Plugin: configure(ctx, params)
-    Worker->>Plugin: execute(file_path)
-    Plugin->>Context: publish(topic, DataFrame)
-    Context->>Sink: write(data + lineage headers)
-    Worker->>Context: commit()
-    Context->>Sink: promote()
-    Worker->>Queue: complete_job()
-```
-
-### Lineage Injection
-
-Every row written to the sink gets **lineage headers**:
-
-```python
-data['_job_id'] = self.job_id
-data['_file_version_id'] = self.file_version_id
-data['_file_id'] = self.file_location_id
-```
-
----
+-----
 
 ## The Queue (Job Management)
 
 `src/casparian_flow/engine/queue.py` provides atomic job claims.
 
 ### SQLite Mode (Dev)
+
 Simple query + update (no locking).
 
+
 ### MSSQL Mode (Production)
+
 Atomic CTE with row locks:
 
 ```sql
@@ -210,7 +217,7 @@ UPDATE cte SET status = 'RUNNING' ...
 OUTPUT inserted.*;
 ```
 
----
+-----
 
 ## The Sinks (Output Writers)
 
@@ -234,7 +241,7 @@ All sinks use staging for atomicity:
 3. On error: staging is discarded
 ```
 
----
+-----
 
 ## The Plugin System
 
@@ -252,12 +259,12 @@ class BasePlugin:
         self._ctx.publish(handle, data)  # Lineage injected here
 ```
 
-### Plugin Discovery (`src/casparian_flow/plugins/loader.py`)
+### Plugin Discovery (`src/casparian_flow/engine/loader.py`)
 
-1. Scans `plugins/` directory for `.py` files
-2. Dynamically imports each module
-3. Looks for `Handler` class
-4. Caches in registry
+1.  Scans `plugins/` directory for `.py` files
+2.  Dynamically imports each module
+3.  Looks for `Handler` class
+4.  Caches in registry
 
 ### User Plugin Example
 
@@ -271,7 +278,7 @@ class Handler(BasePlugin):
         self.publish('output', df)
 ```
 
----
+-----
 
 ## Configuration System
 
@@ -296,7 +303,7 @@ class WorkerConfig:
     plugins: PluginsConfig
 ```
 
----
+-----
 
 ## Integrity & Security
 
@@ -304,9 +311,11 @@ class WorkerConfig:
 
 The system uses **database-based schema fingerprinting** (not file hashing):
 
-1. Query live database structure via SQLAlchemy inspector
-2. Build canonical representation: `table:column:TYPE`
-3. SHA-256 hash of the canonical string
+1.  Query live database structure via SQLAlchemy inspector
+2.  Build canonical representation: `table:column:TYPE`
+3.  SHA-256 hash of the canonical string
+
+<!-- end list -->
 
 ```python
 def compute_schema_fingerprint(engine) -> str:
@@ -318,7 +327,7 @@ def compute_schema_fingerprint(engine) -> str:
 
 Inspector validates all expected tables and columns exist.
 
----
+-----
 
 ## Data Flow Summary
 
@@ -341,16 +350,15 @@ Inspector validates all expected tables and columns exist.
 ├─────────────────────────────────────────────────────────────────────┤
 │  1. JobQueue.pop_job() atomically claims a QUEUED job              │
 │  2. Resolve file path: FileVersion → FileLocation → SourceRoot     │
-│  3. Load PluginConfig + TopicConfig from database                  │
-│  4. Create WorkerContext with lineage metadata                     │
-│  5. Plugin.execute() processes file, calls publish()               │
-│  6. Sink writes to staging with injected lineage columns           │
-│  7. On success: Sink.promote() moves staging → production          │
-│  8. JobQueue.complete_job() marks job COMPLETED                    │
+│  3. ZmqWorker dispatches job via ZMQ (EXEC) to Sidecar             │
+│  4. Sidecar processes file, streams DATA (Arrow) back to Worker    │
+│  5. Worker writes to Sink (Staging) with injected lineage          │
+│  6. On DONE signal: Sink.promote() moves staging → production      │
+│  7. JobQueue.complete_job() marks job COMPLETED                    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
----
+-----
 
 ## Testing Strategy
 
@@ -358,10 +366,17 @@ Inspector validates all expected tables and columns exist.
 |-----------|-------|
 | `test_smoke.py` | End-to-end: Scout → Queue → Worker → Sink |
 | `test_queue.py` | Priority ordering, atomic claims, completion |
+| `test_zmq_integration.py` | Protocol encoding, message flow |
+| `test_zmq_e2e.py` | Full multi-process system test |
 | `test_worker.py` | Error handling, job failure marking |
-| `test_heartbeat.py` | Worker crash handling |
 
 Key fixtures in `conftest.py`:
-- `temp_test_dir`: Isolated test data directory
-- `test_db_engine`: Fresh SQLite per test
-- `test_source_root`: Pre-configured SourceRoot ID
+
+  - `temp_test_dir`: Isolated test data directory
+  - `test_db_engine`: Fresh SQLite per test
+  - `test_source_root`: Pre-configured SourceRoot ID
+
+<!-- end list -->
+
+```
+```

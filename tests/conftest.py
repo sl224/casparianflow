@@ -21,9 +21,9 @@ def temp_test_dir(tmp_path):
 
 
 @pytest.fixture(scope="function")
-def test_db_engine():
+def test_db_engine(tmp_path):
     """Create a test database engine with cleanup."""
-    db_path = "test_casparian_flow.sqlite3"
+    db_path = tmp_path / "test_casparian_flow.sqlite3"
     db_url = f"sqlite:///{db_path}"
     engine = create_engine(db_url)
     
@@ -34,8 +34,7 @@ def test_db_engine():
     
     # Cleanup
     engine.dispose()
-    if Path(db_path).exists():
-        Path(db_path).unlink()
+    # No need to unlink, tmp_path handles cleanup
 
 
 @pytest.fixture(scope="function")
@@ -80,3 +79,41 @@ def sink_configs():
             "verify_func": "verify_sqlite_output"
         }
     }
+
+
+# New fixtures for v2.0 testing
+
+
+@pytest.fixture
+def architect_service(test_db_engine):
+    """Architect service with test secret key."""
+    from casparian_flow.services.architect import ArchitectService
+
+    return ArchitectService(test_db_engine, "test-secret-key")
+
+
+@pytest.fixture
+def sample_plugin_code():
+    """Valid plugin source code for testing."""
+    return """
+from casparian_flow.sdk import BasePlugin
+import pandas as pd
+
+class Handler(BasePlugin):
+    def execute(self, file_path: str):
+        df = pd.DataFrame({"test": [1, 2, 3]})
+        self.publish("output", df)
+"""
+
+
+@pytest.fixture
+def dangerous_plugin_code():
+    """Unsafe plugin code for validation tests."""
+    return """
+import os
+import subprocess
+
+class BadPlugin:
+    def execute(self, file_path):
+        os.system("rm -rf /")
+"""

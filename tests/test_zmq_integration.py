@@ -30,7 +30,7 @@ class TestProtocol:
             header = pack_header(op, 12345, 100)
             assert len(header) == HEADER_SIZE
             
-            unpacked_op, job_id, meta_len = unpack_header(header)
+            unpacked_op, job_id, meta_len, _, _ = unpack_header(header)
             assert unpacked_op == op
             assert job_id == 12345
             assert meta_len == 100
@@ -44,13 +44,13 @@ class TestProtocol:
         """Verify invalid op codes raise ValueError."""
         from casparian_flow.protocol import unpack_header
         
-        # Op code 0 is invalid
-        bad_header = struct.pack('!BxHQI', 0, 0, 123, 50)
+        # Op code 0 is invalid (Version=1)
+        bad_header = struct.pack('!BBHIQ', 1, 0, 0, 50, 123)
         with pytest.raises(ValueError, match="Invalid op_code"):
             unpack_header(bad_header)
         
-        # Op code 255 is invalid
-        bad_header = struct.pack('!BxHQI', 255, 0, 123, 50)
+        # Op code 255 is invalid (Version=1)
+        bad_header = struct.pack('!BBHIQ', 1, 255, 0, 50, 123)
         with pytest.raises(ValueError, match="Invalid op_code"):
             unpack_header(bad_header)
     
@@ -61,12 +61,13 @@ class TestProtocol:
         # Too short
         assert validate_header(b'short') is not None
         
-        # Invalid op code
-        garbage = b'\x00' * 16
+        # Invalid op code (Version=1, Op=0)
+        # Using correct V2 layout
+        garbage = struct.pack('!BBHIQ', 1, 0, 0, 0, 0)
         assert validate_header(garbage) is not None
         
-        # Valid header should pass
-        valid = struct.pack('!BxHQI', 1, 0, 123, 50)
+        # Valid header should pass (Version=1, Op=1)
+        valid = struct.pack('!BBHIQ', 1, 1, 0, 50, 123)
         assert validate_header(valid) is None
 
 
@@ -80,7 +81,7 @@ class TestMessageBuilders:
         frames = msg_execute(999, "/path/to/file.csv")
         
         assert len(frames) == 2
-        op, job_id, meta_len = unpack_header(frames[0])
+        op, job_id, meta_len, _, _ = unpack_header(frames[0])
         assert op == OpCode.EXEC
         assert job_id == 999
         assert frames[1] == b"/path/to/file.csv"
@@ -93,7 +94,7 @@ class TestMessageBuilders:
         frames = msg_data(123, payload)
         
         assert len(frames) == 3
-        op, job_id, _ = unpack_header(frames[0])
+        op, job_id, _, _, _ = unpack_header(frames[0])
         assert op == OpCode.DATA
         assert job_id == 123
         assert frames[2] == payload
@@ -104,7 +105,7 @@ class TestPluginLoader:
     
     def test_load_valid_plugin(self, tmp_path):
         """Verify plugin loading works for valid plugin."""
-        from casparian_flow.sidecar import load_plugin
+        from casparian_flow.sidecar import load_plugin_handler
         
         # Create a simple plugin
         plugin_file = tmp_path / "test_plugin.py"
@@ -115,18 +116,18 @@ def execute(filepath):
     return pd.DataFrame({"col1": [1, 2, 3]})
 """)
         
-        execute_fn = load_plugin(str(plugin_file))
+        execute_fn = load_plugin_handler(str(plugin_file))
         assert callable(execute_fn)
     
     def test_load_missing_execute_raises(self, tmp_path):
         """Verify plugin without execute function raises."""
-        from casparian_flow.sidecar import load_plugin
+        from casparian_flow.sidecar import load_plugin_handler
         
         plugin_file = tmp_path / "bad_plugin.py"
         plugin_file.write_text("x = 1")
         
-        with pytest.raises(AttributeError, match="execute"):
-            load_plugin(str(plugin_file))
+        with pytest.raises(AttributeError, match="Handler"):
+            load_plugin_handler(str(plugin_file))
 
 
 class TestTopicValidation:

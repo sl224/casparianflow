@@ -24,6 +24,15 @@ class StatusEnum(PyEnum):
     SKIPPED = "SKIPPED"
 
 
+class PluginStatusEnum(PyEnum):
+    """Plugin deployment status lifecycle."""
+
+    PENDING = "PENDING"  # Newly submitted, awaiting validation
+    STAGING = "STAGING"  # Passed validation, ready for sandbox testing
+    ACTIVE = "ACTIVE"  # Deployed and actively serving jobs
+    REJECTED = "REJECTED"  # Failed validation or sandbox test
+
+
 class RoutingRule(Base):
     __tablename__ = "cf_routing_rule"
     id = Column(Integer, primary_key=True)
@@ -156,3 +165,31 @@ class WorkerNode(Base):
     last_heartbeat = Column(DateTime, server_default=func.now())
     status = Column(String(50), default="ACTIVE")
     current_job_id = Column(Integer, nullable=True)
+
+
+class PluginManifest(Base):
+    """
+    Plugin code registry for AI-generated plugins.
+
+    Supports the Architect workflow: DEPLOY → Validate → Sandbox → ACTIVE
+    """
+
+    __tablename__ = "cf_plugin_manifest"
+    id = Column(Integer, primary_key=True)
+    plugin_name = Column(String(100), nullable=False, index=True)
+    version = Column(String(50), nullable=False)
+    source_code = Column(Text, nullable=False)
+    source_hash = Column(String(64), nullable=False, unique=True)
+    status = Column(Enum(PluginStatusEnum), default=PluginStatusEnum.PENDING, index=True)
+    signature = Column(String(128), nullable=True)
+    validation_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    deployed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_plugin_active_lookup", "plugin_name", "status"),
+        {"schema": DEFAULT_SCHEMA},
+    )
+
+
+
