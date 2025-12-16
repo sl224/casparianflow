@@ -12,12 +12,12 @@ from pathlib import Path
 from casparian_flow.sdk import BasePlugin
 from casparian_flow.services.architect import ArchitectService
 from casparian_flow.security.signing import Signer
+from casparian_flow.security.gatekeeper import verify_signature
 
 class Handler(BasePlugin):
     def configure(self, ctx, config: dict):
         self.ctx = ctx
-        self.architect_secret = config.get("architect_secret", "dev-secret-key")
-        pass
+        self.architect_secret = config.get("architect_secret", "default-secret-key-change-me")
 
     def execute(self, file_path: str):
         """
@@ -46,15 +46,15 @@ class Handler(BasePlugin):
              
         with open(sig_path, "r", encoding="utf-8") as f:
             registered_sig = f.read().strip()
-            
-        # Verify Integrity using the centralized Signer strategy
-        if not Signer.verify(source_code, registered_sig):
+
+        # Verify HMAC signature using the architect secret key
+        if not verify_signature(source_code, registered_sig, self.architect_secret):
             print(f"[SystemDeployer] ALARM {p.name}: Signature mismatch! Possible tampering.")
             return
 
         print(f"[SystemDeployer] Verified signature for {p.name}. Deploying...")
-        sig = registered_sig # Use the verified hash as the deployment signature
-        
+        sig = registered_sig # Use the verified HMAC signature for deployment
+
         # 4. Deploy via ZMQ Protocol
         self.ctx.send_deploy(
             plugin_name=plugin_name,

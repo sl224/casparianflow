@@ -151,6 +151,41 @@ def initialize_database(eng: sa.Engine, reset_tables: bool = False):
     logger.info(f"Schema fingerprint: {fingerprint[:16]}...")
 
 
+def seed_library_whitelist(eng: sa.Engine):
+    """
+    Seed the LibraryWhitelist table with commonly used Python libraries.
+    Safe to call multiple times - uses INSERT OR IGNORE for SQLite.
+    """
+    from casparian_flow.db.models import LibraryWhitelist
+    from sqlalchemy.orm import Session
+
+    initial_libraries = [
+        ("pandas", ">=2.0.0", "DataFrame processing"),
+        ("pyarrow", ">=22.0.0", "Parquet and Arrow operations"),
+        ("numpy", ">=1.26.0", "Numerical computing"),
+        ("sqlalchemy", ">=2.0.0", "Database operations"),
+        ("pydantic", ">=2.0.0", "Data validation"),
+        ("openpyxl", ">=3.0.0", "Excel file handling"),
+        ("pypdf", ">=5.0.0", "PDF file processing"),
+    ]
+
+    with Session(eng) as session:
+        for lib_name, version, desc in initial_libraries:
+            # Check if library already exists
+            existing = session.query(LibraryWhitelist).filter_by(library_name=lib_name).first()
+            if not existing:
+                lib = LibraryWhitelist(
+                    library_name=lib_name,
+                    version_constraint=version,
+                    description=desc
+                )
+                session.add(lib)
+                logger.info(f"Seeded library: {lib_name} {version}")
+
+        session.commit()
+        logger.info(f"LibraryWhitelist seeding complete. Total libraries: {len(initial_libraries)}")
+
+
 def get_or_create_sourceroot(eng: sa.Engine, path: str, type: str = "local") -> int:
     from sqlalchemy import select
 

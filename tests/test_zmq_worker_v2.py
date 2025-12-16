@@ -41,7 +41,7 @@ def worker_config(tmp_path, test_db_engine):  # Depend on test_db_engine to ensu
     return WorkerConfig(
         database=DatabaseConfig(connection_string=f"sqlite:///{db_path}"),
         storage=StorageConfig(parquet_root=tmp_path / "parquet"),
-        plugins=PluginsConfig(directory=tmp_path / "plugins"),
+        plugins=PluginsConfig(dir=tmp_path / "plugins"),
     )
 
 
@@ -143,7 +143,7 @@ class TestHotReload:
         worker.reload_plugins()
 
         # Verify plugin file was written
-        plugin_path = Path("plugins") / "reload_test_plugin.py"
+        plugin_path = worker_config.plugins.dir / "reload_test_plugin.py"
         assert plugin_path.exists()
         assert plugin_path.read_text(encoding="utf-8") == sample_plugin_code
 
