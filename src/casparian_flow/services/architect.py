@@ -74,6 +74,7 @@ class ArchitectService:
         source_code: str,
         signature: str,
         sample_input: Optional[str] = None,
+        unsafe: bool = False,
     ) -> DeploymentResult:
         """
         Deploy a new plugin through the full lifecycle.
@@ -84,14 +85,15 @@ class ArchitectService:
             source_code: Python source code
             signature: HMAC signature for authenticity
             sample_input: Optional test file path for sandbox testing
+            unsafe: If True, skip signature verification and safety validation (DEV ONLY)
 
         Returns:
             DeploymentResult with success status and details
         """
-        logger.info(f"Starting deployment: {plugin_name} v{version}")
+        logger.info(f"Starting deployment: {plugin_name} v{version}{' [UNSAFE MODE]' if unsafe else ''}")
 
-        # Step 1: Verify signature
-        if not verify_signature(source_code, signature, self.secret_key):
+        # Step 1: Verify signature (skip if unsafe mode)
+        if not unsafe and not verify_signature(source_code, signature, self.secret_key):
             logger.error(f"Signature verification failed: {plugin_name}")
             return DeploymentResult(
                 success=False,
@@ -100,8 +102,14 @@ class ArchitectService:
                 error_message="Invalid signature",
             )
 
-        # Step 2: Validate safety
-        validation = validate_plugin_safety(source_code)
+        # Step 2: Validate safety (skip if unsafe mode)
+        if not unsafe:
+            validation = validate_plugin_safety(source_code)
+        else:
+            # Create a mock validation result in unsafe mode
+            from casparian_flow.security.gatekeeper import ValidationResult
+            validation = ValidationResult(is_safe=True, error_message=None, violations=[])
+
         if not validation.is_safe:
             logger.error(f"Safety validation failed: {plugin_name}")
             with Session(self.engine) as session:
