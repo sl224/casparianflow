@@ -33,7 +33,7 @@ from casparian_flow.db.models import (
     StatusEnum, SourceRoot, PluginManifest
 )
 from casparian_flow.engine.config import WorkerConfig, DatabaseConfig, StorageConfig, PluginsConfig
-from casparian_flow.engine.zmq_worker import ZmqWorker
+from casparian_flow.engine.brokerimport ZmqWorker
 from casparian_flow.services.scout import Scout
 from casparian_flow.services.inspector import profile_file
 from casparian_flow.services.llm_generator import LLMGenerator
