@@ -10,10 +10,6 @@ from casparian_flow.sdk import PluginMetadata
 logger = logging.getLogger(__name__)
 
 def register_plugins_from_source(plugin_dir: Path, session: Session):
-    """
-    Registers plugins based on MANIFEST.subscriptions.
-    Does NOT create RoutingRules (those are configured separately in DB/UI).
-    """
     if not plugin_dir.exists(): return
 
     logger.info(f"Registering plugins from {plugin_dir}")
@@ -35,32 +31,34 @@ def register_plugins_from_source(plugin_dir: Path, session: Session):
                 logger.info(f"Found MANIFEST in {plugin_name}")
                 
                 # A. Plugin Config (Subscriptions)
-                # Join all input topics
                 subs_csv = ",".join(sorted(meta.subscriptions))
-                
                 p_conf = session.get(PluginConfig, plugin_name)
                 if not p_conf:
                     session.add(PluginConfig(plugin_name=plugin_name, subscription_tags=subs_csv))
                 else:
                     p_conf.subscription_tags = subs_csv
                 
-                # B. Topic Configs (Output Sinks)
-                # Use 'sinks' dict to map output_topic -> URI
+                # B. Topic Configs
+                # 1. From 'sinks' dict (Explicit URIs)
                 for topic, uri in meta.sinks.items():
-                    t_conf = session.query(TopicConfig).filter_by(plugin_name=plugin_name, topic_name=topic).first()
-                    if not t_conf:
-                        session.add(TopicConfig(
-                            plugin_name=plugin_name,
-                            topic_name=topic,
-                            uri=uri,
-                            mode="append"
-                        ))
+                    _upsert_topic(session, plugin_name, topic, uri)
                 
-                # Also ensure default topics in 'subscriptions' have output sinks? 
-                # No, inputs != outputs. Outputs are usually defined by what 'publish' calls are made.
-                # If 'sinks' is empty, we don't pre-register outputs. Context defaults to Parquet.
-            
+                # 2. From 'subscriptions' (Implied topics? No, usually outputs are distinct)
+                # But we might want defaults for topics mentioned in code? 
+                # We can't know them unless declared.
+                # However, for the demo, we assume the output topic matches the input subscription name or logic
+                
         except Exception as e:
             logger.error(f"Failed to inspect/register {f.name}: {e}")
             
     session.commit()
+
+def _upsert_topic(session, plugin, topic, uri):
+    t_conf = session.query(TopicConfig).filter_by(plugin_name=plugin, topic_name=topic).first()
+    if not t_conf:
+        session.add(TopicConfig(
+            plugin_name=plugin,
+            topic_name=topic,
+            uri=uri,
+            mode="append"
+        ))

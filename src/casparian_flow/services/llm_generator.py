@@ -19,8 +19,7 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# --- Pydantic Models for Structured Output ---
-# These act as the "Spec" for the LLM.
+# --- Pydantic Models ---
 class ColumnModel(BaseModel):
     name: str
     target_type: str = Field(description="int, float, string, bool, or datetime")
@@ -37,16 +36,13 @@ class SchemaResponseModel(BaseModel):
     read_strategy: str = Field(description="pandas, pyarrow, json, or custom")
     reasoning: str
 
-# ---------------------------------------------
+# -----------------------
 
 class LLMGenerator(AIGenerator):
     def __init__(self, provider: LLMProvider):
         self.provider = provider
         
     def propose_schema(self, profile: FileProfile, user_feedback: Optional[str] = None) -> SchemaProposal:
-        """
-        Step 1: Infer schema. Uses Pydantic for schema definition and validation.
-        """
         # 1. Prepare Context
         sample_str = self._decode_sample(profile)
         schema_json = json.dumps(SchemaResponseModel.model_json_schema(), indent=2)
@@ -64,14 +60,11 @@ class LLMGenerator(AIGenerator):
             json_mode=True
         )
         
-        # 3. Parse & Validate with Pydantic
+        # 3. Parse & Validate
         try:
-            # Still need robust extraction because providers are chatty
             json_str = self._extract_json(resp_str)
             parsed = SchemaResponseModel.model_validate_json(json_str)
             
-            # Convert Pydantic Model -> Internal POD (Domain Object)
-            # This decouples the AI layer from the Core layer
             tables = []
             for t in parsed.tables:
                 cols = [
@@ -96,16 +89,12 @@ class LLMGenerator(AIGenerator):
             raise ValueError(f"LLM returned invalid structure: {e}")
 
     def generate_plugin(self, proposal: SchemaProposal, user_feedback: Optional[str] = None, example_path: str = "") -> PluginCode:
-        """
-        Step 2: Generate Code. 
-        Strings are fine here since we want code, not data.
-        """
         system_prompt = self._get_code_system_prompt()
         user_prompt = self._get_code_user_prompt(proposal, user_feedback, example_path)
 
         logger.info("Sending GENERATE request to LLM...")
         code_str = self.provider.chat_completion(
-            messages=[
+             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
@@ -114,7 +103,7 @@ class LLMGenerator(AIGenerator):
         
         code_str = self._clean_markdown(code_str)
         primary_topic = proposal.tables[0].topic_name if proposal.tables else "output"
-
+             
         return PluginCode(
             filename=f"generated_{primary_topic}.py",
             source_code=code_str,
@@ -122,7 +111,7 @@ class LLMGenerator(AIGenerator):
             entry_point="Handler"
         )
 
-    # --- Helpers & Prompts ---
+    # --- Helpers ---
 
     def _decode_sample(self, profile: FileProfile) -> str:
         if not profile.head_sample.encoding_detected:
@@ -135,7 +124,6 @@ class LLMGenerator(AIGenerator):
             return "<binary_decode_error>"
 
     def _extract_json(self, text: str) -> str:
-        """Robust JSON extractor."""
         text = text.strip()
         if text.startswith("{") and text.endswith("}"):
             return text
@@ -143,7 +131,6 @@ class LLMGenerator(AIGenerator):
         return match.group(1) if match else text
 
     def _clean_markdown(self, text: str) -> str:
-        """Robust code fence stripper."""
         text = text.strip()
         patterns = [r"```python\s*(.*?)```", r"```\s*(.*?)```"]
         for p in patterns:
@@ -185,37 +172,29 @@ Sample Data:
         return """
 You are a Python Expert. Write a Casparian Flow Plugin.
 
-CRITICAL INSTRUCTIONS:
-1. **Imports**: You MUST import `BasePlugin`, `PluginMetadata`, and `FileEvent` from `casparian_flow.sdk`.
-   - DO NOT import `Plugin`. It does not exist.
-   - DO NOT import `Handler` from anywhere. You are defining it.
-2. **Class**: Define a class (e.g., `Handler`) that inherits from `BasePlugin`.
-3. **Manifest**: Define `MANIFEST = PluginMetadata(subscriptions=["..."])` at the module level.
-4. **Logic**: Implement `consume(self, event: FileEvent)`. Access the file path via `event.path`.
-5. **Publishing**: Use `self.publish(topic, df)` to send data.
+STRICT REQUIREMENTS:
+1. **Imports**: 
+   - `from casparian_flow.sdk import BasePlugin, PluginMetadata, FileEvent`
+   - DO NOT import `Plugin`.
+2. **Configuration**: 
+   - `MANIFEST = PluginMetadata(subscriptions=["topic_name"])`
+   - **DO NOT** include `pattern` or `topic` arguments. They are removed. Only `subscriptions` (list).
+3. **Class**: 
+   - `class Handler(BasePlugin):`
+4. **Method**: 
+   - `def consume(self, event: FileEvent):`
+   - Access file path via `event.path`.
+5. **Logic**:
+   - Open/Read `event.path`.
+   - `self.publish("topic_name", dataframe)`
 6. **Output**: Return ONLY valid Python code.
-
-Example Structure:
-```python
-from casparian_flow.sdk import BasePlugin, PluginMetadata, FileEvent
-import pandas as pd
-
-MANIFEST = PluginMetadata(subscriptions=["input_topic"])
-
-class Handler(BasePlugin):
-    def consume(self, event: FileEvent):
-        # logic here
-        pass
-
 """
 
     def _get_code_user_prompt(self, proposal, feedback, example_path) -> str:
         filename = re.split(r'[/\\]', example_path)[-1] if example_path else "*.csv"
-    
+        
         schema_desc = f"Goal: Read format '{proposal.file_type_inferred}'\nTables:"
-        topics = []
         for t in proposal.tables:
-            topics.append(t.topic_name)
             schema_desc += f"\n- Table '{t.topic_name}': {t.description}"
             schema_desc += "\n  Cols: " + ", ".join([f"{c.name}({c.target_type})" for c in t.columns])
 
@@ -224,8 +203,9 @@ class Handler(BasePlugin):
 
 Reasoning: {proposal.reasoning}
 
-Constraint: The MANIFEST pattern/subscription must target files like '{filename}'. """
+Target File Name: {filename}
+"""
         if feedback:
             prompt += f"\nUSER FEEDBACK:\n'{feedback}'\n"
-
+            
         return prompt + "\nWrite the handler code."
