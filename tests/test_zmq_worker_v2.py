@@ -10,7 +10,7 @@ import time
 from unittest.mock import Mock, patch, MagicMock
 from pathlib import Path
 
-from casparian_flow.engine.zmq_worker import ZmqWorker
+from casparian_flow.engine.brokerimport ZmqWorker
 from casparian_flow.engine.config import WorkerConfig
 from casparian_flow.protocol import OpCode, pack_header, msg_heartbeat, msg_deploy
 from casparian_flow.db.models import PluginManifest, PluginStatusEnum

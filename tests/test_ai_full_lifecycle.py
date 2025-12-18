@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from casparian_flow.engine.zmq_worker import ZmqWorker
+from casparian_flow.engine.brokerimport ZmqWorker
 from casparian_flow.engine.config import WorkerConfig, DatabaseConfig, StorageConfig, PluginsConfig
 from casparian_flow.services.ai_types import FileProfile, SchemaProposal, PluginCode
 from casparian_flow.services.llm_generator import LLMGenerator
