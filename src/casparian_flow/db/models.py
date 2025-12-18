@@ -10,6 +10,7 @@ from sqlalchemy import (
     Index,
     Text,
     Float,
+    Boolean,
     func,
 )
 from sqlalchemy.orm import relationship
@@ -28,10 +29,10 @@ class StatusEnum(PyEnum):
 class PluginStatusEnum(PyEnum):
     """Plugin deployment status lifecycle."""
 
-    PENDING = "PENDING"  # Newly submitted, awaiting validation
-    STAGING = "STAGING"  # Passed validation, ready for sandbox testing
-    ACTIVE = "ACTIVE"  # Deployed and actively serving jobs
-    REJECTED = "REJECTED"  # Failed validation or sandbox test
+    PENDING = "PENDING"
+    STAGING = "STAGING"
+    ACTIVE = "ACTIVE"
+    REJECTED = "REJECTED"
 
 
 class RoutingRule(Base):
@@ -40,6 +41,22 @@ class RoutingRule(Base):
     pattern = Column(String(500), nullable=False)
     tag = Column(String(50), nullable=False)
     priority = Column(Integer, default=0)
+
+
+class IgnoreRule(Base):
+    """
+    Patterns to exclude from scanning (e.g., node_modules, *.tmp).
+    Uses .gitignore syntax.
+    """
+
+    __tablename__ = "cf_ignore_rule"
+    id = Column(Integer, primary_key=True)
+    source_root_id = Column(
+        Integer, ForeignKey("cf_source_root.id"), nullable=True
+    )  # Null = Global rule
+    pattern = Column(String(500), nullable=False)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class PluginConfig(Base):
@@ -90,14 +107,11 @@ class FileLocation(Base):
     __tablename__ = "cf_file_location"
     id = Column(Integer, primary_key=True)
     source_root_id = Column(Integer, ForeignKey("cf_source_root.id"), nullable=False)
-
-    # CRITICAL: 850 chars is safe for MSSQL Index (Limit 900 bytes).
-    # Do NOT use Text here or lookups become O(N).
     rel_path = Column(String(850), nullable=False)
     filename = Column(String(255), nullable=False)
 
-    # Inventory State (Decoupled Scanner)
-    last_known_mtime = Column(Float, nullable=True)  # Epoch time from os.stat
+    # Inventory State
+    last_known_mtime = Column(Float, nullable=True)
     last_known_size = Column(Integer, nullable=True)
 
     current_version_id = Column(
@@ -109,7 +123,6 @@ class FileLocation(Base):
     source_root = relationship("SourceRoot")
 
     __table_args__ = (
-        # This index is mandatory for Scout performance
         Index("ix_file_location_lookup", "source_root_id", "rel_path"),
         {"schema": DEFAULT_SCHEMA},
     )
@@ -173,19 +186,15 @@ class WorkerNode(Base):
 
 
 class PluginManifest(Base):
-    """
-    Plugin code registry for AI-generated plugins.
-
-    Supports the Architect workflow: DEPLOY → Validate → Sandbox → ACTIVE
-    """
-
     __tablename__ = "cf_plugin_manifest"
     id = Column(Integer, primary_key=True)
     plugin_name = Column(String(100), nullable=False, index=True)
     version = Column(String(50), nullable=False)
     source_code = Column(Text, nullable=False)
     source_hash = Column(String(64), nullable=False, unique=True)
-    status = Column(Enum(PluginStatusEnum), default=PluginStatusEnum.PENDING, index=True)
+    status = Column(
+        Enum(PluginStatusEnum), default=PluginStatusEnum.PENDING, index=True
+    )
     signature = Column(String(128), nullable=True)
     validation_error = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
@@ -198,7 +207,6 @@ class PluginManifest(Base):
 
 
 class PhaseEnum(PyEnum):
-    """Surveyor Agent protocol phase states."""
     IDLE = "IDLE"
     PHASE_1_RECONNAISSANCE = "PHASE_1_RECONNAISSANCE"
     PHASE_2_ENVIRONMENT = "PHASE_2_ENVIRONMENT"
@@ -211,35 +219,28 @@ class PhaseEnum(PyEnum):
 
 
 class LibraryWhitelist(Base):
-    """Allowed Python libraries for plugin generation."""
     __tablename__ = "cf_library_whitelist"
-
     id = Column(Integer, primary_key=True)
     library_name = Column(String(100), nullable=False, unique=True)
     version_constraint = Column(String(50), nullable=True)
     description = Column(Text, nullable=True)
     added_at = Column(DateTime, server_default=func.now())
-
     __table_args__ = ({"schema": DEFAULT_SCHEMA},)
 
 
 class SurveyorSession(Base):
-    """Tracks Surveyor Agent execution sessions."""
     __tablename__ = "cf_surveyor_session"
-
     id = Column(Integer, primary_key=True)
     source_root_id = Column(Integer, ForeignKey("cf_source_root.id"), nullable=False)
     current_phase = Column(Enum(PhaseEnum), default=PhaseEnum.IDLE)
     started_at = Column(DateTime, server_default=func.now())
     completed_at = Column(DateTime, nullable=True)
     error_message = Column(Text, nullable=True)
-
-    # Phase-specific state (JSON blob for flexibility)
     phase_data = Column(Text, default="{}")
-
     source_root = relationship("SourceRoot")
-    decisions = relationship("SurveyorDecision", back_populates="session", cascade="all, delete-orphan")
-
+    decisions = relationship(
+        "SurveyorDecision", back_populates="session", cascade="all, delete-orphan"
+    )
     __table_args__ = (
         Index("ix_surveyor_session_lookup", "source_root_id", "current_phase"),
         {"schema": DEFAULT_SCHEMA},
@@ -247,19 +248,15 @@ class SurveyorSession(Base):
 
 
 class SurveyorDecision(Base):
-    """Audit trail of Surveyor Agent decisions."""
     __tablename__ = "cf_surveyor_decision"
-
     id = Column(Integer, primary_key=True)
     session_id = Column(Integer, ForeignKey("cf_surveyor_session.id"), nullable=False)
     phase = Column(Enum(PhaseEnum), nullable=False)
     timestamp = Column(DateTime, server_default=func.now())
     decision_type = Column(String(50), nullable=False)
-    decision_data = Column(Text, nullable=False)  # JSON
+    decision_data = Column(Text, nullable=False)
     reasoning = Column(Text, nullable=True)
-
     session = relationship("SurveyorSession", back_populates="decisions")
-
     __table_args__ = (
         Index("ix_surveyor_decision_lookup", "session_id", "phase"),
         {"schema": DEFAULT_SCHEMA},

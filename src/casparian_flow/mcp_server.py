@@ -34,7 +34,7 @@ def get_db():
     return SessionLocal()
 
 
-def get_surveyor_agent(db: Session) -> 'SurveyorAgent':
+def get_surveyor_agent(db: Session) -> "SurveyorAgent":
     """
     Factory for SurveyorAgent with all dependencies.
 
@@ -54,7 +54,9 @@ def get_surveyor_agent(db: Session) -> 'SurveyorAgent':
         llm_provider = get_provider(llm_provider_type)
     except Exception as e:
         # Fallback to manual provider if configured provider fails
-        logger.warning(f"Failed to initialize {llm_provider_type} provider: {e}, falling back to manual")
+        logger.warning(
+            f"Failed to initialize {llm_provider_type} provider: {e}, falling back to manual"
+        )
         llm_provider = get_provider("manual")
 
     llm_generator = LLMGenerator(llm_provider)
@@ -215,9 +217,12 @@ def register_and_scan_path(path: str):
 
         # Get statistics
         file_count = db.query(FileLocation).filter_by(source_root_id=root.id).count()
-        version_count = db.query(FileVersion).join(FileLocation).filter(
-            FileLocation.source_root_id == root.id
-        ).count()
+        version_count = (
+            db.query(FileVersion)
+            .join(FileLocation)
+            .filter(FileLocation.source_root_id == root.id)
+            .count()
+        )
 
         return f"Scan complete for '{path}'. Files: {file_count}, Versions: {version_count}"
 
@@ -247,9 +252,7 @@ def sample_unprocessed_files(limit: int = 5):
 
         # Also include files with empty tags
         empty_tags_query = (
-            db.query(FileVersion)
-            .filter(FileVersion.applied_tags == "")
-            .limit(limit)
+            db.query(FileVersion).filter(FileVersion.applied_tags == "").limit(limit)
         )
 
         empty_tags = empty_tags_query.all()
@@ -261,15 +264,17 @@ def sample_unprocessed_files(limit: int = 5):
         for fv in all_unprocessed:
             loc = db.query(FileLocation).get(fv.location_id)
             if loc:
-                results.append({
-                    "file_version_id": fv.id,
-                    "file_location_id": loc.id,
-                    "path": loc.rel_path,
-                    "filename": loc.filename,
-                    "size_bytes": fv.size_bytes,
-                    "tags": fv.applied_tags,
-                    "content_hash": fv.content_hash,
-                })
+                results.append(
+                    {
+                        "file_version_id": fv.id,
+                        "file_location_id": loc.id,
+                        "path": loc.rel_path,
+                        "filename": loc.filename,
+                        "size_bytes": fv.size_bytes,
+                        "tags": fv.applied_tags,
+                        "content_hash": fv.content_hash,
+                    }
+                )
 
         return json.dumps(results, indent=2)
 
@@ -384,7 +389,9 @@ def deploy_plugin(name: str, code: str):
             "plugin_name": name,
             "manifest_id": result.manifest_id,
             "error": result.error_message,
-            "validation_errors": result.validation_errors if hasattr(result, 'validation_errors') else [],
+            "validation_errors": result.validation_errors
+            if hasattr(result, "validation_errors")
+            else [],
         }
 
         return json.dumps(response, indent=2)
@@ -415,7 +422,11 @@ def configure_routing(pattern: str, tag: str, plugin_name: str):
             db.add(config)
         else:
             # Append tag if not already present
-            existing_tags = set(config.subscription_tags.split(",")) if config.subscription_tags else set()
+            existing_tags = (
+                set(config.subscription_tags.split(","))
+                if config.subscription_tags
+                else set()
+            )
             existing_tags.add(tag)
             config.subscription_tags = ",".join(sorted(existing_tags))
 
@@ -435,15 +446,21 @@ def get_system_status():
     with get_db() as db:
         queued = db.query(ProcessingJob).filter_by(status=StatusEnum.QUEUED).count()
         running = db.query(ProcessingJob).filter_by(status=StatusEnum.RUNNING).count()
-        completed = db.query(ProcessingJob).filter_by(status=StatusEnum.COMPLETED).count()
-        failed = db.query(ProcessingJob).filter_by(status=StatusEnum.FAILED).limit(10).all()
+        completed = (
+            db.query(ProcessingJob).filter_by(status=StatusEnum.COMPLETED).count()
+        )
+        failed = (
+            db.query(ProcessingJob).filter_by(status=StatusEnum.FAILED).limit(10).all()
+        )
 
         recent_failures = [
             {
                 "id": j.id,
                 "plugin": j.plugin_name,
                 "file_version_id": j.file_version_id,
-                "error": j.error_message[:200] if j.error_message else "No error message",
+                "error": j.error_message[:200]
+                if j.error_message
+                else "No error message",
                 "retry_count": j.retry_count,
             }
             for j in failed

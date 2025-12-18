@@ -11,15 +11,15 @@ logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     logger.info("Starting Casparian Sentinel (Broker)...")
-    
+
     config = WorkerConfig(
         database=DatabaseConfig(
             connection_string=str(sql_io.get_engine(settings.database).url)
         )
     )
-    
+
     sentinel = Sentinel(config, bind_addr="tcp://127.0.0.1:5555")
-    
+
     try:
         sentinel.run()
     except KeyboardInterrupt:

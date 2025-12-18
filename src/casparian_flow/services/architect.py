@@ -90,7 +90,9 @@ class ArchitectService:
         Returns:
             DeploymentResult with success status and details
         """
-        logger.info(f"Starting deployment: {plugin_name} v{version}{' [UNSAFE MODE]' if unsafe else ''}")
+        logger.info(
+            f"Starting deployment: {plugin_name} v{version}{' [UNSAFE MODE]' if unsafe else ''}"
+        )
 
         # Step 1: Verify signature (skip if unsafe mode)
         if not unsafe and not verify_signature(source_code, signature, self.secret_key):
@@ -108,7 +110,10 @@ class ArchitectService:
         else:
             # Create a mock validation result in unsafe mode
             from casparian_flow.security.gatekeeper import ValidationResult
-            validation = ValidationResult(is_safe=True, error_message=None, violations=[])
+
+            validation = ValidationResult(
+                is_safe=True, error_message=None, violations=[]
+            )
 
         if not validation.is_safe:
             logger.error(f"Safety validation failed: {plugin_name}")
@@ -137,9 +142,7 @@ class ArchitectService:
         with Session(self.engine) as session:
             # Check for duplicate hash
             existing = (
-                session.query(PluginManifest)
-                .filter_by(source_hash=source_hash)
-                .first()
+                session.query(PluginManifest).filter_by(source_hash=source_hash).first()
             )
             if existing:
                 logger.warning(f"Duplicate plugin detected: {plugin_name}")

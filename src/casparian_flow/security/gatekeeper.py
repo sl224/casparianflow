@@ -122,7 +122,9 @@ def validate_plugin_safety(source_code: str) -> ValidationResult:
         tree = ast.parse(source_code)
     except SyntaxError as e:
         return ValidationResult(
-            is_safe=False, error_message=f"Syntax error: {e}", violations=["SYNTAX_ERROR"]
+            is_safe=False,
+            error_message=f"Syntax error: {e}",
+            violations=["SYNTAX_ERROR"],
         )
 
     # Step 2: Check for dangerous imports

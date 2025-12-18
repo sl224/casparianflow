@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PhaseResult:
     """Result of a phase execution."""
+
     success: bool
     next_phase: PhaseEnum
     data: Dict[str, Any]
@@ -62,7 +63,7 @@ class SurveyorAgent:
         scout: Scout,
         architect: ArchitectService,
         llm_generator: LLMGenerator,
-        test_generator: 'TestGenerator',
+        test_generator: "TestGenerator",
     ):
         self.db = db_session
         self.scout = scout
@@ -81,7 +82,9 @@ class SurveyorAgent:
         self.db.commit()
         self.db.refresh(session)
 
-        logger.info(f"Created surveyor session {session.id} for source_root {source_root_id}")
+        logger.info(
+            f"Created surveyor session {session.id} for source_root {source_root_id}"
+        )
         return session
 
     def execute_phase(self, session: SurveyorSession) -> PhaseResult:
@@ -184,7 +187,9 @@ class SurveyorAgent:
             f"Selected file_version {sample_file.id} as representative sample",
         )
 
-        logger.info(f"[Session {session.id}] Found {len(unprocessed)} unprocessed files")
+        logger.info(
+            f"[Session {session.id}] Found {len(unprocessed)} unprocessed files"
+        )
 
         return PhaseResult(
             success=True,
@@ -320,7 +325,9 @@ class SurveyorAgent:
             try:
                 from casparian_flow.security.gatekeeper import generate_signature
 
-                signature = generate_signature(plugin_code_result.source_code, self.architect.secret_key)
+                signature = generate_signature(
+                    plugin_code_result.source_code, self.architect.secret_key
+                )
 
                 result = self.architect.deploy_plugin(
                     plugin_name=plugin_name,
@@ -349,15 +356,22 @@ class SurveyorAgent:
                         f"Successfully deployed plugin {plugin_name}",
                     )
 
-                    logger.info(f"[Session {session.id}] Plugin {plugin_name} deployed successfully")
+                    logger.info(
+                        f"[Session {session.id}] Plugin {plugin_name} deployed successfully"
+                    )
 
                     return PhaseResult(
                         success=True,
                         next_phase=PhaseEnum.PHASE_4_WIRING,
-                        data={"plugin_name": plugin_name, "manifest_id": result.manifest_id},
+                        data={
+                            "plugin_name": plugin_name,
+                            "manifest_id": result.manifest_id,
+                        },
                     )
                 else:
-                    logger.warning(f"Deployment attempt {attempt + 1} failed: {result.error_message}")
+                    logger.warning(
+                        f"Deployment attempt {attempt + 1} failed: {result.error_message}"
+                    )
                     if attempt == max_retries - 1:
                         return PhaseResult(
                             success=False,
@@ -417,6 +431,7 @@ class SurveyorAgent:
 
         # Infer pattern from filename (e.g., *.csv, *.xlsx)
         from pathlib import Path as PathlibPath
+
         ext = PathlibPath(file_loc.filename).suffix
         pattern = f"*{ext}" if ext else file_loc.filename
 
@@ -433,7 +448,11 @@ class SurveyorAgent:
             config = PluginConfig(plugin_name=plugin_name, subscription_tags=tag)
             self.db.add(config)
         else:
-            existing_tags = set(config.subscription_tags.split(",")) if config.subscription_tags else set()
+            existing_tags = (
+                set(config.subscription_tags.split(","))
+                if config.subscription_tags
+                else set()
+            )
             existing_tags.add(tag)
             config.subscription_tags = ",".join(sorted(existing_tags))
 
@@ -458,7 +477,9 @@ class SurveyorAgent:
             f"Configured routing: {pattern} -> {tag} -> {plugin_name}",
         )
 
-        logger.info(f"[Session {session.id}] Routing configured: {pattern} -> {tag} -> {plugin_name}")
+        logger.info(
+            f"[Session {session.id}] Routing configured: {pattern} -> {tag} -> {plugin_name}"
+        )
 
         return PhaseResult(
             success=True,
@@ -491,7 +512,9 @@ class SurveyorAgent:
         jobs = self.db.query(ProcessingJob).filter_by(plugin_name=plugin_name).all()
 
         if not jobs:
-            logger.warning(f"[Session {session.id}] No jobs found for plugin {plugin_name}, but continuing")
+            logger.warning(
+                f"[Session {session.id}] No jobs found for plugin {plugin_name}, but continuing"
+            )
             # Not a failure - jobs may be queued later
 
         # Count job statuses
@@ -571,6 +594,7 @@ class SurveyorAgent:
 
         # Reconstruct SchemaProposal (simplified)
         from casparian_flow.services.ai_types import SchemaProposal
+
         schema_proposal = SchemaProposal(
             file_type_inferred=schema_proposal_data.get("file_type", "UNKNOWN"),
             target_topic=schema_proposal_data.get("target_topic", "output"),
@@ -599,7 +623,9 @@ class SurveyorAgent:
                     f"Generated test at {test_result.test_file_path}",
                 )
 
-                logger.info(f"[Session {session.id}] Test generated: {test_result.test_file_path}")
+                logger.info(
+                    f"[Session {session.id}] Test generated: {test_result.test_file_path}"
+                )
 
                 return PhaseResult(
                     success=True,
