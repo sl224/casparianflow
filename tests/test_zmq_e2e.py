@@ -11,7 +11,7 @@ from casparian_flow.db.models import (
     TopicConfig, StatusEnum, FileHashRegistry
 )
 from casparian_flow.db.setup import initialize_database, get_or_create_sourceroot
-from casparian_flow.engine.zmq_worker import ZmqWorker
+from casparian_flow.engine.brokerimport ZmqWorker
 from casparian_flow.engine.config import WorkerConfig, DatabaseConfig, StorageConfig
 
 # Use a specific port to avoid conflicts
