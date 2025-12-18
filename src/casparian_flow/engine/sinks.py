@@ -1,6 +1,7 @@
 # src/casparian_flow/engine/sinks.py
 import logging
 import shutil
+import os
 from typing import Any, Protocol, Dict
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -61,10 +62,6 @@ class MssqlSink:
     def promote(self):
         logger.info(f"Promoting {self.staging_table} to {self.table_name}")
         with self.engine.begin() as conn:
-            # 1. Create Target if not exists (Lazy init usually handled by first to_sql if we wrote directly)
-            # Here we assume target might exist.
-
-            # Simple Append Strategy: INSERT INTO Target SELECT * FROM Staging
             try:
                 insert_sql = f"""
                 INSERT INTO {self.schema}.{self.table_name} 
@@ -82,7 +79,20 @@ class MssqlSink:
 
 class SqliteSink:
     def __init__(self, db_path: str, table_name: str, options: Dict, job_id: int):
-        self.engine = create_engine(f"sqlite:///{db_path}")
+        # Handle absolute windows paths correctly for sqlite url
+        # If it's a file path, we need 3 slashes for relative, 4 for absolute?
+        # Actually sqlalchemy create_engine handles sqlite:///C:/path fine.
+        # We just need to ensure db_path is passed correctly.
+        
+        # If db_path comes from urlparse.netloc it might be empty for absolute paths
+        # If we reconstruct it, we need to be careful.
+        if os.name == 'nt' and ':' in db_path and not db_path.startswith('/'):
+             # It's a windows absolute path C:\..., sqlalchemy needs sqlite:///C:\...
+             self.engine = create_engine(f"sqlite:///{db_path}")
+        else:
+             # Standard handling
+             self.engine = create_engine(f"sqlite:///{db_path}")
+             
         self.table_name = table_name
         self.staging_table = f"{table_name}_stg_{job_id}"
         self.if_exists = options.get("mode", ["append"])[0]
@@ -103,7 +113,6 @@ class SqliteSink:
 
     def promote(self):
         with self.engine.begin() as conn:
-            # Check if target table exists
             try:
                 conn.execute(text(f"SELECT 1 FROM {self.table_name} LIMIT 1"))
                 exists = True
@@ -131,7 +140,6 @@ class SqliteSink:
 class ParquetSink:
     def __init__(self, root_path: Path, relative_path: str, options: Dict, job_id: int):
         self.final_path = root_path / relative_path
-        # Staging: Write to a distinct file
         self.staging_path = root_path / f"{relative_path}.stg.{job_id}"
 
         self.staging_path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,13 +175,9 @@ class ParquetSink:
             self.writer = None
 
         if self.staging_path.exists():
-            # Move staging file into the target directory
             filename = self.staging_path.name.replace(".stg.", ".")
-
-            # Treat final_path as a directory for datasets
             target_dir = self.final_path
             if target_dir.suffix != "":
-                # If user specified a file-like path, assume parent is dir
                 target_dir = target_dir.parent
 
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -200,9 +204,24 @@ class SinkFactory:
             return MssqlSink(sql_engine, path, options, job_id)
 
         elif scheme == "sqlite":
-            db_path = parsed.netloc
-            table_name = parsed.path.lstrip("/")
-            return SqliteSink(db_path, table_name, options, job_id)
+            # Parsing logic for sqlite:///path/to/db/table
+            # If netloc is empty (absolute path), path is /C:/.../db/table
+            if not parsed.netloc:
+                full_path = parsed.path
+                # Split at last slash to separate DB file from table name
+                # This assumes table name cannot contain slashes, which is true for SQL tables
+                db_path_str, table_name = full_path.rsplit('/', 1)
+                
+                # Cleanup leading slash if on Windows and it looks like /C:/...
+                if os.name == 'nt' and db_path_str.startswith('/') and ':' in db_path_str:
+                    db_path_str = db_path_str.lstrip('/')
+                    
+                return SqliteSink(db_path_str, table_name, options, job_id)
+            else:
+                # Relative path: sqlite://file.db/table
+                db_path = parsed.netloc
+                table_name = parsed.path.lstrip("/")
+                return SqliteSink(db_path, table_name, options, job_id)
 
         elif scheme == "parquet":
             path = parsed.netloc + parsed.path
