@@ -34,8 +34,6 @@ class Sentinel:
         self.engine = create_engine(config.database.connection_string)
         self.queue = JobQueue(self.engine)
 
-        # ZMQ setup deferred to run() or initialized here?
-        # Initializing here is fine, but CLOSING must happen in the same thread that uses it.
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.ROUTER)
         self.socket.setsockopt(zmq.LINGER, 0)  # Prevent hang on close
@@ -67,7 +65,6 @@ class Sentinel:
         except Exception as e:
             logger.critical(f"Sentinel crashed: {e}", exc_info=True)
         finally:
-            # CRITICAL: Close socket IN THE SAME THREAD that used it
             logger.info("Sentinel shutting down...")
             try:
                 self.socket.close()
@@ -87,17 +84,28 @@ class Sentinel:
                 return
 
             identity, header = frames[0], frames[1]
-            payload = frames[2] if len(frames) > 2 else b""
-
+            # Payload logic depends on OpCode
+            
             op, job_id, _, _, _ = unpack_header(header)
 
             if op == OpCode.HELLO:
+                payload = frames[2] if len(frames) > 2 else b""
                 self._register_worker(identity, payload)
             elif op == OpCode.READY:
                 self._worker_ready(identity)
             elif op == OpCode.DATA:
-                self._handle_data(job_id, payload)
+                # Expect: [Identity, Header, Topic, Payload]
+                # Fallback for backward compatibility if needed
+                if len(frames) >= 4:
+                    topic = frames[2].decode()
+                    payload = frames[3]
+                else:
+                    topic = "output"
+                    payload = frames[2] if len(frames) > 2 else b""
+                    
+                self._handle_data(job_id, topic, payload)
             elif op == OpCode.ERR:
+                payload = frames[2] if len(frames) > 2 else b""
                 self._handle_error(job_id, payload)
                 self._worker_ready(identity)
 
@@ -158,6 +166,9 @@ class Sentinel:
             job_id=job.id,
             file_version_id=job.file_version_id,
         )
+        
+        # We allow dynamic topic registration now, so we don't strictly require "output"
+        # But we can keep it as a default for legacy plugins.
         ctx.register_topic("output", default_uri=f"parquet://{job.plugin_name}_output")
         self.active_contexts[job.id] = ctx
 
@@ -167,7 +178,6 @@ class Sentinel:
             source_root = fl.source_root
             if not source_root:
                 from casparian_flow.db.models import SourceRoot
-
                 source_root = s.get(SourceRoot, fl.source_root_id)
 
             full_path = str(Path(source_root.path) / fl.rel_path)
@@ -178,14 +188,23 @@ class Sentinel:
             [worker.identity] + msg_exec(job.id, job.plugin_name, full_path)
         )
 
-    def _handle_data(self, job_id, payload):
+    def _handle_data(self, job_id, topic, payload):
         if job_id in self.active_contexts:
+            ctx = self.active_contexts[job_id]
             try:
+                # Dynamic Topic Registration
+                # To prevent schema mismatch, we isolate each topic to its own Parquet folder.
+                # URI format: parquet://{topic_name} -> writes to output_root/{topic_name}
+                # The ctx.register_topic method is usually idempotent (returns existing handle).
+                
+                uri = f"parquet://{topic}"
+                handle = ctx.register_topic(topic, default_uri=uri)
+                
                 reader = pa.ipc.open_stream(payload)
                 table = reader.read_all()
-                self.active_contexts[job_id].publish(0, table)
+                ctx.publish(handle, table)
             except Exception as e:
-                logger.error(f"Data Write Error: {e}")
+                logger.error(f"Data Write Error ({topic}): {e}")
 
     def _handle_error(self, job_id, payload):
         msg = payload.decode()

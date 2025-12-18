@@ -36,31 +36,37 @@ class MockGenerator(AIGenerator):
     Useful for testing the plumbing without an LLM.
     """
 
-    def propose_schema(self, profile: FileProfile) -> SchemaProposal:
-        from casparian_flow.services.ai_types import ColumnDef, FileType
+    def propose_schema(self, profile: FileProfile, user_feedback: Optional[str] = None) -> SchemaProposal:
+        from casparian_flow.services.ai_types import ColumnDef, FileType, TableDefinition
 
         # Simple heuristic for mock
         is_csv = profile.file_type == FileType.TEXT_CSV
 
+        cols = [
+            ColumnDef(name="col_1", target_type="string"),
+            ColumnDef(name="col_2", target_type="int"),
+        ]
+        tables = [
+            TableDefinition(topic_name="generated_output", columns=cols, description="Mock Table")
+        ]
+
         return SchemaProposal(
             file_type_inferred=profile.file_type.name,
-            target_topic="generated_output",
-            columns=[
-                ColumnDef(name="col_1", target_type="string"),
-                ColumnDef(name="col_2", target_type="int"),
-            ],
+            tables=tables,
             read_strategy="pandas" if is_csv else "manual",
             reasoning="Mock Reasoning: Detected Text content.",
         )
 
-    def generate_plugin(self, proposal: SchemaProposal) -> PluginCode:
+    def generate_plugin(self, proposal: SchemaProposal, user_feedback: Optional[str] = None) -> PluginCode:
         code = f"""
-from casparian_flow.sdk import BasePlugin
+from casparian_flow.sdk import BasePlugin, PluginMetadata, FileEvent
 import pandas as pd
+
+MANIFEST = PluginMetadata(subscriptions=["input_topic"])
 
 class Handler(BasePlugin):
     # Generated from Proposal: {proposal.reasoning}
-    def execute(self, path: str):
+    def consume(self, event: FileEvent):
         # Strategy: {proposal.read_strategy}
         pass
 """

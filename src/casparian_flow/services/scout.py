@@ -272,7 +272,8 @@ class TaggerService:
                 jobs_to_queue.append(job)
         
         if jobs_to_queue:
-            self.db.execute(insert(ProcessingJob), jobs_to_queue)
+            # FIXED: Use add_all() because jobs_to_queue contains ORM objects, not dicts
+            self.db.add_all(jobs_to_queue)
         
         self.db.commit()
 

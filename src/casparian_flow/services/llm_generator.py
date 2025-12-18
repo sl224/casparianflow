@@ -105,7 +105,7 @@ class LLMGenerator(AIGenerator):
 
         logger.info("Sending GENERATE request to LLM...")
         code_str = self.provider.chat_completion(
-             messages=[
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
@@ -114,7 +114,7 @@ class LLMGenerator(AIGenerator):
         
         code_str = self._clean_markdown(code_str)
         primary_topic = proposal.tables[0].topic_name if proposal.tables else "output"
-             
+
         return PluginCode(
             filename=f"generated_{primary_topic}.py",
             source_code=code_str,
@@ -185,16 +185,33 @@ Sample Data:
         return """
 You are a Python Expert. Write a Casparian Flow Plugin.
 
-Rules:
-1. Define `MANIFEST = PluginMetadata(subscriptions=["input_topic"])`. NO pattern.
-2. Implement `consume(self, event: FileEvent)`. Access path via `event.path`.
-3. Use `self.publish(topic, df)` for EACH table.
-4. Output ONLY Python code.
+CRITICAL INSTRUCTIONS:
+1. **Imports**: You MUST import `BasePlugin`, `PluginMetadata`, and `FileEvent` from `casparian_flow.sdk`.
+   - DO NOT import `Plugin`. It does not exist.
+   - DO NOT import `Handler` from anywhere. You are defining it.
+2. **Class**: Define a class (e.g., `Handler`) that inherits from `BasePlugin`.
+3. **Manifest**: Define `MANIFEST = PluginMetadata(subscriptions=["..."])` at the module level.
+4. **Logic**: Implement `consume(self, event: FileEvent)`. Access the file path via `event.path`.
+5. **Publishing**: Use `self.publish(topic, df)` to send data.
+6. **Output**: Return ONLY valid Python code.
+
+Example Structure:
+```python
+from casparian_flow.sdk import BasePlugin, PluginMetadata, FileEvent
+import pandas as pd
+
+MANIFEST = PluginMetadata(subscriptions=["input_topic"])
+
+class Handler(BasePlugin):
+    def consume(self, event: FileEvent):
+        # logic here
+        pass
+
 """
 
     def _get_code_user_prompt(self, proposal, feedback, example_path) -> str:
         filename = re.split(r'[/\\]', example_path)[-1] if example_path else "*.csv"
-        
+    
         schema_desc = f"Goal: Read format '{proposal.file_type_inferred}'\nTables:"
         topics = []
         for t in proposal.tables:
@@ -207,9 +224,8 @@ Rules:
 
 Reasoning: {proposal.reasoning}
 
-Constraint: The MANIFEST pattern/subscription must target files like '{filename}'.
-"""
+Constraint: The MANIFEST pattern/subscription must target files like '{filename}'. """
         if feedback:
             prompt += f"\nUSER FEEDBACK:\n'{feedback}'\n"
-            
+
         return prompt + "\nWrite the handler code."

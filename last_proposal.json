@@ -1,0 +1,355 @@
+{
+  "file_type_inferred": "csv",
+  "tables": [
+    {
+      "topic_name": "mc_data_telemetry",
+      "columns": [
+        {
+          "name": "record_id",
+          "target_type": "int",
+          "is_nullable": true,
+          "description": "Record identifier"
+        },
+        {
+          "name": "record_type",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": "Discriminator field indicating data category (ACT_*, CONFIG_FLTS, TEST_STATES_*)"
+        },
+        {
+          "name": "field_3",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": "Context-dependent field, often empty"
+        },
+        {
+          "name": "timestamp",
+          "target_type": "datetime",
+          "is_nullable": true,
+          "description": "Event or measurement timestamp"
+        },
+        {
+          "name": "subsystem",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": "Subsystem identifier (MUX_FCNS1, ESM, IFF, etc.)"
+        },
+        {
+          "name": "component_type",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": "Component type (SW, HW, FW, OFP)"
+        },
+        {
+          "name": "status",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": "Status indicator (CLEARED, NOT_RUN, etc.)"
+        },
+        {
+          "name": "data_field_1",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": "Variable data field containing version numbers, test results, or system parameters"
+        },
+        {
+          "name": "data_field_2",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_3",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_4",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_5",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_6",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_7",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_8",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_9",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_10",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_11",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_12",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_13",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_14",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_15",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_16",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_17",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_18",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_19",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_20",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_21",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_22",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_23",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_24",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_25",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_26",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_27",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_28",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_29",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_30",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_31",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_32",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_33",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_34",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_35",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_36",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_37",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_38",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_39",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_40",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_41",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_42",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_43",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_44",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_45",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_46",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_47",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_48",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_49",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        },
+        {
+          "name": "data_field_50",
+          "target_type": "string",
+          "is_nullable": true,
+          "description": null
+        }
+      ],
+      "description": "Unified telemetry data capturing system configurations, active component versions, fault states, and test results across multiple subsystems"
+    }
+  ],
+  "read_strategy": "pandas",
+  "reasoning": "This CSV file contains heterogeneous telemetry data with a discriminator column (record_type) that normally would warrant splitting into multiple tables (ACT_* tables for active component versions, CONFIG_FLTS for fault configurations, TEST_STATES_* for test results). However, per the mandatory user override to select just 1 table, a unified schema is provided with generic data_field columns to accommodate the variable-width records across different record types. The record_type column serves as the discriminator for downstream processing. Pandas is suitable for reading this CSV with variable column usage."
+}
