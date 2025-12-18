@@ -1,6 +1,3 @@
-Here is the completely rewritten `ARCHITECTURE.md` reflecting the new **Pull-Based (Sentinel)** architecture, decoupled Scout services, and autonomous agent workflows.
-
-```markdown
 # Casparian Flow Architecture Guide (v3.0 - Pull Architecture)
 
 A comprehensive mental model for the Casparian Flow system.
@@ -254,7 +251,3 @@ class Handler(BasePlugin):
 1. **Lineage:** Every row in the output DB includes `_job_id` and `_file_version_id`, traceable back to the exact source file hash.
 2. **Gatekeeper:** AI-generated code passes through AST validation (banned imports like `os`, `subprocess`) and HMAC signature verification before running.
 3. **Atomic Promotion:** Data is written to `_stg` tables. It is only moved to production tables if the job completes successfully.
-
-```
-
-```

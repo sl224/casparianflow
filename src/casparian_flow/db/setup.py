@@ -172,18 +172,20 @@ def seed_library_whitelist(eng: sa.Engine):
     with Session(eng) as session:
         for lib_name, version, desc in initial_libraries:
             # Check if library already exists
-            existing = session.query(LibraryWhitelist).filter_by(library_name=lib_name).first()
+            existing = (
+                session.query(LibraryWhitelist).filter_by(library_name=lib_name).first()
+            )
             if not existing:
                 lib = LibraryWhitelist(
-                    library_name=lib_name,
-                    version_constraint=version,
-                    description=desc
+                    library_name=lib_name, version_constraint=version, description=desc
                 )
                 session.add(lib)
                 logger.info(f"Seeded library: {lib_name} {version}")
 
         session.commit()
-        logger.info(f"LibraryWhitelist seeding complete. Total libraries: {len(initial_libraries)}")
+        logger.info(
+            f"LibraryWhitelist seeding complete. Total libraries: {len(initial_libraries)}"
+        )
 
 
 def get_or_create_sourceroot(eng: sa.Engine, path: str, type: str = "local") -> int:

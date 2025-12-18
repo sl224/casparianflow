@@ -12,10 +12,12 @@ import pyarrow as pa
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
+# Project Imports
 from casparian_flow.protocol import OpCode, unpack_header, msg_hello, msg_ready, msg_data, msg_err
 from casparian_flow.config import settings
 from casparian_flow.db import access as sql_io
 from casparian_flow.services.registrar import register_plugins_from_source
+from casparian_flow.sdk import FileEvent  # Import FileEvent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [WORKER] %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,9 +55,7 @@ class GeneralistWorker:
         self.proxy_context = ProxyContext(self)
 
     def start(self):
-        """Main Loop."""
         self.running = True
-        
         logger.info(f"Scanning plugins in {self.plugin_dir}...")
         self._load_plugins()
         
@@ -69,9 +69,7 @@ class GeneralistWorker:
 
         logger.info(f"Dialing Sentinel at {self.sentinel_addr}...")
         self.socket.connect(self.sentinel_addr)
-        
-        caps = list(self.plugins.keys())
-        self.socket.send_multipart(msg_hello(caps))
+        self.socket.send_multipart(msg_hello(list(self.plugins.keys())))
         
         poller = zmq.Poller()
         poller.register(self.socket, zmq.POLLIN)
@@ -81,35 +79,24 @@ class GeneralistWorker:
         
         try:
             while self.running:
-                # 1. Poll (timeout allows checking self.running)
                 socks = dict(poller.poll(timeout=100))
-                
-                # 2. Handle Message
                 if self.socket in socks:
                     self._handle_message()
-                
         except Exception as e:
             logger.critical(f"Worker crashed: {e}", exc_info=True)
         finally:
-            # 3. Clean Shutdown IN THREAD
-            logger.info("Worker shutting down...")
-            try:
-                self.socket.close()
-                self.ctx.term()
-            except Exception as e:
-                logger.error(f"Error closing Worker ZMQ: {e}")
-            logger.info("Worker stopped.")
+            self.stop()
 
     def stop(self):
-        """Safe to call from main thread."""
         self.running = False
+        try:
+            self.socket.close()
+            self.ctx.term()
+        except Exception: pass
+        logger.info("Worker stopped.")
 
     def _handle_message(self):
-        try:
-            frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.Again:
-            return
-
+        frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
         if not frames: return
         
         header = frames[0]
@@ -133,11 +120,22 @@ class GeneralistWorker:
             if not handler:
                 raise ValueError(f"Plugin {plugin_name} not loaded.")
             
-            result = handler.execute(file_path)
+            # Create File Event
+            event = FileEvent(path=file_path, file_id=0) # ID would come from EXEC metadata ideally
             
+            # Try new 'consume' API first, fallback to 'execute'
+            if hasattr(handler, "consume") and callable(handler.consume):
+                try:
+                    result = handler.consume(event)
+                except NotImplementedError:
+                    # Fallback if consume() calls super().consume() which raises NotImplemented
+                    result = handler.execute(file_path)
+            else:
+                result = handler.execute(file_path)
+            
+            # Handle return/yield results (if any)
             if result is not None and not (hasattr(result, "__iter__") and hasattr(result, "__next__")):
-                if not hasattr(result, "send"): 
-                     result = [result]
+                if not hasattr(result, "send"): result = [result]
 
             if result:
                 for batch in result:
@@ -152,8 +150,7 @@ class GeneralistWorker:
             self.current_job_id = None
 
     def _serialize_arrow(self, obj) -> bytes:
-        if hasattr(obj, "to_arrow"):
-            obj = obj.to_arrow()
+        if hasattr(obj, "to_arrow"): obj = obj.to_arrow()
         
         if isinstance(obj, pa.Table):
             sink = pa.BufferOutputStream()
@@ -167,15 +164,12 @@ class GeneralistWorker:
                 table = pa.Table.from_pandas(obj)
                 return self._serialize_arrow(table)
             except Exception as e:
-                logger.warning(f"Pandas cast fallback: {e}")
-                obj = obj.astype(str)
-                table = pa.Table.from_pandas(obj)
-                return self._serialize_arrow(table)
+                logger.warning(f"Pandas cast failed: {e}")
+                return b""
         return b""
 
     def _load_plugins(self):
-        if not self.plugin_dir.exists():
-            return
+        if not self.plugin_dir.exists(): return
         sys.path.insert(0, str(self.plugin_dir.resolve()))
         for f in self.plugin_dir.glob("*.py"):
             if f.name.startswith("_"): continue

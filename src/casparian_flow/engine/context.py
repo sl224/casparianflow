@@ -101,20 +101,20 @@ class WorkerContext:
 
         elif hasattr(data, "combine_chunks"):  # Check if it's an Arrow Table
             import pyarrow as pa
+
             # Efficiently append lineage columns to the Arrow Table
             # Create constant columns
             row_count = data.num_rows
-            
+
             # Create arrays for lineage columns
             job_id_arr = pa.array([self.job_id] * row_count, type=pa.int64())
             ver_id_arr = pa.array([self.file_version_id] * row_count, type=pa.int64())
             loc_id_arr = pa.array([self.file_location_id] * row_count, type=pa.int64())
-            
+
             # Append columns
             data = data.append_column("_job_id", job_id_arr)
             data = data.append_column("_file_version_id", ver_id_arr)
             data = data.append_column("_file_id", loc_id_arr)
-
 
         # Scenario B: Strict Enforcement
         if channel["mode"] == "strict" and channel["schema"]:

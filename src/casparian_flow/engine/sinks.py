@@ -83,16 +83,16 @@ class SqliteSink:
         # If it's a file path, we need 3 slashes for relative, 4 for absolute?
         # Actually sqlalchemy create_engine handles sqlite:///C:/path fine.
         # We just need to ensure db_path is passed correctly.
-        
+
         # If db_path comes from urlparse.netloc it might be empty for absolute paths
         # If we reconstruct it, we need to be careful.
-        if os.name == 'nt' and ':' in db_path and not db_path.startswith('/'):
-             # It's a windows absolute path C:\..., sqlalchemy needs sqlite:///C:\...
-             self.engine = create_engine(f"sqlite:///{db_path}")
+        if os.name == "nt" and ":" in db_path and not db_path.startswith("/"):
+            # It's a windows absolute path C:\..., sqlalchemy needs sqlite:///C:\...
+            self.engine = create_engine(f"sqlite:///{db_path}")
         else:
-             # Standard handling
-             self.engine = create_engine(f"sqlite:///{db_path}")
-             
+            # Standard handling
+            self.engine = create_engine(f"sqlite:///{db_path}")
+
         self.table_name = table_name
         self.staging_table = f"{table_name}_stg_{job_id}"
         self.if_exists = options.get("mode", ["append"])[0]
@@ -210,12 +210,16 @@ class SinkFactory:
                 full_path = parsed.path
                 # Split at last slash to separate DB file from table name
                 # This assumes table name cannot contain slashes, which is true for SQL tables
-                db_path_str, table_name = full_path.rsplit('/', 1)
-                
+                db_path_str, table_name = full_path.rsplit("/", 1)
+
                 # Cleanup leading slash if on Windows and it looks like /C:/...
-                if os.name == 'nt' and db_path_str.startswith('/') and ':' in db_path_str:
-                    db_path_str = db_path_str.lstrip('/')
-                    
+                if (
+                    os.name == "nt"
+                    and db_path_str.startswith("/")
+                    and ":" in db_path_str
+                ):
+                    db_path_str = db_path_str.lstrip("/")
+
                 return SqliteSink(db_path_str, table_name, options, job_id)
             else:
                 # Relative path: sqlite://file.db/table
