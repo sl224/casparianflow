@@ -32,8 +32,11 @@ class Sentinel:
         self.engine = create_engine(config.database.connection_string)
         self.queue = JobQueue(self.engine)
         
+        # ZMQ setup deferred to run() or initialized here?
+        # Initializing here is fine, but CLOSING must happen in the same thread that uses it.
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.ROUTER)
+        self.socket.setsockopt(zmq.LINGER, 0) # Prevent hang on close
         self.socket.bind(bind_addr)
         
         self.workers: Dict[bytes, ConnectedWorker] = {}
@@ -43,22 +46,43 @@ class Sentinel:
         logger.info(f"Sentinel online at {bind_addr}")
 
     def run(self):
+        """Main Event Loop. Runs in its own thread."""
         self.running = True
         poller = zmq.Poller()
         poller.register(self.socket, zmq.POLLIN)
         
-        while self.running:
-            # 1. Network Poll (Non-blocking)
-            socks = dict(poller.poll(timeout=100))
-            if self.socket in socks:
-                self._handle_message()
-            
-            # 2. Dispatch
-            self._dispatch_loop()
+        logger.info("Sentinel loop started.")
+        try:
+            while self.running:
+                # 1. Network Poll (Non-blocking with timeout)
+                # Timeout allows us to check self.running every 100ms
+                socks = dict(poller.poll(timeout=100))
+                if self.socket in socks:
+                    self._handle_message()
+                
+                # 2. Dispatch Logic
+                self._dispatch_loop()
+        except Exception as e:
+            logger.critical(f"Sentinel crashed: {e}", exc_info=True)
+        finally:
+            # CRITICAL: Close socket IN THE SAME THREAD that used it
+            logger.info("Sentinel shutting down...")
+            try:
+                self.socket.close()
+                self.ctx.term()
+            except Exception as e:
+                logger.error(f"Error closing Sentinel ZMQ: {e}")
+            logger.info("Sentinel resources released.")
+
+    def stop(self):
+        """Signal the loop to exit. Safe to call from any thread."""
+        self.running = False
 
     def _handle_message(self):
         try:
             frames = self.socket.recv_multipart()
+            if len(frames) < 2: return
+            
             identity, header = frames[0], frames[1]
             payload = frames[2] if len(frames) > 2 else b""
             
@@ -72,22 +96,24 @@ class Sentinel:
                 self._handle_data(job_id, payload)
             elif op == OpCode.ERR:
                 self._handle_error(job_id, payload)
-                self._worker_ready(identity) # Reset worker state
+                self._worker_ready(identity)
                 
         except Exception as e:
             logger.error(f"Sentinel Error: {e}", exc_info=True)
 
     def _register_worker(self, identity, payload):
-        caps = set(json.loads(payload.decode()))
-        self.workers[identity] = ConnectedWorker(
-            identity=identity, last_seen=time.time(), capabilities=caps
-        )
-        logger.info(f"Worker Joined: {len(caps)} capabilities")
+        try:
+            caps = set(json.loads(payload.decode()))
+            self.workers[identity] = ConnectedWorker(
+                identity=identity, last_seen=time.time(), capabilities=caps
+            )
+            logger.info(f"Worker Joined: {len(caps)} capabilities")
+        except Exception as e:
+            logger.error(f"Bad HELLO payload: {e}")
 
     def _worker_ready(self, identity):
         if identity in self.workers:
             w = self.workers[identity]
-            # If it had a job, finish it
             if w.current_job_id:
                 self._finalize_job(w.current_job_id)
                 w.current_job_id = None
@@ -95,15 +121,12 @@ class Sentinel:
             w.last_seen = time.time()
 
     def _dispatch_loop(self):
-        # Simple FIFO dispatch
         idle_workers = [w for w in self.workers.values() if w.status == "IDLE"]
         if not idle_workers: return
 
-        # Peek/Pop Job
         job = self.queue.pop_job()
         if not job: return
 
-        # Match Capability
         candidate = next((w for w in idle_workers if job.plugin_name in w.capabilities), None)
         
         if candidate:
@@ -115,7 +138,6 @@ class Sentinel:
     def _assign_job(self, worker, job):
         logger.info(f"Assigning Job {job.id} to worker")
         
-        # 1. Create Context (Gatekeeper)
         topic_conf = {}
         with Session(self.engine) as s:
             tcs = s.query(TopicConfig).filter_by(plugin_name=job.plugin_name).all()
@@ -129,27 +151,19 @@ class Sentinel:
             job_id=job.id,
             file_version_id=job.file_version_id
         )
-        # Ensure at least one default topic exists
         ctx.register_topic("output", default_uri=f"parquet://{job.plugin_name}_output")
         self.active_contexts[job.id] = ctx
 
-        # 2. Get Absolute File Path (CRITICAL FIX)
         with Session(self.engine) as s:
             fv = s.get(FileVersion, job.file_version_id)
             fl = s.get(FileLocation, fv.location_id)
-            
-            # Using the ORM relationship to resolve SourceRoot
-            # This ensures we get the absolute path configured in SourceRoot
             source_root = fl.source_root
             if not source_root:
-                # Fallback if relationship not loaded (unlikely with Session.get)
-                # But to be safe, fetch it explicitly if needed
                 from casparian_flow.db.models import SourceRoot
                 source_root = s.get(SourceRoot, fl.source_root_id)
                 
             full_path = str(Path(source_root.path) / fl.rel_path)
 
-        # 3. Send Command
         worker.status = "BUSY"
         worker.current_job_id = job.id
         self.socket.send_multipart([worker.identity] + msg_exec(job.id, job.plugin_name, full_path))
@@ -159,7 +173,6 @@ class Sentinel:
             try:
                 reader = pa.ipc.open_stream(payload)
                 table = reader.read_all()
-                # Zero-copy write to sink
                 self.active_contexts[job_id].publish(0, table)
             except Exception as e:
                 logger.error(f"Data Write Error: {e}")

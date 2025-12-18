@@ -9,6 +9,7 @@ from sqlalchemy import (
     Enum,
     Index,
     Text,
+    Float,
     func,
 )
 from sqlalchemy.orm import relationship
@@ -94,6 +95,10 @@ class FileLocation(Base):
     # Do NOT use Text here or lookups become O(N).
     rel_path = Column(String(850), nullable=False)
     filename = Column(String(255), nullable=False)
+
+    # Inventory State (Decoupled Scanner)
+    last_known_mtime = Column(Float, nullable=True)  # Epoch time from os.stat
+    last_known_size = Column(Integer, nullable=True)
 
     current_version_id = Column(
         Integer, ForeignKey("cf_file_version.id"), nullable=True
@@ -259,6 +264,3 @@ class SurveyorDecision(Base):
         Index("ix_surveyor_decision_lookup", "session_id", "phase"),
         {"schema": DEFAULT_SCHEMA},
     )
-
-
-

@@ -16,10 +16,11 @@ build/
 .idea/
 .vs/
 
-# Python virtual environments
+# environments
 venv/
 .venv/
 env/
+.claude
 
 # Python cache and artifacts
 __pycache__/

@@ -5,10 +5,10 @@ import time
 from pathlib import Path, PurePath
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Set, Optional, Any
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select, insert, text
+from sqlalchemy import select, insert, text, update
 from casparian_flow.db.models import (
     FileLocation,
     FileVersion,
@@ -27,18 +27,13 @@ logger = logging.getLogger(__name__)
 STABILITY_DELAY_SECONDS = 0.1
 
 
-def calculate_hash_and_stat(
-    filepath: Path,
-) -> Optional[Tuple[Path, str, int, float, str]]:
+def calculate_hash_and_stat(filepath: Path) -> Optional[Tuple[str, int]]:
     """
-    Worker function. Returns (original_path_obj, hash, size, mtime, filename_str).
-    Returns None if file cannot be read or is still being written.
-
-    CRITICAL FIX: Implements stability check to detect files in transit.
-    If a file's mtime or size changes between two checks, it's being written.
+    Computes SHA-256 hash and validates file stability.
+    Returns (hash, size) or None.
     """
     try:
-        # Stability check: compare stat twice to detect in-transit files
+        # Stability check
         stat1 = filepath.stat()
         time.sleep(STABILITY_DELAY_SECONDS)
         stat2 = filepath.stat()
@@ -47,303 +42,255 @@ def calculate_hash_and_stat(
             logger.debug(f"Skipping in-transit file: {filepath}")
             return None
 
-        # File is stable, proceed with hashing
         hasher = hashlib.sha256()
-        # Use a larger buffer (64KB) for faster network reads
         with open(filepath, "rb") as f:
             while chunk := f.read(65536):
                 hasher.update(chunk)
-        return (
-            filepath,
-            hasher.hexdigest(),
-            stat2.st_size,
-            stat2.st_mtime,
-            filepath.name,
-        )
+        return hasher.hexdigest(), stat2.st_size
     except Exception as e:
         logger.warning(f"Skipping {filepath}: {e}")
         return None
 
 
 def calculate_priority_from_mtime(mtime: float) -> int:
-    """
-    QoS Priority Assignment based on file recency.
-
-    Priority Tiers:
-    - 100: Real-time (files modified < 24 hours ago)
-    - 50:  Recent (files modified < 7 days ago)
-    - 10:  Historical backlog (older files)
-
-    Higher priority jobs are processed first by the Worker.
-    """
+    """QoS Priority based on file age."""
     now = datetime.now()
     file_dt = datetime.fromtimestamp(mtime)
     age = now - file_dt
 
     if age < timedelta(days=1):
-        return 100  # Real-time / SLA-critical
+        return 100
     elif age < timedelta(days=7):
-        return 50  # Recent
+        return 50
     else:
-        return 10  # Historical backlog
+        return 10
 
 
-class Scout:
+class InventoryScanner:
+    """
+    Component 1: The Scanner.
+    Responsible for fast I/O inventory of the filesystem.
+    Does NOT compute hashes of content.
+    Updates `FileLocation` with current mtime/size.
+    """
     def __init__(self, db: Session):
         self.db = db
         self.scanner = ParallelFileScanner()
         self.BATCH_SIZE = 2000
-        self.HASH_WORKERS = 8
 
-    def scan_source(self, source_root: SourceRoot):
+    def scan(self, source_root: SourceRoot):
         root_path = Path(source_root.path)
         if not root_path.exists():
             logger.error(f"Source root not found: {root_path}")
             return
 
-        logger.info(f"Scouting {root_path} [Batch Mode]...")
+        logger.info(f"Inventory Scan: {root_path}")
 
-        # 1. Pre-load Rules (Small dataset, keep in memory)
-        self.rules = (
-            self.db.query(RoutingRule).order_by(RoutingRule.priority.desc()).all()
-        )
-        self.plugins = self.db.query(PluginConfig).all()
-
-        # 2. Define Filter
         def filter_file(entry):
             return not entry.name.startswith(".")
 
-        # 3. Execution Pipeline
-        # Scanner yields paths -> ThreadPool hashes them -> Main thread batches DB writes
-        with ThreadPoolExecutor(max_workers=self.HASH_WORKERS) as executor:
-            # Submit all tasks.
-            # Note: For millions of files, this holds millions of Future objects in memory.
-            # Practical tradeoff: 1M futures is ~100MB RAM. Acceptable for this appliance.
-            futures = {
-                executor.submit(calculate_hash_and_stat, p): p
-                for p in self.scanner.walk(root_path, filter_file)
-            }
+        batch = []
+        
+        # Parallel Walk (I/O Bound)
+        for path_obj in self.scanner.walk(root_path, filter_file):
+            try:
+                stat = path_obj.stat()
+                rel_path = str(path_obj.relative_to(root_path))
+                
+                batch.append({
+                    "rel_path": rel_path,
+                    "filename": path_obj.name,
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size
+                })
+                
+                if len(batch) >= self.BATCH_SIZE:
+                    self._flush_inventory(batch, source_root)
+                    batch = []
+            except Exception as e:
+                logger.error(f"Error stat-ing {path_obj}: {e}")
 
-            current_batch = []
+        if batch:
+            self._flush_inventory(batch, source_root)
 
-            # Process results as they finish (Order Independent)
-            for f in as_completed(futures):
-                result = f.result()
-                if result:
-                    path_obj, f_hash, f_size, f_mtime, f_name = result
-
-                    # Calculate relative path for DB key
-                    try:
-                        rel_path = str(path_obj.relative_to(root_path))
-                        current_batch.append(
-                            {
-                                "rel_path": rel_path,
-                                "hash": f_hash,
-                                "size": f_size,
-                                "mtime": f_mtime,
-                                "filename": f_name,
-                            }
-                        )
-                    except ValueError:
-                        logger.error(f"Path issue: {path_obj}")
-
-                # Flush if full
-                if len(current_batch) >= self.BATCH_SIZE:
-                    self._flush_batch(current_batch, source_root)
-                    current_batch = []
-
-            # Final Flush
-            if current_batch:
-                self._flush_batch(current_batch, source_root)
-
-    def _flush_batch(self, batch: List[Dict], source_root: SourceRoot):
+    def _flush_inventory(self, batch: List[Dict], source_root: SourceRoot):
         """
-        Efficiently writes a batch of files to DB using Set-based logic (Bulk Operations).
+        Upsert FileLocations with new mtime/size/last_seen.
         """
-        if not batch:
-            return
-        logger.info(f"Flushing batch of {len(batch)} files...")
-
-        # --- Step A: Register New Hashes ---
-        seen_hashes = set(item["hash"] for item in batch)
-
-        # Find which hashes already exist
-        existing_hashes_q = self.db.execute(
-            select(FileHashRegistry.content_hash).where(
-                FileHashRegistry.content_hash.in_(seen_hashes)
+        # 1. Fetch existing
+        rel_paths = [b["rel_path"] for b in batch]
+        existing = self.db.execute(
+            select(FileLocation.rel_path).where(
+                FileLocation.source_root_id == source_root.id,
+                FileLocation.rel_path.in_(rel_paths)
             )
         ).fetchall()
-        existing_hashes = {row[0] for row in existing_hashes_q}
+        existing_paths = {row[0] for row in existing}
 
-        # Insert only new ones
-        new_hashes_data = []
-        unique_batch_hashes = set()
+        # 2. Insert New
+        new_records = []
+        update_records = []
+        
         for item in batch:
-            h = item["hash"]
-            if h not in existing_hashes and h not in unique_batch_hashes:
-                new_hashes_data.append({"content_hash": h, "size_bytes": item["size"]})
-                unique_batch_hashes.add(h)
+            if item["rel_path"] not in existing_paths:
+                new_records.append({
+                    "source_root_id": source_root.id,
+                    "rel_path": item["rel_path"],
+                    "filename": item["filename"],
+                    "last_known_mtime": item["mtime"],
+                    "last_known_size": item["size"],
+                    "last_seen_time": datetime.now()
+                })
+            else:
+                update_records.append({
+                    "rel_path": item["rel_path"],
+                    "mtime": item["mtime"],
+                    "size": item["size"],
+                    "now": datetime.now()
+                })
 
-        if new_hashes_data:
-            self.db.execute(insert(FileHashRegistry), new_hashes_data)
-
-        # --- Step B: Ensure FileLocations Exist ---
-        rel_paths = [item["rel_path"] for item in batch]
-
-        # Map existing paths to IDs
-        existing_locs_q = self.db.execute(
-            select(
-                FileLocation.rel_path, FileLocation.id, FileLocation.current_version_id
+        if new_records:
+            self.db.execute(insert(FileLocation), new_records)
+        
+        if update_records:
+            # Simple executemany update for SQLite compatibility/speed trade-off
+            self.db.execute(
+                update(FileLocation)
+                .where(
+                    FileLocation.source_root_id == source_root.id,
+                    FileLocation.rel_path == text(":rel_path")
+                )
+                .values(
+                    last_known_mtime=text(":mtime"),
+                    last_known_size=text(":size"),
+                    last_seen_time=text(":now")
+                ),
+                update_records
             )
-            .where(FileLocation.source_root_id == source_root.id)
-            .where(FileLocation.rel_path.in_(rel_paths))
-        ).fetchall()
-
-        # Map: rel_path -> (loc_id, current_ver_id)
-        loc_map = {
-            row.rel_path: (row.id, row.current_version_id) for row in existing_locs_q
-        }
-
-        new_locs_data = []
-        for item in batch:
-            if item["rel_path"] not in loc_map:
-                new_locs_data.append(
-                    {
-                        "source_root_id": source_root.id,
-                        "rel_path": item["rel_path"],
-                        "filename": item["filename"],
-                    }
-                )
-
-        if new_locs_data:
-            self.db.execute(insert(FileLocation), new_locs_data)
-            self.db.commit()  # Commit to generate IDs
-
-            # Re-fetch to get the new IDs (Reliable cross-db approach)
-            # Optimization: Only fetch the ones we just inserted
-            added_paths = [x["rel_path"] for x in new_locs_data]
-            refetch_q = self.db.execute(
-                select(
-                    FileLocation.rel_path,
-                    FileLocation.id,
-                    FileLocation.current_version_id,
-                )
-                .where(FileLocation.source_root_id == source_root.id)
-                .where(FileLocation.rel_path.in_(added_paths))
-            ).fetchall()
-            for row in refetch_q:
-                loc_map[row.rel_path] = (row.id, row.current_version_id)
-
-        # --- Step C: Detect Version Drift ---
-        # Get hashes of current versions to compare
-        active_version_ids = [v[1] for v in loc_map.values() if v[1] is not None]
-        active_hashes = {}
-
-        if active_version_ids:
-            # Chunk this if active_version_ids is massive (sqlite limit), but 2000 is safe
-            av_q = self.db.execute(
-                select(FileVersion.id, FileVersion.content_hash).where(
-                    FileVersion.id.in_(active_version_ids)
-                )
-            ).fetchall()
-            active_hashes = {row.id: row.content_hash for row in av_q}
-
-        new_versions = []
-
-        for item in batch:
-            loc_id, current_ver_id = loc_map.get(item["rel_path"], (None, None))
-
-            # Logic: New file OR Content changed
-            should_create_version = False
-            if current_ver_id is None:
-                should_create_version = True
-            elif (
-                current_ver_id in active_hashes
-                and active_hashes[current_ver_id] != item["hash"]
-            ):
-                should_create_version = True
-
-            if should_create_version:
-                tags = self._calculate_tags(item["rel_path"])
-                new_versions.append(
-                    {
-                        "location_id": loc_id,
-                        "content_hash": item["hash"],
-                        "size_bytes": item["size"],
-                        "modified_time": datetime.fromtimestamp(item["mtime"]),
-                        "applied_tags": tags,
-                        "_mtime": item["mtime"],  # Keep raw mtime for priority calc
-                    }
-                )
-
-        # --- Step D: Insert Versions & Queue Jobs ---
-        if new_versions:
-            # Build location_id -> mtime map for priority calculation
-            loc_to_mtime = {v["location_id"]: v["_mtime"] for v in new_versions}
-
-            # Strip internal _mtime field before DB insert
-            versions_for_db = [
-                {k: v for k, v in ver.items() if not k.startswith("_")}
-                for ver in new_versions
-            ]
-
-            # Insert and GET IDs back
-            stmt = (
-                insert(FileVersion)
-                .values(versions_for_db)
-                .returning(
-                    FileVersion.id, FileVersion.location_id, FileVersion.applied_tags
-                )
-            )
-            inserted_versions = self.db.execute(stmt).fetchall()
-
-            # 1. Update Locations to point to new versions
-            for row in inserted_versions:
-                self.db.execute(
-                    text(
-                        "UPDATE cf_file_location SET current_version_id = :vid, last_seen_time = :now WHERE id = :lid"
-                    ),
-                    {"vid": row.id, "lid": row.location_id, "now": datetime.now()},
-                )
-
-            # 2. Queue Jobs with QoS Priority
-            jobs_to_queue = []
-            for row in inserted_versions:
-                vid, loc_id, tags = row.id, row.location_id, row.applied_tags
-                if not tags:
-                    continue
-
-                # Calculate priority from mtime
-                mtime = loc_to_mtime.get(loc_id, 0)
-                priority = calculate_priority_from_mtime(mtime)
-
-                file_tags = set(tags.split(","))
-                for plugin in self.plugins:
-                    if not plugin.subscription_tags:
-                        continue
-                    sub_tags = set(
-                        [t.strip() for t in plugin.subscription_tags.split(",")]
-                    )
-
-                    if file_tags.intersection(sub_tags):
-                        jobs_to_queue.append(
-                            {
-                                "file_version_id": vid,
-                                "plugin_name": plugin.plugin_name,
-                                "status": StatusEnum.QUEUED,
-                                "priority": priority,
-                            }
-                        )
-
-            if jobs_to_queue:
-                self.db.execute(insert(ProcessingJob), jobs_to_queue)
-
+            
         self.db.commit()
 
-    def _calculate_tags(self, rel_path: str) -> str:
-        path_obj = PurePath(rel_path)
-        tags = set()
-        for rule in self.rules:
-            if path_obj.match(rule.pattern):
-                tags.add(rule.tag)
-        return ",".join(sorted(list(tags)))
+
+class TaggerService:
+    """
+    Component 2: The Tagger.
+    Logic-heavy component. Polls DB for "dirty" files.
+    Matches RoutingRules -> Hashes Content -> Creates Versions -> Queues Jobs.
+    """
+    def __init__(self, db: Session):
+        self.db = db
+        self.WORKERS = 4
+
+    def run(self, source_root: SourceRoot):
+        logger.info(f"Tagger running for {source_root.path}")
+        
+        # 1. Load Rules
+        rules = self.db.query(RoutingRule).order_by(RoutingRule.priority.desc()).all()
+        plugins = self.db.query(PluginConfig).all()
+        
+        # 2. Find "Dirty" Files
+        candidates = self.db.execute(
+            select(FileLocation, FileVersion)
+            .outerjoin(FileVersion, FileLocation.current_version_id == FileVersion.id)
+            .where(FileLocation.source_root_id == source_root.id)
+        ).all()
+        
+        dirty_items = []
+        for loc, ver in candidates:
+            needs_processing = False
+            
+            if not ver:
+                needs_processing = True
+            elif loc.last_known_mtime:
+                ver_ts = ver.modified_time.timestamp()
+                if abs(loc.last_known_mtime - ver_ts) > 0.1:
+                    needs_processing = True
+            
+            if needs_processing:
+                path_obj = PurePath(loc.rel_path)
+                matched_tags = set()
+                for r in rules:
+                    if path_obj.match(r.pattern):
+                        matched_tags.add(r.tag)
+                
+                if matched_tags:
+                    dirty_items.append((loc, matched_tags))
+
+        if not dirty_items:
+            return
+
+        logger.info(f"Tagger found {len(dirty_items)} dirty files to process.")
+        
+        root_path = Path(source_root.path)
+        
+        with ThreadPoolExecutor(max_workers=self.WORKERS) as executor:
+            futures = {}
+            for loc, tags in dirty_items:
+                full_path = root_path / loc.rel_path
+                futures[executor.submit(calculate_hash_and_stat, full_path)] = (loc, tags)
+            
+            for f in as_completed(futures):
+                loc, tags = futures[f]
+                result = f.result()
+                
+                if result:
+                    f_hash, f_size = result
+                    self._promote_version(loc, f_hash, f_size, tags, plugins)
+
+    def _promote_version(self, loc: FileLocation, f_hash: str, f_size: int, tags: Set[str], plugins: List[PluginConfig]):
+        """Creates HashRegistry, FileVersion, and Jobs."""
+        
+        if not self.db.get(FileHashRegistry, f_hash):
+            try:
+                self.db.add(FileHashRegistry(content_hash=f_hash, size_bytes=f_size))
+                self.db.commit()
+            except Exception:
+                self.db.rollback() 
+
+        tag_str = ",".join(sorted(list(tags)))
+        
+        new_ver = FileVersion(
+            location_id=loc.id,
+            content_hash=f_hash,
+            size_bytes=f_size,
+            modified_time=datetime.fromtimestamp(loc.last_known_mtime or time.time()),
+            applied_tags=tag_str
+        )
+        self.db.add(new_ver)
+        self.db.commit()
+        
+        loc.current_version_id = new_ver.id
+        self.db.add(loc)
+        
+        for plugin in plugins:
+            if not plugin.subscription_tags: continue
+            
+            sub_tags = set([t.strip() for t in plugin.subscription_tags.split(",")])
+            if tags.intersection(sub_tags):
+                priority = calculate_priority_from_mtime(loc.last_known_mtime or time.time())
+                job = ProcessingJob(
+                    file_version_id=new_ver.id,
+                    plugin_name=plugin.plugin_name,
+                    status=StatusEnum.QUEUED,
+                    priority=priority
+                )
+                self.db.add(job)
+        
+        self.db.commit()
+
+
+class Scout:
+    """
+    Facade for the decoupled Scout architecture.
+    Maintains API compatibility with existing tests.
+    """
+    def __init__(self, db: Session):
+        self.scanner = InventoryScanner(db)
+        self.tagger = TaggerService(db)
+
+    def scan_source(self, source_root: SourceRoot):
+        # 1. Update Inventory (Fast I/O)
+        self.scanner.scan(source_root)
+        
+        # 2. Process Logic (DB -> Hash -> Job)
+        self.tagger.run(source_root)
