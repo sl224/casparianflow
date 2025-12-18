@@ -113,9 +113,15 @@ def msg_ready() -> list:
     return [pack_header(OpCode.READY, 0, 0), b""]
 
 
-def msg_data(job_id: int, arrow_bytes: bytes) -> list:
+def msg_data(job_id: int, topic: str, arrow_bytes: bytes) -> list:
+    """
+    Constructs a multi-frame data message.
+    Frames: [Header, Topic (bytes), Payload (Arrow bytes)]
+    """
+    topic_bytes = topic.encode("utf-8")
     return [
         pack_header(OpCode.DATA, job_id, len(arrow_bytes), ContentType.ARROW),
+        topic_bytes,
         arrow_bytes,
     ]
 

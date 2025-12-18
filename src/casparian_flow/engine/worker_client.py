@@ -17,7 +17,7 @@ from casparian_flow.protocol import OpCode, unpack_header, msg_hello, msg_ready,
 from casparian_flow.config import settings
 from casparian_flow.db import access as sql_io
 from casparian_flow.services.registrar import register_plugins_from_source
-from casparian_flow.sdk import FileEvent  # Import FileEvent
+from casparian_flow.sdk import FileEvent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [WORKER] %(message)s")
 logger = logging.getLogger(__name__)
@@ -25,16 +25,28 @@ logger = logging.getLogger(__name__)
 class ProxyContext:
     def __init__(self, worker: 'GeneralistWorker'):
         self.worker = worker
+        self._topic_map = {} # handle (int) -> topic_name (str)
+        self._next_handle = 1
 
     def register_topic(self, topic: str, default_uri: str = None) -> int:
-        return 0
+        """
+        Maps a topic string to a local integer handle.
+        """
+        handle = self._next_handle
+        self._topic_map[handle] = topic
+        self._next_handle += 1
+        return handle
 
     def publish(self, handle: int, data: Any):
         if self.worker.current_job_id is None:
              raise RuntimeError("Attempted to publish data without an active job context.")
         
+        # Retrieve topic name from local map, default to "output" if missing
+        topic = self._topic_map.get(handle, "output")
+        
         data_bytes = self.worker._serialize_arrow(data)
-        self.worker.socket.send_multipart(msg_data(self.worker.current_job_id, data_bytes))
+        # Pass topic explicitly to protocol
+        self.worker.socket.send_multipart(msg_data(self.worker.current_job_id, topic, data_bytes))
 
 class GeneralistWorker:
     def __init__(self, sentinel_addr: str, plugin_dir: Path, db_engine: Any):
@@ -79,7 +91,12 @@ class GeneralistWorker:
         
         try:
             while self.running:
-                socks = dict(poller.poll(timeout=100))
+                try:
+                    socks = dict(poller.poll(timeout=100))
+                except zmq.ZMQError:
+                    # Context terminated or socket closed
+                    break
+                
                 if self.socket in socks:
                     self._handle_message()
         except Exception as e:
@@ -96,7 +113,11 @@ class GeneralistWorker:
         logger.info("Worker stopped.")
 
     def _handle_message(self):
-        frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+        try:
+            frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+        except zmq.ZMQError:
+            return
+            
         if not frames: return
         
         header = frames[0]
@@ -121,7 +142,7 @@ class GeneralistWorker:
                 raise ValueError(f"Plugin {plugin_name} not loaded.")
             
             # Create File Event
-            event = FileEvent(path=file_path, file_id=0) # ID would come from EXEC metadata ideally
+            event = FileEvent(path=file_path, file_id=0) 
             
             # Try new 'consume' API first, fallback to 'execute'
             if hasattr(handler, "consume") and callable(handler.consume):
@@ -140,8 +161,10 @@ class GeneralistWorker:
             if result:
                 for batch in result:
                     if batch is not None:
+                        # Fallback for old style plugins returning data directly without topic
+                        # We route them to 'output' via internal default
                         data_bytes = self._serialize_arrow(batch)
-                        self.socket.send_multipart(msg_data(job_id, data_bytes))
+                        self.socket.send_multipart(msg_data(job_id, "output", data_bytes))
             
         except Exception as e:
             logger.error(f"Job {job_id} Failed: {e}", exc_info=True)
