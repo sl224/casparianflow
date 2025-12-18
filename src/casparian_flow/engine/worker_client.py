@@ -23,17 +23,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [WORKER] %(message)s
 logger = logging.getLogger(__name__)
 
 class ProxyContext:
+    """
+    Adapts the BasePlugin 'publish' API to the Generalist Worker's streaming model.
+    """
     def __init__(self, worker: 'GeneralistWorker'):
         self.worker = worker
-        self._topic_map = {} # handle (int) -> topic_name (str)
+        self.topic_map: Dict[int, str] = {}
         self._next_handle = 1
 
     def register_topic(self, topic: str, default_uri: str = None) -> int:
-        """
-        Maps a topic string to a local integer handle.
-        """
+        # Cache the topic name so we can retrieve it during publish
         handle = self._next_handle
-        self._topic_map[handle] = topic
+        self.topic_map[handle] = topic
         self._next_handle += 1
         return handle
 
@@ -41,11 +42,12 @@ class ProxyContext:
         if self.worker.current_job_id is None:
              raise RuntimeError("Attempted to publish data without an active job context.")
         
-        # Retrieve topic name from local map, default to "output" if missing
-        topic = self._topic_map.get(handle, "output")
+        # Retrieve topic name
+        topic = self.topic_map.get(handle, "output")
         
         data_bytes = self.worker._serialize_arrow(data)
-        # Pass topic explicitly to protocol
+        
+        # Send [Header, Topic, Data]
         self.worker.socket.send_multipart(msg_data(self.worker.current_job_id, topic, data_bytes))
 
 class GeneralistWorker:
@@ -57,6 +59,7 @@ class GeneralistWorker:
         
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.DEALER)
+        # CRITICAL: Prevent hang on exit
         self.socket.setsockopt(zmq.LINGER, 0)
         
         self.identity = f"w-{time.time_ns()}".encode()
@@ -67,7 +70,9 @@ class GeneralistWorker:
         self.proxy_context = ProxyContext(self)
 
     def start(self):
+        """Main Loop."""
         self.running = True
+        
         logger.info(f"Scanning plugins in {self.plugin_dir}...")
         self._load_plugins()
         
@@ -81,7 +86,9 @@ class GeneralistWorker:
 
         logger.info(f"Dialing Sentinel at {self.sentinel_addr}...")
         self.socket.connect(self.sentinel_addr)
-        self.socket.send_multipart(msg_hello(list(self.plugins.keys())))
+        
+        caps = list(self.plugins.keys())
+        self.socket.send_multipart(msg_hello(caps))
         
         poller = zmq.Poller()
         poller.register(self.socket, zmq.POLLIN)
@@ -92,32 +99,39 @@ class GeneralistWorker:
         try:
             while self.running:
                 try:
+                    # 1. Poll (timeout allows checking self.running)
                     socks = dict(poller.poll(timeout=100))
-                except zmq.ZMQError:
-                    # Context terminated or socket closed
+                    
+                    # 2. Handle Message
+                    if self.socket in socks:
+                        self._handle_message()
+                except zmq.ZMQError as e:
+                    if not self.running: break # Expected during shutdown
+                    logger.error(f"ZMQ Error: {e}")
                     break
                 
-                if self.socket in socks:
-                    self._handle_message()
         except Exception as e:
             logger.critical(f"Worker crashed: {e}", exc_info=True)
         finally:
-            self.stop()
+            # 3. Clean Shutdown IN THREAD
+            logger.info("Worker shutting down...")
+            try:
+                self.socket.close()
+                self.ctx.term()
+            except Exception as e:
+                logger.error(f"Error closing Worker ZMQ: {e}")
+            logger.info("Worker stopped.")
 
     def stop(self):
+        """Safe to call from main thread."""
         self.running = False
-        try:
-            self.socket.close()
-            self.ctx.term()
-        except Exception: pass
-        logger.info("Worker stopped.")
 
     def _handle_message(self):
         try:
             frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
-        except zmq.ZMQError:
+        except zmq.Again:
             return
-            
+
         if not frames: return
         
         header = frames[0]
@@ -136,34 +150,32 @@ class GeneralistWorker:
 
     def _execute_job(self, job_id: int, plugin_name: str, file_path: str):
         self.current_job_id = job_id
+        # Clear topic map for new job context (optional, but cleaner)
+        self.proxy_context.topic_map.clear()
+        
         try:
             handler = self.plugins.get(plugin_name)
             if not handler:
                 raise ValueError(f"Plugin {plugin_name} not loaded.")
             
             # Create File Event
-            event = FileEvent(path=file_path, file_id=0) 
+            event = FileEvent(path=file_path, file_id=0)
             
-            # Try new 'consume' API first, fallback to 'execute'
+            # Execute
             if hasattr(handler, "consume") and callable(handler.consume):
                 try:
                     result = handler.consume(event)
                 except NotImplementedError:
-                    # Fallback if consume() calls super().consume() which raises NotImplemented
                     result = handler.execute(file_path)
             else:
                 result = handler.execute(file_path)
             
-            # Handle return/yield results (if any)
-            if result is not None and not (hasattr(result, "__iter__") and hasattr(result, "__next__")):
-                if not hasattr(result, "send"): result = [result]
-
+            # Handle Return/Yield Results (Implicit Publishing)
             if result:
                 for batch in result:
                     if batch is not None:
-                        # Fallback for old style plugins returning data directly without topic
-                        # We route them to 'output' via internal default
                         data_bytes = self._serialize_arrow(batch)
+                        # Implicit returns go to 'output'
                         self.socket.send_multipart(msg_data(job_id, "output", data_bytes))
             
         except Exception as e:
@@ -188,7 +200,10 @@ class GeneralistWorker:
                 return self._serialize_arrow(table)
             except Exception as e:
                 logger.warning(f"Pandas cast failed: {e}")
-                return b""
+                # Try string cast for mixed types
+                obj = obj.astype(str)
+                table = pa.Table.from_pandas(obj)
+                return self._serialize_arrow(table)
         return b""
 
     def _load_plugins(self):

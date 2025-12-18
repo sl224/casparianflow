@@ -14,7 +14,7 @@ from casparian_flow.services.inspector import profile_file
 from casparian_flow.services.llm_generator import LLMGenerator
 from casparian_flow.services.llm_provider import get_provider
 from casparian_flow.db.setup import initialize_database, get_or_create_sourceroot
-from casparian_flow.db.models import SourceRoot, RoutingRule
+from casparian_flow.db.models import SourceRoot, ProcessingJob, StatusEnum, RoutingRule
 from casparian_flow.services.scout import Scout
 from casparian_flow.engine.config import WorkerConfig, DatabaseConfig, StorageConfig, PluginsConfig
 from casparian_flow.engine.sentinel import Sentinel
@@ -40,17 +40,14 @@ def main():
     # 1. Config
     RAW_SOURCE_FILE = Path(r"tests/static_assets/zips/169069_20250203_004745_025_TransportRSM.fpkg.e2d/169069_20250203_004745_025_MCData")
     
-    # Validation for demo safety
     if not RAW_SOURCE_FILE.exists():
-        RAW_SOURCE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        RAW_SOURCE_FILE.write_text("Dummy,Data,123", encoding="utf-8")
-        logger.warning(f"Created dummy source file at {RAW_SOURCE_FILE}")
+        logger.error(f"File not found: {RAW_SOURCE_FILE}")
+        return
 
     TEST_ROOT = Path("test_env_subscription")
     if TEST_ROOT.exists(): shutil.rmtree(TEST_ROOT)
     TEST_ROOT.mkdir()
     
-    # [NOTE] If you want to persist plugins between runs, comment out the rmtree line below
     PLUGINS_DIR = Path("plugins_sub")
     if PLUGINS_DIR.exists(): shutil.rmtree(PLUGINS_DIR)
     PLUGINS_DIR.mkdir(exist_ok=True)
@@ -64,6 +61,7 @@ def main():
     initialize_database(engine, reset_tables=True)
     
     # 3. Create Routing Rule
+    # This connects the File Pattern (*MCData*) to the Topic (raw_mcdata_events)
     with Session(engine) as session:
         rule = RoutingRule(pattern="*MCData*", tag="raw_mcdata_events", priority=100)
         session.add(rule)
@@ -76,94 +74,80 @@ def main():
     generator = LLMGenerator(provider)
     
     # ==========================================
-    # 4a. Schema Proposal (Skippable)
+    # 4a. Schema Proposal
     # ==========================================
     proposal = None
-    if prompt_yes_no("\nRun schema proposal generation?"):
-        
-        # --- PRE-INPUT CONTEXT ---
-        print(f"\n{'-'*60}")
-        print("CONTEXT CONFIGURATION")
-        print(f"{'-'*60}")
-        print("Enter any specific constraints for the schema (e.g., 'Only create schemas for pfc_db: type data').")
-        user_context = input("Context (press Enter to skip) > ").strip()
-        
-        schema_feedback = user_context if user_context else None
-        
-        while True:
-            try:
-                print("\nGenerating Schema Proposal...")
-                # We pass the context/feedback here
-                proposal = generator.propose_schema(profile, user_feedback=schema_feedback)
-                
-                print("\n" + "="*60)
-                print("SCHEMA PROPOSAL")
-                print("="*60)
-                print(f"File Type Inferred: {proposal.file_type_inferred}")
-                print(f"Read Strategy:      {proposal.read_strategy}")
-                print("-" * 60)
-                
-                if proposal.tables:
-                    for t in proposal.tables:
-                        print(f"Table: {t.topic_name}")
-                        print(f"Desc:  {t.description}")
-                        print("Columns:")
-                        for c in t.columns:
-                            print(f"  - {c.name: <25} {c.target_type: <10} {c.description or ''}")
-                        print("-" * 30)
-                else:
-                    print("No tables proposed.")
-                    
-                print(f"\nReasoning: {proposal.reasoning}")
-                print("=" * 60)
-                
-                choice = input("Approve Schema? [Y/n] or enter feedback > ").strip()
-                if choice.lower() in ['y', 'yes', '']:
-                    break
-                schema_feedback = choice # Update feedback for next loop
-            except Exception as e:
-                logger.error(f"Schema Gen Failed: {e}")
-                schema_feedback = input("Retry hint? > ")
-    else:
-        logger.info("Skipping Schema Proposal generation.")
+    schema_feedback = "Only create schemas for pfc_db: type data if possible."
+    
+    while True:
+        try:
+            print("\nGenerating Schema Proposal...")
+            proposal = generator.propose_schema(profile, user_feedback=schema_feedback)
+            
+            print("\n" + "="*60)
+            print(f"Strategy: {proposal.read_strategy}")
+            print(f"Reasoning: {proposal.reasoning}")
+            print("-" * 60)
+            
+            if proposal.tables:
+                for t in proposal.tables:
+                    print(f"Table: {t.topic_name}")
+                    print(f"Desc:  {t.description}")
+                    print("Columns:")
+                    for c in t.columns[:5]: # Show first 5 cols
+                        print(f"  - {c.name} ({c.target_type})")
+                    if len(t.columns) > 5: print("  ... (more)")
+                    print("-" * 30)
+            else:
+                print("No tables proposed.")
+            print("=" * 60)
+            
+            choice = input("Approve Schema? [Y/n/r] (r=Refine) > ").strip().lower()
+            if choice in ['y', 'yes', '']:
+                break
+            elif choice == 'r':
+                schema_feedback = input("Enter hint > ").strip()
+            else:
+                logger.info("Skipped.")
+                return
+        except Exception as e:
+            logger.error(f"Schema Gen Failed: {e}")
+            return
 
     # ==========================================
-    # 4b. Plugin Generation (Skippable)
+    # 4b. Plugin Generation
     # ==========================================
     code = None
-    if prompt_yes_no("\nRun plugin generation?"):
-        if proposal is None:
-            logger.error("Cannot generate plugin: No schema proposal available (Step skipped).")
-        else:
-            # We pre-seed feedback to ensure subscription matches Routing Rule
-            code_feedback = "Subscribe to 'raw_mcdata_events'. Use BasePlugin from casparian_flow.sdk."
+    # Pre-seed instruction to ensure subscription matches Routing Rule
+    code_feedback = "The input topic is 'raw_mcdata_events'. Subscribe to that."
+    
+    while True:
+        try:
+            print("\nGenerating Plugin Code...")
+            code = generator.generate_plugin(proposal, user_feedback=code_feedback, example_path=str(TARGET_FILE))
             
-            while True:
-                try:
-                    print("\nGenerating Plugin Code...")
-                    code = generator.generate_plugin(proposal, user_feedback=code_feedback)
-                    
-                    print("\n" + "="*40)
-                    print("GENERATED CODE")
-                    print("="*40)
-                    print("\n".join(code.source_code.splitlines()[:20]))
-                    print("... (truncated) ...")
-                    print("-" * 40)
-                    
-                    choice = input("Approve Code? [Y/n] or enter feedback > ").strip()
-                    if choice.lower() in ['y', 'yes', '']:
-                        break
-                    code_feedback = choice
-                except Exception as e:
-                    logger.error(f"Code Gen Failed: {e}")
-                    code_feedback = input("Retry hint? > ")
+            print("\n" + "="*40)
+            print("GENERATED CODE")
+            print("="*40)
+            print(code.source_code)
+            print("-" * 40)
+            
+            choice = input("Approve Code? [Y/n/r] (r=Refine) > ").strip().lower()
+            if choice in ['y', 'yes', '']:
+                break
+            elif choice == 'r':
+                code_feedback = input("Enter hint > ").strip()
+            else:
+                logger.info("Skipped.")
+                return
+        except Exception as e:
+            logger.error(f"Code Gen Failed: {e}")
+            return
 
-            if code:
-                plugin_path = PLUGINS_DIR / code.filename
-                plugin_path.write_text(code.source_code, encoding="utf-8")
-                logger.info(f"Plugin written to {plugin_path}")
-    else:
-        logger.info("Skipping Plugin Generation.")
+    if code:
+        plugin_path = PLUGINS_DIR / code.filename
+        plugin_path.write_text(code.source_code, encoding="utf-8")
+        logger.info(f"Plugin written to {plugin_path}")
 
     # ==========================================
     # 5. Start Infrastructure
@@ -193,22 +177,27 @@ def main():
 
     # 7. Wait & Verify
     logger.info("Waiting for processing...")
-    max_wait = 10
-    found_output = False
+    max_wait = 15
     
     for i in range(max_wait):
-        out_dir = Path("sub_output")
-        if out_dir.exists() and list(out_dir.rglob("*.parquet")):
-            print("\nSUCCESS: Output files generated!")
-            for f in out_dir.rglob("*.parquet"):
-                print(f" - {f}")
-            found_output = True
-            break
+        with Session(engine) as session:
+            job = session.query(ProcessingJob).first()
+            if job and job.status in [StatusEnum.COMPLETED, StatusEnum.FAILED]:
+                logger.info(f"Job Status: {job.status}")
+                if job.status == StatusEnum.FAILED:
+                    logger.error(f"Error: {job.error_message}")
+                break
         time.sleep(1)
         print(".", end="", flush=True)
     
-    if not found_output:
-        print("\nNote: No output files found. (This is expected if Plugin Generation was skipped)")
+    # Check Output
+    out_dir = Path("sub_output")
+    if out_dir.exists() and list(out_dir.rglob("*.parquet")):
+        print("\nSUCCESS: Output files generated!")
+        for f in out_dir.rglob("*.parquet"):
+            print(f" - {f}")
+    else:
+        print("\nFAILURE: No output files found.")
 
     sentinel.stop()
     worker.stop()
