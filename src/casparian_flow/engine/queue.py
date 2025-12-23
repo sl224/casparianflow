@@ -115,13 +115,23 @@ class JobQueue:
                 session.commit()
                 logger.error(f"Job {job_id} marked FAILED.")
 
-    def push_job(self, file_id: int, plugin_name: str, priority: int = 0):
+    def push_job(
+        self,
+        file_id: int,
+        plugin_name: str,
+        priority: int = 0,
+        overrides: Dict[str, Any] = None,
+    ):
+        import json
+
         with Session(self.engine) as session:
+            overrides_json = json.dumps(overrides) if overrides else None
             new_job = ProcessingJob(
                 file_version_id=file_id,
                 plugin_name=plugin_name,
                 status=StatusEnum.QUEUED,
                 priority=priority,
+                config_overrides=overrides_json,
             )
             session.add(new_job)
             session.commit()
