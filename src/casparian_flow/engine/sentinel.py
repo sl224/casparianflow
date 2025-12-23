@@ -16,9 +16,11 @@ from casparian_flow.protocol import (
     SinkConfig,
     JobReceipt,
 )
+from urllib.request import url2pathname
 from casparian_flow.engine.queue import JobQueue
 from casparian_flow.engine.config import WorkerConfig
-from casparian_flow.db.models import FileVersion, FileLocation, TopicConfig, ProcessingJob
+from casparian_flow.db.models import FileVersion, FileLocation, TopicConfig, ProcessingJob, SourceRoot
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -241,12 +243,75 @@ class Sentinel:
             )
             self.queue.complete_job(job_id, "Success")
 
-            # TODO: Update FileLocation / FileVersion records based on artifacts
-            # For now, we just log the artifacts
-            for artifact in receipt.artifacts:
-                logger.info(
-                    f"  Artifact: {artifact['topic']} -> {artifact['uri']}"
-                )
+            # Persist Artifacts to Metadata Store
+            try:
+                with Session(self.engine) as s:
+                    for artifact in receipt.artifacts:
+                        uri = artifact['uri']
+                        logger.info(f"  Artifact: {artifact['topic']} -> {uri}")
+                        
+                        try:
+                            parsed = urlparse(uri)
+                            if parsed.scheme in ["parquet", "file"]:
+                                # It's a file. Let's track it.
+                                # URI format: parquet:///abs/path/to/file.parquet
+                                # Use url2pathname to handle Windows drive letters from /C:/path
+                                full_path = Path(url2pathname(parsed.path))
+                                
+                                # 1. Find SourceRoot (assume Output root is a SourceRoot, or create ad-hoc?)
+                                # For strictness, Sentinel usually only tracks files within known SourceRoots.
+                                # But output dirs might be separate. 
+                                # Strategy: Find best matching SourceRoot parent.
+                                roots = s.query(SourceRoot).filter(SourceRoot.active == 1).all()
+                                best_root = None
+                                for root in roots:
+                                    if str(full_path).startswith(root.path):
+                                        best_root = root
+                                        break
+                                
+                                if best_root:
+                                    rel_path = str(full_path.relative_to(best_root.path))
+                                    filename = full_path.name
+                                    
+                                    # 2. Upsert FileLocation
+                                    loc = s.query(FileLocation).filter_by(
+                                        source_root_id=best_root.id, rel_path=rel_path
+                                    ).first()
+                                    
+                                    if not loc:
+                                        loc = FileLocation(
+                                            source_root_id=best_root.id,
+                                            rel_path=rel_path,
+                                            filename=filename,
+                                            last_known_mtime=time.time(), # Approximate
+                                            last_known_size=0 # Unknown unless we check fs
+                                        )
+                                        s.add(loc)
+                                        s.flush() # Get ID
+                                    
+                                    # 3. Create FileVersion linked to this Job
+                                    # Use a dummy hash or "generated" marker since we didn't hash it yet
+                                    # Note: FileHashRegistry fk constraint requires a valid hash. 
+                                    # TODO: Worker should calculate hash? For now, we might skip Version creation 
+                                    # if we don't have a hash, OR we just track Location.
+                                    # Given the constraints, let's just ensure Location is tracked so Scout picks it up later.
+                                    # Scout will see mtime change and create the Version properly.
+                                    
+                                    # UPDATE: Actually, forcing a Scout scan on this file would be better?
+                                    # Or just touching the Location so the user sees it exists.
+                                    loc.last_seen_time = func.now()
+
+                            elif parsed.scheme in ["mssql", "sqlite"]:
+                                # Database artifact. 
+                                # Maybe log as a special 'Virtual File' later?
+                                pass
+
+                        except Exception as e:
+                            logger.error(f"Failed to persist artifact {uri}: {e}")
+                    
+                    s.commit()
+            except Exception as e:
+                logger.error(f"Failed to commit artifact persistence: {e}")
 
         elif receipt.status == "FAILED":
             error_msg = receipt.error_message or "Unknown error"

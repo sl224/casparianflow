@@ -39,8 +39,9 @@ def env(tmp_path):
     engine = create_engine(conn_str)
     initialize_database(engine, reset_tables=True)
     
-    # 3. Source Root (The watched folder)
+    # 3. Source Root (The watched folder) AND Output Root
     source_root_id = get_or_create_sourceroot(engine, str(root))
+    get_or_create_sourceroot(engine, str(parquet_out))
     
     # 4. Config Object
     config = WorkerConfig(
@@ -184,6 +185,21 @@ class Handler(BasePlugin):
     assert "_job_id" in df.columns, "Lineage column _job_id not found"
     assert "_file_version_id" in df.columns, "Lineage column _file_version_id not found"
     print(f"[OK] Lineage columns verified: _job_id={df.iloc[0]['_job_id']}, _file_version_id={df.iloc[0]['_file_version_id']}")
+
+    # --- Step 7: Verify Sentinel Persistence ---
+    from casparian_flow.db.models import FileLocation
+    
+    loc = None
+    for _ in range(20): # Wait up to 2 seconds for async DB commit
+        with Session(env["engine"]) as session:
+            loc = session.query(FileLocation).filter_by(filename=output_file.name).first()
+            if loc:
+                break
+        time.sleep(0.1)
+
+    assert loc is not None, f"Sentinel failed to persist FileLocation for {output_file.name}"
+    print(f"[OK] Persistence Verified: FileLocation ID {loc.id} found for {loc.filename}")
+
 
     # Cleanup
     sentinel.running = False
