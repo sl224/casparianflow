@@ -18,14 +18,25 @@ class PluginMetadata:
     """
     Configuration contract for Plugins.
     """
+    # File pattern for auto-routing (creates RoutingRule)
+    # e.g. "finance/*.csv" or "*.gtest"
+    pattern: Optional[str] = None
+
+    # Default output topic name (creates TopicConfig)
+    # e.g. "finance_data" or "generalist_out"
+    topic: Optional[str] = None
+
+    # Priority for routing rule (higher = processed first)
+    priority: int = 50
+
     # Input Topics: What events does this plugin react to?
     # e.g. ["finance_files", "raw_invoices"]
-    subscriptions: List[str] 
-    
-    # Output Sinks: Where does data go? (Optional defaults)
+    subscriptions: List[str] = field(default_factory=list)
+
+    # Output Sinks: Where does data go? (Optional explicit URIs)
     # e.g. {"clean_sales": "sqlite://data.db/sales"}
     sinks: Dict[str, str] = field(default_factory=dict)
-    
+
     version: str = "1.0.0"
     description: Optional[str] = None
 

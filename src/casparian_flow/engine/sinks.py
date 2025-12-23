@@ -175,13 +175,16 @@ class ParquetSink:
             self.writer = None
 
         if self.staging_path.exists():
-            filename = self.staging_path.name.replace(".stg.", ".")
-            target_dir = self.final_path
-            if target_dir.suffix != "":
-                target_dir = target_dir.parent
-
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target = target_dir / filename
+            # Move staging file to final location
+            # final_path might be a file or directory
+            if self.final_path.suffix:
+                # final_path is a file (e.g., output.parquet)
+                target = self.final_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                # final_path is a directory (e.g., output/)
+                target = self.final_path / self.staging_path.stem.split('.stg')[0]
+                target.mkdir(parents=True, exist_ok=True)
 
             shutil.move(str(self.staging_path), str(target))
 
