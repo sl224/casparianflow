@@ -358,6 +358,14 @@ class Sentinel:
                                     # UPDATE: Actually, forcing a Scout scan on this file would be better?
                                     # Or just touching the Location so the user sees it exists.
                                     loc.last_seen_time = func.now()
+                                else:
+                                    # Ad-Hoc artifact: Outside known SourceRoots
+                                    # Log for visibility but don't fail job
+                                    logger.warning(
+                                        f"Artifact {uri} is outside known SourceRoots - "
+                                        f"not persisted to FileLocation. Consider registering "
+                                        f"output directory as a SourceRoot for tracking."
+                                    )
 
                             elif parsed.scheme in ["mssql", "sqlite"]:
                                 # Database artifact. 
