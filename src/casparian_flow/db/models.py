@@ -15,7 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
-from casparian_flow.db.base_session import Base, DEFAULT_SCHEMA
+from casparian_flow.db.base_session import Base, DEFAULT_SCHEMA, make_table_args
 
 
 class StatusEnum(PyEnum):
@@ -83,9 +83,8 @@ class TopicConfig(Base):
     schema_json = Column(Text, nullable=True)
     plugin = relationship("PluginConfig", back_populates="topics")
 
-    __table_args__ = (
-        Index("ix_topic_lookup", "plugin_name", "topic_name"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        Index("ix_topic_lookup", "plugin_name", "topic_name")
     )
 
 
@@ -124,16 +123,15 @@ class FileLocation(Base):
     source_root = relationship("SourceRoot")
     tags = relationship("FileTag", cascade="all, delete-orphan")
 
-    __table_args__ = (
-        Index("ix_file_location_lookup", "source_root_id", "rel_path"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        Index("ix_file_location_lookup", "source_root_id", "rel_path")
     )
 
 class FileTag(Base):
     __tablename__ = "cf_file_tag"
     file_id = Column(Integer, ForeignKey("cf_file_location.id"), primary_key=True)
     tag = Column(String(50), primary_key=True, index=True)
-    __table_args__ = ({"schema": DEFAULT_SCHEMA},)
+    __table_args__ = make_table_args()
 
 
 class FileVersion(Base):
@@ -151,9 +149,8 @@ class FileVersion(Base):
     location = relationship("FileLocation", foreign_keys=[location_id])
     hash_registry = relationship("FileHashRegistry")
 
-    __table_args__ = (
-        Index("ix_file_version_lookup", "location_id", "content_hash"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        Index("ix_file_version_lookup", "location_id", "content_hash")
     )
 
 
@@ -176,9 +173,8 @@ class ProcessingJob(Base):
     retry_count = Column(Integer, default=0)
     file_version = relationship("FileVersion")
 
-    __table_args__ = (
-        Index("ix_queue_pop", "status", "priority", "id"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        Index("ix_queue_pop", "status", "priority", "id")
     )
 
 
@@ -191,9 +187,8 @@ class PluginSubscription(Base):
     topic_name = Column(String(100), nullable=False, index=True)
     is_active = Column(Boolean, default=True)
 
-    __table_args__ = (
-        UniqueConstraint("plugin_name", "topic_name", name="uq_plugin_topic_sub"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        UniqueConstraint("plugin_name", "topic_name", name="uq_plugin_topic_sub")
     )
 
 
@@ -225,9 +220,8 @@ class PluginManifest(Base):
     created_at = Column(DateTime, server_default=func.now())
     deployed_at = Column(DateTime, nullable=True)
 
-    __table_args__ = (
-        Index("ix_plugin_active_lookup", "plugin_name", "status"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        Index("ix_plugin_active_lookup", "plugin_name", "status")
     )
 
 
@@ -250,7 +244,7 @@ class LibraryWhitelist(Base):
     version_constraint = Column(String(50), nullable=True)
     description = Column(Text, nullable=True)
     added_at = Column(DateTime, server_default=func.now())
-    __table_args__ = ({"schema": DEFAULT_SCHEMA},)
+    __table_args__ = make_table_args()
 
 
 class SurveyorSession(Base):
@@ -266,9 +260,8 @@ class SurveyorSession(Base):
     decisions = relationship(
         "SurveyorDecision", back_populates="session", cascade="all, delete-orphan"
     )
-    __table_args__ = (
-        Index("ix_surveyor_session_lookup", "source_root_id", "current_phase"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        Index("ix_surveyor_session_lookup", "source_root_id", "current_phase")
     )
 
 
@@ -282,7 +275,6 @@ class SurveyorDecision(Base):
     decision_data = Column(Text, nullable=False)
     reasoning = Column(Text, nullable=True)
     session = relationship("SurveyorSession", back_populates="decisions")
-    __table_args__ = (
-        Index("ix_surveyor_decision_lookup", "session_id", "phase"),
-        {"schema": DEFAULT_SCHEMA},
+    __table_args__ = make_table_args(
+        Index("ix_surveyor_decision_lookup", "session_id", "phase")
     )
