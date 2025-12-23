@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 class DataSink(Protocol):
     def write(self, data: Any): ...
     def close(self): ...
+    def close(self): ...
     def promote(self): ...
+    def get_final_uri(self) -> str: ...
 
 
 class MssqlSink:
@@ -53,6 +55,9 @@ class MssqlSink:
         # Application-side buffering to reduce transaction spam
         self.buffer = []
         self.buffer_row_count = 0
+
+    def get_final_uri(self) -> str:
+        return f"mssql://{self.schema}.{self.table_name}"
 
     def write(self, data: Any):
         if HAS_ARROW and isinstance(data, (pa.Table, pa.RecordBatch)):
@@ -149,6 +154,16 @@ class SqliteSink:
         # Application-side buffering to reduce transaction spam
         self.buffer = []
         self.buffer_row_count = 0
+
+    def get_final_uri(self) -> str:
+        # Reconstruct URI based on engine url
+        # self.engine.url might be sqlite:////absolute/path/db or sqlite:///relative/db
+        db_path = str(self.engine.url.database)
+        if os.name == "nt" and ":" not in db_path and not db_path.startswith("/"):
+             # Handle weird sqlalchemy windows path normalization if needed
+             pass
+        # Simplest approach: Return a valid sqlite URI
+        return f"sqlite:///{db_path}/{self.table_name}"
 
     def write(self, data: Any):
         if HAS_ARROW and isinstance(data, (pa.Table, pa.RecordBatch)):
@@ -249,6 +264,12 @@ class ParquetSink:
         self.staging_path.parent.mkdir(parents=True, exist_ok=True)
         self.compression = options.get("compression", ["snappy"])[0]
         self.writer = None
+
+    def get_final_uri(self) -> str:
+        # Return absolute URI string
+        # Use as_uri() to handle Windows paths (file:///C:/...) correctly
+        file_uri = self.final_path.resolve().as_uri()
+        return file_uri.replace("file:", "parquet:", 1)
 
     def write(self, data: Any):
         table = None

@@ -302,10 +302,16 @@ class GeneralistWorker:
             artifacts = []
             metrics = {"rows": 0, "size_bytes": 0}  # TODO: Track actual metrics
 
+            # Iterate over actual active sinks to get truth
             for topic, sink_list in self.proxy_context.sinks.items():
-                for sink_cfg in sink_configs:
-                    if sink_cfg.topic == topic:
-                        artifacts.append({"topic": topic, "uri": sink_cfg.uri})
+                for sink in sink_list:
+                    try:
+                        final_uri = sink.get_final_uri()
+                        artifacts.append({"topic": topic, "uri": final_uri})
+                    except Exception as e:
+                        logger.warning(f"Failed to get final URI for sink on topic {topic}: {e}")
+                        # Fallback to configured URI if possible, or skip
+                        pass
 
             receipt = JobReceipt(
                 status="SUCCESS", metrics=metrics, artifacts=artifacts
