@@ -12,6 +12,7 @@ from sqlalchemy import (
     Float,
     Boolean,
     func,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from casparian_flow.db.base_session import Base, DEFAULT_SCHEMA
@@ -121,11 +122,18 @@ class FileLocation(Base):
     last_seen_time = Column(DateTime, server_default=func.now())
 
     source_root = relationship("SourceRoot")
+    tags = relationship("FileTag", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("ix_file_location_lookup", "source_root_id", "rel_path"),
         {"schema": DEFAULT_SCHEMA},
     )
+
+class FileTag(Base):
+    __tablename__ = "cf_file_tag"
+    file_id = Column(Integer, ForeignKey("cf_file_location.id"), primary_key=True)
+    tag = Column(String(50), primary_key=True, index=True)
+    __table_args__ = ({"schema": DEFAULT_SCHEMA},)
 
 
 class FileVersion(Base):
@@ -156,6 +164,7 @@ class ProcessingJob(Base):
     plugin_name = Column(
         String(100), ForeignKey(PluginConfig.plugin_name), nullable=False
     )
+    config_overrides = Column(Text, nullable=True)  # JSON string
     status = Column(Enum(StatusEnum), default=StatusEnum.PENDING, index=True)
     priority = Column(Integer, default=0, index=True)
     worker_host = Column(String(100), nullable=True)
@@ -171,6 +180,22 @@ class ProcessingJob(Base):
         Index("ix_queue_pop", "status", "priority", "id"),
         {"schema": DEFAULT_SCHEMA},
     )
+
+
+class PluginSubscription(Base):
+    __tablename__ = "cf_plugin_subscription"
+    id = Column(Integer, primary_key=True)
+    plugin_name = Column(
+        String(100), ForeignKey("cf_plugin_config.plugin_name"), nullable=False
+    )
+    topic_name = Column(String(100), nullable=False, index=True)
+    is_active = Column(Boolean, default=True)
+
+    __table_args__ = (
+        UniqueConstraint("plugin_name", "topic_name", name="uq_plugin_topic_sub"),
+        {"schema": DEFAULT_SCHEMA},
+    )
+
 
 
 class WorkerNode(Base):

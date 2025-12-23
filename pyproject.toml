@@ -25,6 +25,7 @@ dependencies = [
     "openai>=2.12.0",
     "anthropic>=0.75.0",
     "pathspec>=0.12.1",
+    "fastapi>=0.127.0",
 ]
 
 [dependency-groups]

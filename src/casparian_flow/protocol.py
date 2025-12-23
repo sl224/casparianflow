@@ -40,6 +40,9 @@ class OpCode(IntEnum):
     # Bidirectional (Error)
     ERR = 6  # "Something went wrong."
 
+    # Sentinel -> Worker (Config Refresh)
+    RELOAD = 7  # "Reload configuration / plugins."
+
 
 # Header: !BBHQI (16 bytes)
 # [VER:1][OP:1][RES:2][JOB_ID:8][LEN:4]

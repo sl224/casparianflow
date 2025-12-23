@@ -15,6 +15,7 @@ from casparian_flow.protocol import (
     msg_dispatch,
     SinkConfig,
     JobReceipt,
+    pack_header, 
 )
 from urllib.request import url2pathname
 from casparian_flow.engine.queue import JobQueue
@@ -140,6 +141,18 @@ class Sentinel:
                 if identity in self.workers:
                     self.workers[identity].last_seen = time.time()
 
+            elif opcode == OpCode.RELOAD:
+                # Config Reload Signal (from API or Admin)
+                logger.info("Received RELOAD signal. Refreshing configuration...")
+                self._load_topic_configs()
+                
+                # Broadcast RELOAD to all workers
+                # They should re-scan their plugin directories / DB
+                reload_msg = [pack_header(OpCode.RELOAD, 0, 0)]
+                for worker_id, worker in self.workers.items():
+                    self.socket.send_multipart([worker_id] + reload_msg)
+                logger.info("Broadcasted RELOAD to all workers.")
+
             else:
                 logger.warning(f"Unhandled OpCode: {opcode}")
 
@@ -184,7 +197,7 @@ class Sentinel:
         """
         logger.info(f"Assigning Job {job.id} to worker")
 
-        # 1. Load Topic Configs from Cache (non-blocking)
+        # 2. Load Topic Configs from Cache (non-blocking)
         sink_configs = self.topic_map.get(job.plugin_name, []).copy()
 
         # Add default 'output' sink if not configured
@@ -207,7 +220,16 @@ class Sentinel:
                 source_root = s.get(SourceRoot, fl.source_root_id)
             full_path = str(Path(source_root.path) / fl.rel_path)
 
-        # 3. Send DISPATCH message with lineage context
+        # 3. Apply Overrides (Key-Based Replacement)
+        if job.config_overrides:
+            try:
+                overrides = json.loads(job.config_overrides)
+                sink_configs = self._merge_configs(sink_configs, overrides)
+                logger.info(f"Applied config overrides for Job {job.id}")
+            except Exception as e:
+                logger.error(f"Failed to apply overrides for Job {job.id}: {e}")
+
+        # 4. Send DISPATCH message with lineage context
         worker.status = "BUSY"
         worker.current_job_id = job.id
         dispatch_msg = msg_dispatch(
@@ -222,6 +244,42 @@ class Sentinel:
         logger.info(
             f"Dispatched Job {job.id} with {len(sink_configs)} sink configs"
         )
+
+    def _merge_configs(self, defaults: list[SinkConfig], overrides: Dict) -> list[SinkConfig]:
+        """
+        Robust Merge: Overrides strictly replace defaults by Topic Key.
+        """
+        if not overrides:
+            return defaults
+
+        # 1. Group defaults by topic
+        # Note: If defaults has multiple sinks for same topic, this naive dict will overwrite.
+        # But SinkConfig list is the source.
+        # Better: keep map of topic -> list[SinkConfig]
+        final_map = {}
+        for sc in defaults:
+            if sc.topic not in final_map:
+                final_map[sc.topic] = []
+            final_map[sc.topic].append(sc)
+
+        # 2. Apply Overrides
+        for topic, sink_def in overrides.items():
+            # Override implies complete replacement for that topic
+            # sink_def could be a single dict or list of dicts
+            sinks_to_create = sink_def if isinstance(sink_def, list) else [sink_def]
+
+            new_configs = []
+            for s in sinks_to_create:
+                # Ensure topic is set in the dict
+                s_copy = s.copy()
+                s_copy["topic"] = topic
+                # Validate via Pydantic model before using
+                new_configs.append(SinkConfig(**s_copy))
+
+            final_map[topic] = new_configs
+
+        # 3. Flatten
+        return [s for sublist in final_map.values() for s in sublist]
 
     def _handle_conclude(self, identity, job_id, receipt: JobReceipt):
         """
