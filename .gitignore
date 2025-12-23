@@ -34,4 +34,7 @@ tests/static_assets/
 *.sqlite*
 data/
 *.db
+
+# llm
 .agent
+.coverage
