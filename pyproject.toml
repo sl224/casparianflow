@@ -1,15 +1,14 @@
 [build-system]
-requires = ["uv_build>=0.9.9,<0.10.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.uv.build-backend]
-module-name = "e2d_core"
-namespace = true
+[tool.hatch.build.targets.wheel]
+packages = ["src/casparian_flow"]
 
 [project]
 name = "casparianflow"
-version = "0.1.0"
-description = "..."
+version = "5.0.0"
+description = "Enterprise Artifact Registry with Bridge Mode Execution"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -28,7 +27,20 @@ dependencies = [
     "fastapi>=0.127.0",
     "python-fasthtml>=0.12.36",
     "uvicorn>=0.34.0",
+    # v5.0 Bridge Mode: Ed25519 signing
+    "cryptography>=44.0.0",
 ]
+
+[project.optional-dependencies]
+# Enterprise mode (Azure AD authentication)
+entra = [
+    "msal>=1.28.0",
+    "PyJWT[crypto]>=2.8.0",
+]
+
+[project.scripts]
+# v5.0 Bridge Mode CLI
+casparian = "casparian_flow.cli.publish:main"
 
 [dependency-groups]
 dev = [

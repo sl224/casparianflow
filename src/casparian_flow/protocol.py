@@ -43,6 +43,13 @@ class OpCode(IntEnum):
     # Sentinel -> Worker (Config Refresh)
     RELOAD = 7  # "Reload configuration / plugins."
 
+    # v5.0 Bridge Mode: Environment Provisioning
+    PREPARE_ENV = 8  # "Provision this environment (lockfile) before execution."
+    ENV_READY = 9  # "Environment is ready for use."
+
+    # v5.0 Bridge Mode: Artifact Deployment
+    DEPLOY = 10  # "Deploy this artifact (source + lockfile + signature)."
+
 
 # Header: !BBHQI (16 bytes)
 # [VER:1][OP:1][RES:2][JOB_ID:8][LEN:4]
@@ -170,6 +177,73 @@ class ErrorPayload(BaseModel):
     traceback: Optional[str] = None
 
 
+# --- v5.0 Bridge Mode Payloads ---
+
+
+class PrepareEnvCommand(BaseModel):
+    """
+    Payload for OpCode.PREPARE_ENV.
+    Sentinel -> Worker: "Provision this environment before execution."
+
+    Enables Eager Provisioning to avoid network blocking during job execution.
+    """
+
+    env_hash: str  # SHA256 of lockfile content
+    lockfile_content: str  # Raw TOML content (uv.lock)
+    python_version: Optional[str] = None  # e.g., "3.11"
+
+
+class EnvReadyPayload(BaseModel):
+    """
+    Payload for OpCode.ENV_READY.
+    Worker -> Sentinel: "Environment is ready."
+    """
+
+    env_hash: str
+    interpreter_path: str  # Path to Python interpreter in venv
+    cached: bool = False  # True if environment was already cached
+
+
+class DeployCommand(BaseModel):
+    """
+    Payload for OpCode.DEPLOY.
+    CLI -> Sentinel: "Deploy this artifact to the registry."
+
+    Part of the Publisher workflow.
+    """
+
+    plugin_name: str
+    version: str
+    source_code: str
+    lockfile_content: str  # uv.lock content (empty string for legacy mode)
+    env_hash: str  # SHA256(lockfile_content)
+    artifact_hash: str  # SHA256(source_code + lockfile_content)
+    signature: str  # Ed25519 signature of artifact_hash
+    publisher_name: str
+    publisher_email: Optional[str] = None
+    azure_oid: Optional[str] = None  # For enterprise mode
+    system_requirements: Optional[list[str]] = None  # e.g., ["glibc_2.31"]
+
+
+class BridgeDispatchCommand(BaseModel):
+    """
+    Extended DISPATCH command for Bridge Mode execution.
+    Sentinel -> Worker: "Process this file in isolated venv."
+
+    When env_hash is present, Worker spawns subprocess with Arrow IPC bridge.
+    """
+
+    plugin_name: str
+    file_path: str
+    sinks: list[SinkConfig]
+    file_version_id: int
+
+    # Bridge Mode fields (optional - null means Legacy Host Process mode)
+    env_hash: Optional[str] = None  # Links to PluginEnvironment
+    artifact_hash: Optional[str] = None  # For signature verification
+    source_code: Optional[str] = None  # Plugin source (for subprocess execution)
+
+
 # --- Message Builders ---
 
 
@@ -224,6 +298,69 @@ def msg_err(job_id: int, message: str, traceback: Optional[str] = None) -> list:
     payload_obj = ErrorPayload(message=message, traceback=traceback)
     payload = payload_obj.model_dump_json().encode("utf-8")
     return [pack_header(OpCode.ERR, job_id, len(payload)), payload]
+
+
+# --- v5.0 Bridge Mode Message Builders ---
+
+
+def msg_prepare_env(
+    env_hash: str,
+    lockfile_content: str,
+    python_version: Optional[str] = None,
+) -> list:
+    """Build a PREPARE_ENV message (Sentinel -> Worker)."""
+    payload_obj = PrepareEnvCommand(
+        env_hash=env_hash,
+        lockfile_content=lockfile_content,
+        python_version=python_version,
+    )
+    payload = payload_obj.model_dump_json().encode("utf-8")
+    return [pack_header(OpCode.PREPARE_ENV, 0, len(payload)), payload]
+
+
+def msg_env_ready(
+    env_hash: str,
+    interpreter_path: str,
+    cached: bool = False,
+) -> list:
+    """Build an ENV_READY message (Worker -> Sentinel)."""
+    payload_obj = EnvReadyPayload(
+        env_hash=env_hash,
+        interpreter_path=interpreter_path,
+        cached=cached,
+    )
+    payload = payload_obj.model_dump_json().encode("utf-8")
+    return [pack_header(OpCode.ENV_READY, 0, len(payload)), payload]
+
+
+def msg_deploy(cmd: DeployCommand) -> list:
+    """Build a DEPLOY message (CLI -> Sentinel)."""
+    payload = cmd.model_dump_json().encode("utf-8")
+    return [pack_header(OpCode.DEPLOY, 0, len(payload)), payload]
+
+
+def msg_bridge_dispatch(
+    job_id: int,
+    plugin_name: str,
+    file_path: str,
+    sinks: list[SinkConfig],
+    file_version_id: int,
+    env_hash: Optional[str] = None,
+    artifact_hash: Optional[str] = None,
+    source_code: Optional[str] = None,
+) -> list:
+    """Build a Bridge Mode DISPATCH message (Sentinel -> Worker)."""
+    payload_obj = BridgeDispatchCommand(
+        plugin_name=plugin_name,
+        file_path=file_path,
+        sinks=sinks,
+        file_version_id=file_version_id,
+        env_hash=env_hash,
+        artifact_hash=artifact_hash,
+        source_code=source_code,
+    )
+    payload = payload_obj.model_dump_json().encode("utf-8")
+    return [pack_header(OpCode.DISPATCH, job_id, len(payload)), payload]
 
 
 # --- Message Unpacking ---

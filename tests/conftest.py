@@ -117,3 +117,53 @@ class BadPlugin:
     def execute(self, file_path):
         os.system("rm -rf /")
 """
+
+
+# =============================================================================
+# v5.0 Bridge Mode Fixtures
+# =============================================================================
+
+
+@pytest.fixture
+def sample_lockfile():
+    """Sample uv.lock content for testing."""
+    return """
+version = 1
+requires-python = ">=3.11"
+
+[[package]]
+name = "pandas"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "python-dateutil" },
+]
+
+[[package]]
+name = "numpy"
+version = "1.26.0"
+source = { registry = "https://pypi.org/simple" }
+"""
+
+
+@pytest.fixture
+def bridge_plugin_code():
+    """Valid plugin source code for Bridge Mode testing."""
+    return """
+from casparian_flow.sdk import BasePlugin
+import pandas as pd
+
+class Handler(BasePlugin):
+    def execute(self, file_path: str):
+        # Simple plugin that reads CSV and outputs
+        df = pd.read_csv(file_path)
+        return [df]
+"""
+
+
+@pytest.fixture
+def local_identity_provider(tmp_path):
+    """LocalProvider with ephemeral keys for testing."""
+    from casparian_flow.security.local_provider import LocalProvider
+    return LocalProvider(keys_dir=tmp_path, ephemeral=True)
