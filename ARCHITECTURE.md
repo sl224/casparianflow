@@ -1,4 +1,4 @@
-# Casparian Flow Architecture Guide (v3.0 - Pull Architecture)
+# Casparian Flow Architecture Guide (v4.0 - Split Plane)
 
 A comprehensive mental model for the Casparian Flow system.
 
@@ -9,10 +9,10 @@ A comprehensive mental model for the Casparian Flow system.
 Casparian Flow is an autonomous **file-to-data pipeline**. It turns "dark data" (files on disk) into structured, queryable datasets (SQL/Parquet) through a distributed, pull-based architecture.
 
 **Core Principles:**
-1.  **Pull-Based Processing:** Workers explicitly request jobs when ready (Load Balancing).
-2.  **Immutable Versioning:** Every file change creates a new version; jobs process specific versions.
-3.  **Code-First Configuration:** Plugin source code is the source of truth for routing and schemas.
-4.  **Separation of Concerns:** I/O (Scanning) is decoupled from Logic (Tagging/Hashing).
+1.  **Split Plane Architecture:** Control messages flow through the Sentinel; Data flows directly from Workers to Storage/DB.
+2.  **Pull-Based Processing:** Workers explicitly request jobs when ready (Load Balancing).
+3.  **Immutable Versioning:** Every file change creates a new version; jobs process specific versions.
+4.  **Code-First Configuration:** Plugin source code is the source of truth for routing and schemas.
 
 ---
 
@@ -27,18 +27,17 @@ src/casparian_flow/
 ├── sdk.py             # User-facing BasePlugin API
 ├── interface.py       # Internal Plugin Protocol
 ├── main.py            # Sentinel Entry Point
-├── protocol.py        # Binary Protocol v3 (Hello/Ready/Exec)
+├── protocol.py        # Binary Protocol v4 (Split Plane)
 ├── mcp_server.py      # MCP Server for LLM Integration
 ├── db/
 │   ├── models.py      # SQLAlchemy Models (The Source of Truth)
 │   ├── access.py      # DB Engine & Bulk Loaders
 │   └── setup.py       # Schema Fingerprinting & Init
 ├── engine/
-│   ├── sentinel.py    # The Broker/Router (Manages Queue & Sinks)
-│   ├── worker_client.py # The Generalist Worker (Executes Code)
+│   ├── sentinel.py    # The Broker (Control Plane)
+│   ├── worker_client.py # The Generalist Worker (Data Plane)
 │   ├── queue.py       # Atomic Job Queue
-│   ├── context.py     # WorkerContext (Sink Management & Lineage)
-│   ├── sinks.py       # Output Adapters (Parquet/SQLite/MSSQL)
+│   ├── sinks.py       # Output Adapters (Parquet/SQLite/MSSQL) -> Used by Worker
 │   └── config.py      # Engine Config Models
 ├── services/
 │   ├── scout.py       # Discovery Service (Inventory + Tagger)
@@ -57,35 +56,36 @@ src/casparian_flow/
 
 ---
 
-## Process Architecture: The Pull Model (Sentinel & Generalist)
+## Process Architecture: The Split Plane Model
 
-Casparian Flow uses a **Router-Dealer** pattern over ZeroMQ to enable horizontal scaling and robust failure recovery.
+Casparian Flow uses a **Split Plane** architecture. The **Control Plane** (Sentinel <-> Worker) uses ZeroMQ for coordination, while the **Data Plane** (Worker -> Sink) writes directly to storage.
 
 ```mermaid
 sequenceDiagram
     participant Queue as Database Queue
-    participant Sentinel as Sentinel (Router)
-    participant Worker as Generalist Worker (Dealer)
-    participant Sink as Data Sink
+    participant Sentinel as Sentinel (Control)
+    participant Worker as Generalist (Data)
+    participant Sink as SQL/Parquet Storage
 
     Note over Worker: 1. Startup & Register
     Worker->>DB: Register RoutingRules (via comments)
-    Worker->>Sentinel: HELLO (Capabilities)
+    Worker->>Sentinel: IDENTIFY (Capabilities)
     
     loop Processing Cycle
-        Worker->>Sentinel: READY
+        Worker->>Sentinel: HEARTBEAT (IDLE)
         Sentinel->>Queue: Pop Job
         Queue-->>Sentinel: Job Details
-        Sentinel->>Sentinel: Create Context & Sinks
-        Sentinel->>Worker: EXEC (Job ID, File Path)
+        Sentinel->>Sentinel: Resolve Sinks & Config
+        Sentinel->>Worker: DISPATCH (Job ID, Config, Sinks)
         
-        Note over Worker: Execute Plugin
-        Worker->>Worker: Serialize Arrow
-        Worker->>Sentinel: DATA (Stream)
-        Sentinel->>Sink: Write (Staging)
+        Note over Worker: Data Plane Execution
+        Worker->>Worker: Instantiate Local Sinks
+        Worker->>Worker: Run Plugin -> Buffer -> Write
+        Worker->>Sink: Write Staging Data (with Lineage)
         
-        Worker->>Sentinel: READY (Job Done)
-        Sentinel->>Sink: Promote (Commit)
+        Worker->>Sink: Promote to Production (Atomic)
+        Worker->>Worker: CONCLUDE (Receipt)
+        Worker->>Sentinel: CONCLUDE (Receipt)
         Sentinel->>Queue: Mark COMPLETED
     end
 
@@ -93,39 +93,35 @@ sequenceDiagram
 
 ### Components
 
-1. **Sentinel (The Router)**
-* **Role:** The "Brain". Manages the Job Queue, Worker State, and Output Sinks.
+1. **Sentinel (The Controller)**
+* **Role:** The "Brain". Manages the Job Queue and Worker orchestration.
 * **Responsibility:**
 * Tracks connected workers and their capabilities.
 * Matches pending jobs to idle workers.
-* **Governance:** Validates incoming data streams against schema contracts.
-* **Writes:** Owns the connection to the Sinks (SQL/Parquet). All data flows back to the Sentinel for writing.
+* **Configuration:** Eagerly loads `TopicConfig` to send Sink instructions to workers.
+* **No Data:** Does *not* touch the data payload.
 
-
-
-
-2. **Generalist Worker (The Dealer)**
-* **Role:** The "Muscle". Pure compute node.
+2. **Generalist Worker (The Executor)**
+* **Role:** The "Muscle". Compute + I/O node.
 * **Responsibility:**
 * Scans its local `plugins/` directory.
-* **Auto-Registration:** Parsers source code for `# PATTERN:` and `# TOPIC:` to configure the DB.
-* Executes user code in a loop.
-* **Proxy Context:** Intercepts `self.publish()` calls and streams Zero-Copy Arrow IPC data back to the Sentinel.
+* **Execution:** Runs user code.
+* **Sinks:** Instantiates local Sinks (SQL, Parquet) based on instructions from Sentinel.
+* **Buffering:** Buffers rows in memory to minimize I/O transactions.
+* **Lineage:** Injects `_job_id` and `_file_version_id` into every row.
+* **Reporting:** Sends a `JobReceipt` (metrics, artifacts) back to Sentinel.
 
 
-
-
-3. **Protocol v3**
-* **Format:** Fixed 16-byte binary header (`!BBHIQ`) + Payload.
+3. **Protocol v4 (!BBHQI)**
+* **Format:** Fixed 16-byte binary header (`!BBHQI`) + Payload.
+* **Fields:** Version, OpCode, Reserved, JobID (8 bytes), Length (4 bytes).
 * **OpCodes:**
-* `HELLO (1)`: Handshake with capabilities.
-* `EXEC (2)`: Command to process a file.
-* `DATA (3)`: Arrow IPC stream payload.
-* `READY (4)`: "I am idle" / "Job finished" signal.
-* `ERR (5)`: Error reporting.
-
-
-
+* `IDENTIFY (1)`: Handshake with capabilities.
+* `DISPATCH (2)`: Command to process a file (includes Sink Configs).
+* `ABORT (3)`: Cancel job.
+* `HEARTBEAT (4)`: Keep-alive / Status.
+* `CONCLUDE (5)`: Job finished + Receipt.
+* `ERR (6)`: Error reporting.
 
 
 ---
@@ -170,24 +166,23 @@ Discovery is decoupled into **I/O** and **Logic** phases to handle millions of f
 5. **Route:** Checks `RoutingRule` table (e.g., `*.csv` -> `csv_tag`). Saves tags to `FileVersion`.
 6. **Queue:** Checks `PluginConfig` subscriptions. If tags match, inserts `ProcessingJob` with QoS priority.
 
-### Workflow B: The Processing Loop (Pull)
+### Workflow B: The Processing Loop (Split Plane)
 
-1. **Connect:** Generalist Worker connects to Sentinel. Sends `HELLO`.
-2. **Request:** Worker sends `READY`.
-3. **Dispatch:** Sentinel receives `READY`.
-* Checks `idle_workers`.
-* Pops highest priority Job from `JobQueue`.
-* Matches Job Plugin -> Worker Capabilities.
-
-
-4. **Context:** Sentinel initializes `WorkerContext` and opens Staging Sinks (e.g., `table_stg_123`).
-5. **Execute:** Sentinel sends `EXEC` to Worker.
-6. **Stream:** Worker runs plugin. `ProxyContext` intercepts data, serializes to Arrow, sends `DATA` frames.
-7. **Write:** Sentinel receives `DATA`, writes to Staging Sink.
-8. **Commit:** Worker finishes, sends `READY`.
-* Sentinel calls `sink.promote()` (Atomic swap/insert to production).
-* Sentinel marks Job `COMPLETED`.
-
+1. **Connect:** Generalist Worker connects to Sentinel. Sends `IDENTIFY`.
+2. **Idle:** Worker sends `HEARTBEAT` (Idle).
+3. **Dispatch:** Sentinel finds match in `JobQueue`.
+* Resolves `TopicConfig` for the plugin (e.g., Output -> SQL Table).
+* Sends `DISPATCH` message with Sinks and File Path.
+4. **Execute:** Worker receives `DISPATCH`.
+* Initializes local Sinks (e.g., `MssqlSink`).
+* Runs Plugin.
+* Intercepts `publish()` calls.
+* **Lineage:** Injects `_job_id` and `_file_version_id`.
+* Buffers and writes to Staging Tables/Files.
+5. **Commit:** Worker finishes execution.
+* Promotes Staging to Production (Atomic).
+* Sends `CONCLUDE` with Receipt (Rows processed, Artifacts generated).
+6. **Complete:** Sentinel marks Job `COMPLETED` in DB.
 
 
 ### Workflow C: The Surveyor Agent (Autonomous Onboarding)
@@ -250,4 +245,5 @@ class Handler(BasePlugin):
 
 1. **Lineage:** Every row in the output DB includes `_job_id` and `_file_version_id`, traceable back to the exact source file hash.
 2. **Gatekeeper:** AI-generated code passes through AST validation (banned imports like `os`, `subprocess`) and HMAC signature verification before running.
-3. **Atomic Promotion:** Data is written to `_stg` tables. It is only moved to production tables if the job completes successfully.
+3. **Concurrency:** Output files use unique job-IDs to prevent race conditions.
+4. **Atomic Promotion:** Data is written to `_stg` tables. It is only moved to production tables if the job completes successfully.

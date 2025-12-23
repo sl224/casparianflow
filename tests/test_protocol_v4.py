@@ -145,11 +145,15 @@ class TestPydanticModels:
             SinkConfig(topic="output", uri="parquet://output.parquet", mode="append")
         ]
         cmd = DispatchCommand(
-            plugin_name="test_plugin", file_path="/path/to/file.csv", sinks=sinks
+            plugin_name="test_plugin",
+            file_path="/path/to/file.csv",
+            sinks=sinks,
+            file_version_id=42,
         )
         assert cmd.plugin_name == "test_plugin"
         assert cmd.file_path == "/path/to/file.csv"
         assert len(cmd.sinks) == 1
+        assert cmd.file_version_id == 42
 
     def test_job_receipt_success(self):
         """Test JobReceipt for successful job."""
@@ -215,7 +219,7 @@ class TestMessageBuilders:
         sinks = [
             SinkConfig(topic="output", uri="parquet://output.parquet", mode="append")
         ]
-        frames = msg_dispatch(123, "test_plugin", "/path/to/file.csv", sinks)
+        frames = msg_dispatch(123, "test_plugin", "/path/to/file.csv", sinks, 99)
         assert len(frames) == 2
 
         opcode, job_id, payload_len = unpack_header(frames[0])
@@ -226,6 +230,7 @@ class TestMessageBuilders:
         assert payload["plugin_name"] == "test_plugin"
         assert payload["file_path"] == "/path/to/file.csv"
         assert len(payload["sinks"]) == 1
+        assert payload["file_version_id"] == 99
 
     def test_msg_abort(self):
         """Test msg_abort builder."""
@@ -300,12 +305,13 @@ class TestMessageUnpacking:
         sinks = [
             SinkConfig(topic="output", uri="parquet://output.parquet", mode="append")
         ]
-        frames = msg_dispatch(123, "test_plugin", "/path/to/file.csv", sinks)
+        frames = msg_dispatch(123, "test_plugin", "/path/to/file.csv", sinks, 55)
         opcode, job_id, payload_dict = unpack_msg(frames)
 
         assert opcode == OpCode.DISPATCH
         assert job_id == 123
         assert payload_dict["plugin_name"] == "test_plugin"
+        assert payload_dict["file_version_id"] == 55
 
     def test_unpack_conclude(self):
         """Test unpacking CONCLUDE message."""
@@ -360,7 +366,7 @@ class TestRoundtrip:
             SinkConfig(topic="output", uri="parquet://output.parquet", mode="append"),
             SinkConfig(topic="errors", uri="sqlite:///db.sqlite/errors", mode="append"),
         ]
-        frames = msg_dispatch(999, "csv_parser", "/data/file.csv", sinks)
+        frames = msg_dispatch(999, "csv_parser", "/data/file.csv", sinks, 777)
         opcode, job_id, payload_dict = unpack_msg(frames)
 
         assert opcode == OpCode.DISPATCH
@@ -368,6 +374,7 @@ class TestRoundtrip:
         assert payload_dict["plugin_name"] == "csv_parser"
         assert payload_dict["file_path"] == "/data/file.csv"
         assert len(payload_dict["sinks"]) == 2
+        assert payload_dict["file_version_id"] == 777
 
     def test_conclude_success_roundtrip(self):
         """Test CONCLUDE SUCCESS message roundtrip."""

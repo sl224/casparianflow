@@ -151,12 +151,11 @@ class Handler(BasePlugin):
         assert len(rows) == 2
         assert rows[0].val == "A"
         
-        # TODO: Lineage Columns (Not yet implemented in Split Plane architecture)
-        # In the future, we may want to inject _job_id and _file_version_id
-        # cols = conn.execute(text("PRAGMA table_info(results_table)")).fetchall()
-        # col_names = [c[1] for c in cols]
-        # assert "_job_id" in col_names
-        # assert "_file_version_id" in col_names
+        # Lineage Columns Verification
+        cols = conn.execute(text("PRAGMA table_info(results_table)")).fetchall()
+        col_names = [c[1] for c in cols]
+        assert "_job_id" in col_names
+        assert "_file_version_id" in col_names
 
     # Clean Shutdown
     sentinel.stop()

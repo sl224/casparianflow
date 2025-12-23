@@ -41,10 +41,12 @@ class OpCode(IntEnum):
     ERR = 6  # "Something went wrong."
 
 
-# Header: !BBHIQ (16 bytes)
+# Header: !BBHQI (16 bytes)
 # [VER:1][OP:1][RES:2][JOB_ID:8][LEN:4]
 # RES = Reserved for future use
-HEADER_FORMAT = "!BBHIQ"
+# CRITICAL: Q (8 bytes) for JOB_ID, I (4 bytes) for LEN
+# This gives ~18 quintillion possible job IDs before overflow
+HEADER_FORMAT = "!BBHQI"
 HEADER_SIZE = 16
 
 
@@ -120,6 +122,7 @@ class DispatchCommand(BaseModel):
     plugin_name: str
     file_path: str
     sinks: list[SinkConfig]
+    file_version_id: int  # Required for lineage restoration
 
 
 class JobReceipt(BaseModel):
@@ -175,11 +178,18 @@ def msg_identify(capabilities: list[str], worker_id: Optional[str] = None) -> li
 
 
 def msg_dispatch(
-    job_id: int, plugin_name: str, file_path: str, sinks: list[SinkConfig]
+    job_id: int,
+    plugin_name: str,
+    file_path: str,
+    sinks: list[SinkConfig],
+    file_version_id: int,
 ) -> list:
     """Build a DISPATCH message (Sentinel -> Worker)."""
     payload_obj = DispatchCommand(
-        plugin_name=plugin_name, file_path=file_path, sinks=sinks
+        plugin_name=plugin_name,
+        file_path=file_path,
+        sinks=sinks,
+        file_version_id=file_version_id,
     )
     payload = payload_obj.model_dump_json().encode("utf-8")
     return [pack_header(OpCode.DISPATCH, job_id, len(payload)), payload]
