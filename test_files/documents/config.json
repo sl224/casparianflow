@@ -1,0 +1,15 @@
+{
+  "application": "SalesTracker",
+  "version": "2.1.0",
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "name": "sales_db"
+  },
+  "features": {
+    "auto_sync": true,
+    "notifications": true,
+    "reporting": true
+  },
+  "refresh_interval": 300
+}
