@@ -4,7 +4,7 @@ import sys
 import importlib.util
 from pathlib import Path
 from sqlalchemy.orm import Session
-from casparian_flow.db.models import PluginConfig, TopicConfig
+from casparian_flow.db.models import PluginConfig, TopicConfig, RoutingRule
 from casparian_flow.sdk import PluginMetadata
 
 logger = logging.getLogger(__name__)
@@ -29,19 +29,50 @@ def register_plugins_from_source(plugin_dir: Path, session: Session):
             if hasattr(mod, "MANIFEST") and isinstance(mod.MANIFEST, PluginMetadata):
                 meta: PluginMetadata = mod.MANIFEST
                 logger.info(f"Found MANIFEST in {plugin_name}")
-                
-                # A. Plugin Config (Subscriptions)
-                subs_csv = ",".join(sorted(meta.subscriptions))
+
+                # A. Create RoutingRule from pattern
+                if meta.pattern:
+                    auto_tag = f"auto_{plugin_name}"
+                    existing_rule = session.query(RoutingRule).filter_by(
+                        pattern=meta.pattern
+                    ).first()
+
+                    if not existing_rule:
+                        session.add(RoutingRule(
+                            pattern=meta.pattern,
+                            tag=auto_tag,
+                            priority=meta.priority or 50
+                        ))
+                        logger.info(f"Created RoutingRule: {meta.pattern} -> {auto_tag}")
+                    else:
+                        # Update existing rule
+                        existing_rule.tag = auto_tag
+                        existing_rule.priority = meta.priority or 50
+                        logger.info(f"Updated RoutingRule: {meta.pattern} -> {auto_tag}")
+
+                # B. Plugin Config (Subscriptions)
+                # Include the auto tag in subscriptions
+                auto_tag = f"auto_{plugin_name}"
+                all_subs = sorted(set(meta.subscriptions) | {auto_tag})
+                subs_csv = ",".join(all_subs)
+
                 p_conf = session.get(PluginConfig, plugin_name)
                 if not p_conf:
                     session.add(PluginConfig(plugin_name=plugin_name, subscription_tags=subs_csv))
                 else:
                     p_conf.subscription_tags = subs_csv
-                
-                # B. Topic Configs
+
+                # C. Topic Configs
                 # 1. From 'sinks' dict (Explicit URIs)
                 for topic, uri in meta.sinks.items():
                     _upsert_topic(session, plugin_name, topic, uri)
+
+                # 2. Create default 'output' topic config if 'topic' is specified in MANIFEST
+                # This maps the default yield behavior to the named topic
+                if meta.topic and "output" not in meta.sinks:
+                    default_uri = f"parquet://{meta.topic}.parquet"
+                    _upsert_topic(session, plugin_name, "output", default_uri)
+                    logger.info(f"Created default output topic config: output -> {default_uri}")
                 
                 # 2. From 'subscriptions' (Implied topics? No, usually outputs are distinct)
                 # But we might want defaults for topics mentioned in code? 

@@ -71,20 +71,24 @@ def test_generalist_flow_e2e(env):
     # --- Step 1: Write Plugin "The Tagger" ---
     # We define a plugin that handles *.gtest files and outputs to 'generalist_out'
     plugin_code = """
-# PATTERN: *.gtest
-# TOPIC: generalist_out
-from casparian_flow.sdk import BasePlugin
+from casparian_flow.sdk import BasePlugin, PluginMetadata
 import pandas as pd
 import pyarrow as pa
+
+MANIFEST = PluginMetadata(
+    pattern="*.gtest",
+    topic="generalist_out",
+    version="1.0"
+)
 
 class Handler(BasePlugin):
     def execute(self, file_path: str):
         # Read the dummy file (CSV format)
         df = pd.read_csv(file_path)
-        
+
         # Add a proof-of-processing column
         df['worker_type'] = 'GENERALIST'
-        
+
         # Yield as Arrow Table
         yield pa.Table.from_pandas(df)
 """
@@ -100,7 +104,9 @@ class Handler(BasePlugin):
     
     # B. Start Worker (Client)
     # This triggers 'register_plugins_from_source', writing RoutingRules to DB
-    worker = GeneralistWorker(sentinel_addr, env["plugins"], env["engine"])
+    worker = GeneralistWorker(
+        sentinel_addr, env["plugins"], env["engine"], parquet_root=env["parquet"]
+    )
     t_worker = threading.Thread(target=worker.start, daemon=True)
     t_worker.start()
     
@@ -110,8 +116,8 @@ class Handler(BasePlugin):
     # VERIFY: Did the worker register the routing rule?
     with Session(env["engine"]) as session:
         rule = session.query(RoutingRule).filter_by(pattern="*.gtest").first()
-        assert rule is not None, "Worker failed to auto-register RoutingRule from plugin comments!"
-        print(f"✅ Auto-Registered Rule: {rule.pattern} -> {rule.tag}")
+        assert rule is not None, "Worker failed to auto-register RoutingRule from plugin MANIFEST!"
+        print(f"[OK] Auto-Registered Rule: {rule.pattern} -> {rule.tag}")
 
     # --- Step 3: Push Dummy File (The Trigger) ---
     data_file = env["root"] / "input.gtest"
@@ -131,12 +137,12 @@ class Handler(BasePlugin):
         job = session.query(ProcessingJob).first()
         assert job is not None, "Scout failed to queue job"
         assert job.status == StatusEnum.QUEUED
-        print(f"✅ Job Queued: {job.id} for plugin {job.plugin_name}")
+        print(f"[OK] Job Queued: {job.id} for plugin {job.plugin_name}")
 
     # --- Step 5: Wait for Execution ---
     # Sentinel should pick up the QUEUED job and dispatch it to the Worker
-    print("⏳ Waiting for Sentinel to process job...")
-    
+    print("[WAIT] Waiting for Sentinel to process job...")
+
     success = False
     for _ in range(50): # 5 seconds timeout
         with Session(env["engine"]) as session:
@@ -147,18 +153,22 @@ class Handler(BasePlugin):
             elif job.status == StatusEnum.FAILED:
                 pytest.fail(f"Job Failed: {job.error_message}")
         time.sleep(0.1)
-        
+
     assert success, "Job did not complete in time"
-    print("✅ Job Completed")
+    print("[OK] Job Completed")
 
     # --- Step 6: Verify Data Output ---
-    # The Sentinel/Context should have written parquet to the configured root
-    # Topic was 'generalist_out', so folder is output/generalist_out
-    output_dir = env["parquet"] / "generalist_out"
-    assert output_dir.exists(), "Output directory was not created"
-    
-    df = pd.read_parquet(output_dir)
-    print("✅ Output Data Found:\n", df)
+    # The Worker should have written parquet to the configured root
+    # Let's check what files were created
+    print(f"[DEBUG] Parquet root: {env['parquet']}")
+    print(f"[DEBUG] Files created: {list(env['parquet'].rglob('*'))}")
+
+    # Topic was 'generalist_out', so file is output/generalist_out.parquet
+    output_file = env["parquet"] / "generalist_out.parquet"
+    assert output_file.exists(), f"Output file was not created. Expected: {output_file}"
+
+    df = pd.read_parquet(output_file)
+    print("[OK] Output Data Found:\n", df)
     
     assert len(df) == 2
     assert "worker_type" in df.columns

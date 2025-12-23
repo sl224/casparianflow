@@ -109,19 +109,21 @@ class InventoryScanner:
 
     def _flush_inventory(self, batch: List[Dict], source_root: SourceRoot):
         rel_paths = [b["rel_path"] for b in batch]
+
+        # Fetch existing records with IDs
         existing = self.db.execute(
-            select(FileLocation.rel_path).where(
+            select(FileLocation.id, FileLocation.rel_path).where(
                 FileLocation.source_root_id == source_root.id,
                 FileLocation.rel_path.in_(rel_paths)
             )
         ).fetchall()
-        existing_paths = {row[0] for row in existing}
+        existing_map = {row.rel_path: row.id for row in existing}
 
         new_records = []
         update_records = []
-        
+
         for item in batch:
-            if item["rel_path"] not in existing_paths:
+            if item["rel_path"] not in existing_map:
                 new_records.append({
                     "source_root_id": source_root.id,
                     "rel_path": item["rel_path"],
@@ -131,30 +133,21 @@ class InventoryScanner:
                     "last_seen_time": datetime.now()
                 })
             else:
+                # Include the ID for bulk update
                 update_records.append({
-                    "rel_path": item["rel_path"],
-                    "mtime": item["mtime"],
-                    "size": item["size"],
-                    "now": datetime.now()
+                    "id": existing_map[item["rel_path"]],
+                    "last_known_mtime": item["mtime"],
+                    "last_known_size": item["size"],
+                    "last_seen_time": datetime.now()
                 })
 
         if new_records:
             self.db.execute(insert(FileLocation), new_records)
-        
+
         if update_records:
-            self.db.execute(
-                update(FileLocation)
-                .where(
-                    FileLocation.source_root_id == source_root.id,
-                    FileLocation.rel_path == text(":rel_path")
-                )
-                .values(
-                    last_known_mtime=text(":mtime"),
-                    last_known_size=text(":size"),
-                    last_seen_time=text(":now")
-                ),
-                update_records
-            )
+            # Use ORM bulk update with primary keys
+            self.db.bulk_update_mappings(FileLocation, update_records)
+
         self.db.commit()
 
 
