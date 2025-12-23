@@ -36,20 +36,30 @@ def get_job_queue():
     engine = get_engine(settings.database)
     return JobQueue(engine)
 
-# To signal Sentinel (assuming standard port)
-def signal_sentinel_reload():
-    # Helper to send RELOAD signal
+# Signal Sentinel to reload (thread-safe: creates new context/socket per call)
+def signal_sentinel_reload(sentinel_addr: str = "tcp://127.0.0.1:5555"):
+    """
+    Send RELOAD signal to Sentinel.
+    Thread-safe: Creates fresh ZMQ context and socket per call.
+    """
+    ctx = None
+    socket = None
     try:
         ctx = zmq.Context()
         socket = ctx.socket(zmq.DEALER)
-        socket.connect("tcp://127.0.0.1:5555") # TODO: Configurable
-        # RELOAD op has no payload
-        msg = [pack_header(OpCode.RELOAD, 0, 0)]
+        socket.setsockopt(zmq.LINGER, 0)  # Don't block on close
+        socket.connect(sentinel_addr)
+        # RELOAD op has no payload, but protocol expects 2 frames [header, payload]
+        msg = [pack_header(OpCode.RELOAD, 0, 0), b""]
         socket.send_multipart(msg)
-        socket.close()
-        ctx.term()
+        logger.info(f"Sent RELOAD signal to Sentinel at {sentinel_addr}")
     except Exception as e:
         logger.error(f"Failed to signal Sentinel: {e}")
+    finally:
+        if socket:
+            socket.close()
+        if ctx:
+            ctx.term()
 
 # --- Models ---
 

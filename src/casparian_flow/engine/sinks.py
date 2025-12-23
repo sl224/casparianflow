@@ -56,6 +56,13 @@ class MssqlSink:
         self.buffer = []
         self.buffer_row_count = 0
 
+        # Destructive Initialization: Clean stale staging table
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {self.schema}.{self.staging_table}"))
+        except Exception as e:
+            logger.warning(f"Failed to drop stale staging table: {e}")
+
     def get_final_uri(self) -> str:
         return f"mssql://{self.schema}.{self.table_name}"
 
@@ -154,6 +161,13 @@ class SqliteSink:
         # Application-side buffering to reduce transaction spam
         self.buffer = []
         self.buffer_row_count = 0
+
+        # Destructive Initialization: Clean stale staging table
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {self.staging_table}"))
+        except Exception as e:
+            logger.warning(f"Failed to drop stale staging table: {e}")
 
     def get_final_uri(self) -> str:
         # Reconstruct URI based on engine url
@@ -264,6 +278,17 @@ class ParquetSink:
         self.staging_path.parent.mkdir(parents=True, exist_ok=True)
         self.compression = options.get("compression", ["snappy"])[0]
         self.writer = None
+
+        # Destructive Initialization: Clean stale staging artifacts
+        if self.staging_path.exists():
+            try:
+                if self.staging_path.is_dir():
+                    shutil.rmtree(self.staging_path)
+                else:
+                    self.staging_path.unlink()
+                logger.info(f"Cleaned stale staging artifact: {self.staging_path}")
+            except OSError as e:
+                logger.warning(f"Failed to clean staging artifact: {e}")
 
     def get_final_uri(self) -> str:
         # Return absolute URI string
