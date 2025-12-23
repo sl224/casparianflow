@@ -209,7 +209,9 @@ class GeneralistWorker:
                 return
 
             logger.info(f"Received Job {job_id} -> {cmd.plugin_name}")
-            self._execute_job(job_id, cmd.plugin_name, cmd.file_path, cmd.sinks)
+            self._execute_job(
+                job_id, cmd.plugin_name, cmd.file_path, cmd.sinks, cmd.file_version_id
+            )
 
         elif opcode == OpCode.ABORT:
             logger.warning(f"Received ABORT for job {job_id}")
@@ -228,10 +230,12 @@ class GeneralistWorker:
         plugin_name: str,
         file_path: str,
         sink_configs: list[SinkConfig],
+        file_version_id: int,
     ):
         """
         Execute a job with Split Plane architecture:
         - Data is written directly to local sinks
+        - Lineage columns (_job_id, _file_version_id) are injected
         - Receipt is sent to Sentinel on completion
         """
         self.current_job_id = job_id
@@ -255,6 +259,7 @@ class GeneralistWorker:
                         sql_engine=self.db_engine,
                         parquet_root=self.parquet_root,
                         job_id=job_id,
+                        file_version_id=file_version_id,
                     )
                     self.proxy_context.add_sink(sink_config.topic, sink)
                     logger.info(
@@ -339,28 +344,6 @@ class GeneralistWorker:
                         )
                     except Exception:
                         pass
-
-    def _serialize_arrow(self, obj) -> bytes:
-        if hasattr(obj, "to_arrow"): obj = obj.to_arrow()
-        
-        if isinstance(obj, pa.Table):
-            sink = pa.BufferOutputStream()
-            with pa.ipc.new_stream(sink, obj.schema) as writer:
-                writer.write_table(obj)
-            return sink.getvalue().to_pybytes()
-            
-        import pandas as pd
-        if isinstance(obj, pd.DataFrame):
-            try:
-                table = pa.Table.from_pandas(obj)
-                return self._serialize_arrow(table)
-            except Exception as e:
-                logger.warning(f"Pandas cast failed: {e}")
-                # Try string cast for mixed types
-                obj = obj.astype(str)
-                table = pa.Table.from_pandas(obj)
-                return self._serialize_arrow(table)
-        return b""
 
     def _load_plugins(self):
         if not self.plugin_dir.exists(): return

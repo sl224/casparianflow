@@ -161,18 +161,29 @@ class Handler(BasePlugin):
     # The Worker should have written parquet to the configured root
     # Let's check what files were created
     print(f"[DEBUG] Parquet root: {env['parquet']}")
-    print(f"[DEBUG] Files created: {list(env['parquet'].rglob('*'))}")
+    created_files = list(env['parquet'].rglob('*.parquet'))
+    print(f"[DEBUG] Files created: {created_files}")
 
-    # Topic was 'generalist_out', so file is output/generalist_out.parquet
-    output_file = env["parquet"] / "generalist_out.parquet"
-    assert output_file.exists(), f"Output file was not created. Expected: {output_file}"
+    # With job_id injection, the file will have a suffix like _1.parquet
+    # Find any parquet file that was created
+    assert len(created_files) > 0, "No parquet files were created"
+    output_file = created_files[0]
+    print(f"[OK] Output file found: {output_file}")
+    
+    # Verify unique filename format (race condition fix)
+    assert f"_{job.id}.parquet" in output_file.name, f"Filename {output_file.name} does not contain job ID {job.id}"
 
     df = pd.read_parquet(output_file)
     print("[OK] Output Data Found:\n", df)
-    
+
     assert len(df) == 2
     assert "worker_type" in df.columns
     assert df.iloc[0]["worker_type"] == "GENERALIST"
+
+    # Verify lineage columns were injected
+    assert "_job_id" in df.columns, "Lineage column _job_id not found"
+    assert "_file_version_id" in df.columns, "Lineage column _file_version_id not found"
+    print(f"[OK] Lineage columns verified: _job_id={df.iloc[0]['_job_id']}, _file_version_id={df.iloc[0]['_file_version_id']}")
 
     # Cleanup
     sentinel.running = False

@@ -44,7 +44,37 @@ class Sentinel:
         self.workers: Dict[bytes, ConnectedWorker] = {}
         self.running = False
 
+        # Cache topic configurations to avoid blocking I/O in event loop
+        self.topic_map: Dict[str, list[SinkConfig]] = {}
+        self._load_topic_configs()
+
         logger.info(f"Sentinel online at {bind_addr}")
+
+    def _load_topic_configs(self):
+        """
+        Load all topic configurations into memory on startup.
+        This avoids blocking database queries in the event loop.
+        """
+        with Session(self.engine) as s:
+            all_configs = s.query(TopicConfig).all()
+
+            for tc in all_configs:
+                if tc.plugin_name not in self.topic_map:
+                    self.topic_map[tc.plugin_name] = []
+
+                self.topic_map[tc.plugin_name].append(
+                    SinkConfig(
+                        topic=tc.topic_name,
+                        uri=tc.uri,
+                        mode=tc.mode or "append",
+                        schema_def=tc.schema_json,
+                    )
+                )
+
+        logger.info(
+            f"Loaded topic configs for {len(self.topic_map)} plugins "
+            f"({sum(len(v) for v in self.topic_map.values())} total sinks)"
+        )
 
     def run(self):
         self.running = True
@@ -148,35 +178,24 @@ class Sentinel:
     def _assign_job(self, worker, job):
         """
         Assign a job to a worker using the Split Plane DISPATCH protocol.
-        Resolves sink configurations from the database and sends them to the worker.
+        Uses cached sink configurations and resolves file paths from the database.
         """
         logger.info(f"Assigning Job {job.id} to worker")
 
-        # 1. Load Topic Configs from Database
-        sink_configs = []
+        # 1. Load Topic Configs from Cache (non-blocking)
+        sink_configs = self.topic_map.get(job.plugin_name, []).copy()
+
+        # Add default 'output' sink if not configured
+        if not any(sc.topic == "output" for sc in sink_configs):
+            default_output_uri = (
+                f"parquet://{job.plugin_name}_output.parquet"
+            )
+            sink_configs.append(
+                SinkConfig(topic="output", uri=default_output_uri, mode="append")
+            )
+
+        # 2. Resolve file path (still requires database access)
         with Session(self.engine) as s:
-            tcs = s.query(TopicConfig).filter_by(plugin_name=job.plugin_name).all()
-
-            for tc in tcs:
-                sink_configs.append(
-                    SinkConfig(
-                        topic=tc.topic_name,
-                        uri=tc.uri,
-                        mode=tc.mode or "append",
-                        schema_def=tc.schema_json,
-                    )
-                )
-
-            # Add default 'output' sink if not configured
-            if not any(sc.topic == "output" for sc in sink_configs):
-                default_output_uri = (
-                    f"parquet://{job.plugin_name}_output.parquet"
-                )
-                sink_configs.append(
-                    SinkConfig(topic="output", uri=default_output_uri, mode="append")
-                )
-
-            # 2. Resolve file path
             fv = s.get(FileVersion, job.file_version_id)
             fl = s.get(FileLocation, fv.location_id)
             source_root = fl.source_root
@@ -186,10 +205,16 @@ class Sentinel:
                 source_root = s.get(SourceRoot, fl.source_root_id)
             full_path = str(Path(source_root.path) / fl.rel_path)
 
-        # 3. Send DISPATCH message
+        # 3. Send DISPATCH message with lineage context
         worker.status = "BUSY"
         worker.current_job_id = job.id
-        dispatch_msg = msg_dispatch(job.id, job.plugin_name, full_path, sink_configs)
+        dispatch_msg = msg_dispatch(
+            job.id,
+            job.plugin_name,
+            full_path,
+            sink_configs,
+            job.file_version_id  # Pass file_version_id for lineage restoration
+        )
         self.socket.send_multipart([worker.identity] + dispatch_msg)
 
         logger.info(
