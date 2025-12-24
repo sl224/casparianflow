@@ -14,17 +14,14 @@ Casparian Flow transforms "dark data" (files on disk) into structured, queryable
 ## Quick Start
 
 ```bash
-# Install dependencies
-uv sync
+# Build the unified binary
+cargo build --release
 
-# Publish a plugin
-casparian publish ./my_plugin/
+# Run both Sentinel and Worker (unified process)
+./target/release/casparian start
 
-# Run the Sentinel (control plane)
-uv run -m casparian_flow.main
-
-# Run a Worker (data plane)
-uv run -m casparian_flow.engine.worker_client --connect tcp://localhost:5555
+# Publish a plugin (creates signed artifact)
+./target/release/casparian publish my_plugin.py --version 1.0.0
 ```
 
 ## Architecture
@@ -59,8 +56,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete system design.
 
 ## Requirements
 
-- Python 3.13+
-- [uv](https://github.com/astral-sh/uv) package manager
+- Rust 1.75+ (for building from source)
+- [uv](https://github.com/astral-sh/uv) (for plugin venv management)
 
 ## License
 
