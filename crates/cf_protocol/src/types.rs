@@ -49,15 +49,35 @@ pub struct DispatchCommand {
 // OpCode.CONCLUDE (Worker -> Sentinel)
 // ============================================================================
 
+/// Job completion status - type-safe enum instead of stringly-typed
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum JobStatus {
+    Success,
+    Failed,
+    Rejected,  // Worker at capacity
+    Aborted,   // Cancelled by sentinel
+}
+
+impl JobStatus {
+    pub fn is_success(&self) -> bool {
+        matches!(self, JobStatus::Success)
+    }
+
+    pub fn is_failure(&self) -> bool {
+        !self.is_success()
+    }
+}
+
 /// Payload for OpCode.CONCLUDE.
 /// Worker -> Sentinel: "Job finished. Here are the results."
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobReceipt {
-    pub status: String, // "SUCCESS" | "FAILED"
+    pub status: JobStatus,
     pub metrics: HashMap<String, i64>, // e.g., {"rows": 1500, "size_bytes": 42000}
     pub artifacts: Vec<HashMap<String, String>>, // e.g., [{"topic": "output", "uri": "s3://..."}]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>, // Populated if status == "FAILED"
+    pub error_message: Option<String>, // Populated if status is failure
 }
 
 // ============================================================================
@@ -81,9 +101,20 @@ pub struct IdentifyPayload {
 /// Worker -> Sentinel: Status update.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatPayload {
-    pub status: String, // "IDLE" | "BUSY"
+    pub status: String, // "IDLE" | "BUSY" | "ALIVE"
+    /// First active job ID (for backward compatibility)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_job_id: Option<i64>,
+    /// Number of currently active jobs (0 to MAX_CONCURRENT_JOBS)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub active_job_count: usize,
+    /// All active job IDs (for monitoring/debugging)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_job_ids: Vec<i64>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 // ============================================================================
@@ -151,6 +182,16 @@ pub struct DeployCommand {
     pub system_requirements: Option<Vec<String>>, // e.g., ["glibc_2.31"]
 }
 
+/// Response to a DEPLOY command.
+/// Sentinel -> CLI: "Deploy succeeded/failed."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeployResponse {
+    pub success: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,12 +228,27 @@ mod tests {
         let payload = HeartbeatPayload {
             status: "BUSY".to_string(),
             current_job_id: Some(12345),
+            active_job_count: 3,
+            active_job_ids: vec![12345, 12346, 12347],
         };
 
         let json = serde_json::to_string(&payload).unwrap();
         let deserialized: HeartbeatPayload = serde_json::from_str(&json).unwrap();
         assert_eq!(payload.status, deserialized.status);
         assert_eq!(payload.current_job_id, deserialized.current_job_id);
+        assert_eq!(payload.active_job_count, deserialized.active_job_count);
+        assert_eq!(payload.active_job_ids, deserialized.active_job_ids);
+    }
+
+    #[test]
+    fn test_heartbeat_payload_backward_compat() {
+        // Old payload without new fields should deserialize with defaults
+        let old_json = r#"{"status":"ALIVE","current_job_id":123}"#;
+        let payload: HeartbeatPayload = serde_json::from_str(old_json).unwrap();
+        assert_eq!(payload.status, "ALIVE");
+        assert_eq!(payload.current_job_id, Some(123));
+        assert_eq!(payload.active_job_count, 0);
+        assert!(payload.active_job_ids.is_empty());
     }
 
     #[test]
@@ -202,7 +258,7 @@ mod tests {
         metrics.insert("size_bytes".to_string(), 42000);
 
         let receipt = JobReceipt {
-            status: "SUCCESS".to_string(),
+            status: JobStatus::Success,
             metrics,
             artifacts: vec![],
             error_message: None,
@@ -212,5 +268,51 @@ mod tests {
         let deserialized: JobReceipt = serde_json::from_str(&json).unwrap();
         assert_eq!(receipt.status, deserialized.status);
         assert_eq!(receipt.metrics, deserialized.metrics);
+    }
+
+    #[test]
+    fn test_job_status_serialization() {
+        // Test that JobStatus serializes to SCREAMING_SNAKE_CASE
+        assert_eq!(
+            serde_json::to_string(&JobStatus::Success).unwrap(),
+            "\"SUCCESS\""
+        );
+        assert_eq!(
+            serde_json::to_string(&JobStatus::Failed).unwrap(),
+            "\"FAILED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&JobStatus::Rejected).unwrap(),
+            "\"REJECTED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&JobStatus::Aborted).unwrap(),
+            "\"ABORTED\""
+        );
+
+        // Test deserialization
+        assert_eq!(
+            serde_json::from_str::<JobStatus>("\"SUCCESS\"").unwrap(),
+            JobStatus::Success
+        );
+        assert_eq!(
+            serde_json::from_str::<JobStatus>("\"FAILED\"").unwrap(),
+            JobStatus::Failed
+        );
+    }
+
+    #[test]
+    fn test_job_status_methods() {
+        assert!(JobStatus::Success.is_success());
+        assert!(!JobStatus::Success.is_failure());
+
+        assert!(!JobStatus::Failed.is_success());
+        assert!(JobStatus::Failed.is_failure());
+
+        assert!(!JobStatus::Rejected.is_success());
+        assert!(JobStatus::Rejected.is_failure());
+
+        assert!(!JobStatus::Aborted.is_success());
+        assert!(JobStatus::Aborted.is_failure());
     }
 }

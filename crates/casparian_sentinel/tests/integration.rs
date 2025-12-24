@@ -2,7 +2,7 @@
 //!
 //! Tests the complete control plane: worker registration, job dispatch, and ZMQ communication.
 
-use cf_protocol::types::{IdentifyPayload, JobReceipt};
+use cf_protocol::types::{IdentifyPayload, JobReceipt, JobStatus};
 use cf_protocol::{Message, OpCode};
 use std::time::Duration;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend};
@@ -16,7 +16,7 @@ fn test_identify_message() {
     };
 
     let payload = serde_json::to_vec(&identify).unwrap();
-    let msg = Message::new(OpCode::Identify, 0, payload);
+    let msg = Message::new(OpCode::Identify, 0, payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     // Verify header format
@@ -36,14 +36,14 @@ fn test_identify_message() {
 #[test]
 fn test_conclude_message() {
     let receipt = JobReceipt {
-        status: "SUCCESS".to_string(),
+        status: JobStatus::Success,
         metrics: std::collections::HashMap::from([("rows".to_string(), 1000i64)]),
         artifacts: vec![],
         error_message: None,
     };
 
     let payload = serde_json::to_vec(&receipt).unwrap();
-    let msg = Message::new(OpCode::Conclude, 42, payload);
+    let msg = Message::new(OpCode::Conclude, 42, payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     assert_eq!(header[1], 0x05); // CONCLUDE = 5
@@ -52,7 +52,7 @@ fn test_conclude_message() {
     assert_eq!(unpacked.header.job_id, 42);
 
     let parsed: JobReceipt = serde_json::from_slice(&unpacked.payload).unwrap();
-    assert_eq!(parsed.status, "SUCCESS");
+    assert_eq!(parsed.status, JobStatus::Success);
     assert_eq!(parsed.metrics.get("rows"), Some(&1000i64));
 }
 
@@ -82,7 +82,7 @@ async fn test_worker_sentinel_exchange() {
         worker_id: Some("worker-1".to_string()),
     };
     let payload = serde_json::to_vec(&identify).unwrap();
-    let msg = Message::new(OpCode::Identify, 0, payload);
+    let msg = Message::new(OpCode::Identify, 0, payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     // Send as multipart message (not separate sends!)

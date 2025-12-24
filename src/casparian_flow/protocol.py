@@ -4,6 +4,17 @@ Binary Protocol v4: The Split Plane Protocol.
 
 Wire format for Sentinel <-> Worker communication.
 Control Plane only - Data flows directly from Worker to Storage.
+
+DEPRECATED: This protocol has been ported to Rust.
+
+The Rust implementation is in: crates/cf_protocol/
+
+This file is kept for:
+- Reference implementation
+- Python tools that need to communicate with Rust Sentinel/Worker
+- CLI publish workflow
+
+Migration: Operation Iron Core (2025-12-23)
 """
 
 import struct

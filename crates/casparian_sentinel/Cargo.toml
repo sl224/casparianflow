@@ -10,9 +10,6 @@ license.workspace = true
 name = "casparian_sentinel"
 path = "src/lib.rs"
 
-[[bin]]
-name = "casparian-sentinel"
-path = "src/main.rs"
 
 [dependencies]
 # Protocol
@@ -45,6 +42,7 @@ clap.workspace = true
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

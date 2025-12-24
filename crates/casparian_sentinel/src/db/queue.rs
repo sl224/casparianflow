@@ -6,9 +6,13 @@
 use anyhow::Result;
 use chrono::Utc;
 use sqlx::{Pool, Sqlite};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::models::ProcessingJob;
+
+/// Maximum number of retries before a job is marked as permanently failed
+/// This prevents infinite retry loops for jobs that consistently fail
+pub const MAX_RETRY_COUNT: i32 = 5;
 
 pub struct JobQueue {
     pool: Pool<Sqlite>,
@@ -17,6 +21,23 @@ pub struct JobQueue {
 impl JobQueue {
     pub fn new(pool: Pool<Sqlite>) -> Self {
         Self { pool }
+    }
+
+    /// Peek at the next job without claiming it.
+    /// Used to check if a capable worker exists before popping.
+    pub async fn peek_job(&self) -> Result<Option<ProcessingJob>> {
+        let job: Option<ProcessingJob> = sqlx::query_as(
+            r#"
+            SELECT * FROM cf_processing_queue
+            WHERE status = 'QUEUED'
+            ORDER BY priority DESC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(job)
     }
 
     /// Atomically pop a job from the queue (SQLite version)
@@ -126,7 +147,37 @@ impl JobQueue {
     }
 
     /// Requeue a job (move from RUNNING back to QUEUED)
+    ///
+    /// If the job has exceeded MAX_RETRY_COUNT, it is marked as FAILED instead.
+    /// This prevents infinite retry loops for jobs that consistently fail.
     pub async fn requeue_job(&self, job_id: i32) -> Result<()> {
+        // First check the current retry count
+        let current_retry: Option<i32> = sqlx::query_scalar(
+            "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(retry_count) = current_retry else {
+            warn!("Cannot requeue job {}: not found in queue", job_id);
+            return Ok(());
+        };
+
+        if retry_count >= MAX_RETRY_COUNT {
+            // Exceeded max retries - fail permanently
+            warn!(
+                "Job {} exceeded max retries ({}/{}), marking as FAILED",
+                job_id, retry_count, MAX_RETRY_COUNT
+            );
+            self.fail_job(
+                job_id,
+                &format!("Exceeded maximum retry count ({})", MAX_RETRY_COUNT),
+            ).await?;
+            return Ok(());
+        }
+
+        // Requeue with incremented retry count
         sqlx::query(
             r#"
             UPDATE cf_processing_queue
@@ -140,7 +191,7 @@ impl JobQueue {
         .execute(&self.pool)
         .await?;
 
-        info!("Job {} requeued", job_id);
+        info!("Job {} requeued (retry {}/{})", job_id, retry_count + 1, MAX_RETRY_COUNT);
         Ok(())
     }
 
@@ -267,5 +318,93 @@ mod tests {
 
         assert_eq!(job.status, StatusEnum::Completed);
         assert_eq!(job.result_summary, Some("Success".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_fail_job() {
+        use crate::db::models::StatusEnum;
+
+        let pool = setup_test_db().await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status)
+            VALUES (1, 1, 'test', 'RUNNING')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let queue = JobQueue::new(pool.clone());
+        queue.fail_job(1, "Connection timeout").await.unwrap();
+
+        let job: ProcessingJob = sqlx::query_as("SELECT * FROM cf_processing_queue WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(job.status, StatusEnum::Failed);
+        assert_eq!(job.error_message, Some("Connection timeout".to_string()));
+        assert!(job.end_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_requeue_job() {
+        use crate::db::models::StatusEnum;
+
+        let pool = setup_test_db().await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, retry_count)
+            VALUES (1, 1, 'test', 'RUNNING', 0)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let queue = JobQueue::new(pool.clone());
+        queue.requeue_job(1).await.unwrap();
+
+        let job: ProcessingJob = sqlx::query_as("SELECT * FROM cf_processing_queue WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(job.status, StatusEnum::Queued);
+        assert_eq!(job.retry_count, 1);
+        assert!(job.claim_time.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_requeue_exceeds_max_retries() {
+        use crate::db::models::StatusEnum;
+
+        let pool = setup_test_db().await;
+
+        // Insert job that has already been retried MAX_RETRY_COUNT times
+        sqlx::query(
+            r#"
+            INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, retry_count)
+            VALUES (1, 1, 'test', 'RUNNING', 5)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let queue = JobQueue::new(pool.clone());
+        queue.requeue_job(1).await.unwrap();
+
+        // Job should be marked as FAILED, not requeued
+        let job: ProcessingJob = sqlx::query_as("SELECT * FROM cf_processing_queue WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(job.status, StatusEnum::Failed);
+        assert!(job.error_message.unwrap().contains("maximum retry count"));
     }
 }

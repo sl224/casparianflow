@@ -3,6 +3,7 @@
 *.zip
 *.e2d
 *.parquet
+*.log
 
 # Macos
 .DS_Store

@@ -1,4 +1,14 @@
 # src/casparian_flow/engine/queue.py
+"""
+DEPRECATED: Job queue operations have been ported to Rust.
+
+The Rust implementation is in: crates/casparian_sentinel/src/db/queue.rs
+
+This file is kept for reference and for Python tools that still need queue access.
+For production workloads, use the Rust Sentinel which handles queue operations internally.
+
+Migration: Operation Iron Core (2025-12-23)
+"""
 import logging
 import socket
 import os
