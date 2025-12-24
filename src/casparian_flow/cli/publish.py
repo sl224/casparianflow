@@ -50,17 +50,23 @@ class PublishError(Exception):
     pass
 
 
-def find_lockfile(plugin_path: Path) -> Tuple[Optional[Path], Optional[str]]:
+def find_lockfile(plugin_path: Path) -> Tuple[Path, str]:
     """
     Find or generate a lockfile for the plugin.
+
+    v5.0 Bridge Mode: Lockfiles are REQUIRED. Auto-generates if missing.
 
     Discovery order:
     1. uv.lock in same directory as plugin
     2. pyproject.toml in same directory (will run uv lock)
     3. uv.lock in parent directories (up to 3 levels)
+    4. Auto-generate minimal pyproject.toml + lockfile
 
     Returns:
-        Tuple of (lockfile_path, lockfile_content) or (None, "") for legacy mode
+        Tuple of (lockfile_path, lockfile_content)
+
+    Raises:
+        PublishError: If lockfile cannot be generated
     """
     plugin_dir = plugin_path.parent
 
@@ -85,9 +91,28 @@ def find_lockfile(plugin_path: Path) -> Tuple[Optional[Path], Optional[str]]:
                 logger.info(f"Found lockfile in parent: {lockfile}")
                 return lockfile, lockfile.read_text()
 
-    # No lockfile found - legacy mode
-    logger.warning("No lockfile found. Plugin will run in Legacy Mode (Host Process).")
-    return None, ""
+    # No lockfile found - auto-generate minimal pyproject.toml
+    logger.warning(
+        "No lockfile or pyproject.toml found. "
+        "Auto-generating minimal pyproject.toml for Bridge Mode..."
+    )
+
+    # Create minimal pyproject.toml with common dependencies
+    minimal_pyproject = f"""[project]
+name = "{plugin_path.stem}"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+]
+"""
+    pyproject_path = plugin_dir / "pyproject.toml"
+    pyproject_path.write_text(minimal_pyproject)
+    logger.info(f"Created minimal pyproject.toml at {pyproject_path}")
+
+    # Generate lockfile
+    return generate_lockfile(plugin_dir)
 
 
 def generate_lockfile(project_dir: Path) -> Tuple[Path, str]:
@@ -198,15 +223,14 @@ def publish_plugin(
         raise PublishError(f"Plugin validation failed: {validation.error_message}")
     logger.info("✓ Plugin passed safety validation")
 
-    # 3. Find or generate lockfile
+    # 3. Find or generate lockfile (required for Bridge Mode)
     lockfile_path, lockfile_content = find_lockfile(plugin_path)
 
     # 4. Compute hashes
-    env_hash = compute_env_hash(lockfile_content) if lockfile_content else ""
+    env_hash = compute_env_hash(lockfile_content)
     artifact_hash = compute_artifact_hash(source_code, lockfile_content)
+    logger.info(f"Environment hash: {env_hash[:16]}...")
     logger.info(f"Artifact hash: {artifact_hash[:16]}...")
-    if env_hash:
-        logger.info(f"Environment hash: {env_hash[:16]}...")
 
     # 5. Authenticate
     logger.info("Authenticating...")

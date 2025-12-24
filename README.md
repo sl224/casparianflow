@@ -35,17 +35,20 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete system design.
 
 | Component | Description |
 |-----------|-------------|
-| **Publisher CLI** | End-to-end artifact publishing with signing |
+| **Publisher CLI** | End-to-end artifact publishing with Ed25519 signing |
 | **Sentinel** | Control plane broker for job orchestration |
-| **Worker** | Data plane executor with Bridge Mode support |
+| **Worker** | Data plane executor (Bridge Mode only) |
 | **Architect** | Plugin deployment lifecycle management |
 | **Scout** | File discovery and versioning service |
 | **VenvManager** | Isolated environment lifecycle (LRU eviction) |
 
-### Execution Modes
+### Execution Model
 
-- **Legacy Mode**: Plugin runs in host process (shared deps, higher performance)
-- **Bridge Mode**: Plugin runs in isolated venv subprocess (full isolation via Arrow IPC)
+- **Bridge Mode Only**: All plugins run in isolated venv subprocesses
+- **Auto-Lockfile**: `uv.lock` auto-generated if missing
+- **Arrow IPC**: Data streams via AF_UNIX sockets
+- **Lineage Tracking**: `file_version_id` flows to guest process
+- **Zero Trust**: Guest has no credentials, no heavy drivers
 
 ## Security
 
