@@ -27,11 +27,8 @@ class EditorStore {
   error = $state<string | null>(null);
 
   // Plugin directory (configured at runtime via window property or default)
-  pluginDir = $state(
-    typeof window !== "undefined" && (window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__
-      ? String((window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__)
-      : "/Users/shan/workspace/casparianflow/demo/plugins"
-  );
+  // NOTE: Initialized empty to avoid window access during module load (causes freeze on cold start)
+  pluginDir = $state("");
 
   /** Check if there are unsaved changes */
   get hasChanges(): boolean {
@@ -40,6 +37,14 @@ class EditorStore {
 
   /** Load list of plugins from directory */
   async loadPlugins(): Promise<void> {
+    // Defer plugin directory initialization to avoid race conditions on cold start
+    if (!this.pluginDir) {
+      this.pluginDir =
+        typeof window !== "undefined" && (window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__
+          ? String((window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__)
+          : "/Users/shan/workspace/casparianflow/demo/plugins";
+    }
+
     this.loadingPlugins = true;
     this.pluginsError = null;
 

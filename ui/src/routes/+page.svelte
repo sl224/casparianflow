@@ -14,7 +14,6 @@
   $effect(() => {
     if (activeTab === "editor" && !pluginsLoaded) {
       pluginsLoaded = true;
-      // Use setTimeout to break out of the reactive context
       setTimeout(() => editorStore.loadPlugins(), 0);
     }
   });
@@ -198,7 +197,6 @@
             &#8635; Refresh
           </button>
         </div>
-
         <div class="editor-main">
           {#if editorStore.loading}
             <div class="loading-overlay">
@@ -261,10 +259,7 @@
                 {/if}
               </div>
             {/if}
-            <!-- <CodeEditor /> -->
-            <div class="editor-placeholder" style="flex:1; display:flex; align-items:center; justify-content:center; color: var(--color-text-muted); font-family: var(--font-mono);">
-              Code editor disabled for debugging
-            </div>
+            <CodeEditor />
           {:else}
             <div class="empty-state">
               <span class="empty-icon">&#128221;</span>

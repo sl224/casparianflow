@@ -1,13 +1,15 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
-  import * as monaco from "monaco-editor";
   import { editorStore } from "$lib/stores/editor.svelte";
 
+  // Monaco loaded lazily
+  let monaco: typeof import("monaco-editor") | null = null;
   let container: HTMLDivElement;
-  let editor: monaco.editor.IStandaloneCodeEditor | null = null;
+  let editor: import("monaco-editor").editor.IStandaloneCodeEditor | null = null;
 
   // Define the cyberpunk theme
   function defineTheme() {
+    if (!monaco) return;
     monaco.editor.defineTheme("cyberpunk", {
       base: "vs-dark",
       inherit: true,
@@ -43,14 +45,30 @@
     });
   }
 
-  onMount(() => {
+  onMount(async () => {
+    // Configure workers before loading Monaco
+    self.MonacoEnvironment = {
+      getWorkerUrl: function (_moduleId: string, label: string): string {
+        if (label === "json") return "/monaco-workers/json.worker.js";
+        if (label === "typescript" || label === "javascript") return "/monaco-workers/ts.worker.js";
+        return "/monaco-workers/editor.worker.js";
+      },
+    };
+
+    // Lazy load Monaco - this is the heavy part
+    monaco = await import("monaco-editor");
+
     defineTheme();
 
-    editor = monaco.editor.create(container, {
+    // Defer editor creation to next frame to avoid blocking UI
+    requestAnimationFrame(() => {
+      if (!container || !monaco) return;
+
+      editor = monaco.editor.create(container, {
       value: editorStore.currentContent,
       language: "python",
       theme: "cyberpunk",
-      automaticLayout: true,
+      automaticLayout: false, // Disabled - can cause performance issues
       fontSize: 14,
       fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
       fontLigatures: true,
@@ -79,6 +97,7 @@
 
     // Initialize sync tracking
     lastSyncedContent = editorStore.currentContent;
+    });
   });
 
   onDestroy(() => {
