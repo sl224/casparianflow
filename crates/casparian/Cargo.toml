@@ -26,3 +26,11 @@ clap.workspace = true
 
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
+
+# Signal handling (Unix)
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+# Signal handling (Windows)
+[target.'cfg(windows)'.dependencies]
+ctrlc = "3.4"

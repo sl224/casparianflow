@@ -122,6 +122,20 @@ impl Sentinel {
         // Clone pool only once for the queue
         let queue = JobQueue::new(pool.clone());
 
+        // Destructive Initialization for IPC sockets (Unix only)
+        // Unlink stale socket files to prevent "Address in use" errors
+        #[cfg(unix)]
+        if config.bind_addr.starts_with("ipc://") {
+            let socket_path = config.bind_addr.strip_prefix("ipc://").unwrap();
+            let path = std::path::Path::new(socket_path);
+            if path.exists() {
+                info!("Removing stale IPC socket: {}", socket_path);
+                if let Err(e) = std::fs::remove_file(path) {
+                    warn!("Failed to remove stale socket {}: {}", socket_path, e);
+                }
+            }
+        }
+
         // Create and bind ROUTER socket
         let mut socket = RouterSocket::new();
         socket
