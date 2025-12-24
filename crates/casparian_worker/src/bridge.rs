@@ -3,6 +3,10 @@
 //! Implements IPC via Unix socket for privilege separation.
 //! All I/O is synchronous and runs in a blocking thread pool.
 //!
+//! ## Single Binary Distribution
+//! The bridge shim Python code is embedded in the binary at compile time.
+//! At runtime, it's materialized to `~/.casparian_flow/shim/{version}/bridge_shim.py`.
+//!
 //! ## Timeouts
 //! - Connection timeout: 30 seconds for Python to connect to the socket
 //! - Read timeout: 60 seconds per read operation
@@ -11,12 +15,20 @@
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+
+/// Embedded Python bridge shim source code.
+/// This is baked into the binary at compile time for single-file distribution.
+const BRIDGE_SHIM_SOURCE: &str = include_str!("../shim/bridge_shim.py");
+
+/// Crate version for shim cache path versioning.
+/// When the shim changes, the version bump ensures old cached shims are replaced.
+const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const HEADER_SIZE: usize = 4;
 const END_OF_STREAM: u32 = 0;
@@ -422,29 +434,109 @@ fn read_error_message(
     Ok(String::from_utf8_lossy(&error_buf).to_string())
 }
 
-/// Find bridge_shim.py - call this once at startup, not per-job
-pub fn find_bridge_shim() -> Result<PathBuf> {
-    let candidates = [
-        // New location in Rust crate
-        "crates/casparian_worker/shim/bridge_shim.py",
-        "../crates/casparian_worker/shim/bridge_shim.py",
-        "../../crates/casparian_worker/shim/bridge_shim.py",
-        // Relative to crate directory
-        "shim/bridge_shim.py",
-        "../shim/bridge_shim.py",
-    ];
+/// Materialize the embedded bridge shim to the filesystem.
+///
+/// The shim is written to `~/.casparian_flow/shim/{version}/bridge_shim.py`.
+/// This ensures the single binary can run from any location without
+/// needing the source repository.
+///
+/// The function is idempotent: if the file exists and matches, it's reused.
+/// Version changes cause a new directory to be created.
+pub fn materialize_bridge_shim() -> Result<PathBuf> {
+    // Resolve cache directory: ~/.casparian_flow/shim/{version}/
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .context("Could not determine home directory (HOME or USERPROFILE not set)")?;
 
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if path.exists() {
-            return Ok(path.canonicalize()?);
+    let shim_dir = PathBuf::from(home)
+        .join(".casparian_flow")
+        .join("shim")
+        .join(CRATE_VERSION);
+
+    let shim_path = shim_dir.join("bridge_shim.py");
+
+    // Check if file exists and content matches (fast path)
+    if shim_path.exists() {
+        match std::fs::read_to_string(&shim_path) {
+            Ok(existing) if existing == BRIDGE_SHIM_SOURCE => {
+                debug!("Using cached bridge shim: {}", shim_path.display());
+                return Ok(shim_path);
+            }
+            Ok(_) => {
+                info!("Bridge shim content changed, updating: {}", shim_path.display());
+            }
+            Err(e) => {
+                warn!("Failed to read existing shim, will recreate: {}", e);
+            }
         }
     }
 
-    anyhow::bail!(
-        "bridge_shim.py not found. Searched: {:?}",
-        candidates
-    )
+    // Create directory if needed
+    std::fs::create_dir_all(&shim_dir)
+        .with_context(|| format!("Failed to create shim directory: {}", shim_dir.display()))?;
+
+    // Write shim atomically (write to temp, then rename)
+    // Use PID + thread ID + timestamp to avoid collisions in concurrent scenarios
+    let unique_id = format!(
+        "{}.{:?}.{}",
+        std::process::id(),
+        std::thread::current().id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let temp_path = shim_dir.join(format!(".bridge_shim.py.{}.tmp", unique_id));
+
+    let mut file = std::fs::File::create(&temp_path)
+        .with_context(|| format!("Failed to create temp shim file: {}", temp_path.display()))?;
+
+    file.write_all(BRIDGE_SHIM_SOURCE.as_bytes())
+        .with_context(|| format!("Failed to write shim content to: {}", temp_path.display()))?;
+
+    file.sync_all()
+        .with_context(|| "Failed to sync shim file to disk")?;
+
+    drop(file);
+
+    // Set executable permission on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&temp_path, perms)
+            .with_context(|| format!("Failed to set permissions on: {}", temp_path.display()))?;
+    }
+
+    // Atomic rename (handles race: if another process already created it, this succeeds)
+    // On Unix, rename is atomic and will overwrite the destination
+    match std::fs::rename(&temp_path, &shim_path) {
+        Ok(()) => {
+            info!("Materialized bridge shim v{}: {}", CRATE_VERSION, shim_path.display());
+        }
+        Err(e) => {
+            // Clean up temp file if rename failed (another process might have won the race)
+            let _ = std::fs::remove_file(&temp_path);
+            // If the target now exists, we're fine (another process created it)
+            if !shim_path.exists() {
+                return Err(e).with_context(|| {
+                    format!("Failed to rename temp shim to: {}", shim_path.display())
+                });
+            }
+            debug!("Another process materialized shim, using existing: {}", shim_path.display());
+        }
+    }
+
+    Ok(shim_path)
+}
+
+/// Deprecated: Use `materialize_bridge_shim()` instead.
+///
+/// This function is kept for backward compatibility but now delegates
+/// to the new materialization logic.
+#[deprecated(since = "0.2.0", note = "Use materialize_bridge_shim() instead")]
+pub fn find_bridge_shim() -> Result<PathBuf> {
+    materialize_bridge_shim()
 }
 
 #[cfg(test)]
@@ -452,13 +544,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_find_bridge_shim() {
-        // This test only passes when run from repo root
-        if PathBuf::from("crates/casparian_worker/shim/bridge_shim.py").exists() {
-            let path = find_bridge_shim().unwrap();
-            assert!(path.exists());
-            assert!(path.to_string_lossy().contains("bridge_shim.py"));
+    fn test_materialize_bridge_shim() {
+        // This test verifies the shim can be materialized
+        let path = materialize_bridge_shim().unwrap();
+        assert!(path.exists(), "Shim should exist after materialization");
+        assert!(
+            path.to_string_lossy().contains("bridge_shim.py"),
+            "Path should contain bridge_shim.py"
+        );
+        assert!(
+            path.to_string_lossy().contains(CRATE_VERSION),
+            "Path should contain version: {}",
+            CRATE_VERSION
+        );
+
+        // Verify content matches
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, BRIDGE_SHIM_SOURCE, "Content should match embedded source");
+
+        // Verify permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&path).unwrap().permissions();
+            assert!(
+                perms.mode() & 0o111 != 0,
+                "Shim should be executable"
+            );
         }
+    }
+
+    #[test]
+    fn test_materialize_bridge_shim_idempotent() {
+        // Calling materialize twice should return the same path
+        let path1 = materialize_bridge_shim().unwrap();
+        let path2 = materialize_bridge_shim().unwrap();
+        assert_eq!(path1, path2, "Materialization should be idempotent");
+    }
+
+    #[test]
+    fn test_embedded_shim_not_empty() {
+        assert!(
+            !BRIDGE_SHIM_SOURCE.is_empty(),
+            "Embedded shim source should not be empty"
+        );
+        assert!(
+            BRIDGE_SHIM_SOURCE.contains("BridgeContext"),
+            "Shim should contain BridgeContext class"
+        );
+        assert!(
+            BRIDGE_SHIM_SOURCE.contains("def main()"),
+            "Shim should contain main function"
+        );
     }
 
     #[test]
@@ -486,5 +623,16 @@ mod tests {
         let job_id = 12345u64;
         let socket_path = format!("/tmp/bridge_{}.sock", job_id);
         assert_eq!(socket_path, "/tmp/bridge_12345.sock");
+    }
+
+    #[test]
+    fn test_crate_version_defined() {
+        assert!(!CRATE_VERSION.is_empty(), "CRATE_VERSION should be defined");
+        // Should match semantic versioning pattern
+        assert!(
+            CRATE_VERSION.contains('.'),
+            "Version should contain dots: {}",
+            CRATE_VERSION
+        );
     }
 }
