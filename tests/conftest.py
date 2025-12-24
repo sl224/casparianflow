@@ -3,12 +3,60 @@ Pytest fixtures and configuration for Casparian Flow tests.
 """
 import pytest
 import shutil
+import os
 from pathlib import Path
 from sqlalchemy import create_engine
 from casparian_flow.config import settings
 from casparian_flow.db.base_session import SessionLocal
 from casparian_flow.db.setup import initialize_database, get_or_create_sourceroot
 from casparian_flow.db.models import PluginConfig, TopicConfig
+
+
+# =============================================================================
+# VCR Configuration for Azure Integration Tests
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def vcr_config():
+    """Configure VCR.py for Azure integration tests with secret scrubbing."""
+    return {
+        "cassette_library_dir": "tests/cassettes",
+        "record_mode": "once",  # Record on first run, then replay
+        "match_on": ["method", "scheme", "host", "port", "path", "query"],
+        "filter_headers": [
+            "Authorization",  # Remove bearer tokens
+            "client-secret",  # Remove Azure client secrets
+        ],
+        "filter_post_data_parameters": [
+            "client_secret",
+            "client_assertion",
+        ],
+        "before_record_response": scrub_response_data,
+    }
+
+
+def scrub_response_data(response):
+    """Sanitize sensitive data from VCR cassettes before recording."""
+    # Scrub access tokens and refresh tokens from response bodies
+    if "body" in response and "string" in response["body"]:
+        body = response["body"]["string"]
+        if isinstance(body, bytes):
+            body_str = body.decode("utf-8")
+            # Replace tokens with dummy values
+            import json
+            try:
+                data = json.loads(body_str)
+                if "access_token" in data:
+                    data["access_token"] = "SCRUBBED_ACCESS_TOKEN"
+                if "refresh_token" in data:
+                    data["refresh_token"] = "SCRUBBED_REFRESH_TOKEN"
+                if "id_token" in data:
+                    data["id_token"] = "SCRUBBED_ID_TOKEN"
+                response["body"]["string"] = json.dumps(data).encode("utf-8")
+            except (json.JSONDecodeError, TypeError):
+                pass  # Not JSON, skip scrubbing
+    return response
 
 
 @pytest.fixture(scope="function")
