@@ -19,56 +19,50 @@ Casparian Flow is an **Enterprise Artifact Registry with Bridge Mode Execution**
 
 ## Directory Structure
 
+### Rust Core (Control Plane)
+```
+crates/
+├── casparian/             # Unified binary entry point
+│   └── src/
+│       ├── main.rs        # CLI: start, publish commands
+│       ├── runtime.rs     # Split Tokio runtime (control/data)
+│       └── server.rs      # Sentinel server implementation
+├── cf_security/           # Authentication & validation (Rust)
+│   └── src/
+│       ├── azure.rs       # Azure AD Device Code Flow
+│       ├── gatekeeper.rs  # AST-based validation
+│       └── signing.rs     # Ed25519 signatures
+└── cf_protocol/           # Binary protocol definitions
+    └── src/
+        └── lib.rs         # OpCodes, serialization
+```
+
+### Python Runtime (Data Plane)
 ```
 src/casparian_flow/
-├── cli/
-│   └── publish.py         # v5.0 Publisher CLI entry point
 ├── config.py              # Global Pydantic settings
 ├── sdk.py                 # User-facing BasePlugin API
-├── main.py                # Sentinel Entry Point
-├── main_ui.py             # UI Entry Point
+├── main.py                # Legacy entry point (deprecated)
 ├── protocol.py            # Binary Protocol v5 (Bridge Mode OpCodes)
 ├── mcp_server.py          # MCP Server for LLM Integration
 ├── db/
 │   ├── models.py          # SQLAlchemy Models (The Source of Truth)
 │   ├── access.py          # DB Engine & Bulk Loaders
-│   ├── base_session.py    # SQLAlchemy Session Factory
 │   └── setup.py           # Schema Fingerprinting & Init
 ├── engine/
-│   ├── sentinel.py        # The Broker (Control Plane)
-│   ├── worker_client.py   # The Generalist Worker (Data Plane)
-│   ├── bridge.py          # v5.0: Host-side execution bridge
-│   ├── bridge_shim.py     # v5.0: Guest process in isolated venv
-│   ├── venv_manager.py    # v5.0: Isolated venv lifecycle
+│   ├── sentinel.py        # Legacy Python Sentinel (deprecated)
+│   ├── worker_client.py   # Worker (Data Plane)
+│   ├── bridge.py          # Host-side execution bridge
+│   ├── bridge_shim.py     # Guest process in isolated venv
+│   ├── venv_manager.py    # Isolated venv lifecycle
 │   ├── queue.py           # Atomic Job Queue
-│   ├── sinks.py           # Output Adapters (Parquet/SQLite/MSSQL)
-│   └── config.py          # Engine Config Models
+│   └── sinks.py           # Output Adapters (Parquet/SQLite/MSSQL)
 ├── services/
 │   ├── scout.py           # Discovery Service (Inventory + Tagger)
-│   ├── fs_engine.py       # Parallel Directory Walker
-│   ├── filter_logic.py    # Path Filtering (.gitignore style)
-│   ├── import_service.py  # File Import Service
-│   ├── registrar.py       # Code-First Plugin Registration
-│   ├── architect.py       # Plugin Deployment & Governance (Publish-to-Execute)
-│   ├── inspector.py       # File Profiling
-│   ├── ai_types.py        # AI/LLM Type Definitions
-│   ├── ai_hook.py         # AI Generator Interface
-│   ├── llm_provider.py    # LLM Provider Abstraction
-│   ├── llm_generator.py   # AI Code Generation
-│   └── test_generator.py  # AI Test Generation
-├── security/
-│   ├── identity.py        # v5.0: User & signing abstractions
-│   ├── local_provider.py  # v5.0: Local mode (dev/implicit trust)
-│   ├── azure_provider.py  # v5.0: Enterprise mode (Azure AD/Entra)
-│   ├── factory.py         # Identity provider factory
-│   ├── signing.py         # Signature utilities
-│   └── gatekeeper.py      # Static Analysis & Signatures
-├── agents/
-│   └── surveyor.py        # Autonomous Onboarding Agent
-├── ui/
-│   └── app.py             # FastHTML UI Application
-└── server/
-    └── api.py             # REST API Endpoints
+│   ├── architect.py       # Plugin Deployment & Governance
+│   └── ...                # Additional services
+└── ui/
+    └── app.py             # FastHTML UI Application
 ```
 
 ---
@@ -114,18 +108,19 @@ sequenceDiagram
 
 ### Components
 
-**1. Publisher CLI (`cli/publish.py`)**
-* **Role:** End-to-end artifact publishing
+**1. Publisher CLI (`crates/casparian/src/main.rs publish`)**
+* **Role:** End-to-end artifact publishing (Rust implementation)
 * **Workflow:**
   1. Discovery: Finds `pyproject.toml` or `uv.lock`
   2. Locking: Runs `uv lock --universal` for cross-platform deps
   3. Hashing: Computes `env_hash` (lockfile) and `artifact_hash` (source + lockfile)
-  4. Authentication: Local API key or Azure AD Device Code Flow
-  5. Signing: Ed25519 signature of artifact
+  4. Authentication: Local API key or Azure AD Device Code Flow (via `cf_security::AzureProvider`)
+  5. Signing: Ed25519 signature of artifact (via `cf_security::signing`)
   6. Upload: Sends `DEPLOY` OpCode to Sentinel
 
-**2. Sentinel (The Controller)**
+**2. Sentinel (`crates/casparian/src/server.rs` - Rust)**
 * **Role:** The "Brain". Manages Job Queue and Worker orchestration.
+* **Implementation:** Rust with split Tokio runtime (control/data planes)
 * **Responsibility:**
   * Tracks connected workers and their capabilities
   * Matches pending jobs to idle workers
@@ -268,24 +263,27 @@ REJECTED = "REJECTED"    # Blocked
 
 ## Security Architecture
 
-### Dual-Mode Strategy
+### Dual-Mode Strategy (Rust Implementation)
+
+All security primitives implemented in `crates/cf_security/`:
 
 **Local Mode (Development)**
 * Zero friction, auto-generated Ed25519 keys
 * Implicit trust for rapid iteration
-* Provider: `LocalProvider`
+* Implementation: `cf_security::signing::generate_keypair()`
 
 **Enterprise Mode (Production)**
-* Zero trust, Azure AD integration via MSAL
+* Zero trust, Azure AD integration (raw HTTP, no SDK dependencies)
 * JWT validation, audit trails
 * Device Code Flow for CLI authentication
-* Provider: `AzureProvider`
+* Implementation: `cf_security::azure::AzureProvider`
+* Real Azure tests: `cargo test -p cf_security --test test_azure_real -- --ignored`
 
 ### Artifact Security
 
-1. **Signing:** Ed25519 signatures on all artifacts
+1. **Signing:** Ed25519 signatures on all artifacts (`cf_security::signing`)
 2. **Hashing:** SHA-256 of (source + lockfile) = `artifact_hash`
-3. **Gatekeeper:** AST validation (banned imports: `os`, `subprocess`)
+3. **Gatekeeper:** AST validation using `rustpython-parser` (banned imports: `os`, `subprocess`)
 4. **Isolation:** Guest process has no credentials
 
 ---

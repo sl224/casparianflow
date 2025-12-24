@@ -6,6 +6,7 @@ members = [
     "crates/casparian_sentinel",
     "crates/casparian",
     "crates/cf_security",
+    "ui/src-tauri",
 ]
 
 [workspace.package]

@@ -1,0 +1,13 @@
+[project]
+name = "slow-processor"
+version = "1.0.0"
+description = "Demo plugin for E2E testing"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

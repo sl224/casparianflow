@@ -41,31 +41,44 @@ The database is automatically initialized when you run the system for the first 
 
 ## Running the System
 
-### Quick Start
+### Quick Start (Rust Binary)
 
 ```bash
-# Install dependencies
-uv sync
+# Build the unified binary
+cargo build --release
 
-# Run the Sentinel (control plane)
-uv run -m casparian_flow.main
-
-# Run a Worker (data plane) in another terminal
-uv run -m casparian_flow.engine.worker_client --connect tcp://localhost:5555 --output ./output
+# Run both Sentinel and Worker in a single process
+./target/release/casparian start
 ```
 
-### Publishing a Plugin (v5.0)
+**Legacy Python mode** (deprecated):
+```bash
+uv run -m casparian_flow.main  # Sentinel only
+uv run -m casparian_flow.engine.worker_client --connect tcp://localhost:5555  # Worker
+```
+
+### Publishing a Plugin (Rust Implementation)
 
 ```bash
 # Publish a plugin with automatic signing
-casparian publish ./my_plugin/
+./target/release/casparian publish my_plugin.py --version 1.0.0
 ```
 
 This will:
 1. Lock dependencies with `uv lock --universal`
-2. Compute artifact hash
-3. Sign with Ed25519
-4. Deploy to Sentinel
+2. Compute artifact hash (SHA-256)
+3. Authenticate (Local keys or Azure AD Device Code Flow)
+4. Sign with Ed25519 (`cf_security::signing`)
+5. Validate via Gatekeeper (AST analysis)
+6. Deploy to Sentinel
+
+**Enterprise Mode** (Azure AD):
+```bash
+export AZURE_TENANT_ID="your-tenant-id"
+export AZURE_CLIENT_ID="your-client-id"
+./target/release/casparian publish my_plugin.py --version 1.0.0
+```
+Follow the device code flow prompts in the terminal.
 
 ### Running the Scout
 

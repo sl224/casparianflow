@@ -1,10 +1,72 @@
-# Manual Testing Guide for File Import Feature
+# Manual Testing Guide
 
 ## Quick Start
+
+**Build the Rust binary:**
+```bash
+cargo build --release
+```
+
+**Start the system:**
+```bash
+./target/release/casparian start
+```
 
 **UI is running at: http://localhost:5000**
 
 ---
+
+## Testing Rust Components
+
+### TEST: Publish Command (Azure Authentication)
+
+1. **Set Azure credentials** (if testing enterprise mode):
+   ```bash
+   export AZURE_TENANT_ID="your-tenant-id"
+   export AZURE_CLIENT_ID="your-client-id"
+   export AZURE_CLIENT_SECRET="your-secret"  # Optional for confidential clients
+   ```
+
+2. **Publish a plugin:**
+   ```bash
+   ./target/release/casparian publish my_plugin.py --version 1.0.0
+   ```
+
+3. **Verify:**
+   - Device code flow prompts appear if using Azure
+   - Plugin is signed with Ed25519
+   - Artifact is deployed to Sentinel
+   - Check logs for "Successfully published"
+
+### TEST: Sentinel Server
+
+1. **Start unified process:**
+   ```bash
+   ./target/release/casparian start
+   ```
+
+2. **Verify:**
+   - Server binds to configured port (default: 5555)
+   - Control plane runtime starts
+   - Data plane runtime starts
+   - Check logs for "Sentinel listening on tcp://..."
+
+### TEST: Azure Integration (Real)
+
+Run real Azure AD tests (requires credentials):
+```bash
+cargo test -p cf_security --test test_azure_real -- --ignored --nocapture
+```
+
+**Expected:**
+- OpenID configuration fetched successfully
+- Device code flow prompts for browser authentication
+- Access token received after authentication
+- Token type is "Bearer"
+
+---
+
+## Testing File Import Feature
 
 ## Test Environment Setup ✅
 
