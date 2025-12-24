@@ -86,6 +86,25 @@ CREATE TABLE IF NOT EXISTS cf_topic_config (
 
 CREATE INDEX IF NOT EXISTS ix_topic_lookup ON cf_topic_config(plugin_name, topic_name);
 
+-- Plugin configuration (for topology view)
+CREATE TABLE IF NOT EXISTS cf_plugin_config (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_name TEXT NOT NULL UNIQUE,
+    subscription_tags TEXT DEFAULT '',
+    default_parameters TEXT,
+    enabled INTEGER DEFAULT 1
+);
+
+-- Plugin subscriptions (for topology edges)
+CREATE TABLE IF NOT EXISTS cf_plugin_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_name TEXT NOT NULL,
+    topic_name TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(plugin_name, topic_name)
+);
+
 -- ============================================================================
 -- Demo Data - Slow Processor Plugin
 -- ============================================================================
@@ -144,13 +163,35 @@ class Handler(BasePlugin):
     'demo_env_hash'
 );
 
--- Topic configuration
+-- Topic configurations (multiple for demo visibility)
 INSERT INTO cf_topic_config (plugin_name, topic_name, uri, mode)
-VALUES ('slow_processor', 'processed_output', 'parquet://demo_output.parquet', 'append');
+VALUES
+    ('slow_processor', 'processed_output', 'parquet://DEMO_DIR/output/processed_output.parquet', 'write'),
+    ('data_validator', 'validated_data', 'parquet://DEMO_DIR/output/validated.parquet', 'write'),
+    ('data_validator', 'errors', 'parquet://DEMO_DIR/output/errors.parquet', 'write');
 
--- Queue multiple jobs for demo visibility (3 jobs = ~18 seconds total processing)
+-- Plugin configurations (for topology view)
+INSERT INTO cf_plugin_config (plugin_name, subscription_tags, default_parameters)
+VALUES
+    ('slow_processor', 'demo,csv', '{"batch_size": 5, "delay": 1.5}'),
+    ('data_validator', 'demo', '{"strict": true}');
+
+-- Plugin subscriptions (creates topic -> plugin edges in topology)
+INSERT INTO cf_plugin_subscriptions (plugin_name, topic_name, is_active)
+VALUES
+    ('data_validator', 'slow_processor:processed_output', 1);
+
+-- Queue jobs for processing (will be processed by the worker)
 INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority)
 VALUES
     (1, 'slow_processor', 'QUEUED', 10),
     (1, 'slow_processor', 'QUEUED', 5),
     (1, 'slow_processor', 'QUEUED', 1);
+
+-- Pre-completed jobs with output files (for immediate Data tab testing)
+INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, end_time, result_summary)
+VALUES
+    (1, 'slow_processor', 'COMPLETED', 0, datetime('now', '-5 minutes'), 'DEMO_DIR/output/processed_output.parquet'),
+    (1, 'data_validator', 'COMPLETED', 0, datetime('now', '-3 minutes'), 'DEMO_DIR/output/validated.parquet'),
+    (1, 'data_validator', 'COMPLETED', 0, datetime('now', '-2 minutes'), 'DEMO_DIR/output/errors.parquet'),
+    (1, 'simple_transform', 'COMPLETED', 0, datetime('now', '-1 minutes'), 'DEMO_DIR/output/mixed_types.parquet');
