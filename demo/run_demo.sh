@@ -120,8 +120,8 @@ if [ "$USE_UI" = true ]; then
     TAURI_PID=$!
 
     # Wait for socket to appear
-    echo -n "  Waiting for Sentinel..."
-    for i in {1..30}; do
+    echo -n "  Waiting for Sentinel (initial compile may take a few minutes)..."
+    for i in {1..300}; do
         if [ -S "$SOCKET_PATH" ]; then
             echo -e " ${GREEN}ready!${NC}"
             break
@@ -131,7 +131,7 @@ if [ "$USE_UI" = true ]; then
     done
 
     if [ ! -S "$SOCKET_PATH" ]; then
-        echo -e "\n${RED}  ✗ Sentinel failed to start within 30 seconds${NC}"
+        echo -e "\n${RED}  ✗ Sentinel failed to start within 5 minutes${NC}"
         exit 1
     fi
 else

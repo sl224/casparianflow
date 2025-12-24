@@ -3,181 +3,12 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { $derived } from "svelte/reactivity";
 
 /** Plugin file information */
 export interface PluginFile {
   name: string;
   path: string;
-}
-
-class EditorStore {
-  // Available plugins
-  plugins = $state<PluginFile[]>([]);
-  loadingPlugins = $state(false);
-  pluginsError = $state<string | null>(null);
-
-  // Currently open file
-  currentFile = $state<PluginFile | null>(null);
-  currentContent = $state("");
-  originalContent = $state(""); // For tracking unsaved changes
-
-  // Editor state
-  loading = $state(false);
-  saving = $state(false);
-  error = $state<string | null>(null);
-
-  // Plugin directory (configured at runtime via window property or default)
-  pluginDir = $state(
-    typeof window !== "undefined" && (window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__
-      ? String((window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__)
-      : "/Users/shan/workspace/casparianflow/demo/plugins"
-  );
-
-  /** Check if there are unsaved changes */
-  get hasChanges(): boolean {
-    return this.currentContent !== this.originalContent;
-  }
-
-  /** Load list of plugins from directory */
-  async loadPlugins(): Promise<void> {
-    this.loadingPlugins = true;
-    this.pluginsError = null;
-
-    try {
-      const files = await invoke<string[]>("list_plugins", { dir: this.pluginDir });
-      this.plugins = files.map(name => ({
-        name,
-        path: `${this.pluginDir}/${name}`,
-      }));
-      console.log("[EditorStore] Loaded", this.plugins.length, "plugins");
-    } catch (err) {
-      this.pluginsError = err instanceof Error ? err.message : String(err);
-      console.error("[EditorStore] Failed to load plugins:", this.pluginsError);
-    } finally {
-      this.loadingPlugins = false;
-    }
-  }
-
-  /** Open a plugin file for editing */
-  async openFile(file: PluginFile): Promise<void> {
-    // Check for unsaved changes
-    if (this.hasChanges && this.currentFile) {
-      const discard = confirm(
-        `You have unsaved changes in ${this.currentFile.name}. Discard?`
-      );
-      if (!discard) return;
-    }
-
-    this.loading = true;
-    this.error = null;
-
-    try {
-      const content = await invoke<string>("read_plugin_file", { path: file.path });
-      this.currentFile = file;
-      this.currentContent = content;
-      this.originalContent = content;
-      console.log("[EditorStore] Opened", file.name);
-    } catch (err) {
-      this.error = err instanceof Error ? err.message : String(err);
-      console.error("[EditorStore] Failed to open file:", this.error);
-    } finally {
-      this.loading = false;
-    }
-  }
-
-  /** Save current file */
-  async saveFile(): Promise<boolean> {
-    if (!this.currentFile) return false;
-
-    this.saving = true;
-    this.error = null;
-
-    try {
-      await invoke("write_plugin_file", {
-        path: this.currentFile.path,
-        content: this.currentContent,
-      });
-      this.originalContent = this.currentContent;
-      console.log("[EditorStore] Saved", this.currentFile.name);
-      return true;
-    } catch (err) {
-      this.error = err instanceof Error ? err.message : String(err);
-      console.error("[EditorStore] Failed to save file:", this.error);
-      return false;
-    } finally {
-      this.saving = false;
-    }
-  }
-
-  /** Update content (from editor) */
-  updateContent(content: string): void {
-    this.currentContent = content;
-  }
-
-  /** Revert to original content */
-  revert(): void {
-    this.currentContent = this.originalContent;
-  }
-
-  /** Close current file */
-  closeFile(): void {
-    if (this.hasChanges) {
-      const discard = confirm("You have unsaved changes. Discard?");
-      if (!discard) return;
-    }
-
-    this.currentFile = null;
-    this.currentContent = "";
-    this.originalContent = "";
-    this.error = null;
-  }
-
-  // Deploy state
-  deploying = $state(false);
-  deployResult = $state<DeployResult | null>(null);
-
-  /** Deploy the current plugin */
-  async deployPlugin(): Promise<boolean> {
-    if (!this.currentFile) return false;
-
-    // Save first if there are changes
-    if (this.hasChanges) {
-      const saved = await this.saveFile();
-      if (!saved) return false;
-    }
-
-    this.deploying = true;
-    this.deployResult = null;
-    this.error = null;
-
-    try {
-      const result = await invoke<DeployResult>("deploy_plugin", {
-        path: this.currentFile.path,
-        code: this.currentContent,
-      });
-
-      this.deployResult = result;
-
-      if (result.success) {
-        console.log("[EditorStore] Deployed", result.pluginName, "v" + result.version);
-      } else {
-        console.warn("[EditorStore] Deploy failed:", result.validationErrors);
-      }
-
-      return result.success;
-    } catch (err) {
-      this.error = err instanceof Error ? err.message : String(err);
-      console.error("[EditorStore] Deploy error:", this.error);
-      return false;
-    } finally {
-      this.deploying = false;
-    }
-  }
-
-  /** Clear deploy result */
-  clearDeployResult(): void {
-    this.deployResult = null;
-  }
 }
 
 /** Deploy result from Rust backend */
@@ -189,4 +20,204 @@ export interface DeployResult {
   validationErrors: string[];
 }
 
-export const editorStore = new EditorStore();
+function createEditorStore() {
+  // Available plugins
+  let plugins = $state<PluginFile[]>([]);
+  let loadingPlugins = $state(false);
+  let pluginsError = $state<string | null>(null);
+
+  // Currently open file
+  let currentFile = $state<PluginFile | null>(null);
+  let currentContent = $state("");
+  let originalContent = $state(""); // For tracking unsaved changes
+
+  // Editor state
+  let loading = $state(false);
+  let saving = $state(false);
+  let error = $state<string | null>(null);
+
+  // Plugin directory - will be initialized later
+  let pluginDir = $state("");
+
+  /** Check if there are unsaved changes */
+  const hasChanges = $derived(currentContent !== originalContent);
+
+  /** Load list of plugins from directory */
+  async function loadPlugins(): Promise<void> {
+    // Defer plugin directory initialization to avoid race conditions on cold start
+    if (!pluginDir) {
+      pluginDir =
+        typeof window !== "undefined" && (window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__
+          ? String((window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__)
+          : "/Users/shan/workspace/casparianflow/demo/plugins"; // Fallback for safety
+    }
+
+    loadingPlugins = true;
+    pluginsError = null;
+
+    try {
+      const files = await invoke<string[]>("list_plugins", { dir: pluginDir });
+      plugins = files.map((name) => ({
+        name,
+        path: `${pluginDir}/${name}`,
+      }));
+      console.log("[EditorStore] Loaded", plugins.length, "plugins");
+    } catch (err) {
+      pluginsError = err instanceof Error ? err.message : String(err);
+      console.error("[EditorStore] Failed to load plugins:", pluginsError);
+    } finally {
+      loadingPlugins = false;
+    }
+  }
+
+  /** Open a plugin file for editing */
+  async function openFile(file: PluginFile): Promise<void> {
+    // Check for unsaved changes
+    if (hasChanges && currentFile) {
+      const discard = confirm(
+        `You have unsaved changes in ${currentFile.name}. Discard?`
+      );
+      if (!discard) return;
+    }
+
+    loading = true;
+    error = null;
+
+    try {
+      const content = await invoke<string>("read_plugin_file", { path: file.path });
+      currentFile = file;
+      currentContent = content;
+      originalContent = content;
+      console.log("[EditorStore] Opened", file.name);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      console.error("[EditorStore] Failed to open file:", error);
+    } finally {
+      loading = false;
+    }
+  }
+
+  /** Save current file */
+  async function saveFile(): Promise<boolean> {
+    if (!currentFile) return false;
+
+    saving = true;
+    error = null;
+
+    try {
+      await invoke("write_plugin_file", {
+        path: currentFile.path,
+        content: currentContent,
+      });
+      originalContent = currentContent;
+      console.log("[EditorStore] Saved", currentFile.name);
+      return true;
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      console.error("[EditorStore] Failed to save file:", error);
+      return false;
+    } finally {
+      saving = false;
+    }
+  }
+
+  /** Update content (from editor) */
+  function updateContent(content: string): void {
+    currentContent = content;
+  }
+
+  /** Revert to original content */
+  function revert(): void {
+    currentContent = originalContent;
+  }
+
+  /** Close current file */
+  function closeFile(): void {
+    if (hasChanges) {
+      const discard = confirm("You have unsaved changes. Discard?");
+      if (!discard) return;
+    }
+
+    currentFile = null;
+    currentContent = "";
+    originalContent = "";
+    error = null;
+  }
+
+  // Deploy state
+  let deploying = $state(false);
+  let deployResult = $state<DeployResult | null>(null);
+
+  /** Deploy the current plugin */
+  async function deployPlugin(): Promise<boolean> {
+    if (!currentFile) return false;
+
+    // Save first if there are changes
+    if (hasChanges) {
+      const saved = await saveFile();
+      if (!saved) return false;
+    }
+
+    deploying = true;
+    deployResult = null;
+    error = null;
+
+    try {
+      const result = await invoke<DeployResult>("deploy_plugin", {
+        path: currentFile.path,
+        code: currentContent,
+      });
+
+      deployResult = result;
+
+      if (result.success) {
+        console.log("[EditorStore] Deployed", result.pluginName, "v" + result.version);
+      } else {
+        console.warn("[EditorStore] Deploy failed:", result.validationErrors);
+      }
+
+      return result.success;
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      console.error("[EditorStore] Deploy error:", error);
+      return false;
+    } finally {
+      deploying = false;
+    }
+  }
+
+  /** Clear deploy result */
+  function clearDeployResult(): void {
+    deployResult = null;
+  }
+
+  return {
+    // State (read-only access via getters)
+    get plugins() { return plugins; },
+    get loadingPlugins() { return loadingPlugins; },
+    get pluginsError() { return pluginsError; },
+    get currentFile() { return currentFile; },
+    get currentContent() { return currentContent; },
+    get originalContent() { return originalContent; },
+    get loading() { return loading; },
+    get saving() { return saving; },
+    get error() { return error; },
+    get deploying() { return deploying; },
+    get deployResult() { return deployResult; },
+
+    // Derived state
+    get hasChanges() { return hasChanges; },
+
+    // Methods
+    loadPlugins,
+    openFile,
+    saveFile,
+    updateContent,
+    revert,
+    closeFile,
+    deployPlugin,
+    clearDeployResult,
+  };
+}
+
+export const editorStore = createEditorStore();
