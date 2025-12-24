@@ -126,13 +126,20 @@ class SinkConfig(BaseModel):
 class DispatchCommand(BaseModel):
     """
     Payload for OpCode.DISPATCH.
-    Sentinel -> Worker: "Process this file with these sinks."
+    Sentinel -> Worker: "Process this file in isolated venv with Bridge Mode."
+
+    v5.0: Bridge Mode is now mandatory. All execution happens in isolated subprocesses.
     """
 
     plugin_name: str
     file_path: str
     sinks: list[SinkConfig]
     file_version_id: int  # Required for lineage restoration
+
+    # Bridge Mode fields (now required)
+    env_hash: str  # SHA256 of lockfile - links to PluginEnvironment
+    source_code: str  # Plugin source code for subprocess execution
+    artifact_hash: Optional[str] = None  # For signature verification (optional for legacy manifests)
 
 
 class JobReceipt(BaseModel):
@@ -225,25 +232,6 @@ class DeployCommand(BaseModel):
     system_requirements: Optional[list[str]] = None  # e.g., ["glibc_2.31"]
 
 
-class BridgeDispatchCommand(BaseModel):
-    """
-    Extended DISPATCH command for Bridge Mode execution.
-    Sentinel -> Worker: "Process this file in isolated venv."
-
-    When env_hash is present, Worker spawns subprocess with Arrow IPC bridge.
-    """
-
-    plugin_name: str
-    file_path: str
-    sinks: list[SinkConfig]
-    file_version_id: int
-
-    # Bridge Mode fields (optional - null means Legacy Host Process mode)
-    env_hash: Optional[str] = None  # Links to PluginEnvironment
-    artifact_hash: Optional[str] = None  # For signature verification
-    source_code: Optional[str] = None  # Plugin source (for subprocess execution)
-
-
 # --- Message Builders ---
 
 
@@ -260,13 +248,23 @@ def msg_dispatch(
     file_path: str,
     sinks: list[SinkConfig],
     file_version_id: int,
+    env_hash: str,
+    source_code: str,
+    artifact_hash: Optional[str] = None,
 ) -> list:
-    """Build a DISPATCH message (Sentinel -> Worker)."""
+    """
+    Build a DISPATCH message (Sentinel -> Worker).
+
+    v5.0: Bridge Mode is mandatory - env_hash and source_code are required.
+    """
     payload_obj = DispatchCommand(
         plugin_name=plugin_name,
         file_path=file_path,
         sinks=sinks,
         file_version_id=file_version_id,
+        env_hash=env_hash,
+        source_code=source_code,
+        artifact_hash=artifact_hash,
     )
     payload = payload_obj.model_dump_json().encode("utf-8")
     return [pack_header(OpCode.DISPATCH, job_id, len(payload)), payload]
@@ -337,30 +335,6 @@ def msg_deploy(cmd: DeployCommand) -> list:
     """Build a DEPLOY message (CLI -> Sentinel)."""
     payload = cmd.model_dump_json().encode("utf-8")
     return [pack_header(OpCode.DEPLOY, 0, len(payload)), payload]
-
-
-def msg_bridge_dispatch(
-    job_id: int,
-    plugin_name: str,
-    file_path: str,
-    sinks: list[SinkConfig],
-    file_version_id: int,
-    env_hash: Optional[str] = None,
-    artifact_hash: Optional[str] = None,
-    source_code: Optional[str] = None,
-) -> list:
-    """Build a Bridge Mode DISPATCH message (Sentinel -> Worker)."""
-    payload_obj = BridgeDispatchCommand(
-        plugin_name=plugin_name,
-        file_path=file_path,
-        sinks=sinks,
-        file_version_id=file_version_id,
-        env_hash=env_hash,
-        artifact_hash=artifact_hash,
-        source_code=source_code,
-    )
-    payload = payload_obj.model_dump_json().encode("utf-8")
-    return [pack_header(OpCode.DISPATCH, job_id, len(payload)), payload]
 
 
 # --- Message Unpacking ---

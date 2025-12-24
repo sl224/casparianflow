@@ -173,29 +173,21 @@ sequenceDiagram
 
 ---
 
-## Execution Modes
+## Execution Architecture
 
-### Legacy Host Process Mode
-```
-Worker -> Plugin (in-process) -> Sinks
-```
-* Plugin runs in host Python process
-* No lockfile (env_hash = null)
-* Shared dependencies
-* Lower isolation, higher performance
-
-### Bridge Mode (v5.0)
+### Bridge Mode (v5.0 - Only Mode)
 ```
 Worker (Host) <-- AF_UNIX --> Guest Process (isolated venv)
      |                              |
      v                              v
    Sinks                    Plugin Execution
 ```
-* Plugin runs in isolated venv subprocess
-* Uses `uv.lock` for reproducible dependencies
+* **All** plugins run in isolated venv subprocesses
+* Uses `uv.lock` for reproducible dependencies (auto-generated if missing)
 * Host holds credentials/drivers
 * Guest streams data via Arrow IPC
-* Higher isolation, full dependency control
+* Complete isolation, full dependency control
+* Lineage tracking via `file_version_id` passed through environment
 
 ---
 

@@ -28,6 +28,7 @@ Usage:
     BRIDGE_PLUGIN_CODE=<base64> \
     BRIDGE_FILE_PATH=/path/to/file.csv \
     BRIDGE_JOB_ID=123 \
+    BRIDGE_FILE_VERSION_ID=456 \
     python bridge_shim.py
 """
 
@@ -167,10 +168,17 @@ class BridgeContext:
 def execute_plugin(
     source_code: str,
     file_path: str,
+    file_version_id: int,
     context: BridgeContext,
 ) -> dict:
     """
     Execute plugin code with the provided file path.
+
+    Args:
+        source_code: Plugin source code
+        file_path: Path to input file
+        file_version_id: File version ID for lineage tracking
+        context: BridgeContext for IPC communication
 
     Returns:
         dict with execution metrics
@@ -196,8 +204,8 @@ def execute_plugin(
     if hasattr(handler, "configure"):
         handler.configure(context, {})
 
-    # Create file event
-    file_event = type("FileEvent", (), {"path": file_path, "file_id": 0})()
+    # Create file event with lineage tracking
+    file_event = type("FileEvent", (), {"path": file_path, "file_id": file_version_id})()
 
     # Execute the plugin
     if hasattr(handler, "consume") and callable(handler.consume):
@@ -229,6 +237,7 @@ def main():
     plugin_code_b64 = os.environ.get("BRIDGE_PLUGIN_CODE")
     file_path = os.environ.get("BRIDGE_FILE_PATH")
     job_id = int(os.environ.get("BRIDGE_JOB_ID", "0"))
+    file_version_id = int(os.environ.get("BRIDGE_FILE_VERSION_ID", "0"))
 
     if not all([socket_path, plugin_code_b64, file_path]):
         logger.error(
@@ -251,7 +260,7 @@ def main():
         context.connect()
 
         # Execute plugin
-        metrics = execute_plugin(source_code, file_path, context)
+        metrics = execute_plugin(source_code, file_path, file_version_id, context)
 
         # Log success
         logger.info(f"Plugin execution completed: {metrics}")

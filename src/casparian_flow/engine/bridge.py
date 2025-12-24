@@ -78,6 +78,7 @@ class BridgeExecutor:
         source_code: str,
         file_path: str,
         job_id: int,
+        file_version_id: int,
         timeout_seconds: int = 300,
     ):
         """
@@ -88,12 +89,14 @@ class BridgeExecutor:
             source_code: Plugin source code
             file_path: Path to input file
             job_id: Job ID for tracking
+            file_version_id: File version ID for lineage tracking
             timeout_seconds: Execution timeout
         """
         self.interpreter_path = Path(interpreter_path)
         self.source_code = source_code
         self.file_path = file_path
         self.job_id = job_id
+        self.file_version_id = file_version_id
         self.timeout_seconds = timeout_seconds
 
         # Socket and process handles
@@ -165,6 +168,7 @@ class BridgeExecutor:
             "BRIDGE_PLUGIN_CODE": source_b64,
             "BRIDGE_FILE_PATH": self.file_path,
             "BRIDGE_JOB_ID": str(self.job_id),
+            "BRIDGE_FILE_VERSION_ID": str(self.file_version_id),
         })
 
         # Spawn subprocess

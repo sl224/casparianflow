@@ -284,16 +284,42 @@ class Sentinel:
                 SinkConfig(topic="output", uri=default_output_uri, mode="append")
             )
 
-        # 2. Resolve file path (still requires database access)
+        # 2. Resolve file path and plugin manifest (requires database access)
         with Session(self.engine) as s:
+            from casparian_flow.db.models import SourceRoot, PluginManifest, PluginStatusEnum
+
             fv = s.get(FileVersion, job.file_version_id)
             fl = s.get(FileLocation, fv.location_id)
             source_root = fl.source_root
             if not source_root:
-                from casparian_flow.db.models import SourceRoot
-
                 source_root = s.get(SourceRoot, fl.source_root_id)
             full_path = str(Path(source_root.path) / fl.rel_path)
+
+            # Get ACTIVE plugin manifest for Bridge Mode execution
+            manifest = s.query(PluginManifest).filter_by(
+                plugin_name=job.plugin_name,
+                status=PluginStatusEnum.ACTIVE
+            ).order_by(PluginManifest.created_at.desc()).first()
+
+            if not manifest:
+                logger.error(f"No ACTIVE manifest found for plugin: {job.plugin_name}")
+                self.queue.fail_job(job.id, f"Plugin {job.plugin_name} has no ACTIVE manifest")
+                return
+
+            if not manifest.env_hash or not manifest.source_code:
+                logger.error(
+                    f"Manifest for {job.plugin_name} missing env_hash or source_code. "
+                    "Bridge Mode requires lockfile."
+                )
+                self.queue.fail_job(
+                    job.id,
+                    f"Plugin {job.plugin_name} not compatible with Bridge Mode (missing lockfile)"
+                )
+                return
+
+            env_hash = manifest.env_hash
+            source_code = manifest.source_code
+            artifact_hash = manifest.artifact_hash
 
         # 3. Apply Overrides (Key-Based Replacement)
         if job.config_overrides:
@@ -304,7 +330,7 @@ class Sentinel:
             except Exception as e:
                 logger.error(f"Failed to apply overrides for Job {job.id}: {e}")
 
-        # 4. Send DISPATCH message with lineage context
+        # 4. Send DISPATCH message with Bridge Mode context
         worker.status = "BUSY"
         worker.current_job_id = job.id
         dispatch_msg = msg_dispatch(
@@ -312,7 +338,10 @@ class Sentinel:
             job.plugin_name,
             full_path,
             sink_configs,
-            job.file_version_id  # Pass file_version_id for lineage restoration
+            job.file_version_id,
+            env_hash,
+            source_code,
+            artifact_hash,
         )
         self.socket.send_multipart([worker.identity] + dispatch_msg)
 
