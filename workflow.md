@@ -4,10 +4,12 @@ This document outlines how to use the Casparian Flow system for file processing 
 
 ## Overview
 
-Casparian Flow is a file monitoring and processing system with three main components:
+Casparian Flow is a file monitoring and processing system with these main components:
 - **Scout**: Monitors source directories and queues files for processing
+- **Sentinel**: Control plane broker that orchestrates workers
 - **Worker**: Processes queued files using configured plugins
 - **Plugins**: Execute custom logic on files and output to configured sinks
+- **Architect**: Manages plugin deployment and auto-wiring
 
 ### File Versioning
 
@@ -15,12 +17,12 @@ The system implements **immutable file versioning** to handle "slowly changing f
 
 - **FileLocation**: Represents the persistent path/container (e.g., `data/finance.csv`)
 - **FileVersion**: Immutable snapshot of file content at a point in time
-- **Processing Jobs**: Link to specific versions, not mutable locations
+- **ProcessingJob**: Links to specific versions, not mutable locations
 
 When a file is modified, Scout creates a new `FileVersion` record instead of updating the existing one. This ensures:
 - **Audit Trail**: You can always determine which version of a file was processed by each job
 - **Data Integrity**: Job records permanently reference the exact content they processed
-- **Lineage Tracking**: No gaps when users edit files in place (typo corrections, data updates, etc.)
+- **Lineage Tracking**: No gaps when users edit files in place
 
 ## Setup
 
@@ -35,24 +37,35 @@ db_location = "casparian_flow.sqlite3"
 
 ### 2. Database Initialization
 
-The database is automatically initialized when you run the smoke test or worker for the first time.
+The database is automatically initialized when you run the system for the first time.
 
 ## Running the System
 
-### Quick Start: Smoke Test
-
-To verify the entire system end-to-end:
+### Quick Start
 
 ```bash
-uv run python scripts/smoke_test.py
+# Install dependencies
+uv sync
+
+# Run the Sentinel (control plane)
+uv run -m casparian_flow.main
+
+# Run a Worker (data plane) in another terminal
+uv run -m casparian_flow.engine.worker_client --connect tcp://localhost:5555 --output ./output
+```
+
+### Publishing a Plugin (v5.0)
+
+```bash
+# Publish a plugin with automatic signing
+casparian publish ./my_plugin/
 ```
 
 This will:
-1. Create a test directory with sample data
-2. Initialize the database
-3. Configure a source root and plugin
-4. Run the Scout to queue files
-5. Verify jobs were created
+1. Lock dependencies with `uv lock --universal`
+2. Compute artifact hash
+3. Sign with Ed25519
+4. Deploy to Sentinel
 
 ### Running the Scout
 
@@ -60,13 +73,15 @@ The Scout scans source directories and queues files for processing:
 
 ```python
 from casparian_flow.services.scout import Scout
-from casparian_flow.db.base_session import SessionLocal
+from casparian_flow.db.access import get_engine
 from casparian_flow.db.models import SourceRoot
+from casparian_flow.config import settings
+from sqlalchemy.orm import Session
 
-# Get database session
-db = SessionLocal()
+engine = get_engine(settings.database)
+db = Session(engine)
 
-# Get source root (assumes it exists in DB)
+# Get source root
 root = db.query(SourceRoot).first()
 
 # Run scout
@@ -74,129 +89,75 @@ scout = Scout(db)
 scout.scan_source(root)
 ```
 
-### Running the Worker
-
-The Worker processes queued jobs:
-
-```bash
-uv run -m casparian_flow.main
-```
-
-The worker will:
-1. Load all plugins from `src/casparian_flow/plugins/`
-2. Poll the job queue for pending work
-3. Execute plugins on queued files
-4. Write outputs to configured sinks (Parquet, MSSQL, etc.)
-
 ## Creating a Plugin
 
 Plugins must inherit from `BasePlugin` and implement the `execute` method:
 
 ```python
-from casparian_flow.sdk import BasePlugin
-from typing import Dict, Any
+from casparian_flow.sdk import BasePlugin, PluginMetadata
 import pandas as pd
+
+MANIFEST = PluginMetadata(
+    pattern="*.csv",           # Auto-creates RoutingRule
+    topic="sales_data",        # Auto-creates TopicConfig
+    priority=50,
+    subscriptions=["csv"]
+)
 
 class Handler(BasePlugin):
     def execute(self, file_path: str):
-        # Your custom processing logic
         df = pd.read_csv(file_path)
-        
+
         # Publish results to configured sink
-        self.publish('topic_name', df)
+        self.publish('sales_data', df)
 ```
 
 **Important**: The plugin class must be named `Handler` for the loader to find it.
 
-## Plugin Configuration
-
-Configure plugins in the database via `PluginConfig`:
-
-```python
-from casparian_flow.db.models import PluginConfig
-
-plugin_config = PluginConfig(
-    plugin_name="my_plugin",
-    topic_config='{"output_topic": {"uri": "parquet://./output", "mode": "append"}}'
-)
-db.add(plugin_config)
-db.commit()
-```
-
-### Sink URIs
+## Sink URIs
 
 - **Parquet**: `parquet://path/to/output` (creates parquet files)
+- **SQLite**: `sqlite:///path/to/db.sqlite3` (writes to SQLite)
 - **MSSQL**: `mssql://table_name` (writes to SQL Server)
 
 ## File Processing Flow
 
 1. **Scout** scans source directory and finds `example.csv`
-2. Scout creates `FileMetadata` record and computes hash
-3. Scout creates `ProcessingJob` with appropriate plugin
-4. **Worker** polls queue and gets the job
-5. Worker loads the plugin and executes it with the file path
-6. Plugin processes the file and calls `publish()` with results
-7. Worker writes results to configured sink (Parquet/MSSQL)
-8. Job is marked `COMPLETED`
-
-## Verifying Output
-
-After running the worker, check output files:
-
-```bash
-# Check parquet output
-ls -la data/parquet/
-
-# Read parquet file
-uv run python -c "import pandas as pd; print(pd.read_parquet('data/parquet/output'))"
-
-# Check job status in database
-uv run python -c "from casparian_flow.db.base_session import SessionLocal; from casparian_flow.db.models import ProcessingJob; from sqlalchemy import create_engine; engine = create_engine('sqlite:///casparian_flow.sqlite3'); db = SessionLocal(bind=engine); jobs = db.query(ProcessingJob).all(); [print(f'Job {j.id}: Status={j.status}') for j in jobs]"
-```
+2. Scout creates `FileLocation` record and computes hash
+3. Scout creates `FileVersion` with content hash
+4. Scout applies routing rules and creates `ProcessingJob`
+5. **Worker** polls Sentinel and receives job dispatch
+6. Worker loads the plugin and executes it with the file path
+7. Plugin processes the file and calls `publish()` with results
+8. Worker writes results to configured sink (Parquet/SQL)
+9. Worker sends `CONCLUDE` receipt to Sentinel
+10. Job is marked `COMPLETED`
 
 ## Querying Version History
-
-The versioning architecture enables powerful lineage and audit queries:
 
 ### View All Versions of a File
 
 ```python
-from casparian_flow.db.base_session import SessionLocal
+from casparian_flow.db.access import get_engine
 from casparian_flow.db.models import FileLocation, FileVersion
-from sqlalchemy import create_engine
+from casparian_flow.config import settings
+from sqlalchemy.orm import Session
 
-engine = create_engine('sqlite:///casparian_flow.sqlite3')
-db = SessionLocal(bind=engine)
+engine = get_engine(settings.database)
+db = Session(engine)
 
 # Get all versions for a specific file
 location = db.query(FileLocation).filter_by(rel_path='data/finance.csv').first()
 versions = db.query(FileVersion).filter_by(location_id=location.id).order_by(FileVersion.detected_at).all()
 
 for v in versions:
-    print(f"Version {v.id}: Hash={v.content_hash[:8]}..., Detected={v.detected_at}, Size={v.size_bytes}")
-```
-
-### Audit: Which Version Did a Job Process?
-
-```python
-from casparian_flow.db.models import ProcessingJob, FileVersion, FileLocation
-
-job = db.query(ProcessingJob).get(job_id)
-version = db.query(FileVersion).get(job.file_version_id)
-location = db.query(FileLocation).get(version.location_id)
-
-print(f"Job {job.id} processed {location.rel_path}")
-print(f"  Version: {version.id}")
-print(f"  Hash: {version.content_hash}")
-print(f"  Detected: {version.detected_at}")
-print(f"  Job Status: {job.status}")
+    print(f"Version {v.id}: Hash={v.content_hash[:8]}..., Detected={v.detected_at}")
 ```
 
 ### SQL Query: Version Timeline
 
 ```sql
--- View version history for all files
-SELECT 
+SELECT
     l.rel_path,
     v.id as version_id,
     v.content_hash,
@@ -210,31 +171,13 @@ GROUP BY l.rel_path, v.id
 ORDER BY l.rel_path, v.detected_at;
 ```
 
-### SQL Query: Job-to-Version Lineage
-
-```sql
--- Complete lineage: Job → Version → Location
-SELECT 
-    j.id as job_id,
-    j.status,
-    j.plugin_name,
-    v.id as version_id,
-    v.content_hash,
-    l.rel_path,
-    v.detected_at
-FROM cf_processing_queue j
-JOIN cf_file_version v ON v.id = j.file_version_id
-JOIN cf_file_location l ON l.id = v.location_id
-ORDER BY j.id;
-```
-
 ## Troubleshooting
 
 ### Common Issues
 
-1. **No jobs queued**: Ensure source root is configured in the database
+1. **No jobs queued**: Ensure source root is configured and routing rules match
 2. **Plugin not found**: Verify plugin class is named `Handler`
-3. **No output files**: Check `PluginConfig.topic_config` for correct sink URI
+3. **No output files**: Check `TopicConfig` for correct sink URI
 4. **Worker exits immediately**: Ensure there are jobs in `QUEUED` status
 
 ### Logs
