@@ -46,6 +46,11 @@ enum Commands {
         /// Number of worker threads for Data Plane (default: CPU cores - 1)
         #[arg(long)]
         data_threads: Option<usize>,
+
+        /// Directory for Python virtual environments
+        /// Default: ~/.casparian_flow/venvs
+        #[arg(long, env = "CASPARIAN_VENVS_DIR")]
+        venvs_dir: Option<std::path::PathBuf>,
     },
     /// Start only the Sentinel (Control Plane)
     Sentinel {
@@ -148,7 +153,8 @@ fn main() -> Result<()> {
             database,
             output,
             data_threads,
-        } => run_unified(addr, database, output, data_threads),
+            venvs_dir,
+        } => run_unified(addr, database, output, data_threads, venvs_dir),
         Commands::Sentinel { args } => run_sentinel_standalone(args),
         Commands::Worker { args } => run_worker_standalone(args),
     }
@@ -160,6 +166,7 @@ fn run_unified(
     database: String,
     output: std::path::PathBuf,
     data_threads: Option<usize>,
+    venvs_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let addr = addr.unwrap_or_else(get_default_ipc_addr);
     info!("Starting Unified Casparian Stack (Split-Runtime Architecture)");
@@ -245,7 +252,8 @@ fn run_unified(
     };
 
     // Prepare Worker config
-    let shim_path = bridge::find_bridge_shim()?;
+    // Materialize embedded bridge shim to disk (single binary distribution)
+    let shim_path = bridge::materialize_bridge_shim()?;
     let worker_id = format!(
         "rust-{}",
         uuid::Uuid::new_v4()
@@ -260,7 +268,7 @@ fn run_unified(
         worker_id,
         shim_path,
         capabilities: vec!["*".to_string()],
-        venvs_dir: None,
+        venvs_dir,
     };
 
     // Channel for Worker shutdown
@@ -424,7 +432,8 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
     }
 
     rt.block_on(async move {
-        let shim_path = bridge::find_bridge_shim()?;
+        // Materialize embedded bridge shim to disk (single binary distribution)
+        let shim_path = bridge::materialize_bridge_shim()?;
         let worker_id = args.worker_id.unwrap_or_else(|| {
             format!(
                 "rust-{}",
@@ -442,7 +451,7 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
             worker_id,
             shim_path,
             capabilities: vec!["*".to_string()],
-            venvs_dir: None,
+            venvs_dir: None, // Use default ~/.casparian_flow/venvs
         };
 
         let (worker, shutdown_tx) = Worker::connect(config).await?;
