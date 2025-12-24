@@ -23,16 +23,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("fanout_demo")
 
 # --- Configuration ---
-TEST_ROOT = Path("test_env_fanout")
-PLUGINS_DIR = Path("plugins_sub") # Ensure this matches where you saved the plugin
-OUTPUT_DIR = Path("output_fanout")
-DB_PATH = Path("fanout_test.db")
+DEMO_ROOT = Path(".demo_output/fanout")
+TEST_ROOT = DEMO_ROOT / "files"
+PLUGINS_DIR = Path("tests/fixtures/plugins")  # Use consolidated fixtures
+OUTPUT_DIR = DEMO_ROOT / "output"
+DB_PATH = DEMO_ROOT / "fanout_test.db"
 TARGET_FILE_SRC = Path(r"tests/static_assets/zips/169069_20250203_004745_025_TransportRSM.fpkg.e2d/169069_20250203_004745_025_MCData")
 
 def setup_env():
-    if TEST_ROOT.exists(): shutil.rmtree(TEST_ROOT)
+    if DEMO_ROOT.exists(): shutil.rmtree(DEMO_ROOT)
+    DEMO_ROOT.mkdir(parents=True)
     TEST_ROOT.mkdir()
-    if OUTPUT_DIR.exists(): shutil.rmtree(OUTPUT_DIR)
     OUTPUT_DIR.mkdir()
     
     # Copy target file to isolated scan root

@@ -1,4 +1,0 @@
-1,CONFIG_FLTS,,02/03/2025 01:37:28,RDR,FW,CLEARED,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,
-1,PFC_DB:,,,35537,CT ROUTER - NFS2 INTERFACE DOWN,02/03/2025 01:09:02,COMM,CI,E2HAWKEYEE2D-26512-02162-00&DMC-E2HAWKEYEE2D-AAAA-E43-91-0000-01000-411A-A,,,CONFIRMED_TRUE,,,,,NO_GRP,,0,False,True,,,,,False,IFPM,,,,,,,,,False,True,,,False,,,,,,,,,,
-1,PFC_DB:,,,35538,ANOTHER FAULT EXAMPLE,02/03/2025 01:10:00,COMM,CI,ID_123,,,CONFIRMED_FALSE,,,,,NO_GRP,,0,True,False,,,,,True,IFPM,,,,,,,,,True,False,,,True,,,,,,,,,,
-1,LCS_TEMP:,,02/03/2025 01:09:02,65.6,INIT,01:09:01,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,

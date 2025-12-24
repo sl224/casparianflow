@@ -44,15 +44,17 @@ def main():
         logger.error(f"File not found: {RAW_SOURCE_FILE}")
         return
 
-    TEST_ROOT = Path("test_env_subscription")
-    if TEST_ROOT.exists(): shutil.rmtree(TEST_ROOT)
+    DEMO_ROOT = Path(".demo_output/subscription")
+    if DEMO_ROOT.exists(): shutil.rmtree(DEMO_ROOT)
+    DEMO_ROOT.mkdir(parents=True)
+
+    TEST_ROOT = DEMO_ROOT / "files"
     TEST_ROOT.mkdir()
-    
-    PLUGINS_DIR = Path("plugins_sub")
-    if PLUGINS_DIR.exists(): shutil.rmtree(PLUGINS_DIR)
-    PLUGINS_DIR.mkdir(exist_ok=True)
-    
-    DB_PATH = Path("subscription_test.db")
+
+    PLUGINS_DIR = DEMO_ROOT / "plugins"
+    PLUGINS_DIR.mkdir()
+
+    DB_PATH = DEMO_ROOT / "subscription_test.db"
     TARGET_FILE = TEST_ROOT / RAW_SOURCE_FILE.name
     shutil.copy(RAW_SOURCE_FILE, TARGET_FILE)
     

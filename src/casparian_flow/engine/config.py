@@ -25,7 +25,7 @@ class PluginsConfig(BaseModel):
     """Plugin discovery configuration."""
 
     dir: Path = Field(
-        default=Path("src/casparian_flow/plugins"),
+        default=Path("tests/fixtures/plugins"),
         description="Directory containing plugin files",
     )
 
