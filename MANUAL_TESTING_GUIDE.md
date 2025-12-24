@@ -9,7 +9,7 @@
 ## Test Environment Setup ✅
 
 ### Test Files Created
-Located in: `C:\Users\shan\workspace\casparianflow\test_files`
+Located in: `test_files/` (relative to project root)
 
 ```
 test_files/
@@ -231,7 +231,6 @@ After completing the tests, verify:
 Run this command to see what was created:
 
 ```bash
-cd /c/Users/shan/workspace/casparianflow
 uv run python -c "
 from sqlalchemy.orm import Session
 from casparian_flow.db.access import get_engine
@@ -286,8 +285,7 @@ db.close()
 To reset the test environment:
 
 ```bash
-cd /c/Users/shan/workspace/casparianflow
-uv run python setup_manual_test.py
+uv run python scripts/setup_manual_test.py
 ```
 
 This will:

@@ -46,7 +46,6 @@ casparian = "casparian_flow.cli.publish:main"
 dev = [
     "pytest>=9.0.1",
     "ipykernel>=7.1.0",
-    "pre-commit>=4.4.0",
     "ruff>=0.14.4",
     "pygount>=3.1.0",
     # VCR for Azure integration testing
