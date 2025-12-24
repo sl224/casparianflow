@@ -13,14 +13,19 @@ from casparian_flow.protocol import (
     OpCode,
     unpack_msg,
     msg_dispatch,
+    msg_conclude,
+    msg_err,
     SinkConfig,
     JobReceipt,
-    pack_header, 
+    DeployCommand,
+    pack_header,
 )
 from urllib.request import url2pathname
 from casparian_flow.engine.queue import JobQueue
 from casparian_flow.engine.config import WorkerConfig
 from casparian_flow.db.models import FileVersion, FileLocation, TopicConfig, ProcessingJob, SourceRoot
+from casparian_flow.services.architect import ArchitectService
+from casparian_flow.security.identity import User
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -34,10 +39,13 @@ class ConnectedWorker:
     current_job_id: int = None
 
 class Sentinel:
-    def __init__(self, config: WorkerConfig, bind_addr: str = "tcp://127.0.0.1:5555"):
+    def __init__(self, config: WorkerConfig, bind_addr: str = "tcp://127.0.0.1:5555", secret_key: str = "default-secret"):
         self.config = config
         self.engine = create_engine(config.database.connection_string)
         self.queue = JobQueue(self.engine)
+
+        # v5.0: Architect Service for deployment lifecycle
+        self.architect = ArchitectService(self.engine, secret_key)
 
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.ROUTER)
@@ -145,13 +153,17 @@ class Sentinel:
                 # Config Reload Signal (from API or Admin)
                 logger.info("Received RELOAD signal. Refreshing configuration...")
                 self._load_topic_configs()
-                
+
                 # Broadcast RELOAD to all workers
                 # They should re-scan their plugin directories / DB
                 reload_msg = [pack_header(OpCode.RELOAD, 0, 0)]
                 for worker_id, worker in self.workers.items():
                     self.socket.send_multipart([worker_id] + reload_msg)
                 logger.info("Broadcasted RELOAD to all workers.")
+
+            elif opcode == OpCode.DEPLOY:
+                # v5.0 Bridge Mode: Artifact Deployment
+                self._handle_deploy(identity, payload_dict)
 
             else:
                 logger.warning(f"Unhandled OpCode: {opcode}")
@@ -173,6 +185,69 @@ class Sentinel:
             )
         except Exception as e:
             logger.error(f"Bad IDENTIFY payload: {e}")
+
+    def _handle_deploy(self, identity, payload_dict):
+        """
+        Handle DEPLOY OpCode - Artifact deployment lifecycle.
+
+        v5.0 Bridge Mode: Treats plugin code as data, extracts MANIFEST via AST,
+        and projects state to database (RoutingRule, PluginSubscription, TopicConfig).
+
+        Args:
+            identity: ZMQ identity of sender (CLI client)
+            payload_dict: Parsed DeployCommand payload
+        """
+        try:
+            # Parse DeployCommand
+            cmd = DeployCommand(**payload_dict)
+
+            # Create User object from payload
+            publisher = User(
+                id=0,  # Will be assigned by database
+                name=cmd.publisher_name,
+                email=cmd.publisher_email,
+                azure_oid=cmd.azure_oid,
+            )
+
+            logger.info(
+                f"[Sentinel] DEPLOY received: {cmd.plugin_name} v{cmd.version} "
+                f"from {publisher.name}"
+            )
+
+            # Delegate to Architect Service
+            result = self.architect.deploy_artifact(cmd, publisher)
+
+            if result.success:
+                logger.info(
+                    f"[Sentinel] ✓ Deployment successful: {result.plugin_name} "
+                    f"(manifest_id={result.manifest_id})"
+                )
+                # Reply with CONCLUDE (success)
+                receipt = JobReceipt(
+                    status="SUCCESS",
+                    metrics={"manifest_id": result.manifest_id or 0},
+                    artifacts=[],
+                )
+                reply = msg_conclude(0, receipt)
+                self.socket.send_multipart([identity] + reply)
+
+                # Reload topic configs to pick up new routing rules
+                self._load_topic_configs()
+
+            else:
+                logger.error(
+                    f"[Sentinel] ✗ Deployment failed: {result.plugin_name} - "
+                    f"{result.error_message}"
+                )
+                # Reply with ERR
+                reply = msg_err(0, result.error_message or "Deployment failed")
+                self.socket.send_multipart([identity] + reply)
+
+        except Exception as e:
+            logger.error(f"[Sentinel] DEPLOY handler exception: {e}", exc_info=True)
+            # Reply with ERR
+            reply = msg_err(0, f"DEPLOY exception: {e}")
+            self.socket.send_multipart([identity] + reply)
 
 
     def _dispatch_loop(self):
