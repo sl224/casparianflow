@@ -1,10 +1,29 @@
 # src/casparian_flow/engine/worker_client.py
 """
+DEPRECATED: Python Worker has been superseded by the Rust implementation.
+
+Use the Rust binary instead:
+    ./target/release/casparian-worker --connect tcp://sentinel:5555 --output ./output
+
+The Rust implementation is in: crates/casparian_worker/
+
+This file is kept for reference only.
+
+Migration: Operation Iron Core (2025-12-23)
+
+---
+Original docstring:
 Generalist Worker for Casparian Flow.
 
 v5.0 Bridge Mode: All execution happens in isolated venvs via subprocess + Arrow IPC.
 Legacy in-process execution has been removed.
 """
+import warnings
+warnings.warn(
+    "Python Worker is deprecated. Use Rust binary: casparian-worker",
+    DeprecationWarning,
+    stacklevel=2
+)
 import zmq
 import logging
 import time

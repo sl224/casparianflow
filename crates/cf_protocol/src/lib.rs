@@ -62,6 +62,7 @@ pub enum OpCode {
 
     // v5.0 Bridge Mode: Artifact Deployment
     Deploy = 10, // "Deploy this artifact (source + lockfile + signature)."
+    Ack = 11,    // "Generic acknowledgment (used for DeployResponse, etc.)"
 }
 
 impl OpCode {
@@ -79,6 +80,7 @@ impl OpCode {
             8 => Ok(OpCode::PrepareEnv),
             9 => Ok(OpCode::EnvReady),
             10 => Ok(OpCode::Deploy),
+            11 => Ok(OpCode::Ack),
             _ => Err(ProtocolError::InvalidOpCode(value)),
         }
     }
@@ -178,11 +180,22 @@ pub struct Message {
     pub payload: Vec<u8>,
 }
 
+/// Maximum payload size (4GB - 1, the max value of u32)
+pub const MAX_PAYLOAD_SIZE: usize = u32::MAX as usize;
+
 impl Message {
     /// Create a new message
-    pub fn new(opcode: OpCode, job_id: u64, payload: Vec<u8>) -> Self {
+    ///
+    /// Returns an error if payload exceeds MAX_PAYLOAD_SIZE (4GB).
+    pub fn new(opcode: OpCode, job_id: u64, payload: Vec<u8>) -> Result<Self> {
+        if payload.len() > MAX_PAYLOAD_SIZE {
+            return Err(ProtocolError::PayloadTooLarge {
+                size: payload.len(),
+                max: MAX_PAYLOAD_SIZE,
+            });
+        }
         let header = Header::new(opcode, job_id, payload.len() as u32);
-        Self { header, payload }
+        Ok(Self { header, payload })
     }
 
     /// Pack message into ZMQ frames (header, payload)
@@ -267,7 +280,7 @@ mod tests {
     #[test]
     fn test_message_pack_unpack() {
         let payload = b"Hello, Protocol!".to_vec();
-        let msg = Message::new(OpCode::Identify, 42, payload.clone());
+        let msg = Message::new(OpCode::Identify, 42, payload.clone()).unwrap();
 
         let (header_bytes, payload_bytes) = msg.pack().unwrap();
         let frames = vec![header_bytes, payload_bytes];

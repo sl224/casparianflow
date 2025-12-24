@@ -27,7 +27,7 @@ fn test_protocol_message_roundtrip() {
     };
 
     let payload = serde_json::to_vec(&cmd).unwrap();
-    let msg = Message::new(OpCode::Dispatch, 12345, payload);
+    let msg = Message::new(OpCode::Dispatch, 12345, payload).unwrap();
 
     // Pack and unpack
     let (header, body) = msg.pack().unwrap();
@@ -52,7 +52,7 @@ fn test_identify_message_format() {
     };
 
     let payload = serde_json::to_vec(&identify).unwrap();
-    let msg = Message::new(OpCode::Identify, 0, payload);
+    let msg = Message::new(OpCode::Identify, 0, payload).unwrap();
 
     let (header, body) = msg.pack().unwrap();
 
@@ -77,14 +77,14 @@ fn test_conclude_message_format() {
     metrics.insert("rows".to_string(), 1500i64);
 
     let receipt = types::JobReceipt {
-        status: "SUCCESS".to_string(),
+        status: types::JobStatus::Success,
         metrics,
         artifacts: vec![],
         error_message: None,
     };
 
     let payload = serde_json::to_vec(&receipt).unwrap();
-    let msg = Message::new(OpCode::Conclude, 99999, payload);
+    let msg = Message::new(OpCode::Conclude, 99999, payload).unwrap();
 
     let (header, body) = msg.pack().unwrap();
 
@@ -108,7 +108,7 @@ fn test_env_ready_message_format() {
     };
 
     let json = serde_json::to_vec(&payload).unwrap();
-    let msg = Message::new(OpCode::EnvReady, 0, json);
+    let msg = Message::new(OpCode::EnvReady, 0, json).unwrap();
 
     let (header, _) = msg.pack().unwrap();
 
@@ -141,7 +141,7 @@ fn test_error_message_format() {
     };
 
     let json = serde_json::to_vec(&err).unwrap();
-    let msg = Message::new(OpCode::Err, 123, json);
+    let msg = Message::new(OpCode::Err, 123, json).unwrap();
 
     let (header, body) = msg.pack().unwrap();
 
@@ -175,7 +175,7 @@ async fn test_zmq_message_exchange() {
         worker_id: Some("test-worker".to_string()),
     };
     let payload = serde_json::to_vec(&identify).unwrap();
-    let msg = Message::new(OpCode::Identify, 0, payload);
+    let msg = Message::new(OpCode::Identify, 0, payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     dealer.send(header.to_vec().into()).await.unwrap();

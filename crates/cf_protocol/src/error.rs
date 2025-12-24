@@ -22,6 +22,9 @@ pub enum ProtocolError {
     #[error("Payload length mismatch: expected {expected} bytes, got {got}")]
     PayloadLengthMismatch { expected: usize, got: usize },
 
+    #[error("Payload too large: {size} bytes exceeds maximum {max} bytes")]
+    PayloadTooLarge { size: usize, max: usize },
+
     #[error("JSON serialization error: {0}")]
     JsonError(#[from] serde_json::Error),
 

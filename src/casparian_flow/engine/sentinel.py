@@ -1,4 +1,21 @@
 # src/casparian_flow/engine/sentinel.py
+"""
+DEPRECATED: This Python Sentinel has been superseded by the Rust implementation.
+
+Use the Rust binary instead:
+    ./target/release/casparian-sentinel --bind tcp://0.0.0.0:5555 --database sqlite://flow.db
+
+This file is kept for reference only. See: crates/casparian_sentinel/
+
+Migration: Operation Iron Core (2025-12-23)
+"""
+import warnings
+warnings.warn(
+    "Python Sentinel is deprecated. Use Rust binary: casparian-sentinel",
+    DeprecationWarning,
+    stacklevel=2
+)
+
 import logging
 import time
 import zmq

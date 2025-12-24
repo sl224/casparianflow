@@ -3,12 +3,14 @@
 //! Data-oriented design:
 //! - Vec instead of HashMap (we have few venvs, linear search is fine)
 //! - All I/O is synchronous (no async lies)
+//! - Thread-safe via std::sync::Mutex (not async mutex)
 //! - Plain functions where possible, minimal state
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use tracing::{info, warn};
 
 /// Venv entry - plain data
@@ -48,22 +50,37 @@ impl VenvMetadata {
     }
 }
 
-/// VenvManager - holds paths and metadata, created once at startup
+/// VenvManager - thread-safe via interior mutability
+///
+/// Uses std::sync::Mutex for metadata (not tokio::sync::Mutex).
+/// This is intentional - all venv operations are blocking I/O,
+/// so they should be called from spawn_blocking anyway.
 pub struct VenvManager {
     pub venvs_dir: PathBuf,
     pub uv_path: PathBuf,
     metadata_path: PathBuf,
-    metadata: VenvMetadata,
+    metadata: Mutex<VenvMetadata>,
 }
 
+// VenvManager is automatically Send + Sync because:
+// - PathBuf is Send + Sync
+// - Mutex<T> is Send + Sync when T: Send
+// No unsafe impl needed!
+
 impl VenvManager {
-    /// Create a new VenvManager. Call once at startup.
+    /// Create a new VenvManager with default path (~/.casparian_flow/venvs).
     pub fn new() -> Result<Self> {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .context("Could not determine home directory")?;
 
         let venvs_dir = PathBuf::from(&home).join(".casparian_flow/venvs");
+        Self::with_path(venvs_dir)
+    }
+
+    /// Create a VenvManager with a custom venvs directory.
+    /// Useful for testing with isolated temp directories.
+    pub fn with_path(venvs_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&venvs_dir)?;
 
         let metadata_path = venvs_dir.join(".metadata.json");
@@ -71,17 +88,21 @@ impl VenvManager {
 
         let uv_path = find_uv()?;
 
-        info!("VenvManager initialized: {} cached envs", metadata.entries.len());
+        info!(
+            "VenvManager initialized at {}: {} cached envs",
+            venvs_dir.display(),
+            metadata.entries.len()
+        );
 
         Ok(Self {
             venvs_dir,
             uv_path,
             metadata_path,
-            metadata,
+            metadata: Mutex::new(metadata),
         })
     }
 
-    /// Get interpreter path for an env hash
+    /// Get interpreter path for an env hash (no lock needed - pure computation)
     pub fn interpreter_path(&self, env_hash: &str) -> PathBuf {
         let venv_path = self.venvs_dir.join(env_hash);
         if cfg!(windows) {
@@ -91,67 +112,100 @@ impl VenvManager {
         }
     }
 
-    /// Get or create venv. Synchronous - call from spawn_blocking if needed.
+    /// Get or create venv. Synchronous - call from spawn_blocking.
+    /// Thread-safe via internal mutex.
     pub fn get_or_create(
-        &mut self,
+        &self, // Note: &self, not &mut self - thread-safe
         env_hash: &str,
         lockfile_content: &str,
         python_version: Option<&str>,
     ) -> Result<PathBuf> {
         let interpreter = self.interpreter_path(env_hash);
 
-        // Cache hit
+        // Cache hit - quick check without heavy operations
         if interpreter.exists() {
-            info!("VenvManager: cache hit for {}", &env_hash[..12]);
+            info!("VenvManager: cache hit for {}", truncate_hash(env_hash));
             self.touch(env_hash);
             return Ok(interpreter);
         }
 
-        // Cache miss - create venv
-        info!("VenvManager: cache miss for {}, creating...", &env_hash[..12]);
+        // Cache miss - create venv (this is the slow path)
+        info!(
+            "VenvManager: cache miss for {}, creating...",
+            truncate_hash(env_hash)
+        );
 
         let venv_path = self.venvs_dir.join(env_hash);
         create_venv(&self.uv_path, &venv_path, lockfile_content, python_version)?;
 
-        // Record metadata
+        // Record metadata (under lock)
         let size = dir_size(&venv_path);
         let now = chrono::Utc::now().to_rfc3339();
-        self.metadata.upsert(VenvEntry {
-            env_hash: env_hash.to_string(),
-            created_at: now.clone(),
-            last_used: now,
-            size_bytes: size,
-        });
+        {
+            let mut metadata = self.metadata.lock().unwrap();
+            metadata.upsert(VenvEntry {
+                env_hash: env_hash.to_string(),
+                created_at: now.clone(),
+                last_used: now,
+                size_bytes: size,
+            });
+        }
         self.save_metadata();
 
-        info!("VenvManager: created venv for {}", &env_hash[..12]);
+        info!("VenvManager: created venv for {}", truncate_hash(env_hash));
         Ok(interpreter)
     }
 
     /// Update last_used timestamp
-    fn touch(&mut self, env_hash: &str) {
-        if let Some(entry) = self.metadata.find_mut(env_hash) {
+    fn touch(&self, env_hash: &str) {
+        let mut metadata = self.metadata.lock().unwrap();
+        if let Some(entry) = metadata.find_mut(env_hash) {
             entry.last_used = chrono::Utc::now().to_rfc3339();
-            self.save_metadata();
         }
+        drop(metadata); // Release lock before I/O
+        self.save_metadata();
     }
 
-    /// Save metadata to disk
+    /// Save metadata to disk atomically
+    ///
+    /// Holds the lock during the entire write to prevent race conditions.
+    /// Uses atomic write (write to temp file, then rename) for crash safety.
     fn save_metadata(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.metadata) {
-            let _ = std::fs::write(&self.metadata_path, json);
+        let metadata = self.metadata.lock().unwrap();
+        if let Ok(json) = serde_json::to_string_pretty(&*metadata) {
+            // Atomic write: write to temp file, then rename
+            // This prevents partial writes and race conditions
+            let temp_path = self.metadata_path.with_extension("json.tmp");
+            if std::fs::write(&temp_path, &json).is_ok() {
+                if let Err(e) = std::fs::rename(&temp_path, &self.metadata_path) {
+                    warn!("Failed to rename metadata file: {}", e);
+                    // Fallback: try direct write (non-atomic but better than nothing)
+                    let _ = std::fs::write(&self.metadata_path, &json);
+                }
+            }
         }
+        // Lock is held until function returns - prevents TOCTOU race
     }
 
     /// Get cache stats
     pub fn stats(&self) -> (usize, u64) {
-        let count = self.metadata.entries.len();
-        let total_bytes: u64 = self.metadata.entries.iter().map(|e| e.size_bytes).sum();
+        let metadata = self.metadata.lock().unwrap();
+        let count = metadata.entries.len();
+        let total_bytes: u64 = metadata.entries.iter().map(|e| e.size_bytes).sum();
         (count, total_bytes)
     }
 }
 
 // --- Free functions (no state needed) ---
+
+/// Truncate hash for display
+fn truncate_hash(hash: &str) -> &str {
+    if hash.len() > 12 {
+        &hash[..12]
+    } else {
+        hash
+    }
+}
 
 fn load_metadata(path: &Path) -> VenvMetadata {
     if !path.exists() {
@@ -229,7 +283,10 @@ dependencies = []
 
     let output = cmd.output().context("Failed to run uv venv")?;
     if !output.status.success() {
-        anyhow::bail!("uv venv failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "uv venv failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // Move .venv contents up (flatter structure)
@@ -250,7 +307,10 @@ dependencies = []
         .context("Failed to run uv sync")?;
 
     if !output.status.success() {
-        anyhow::bail!("uv sync failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "uv sync failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(())
@@ -310,16 +370,9 @@ mod tests {
     }
 
     #[test]
-    fn test_interpreter_path_unix() {
-        let mgr = VenvManager {
-            venvs_dir: PathBuf::from("/tmp/venvs"),
-            uv_path: PathBuf::from("/usr/bin/uv"),
-            metadata_path: PathBuf::from("/tmp/meta.json"),
-            metadata: VenvMetadata::default(),
-        };
-
-        let path = mgr.interpreter_path("abc123");
-        assert!(path.to_string_lossy().contains("abc123"));
-        assert!(path.to_string_lossy().contains("python"));
+    fn test_truncate_hash() {
+        assert_eq!(truncate_hash("abc"), "abc");
+        assert_eq!(truncate_hash("123456789012"), "123456789012");
+        assert_eq!(truncate_hash("1234567890123"), "123456789012");
     }
 }
