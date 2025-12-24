@@ -24,15 +24,15 @@ src/casparian_flow/
 ├── cli/
 │   └── publish.py         # v5.0 Publisher CLI entry point
 ├── config.py              # Global Pydantic settings
-├── context.py             # Environmental Context (Host, User, GitHash)
 ├── sdk.py                 # User-facing BasePlugin API
-├── interface.py           # Internal Plugin Protocol
 ├── main.py                # Sentinel Entry Point
+├── main_ui.py             # UI Entry Point
 ├── protocol.py            # Binary Protocol v5 (Bridge Mode OpCodes)
 ├── mcp_server.py          # MCP Server for LLM Integration
 ├── db/
 │   ├── models.py          # SQLAlchemy Models (The Source of Truth)
 │   ├── access.py          # DB Engine & Bulk Loaders
+│   ├── base_session.py    # SQLAlchemy Session Factory
 │   └── setup.py           # Schema Fingerprinting & Init
 ├── engine/
 │   ├── sentinel.py        # The Broker (Control Plane)
@@ -46,9 +46,14 @@ src/casparian_flow/
 ├── services/
 │   ├── scout.py           # Discovery Service (Inventory + Tagger)
 │   ├── fs_engine.py       # Parallel Directory Walker
+│   ├── filter_logic.py    # Path Filtering (.gitignore style)
+│   ├── import_service.py  # File Import Service
 │   ├── registrar.py       # Code-First Plugin Registration
 │   ├── architect.py       # Plugin Deployment & Governance (Publish-to-Execute)
 │   ├── inspector.py       # File Profiling
+│   ├── ai_types.py        # AI/LLM Type Definitions
+│   ├── ai_hook.py         # AI Generator Interface
+│   ├── llm_provider.py    # LLM Provider Abstraction
 │   ├── llm_generator.py   # AI Code Generation
 │   └── test_generator.py  # AI Test Generation
 ├── security/
@@ -56,6 +61,7 @@ src/casparian_flow/
 │   ├── local_provider.py  # v5.0: Local mode (dev/implicit trust)
 │   ├── azure_provider.py  # v5.0: Enterprise mode (Azure AD/Entra)
 │   ├── factory.py         # Identity provider factory
+│   ├── signing.py         # Signature utilities
 │   └── gatekeeper.py      # Static Analysis & Signatures
 ├── agents/
 │   └── surveyor.py        # Autonomous Onboarding Agent
