@@ -81,29 +81,31 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// Spawn the guest Python process
+/// Spawn the guest Python process using `uv run`
+///
+/// Delegates to uv for correct Python environment setup on all platforms.
+/// uv reconstructs the macOS-specific env vars (like __PYVENV_LAUNCHER__)
+/// that Python's multiprocessing module needs to bootstrap correctly.
 fn spawn_guest(config: &BridgeConfig, socket_path: &str) -> Result<Child> {
     use base64::{Engine as _, engine::general_purpose};
     let source_b64 = general_purpose::STANDARD.encode(&config.source_code);
 
-    // Resolve venv root from interpreter path (e.g., /path/to/venv/bin/python -> /path/to/venv)
-    // Important: resolve the VENV DIRECTORY symlink, not the python binary
-    // (python binary might symlink to uv's base install, but we need the venv's site-packages)
-    let venv_root = config.interpreter_path
-        .parent()  // bin/
-        .and_then(|p| p.parent())  // venv/
-        .and_then(|p| p.canonicalize().ok());  // resolve venv symlink
+    // Use uv to spawn Python - it knows how to set up the environment correctly
+    let mut cmd = Command::new("uv");
 
-    // Build command with clean environment
-    // CRITICAL: env_clear() MUST be called before adding any env vars
-    let mut cmd = Command::new(&config.interpreter_path);
-    cmd.env_clear();  // Clear ALL inherited env vars first
+    // NOTE: Do NOT use env_clear() - macOS Python needs inherited env vars
+    // like __PYVENV_LAUNCHER__, LC_CTYPE, etc. for multiprocessing to work.
+    // uv will handle passing these through correctly.
 
-    // Now add only the vars we need
-    cmd.arg(&config.shim_path)
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("BRIDGE_SOCKET", socket_path)
+    // uv run --frozen --python <interpreter> <script>
+    cmd.arg("run")
+        .arg("--frozen")
+        .arg("--python")
+        .arg(&config.interpreter_path)
+        .arg(&config.shim_path);
+
+    // Bridge context vars
+    cmd.env("BRIDGE_SOCKET", socket_path)
         .env("BRIDGE_PLUGIN_CODE", source_b64)
         .env("BRIDGE_FILE_PATH", &config.file_path)
         .env("BRIDGE_JOB_ID", config.job_id.to_string())
@@ -111,19 +113,13 @@ fn spawn_guest(config: &BridgeConfig, socket_path: &str) -> Result<Child> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Set VIRTUAL_ENV so Python finds correct site-packages (required for uv-managed venvs)
-    if let Some(venv) = &venv_root {
-        cmd.env("VIRTUAL_ENV", venv);
-        info!("VIRTUAL_ENV={} (env_clear applied)", venv.display());
-    } else {
-        warn!("Could not resolve venv root from interpreter path");
-    }
+    // NOTE: uv sets VIRTUAL_ENV automatically, no need to do it ourselves
 
     let child = cmd.spawn()
-        .context("Failed to spawn guest process")?;
+        .context("Failed to spawn guest process via uv run. Is uv installed?")?;
 
     info!(
-        "Spawned guest process (pid={}) with interpreter {}",
+        "Spawned guest via uv (pid={}) using interpreter {}",
         child.id(),
         config.interpreter_path.display()
     );

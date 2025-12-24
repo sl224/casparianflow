@@ -250,7 +250,6 @@ class Handler(BasePlugin):
     # Start Worker
     worker = GeneralistWorker(
         sentinel_addr,
-        e2e_env["plugins_dir"],
         e2e_env["engine"],
         parquet_root=e2e_env["output_dir"],
     )

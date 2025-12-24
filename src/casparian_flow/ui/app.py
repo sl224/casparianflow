@@ -13,7 +13,7 @@ from casparian_flow.db.models import (
     FileHashRegistry, FileVersion, ProcessingJob, WorkerNode,
     PluginManifest, LibraryWhitelist, SurveyorSession, SurveyorDecision
 )
-from casparian_flow.engine.queue import JobQueue
+from casparian_flow.engine.job_queue import JobQueue
 from casparian_flow.server.api import signal_sentinel_reload
 
 # Setup Logging

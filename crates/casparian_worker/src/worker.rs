@@ -6,7 +6,7 @@
 //! - Sink logic inlined (was only ~100 lines, not worth separate file)
 //! - Async only where truly needed (ZMQ recv), sync for blocking I/O
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow::array::RecordBatch;
 use cf_protocol::types::{self, DispatchCommand, PrepareEnvCommand};
 use cf_protocol::{Message, OpCode};
@@ -265,10 +265,6 @@ impl Worker {
             mgr.get_or_create(&env_hash, &lockfile, python_version.as_deref())
         })
         .await?
-    }
-
-    pub fn stop(&mut self) {
-        self.running = false;
     }
 }
 

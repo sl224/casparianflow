@@ -1,14 +1,15 @@
-[2m2025-12-24T04:42:34.503271Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m Found bridge_shim.py: /Users/shan/workspace/casparianflow/src/casparian_flow/engine/bridge_shim.py
-[2m2025-12-24T04:42:34.503423Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m Starting Casparian Rust Worker
-[2m2025-12-24T04:42:34.503430Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m   Sentinel: tcp://127.0.0.1:15557
-[2m2025-12-24T04:42:34.503435Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m   Output: /Users/shan/workspace/casparianflow/tests/e2e/output
-[2m2025-12-24T04:42:34.503439Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m   Worker ID: rust-aeb36566
-[2m2025-12-24T04:42:34.503582Z[0m [32m INFO[0m [2mcasparian_worker::venv_manager[0m[2m:[0m VenvManager initialized: 0 cached envs
-[2m2025-12-24T04:42:34.503591Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m VenvManager: 0 cached envs, 0 MB
-[2m2025-12-24T04:42:34.505091Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Connected to sentinel: tcp://127.0.0.1:15557
-[2m2025-12-24T04:42:34.505135Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Sent IDENTIFY as rust-aeb36566
-[2m2025-12-24T04:42:34.505144Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Entering event loop...
-[2m2025-12-24T04:42:34.507362Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m DISPATCH job 1 -> test_plugin
-[2m2025-12-24T04:42:34.507736Z[0m [32m INFO[0m [2mcasparian_worker::bridge[0m[2m:[0m VIRTUAL_ENV=/Users/shan/workspace/casparianflow/.venv (env_clear applied)
-[2m2025-12-24T04:42:34.508315Z[0m [32m INFO[0m [2mcasparian_worker::bridge[0m[2m:[0m Spawned guest process (pid=67628) with interpreter /Users/shan/.casparian_flow/venvs/test_env_hash_123/bin/python
-[2m2025-12-24T04:42:35.289221Z[0m [31mERROR[0m [2mcasparian_worker::worker[0m[2m:[0m Job 1 failed: Guest process error: cannot import name Queue
+[2m2025-12-24T05:36:56.315411Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m Found bridge_shim.py: /Users/shan/workspace/casparianflow/src/casparian_flow/engine/bridge_shim.py
+[2m2025-12-24T05:36:56.315621Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m Starting Casparian Rust Worker
+[2m2025-12-24T05:36:56.315634Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m   Sentinel: tcp://127.0.0.1:15557
+[2m2025-12-24T05:36:56.315643Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m   Output: /Users/shan/workspace/casparianflow/tests/e2e/output
+[2m2025-12-24T05:36:56.315651Z[0m [32m INFO[0m [2mcasparian_worker[0m[2m:[0m   Worker ID: rust-ac6f27e8
+[2m2025-12-24T05:36:56.315857Z[0m [32m INFO[0m [2mcasparian_worker::venv_manager[0m[2m:[0m VenvManager initialized: 0 cached envs
+[2m2025-12-24T05:36:56.315871Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m VenvManager: 0 cached envs, 0 MB
+[2m2025-12-24T05:36:56.318343Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Connected to sentinel: tcp://127.0.0.1:15557
+[2m2025-12-24T05:36:56.318459Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Sent IDENTIFY as rust-ac6f27e8
+[2m2025-12-24T05:36:56.318471Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Entering event loop...
+[2m2025-12-24T05:36:56.321069Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m DISPATCH job 1 -> test_plugin
+[2m2025-12-24T05:36:56.322239Z[0m [32m INFO[0m [2mcasparian_worker::bridge[0m[2m:[0m Spawned guest via uv (pid=74184) using interpreter /Users/shan/.casparian_flow/venvs/test_env_hash_123/bin/python
+[2m2025-12-24T05:36:57.440427Z[0m [32m INFO[0m [2mcasparian_worker::bridge[0m[2m:[0m Bridge execution complete: 1 batches
+[2m2025-12-24T05:36:57.441340Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Wrote Parquet: /Users/shan/workspace/casparianflow/tests/e2e/output/1_output.parquet
+[2m2025-12-24T05:36:57.441353Z[0m [32m INFO[0m [2mcasparian_worker::worker[0m[2m:[0m Job 1 complete: 3 rows

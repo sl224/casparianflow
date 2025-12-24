@@ -17,7 +17,7 @@ from casparian_flow.db.models import (
     ProcessingJob,
     StatusEnum
 )
-from casparian_flow.engine.queue import JobQueue
+from casparian_flow.engine.job_queue import JobQueue
 from casparian_flow.engine.sentinel import Sentinel # Use ZMQ to signal? 
 # To signal sentinel, we need a ZMQ Client (Dealer) to send RELOAD message.
 import zmq
