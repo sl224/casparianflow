@@ -10,6 +10,7 @@ license.workspace = true
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
 cf_protocol = { path = "../cf_protocol" }
+cf_security = { path = "../cf_security" }
 
 # Async runtime
 tokio.workspace = true
@@ -24,12 +25,20 @@ tracing-subscriber.workspace = true
 # CLI
 clap.workspace = true
 
+# ZeroMQ
+zeromq.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
 
 # Signal handling (Unix)
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
+libc = "0.2"
 
 # Signal handling (Windows)
 [target.'cfg(windows)'.dependencies]

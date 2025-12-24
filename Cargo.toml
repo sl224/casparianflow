@@ -5,6 +5,7 @@ members = [
     "crates/casparian_worker",
     "crates/casparian_sentinel",
     "crates/casparian",
+    "crates/cf_security",
 ]
 
 [workspace.package]

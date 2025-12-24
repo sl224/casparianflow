@@ -62,18 +62,55 @@ enum Commands {
         #[command(flatten)]
         args: WorkerArgs,
     },
+    /// Publish a plugin to the Sentinel registry
+    Publish {
+        /// Path to the Python plugin file
+        file: std::path::PathBuf,
+
+        /// Plugin version (e.g., "1.0.2")
+        #[arg(long)]
+        version: String,
+
+        /// Sentinel address (default: IPC socket)
+        #[arg(long)]
+        addr: Option<String>,
+
+        /// Publisher name (defaults to system username)
+        #[arg(long)]
+        publisher: Option<String>,
+
+        /// Publisher email (optional)
+        #[arg(long)]
+        email: Option<String>,
+    },
 }
 
-/// Get the default IPC address for the current platform
+/// Get the default IPC address for the current platform.
+///
+/// Uses user-specific paths to avoid collisions on multi-user systems:
+/// - **Unix**: `$XDG_RUNTIME_DIR/casparian.sock` or `/tmp/casparian_{uid}.sock`
+/// - **Windows**: `ipc://casparian_{username}` (named pipe scoped to user)
 fn get_default_ipc_addr() -> String {
     #[cfg(windows)]
     {
-        "ipc://casparian_flow".to_string()
+        // Windows named pipes are global - scope to username to avoid collision
+        let username = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_else(|_| "default".to_string());
+        format!("ipc://casparian_{}", username)
     }
     #[cfg(not(windows))]
     {
+        // Try XDG_RUNTIME_DIR first (standard on Linux for user-specific sockets)
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            let socket_path = std::path::Path::new(&runtime_dir).join("casparian.sock");
+            return format!("ipc://{}", socket_path.display());
+        }
+
+        // Fallback to temp_dir with user ID to avoid collision on shared systems
         let temp_dir = std::env::temp_dir();
-        let socket_path = temp_dir.join("casparian.sock");
+        let uid = unsafe { libc::getuid() };
+        let socket_path = temp_dir.join(format!("casparian_{}.sock", uid));
         format!("ipc://{}", socket_path.display())
     }
 }
@@ -157,6 +194,18 @@ fn main() -> Result<()> {
         } => run_unified(addr, database, output, data_threads, venvs_dir),
         Commands::Sentinel { args } => run_sentinel_standalone(args),
         Commands::Worker { args } => run_worker_standalone(args),
+        Commands::Publish {
+            file,
+            version,
+            addr,
+            publisher,
+            email,
+        } => {
+            // Publish runs synchronously (no need for tokio runtime)
+            tokio::runtime::Runtime::new()?.block_on(async {
+                run_publish(file, version, addr, publisher, email).await
+            })
+        }
     }
 }
 
@@ -469,6 +518,149 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
     })
 }
 
+/// Publish a plugin to the Sentinel registry
+async fn run_publish(
+    file: std::path::PathBuf,
+    version: String,
+    addr: Option<String>,
+    publisher: Option<String>,
+    email: Option<String>,
+) -> Result<()> {
+    use cf_protocol::types::DeployCommand;
+    use cf_protocol::{Message, OpCode};
+    use cf_security::signing::sha256;
+    use cf_security::Gatekeeper;
+    use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
+
+    info!("Publishing plugin: {:?} v{}", file, version);
+
+    // 1. Read plugin source code
+    let source_code = std::fs::read_to_string(&file)
+        .with_context(|| format!("Failed to read plugin file: {:?}", file))?;
+
+    // 2. Validate with Gatekeeper (AST-based security checks)
+    let gatekeeper = Gatekeeper::new();
+    gatekeeper
+        .validate(&source_code)
+        .context("Plugin failed security validation")?;
+    info!("✓ Security validation passed");
+
+    // 3. Check for uv.lock, run `uv lock` if missing
+    let plugin_dir = file
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Plugin file has no parent directory"))?;
+    let lockfile_path = plugin_dir.join("uv.lock");
+
+    if !lockfile_path.exists() {
+        info!("No uv.lock found, running `uv lock` in {:?}...", plugin_dir);
+        let output = std::process::Command::new("uv")
+            .arg("lock")
+            .current_dir(plugin_dir)
+            .output()
+            .context("Failed to run `uv lock` (is uv installed?)")?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "uv lock failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        info!("✓ Generated uv.lock");
+    }
+
+    let lockfile_content = std::fs::read_to_string(&lockfile_path)
+        .context("Failed to read uv.lock after generation")?;
+
+    // 4. Compute hashes
+    let env_hash = sha256(lockfile_content.as_bytes());
+    let artifact_content = format!("{}{}", source_code, lockfile_content);
+    let artifact_hash = sha256(artifact_content.as_bytes());
+    info!("✓ Computed hashes (env: {}..., artifact: {}...)", &env_hash[..8], &artifact_hash[..8]);
+
+    // 5. Extract plugin name from file
+    let plugin_name = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Could not extract plugin name from file path"))?
+        .to_string();
+
+    // Get publisher name (default to system username)
+    let publisher_name = publisher.unwrap_or_else(|| {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string())
+    });
+
+    // 6. Construct DeployCommand
+    let deploy_cmd = DeployCommand {
+        plugin_name: plugin_name.clone(),
+        version: version.clone(),
+        source_code,
+        lockfile_content,
+        env_hash,
+        artifact_hash,
+        signature: String::new(), // TODO: Add Ed25519 signing
+        publisher_name,
+        publisher_email: email,
+        azure_oid: None,
+        system_requirements: None,
+    };
+
+    // 7. Send via ZMQ DEALER to Sentinel
+    let sentinel_addr = addr.unwrap_or_else(get_default_ipc_addr);
+    info!("Connecting to Sentinel at {}", sentinel_addr);
+
+    let mut socket = zeromq::DealerSocket::new();
+    socket.connect(&sentinel_addr).await?;
+    info!("✓ Connected to Sentinel");
+
+    // Serialize payload
+    let payload = serde_json::to_vec(&deploy_cmd)?;
+
+    // Create protocol message
+    let msg = Message::new(OpCode::Deploy, 0, payload)?;
+    let (header_bytes, payload_bytes) = msg.pack()?;
+
+    // Send message (multipart)
+    let mut multipart = ZmqMessage::from(header_bytes);
+    multipart.push_back(payload_bytes.into());
+    socket.send(multipart).await?;
+    info!("✓ Sent deployment request");
+
+    // 8. Await ACK/ERR response
+    let response_frames: ZmqMessage = socket.recv().await?;
+    let response_msg = Message::unpack(
+        &response_frames
+            .into_vec()
+            .iter()
+            .map(|f| f.to_vec())
+            .collect::<Vec<_>>(),
+    )?;
+
+    match response_msg.header.opcode {
+        OpCode::Ack => {
+            use cf_protocol::types::DeployResponse;
+            let deploy_response: DeployResponse = serde_json::from_slice(&response_msg.payload)?;
+
+            if deploy_response.success {
+                println!("✅ Deployed plugin '{}' v{}", plugin_name, version);
+                Ok(())
+            } else {
+                anyhow::bail!("Deployment failed: {}", deploy_response.message)
+            }
+        }
+        OpCode::Err => {
+            use cf_protocol::types::ErrorPayload;
+            let error_payload: ErrorPayload = serde_json::from_slice(&response_msg.payload)?;
+            anyhow::bail!("Deployment error: {}", error_payload.message)
+        }
+        _ => anyhow::bail!(
+            "Unexpected response opcode: {:?}",
+            response_msg.header.opcode
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,16 +672,43 @@ mod tests {
 
         #[cfg(not(windows))]
         {
-            assert!(addr.contains("casparian.sock"), "Unix IPC should use casparian.sock");
-            // Should be in temp directory
-            let temp_dir = std::env::temp_dir();
-            let expected_path = temp_dir.join("casparian.sock");
-            assert_eq!(addr, format!("ipc://{}", expected_path.display()));
+            // Should contain casparian in the socket name
+            assert!(
+                addr.contains("casparian"),
+                "Unix IPC should contain 'casparian' in path: {}",
+                addr
+            );
+            assert!(
+                addr.ends_with(".sock"),
+                "Unix IPC should end with .sock: {}",
+                addr
+            );
+
+            // Verify it uses either XDG_RUNTIME_DIR or temp_dir with UID
+            if std::env::var("XDG_RUNTIME_DIR").is_ok() {
+                assert!(
+                    addr.contains("casparian.sock"),
+                    "With XDG_RUNTIME_DIR, should use casparian.sock: {}",
+                    addr
+                );
+            } else {
+                let uid = unsafe { libc::getuid() };
+                assert!(
+                    addr.contains(&format!("casparian_{}", uid)),
+                    "Without XDG_RUNTIME_DIR, should use casparian_<uid>.sock: {}",
+                    addr
+                );
+            }
         }
 
         #[cfg(windows)]
         {
-            assert_eq!(addr, "ipc://casparian_flow");
+            assert!(addr.starts_with("ipc://casparian_"), "Windows should start with ipc://casparian_");
+            // Should contain username
+            let username = std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_else(|_| "default".to_string());
+            assert_eq!(addr, format!("ipc://casparian_{}", username));
         }
     }
 
