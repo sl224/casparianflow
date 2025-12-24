@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
-const UV_TIMEOUT_SECONDS: u64 = 300;
-
 /// Venv entry - plain data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VenvEntry {
@@ -30,6 +28,7 @@ pub struct VenvMetadata {
 
 impl VenvMetadata {
     /// Find entry by hash (linear search is fine for ~20 items)
+    #[cfg(test)]
     pub fn find(&self, env_hash: &str) -> Option<&VenvEntry> {
         self.entries.iter().find(|e| e.env_hash == env_hash)
     }
@@ -90,11 +89,6 @@ impl VenvManager {
         } else {
             venv_path.join("bin/python")
         }
-    }
-
-    /// Check if venv exists (just check if interpreter exists)
-    pub fn exists(&self, env_hash: &str) -> bool {
-        self.interpreter_path(env_hash).exists()
     }
 
     /// Get or create venv. Synchronous - call from spawn_blocking if needed.

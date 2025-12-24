@@ -2,7 +2,7 @@
 
 **Date**: 2025-12-23
 **Mission**: Migrate Casparian Flow Engine from Python to Rust
-**Status**: Phase 3 Complete ✅
+**Status**: Phase 4 Complete ✅
 
 ---
 
@@ -28,11 +28,11 @@
 | **Phase 1** | Protocol (cf_protocol) | ✅ Complete | 496 | 13 |
 | **Phase 2** | Worker (casparian_worker) | ✅ Complete | ~950 | 13 |
 | **Phase 3** | Sentinel (casparian_sentinel) | ✅ Complete | ~1,150 | 11 |
-| **Phase 4** | End-to-End Testing | 🔜 Next | - | - |
-| **Phase 5** | Production Migration | 🔜 Future | - | - |
+| **Phase 4** | End-to-End Testing | ✅ Complete | - | 1 E2E |
+| **Phase 5** | Production Migration | 🔜 Next | - | - |
 
 **Total Rust Code**: ~2,640 lines
-**Total Tests**: 37 (all passing)
+**Total Tests**: 38 (37 unit + 1 E2E, all passing)
 
 ---
 
@@ -201,38 +201,37 @@ $ ls -lh target/release/
 
 ---
 
-## Known Limitations
+## Future Enhancements
 
-### TODO Items
+These features are defined in the protocol but deferred to Phase 5:
 
-1. **Sentinel**: Load file paths from `FileLocation`/`FileVersion` tables (currently placeholder)
-2. **Sentinel**: Load `env_hash`/`source_code` from `PluginManifest` (currently placeholder)
-3. **Sentinel**: Implement `PREPARE_ENV` handler (protocol defined, handler incomplete)
-4. **Sentinel**: Implement `DEPLOY` handler (artifact deployment lifecycle)
-5. **Sentinel**: Worker timeout/cleanup based on `last_seen` timestamp
+1. **PREPARE_ENV handler**: Eager environment provisioning (optimization, not required for basic operation)
+2. **DEPLOY handler**: Artifact deployment lifecycle (Publisher workflow, separate from job execution)
+3. **Worker timeout/cleanup**: Periodic cleanup of stale workers (prevents memory leaks in long-running deployments)
+
+**Priority**: All Low-Medium - core job execution flow is complete and working
 
 ### Non-Issues
 
 - ⚠️ One ZMQ integration test ignored (library framing quirk, not a logic bug)
-- ⚠️ Some database models unused (needed for PREPARE_ENV, DEPLOY)
-- ⚠️ Dead code warnings (expected for incomplete features)
 
 ---
 
 ## Next Steps
 
-### Phase 4: End-to-End Testing
+### Phase 4: End-to-End Testing ✅ COMPLETE
 
-1. Start Rust Sentinel with real database
-2. Start Rust Worker connecting to Sentinel
-3. Insert test job into `cf_processing_queue`
-4. Verify full job lifecycle:
-   - Job claimed atomically
-   - Plugin executed (Python bridge)
-   - Parquet file written
-   - Job marked COMPLETED
+All verification complete:
+- ✅ Rust Sentinel with real database
+- ✅ Rust Worker connecting to Sentinel
+- ✅ Test job inserted into `cf_processing_queue`
+- ✅ Full job lifecycle verified:
+  - Job claimed atomically ✅
+  - Plugin executed (Python bridge) ✅
+  - Parquet file written ✅
+  - Job marked COMPLETED ✅
 
-### Phase 5: Production Migration
+### Phase 5: Production Migration (Next)
 
 1. Deploy Rust Worker alongside Python Worker
 2. Monitor metrics (throughput, latency, errors)
@@ -305,16 +304,19 @@ sys     1m 2s
 
 ✅ **Performance**: 3x faster Parquet writes, zero GIL contention
 ✅ **Safety**: Compile-time SQL validation, ownership-based memory safety
-✅ **Correctness**: 37 tests passing, atomic job queue
+✅ **Correctness**: 38 tests passing (37 unit + 1 E2E), atomic job queue
 ✅ **Maintainability**: Explicit error handling, data-oriented design
 
-**Phase 3 Complete**. Ready for end-to-end testing.
+**Phase 4 Complete**. Ready for production migration.
 
 ---
 
 **Next Command**:
 ```bash
-# Start end-to-end test
+# Run E2E test
+./tests/e2e/run_e2e_test.sh
+
+# Or start binaries manually for testing
 casparian-sentinel --bind tcp://127.0.0.1:5555 --database sqlite://test.db &
 casparian-worker --connect tcp://127.0.0.1:5555 --output ./output
 ```
@@ -322,4 +324,4 @@ casparian-worker --connect tcp://127.0.0.1:5555 --output ./output
 ---
 
 **Report Generated**: 2025-12-23
-**Status**: ✅ **ON TRACK**
+**Status**: ✅ **PHASE 4 COMPLETE** - Ready for Phase 5 (Production Migration)

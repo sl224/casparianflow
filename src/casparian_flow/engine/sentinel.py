@@ -21,7 +21,7 @@ from casparian_flow.protocol import (
     pack_header,
 )
 from urllib.request import url2pathname
-from casparian_flow.engine.queue import JobQueue
+from casparian_flow.engine.job_queue import JobQueue
 from casparian_flow.engine.config import WorkerConfig
 from casparian_flow.db.models import FileVersion, FileLocation, TopicConfig, ProcessingJob, SourceRoot
 from casparian_flow.services.architect import ArchitectService
