@@ -1,0 +1,12 @@
+[2m2025-12-24T04:42:33.361929Z[0m [32m INFO[0m [2mcasparian_sentinel[0m[2m:[0m Starting Casparian Rust Sentinel
+[2m2025-12-24T04:42:33.362034Z[0m [32m INFO[0m [2mcasparian_sentinel[0m[2m:[0m   Bind: tcp://127.0.0.1:15557
+[2m2025-12-24T04:42:33.362040Z[0m [32m INFO[0m [2mcasparian_sentinel[0m[2m:[0m   Database: sqlite:///Users/shan/workspace/casparianflow/tests/e2e/test.db
+[2m2025-12-24T04:42:33.364600Z[0m [32m INFO[0m [2mcasparian_sentinel::sentinel[0m[2m:[0m Sentinel bound to tcp://127.0.0.1:15557
+[2m2025-12-24T04:42:33.365254Z[0m [32m INFO[0m [2mcasparian_sentinel::sentinel[0m[2m:[0m Loaded 1 plugin topic configs
+[2m2025-12-24T04:42:33.365280Z[0m [32m INFO[0m [2mcasparian_sentinel::sentinel[0m[2m:[0m Sentinel event loop started
+[2m2025-12-24T04:42:34.505189Z[0m [32m INFO[0m [2mcasparian_sentinel::sentinel[0m[2m:[0m Worker joined [rust-aeb36566]: 1 capabilities
+[2m2025-12-24T04:42:34.506308Z[0m [32m INFO[0m [2mcasparian_sentinel::db::queue[0m[2m:[0m Claimed job 1: test_plugin
+[2m2025-12-24T04:42:34.506377Z[0m [32m INFO[0m [2mcasparian_sentinel::sentinel[0m[2m:[0m Assigning job 1 to worker
+[2m2025-12-24T04:42:34.507193Z[0m [32m INFO[0m [2mcasparian_sentinel::sentinel[0m[2m:[0m Dispatched job 1 (test_plugin)
+[2m2025-12-24T04:42:35.289439Z[0m [31mERROR[0m [2mcasparian_sentinel::sentinel[0m[2m:[0m Job 1 failed: Guest process error: cannot import name Queue
+[2m2025-12-24T04:42:35.290242Z[0m [32m INFO[0m [2mcasparian_sentinel::db::queue[0m[2m:[0m Job 1 failed: Guest process error: cannot import name Queue

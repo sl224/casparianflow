@@ -54,3 +54,8 @@ data/
 .sesskey
 *.json.bak
 last_proposal.json
+
+# Rust artifacts
+target/
+Cargo.lock
+**/*.rs.bk
