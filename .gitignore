@@ -2,6 +2,7 @@
 *.pkl
 *.zip
 *.e2d
+*.parquet
 
 # Macos
 .DS_Store
@@ -10,6 +11,7 @@
 *.egg-info/
 dist/
 build/
+*.build/
 
 # IDE configuration
 .vscode/
@@ -26,9 +28,18 @@ env/
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
 
-# Test assets
+# Test output and artifacts
+.test_output/
+.demo_output/
+test_output/
+*_output/
+output_*/
+sub_output/
+test_env_*/
 tests/static_assets/
+*_test.db
 
 # DB
 *.sqlite*
@@ -38,3 +49,8 @@ data/
 # llm
 .agent
 .coverage
+
+# Session/temp files
+.sesskey
+*.json.bak
+last_proposal.json

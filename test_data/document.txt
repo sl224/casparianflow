@@ -1,3 +1,0 @@
-This is a test document.
-It contains some sample text.
-We will use it to test the import feature.

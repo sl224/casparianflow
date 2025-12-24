@@ -146,7 +146,7 @@ try:
     print("\n[STEP 4] Executing job with plugin...")
 
     # Load plugin
-    plugin_path = Path("plugins/test_csv_parser.py")
+    plugin_path = Path("tests/fixtures/plugins/test_csv_parser.py")
     if not plugin_path.exists():
         print(f"  ERROR: Plugin file not found: {plugin_path}")
         sys.exit(1)

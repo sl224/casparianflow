@@ -1,4 +1,4 @@
-# plugins_sub/generated_pfc_db.py
+# tests/fixtures/plugins/generated_pfc_db.py
 from casparian_flow.sdk import BasePlugin, PluginMetadata, FileEvent
 import pandas as pd
 
