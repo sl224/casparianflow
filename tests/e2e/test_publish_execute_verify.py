@@ -335,6 +335,22 @@ class Handler(BasePlugin):
     print("  Deploy (DOD) → Scout → Queue → Execute → Output")
     print("=" * 70)
 
+    # =========================================================================
+    # MANUAL INSPECTION: Pause here to inspect database
+    # =========================================================================
+    db_path = str(e2e_env["engine"].url).replace("sqlite:///", "")
+    print(f"\n🔍 DATABASE INSPECTION:")
+    print(f"   Database: {db_path}")
+    print(f"   Source:   {e2e_env['source_dir']}")
+    print(f"   Output:   {e2e_env['output_dir']}")
+    print(f"   Plugins:  {e2e_env['plugins_dir']}")
+    print(f"\n📊 To inspect the database, run:")
+    print(f"   sqlite3 {db_path}")
+    print(f"\n⏸  Press ENTER to continue and cleanup...")
+
+    # Uncomment the line below to pause for manual inspection
+    # input()  # <-- Remove comment to enable pause
+
 
 @pytest.mark.integration
 def test_deploy_multiple_plugins_routing(e2e_env):
