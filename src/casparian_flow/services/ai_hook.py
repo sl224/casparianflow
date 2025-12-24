@@ -37,18 +37,24 @@ class MockGenerator(AIGenerator):
     """
 
     def propose_schema(self, profile: FileProfile) -> SchemaProposal:
-        from casparian_flow.services.ai_types import ColumnDef, FileType
+        from casparian_flow.services.ai_types import ColumnDef, TableDefinition, FileType
 
         # Simple heuristic for mock
         is_csv = profile.file_type == FileType.TEXT_CSV
 
-        return SchemaProposal(
-            file_type_inferred=profile.file_type.name,
-            target_topic="generated_output",
+        # Create a single table definition
+        table = TableDefinition(
+            topic_name="generated_output",
             columns=[
                 ColumnDef(name="col_1", target_type="string"),
                 ColumnDef(name="col_2", target_type="int"),
             ],
+            description="Mock table for testing"
+        )
+
+        return SchemaProposal(
+            file_type_inferred=profile.file_type.name,
+            tables=[table],
             read_strategy="pandas" if is_csv else "manual",
             reasoning="Mock Reasoning: Detected Text content.",
         )

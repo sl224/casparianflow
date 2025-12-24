@@ -78,7 +78,8 @@ def test_mock_generator_contract(csv_file):
     proposal = gen.propose_schema(profile)
     assert isinstance(proposal, SchemaProposal)
     assert proposal.file_type_inferred == "TEXT_CSV"
-    assert len(proposal.columns) > 0
+    assert len(proposal.tables) > 0
+    assert len(proposal.tables[0].columns) > 0
     
     # Step 2: Generate
     code = gen.generate_plugin(proposal)

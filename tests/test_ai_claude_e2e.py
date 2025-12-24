@@ -66,7 +66,8 @@ def test_claude_e2e_generation(sample_csv, tmp_path):
         pytest.fail(f"Claude CLI failed (are you logged in?): {e}")
 
     assert proposal.file_type_inferred.upper() in ["CSV", "TEXT_CSV"]
-    assert len(proposal.columns) == 4
+    assert len(proposal.tables) > 0
+    assert len(proposal.tables[0].columns) == 4
     
     # 4. Generate Plugin
     print("\n[Claude E2E] Asking Claude to write code...")
