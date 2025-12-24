@@ -71,8 +71,8 @@ else
 fi
 echo -e "${GREEN}  ✓ Build complete${NC}\n"
 
-# Step 2: Setup database
-echo -e "${YELLOW}[2/6] Setting up demo database...${NC}"
+# Step 2: Setup database and sample data
+echo -e "${YELLOW}[2/7] Setting up demo database...${NC}"
 rm -f "$DB_PATH"
 rm -f "$SOCKET_PATH"
 rm -rf "$OUTPUT_DIR"
@@ -81,18 +81,30 @@ mkdir -p "$OUTPUT_DIR"
 # Update the schema with actual paths
 sed "s|DEMO_DIR|$DEMO_DIR|g" "$DEMO_DIR/schema.sql" | sqlite3 "$DB_PATH"
 echo -e "${GREEN}  ✓ Database created at $DB_PATH${NC}"
-echo -e "  ✓ 3 jobs queued for processing\n"
+echo -e "  ✓ 3 jobs queued for processing"
+echo -e "  ✓ 4 pre-completed jobs for Data tab\n"
 
-# Step 3: Setup Python environment
-echo -e "${YELLOW}[3/6] Setting up Python environment...${NC}"
+# Generate sample parquet files
+echo -e "${YELLOW}[3/7] Generating sample parquet files...${NC}"
+cd "$PROJECT_ROOT"
+if [ -f ".venv/bin/python" ]; then
+    .venv/bin/python "$DEMO_DIR/generate_sample_data.py"
+    echo -e "${GREEN}  ✓ Sample parquet files created${NC}\n"
+else
+    echo -e "${YELLOW}  ⚠ Python venv not found, skipping parquet generation${NC}"
+    echo -e "  (Data tab will work after jobs complete)\n"
+fi
+
+# Step 4: Setup Python environment
+echo -e "${YELLOW}[4/7] Setting up Python environment...${NC}"
 VENV_DIR="$HOME/.casparian_flow/venvs/demo_env_hash"
 mkdir -p "$(dirname "$VENV_DIR")"
 rm -rf "$VENV_DIR"
 ln -sf "$PROJECT_ROOT/.venv" "$VENV_DIR"
 echo -e "${GREEN}  ✓ Environment linked${NC}\n"
 
-# Step 4: Start Sentinel
-echo -e "${YELLOW}[4/6] Starting Sentinel...${NC}"
+# Step 5: Start Sentinel
+echo -e "${YELLOW}[5/7] Starting Sentinel...${NC}"
 
 if [ "$USE_UI" = true ]; then
     echo -e "  ${CYAN}Starting Casparian Deck (Tauri UI)...${NC}"
@@ -141,8 +153,8 @@ fi
 
 echo -e "${GREEN}  ✓ Sentinel listening on $BIND_ADDR${NC}\n"
 
-# Step 5: Start Worker
-echo -e "${YELLOW}[5/6] Starting Worker...${NC}"
+# Step 6: Start Worker
+echo -e "${YELLOW}[6/7] Starting Worker...${NC}"
 
 "$PROJECT_ROOT/target/release/casparian" worker \
     --connect "$BIND_ADDR" \
@@ -158,8 +170,8 @@ if ! kill -0 $WORKER_PID 2>/dev/null; then
 fi
 echo -e "${GREEN}  ✓ Worker running (PID: $WORKER_PID)${NC}\n"
 
-# Step 6: Monitor jobs
-echo -e "${YELLOW}[6/6] Processing jobs...${NC}"
+# Step 7: Monitor jobs
+echo -e "${YELLOW}[7/7] Processing jobs...${NC}"
 echo -e "  ${CYAN}Watch the UI for real-time metrics!${NC}"
 echo ""
 echo -e "${BOLD}  Processing 3 jobs × 4 batches × 1.5s delay = ~18 seconds total${NC}"
@@ -180,9 +192,11 @@ while true; do
 
     read QUEUED RUNNING COMPLETED FAILED <<< "$STATS"
 
-    # Progress bar
+    # Progress bar (only count queued jobs, not pre-completed)
     TOTAL=3
-    DONE=$((COMPLETED + FAILED))
+    # Pre-completed jobs in schema = 4, so subtract them from COMPLETED
+    REAL_COMPLETED=$((COMPLETED > 4 ? COMPLETED - 4 : 0))
+    DONE=$((REAL_COMPLETED + FAILED))
     PCT=$((DONE * 100 / TOTAL))
     BAR_LEN=$((PCT / 5))
 
@@ -196,8 +210,8 @@ while true; do
     done
     printf "] %3d%% | Q:%d R:%d C:%d F:%d  " "$PCT" "$QUEUED" "$RUNNING" "$COMPLETED" "$FAILED"
 
-    # Check if all done
-    if [ "$DONE" -eq "$TOTAL" ]; then
+    # Check if all queued jobs are done
+    if [ "$DONE" -ge "$TOTAL" ]; then
         echo ""
         break
     fi
@@ -230,7 +244,36 @@ ls -lh "$OUTPUT_DIR"/*.parquet 2>/dev/null || echo "  (no output files yet)"
 
 echo ""
 if [ "$USE_UI" = true ]; then
-    echo -e "${YELLOW}The Tauri UI window is still open.${NC}"
+    echo -e "${BOLD}${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║                  UI TESTING GUIDE                            ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "${CYAN}Test each tab:${NC}"
+    echo ""
+    echo -e "  ${BOLD}DASHBOARD${NC} - Real-time metrics"
+    echo "    ✓ Workers should show 1 connected"
+    echo "    ✓ Jobs in-flight should pulse during processing"
+    echo "    ✓ Completed/Failed counters should increment"
+    echo "    ✓ Throughput should show jobs/sec"
+    echo ""
+    echo -e "  ${BOLD}PIPELINE${NC} - Topology graph"
+    echo "    ✓ Should show slow_processor and data_validator plugins"
+    echo "    ✓ Topics should appear on the right"
+    echo "    ✓ Edges should connect plugins to topics"
+    echo ""
+    echo -e "  ${BOLD}EDITOR${NC} - Plugin code editor"
+    echo "    ✓ 4 plugins in sidebar: slow_processor, data_validator,"
+    echo "      simple_transform, bad_plugin"
+    echo "    ✓ Click to open and edit code"
+    echo "    ✓ Deploy slow_processor.py → should succeed"
+    echo "    ✓ Deploy bad_plugin.py → should show validation errors"
+    echo ""
+    echo -e "  ${BOLD}DATA${NC} - Query job outputs"
+    echo "    ✓ 4+ completed jobs in sidebar"
+    echo "    ✓ Click job to query parquet and see DataGrid"
+    echo "    ✓ Columns: id, name, value, etc."
+    echo ""
     echo -e "${YELLOW}Press Ctrl+C to exit and close everything.${NC}"
     wait
 fi
