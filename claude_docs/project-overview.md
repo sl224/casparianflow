@@ -3,9 +3,9 @@
 ## What Is This?
 
 Casparian Flow is a distributed job processing system with:
-- **Rust backend** (`src/`) - Sentinel (job dispatcher), workers, ZeroMQ messaging
-- **Tauri desktop app** (`ui/`) - "Casparian Deck" dashboard for monitoring and config
-- **Python plugins** - User-defined job processors
+- **Rust backend** - Sentinel (job dispatcher), Workers, ZeroMQ messaging
+- **Tauri desktop app** - "Casparian Deck" dashboard for monitoring and config
+- **Python plugins** - User-defined job processors (no SDK required)
 
 ## Tech Stack
 
@@ -16,39 +16,76 @@ Casparian Flow is a distributed job processing system with:
 | Styling | CSS variables, dark theme |
 | Testing | Playwright (UI), Cargo test (Rust) |
 | Package Manager | Bun (UI), Cargo (Rust) |
+| Plugin Runtime | Python (pandas, pyarrow) via bridge_shim |
 
 ## Directory Structure
 
 ```
 casparianflow/
-├── src/                    # Rust source (sentinel, worker, CLI)
-├── ui/                     # Tauri + Svelte desktop app
+├── crates/                     # Rust source
+│   ├── casparian/              # CLI binary
+│   ├── casparian_sentinel/     # Job dispatcher
+│   ├── casparian_worker/       # Job executor
+│   │   └── shim/bridge_shim.py # Embedded Python shim
+│   ├── cf_protocol/            # Wire protocol
+│   └── cf_security/            # Signing, Azure auth
+├── ui/                         # Tauri + Svelte desktop app
 │   └── src/
 │       ├── lib/
-│       │   ├── components/ # Svelte components
-│       │   ├── stores/     # Svelte 5 stores ($state, $effect)
-│       │   ├── tauri.ts    # Tauri API wrapper (real or mock)
-│       │   └── tauri-mock.ts # Mock for browser testing
-│       └── routes/         # SvelteKit pages
+│       │   ├── components/     # Svelte components
+│       │   ├── stores/         # Svelte 5 stores
+│       │   └── tauri.ts        # Tauri API wrapper
+│       └── routes/             # SvelteKit pages
 ├── tests/
-│   └── ui-agent/           # Playwright blind agent tests
-├── demo/                   # Demo data, schema.sql
-└── claude_docs/            # Context docs for Claude sessions
+│   └── ui-agent/               # Playwright blind agent tests
+├── demo/
+│   ├── plugins/                # Example plugins (no SDK needed)
+│   └── data/                   # Sample data files
+└── claude_docs/                # Context docs for Claude sessions
 ```
 
 ## Key Concepts
 
+### Plugin Contract (No SDK)
+
+Plugins are simple Python files. No inheritance or SDK imports required:
+
+```python
+import pandas as pd
+import pyarrow as pa
+
+MANIFEST = {
+    "pattern": "*.csv",
+    "topic": "output",
+}
+
+class Handler:
+    def execute(self, file_path: str):
+        df = pd.read_csv(file_path)
+        yield pa.Table.from_pandas(df)
+```
+
+### Bridge Mode Execution
+
+Plugins run in isolated venvs via subprocess:
+
+```
+Rust Worker
+    │
+    ├── Creates venv from lockfile (uv sync)
+    ├── Spawns Python subprocess (bridge_shim.py)
+    ├── Passes plugin code via env var (base64)
+    └── Receives Arrow IPC batches via Unix socket
+```
+
 ### Svelte 5 Runes
 
 The UI uses Svelte 5's new runes syntax:
-```typescript
-// State
-let count = $state(0);
 
-// Derived
+```typescript
+let count = $state(0);
 let doubled = $derived(count * 2);
 
-// Effects
 $effect(() => {
   console.log('count changed:', count);
 });
@@ -57,28 +94,12 @@ $effect(() => {
 ### Tauri Commands
 
 Frontend calls Rust via `invoke`:
+
 ```typescript
 import { invoke } from '$lib/tauri';
 
 const rules = await invoke<RoutingRule[]>('get_routing_rules');
 await invoke('create_routing_rule', { pattern: '*.csv', tag: 'data' });
-```
-
-### Store Pattern
-
-Stores in `ui/src/lib/stores/` use class-based pattern with runes:
-```typescript
-class MyStore {
-  data = $state<Item[]>([]);
-  loading = $state(false);
-
-  async load() {
-    this.loading = true;
-    this.data = await invoke('get_items');
-    this.loading = false;
-  }
-}
-export const myStore = new MyStore();
 ```
 
 ## Running the App
@@ -87,50 +108,54 @@ export const myStore = new MyStore();
 # Full Tauri app (desktop)
 cd ui && bun tauri dev
 
-# Just the web UI (for testing, uses mocks)
-cd ui && bun run dev
-
-# Run UI tests
+# Run UI tests (ephemeral backend)
 cd tests/ui-agent && bun run pw
+
+# Build release
+cargo build --release
 ```
 
 ## Common Tasks
 
 ### Adding a New Tauri Command
 
-1. **Rust** (`src/commands/*.rs`): Define command with `#[tauri::command]`
-2. **Register** (`src/lib.rs`): Add to `invoke_handler`
-3. **Mock** (`ui/src/lib/tauri-mock.ts`): Add mock response
-4. **Use** (`ui/src/lib/stores/*.ts`): Call via `invoke()`
+1. **Rust** (`ui/src-tauri/src/*.rs`): Define with `#[tauri::command]`
+2. **Register** (`ui/src-tauri/src/lib.rs`): Add to `invoke_handler`
+3. **Use** (`ui/src/lib/stores/*.ts`): Call via `invoke()`
 
-### Adding a New UI Component
+### Writing a New Plugin
 
-1. Create `ui/src/lib/components/MyComponent.svelte`
-2. Add mock data to `ui/src/lib/tauri-mock.ts` if needed
-3. Write tests in `tests/ui-agent/my-component.test.ts`
+Create a Python file with:
+```python
+MANIFEST = {"pattern": "*.csv", "topic": "my_output"}
 
-### Testing Approach
+class Handler:
+    def execute(self, file_path: str):
+        # Process file, yield Arrow tables
+        yield pa.Table.from_pandas(df)
+```
 
-- **Unit tests**: Cargo test for Rust logic
-- **UI tests**: Playwright blind agent tests (see `claude_docs/ui-testing.md`)
-- **Integration**: Full Tauri app with real SQLite database
+### Testing UI Changes
 
-## UI Components
-
-| Component | Purpose |
-|-----------|---------|
-| `RoutingTable` | CRUD for routing rules (pattern → tag mapping) |
-| `DataGrid` | Displays parquet query results |
-| `LogViewer` | Shows job logs and details |
-| `TitleBar` | Custom window controls (minimize, maximize, close) |
+```bash
+cd tests/ui-agent
+bun run pw:headed  # Watch tests run in browser
+```
 
 ## Database Schema
 
 Main tables (SQLite):
 - `routing_rules` - Pattern matching rules for file routing
-- `topic_configs` - Plugin topic configurations
-- `jobs` - Job queue and history
+- `plugin_manifests` - Registered plugins with source code
+- `processing_jobs` - Job queue and history
+- `plugin_environments` - Cached lockfiles for venv management
 
-## Environment Variables
+## CLI Commands
 
-- `CASPARIAN_DATABASE` - SQLite connection string (e.g., `sqlite:///path/to/db.sqlite3`)
+```bash
+# Start sentinel
+./target/release/casparian start --database sqlite://db.sqlite3
+
+# Worker mode
+./target/release/casparian worker --connect tcp://localhost:5555
+```

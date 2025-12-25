@@ -154,19 +154,15 @@ INSERT INTO cf_plugin_manifest (plugin_name, version, source_code, source_hash, 
 VALUES (
     'slow_processor',
     '1.0.0',
-    '# See demo/plugins/slow_processor.py for full source
-# This is a placeholder - actual code loaded from file system
+    '"""Slow Processor - Demo plugin that processes files with delays."""
 import time
 import pandas as pd
-import pyarrow as pa
-from casparian_flow.sdk import BasePlugin, PluginMetadata
 
-MANIFEST = PluginMetadata(
-    pattern="demo/data/*.csv",
-    topic="processed_output",
-)
+class Handler:
+    def configure(self, context, config):
+        self.context = context
+        self.handle = context.register_topic("processed_output")
 
-class Handler(BasePlugin):
     def execute(self, file_path: str):
         batch_size = 5
         delay_seconds = 1.5
@@ -180,7 +176,11 @@ class Handler(BasePlugin):
             time.sleep(delay_seconds)
             batch_df["_batch"] = batch_number
             batch_df["_processed_at"] = pd.Timestamp.now().isoformat()
-            yield pa.Table.from_pandas(batch_df)
+            self.context.publish(self.handle, batch_df)
+            print(f"[slow_processor] Batch {batch_number} done, {len(batch_df)} rows")
+
+        print(f"[slow_processor] Complete: {total_rows} rows in {batch_number} batches")
+        return None
 ',
     'slow_processor_demo_hash_v1',
     'ACTIVE',
@@ -205,29 +205,31 @@ INSERT INTO cf_plugin_subscriptions (plugin_name, topic_name, is_active)
 VALUES
     ('data_validator', 'slow_processor:processed_output', 1);
 
--- Queue jobs for processing (will be processed by the worker)
+-- Pre-completed jobs with output files (for immediate Data tab testing)
+-- These get IDs 1-4 automatically
+INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, end_time, result_summary)
+VALUES
+    (1, 'slow_processor', 'COMPLETED', 0, datetime('now', '-5 minutes'), 'DEMO_DIR/output/processed_output.parquet'),
+    (1, 'data_validator', 'COMPLETED', 0, datetime('now', '-3 minutes'), 'DEMO_DIR/output/validated.parquet'),
+    (1, 'data_validator', 'COMPLETED', 0, datetime('now', '-2 minutes'), 'DEMO_DIR/output/errors.parquet'),
+    (1, 'simple_transform', 'COMPLETED', 0, datetime('now', '-1 minutes'), 'DEMO_DIR/output/mixed_types.parquet');
+
+-- Pre-failed job for testing error display (ID 5)
+INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, end_time, error_message)
+VALUES
+    (1, 'broken_plugin', 'FAILED', 0, datetime('now', '-30 seconds'), 'ModuleNotFoundError: No module named ''pandas''');
+
+-- Queue jobs for processing (IDs 6, 7, 8 - will be processed by the worker)
 INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority)
 VALUES
     (1, 'slow_processor', 'QUEUED', 10),
     (1, 'slow_processor', 'QUEUED', 5),
     (1, 'slow_processor', 'QUEUED', 1);
 
--- Pre-completed jobs with output files (for immediate Data tab testing)
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority, end_time, result_summary)
-VALUES
-    (100, 1, 'slow_processor', 'COMPLETED', 0, datetime('now', '-5 minutes'), 'DEMO_DIR/output/processed_output.parquet'),
-    (101, 1, 'data_validator', 'COMPLETED', 0, datetime('now', '-3 minutes'), 'DEMO_DIR/output/validated.parquet'),
-    (102, 1, 'data_validator', 'COMPLETED', 0, datetime('now', '-2 minutes'), 'DEMO_DIR/output/errors.parquet'),
-    (103, 1, 'simple_transform', 'COMPLETED', 0, datetime('now', '-1 minutes'), 'DEMO_DIR/output/mixed_types.parquet');
-
--- Pre-failed job for testing error display
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority, end_time, error_message)
-VALUES
-    (104, 1, 'broken_plugin', 'FAILED', 0, datetime('now', '-30 seconds'), 'ModuleNotFoundError: No module named ''pandas''');
-
 -- Sample logs for demo jobs (Glass Box feature)
+-- Job IDs: 1=slow_processor, 2=data_validator, 5=broken_plugin
 INSERT INTO cf_job_logs (job_id, log_text) VALUES
-(100, '[INFO] Plugin execution started
+(1, '[INFO] Plugin execution started
 [STDOUT] Processing file: sample_data.csv
 [STDOUT] Reading 25 rows...
 [DEBUG] Batch 1: 5 rows processed
@@ -237,12 +239,12 @@ INSERT INTO cf_job_logs (job_id, log_text) VALUES
 [DEBUG] Batch 5: 5 rows processed
 [INFO] Total rows processed: 25
 [INFO] Plugin execution completed: {''rows_published'': 25, ''status'': ''SUCCESS''}'),
-(101, '[INFO] Plugin execution started
+(2, '[INFO] Plugin execution started
 [STDOUT] Validating data from processed_output.parquet
 [INFO] Schema validation passed
 [INFO] Data quality checks passed
 [INFO] Plugin execution completed: {''rows_published'': 25, ''status'': ''SUCCESS''}'),
-(104, '[INFO] Plugin execution started
+(5, '[INFO] Plugin execution started
 [STDERR] WARNING: Missing optional dependency
 [ERROR] Plugin execution failed: ModuleNotFoundError: No module named ''pandas''
 Traceback (most recent call last):

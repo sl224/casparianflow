@@ -62,8 +62,8 @@ class SystemStore {
   constructor() {
     // Defer initialization to avoid issues with SSR/module loading
     if (typeof window !== "undefined") {
-      // Use setTimeout to ensure Tauri is ready
-      setTimeout(() => this.init(), 100);
+      // Initialize immediately - waitForTauri in tauri.ts handles timing
+      this.init();
     }
   }
 
