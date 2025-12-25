@@ -33,16 +33,119 @@ const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEADER_SIZE: usize = 4;
 const END_OF_STREAM: u32 = 0;
 const ERROR_SIGNAL: u32 = 0xFFFF_FFFF;
+const LOG_SIGNAL: u32 = 0xFFFF_FFFE;  // Sideband logging signal
+
+/// Log levels (must match Python bridge_shim.py)
+#[allow(dead_code)]
+mod log_level {
+    pub const STDOUT: u8 = 0;
+    pub const STDERR: u8 = 1;
+    pub const DEBUG: u8 = 2;
+    pub const INFO: u8 = 3;
+    pub const WARNING: u8 = 4;
+    pub const ERROR: u8 = 5;
+}
 
 /// Maximum size for error messages from guest (1 MB)
 /// Prevents OOM from malicious or buggy guest processes
 const MAX_ERROR_MESSAGE_SIZE: u32 = 1024 * 1024;
+
+/// Maximum log file size (10 MB) - prevents disk exhaustion
+const MAX_LOG_FILE_SIZE: usize = 10 * 1024 * 1024;
 
 /// Timeout for Python guest to connect to Unix socket
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for read operations on the socket
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Streaming log writer that writes to a temp file with size cap.
+/// Memory usage is O(1) regardless of log volume - key for preventing OOM.
+struct JobLogWriter {
+    writer: std::io::BufWriter<std::fs::File>,
+    path: PathBuf,
+    bytes_written: usize,
+    truncated: bool,
+}
+
+impl JobLogWriter {
+    /// Create a new log writer for the given job.
+    /// Creates the log directory if needed.
+    fn new(job_id: u64) -> Result<Self> {
+        let log_dir = PathBuf::from("/tmp/casparian_logs");
+        std::fs::create_dir_all(&log_dir)
+            .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+
+        let path = log_dir.join(format!("{}.log", job_id));
+        let file = std::fs::File::create(&path)
+            .with_context(|| format!("Failed to create log file: {}", path.display()))?;
+
+        Ok(Self {
+            writer: std::io::BufWriter::with_capacity(8192, file),
+            path,
+            bytes_written: 0,
+            truncated: false,
+        })
+    }
+
+    /// Write a log line with level prefix.
+    /// Returns silently if file is truncated (over limit).
+    fn write_log(&mut self, level: u8, message: &str) {
+        if self.truncated {
+            return;
+        }
+
+        // Check if we would exceed limit
+        let prefix = match level {
+            log_level::STDOUT => "[STDOUT] ",
+            log_level::STDERR => "[STDERR] ",
+            log_level::DEBUG => "[DEBUG] ",
+            log_level::INFO => "[INFO] ",
+            log_level::WARNING => "[WARN] ",
+            log_level::ERROR => "[ERROR] ",
+            _ => "[LOG] ",
+        };
+
+        let line = format!("{}{}\n", prefix, message);
+        let line_bytes = line.as_bytes();
+
+        if self.bytes_written + line_bytes.len() > MAX_LOG_FILE_SIZE {
+            // Write truncation notice and stop
+            let notice = "\n[SYSTEM] Log truncated (exceeded 10MB limit)\n";
+            let _ = self.writer.write_all(notice.as_bytes());
+            self.truncated = true;
+            return;
+        }
+
+        if let Err(e) = self.writer.write_all(line_bytes) {
+            warn!("Failed to write log line: {}", e);
+            return;
+        }
+
+        self.bytes_written += line_bytes.len();
+    }
+
+    /// Flush and close the log file, returning the path.
+    fn finish(mut self) -> Result<PathBuf> {
+        self.writer.flush()
+            .with_context(|| format!("Failed to flush log file: {}", self.path.display()))?;
+        debug!("Log file closed: {} ({} bytes)", self.path.display(), self.bytes_written);
+        Ok(self.path)
+    }
+
+    /// Read the log file contents and delete the file.
+    /// Returns the log text (capped at 10MB).
+    fn read_and_cleanup(self) -> Result<String> {
+        let path = self.finish()?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read log file: {}", path.display()))?;
+
+        // Delete temp file
+        let _ = std::fs::remove_file(&path);
+
+        Ok(content)
+    }
+}
 
 /// Bridge execution configuration (plain data, no behavior)
 pub struct BridgeConfig {
@@ -54,9 +157,19 @@ pub struct BridgeConfig {
     pub shim_path: PathBuf,
 }
 
+/// Result of bridge execution including data and logs
+pub struct BridgeResult {
+    /// Arrow record batches produced by the plugin
+    pub batches: Vec<RecordBatch>,
+    /// Captured logs from the plugin (stdout, stderr, logging)
+    /// This is O(1) memory during execution but loaded at end (capped at 10MB)
+    pub logs: String,
+}
+
 /// Execute a bridge job. This is the only public entry point.
 /// Runs blocking I/O in a separate thread pool.
-pub async fn execute_bridge(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
+/// Returns both the data batches and captured logs.
+pub async fn execute_bridge(config: BridgeConfig) -> Result<BridgeResult> {
     // Move all blocking work to spawn_blocking
     tokio::task::spawn_blocking(move || execute_bridge_sync(config))
         .await
@@ -64,12 +177,16 @@ pub async fn execute_bridge(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
 }
 
 /// Synchronous bridge execution - no async lies here
-fn execute_bridge_sync(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
+fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     let job_id = config.job_id;
     let socket_path = format!("/tmp/bridge_{}.sock", job_id);
 
     // Cleanup stale socket (TOCTOU is acceptable here - worst case we fail to bind)
     let _ = std::fs::remove_file(&socket_path);
+
+    // Create log writer for sideband logging (streams to disk, not RAM)
+    let mut log_writer = JobLogWriter::new(job_id)
+        .with_context(|| format!("[Job {}] Failed to create log writer", job_id))?;
 
     // Create socket and spawn process
     let listener = UnixListener::bind(&socket_path)
@@ -90,8 +207,11 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
 
             if !stderr_output.is_empty() {
                 error!("[Job {}] Guest stderr before connection failure:\n{}", job_id, stderr_output);
+                log_writer.write_log(log_level::STDERR, &stderr_output);
             }
-            return Err(e);
+            // Still return the logs even on failure
+            let logs = log_writer.read_and_cleanup().unwrap_or_default();
+            return Err(e.context(format!("Logs:\n{}", logs)));
         }
     };
 
@@ -101,8 +221,8 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
     stream.set_read_timeout(Some(READ_TIMEOUT))
         .with_context(|| format!("[Job {}] Failed to set read timeout on socket", job_id))?;
 
-    // Read all batches
-    let batches = match read_arrow_batches(&mut stream, job_id) {
+    // Read all batches (log_writer receives sideband log messages)
+    let batches = match read_arrow_batches(&mut stream, job_id, &mut log_writer) {
         Ok(batches) => batches,
         Err(e) => {
             let stderr_output = collect_stderr(&mut process);
@@ -110,8 +230,10 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
 
             if !stderr_output.is_empty() {
                 error!("[Job {}] Guest stderr during read failure:\n{}", job_id, stderr_output);
+                log_writer.write_log(log_level::STDERR, &stderr_output);
             }
-            return Err(e);
+            let logs = log_writer.read_and_cleanup().unwrap_or_default();
+            return Err(e.context(format!("Logs:\n{}", logs)));
         }
     };
 
@@ -128,26 +250,36 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<Vec<RecordBatch>> {
 
         if !stderr_output.is_empty() {
             error!("[Job {}] Guest stderr:\n{}", job_id, stderr_output);
+            log_writer.write_log(log_level::STDERR, &stderr_output);
         }
+        let logs = log_writer.read_and_cleanup().unwrap_or_default();
         anyhow::bail!(
-            "[Job {}] Guest process (pid={}) exited with {}: {}",
+            "[Job {}] Guest process (pid={}) exited with {}: {}\n\nLogs:\n{}",
             job_id,
             process_pid,
             status,
-            if stderr_output.is_empty() { "(no stderr output)" } else { &stderr_output }
+            if stderr_output.is_empty() { "(no stderr output)" } else { &stderr_output },
+            logs
         );
     }
 
-    // Log warnings from stderr even on success
+    // Log warnings from stderr even on success (append to sideband logs)
     if !stderr_output.is_empty() {
         warn!("[Job {}] Guest stderr (process succeeded but had output):\n{}", job_id, stderr_output);
+        log_writer.write_log(log_level::STDERR, &stderr_output);
     }
 
     // Cleanup
     let _ = std::fs::remove_file(&socket_path);
 
-    info!("[Job {}] Bridge execution complete: {} batches", job_id, batches.len());
-    Ok(batches)
+    // Read and cleanup log file
+    let logs = log_writer.read_and_cleanup()
+        .with_context(|| format!("[Job {}] Failed to read logs", job_id))?;
+
+    info!("[Job {}] Bridge execution complete: {} batches, {} bytes logs",
+          job_id, batches.len(), logs.len());
+
+    Ok(BridgeResult { batches, logs })
 }
 
 /// Accept a connection with timeout, checking if process is still alive
@@ -303,13 +435,15 @@ fn spawn_guest(config: &BridgeConfig, socket_path: &str) -> Result<Child> {
     Ok(child)
 }
 
-/// Read Arrow IPC batches from socket stream
+/// Read Arrow IPC batches from socket stream, handling sideband log messages
 fn read_arrow_batches(
     stream: &mut std::os::unix::net::UnixStream,
     job_id: u64,
+    log_writer: &mut JobLogWriter,
 ) -> Result<Vec<RecordBatch>> {
     let mut batches = Vec::new();
     let mut batch_count = 0u32;
+    let mut log_count = 0u32;
 
     loop {
         // Read 4-byte header
@@ -346,7 +480,8 @@ fn read_arrow_batches(
 
         // End of stream signal
         if length == END_OF_STREAM {
-            debug!("[Job {}] Received end-of-stream signal after {} batches", job_id, batch_count);
+            debug!("[Job {}] Received end-of-stream signal after {} batches, {} logs",
+                   job_id, batch_count, log_count);
             break;
         }
 
@@ -354,6 +489,13 @@ fn read_arrow_batches(
         if length == ERROR_SIGNAL {
             let error_msg = read_error_message(stream, job_id)?;
             anyhow::bail!("[Job {}] Guest process error: {}", job_id, error_msg);
+        }
+
+        // Log signal - sideband logging from Python
+        if length == LOG_SIGNAL {
+            read_and_write_log(stream, job_id, log_writer)?;
+            log_count += 1;
+            continue;  // Don't treat as data batch
         }
 
         // Sanity check on payload size (max 100MB per batch to prevent OOM)
@@ -400,6 +542,48 @@ fn read_arrow_batches(
     }
 
     Ok(batches)
+}
+
+/// Read a log message from the socket and write to the log file.
+/// Protocol: [LEVEL:1][LENGTH:4][MESSAGE]
+fn read_and_write_log(
+    stream: &mut std::os::unix::net::UnixStream,
+    job_id: u64,
+    log_writer: &mut JobLogWriter,
+) -> Result<()> {
+    // Read 1-byte log level
+    let mut level_buf = [0u8; 1];
+    stream.read_exact(&mut level_buf)
+        .with_context(|| format!("[Job {}] Failed to read log level", job_id))?;
+    let level = level_buf[0];
+
+    // Read 4-byte message length
+    let mut len_buf = [0u8; HEADER_SIZE];
+    stream.read_exact(&mut len_buf)
+        .with_context(|| format!("[Job {}] Failed to read log message length", job_id))?;
+    let msg_len = u32::from_be_bytes(len_buf);
+
+    // Enforce size limit (64KB per message - same as Python side)
+    const MAX_LOG_MESSAGE: u32 = 65536;
+    if msg_len > MAX_LOG_MESSAGE {
+        anyhow::bail!(
+            "[Job {}] Log message size {} bytes exceeds maximum {} bytes",
+            job_id, msg_len, MAX_LOG_MESSAGE
+        );
+    }
+
+    // Read message bytes
+    let mut msg_buf = vec![0u8; msg_len as usize];
+    stream.read_exact(&mut msg_buf)
+        .with_context(|| format!("[Job {}] Failed to read log message body", job_id))?;
+
+    // Convert to string (lossy for invalid UTF-8)
+    let message = String::from_utf8_lossy(&msg_buf);
+
+    // Write to log file (O(1) memory - streams to disk)
+    log_writer.write_log(level, &message);
+
+    Ok(())
 }
 
 /// Read error message after ERROR_SIGNAL with size limit
@@ -599,9 +783,23 @@ mod tests {
     }
 
     #[test]
-    fn test_error_signal_constant() {
+    fn test_protocol_constants() {
         assert_eq!(ERROR_SIGNAL, 0xFFFFFFFF);
+        assert_eq!(LOG_SIGNAL, 0xFFFFFFFE);
         assert_eq!(END_OF_STREAM, 0);
+        // LOG_SIGNAL must be distinct from ERROR_SIGNAL and valid data lengths
+        assert_ne!(LOG_SIGNAL, ERROR_SIGNAL);
+        assert!(LOG_SIGNAL > 100 * 1024 * 1024); // Greater than max batch size
+    }
+
+    #[test]
+    fn test_log_levels() {
+        assert_eq!(log_level::STDOUT, 0);
+        assert_eq!(log_level::STDERR, 1);
+        assert_eq!(log_level::DEBUG, 2);
+        assert_eq!(log_level::INFO, 3);
+        assert_eq!(log_level::WARNING, 4);
+        assert_eq!(log_level::ERROR, 5);
     }
 
     #[test]

@@ -2,7 +2,7 @@
  * Jobs Store - Completed job outputs and data querying
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "$lib/tauri";
 
 /** Job output from backend */
 export interface JobOutput {
@@ -21,6 +21,21 @@ export interface QueryResult {
   executionTimeMs: number;
 }
 
+/** Detailed job information for LogViewer */
+export interface JobDetails {
+  jobId: number;
+  pluginName: string;
+  status: string;
+  outputPath: string | null;
+  errorMessage: string | null;
+  resultSummary: string | null;
+  claimTime: string | null;
+  endTime: string | null;
+  retryCount: number;
+  /** Captured logs (stdout, stderr, logging) from plugin execution */
+  logs: string | null;
+}
+
 /** Reactive jobs store */
 class JobsStore {
   // List of completed jobs
@@ -28,6 +43,12 @@ class JobsStore {
 
   // Current query result
   queryResult = $state<QueryResult | null>(null);
+
+  // Job details for LogViewer
+  selectedJob = $state<JobOutput | null>(null);
+  jobDetails = $state<JobDetails | null>(null);
+  loadingDetails = $state(false);
+  detailsError = $state<string | null>(null);
 
   // Loading states
   loadingJobs = $state(false);
@@ -96,9 +117,41 @@ class JobsStore {
     this.queryError = null;
   }
 
+  /** Select a job and fetch its details for LogViewer */
+  async selectJob(job: JobOutput): Promise<void> {
+    this.selectedJob = job;
+    this.loadingDetails = true;
+    this.detailsError = null;
+
+    try {
+      this.jobDetails = await invoke<JobDetails>("get_job_details", {
+        jobId: job.jobId,
+      });
+      console.log("[JobsStore] Loaded details for job", job.jobId);
+    } catch (err) {
+      this.detailsError = err instanceof Error ? err.message : String(err);
+      this.jobDetails = null;
+      console.error("[JobsStore] Failed to load job details:", this.detailsError);
+    } finally {
+      this.loadingDetails = false;
+    }
+  }
+
+  /** Close the job details view */
+  closeJobDetails(): void {
+    this.selectedJob = null;
+    this.jobDetails = null;
+    this.detailsError = null;
+  }
+
   /** Get jobs that have queryable output files */
   get queryableJobs(): JobOutput[] {
     return this.jobs.filter(j => j.outputPath !== null);
+  }
+
+  /** Check if a job is failed */
+  isJobFailed(job: JobOutput): boolean {
+    return job.status === "FAILED";
   }
 }
 

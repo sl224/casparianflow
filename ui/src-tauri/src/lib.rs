@@ -87,6 +87,10 @@ pub struct TopologyNode {
     pub node_type: String, // "plugin" or "topic"
     pub status: Option<String>,
     pub metadata: HashMap<String, String>,
+    /// X position for layout (calculated by backend)
+    pub x: f64,
+    /// Y position for layout (calculated by backend)
+    pub y: f64,
 }
 
 /// An edge connecting nodes in the pipeline
@@ -131,6 +135,50 @@ pub struct JobOutput {
     pub status: String,
     pub output_path: Option<String>,
     pub completed_at: Option<String>,
+}
+
+/// Detailed job information including logs/errors
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobDetails {
+    pub job_id: i32,
+    pub plugin_name: String,
+    pub status: String,
+    pub output_path: Option<String>,
+    pub error_message: Option<String>,
+    pub result_summary: Option<String>,
+    pub claim_time: Option<String>,
+    pub end_time: Option<String>,
+    pub retry_count: i32,
+    /// Captured logs (stdout, stderr, logging) from plugin execution
+    pub logs: Option<String>,
+}
+
+// ============================================================================
+// Routing & Configuration Types
+// ============================================================================
+
+/// A routing rule that maps file patterns to tags
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingRule {
+    pub id: i32,
+    pub pattern: String,
+    pub tag: String,
+    pub priority: i32,
+    pub enabled: bool,
+    pub description: Option<String>,
+}
+
+/// Topic configuration for plugin outputs
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicConfig {
+    pub id: i32,
+    pub plugin_name: String,
+    pub topic_name: String,
+    pub uri: String,
+    pub mode: String,
 }
 
 /// Sentinel state managed by Tauri
@@ -213,12 +261,19 @@ async fn get_topology(state: tauri::State<'_, SentinelState>) -> Result<Pipeline
     .await
     .map_err(|e| format!("Failed to query subscriptions: {}", e))?;
 
-    // Build nodes
+    // Build nodes with layout positions
+    // Layout: Plugins on left (x=100), Topics on right (x=500)
+    // Vertical spacing: 120px between nodes
+    const PLUGIN_X: f64 = 100.0;
+    const TOPIC_X: f64 = 500.0;
+    const VERTICAL_SPACING: f64 = 120.0;
+    const START_Y: f64 = 50.0;
+
     let mut nodes = Vec::new();
     let mut topic_owners: HashMap<String, String> = HashMap::new();
 
-    // Plugin nodes
-    for (name, tags, _params) in &plugins {
+    // Plugin nodes (left column)
+    for (idx, (name, tags, _params)) in plugins.iter().enumerate() {
         let mut metadata = HashMap::new();
         metadata.insert("tags".to_string(), tags.clone());
 
@@ -228,11 +283,13 @@ async fn get_topology(state: tauri::State<'_, SentinelState>) -> Result<Pipeline
             node_type: "plugin".to_string(),
             status: Some("active".to_string()),
             metadata,
+            x: PLUGIN_X,
+            y: START_Y + (idx as f64 * VERTICAL_SPACING),
         });
     }
 
-    // Topic nodes
-    for (_id, plugin_name, topic_name, uri, mode) in &topics {
+    // Topic nodes (right column)
+    for (idx, (_id, plugin_name, topic_name, uri, mode)) in topics.iter().enumerate() {
         let mut metadata = HashMap::new();
         metadata.insert("uri".to_string(), uri.clone());
         metadata.insert("mode".to_string(), mode.clone());
@@ -247,6 +304,8 @@ async fn get_topology(state: tauri::State<'_, SentinelState>) -> Result<Pipeline
             node_type: "topic".to_string(),
             status: None,
             metadata,
+            x: TOPIC_X,
+            y: START_Y + (idx as f64 * VERTICAL_SPACING),
         });
     }
 
@@ -298,7 +357,7 @@ async fn get_topology(state: tauri::State<'_, SentinelState>) -> Result<Pipeline
     Ok(PipelineTopology { nodes, edges })
 }
 
-/// Get list of completed jobs with their outputs
+/// Get list of completed and failed jobs with their outputs
 #[tauri::command]
 async fn get_job_outputs(
     state: tauri::State<'_, SentinelState>,
@@ -309,11 +368,12 @@ async fn get_job_outputs(
 
     let limit = limit.unwrap_or(50);
 
+    // Include both completed and failed jobs so users can debug failures
     let jobs: Vec<(i32, String, String, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
         SELECT id, plugin_name, status, result_summary, end_time
         FROM cf_processing_queue
-        WHERE status = 'COMPLETED'
+        WHERE status IN ('COMPLETED', 'FAILED')
         ORDER BY end_time DESC
         LIMIT ?
         "#,
@@ -346,6 +406,235 @@ async fn get_job_outputs(
             }
         })
         .collect())
+}
+
+/// Get detailed information for a specific job (for LogViewer)
+#[tauri::command]
+async fn get_job_details(
+    state: tauri::State<'_, SentinelState>,
+    job_id: i32,
+) -> Result<JobDetails, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    // Query job details from processing queue
+    let job: (i32, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, i32) = sqlx::query_as(
+        r#"
+        SELECT id, plugin_name, status, result_summary, error_message,
+               result_summary, claim_time, end_time, retry_count
+        FROM cf_processing_queue
+        WHERE id = ?
+        "#,
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("Job not found: {}", e))?;
+
+    // Query logs from cold storage table (separate from hot queue)
+    let logs: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT log_text
+        FROM cf_job_logs
+        WHERE job_id = ?
+        "#,
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to query logs: {}", e))?
+    .flatten();
+
+    // Extract output path from result_summary if it's a file path
+    let output_path = job.3
+        .as_ref()
+        .and_then(|s| {
+            if s.ends_with(".parquet") || s.ends_with(".csv") || s.ends_with(".json") {
+                Some(s.clone())
+            } else {
+                None
+            }
+        });
+
+    Ok(JobDetails {
+        job_id: job.0,
+        plugin_name: job.1,
+        status: job.2,
+        output_path,
+        error_message: job.4,
+        result_summary: job.5,
+        claim_time: job.6,
+        end_time: job.7,
+        retry_count: job.8,
+        logs,
+    })
+}
+
+// ============================================================================
+// Routing Rules CRUD Commands
+// ============================================================================
+
+/// Get all routing rules
+#[tauri::command]
+async fn get_routing_rules(
+    state: tauri::State<'_, SentinelState>,
+) -> Result<Vec<RoutingRule>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let rules: Vec<(i32, String, String, i32, i32, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT id, pattern, tag, priority, enabled, description
+        FROM cf_routing_rules
+        ORDER BY priority DESC, id
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to query routing rules: {}", e))?;
+
+    Ok(rules
+        .into_iter()
+        .map(|(id, pattern, tag, priority, enabled, description)| RoutingRule {
+            id,
+            pattern,
+            tag,
+            priority,
+            enabled: enabled != 0,
+            description,
+        })
+        .collect())
+}
+
+/// Create a new routing rule
+#[tauri::command]
+async fn create_routing_rule(
+    state: tauri::State<'_, SentinelState>,
+    pattern: String,
+    tag: String,
+    priority: i32,
+    description: Option<String>,
+) -> Result<i32, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO cf_routing_rules (pattern, tag, priority, enabled, description)
+        VALUES (?, ?, ?, 1, ?)
+        "#,
+    )
+    .bind(&pattern)
+    .bind(&tag)
+    .bind(priority)
+    .bind(&description)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to create routing rule: {}", e))?;
+
+    Ok(result.last_insert_rowid() as i32)
+}
+
+/// Update an existing routing rule
+#[tauri::command]
+async fn update_routing_rule(
+    state: tauri::State<'_, SentinelState>,
+    rule: RoutingRule,
+) -> Result<(), String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    sqlx::query(
+        r#"
+        UPDATE cf_routing_rules
+        SET pattern = ?, tag = ?, priority = ?, enabled = ?, description = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(&rule.pattern)
+    .bind(&rule.tag)
+    .bind(rule.priority)
+    .bind(if rule.enabled { 1 } else { 0 })
+    .bind(&rule.description)
+    .bind(rule.id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to update routing rule: {}", e))?;
+
+    Ok(())
+}
+
+/// Delete a routing rule
+#[tauri::command]
+async fn delete_routing_rule(
+    state: tauri::State<'_, SentinelState>,
+    id: i32,
+) -> Result<(), String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    sqlx::query("DELETE FROM cf_routing_rules WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to delete routing rule: {}", e))?;
+
+    Ok(())
+}
+
+// ============================================================================
+// Topic Configuration Commands
+// ============================================================================
+
+/// Get all topic configurations
+#[tauri::command]
+async fn get_topic_configs(
+    state: tauri::State<'_, SentinelState>,
+) -> Result<Vec<TopicConfig>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let topics: Vec<(i32, String, String, String, String)> = sqlx::query_as(
+        r#"
+        SELECT id, plugin_name, topic_name, uri, mode
+        FROM cf_topic_config
+        ORDER BY plugin_name, topic_name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to query topic configs: {}", e))?;
+
+    Ok(topics
+        .into_iter()
+        .map(|(id, plugin_name, topic_name, uri, mode)| TopicConfig {
+            id,
+            plugin_name,
+            topic_name,
+            uri,
+            mode,
+        })
+        .collect())
+}
+
+/// Update a topic's URI
+#[tauri::command]
+async fn update_topic_uri(
+    state: tauri::State<'_, SentinelState>,
+    id: i32,
+    uri: String,
+) -> Result<(), String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    sqlx::query("UPDATE cf_topic_config SET uri = ? WHERE id = ?")
+        .bind(&uri)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to update topic URI: {}", e))?;
+
+    Ok(())
 }
 
 /// Maximum rows to return from a query to prevent memory blowup
@@ -780,11 +1069,20 @@ pub fn run() {
             get_bind_address,
             get_topology,
             get_job_outputs,
+            get_job_details,
             query_parquet,
             read_plugin_file,
             write_plugin_file,
             list_plugins,
             deploy_plugin,
+            // Routing rules CRUD
+            get_routing_rules,
+            create_routing_rule,
+            update_routing_rule,
+            delete_routing_rule,
+            // Topic configuration
+            get_topic_configs,
+            update_topic_uri,
         ])
         .setup(move |app| {
             // Initialize database pool
@@ -959,11 +1257,15 @@ mod tests {
             node_type: "plugin".to_string(),
             status: Some("active".to_string()),
             metadata: HashMap::new(),
+            x: 100.0,
+            y: 50.0,
         };
 
         let json = serde_json::to_string(&node).unwrap();
         assert!(json.contains("\"nodeType\":\"plugin\"")); // camelCase
         assert!(json.contains("\"id\":\"plugin:test\""));
+        assert!(json.contains("\"x\":100.0"));
+        assert!(json.contains("\"y\":50.0"));
     }
 
     #[test]

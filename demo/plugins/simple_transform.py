@@ -7,15 +7,14 @@ Good for quick testing without the artificial delays of slow_processor.
 
 import pandas as pd
 import pyarrow as pa
-from casparian_flow.sdk import BasePlugin, PluginMetadata
 
-MANIFEST = PluginMetadata(
-    pattern="**/*.csv",
-    topic="transformed_output",
-)
+MANIFEST = {
+    "pattern": "**/*.csv",
+    "topic": "transformed_output",
+}
 
 
-class Handler(BasePlugin):
+class Handler:
     """Simple transformer that adds computed columns."""
 
     def execute(self, file_path: str):

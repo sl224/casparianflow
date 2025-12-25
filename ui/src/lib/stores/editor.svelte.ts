@@ -2,7 +2,7 @@
  * Editor Store - Plugin source code editing
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "$lib/tauri";
 
 /** Plugin file information */
 export interface PluginFile {
@@ -39,9 +39,10 @@ class EditorStore {
   async loadPlugins(): Promise<void> {
     // Defer plugin directory initialization to avoid race conditions on cold start
     if (!this.pluginDir) {
+      const win = window as unknown as Record<string, unknown>;
       this.pluginDir =
-        typeof window !== "undefined" && (window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__
-          ? String((window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__)
+        typeof window !== "undefined" && win.__CASPARIAN_PLUGIN_DIR__
+          ? String(win.__CASPARIAN_PLUGIN_DIR__)
           : "/Users/shan/workspace/casparianflow/demo/plugins";
     }
 

@@ -1,5 +1,7 @@
 # Bug Report: Editor Tab Freezes on Cold Start
 
+## Status: RESOLVED
+
 ## Summary
 The Editor tab in Casparian Deck UI freezes (becomes unresponsive) on **cold start only**. The same code works perfectly via **HMR (Hot Module Replacement)**.
 
@@ -62,5 +64,34 @@ Possible causes:
 5. Test with Vite's `--force` flag to bypass cache
 6. Test production build vs dev build
 
-## Workaround
-Currently none known. The freeze only happens on cold start, making development via HMR possible but production unusable.
+## Root Cause
+The `editorStore` class had a `$state` property that accessed `window` during class property initialization:
+
+```typescript
+// BAD - runs at MODULE LOAD TIME, blocks on cold start in Tauri WebView
+pluginDir = $state(
+  typeof window !== "undefined" && (window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__
+    ? String((window as Record<string, unknown>).__CASPARIAN_PLUGIN_DIR__)
+    : "/path/to/plugins"
+);
+```
+
+On cold start, Vite processes the module graph synchronously. Accessing `window` properties during Svelte 5 `$state` initialization in a Tauri WebView caused the main thread to block indefinitely.
+
+## Fix
+Defer `window` access from module initialization to runtime:
+
+```typescript
+// GOOD - initialize empty, defer window access to async method
+pluginDir = $state("");
+
+async loadPlugins(): Promise<void> {
+  if (!this.pluginDir) {
+    this.pluginDir = typeof window !== "undefined" && ...
+  }
+  // ...
+}
+```
+
+## Lesson Learned
+In Svelte 5 stores with `$state` runes, **never access `window` or browser APIs during class property initialization**. Defer such access to methods that run at runtime (e.g., inside `onMount` callbacks or async functions called after mount).
