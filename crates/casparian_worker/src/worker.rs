@@ -475,7 +475,13 @@ async fn execute_job_inner(
         shim_path: shim_path.to_path_buf(),
     };
 
-    let batches = bridge::execute_bridge(config).await?;
+    let bridge_result = bridge::execute_bridge(config).await?;
+    let batches = bridge_result.batches;
+
+    // Log the captured logs for debugging (will be stored in DB in Phase 3)
+    if !bridge_result.logs.is_empty() {
+        debug!("Job {} logs ({} bytes):\n{}", job_id, bridge_result.logs.len(), bridge_result.logs);
+    }
 
     // Write to Parquet
     let mut total_rows = 0;

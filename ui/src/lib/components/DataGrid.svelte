@@ -1,11 +1,33 @@
 <script lang="ts">
+  import { createVirtualizer, type SvelteVirtualizer } from "@tanstack/svelte-virtual";
   import { jobsStore, type QueryResult } from "$lib/stores/jobs.svelte";
+  import type { Readable } from "svelte/store";
 
   interface Props {
     result: QueryResult;
   }
 
   let { result }: Props = $props();
+
+  // Scroll container reference
+  let scrollContainer: HTMLDivElement | undefined = $state();
+
+  // Row height estimate
+  const ROW_HEIGHT = 36;
+
+  // Create virtualizer for rows - use $effect for Svelte 5 compatibility
+  let virtualizer: Readable<SvelteVirtualizer<HTMLDivElement, Element>> | undefined = $state();
+
+  $effect(() => {
+    if (scrollContainer) {
+      virtualizer = createVirtualizer<HTMLDivElement, Element>({
+        count: result.rows.length,
+        getScrollElement: () => scrollContainer!,
+        estimateSize: () => ROW_HEIGHT,
+        overscan: 10,
+      });
+    }
+  });
 
   // Format cell values for display
   function formatValue(value: unknown): string {
@@ -49,27 +71,48 @@
     </button>
   </div>
 
-  <div class="grid-wrapper">
-    <table class="data-table">
-      <thead>
-        <tr>
-          {#each result.columns as column}
-            <th>{column}</th>
-          {/each}
-        </tr>
-      </thead>
-      <tbody>
-        {#each result.rows as row}
-          <tr>
-            {#each row as cell}
-              <td class:null={isNull(cell)} class:numeric={isNumeric(cell)}>
+  <!-- Sticky column headers -->
+  <div class="column-headers">
+    {#each result.columns as column}
+      <div class="column-header">{column}</div>
+    {/each}
+  </div>
+
+  <!-- Virtualized scroll container -->
+  <div class="grid-body" bind:this={scrollContainer}>
+    {#if virtualizer && $virtualizer}
+      <div
+        class="virtual-list"
+        style="height: {$virtualizer.getTotalSize()}px; position: relative;"
+      >
+        {#each $virtualizer.getVirtualItems() as virtualRow (virtualRow.index)}
+          {@const row = result.rows[virtualRow.index]}
+          <div
+            class="virtual-row"
+            style="
+              position: absolute;
+              top: 0;
+              left: 0;
+              width: 100%;
+              height: {virtualRow.size}px;
+              transform: translateY({virtualRow.start}px);
+            "
+          >
+            {#each row as cell, colIndex}
+              <div
+                class="cell"
+                class:null={isNull(cell)}
+                class:numeric={isNumeric(cell)}
+              >
                 {formatValue(cell)}
-              </td>
+              </div>
             {/each}
-          </tr>
+          </div>
         {/each}
-      </tbody>
-    </table>
+      </div>
+    {:else}
+      <div class="loading-rows">Loading...</div>
+    {/if}
   </div>
 
   {#if jobsStore.selectedFile}
@@ -101,6 +144,7 @@
     border-bottom: 1px solid var(--color-border);
     font-family: var(--font-mono);
     font-size: 12px;
+    flex-shrink: 0;
   }
 
   .grid-info {
@@ -141,50 +185,68 @@
     color: var(--color-error);
   }
 
-  .grid-wrapper {
-    flex: 1;
-    overflow: auto;
+  /* Column headers - sticky */
+  .column-headers {
+    display: flex;
+    background: var(--color-bg-tertiary);
+    border-bottom: 1px solid var(--color-border);
+    flex-shrink: 0;
   }
 
-  .data-table {
-    width: 100%;
-    border-collapse: collapse;
+  .column-header {
+    flex: 1;
+    min-width: 120px;
+    max-width: 300px;
+    padding: 10px 12px;
     font-family: var(--font-mono);
     font-size: 12px;
-  }
-
-  .data-table th {
-    position: sticky;
-    top: 0;
-    background: var(--color-bg-tertiary);
-    padding: 10px 12px;
-    text-align: left;
     font-weight: 600;
     color: var(--color-text-primary);
-    border-bottom: 1px solid var(--color-border);
     white-space: nowrap;
-  }
-
-  .data-table td {
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--color-border);
-    color: var(--color-text-secondary);
-    max-width: 300px;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
-  .data-table tr:hover td {
+  /* Virtualized body */
+  .grid-body {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: auto;
+  }
+
+  .virtual-list {
+    width: 100%;
+  }
+
+  .virtual-row {
+    display: flex;
+    border-bottom: 1px solid var(--color-border);
+    transition: background 0.1s ease;
+  }
+
+  .virtual-row:hover {
     background: var(--color-bg-tertiary);
   }
 
-  .data-table td.null {
+  .cell {
+    flex: 1;
+    min-width: 120px;
+    max-width: 300px;
+    padding: 8px 12px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--color-text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .cell.null {
     color: var(--color-text-muted);
     font-style: italic;
   }
 
-  .data-table td.numeric {
+  .cell.numeric {
     text-align: right;
     font-variant-numeric: tabular-nums;
   }
@@ -193,11 +255,22 @@
     padding: 8px 16px;
     background: var(--color-bg-secondary);
     border-top: 1px solid var(--color-border);
+    flex-shrink: 0;
   }
 
   .file-path {
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--color-text-muted);
+  }
+
+  .loading-rows {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100px;
+    color: var(--color-text-muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
   }
 </style>

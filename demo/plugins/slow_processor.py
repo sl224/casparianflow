@@ -12,16 +12,15 @@ Watch the UI metrics update in real-time!
 import time
 import pandas as pd
 import pyarrow as pa
-from casparian_flow.sdk import BasePlugin, PluginMetadata
 
 # Plugin manifest - defines routing and output
-MANIFEST = PluginMetadata(
-    pattern="demo/data/*.csv",
-    topic="processed_output",
-)
+MANIFEST = {
+    "pattern": "demo/data/*.csv",
+    "topic": "processed_output",
+}
 
 
-class Handler(BasePlugin):
+class Handler:
     """
     Demo plugin that processes files slowly for UI testing.
 

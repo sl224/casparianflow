@@ -75,6 +75,16 @@ CREATE TABLE IF NOT EXISTS cf_processing_queue (
 
 CREATE INDEX IF NOT EXISTS ix_queue_pop ON cf_processing_queue(status, priority, id);
 
+-- Job logs table (COLD storage - separate from hot processing_queue)
+-- Only loaded on-demand when user requests job details
+-- Uses BLOB to allow future compression (gzip)
+CREATE TABLE IF NOT EXISTS cf_job_logs (
+    job_id INTEGER PRIMARY KEY,
+    log_text BLOB,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(job_id) REFERENCES cf_processing_queue(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS cf_topic_config (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_name TEXT NOT NULL,
@@ -104,6 +114,20 @@ CREATE TABLE IF NOT EXISTS cf_plugin_subscriptions (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(plugin_name, topic_name)
 );
+
+-- Routing Rules: Maps file patterns to tags
+-- Example: pattern='data/sales/*.csv' -> tag='finance'
+CREATE TABLE IF NOT EXISTS cf_routing_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    priority INTEGER DEFAULT 0,
+    enabled INTEGER DEFAULT 1,
+    description TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_routing_priority ON cf_routing_rules(priority DESC, id);
 
 -- ============================================================================
 -- Demo Data - Slow Processor Plugin
@@ -189,9 +213,51 @@ VALUES
     (1, 'slow_processor', 'QUEUED', 1);
 
 -- Pre-completed jobs with output files (for immediate Data tab testing)
-INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, end_time, result_summary)
+INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority, end_time, result_summary)
 VALUES
-    (1, 'slow_processor', 'COMPLETED', 0, datetime('now', '-5 minutes'), 'DEMO_DIR/output/processed_output.parquet'),
-    (1, 'data_validator', 'COMPLETED', 0, datetime('now', '-3 minutes'), 'DEMO_DIR/output/validated.parquet'),
-    (1, 'data_validator', 'COMPLETED', 0, datetime('now', '-2 minutes'), 'DEMO_DIR/output/errors.parquet'),
-    (1, 'simple_transform', 'COMPLETED', 0, datetime('now', '-1 minutes'), 'DEMO_DIR/output/mixed_types.parquet');
+    (100, 1, 'slow_processor', 'COMPLETED', 0, datetime('now', '-5 minutes'), 'DEMO_DIR/output/processed_output.parquet'),
+    (101, 1, 'data_validator', 'COMPLETED', 0, datetime('now', '-3 minutes'), 'DEMO_DIR/output/validated.parquet'),
+    (102, 1, 'data_validator', 'COMPLETED', 0, datetime('now', '-2 minutes'), 'DEMO_DIR/output/errors.parquet'),
+    (103, 1, 'simple_transform', 'COMPLETED', 0, datetime('now', '-1 minutes'), 'DEMO_DIR/output/mixed_types.parquet');
+
+-- Pre-failed job for testing error display
+INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority, end_time, error_message)
+VALUES
+    (104, 1, 'broken_plugin', 'FAILED', 0, datetime('now', '-30 seconds'), 'ModuleNotFoundError: No module named ''pandas''');
+
+-- Sample logs for demo jobs (Glass Box feature)
+INSERT INTO cf_job_logs (job_id, log_text) VALUES
+(100, '[INFO] Plugin execution started
+[STDOUT] Processing file: sample_data.csv
+[STDOUT] Reading 25 rows...
+[DEBUG] Batch 1: 5 rows processed
+[DEBUG] Batch 2: 5 rows processed
+[DEBUG] Batch 3: 5 rows processed
+[DEBUG] Batch 4: 5 rows processed
+[DEBUG] Batch 5: 5 rows processed
+[INFO] Total rows processed: 25
+[INFO] Plugin execution completed: {''rows_published'': 25, ''status'': ''SUCCESS''}'),
+(101, '[INFO] Plugin execution started
+[STDOUT] Validating data from processed_output.parquet
+[INFO] Schema validation passed
+[INFO] Data quality checks passed
+[INFO] Plugin execution completed: {''rows_published'': 25, ''status'': ''SUCCESS''}'),
+(104, '[INFO] Plugin execution started
+[STDERR] WARNING: Missing optional dependency
+[ERROR] Plugin execution failed: ModuleNotFoundError: No module named ''pandas''
+Traceback (most recent call last):
+  File "bridge_shim.py", line 194, in execute_plugin
+    exec(source_code, plugin_namespace)
+  File "<bridge>", line 1, in <module>
+    import pandas as pd
+ModuleNotFoundError: No module named ''pandas''');
+
+-- Demo Routing Rules (file pattern -> tag mapping)
+INSERT INTO cf_routing_rules (pattern, tag, priority, enabled, description) VALUES
+    ('data/sales/*.csv', 'finance', 100, 1, 'Sales CSV files go to finance pipeline'),
+    ('data/sales/*.xlsx', 'finance', 100, 1, 'Sales Excel files go to finance pipeline'),
+    ('data/marketing/**/*.json', 'marketing', 90, 1, 'Marketing JSON data'),
+    ('data/logs/*.log', 'logs', 50, 1, 'Application logs for analysis'),
+    ('data/raw/**/*', 'raw', 10, 1, 'Catch-all for raw data ingestion'),
+    ('**/*.parquet', 'processed', 80, 1, 'Already processed parquet files'),
+    ('data/test/*', 'test', 200, 0, 'Test data (disabled)');

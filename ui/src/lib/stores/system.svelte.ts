@@ -5,8 +5,7 @@
  * reactive state for the dashboard.
  */
 
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { listen, invoke } from "$lib/tauri";
 
 /** System pulse payload from Rust backend */
 export interface SystemPulse {

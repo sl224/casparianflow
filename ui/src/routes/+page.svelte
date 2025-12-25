@@ -1,22 +1,12 @@
 <script lang="ts">
   import { systemStore } from "$lib/stores/system.svelte";
   import { jobsStore } from "$lib/stores/jobs.svelte";
-  import { editorStore } from "$lib/stores/editor.svelte";
-  import Pipeline from "$lib/components/Pipeline.svelte";
+  import RoutingTable from "$lib/components/RoutingTable.svelte";
   import DataGrid from "$lib/components/DataGrid.svelte";
-  import CodeEditor from "$lib/components/CodeEditor.svelte";
+  import LogViewer from "$lib/components/LogViewer.svelte";
 
   // Current view tab
-  let activeTab = $state<"dashboard" | "pipeline" | "editor" | "data">("dashboard");
-
-  // Load plugins when editor tab is activated (only once)
-  let pluginsLoaded = false;
-  $effect(() => {
-    if (activeTab === "editor" && !pluginsLoaded) {
-      pluginsLoaded = true;
-      setTimeout(() => editorStore.loadPlugins(), 0);
-    }
-  });
+  let activeTab = $state<"dashboard" | "config" | "data">("dashboard");
 </script>
 
 <div class="app">
@@ -37,17 +27,10 @@
       </button>
       <button
         class="tab"
-        class:active={activeTab === "pipeline"}
-        onclick={() => (activeTab = "pipeline")}
+        class:active={activeTab === "config"}
+        onclick={() => (activeTab = "config")}
       >
-        PIPELINE
-      </button>
-      <button
-        class="tab"
-        class:active={activeTab === "editor"}
-        onclick={() => (activeTab = "editor")}
-      >
-        EDITOR
+        CONFIG
       </button>
       <button
         class="tab"
@@ -163,111 +146,10 @@
           </div>
         </section>
       </div>
-    {:else if activeTab === "pipeline"}
-      <!-- Pipeline View -->
-      <div class="pipeline-view">
-        <Pipeline />
-      </div>
-    {:else if activeTab === "editor"}
-      <!-- Editor View -->
-      <div class="editor-view">
-        <div class="editor-sidebar">
-          <h3 class="sidebar-title">PLUGINS</h3>
-          <div class="plugin-list">
-            {#if editorStore.loadingPlugins}
-              <div class="loading">Loading...</div>
-            {:else if editorStore.pluginsError}
-              <div class="error">{editorStore.pluginsError}</div>
-            {:else if editorStore.plugins.length === 0}
-              <div class="empty">No plugins found</div>
-            {:else}
-              {#each editorStore.plugins as plugin}
-                <button
-                  class="plugin-item"
-                  class:selected={editorStore.currentFile?.path === plugin.path}
-                  onclick={() => editorStore.openFile(plugin)}
-                >
-                  <span class="plugin-icon">&#128196;</span>
-                  <span class="plugin-name">{plugin.name}</span>
-                </button>
-              {/each}
-            {/if}
-          </div>
-          <button class="refresh-btn" onclick={() => editorStore.loadPlugins()}>
-            &#8635; Refresh
-          </button>
-        </div>
-        <div class="editor-main">
-          {#if editorStore.loading}
-            <div class="loading-overlay">
-              <div class="loading-spinner"></div>
-              <span>Loading...</span>
-            </div>
-          {:else if editorStore.currentFile}
-            <div class="editor-toolbar">
-              <span class="file-name">
-                {editorStore.currentFile.name}
-                {#if editorStore.hasChanges}
-                  <span class="unsaved-dot"></span>
-                {/if}
-              </span>
-              <div class="toolbar-actions">
-                {#if editorStore.hasChanges}
-                  <button class="toolbar-btn" onclick={() => editorStore.revert()}>
-                    Revert
-                  </button>
-                {/if}
-                <button
-                  class="toolbar-btn"
-                  onclick={() => editorStore.saveFile()}
-                  disabled={!editorStore.hasChanges || editorStore.saving}
-                >
-                  {editorStore.saving ? "Saving..." : "Save"}
-                </button>
-                <button
-                  class="toolbar-btn primary"
-                  onclick={() => editorStore.deployPlugin()}
-                  disabled={editorStore.deploying}
-                >
-                  {editorStore.deploying ? "Deploying..." : "Deploy"}
-                </button>
-              </div>
-            </div>
-            {#if editorStore.error}
-              <div class="editor-error">{editorStore.error}</div>
-            {/if}
-            {#if editorStore.deployResult}
-              <div class="deploy-result" class:success={editorStore.deployResult.success}>
-                <div class="deploy-header">
-                  {#if editorStore.deployResult.success}
-                    <span class="deploy-icon">&#10003;</span>
-                    <span>Deployed {editorStore.deployResult.pluginName} v{editorStore.deployResult.version}</span>
-                  {:else}
-                    <span class="deploy-icon">&#10007;</span>
-                    <span>Validation Failed</span>
-                  {/if}
-                  <button class="deploy-close" onclick={() => editorStore.clearDeployResult()}>
-                    &times;
-                  </button>
-                </div>
-                {#if !editorStore.deployResult.success}
-                  <ul class="validation-errors">
-                    {#each editorStore.deployResult.validationErrors as error}
-                      <li>{error}</li>
-                    {/each}
-                  </ul>
-                {/if}
-              </div>
-            {/if}
-            <CodeEditor />
-          {:else}
-            <div class="empty-state">
-              <span class="empty-icon">&#128221;</span>
-              <span class="empty-title">No File Open</span>
-              <span class="empty-message">Select a plugin from the sidebar to edit</span>
-            </div>
-          {/if}
-        </div>
+    {:else if activeTab === "config"}
+      <!-- Config View - Routing Rules -->
+      <div class="config-view">
+        <RoutingTable />
       </div>
     {:else if activeTab === "data"}
       <!-- Data View -->
@@ -283,14 +165,16 @@
               {#each jobsStore.jobs as job}
                 <button
                   class="job-item"
-                  class:selected={jobsStore.selectedFile === job.outputPath}
+                  class:selected={jobsStore.selectedJob?.jobId === job.jobId}
                   class:queryable={job.outputPath !== null}
-                  onclick={() => job.outputPath && jobsStore.queryFile(job.outputPath)}
-                  disabled={!job.outputPath}
+                  class:failed={job.status === "FAILED"}
+                  onclick={() => jobsStore.selectJob(job)}
                 >
                   <span class="job-name">{job.pluginName}</span>
                   <span class="job-id">#{job.jobId}</span>
-                  {#if job.outputPath}
+                  {#if job.status === "FAILED"}
+                    <span class="job-failed">&#10007;</span>
+                  {:else if job.outputPath}
                     <span class="job-output">&#9654;</span>
                   {/if}
                 </button>
@@ -315,11 +199,23 @@
             </div>
           {:else if jobsStore.queryResult}
             <DataGrid result={jobsStore.queryResult} />
+          {:else if jobsStore.loadingDetails}
+            <div class="loading-overlay">
+              <div class="loading-spinner"></div>
+              <span>Loading details...</span>
+            </div>
+          {:else if jobsStore.detailsError}
+            <div class="error-overlay">
+              <span class="error-icon">!</span>
+              <span class="error-message">{jobsStore.detailsError}</span>
+            </div>
+          {:else if jobsStore.jobDetails}
+            <LogViewer details={jobsStore.jobDetails} />
           {:else}
             <div class="empty-state">
               <span class="empty-icon">&#128202;</span>
-              <span class="empty-title">Select a Job Output</span>
-              <span class="empty-message">Click on a completed job with output to view its data</span>
+              <span class="empty-title">Select a Job</span>
+              <span class="empty-message">Click on a job to view details, errors, or query output data</span>
             </div>
           {/if}
         </div>
@@ -642,210 +538,10 @@
     color: var(--color-success);
   }
 
-  /* Pipeline View */
-  .pipeline-view {
+  /* Config View */
+  .config-view {
     height: 100%;
-  }
-
-  /* Editor View */
-  .editor-view {
-    display: flex;
-    height: 100%;
-  }
-
-  .editor-sidebar {
-    width: 240px;
-    background: var(--color-bg-secondary);
-    border-right: 1px solid var(--color-border);
-    display: flex;
-    flex-direction: column;
-  }
-
-  .plugin-list {
-    flex: 1;
-    overflow: auto;
-    padding: var(--space-sm);
-  }
-
-  .plugin-item {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-    width: 100%;
-    padding: var(--space-sm) var(--space-md);
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--color-text-secondary);
-    cursor: pointer;
-    text-align: left;
-    transition: all 0.15s ease;
-  }
-
-  .plugin-item:hover {
-    background: var(--color-bg-tertiary);
-    border-color: var(--color-border);
-  }
-
-  .plugin-item.selected {
-    background: var(--color-bg-tertiary);
-    border-color: var(--color-accent-cyan);
-    color: var(--color-text-primary);
-  }
-
-  .plugin-icon {
-    font-size: 14px;
-  }
-
-  .plugin-name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .editor-main {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .editor-toolbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: var(--space-sm) var(--space-md);
-    background: var(--color-bg-secondary);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  .file-name {
-    font-family: var(--font-mono);
-    font-size: 13px;
-    color: var(--color-text-primary);
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-  }
-
-  .unsaved-dot {
-    width: 8px;
-    height: 8px;
-    background: var(--color-warning);
-    border-radius: 50%;
-  }
-
-  .toolbar-actions {
-    display: flex;
-    gap: var(--space-sm);
-  }
-
-  .toolbar-btn {
-    padding: 6px 12px;
-    background: var(--color-bg-tertiary);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-sm);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--color-text-secondary);
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-
-  .toolbar-btn:hover:not(:disabled) {
-    border-color: var(--color-accent-cyan);
-    color: var(--color-accent-cyan);
-  }
-
-  .toolbar-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .toolbar-btn.primary {
-    background: var(--color-accent-cyan);
-    border-color: var(--color-accent-cyan);
-    color: var(--color-bg-primary);
-  }
-
-  .toolbar-btn.primary:hover:not(:disabled) {
-    background: transparent;
-    color: var(--color-accent-cyan);
-  }
-
-  .editor-error {
-    padding: var(--space-sm) var(--space-md);
-    background: rgba(255, 51, 85, 0.1);
-    border-bottom: 1px solid var(--color-error);
-    font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--color-error);
-  }
-
-  .deploy-result {
-    padding: var(--space-sm) var(--space-md);
-    background: rgba(255, 51, 85, 0.1);
-    border-bottom: 1px solid var(--color-error);
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-
-  .deploy-result.success {
-    background: rgba(0, 255, 136, 0.1);
-    border-color: var(--color-success);
-  }
-
-  .deploy-header {
-    display: flex;
-    align-items: center;
-    gap: var(--space-sm);
-  }
-
-  .deploy-icon {
-    font-size: 14px;
-  }
-
-  .deploy-result.success .deploy-icon {
-    color: var(--color-success);
-  }
-
-  .deploy-result:not(.success) .deploy-icon {
-    color: var(--color-error);
-  }
-
-  .deploy-result.success .deploy-header span {
-    color: var(--color-success);
-  }
-
-  .deploy-result:not(.success) .deploy-header span {
-    color: var(--color-error);
-  }
-
-  .deploy-close {
-    margin-left: auto;
-    background: transparent;
-    border: none;
-    color: var(--color-text-muted);
-    cursor: pointer;
-    font-size: 16px;
-    padding: 0 4px;
-  }
-
-  .deploy-close:hover {
-    color: var(--color-text-primary);
-  }
-
-  .validation-errors {
-    margin: var(--space-sm) 0 0;
-    padding-left: var(--space-lg);
-    color: var(--color-error);
-  }
-
-  .validation-errors li {
-    margin: var(--space-xs) 0;
+    padding: var(--space-lg);
   }
 
   /* Data View */
@@ -930,6 +626,20 @@
   .job-output {
     color: var(--color-accent-green);
     font-size: 10px;
+  }
+
+  .job-failed {
+    color: var(--color-error);
+    font-size: 10px;
+    font-weight: bold;
+  }
+
+  .job-item.failed {
+    border-left: 2px solid var(--color-error);
+  }
+
+  .job-item.failed .job-name {
+    color: var(--color-error);
   }
 
   .refresh-btn {

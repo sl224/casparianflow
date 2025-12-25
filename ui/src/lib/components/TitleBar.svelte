@@ -1,23 +1,28 @@
 <script lang="ts">
-  import { getCurrentWindow } from "@tauri-apps/api/window";
-
-  const appWindow = getCurrentWindow();
+  import { getCurrentWindow, isTauri } from "$lib/tauri";
 
   async function minimize() {
-    await appWindow.minimize();
+    const win = await getCurrentWindow();
+    await win.minimize();
   }
 
   async function toggleMaximize() {
-    const isMaximized = await appWindow.isMaximized();
-    if (isMaximized) {
-      await appWindow.unmaximize();
+    const win = await getCurrentWindow();
+    if (isTauri) {
+      const isMaximized = await (win as any).isMaximized();
+      if (isMaximized) {
+        await (win as any).unmaximize();
+      } else {
+        await (win as any).maximize();
+      }
     } else {
-      await appWindow.maximize();
+      await win.toggleMaximize();
     }
   }
 
   async function close() {
-    await appWindow.close();
+    const win = await getCurrentWindow();
+    await win.close();
   }
 </script>
 

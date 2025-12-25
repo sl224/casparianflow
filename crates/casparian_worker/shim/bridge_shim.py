@@ -58,11 +58,103 @@ logger = logging.getLogger(__name__)
 # Special messages:
 #   LENGTH=0: End of stream
 #   LENGTH=0xFFFFFFFF: Error (followed by UTF-8 error message)
+#   LENGTH=0xFFFFFFFE: Log message (sideband logging)
 
 HEADER_FORMAT = "!I"  # 4-byte unsigned int (big-endian)
 HEADER_SIZE = 4
 END_OF_STREAM = 0
 ERROR_SIGNAL = 0xFFFFFFFF
+LOG_SIGNAL = 0xFFFFFFFE  # Sideband logging signal
+
+# Log levels for protocol
+LOG_LEVEL_STDOUT = 0
+LOG_LEVEL_STDERR = 1
+LOG_LEVEL_DEBUG = 2
+LOG_LEVEL_INFO = 3
+LOG_LEVEL_WARNING = 4
+LOG_LEVEL_ERROR = 5
+
+
+class SocketWriter:
+    """
+    File-like object that captures writes and sends them via sideband logging.
+
+    Implements the minimal file interface needed to replace sys.stdout/stderr.
+    Buffers small writes until newline to reduce socket overhead.
+    """
+
+    def __init__(self, context: "BridgeContext", level: int):
+        self.context = context
+        self.level = level
+        self._buffer = ""
+        self._original = sys.stdout if level == LOG_LEVEL_STDOUT else sys.stderr
+
+    def write(self, text: str) -> int:
+        """Buffer writes and flush on newline."""
+        if not text:
+            return 0
+
+        self._buffer += text
+
+        # Flush complete lines immediately
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line:  # Skip empty lines
+                self.context.send_log(self.level, line)
+
+        return len(text)
+
+    def flush(self) -> None:
+        """Flush any remaining buffered content."""
+        if self._buffer:
+            self.context.send_log(self.level, self._buffer)
+            self._buffer = ""
+
+    def fileno(self) -> int:
+        """Return original file descriptor for compatibility."""
+        return self._original.fileno()
+
+    def isatty(self) -> bool:
+        """Not a TTY when redirected."""
+        return False
+
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+
+class BridgeLogHandler(logging.Handler):
+    """
+    Logging handler that routes log records through the bridge sideband channel.
+    """
+
+    LEVEL_MAP = {
+        logging.DEBUG: LOG_LEVEL_DEBUG,
+        logging.INFO: LOG_LEVEL_INFO,
+        logging.WARNING: LOG_LEVEL_WARNING,
+        logging.ERROR: LOG_LEVEL_ERROR,
+        logging.CRITICAL: LOG_LEVEL_ERROR,
+    }
+
+    def __init__(self, context: "BridgeContext"):
+        super().__init__()
+        self.context = context
+        self.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Send log record through sideband channel."""
+        try:
+            msg = self.format(record)
+            level = self.LEVEL_MAP.get(record.levelno, LOG_LEVEL_INFO)
+            self.context.send_log(level, msg)
+        except Exception:
+            # Avoid recursion - don't log failures in logging
+            pass
 
 
 class BridgeContext:
@@ -109,7 +201,39 @@ class BridgeContext:
                 self._socket.sendall(struct.pack(HEADER_FORMAT, len(error_bytes)))
                 self._socket.sendall(error_bytes)
             except Exception as e:
-                logger.error(f"Error sending error signal: {e}")
+                # Can't use logger here - it might route back through socket
+                sys.__stderr__.write(f"Error sending error signal: {e}\n")
+
+    def send_log(self, level: int, message: str):
+        """
+        Send a log message through the sideband channel.
+
+        Protocol: [LOG_SIGNAL:4][LEVEL:1][LENGTH:4][MESSAGE]
+
+        Args:
+            level: Log level (LOG_LEVEL_STDOUT, LOG_LEVEL_STDERR, etc.)
+            message: Log message text
+        """
+        if not self._socket:
+            return
+
+        try:
+            # Encode message
+            msg_bytes = message.encode("utf-8", errors="replace")
+
+            # Cap message size to prevent abuse (64KB per message)
+            if len(msg_bytes) > 65536:
+                msg_bytes = msg_bytes[:65530] + b"[...]"
+
+            # Send: [LOG_SIGNAL:4][LEVEL:1][LENGTH:4][MESSAGE]
+            self._socket.sendall(struct.pack(HEADER_FORMAT, LOG_SIGNAL))
+            self._socket.sendall(struct.pack("!B", level))  # 1 byte level
+            self._socket.sendall(struct.pack(HEADER_FORMAT, len(msg_bytes)))
+            self._socket.sendall(msg_bytes)
+
+        except Exception as e:
+            # Write to real stderr, not the redirected one
+            sys.__stderr__.write(f"Failed to send log: {e}\n")
 
     def register_topic(self, topic: str, default_uri: str = None) -> int:
         """Register a topic and return a handle."""
@@ -259,28 +383,60 @@ def main():
     try:
         context.connect()
 
-        # Execute plugin
-        metrics = execute_plugin(source_code, file_path, file_version_id, context)
+        # === SIDEBAND LOGGING SETUP ===
+        # Hijack stdout/stderr BEFORE executing user code to capture print() statements
+        # Save originals for fallback
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
 
-        # Log success
-        logger.info(f"Plugin execution completed: {metrics}")
+        # Replace with socket writers
+        sys.stdout = SocketWriter(context, LOG_LEVEL_STDOUT)
+        sys.stderr = SocketWriter(context, LOG_LEVEL_STDERR)
 
-        # Send completion
-        context.close()
+        # Route logging through sideband channel
+        bridge_handler = BridgeLogHandler(context)
+        root_logger = logging.getLogger()
+        # Remove default handlers
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+        root_logger.addHandler(bridge_handler)
 
-        # Print metrics to stdout for Host to capture
-        print(json.dumps(metrics))
-        sys.exit(0)
+        try:
+            # Execute plugin
+            metrics = execute_plugin(source_code, file_path, file_version_id, context)
+
+            # Flush any remaining buffered output
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+            # Log success through sideband
+            logger.info(f"Plugin execution completed: {metrics}")
+
+            # Send completion
+            context.close()
+
+            # Restore stdout for final JSON output to host process
+            sys.stdout = original_stdout
+            print(json.dumps(metrics))
+            sys.exit(0)
+
+        finally:
+            # Always restore stdio in case of exception
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
     except Exception as e:
         error_msg = traceback.format_exc()
-        logger.error(f"Plugin execution failed: {e}\n{error_msg}")
 
-        # Send error to Host
+        # Try to send through sideband if socket still connected
+        if context._socket:
+            context.send_log(LOG_LEVEL_ERROR, f"Plugin execution failed: {e}\n{error_msg}")
+
+        # Send error to Host via error signal
         context.send_error(str(e))
         context.close()
 
-        # Print error metrics
+        # Print error metrics to original stdout
         print(json.dumps({
             "status": "FAILED",
             "error": str(e),

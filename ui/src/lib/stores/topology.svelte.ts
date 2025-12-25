@@ -5,7 +5,7 @@
  * for use with Svelte Flow.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "$lib/tauri";
 import type { Node, Edge } from "@xyflow/svelte";
 
 /** Raw topology from Rust backend */
@@ -15,6 +15,10 @@ interface TopologyNode {
   nodeType: "plugin" | "topic";
   status: string | null;
   metadata: Record<string, string>;
+  /** X position calculated by backend */
+  x: number;
+  /** Y position calculated by backend */
+  y: number;
 }
 
 interface TopologyEdge {
@@ -30,48 +34,19 @@ interface PipelineTopology {
   edges: TopologyEdge[];
 }
 
-/** Node positions using auto-layout */
-function calculatePositions(nodes: TopologyNode[]): Map<string, { x: number; y: number }> {
-  const positions = new Map<string, { x: number; y: number }>();
-
-  // Separate plugins and topics
-  const plugins = nodes.filter(n => n.nodeType === "plugin");
-  const topics = nodes.filter(n => n.nodeType === "topic");
-
-  // Layout: plugins on left, topics on right
-  const pluginX = 100;
-  const topicX = 500;
-  const startY = 100;
-  const gapY = 150;
-
-  plugins.forEach((node, i) => {
-    positions.set(node.id, { x: pluginX, y: startY + i * gapY });
-  });
-
-  topics.forEach((node, i) => {
-    positions.set(node.id, { x: topicX, y: startY + i * gapY });
-  });
-
-  return positions;
-}
-
 /** Convert backend topology to Svelte Flow format */
 function toFlowElements(topology: PipelineTopology): { nodes: Node[]; edges: Edge[] } {
-  const positions = calculatePositions(topology.nodes);
-
-  const nodes: Node[] = topology.nodes.map(node => {
-    const pos = positions.get(node.id) || { x: 0, y: 0 };
-    return {
-      id: node.id,
-      type: node.nodeType === "plugin" ? "plugin" : "topic",
-      position: pos,
-      data: {
-        label: node.label,
-        status: node.status,
-        metadata: node.metadata,
-      },
-    };
-  });
+  // Use positions calculated by backend - no client-side layout needed
+  const nodes: Node[] = topology.nodes.map(node => ({
+    id: node.id,
+    type: node.nodeType === "plugin" ? "plugin" : "topic",
+    position: { x: node.x, y: node.y },
+    data: {
+      label: node.label,
+      status: node.status,
+      metadata: node.metadata,
+    },
+  }));
 
   const edges: Edge[] = topology.edges.map(edge => ({
     id: edge.id,

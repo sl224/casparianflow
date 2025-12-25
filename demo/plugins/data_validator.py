@@ -7,16 +7,15 @@ Used to demonstrate the pipeline topology with multiple outputs.
 
 import pandas as pd
 import pyarrow as pa
-from casparian_flow.sdk import BasePlugin, PluginMetadata
 
 # Plugin manifest
-MANIFEST = PluginMetadata(
-    pattern="demo/output/processed_*.parquet",
-    topic="validated_data",
-)
+MANIFEST = {
+    "pattern": "demo/output/processed_*.parquet",
+    "topic": "validated_data",
+}
 
 
-class Handler(BasePlugin):
+class Handler:
     """
     Validates processed data and splits into valid/error streams.
     """
