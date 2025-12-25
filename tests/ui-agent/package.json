@@ -1,0 +1,20 @@
+{
+  "name": "casparian-ui-agent-tests",
+  "version": "1.0.0",
+  "description": "Blind Agent UI Testing for Casparian Deck",
+  "scripts": {
+    "pw": "bunx playwright test",
+    "pw:headed": "bunx playwright test --headed",
+    "pw:debug": "bunx playwright test --debug",
+    "pw:ui": "bunx playwright test --ui",
+    "bridge": "bun run bridge/server.ts",
+    "report": "bunx playwright show-report"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0",
+    "@types/better-sqlite3": "^7.6.8"
+  }
+}

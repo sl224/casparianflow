@@ -148,6 +148,7 @@ impl JobLogWriter {
 }
 
 /// Bridge execution configuration (plain data, no behavior)
+#[derive(Debug)]
 pub struct BridgeConfig {
     pub interpreter_path: PathBuf,
     pub source_code: String,
@@ -158,6 +159,7 @@ pub struct BridgeConfig {
 }
 
 /// Result of bridge execution including data and logs
+#[derive(Debug)]
 pub struct BridgeResult {
     /// Arrow record batches produced by the plugin
     pub batches: Vec<RecordBatch>,
@@ -217,9 +219,12 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
 
     debug!("[Job {}] Guest process (pid={}) connected", job_id, process_pid);
 
-    // Set read timeout on the stream
-    stream.set_read_timeout(Some(READ_TIMEOUT))
-        .with_context(|| format!("[Job {}] Failed to set read timeout on socket", job_id))?;
+    // Set read timeout on the stream (may already be set in accept_with_timeout)
+    // On macOS, this can fail with EINVAL if the peer has already closed
+    // We try it anyway but don't fail if it doesn't work - the read will still work
+    if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
+        warn!("[Job {}] Could not set read timeout (may already be set or peer closed): {}", job_id, e);
+    }
 
     // Read all batches (log_writer receives sideband log messages)
     let batches = match read_arrow_batches(&mut stream, job_id, &mut log_writer) {
@@ -310,32 +315,16 @@ fn accept_with_timeout(
             );
         }
 
-        // Check if process has exited
-        match process.try_wait() {
-            Ok(Some(status)) => {
-                anyhow::bail!(
-                    "[Job {}] Guest process exited with {} before connecting to socket. \
-                    The Python subprocess crashed during startup. \
-                    Check the guest stderr output above for details.",
-                    job_id,
-                    status
-                );
-            }
-            Ok(None) => {
-                // Process still running, continue waiting
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "[Job {}] Failed to check guest process status: {}",
-                    job_id,
-                    e
-                );
-            }
-        }
-
-        // Try to accept connection
+        // Try to accept connection FIRST - a connection may be pending even if process exited
         match listener.accept() {
             Ok((stream, _)) => {
+                // Set read timeout first (while still non-blocking) - this helps on macOS
+                // where the order of socket option calls matters
+                if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
+                    debug!("[Job {}] Could not set read timeout in accept: {}", job_id, e);
+                    // Continue anyway - we'll set it later if needed
+                }
+
                 // Switch back to blocking mode for the stream
                 stream.set_nonblocking(false)
                     .with_context(|| format!("[Job {}] Failed to set stream to blocking mode", job_id))?;
@@ -348,12 +337,52 @@ fn accept_with_timeout(
                 return Ok(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No connection yet, sleep and retry
-                std::thread::sleep(poll_interval);
+                // No connection yet, check if process is still alive
             }
             Err(e) => {
                 anyhow::bail!(
                     "[Job {}] Failed to accept connection on socket: {}",
+                    job_id,
+                    e
+                );
+            }
+        }
+
+        // Only check if process exited when there's no pending connection
+        match process.try_wait() {
+            Ok(Some(status)) => {
+                // Process exited - try once more to accept in case connection was queued
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // Try to set timeout, ignore if it fails on dead connection
+                        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+                        stream.set_nonblocking(false)
+                            .with_context(|| format!("[Job {}] Failed to set stream to blocking mode", job_id))?;
+                        debug!(
+                            "[Job {}] Guest connected after {:.2}s (process already exited)",
+                            job_id,
+                            elapsed.as_secs_f64()
+                        );
+                        return Ok(stream);
+                    }
+                    Err(_) => {
+                        anyhow::bail!(
+                            "[Job {}] Guest process exited with {} before connecting to socket. \
+                            The Python subprocess crashed during startup. \
+                            Check the guest stderr output above for details.",
+                            job_id,
+                            status
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                // Process still running, sleep and retry
+                std::thread::sleep(poll_interval);
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "[Job {}] Failed to check guest process status: {}",
                     job_id,
                     e
                 );

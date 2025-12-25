@@ -147,7 +147,7 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
       return true as T;
 
     case 'get_bind_address':
-      return 'mock://localhost:5555' as T;
+      return 'ipc:///tmp/casparian_mock.sock' as T;
 
     default:
       console.warn('[TauriMock] Unhandled command:', cmd);
@@ -155,24 +155,40 @@ export async function mockInvoke<T>(cmd: string, args?: Record<string, unknown>)
   }
 }
 
+// Mock state for stable incrementing values
+let mockPulseState = {
+  jobsCompleted: 150,
+  jobsDispatched: 155,
+  messagesSent: 1000,
+  messagesReceived: 998,
+};
+
 // Mock listen function
 export function mockListen(event: string, callback: (event: { payload: unknown }) => void): () => void {
   console.log('[TauriMock] listen:', event);
 
-  // For system-pulse, emit periodic updates
+  // For system-pulse, emit periodic updates with stable incrementing values
   if (event === 'system-pulse') {
     const interval = setInterval(() => {
+      // Simulate slow job completion (1 job every ~5 seconds)
+      if (Math.random() < 0.1) {
+        mockPulseState.jobsCompleted++;
+        mockPulseState.jobsDispatched++;
+      }
+      mockPulseState.messagesSent += 2;
+      mockPulseState.messagesReceived += 2;
+
       callback({
         payload: {
           connectedWorkers: 2,
-          jobsCompleted: 150 + Math.floor(Math.random() * 10),
+          jobsCompleted: mockPulseState.jobsCompleted,
           jobsFailed: 3,
-          jobsDispatched: 155 + Math.floor(Math.random() * 10),
-          jobsInFlight: Math.floor(Math.random() * 5),
+          jobsDispatched: mockPulseState.jobsDispatched,
+          jobsInFlight: mockPulseState.jobsDispatched - mockPulseState.jobsCompleted - 3,
           avgDispatchMs: 1.5,
           avgConcludeMs: 12.3,
-          messagesSent: 1000 + Math.floor(Math.random() * 100),
-          messagesReceived: 998 + Math.floor(Math.random() * 100),
+          messagesSent: mockPulseState.messagesSent,
+          messagesReceived: mockPulseState.messagesReceived,
           timestamp: Math.floor(Date.now() / 1000),
         },
       });

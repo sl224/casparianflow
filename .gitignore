@@ -60,3 +60,5 @@ last_proposal.json
 target/
 Cargo.lock
 **/*.rs.bk
+
+node_modules
