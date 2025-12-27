@@ -144,6 +144,141 @@ const commands: Record<string, CommandHandler> = {
     return null;
   },
 
+  // Publish Wizard Commands
+  analyze_plugin_manifest: (args) => {
+    const { path } = args as { path: string };
+
+    // Read the file (Real I/O)
+    const fs = require('fs');
+    if (!fs.existsSync(path)) {
+      throw new Error(`File not found: ${path}`);
+    }
+
+    const sourceCode = fs.readFileSync(path, 'utf-8');
+    const pluginName = path.split('/').pop()?.replace('.py', '') || 'unknown';
+
+    // Simple validation (check for banned imports)
+    const hasBannedImports = /import\s+(os|subprocess|sys|socket)/m.test(sourceCode);
+
+    // Detect Handler methods
+    const handlerMethods: string[] = [];
+    const methodMatches = sourceCode.matchAll(/def\s+(\w+)\s*\(/g);
+    for (const match of methodMatches) {
+      if (match[1] !== '__init__') {
+        handlerMethods.push(match[1]);
+      }
+    }
+
+    // Detect topics
+    const detectedTopics: string[] = [];
+    const topicMatches = sourceCode.matchAll(/register_topic\s*\(\s*["']([^"']+)["']/g);
+    for (const match of topicMatches) {
+      detectedTopics.push(match[1]);
+    }
+
+    // Compute hash
+    const crypto = require('crypto');
+    const sourceHash = crypto.createHash('sha256').update(sourceCode).digest('hex');
+
+    // Check for lockfile
+    const dir = path.substring(0, path.lastIndexOf('/'));
+    const hasLockfile = fs.existsSync(`${dir}/uv.lock`);
+    let envHash = null;
+    if (hasLockfile) {
+      const lockContent = fs.readFileSync(`${dir}/uv.lock`, 'utf-8');
+      envHash = crypto.createHash('sha256').update(lockContent).digest('hex');
+    }
+
+    return {
+      pluginName,
+      sourceHash,
+      isValid: !hasBannedImports,
+      validationErrors: hasBannedImports ? ['Banned imports detected (os, subprocess, sys, or socket)'] : [],
+      hasLockfile,
+      envHash,
+      handlerMethods,
+      detectedTopics,
+    };
+  },
+
+  publish_with_overrides: (args) => {
+    const {
+      path,
+      version,
+      routingPattern,
+      routingTag,
+      routingPriority,
+      topicUriOverride,
+    } = args as {
+      path: string;
+      version?: string;
+      routingPattern?: string;
+      routingTag?: string;
+      routingPriority?: number;
+      topicUriOverride?: string;
+    };
+
+    // Read and analyze
+    const fs = require('fs');
+    const sourceCode = fs.readFileSync(path, 'utf-8');
+    const pluginName = path.split('/').pop()?.replace('.py', '') || 'unknown';
+
+    // Compute hashes
+    const crypto = require('crypto');
+    const sourceHash = crypto.createHash('sha256').update(sourceCode).digest('hex');
+
+    // Check for lockfile
+    const dir = path.substring(0, path.lastIndexOf('/'));
+    const hasLockfile = fs.existsSync(`${dir}/uv.lock`);
+    let envHash = null;
+    if (hasLockfile) {
+      const lockContent = fs.readFileSync(`${dir}/uv.lock`, 'utf-8');
+      envHash = crypto.createHash('sha256').update(lockContent).digest('hex');
+    }
+
+    // Generate version if not provided
+    const now = new Date();
+    const finalVersion = version || now.toISOString().replace(/[-:T.Z]/g, '').substring(0, 14);
+
+    // Insert into manifest
+    db.query(
+      `INSERT INTO cf_plugin_manifest (plugin_name, version, source_code, source_hash, env_hash, status, created_at)
+       VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?)
+       ON CONFLICT(plugin_name, version)
+       DO UPDATE SET source_code = excluded.source_code, source_hash = excluded.source_hash, env_hash = excluded.env_hash, status = 'ACTIVE'`
+    ).run(pluginName, finalVersion, sourceCode, sourceHash, envHash, now.toISOString());
+
+    let routingRuleId = null;
+    if (routingPattern && routingTag) {
+      const result = db.query(
+        `INSERT INTO cf_routing_rules (pattern, tag, priority, enabled, description)
+         VALUES (?, ?, ?, 1, ?)`
+      ).run(routingPattern, routingTag, routingPriority || 50, `Auto-created for ${pluginName}`);
+      routingRuleId = result.lastInsertRowid;
+    }
+
+    let topicConfigId = null;
+    if (topicUriOverride) {
+      const result = db.query(
+        `INSERT INTO cf_topic_config (plugin_name, topic_name, uri, mode)
+         VALUES (?, 'output', ?, 'write')
+         ON CONFLICT(plugin_name, topic_name) DO UPDATE SET uri = excluded.uri`
+      ).run(pluginName, topicUriOverride);
+      topicConfigId = result.lastInsertRowid;
+    }
+
+    return {
+      success: true,
+      pluginName,
+      version: finalVersion,
+      sourceHash,
+      envHash,
+      routingRuleId,
+      topicConfigId,
+      message: 'Plugin published successfully',
+    };
+  },
+
   // Pipeline Topology
   get_topology: () => {
     const plugins = db

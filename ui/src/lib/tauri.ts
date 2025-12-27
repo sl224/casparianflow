@@ -1,15 +1,14 @@
 /**
  * Tauri API Wrapper
  *
- * Supports three modes:
+ * Supports two modes:
  * 1. Tauri mode - Real Tauri IPC (desktop app)
  * 2. Bridge mode - HTTP to SQLite bridge (Playwright tests)
- * 3. Mock mode - Static mock data (fallback)
+ *
+ * If neither mode is available, throws an error. No mocks.
  *
  * Import from this module instead of @tauri-apps/api/* for cross-environment compatibility.
  */
-
-import { mockInvoke, mockListen, mockWindow } from './tauri-mock';
 
 // Check if we're in Tauri - must be a function for dynamic checking
 // since __TAURI_INTERNALS__ may be injected after module load
@@ -57,7 +56,8 @@ async function waitForTauri(maxWaitMs = 500): Promise<boolean> {
 }
 
 /**
- * Invoke a command - routes to Tauri, Bridge, or Mock based on environment
+ * Invoke a command - routes to Tauri or Bridge based on environment
+ * Throws if neither backend is available (no mock fallback)
  */
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   // 1. Real Tauri (wait for injection on first call)
@@ -87,12 +87,16 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
     return data.result as T;
   }
 
-  // 3. Fallback to mock
-  return mockInvoke<T>(cmd, args);
+  // No backend available - fail hard
+  throw new Error(
+    `Backend not available. Command: ${cmd}. ` +
+    'This UI requires either Tauri desktop app or test bridge server.'
+  );
 }
 
 /**
- * Listen for events - routes to Tauri, Bridge, or Mock
+ * Listen for events - routes to Tauri or Bridge
+ * Throws if neither backend is available (no mock fallback)
  */
 export async function listen<T>(
   event: string,
@@ -118,19 +122,29 @@ export async function listen<T>(
     return () => clearInterval(intervalId);
   }
 
-  // Mock mode
-  return mockListen(event, handler as (event: { payload: unknown }) => void);
+  // No backend available - fail hard
+  throw new Error(
+    `Backend not available for event: ${event}. ` +
+    'This UI requires either Tauri desktop app or test bridge server.'
+  );
 }
 
 /**
  * Get current window - for window controls
+ * Returns a no-op mock when not in Tauri (window controls only work in desktop app)
  */
 export async function getCurrentWindow() {
   if (await waitForTauri()) {
     const { getCurrentWindow: tauriGetCurrentWindow } = await import('@tauri-apps/api/window');
     return tauriGetCurrentWindow();
   }
-  return mockWindow;
+
+  // Window controls are desktop-only, return no-op for web/test environments
+  return {
+    minimize: async () => console.warn('Window controls only available in desktop app'),
+    toggleMaximize: async () => console.warn('Window controls only available in desktop app'),
+    close: async () => console.warn('Window controls only available in desktop app'),
+  };
 }
 
 /**

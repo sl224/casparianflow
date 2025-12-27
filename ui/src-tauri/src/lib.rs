@@ -2,12 +2,14 @@
 //!
 //! Embeds the Sentinel and provides real-time system monitoring via Tauri events.
 
+use casparian::publish::analyze_plugin;
 use casparian_sentinel::{Sentinel, SentinelConfig, METRICS};
 use cf_security::Gatekeeper;
 use serde::Serialize;
 use sha2::{Sha256, Digest};
 use sqlx::{Pool, Sqlite, SqlitePool};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -923,6 +925,203 @@ async fn deploy_plugin(
     }
 }
 
+// ============================================================================
+// Publish Wizard Commands (Real I/O, No Mocks)
+// ============================================================================
+
+/// Result of analyzing a plugin manifest
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManifest {
+    pub plugin_name: String,
+    pub source_hash: String,
+    pub is_valid: bool,
+    pub validation_errors: Vec<String>,
+    pub has_lockfile: bool,
+    pub env_hash: Option<String>,
+    pub handler_methods: Vec<String>,
+    pub detected_topics: Vec<String>,
+}
+
+/// Analyze a plugin file on disk (Real I/O, Real AST parsing)
+///
+/// This reads the actual file from the filesystem and performs
+/// real Gatekeeper validation using AST parsing.
+#[tauri::command]
+async fn analyze_plugin_manifest(path: String) -> Result<PluginManifest, String> {
+    // Validate path is a .py file
+    let plugin_path = Path::new(&path);
+    if plugin_path.extension().and_then(|e| e.to_str()) != Some("py") {
+        return Err("Only .py files are allowed".to_string());
+    }
+
+    // Real I/O: Read and analyze the plugin
+    let analysis = analyze_plugin(plugin_path)
+        .map_err(|e| format!("Failed to analyze plugin: {}", e))?;
+
+    Ok(PluginManifest {
+        plugin_name: analysis.plugin_name,
+        source_hash: analysis.source_hash,
+        is_valid: analysis.is_valid,
+        validation_errors: analysis.validation_errors,
+        has_lockfile: analysis.has_lockfile,
+        env_hash: analysis.env_hash,
+        handler_methods: analysis.handler_methods,
+        detected_topics: analysis.detected_topics,
+    })
+}
+
+/// Options for publishing with overrides
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishWithOverridesArgs {
+    pub path: String,
+    pub version: Option<String>,
+    pub routing_pattern: Option<String>,
+    pub routing_tag: Option<String>,
+    pub routing_priority: Option<i32>,
+    pub topic_uri_override: Option<String>,
+}
+
+/// Result of a successful publish with overrides
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishReceipt {
+    pub success: bool,
+    pub plugin_name: String,
+    pub version: String,
+    pub source_hash: String,
+    pub env_hash: Option<String>,
+    pub routing_rule_id: Option<i64>,
+    pub topic_config_id: Option<i64>,
+    pub message: String,
+}
+
+/// Publish a plugin with optional routing and topic overrides
+///
+/// This performs the complete publishing transaction:
+/// 1. Validate the plugin (Real Gatekeeper AST parsing)
+/// 2. Save to cf_plugin_manifest (Real SQLite)
+/// 3. Create routing rule if specified (Real SQLite)
+/// 4. Create/update topic config if specified (Real SQLite)
+#[tauri::command]
+async fn publish_with_overrides(
+    state: tauri::State<'_, SentinelState>,
+    args: PublishWithOverridesArgs,
+) -> Result<PublishReceipt, String> {
+    let plugin_path = Path::new(&args.path);
+
+    // 1. Analyze plugin (Real I/O + Real AST)
+    let analysis = analyze_plugin(plugin_path)
+        .map_err(|e| format!("Failed to analyze plugin: {}", e))?;
+
+    if !analysis.is_valid {
+        return Ok(PublishReceipt {
+            success: false,
+            plugin_name: analysis.plugin_name,
+            version: "0.0.0".to_string(),
+            source_hash: analysis.source_hash,
+            env_hash: analysis.env_hash,
+            routing_rule_id: None,
+            topic_config_id: None,
+            message: format!("Validation failed: {}", analysis.validation_errors.join(", ")),
+        });
+    }
+
+    // 2. Get database pool (Real SQLite connection)
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    // Generate version
+    let now = chrono::Utc::now();
+    let version = args.version.unwrap_or_else(|| now.format("%Y%m%d.%H%M%S").to_string());
+
+    // 3. Insert into cf_plugin_manifest (Real SQL)
+    sqlx::query(
+        r#"
+        INSERT INTO cf_plugin_manifest
+            (plugin_name, version, source_code, source_hash, env_hash, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?)
+        ON CONFLICT(plugin_name, version)
+        DO UPDATE SET source_code = excluded.source_code,
+                      source_hash = excluded.source_hash,
+                      env_hash = excluded.env_hash,
+                      status = 'ACTIVE'
+        "#,
+    )
+    .bind(&analysis.plugin_name)
+    .bind(&version)
+    .bind(&analysis.source_code)
+    .bind(&analysis.source_hash)
+    .bind(&analysis.env_hash)
+    .bind(now.to_rfc3339())
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to save plugin: {}", e))?;
+
+    info!("Saved plugin {} v{} to manifest", analysis.plugin_name, version);
+
+    // 4. Create routing rule if specified (Real SQL)
+    let mut routing_rule_id = None;
+    if let (Some(pattern), Some(tag)) = (&args.routing_pattern, &args.routing_tag) {
+        let priority = args.routing_priority.unwrap_or(50);
+        let result = sqlx::query(
+            r#"
+            INSERT INTO cf_routing_rules (pattern, tag, priority, enabled, description)
+            VALUES (?, ?, ?, 1, ?)
+            "#,
+        )
+        .bind(pattern)
+        .bind(tag)
+        .bind(priority)
+        .bind(format!("Auto-created for plugin {}", analysis.plugin_name))
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to create routing rule: {}", e))?;
+
+        routing_rule_id = Some(result.last_insert_rowid());
+        info!("Created routing rule {} -> {} (id: {:?})", pattern, tag, routing_rule_id);
+    }
+
+    // 5. Create/update topic config if specified (Real SQL)
+    let mut topic_config_id = None;
+    if let Some(uri) = &args.topic_uri_override {
+        // Use first detected topic or "output"
+        let topic_name = analysis.detected_topics.first()
+            .map(|s| s.as_str())
+            .unwrap_or("output");
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO cf_topic_config (plugin_name, topic_name, uri, mode)
+            VALUES (?, ?, ?, 'write')
+            ON CONFLICT(plugin_name, topic_name)
+            DO UPDATE SET uri = excluded.uri
+            "#,
+        )
+        .bind(&analysis.plugin_name)
+        .bind(topic_name)
+        .bind(uri)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to create topic config: {}", e))?;
+
+        topic_config_id = Some(result.last_insert_rowid());
+        info!("Created/updated topic config {} -> {} (id: {:?})", topic_name, uri, topic_config_id);
+    }
+
+    Ok(PublishReceipt {
+        success: true,
+        plugin_name: analysis.plugin_name,
+        version,
+        source_hash: analysis.source_hash,
+        env_hash: analysis.env_hash,
+        routing_rule_id,
+        topic_config_id,
+        message: "Plugin published successfully".to_string(),
+    })
+}
+
 /// Start the pulse emitter task
 fn start_pulse_emitter(app: AppHandle, running: Arc<AtomicBool>) {
     // Spawn a task that emits system pulse events every 500ms
@@ -1061,6 +1260,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_system_pulse,
@@ -1083,6 +1283,9 @@ pub fn run() {
             // Topic configuration
             get_topic_configs,
             update_topic_uri,
+            // Publish Wizard (Real I/O)
+            analyze_plugin_manifest,
+            publish_with_overrides,
         ])
         .setup(move |app| {
             // Initialize database pool

@@ -17,8 +17,10 @@ tauri-build = { version = "2", features = [] }
 # Tauri
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 
 # Casparian Crates
+casparian = { path = "../../crates/casparian" }
 casparian_sentinel = { path = "../../crates/casparian_sentinel" }
 casparian_worker = { path = "../../crates/casparian_worker" }
 cf_protocol = { path = "../../crates/cf_protocol" }

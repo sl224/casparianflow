@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS cf_topic_config (
     plugin_name TEXT NOT NULL,
     topic_name TEXT NOT NULL,
     uri TEXT NOT NULL,
-    mode TEXT DEFAULT 'write'
+    mode TEXT DEFAULT 'write',
+    UNIQUE(plugin_name, topic_name)
 );
 
 -- Plugin subscriptions
@@ -92,15 +93,22 @@ CREATE TABLE IF NOT EXISTS cf_job_logs (
     log_text TEXT
 );
 
--- Plugin manifests
+-- Plugin manifests (matches production schema)
 CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_name TEXT NOT NULL,
     version TEXT NOT NULL,
-    source_code TEXT,
-    source_hash TEXT,
+    source_code TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
     status TEXT DEFAULT 'PENDING',
-    created_at TEXT,
+    signature TEXT,
+    validation_error TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    deployed_at TEXT,
+    env_hash TEXT,
+    artifact_hash TEXT,
+    publisher_id INTEGER,
+    system_requirements TEXT,
     UNIQUE(plugin_name, version)
 );
 `;

@@ -4,9 +4,10 @@
   import RoutingTable from "$lib/components/RoutingTable.svelte";
   import DataGrid from "$lib/components/DataGrid.svelte";
   import LogViewer from "$lib/components/LogViewer.svelte";
+  import PublishWizard from "$lib/components/PublishWizard.svelte";
 
   // Current view tab
-  let activeTab = $state<"dashboard" | "config" | "data">("dashboard");
+  let activeTab = $state<"dashboard" | "config" | "data" | "publish">("dashboard");
 </script>
 
 <div class="app">
@@ -38,6 +39,13 @@
         onclick={() => (activeTab = "data")}
       >
         DATA
+      </button>
+      <button
+        class="tab"
+        class:active={activeTab === "publish"}
+        onclick={() => (activeTab = "publish")}
+      >
+        PUBLISH
       </button>
     </nav>
 
@@ -219,6 +227,11 @@
             </div>
           {/if}
         </div>
+      </div>
+    {:else if activeTab === "publish"}
+      <!-- Publish View -->
+      <div class="publish-view">
+        <PublishWizard />
       </div>
     {/if}
   </main>
@@ -542,6 +555,13 @@
   .config-view {
     height: 100%;
     padding: var(--space-lg);
+  }
+
+  /* Publish View */
+  .publish-view {
+    height: 100%;
+    padding: var(--space-lg);
+    overflow: auto;
   }
 
   /* Data View */
