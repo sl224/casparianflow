@@ -2,6 +2,8 @@
 //!
 //! Embeds the Sentinel and provides real-time system monitoring via Tauri events.
 
+mod scout;
+
 use casparian::publish::analyze_plugin;
 use casparian_sentinel::{Sentinel, SentinelConfig, METRICS};
 use cf_security::Gatekeeper;
@@ -112,20 +114,6 @@ pub struct TopologyEdge {
 pub struct PipelineTopology {
     pub nodes: Vec<TopologyNode>,
     pub edges: Vec<TopologyEdge>,
-}
-
-// ============================================================================
-// Query Types for DuckDB
-// ============================================================================
-
-/// Result of a parquet query
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueryResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<Vec<serde_json::Value>>,
-    pub row_count: usize,
-    pub execution_time_ms: u64,
 }
 
 /// Job output information
@@ -639,109 +627,152 @@ async fn update_topic_uri(
     Ok(())
 }
 
-/// Maximum rows to return from a query to prevent memory blowup
-const MAX_QUERY_ROWS: usize = 10_000;
+// ============================================================================
+// Scout-Sentinel Bridge Commands
+// ============================================================================
 
-/// Query a parquet file using DuckDB
+/// Result of submitting tagged files to Sentinel
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmitResult {
+    /// Number of files submitted
+    pub submitted: usize,
+    /// Number of files skipped (no matching plugin)
+    pub skipped: usize,
+    /// Job IDs created (maps file_id -> job_id)
+    pub job_ids: Vec<(i64, i64)>,
+    /// Files skipped due to no plugin (file_id, tag)
+    pub no_plugin: Vec<(i64, String)>,
+}
+
+/// Submit tagged files to Sentinel's processing queue
+///
+/// This is the bridge between Scout (discovery + tagging) and Sentinel (processing).
+/// For each tagged file:
+/// 1. Look up plugins subscribed to the tag
+/// 2. Create a job in cf_processing_queue
+/// 3. Update Scout's file status to 'queued' with sentinel_job_id
 #[tauri::command]
-async fn query_parquet(file_path: String, sql: Option<String>) -> Result<QueryResult, String> {
-    use duckdb::Connection;
-    use std::time::Instant;
+async fn submit_tagged_files(
+    sentinel_state: tauri::State<'_, SentinelState>,
+    scout_state: tauri::State<'_, scout::ScoutState>,
+    file_ids: Vec<i64>,
+) -> Result<SubmitResult, String> {
+    // Get Scout database
+    let scout_db = scout_state.get_db()?;
 
-    let start = Instant::now();
+    // Get Sentinel database pool
+    let pool_guard = sentinel_state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Sentinel database not connected")?;
 
-    // Canonicalize the path to prevent path traversal
-    let canonical_path = std::fs::canonicalize(&file_path)
-        .map_err(|e| format!("Invalid file path: {}", e))?;
-
-    // Validate file exists and is a regular file
-    if !canonical_path.is_file() {
-        return Err(format!("Not a valid file: {}", file_path));
-    }
-
-    // Validate file extension (only allow data files)
-    let ext = canonical_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    if !matches!(ext, "parquet" | "csv" | "json" | "jsonl") {
-        return Err(format!("Unsupported file type: .{}", ext));
-    }
-
-    let file_path_str = canonical_path.to_string_lossy().to_string();
-
-    // Use provided SQL or default to SELECT * LIMIT 100
-    // Note: SQL is user-provided for their own local data files,
-    // so SQL injection is not a security concern here.
-    let query = sql.unwrap_or_else(|| {
-        format!("SELECT * FROM read_parquet('{}') LIMIT 100", file_path_str)
-    });
-
-    // Execute in a blocking task since DuckDB is sync
-    let result = tokio::task::spawn_blocking(move || -> Result<QueryResult, String> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| format!("Failed to open DuckDB: {}", e))?;
-
-        let mut stmt = conn
-            .prepare(&query)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
-
-        // Get column names
-        let columns: Vec<String> = stmt
-            .column_names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        // Execute and collect rows
-        let rows_iter = stmt
-            .query_map([], |row| {
-                let mut values = Vec::new();
-                for i in 0..columns.len() {
-                    // Try to get value as different types
-                    let value: serde_json::Value = if let Ok(v) = row.get::<_, i64>(i) {
-                        serde_json::Value::Number(v.into())
-                    } else if let Ok(v) = row.get::<_, f64>(i) {
-                        serde_json::Number::from_f64(v)
-                            .map(serde_json::Value::Number)
-                            .unwrap_or(serde_json::Value::Null)
-                    } else if let Ok(v) = row.get::<_, String>(i) {
-                        serde_json::Value::String(v)
-                    } else if let Ok(v) = row.get::<_, bool>(i) {
-                        serde_json::Value::Bool(v)
-                    } else {
-                        serde_json::Value::Null
-                    };
-                    values.push(value);
-                }
-                Ok(values)
-            })
-            .map_err(|e| format!("Failed to execute query: {}", e))?;
-
-        // Collect with row limit to prevent memory blowup
-        let rows: Vec<Vec<serde_json::Value>> = rows_iter
-            .filter_map(|r| r.ok())
-            .take(MAX_QUERY_ROWS)
-            .collect();
-
-        let row_count = rows.len();
-
-        Ok(QueryResult {
-            columns,
-            rows,
-            row_count,
-            execution_time_ms: 0, // Will be set after
-        })
-    })
+    // Load all plugin configs to match tags to plugins
+    let plugin_configs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT plugin_name, subscription_tags FROM cf_plugin_config WHERE enabled = 1"
+    )
+    .fetch_all(pool)
     .await
-    .map_err(|e| format!("Task error: {}", e))??;
+    .map_err(|e| format!("Failed to load plugin configs: {}", e))?;
 
-    let execution_time_ms = start.elapsed().as_millis() as u64;
+    let mut submitted = 0;
+    let mut skipped = 0;
+    let mut job_ids: Vec<(i64, i64)> = Vec::new();
+    let mut no_plugin: Vec<(i64, String)> = Vec::new();
 
-    Ok(QueryResult {
-        execution_time_ms,
-        ..result
+    for file_id in file_ids {
+        // Get file info from Scout
+        let file = scout_db
+            .get_file(file_id)
+            .map_err(|e| format!("Failed to get file {}: {}", file_id, e))?;
+
+        let Some(file) = file else {
+            continue; // File not found, skip
+        };
+
+        let Some(tag) = &file.tag else {
+            skipped += 1;
+            continue; // No tag, skip
+        };
+
+        // Find plugin(s) that subscribe to this tag
+        let matching_plugins: Vec<&str> = plugin_configs
+            .iter()
+            .filter(|(_, tags)| tags.split(',').any(|t| t.trim() == tag))
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        if matching_plugins.is_empty() {
+            no_plugin.push((file_id, tag.clone()));
+            skipped += 1;
+            continue;
+        }
+
+        // For now, use the first matching plugin
+        // Future: could create multiple jobs for multiple plugins
+        let plugin_name = matching_plugins[0];
+
+        // Insert job into Sentinel's queue
+        let result = sqlx::query(
+            r#"
+            INSERT INTO cf_processing_queue
+                (file_version_id, plugin_name, status, priority, config_overrides)
+            VALUES (?, ?, 'QUEUED', 0, NULL)
+            "#,
+        )
+        .bind(file_id) // Using file_id as file_version_id for now
+        .bind(plugin_name)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to create job for file {}: {}", file_id, e))?;
+
+        let job_id = result.last_insert_rowid();
+
+        // Update Scout file status to queued
+        scout_db
+            .mark_file_queued(file_id, job_id)
+            .map_err(|e| format!("Failed to mark file {} as queued: {}", file_id, e))?;
+
+        job_ids.push((file_id, job_id));
+        submitted += 1;
+    }
+
+    info!(
+        "Submitted {} files to Sentinel, {} skipped ({} no plugin)",
+        submitted,
+        skipped,
+        no_plugin.len()
+    );
+
+    Ok(SubmitResult {
+        submitted,
+        skipped,
+        job_ids,
+        no_plugin,
     })
+}
+
+/// Get plugins available for a tag
+#[tauri::command]
+async fn get_plugins_for_tag(
+    state: tauri::State<'_, SentinelState>,
+    tag: String,
+) -> Result<Vec<String>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let plugins: Vec<(String, String)> = sqlx::query_as(
+        "SELECT plugin_name, subscription_tags FROM cf_plugin_config WHERE enabled = 1"
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to query plugins: {}", e))?;
+
+    let matching: Vec<String> = plugins
+        .into_iter()
+        .filter(|(_, tags)| tags.split(',').any(|t| t.trim() == tag))
+        .map(|(name, _)| name)
+        .collect();
+
+    Ok(matching)
 }
 
 /// Validate that a path is a safe plugin file path
@@ -1258,10 +1289,14 @@ pub fn run() {
         database_url: database_url.clone(),
     };
 
+    // Create Scout state
+    let scout_state = scout::ScoutState::new();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(state)
+        .manage(scout_state)
         .invoke_handler(tauri::generate_handler![
             get_system_pulse,
             get_prometheus_metrics,
@@ -1270,7 +1305,6 @@ pub fn run() {
             get_topology,
             get_job_outputs,
             get_job_details,
-            query_parquet,
             read_plugin_file,
             write_plugin_file,
             list_plugins,
@@ -1283,9 +1317,37 @@ pub fn run() {
             // Topic configuration
             get_topic_configs,
             update_topic_uri,
+            // Scout-Sentinel Bridge
+            submit_tagged_files,
+            get_plugins_for_tag,
             // Publish Wizard (Real I/O)
             analyze_plugin_manifest,
             publish_with_overrides,
+            // Scout commands (File Discovery + Tagging)
+            scout::scout_init_db,
+            scout::scout_list_sources,
+            scout::scout_add_source,
+            scout::scout_remove_source,
+            scout::scout_scan,
+            scout::scout_status,
+            // Scout file commands
+            scout::scout_list_files,
+            scout::scout_list_untagged_files,
+            scout::scout_list_failed_files,
+            // Scout tagging rule commands
+            scout::scout_list_tagging_rules,
+            scout::scout_list_tagging_rules_for_source,
+            scout::scout_add_tagging_rule,
+            scout::scout_remove_tagging_rule,
+            // Scout tagging commands
+            scout::scout_tag_file,
+            scout::scout_tag_files,
+            scout::scout_auto_tag,
+            scout::scout_get_tag_stats,
+            // Scout analysis commands
+            scout::scout_preview_pattern,
+            scout::scout_analyze_coverage,
+            scout::scout_retry_failed,
         ])
         .setup(move |app| {
             // Initialize database pool
@@ -1496,51 +1558,5 @@ mod tests {
         let json = serde_json::to_string(&topology).unwrap();
         assert!(json.contains("\"nodes\":[]"));
         assert!(json.contains("\"edges\":[]"));
-    }
-
-    // =========================================================================
-    // QueryResult Tests
-    // =========================================================================
-
-    #[test]
-    fn test_query_result_serialization() {
-        let result = QueryResult {
-            columns: vec!["id".to_string(), "name".to_string()],
-            rows: vec![
-                vec![serde_json::json!(1), serde_json::json!("test")],
-            ],
-            row_count: 1,
-            execution_time_ms: 42,
-        };
-
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("\"rowCount\":1")); // camelCase
-        assert!(json.contains("\"executionTimeMs\":42"));
-    }
-
-    #[test]
-    fn test_query_result_handles_null_values() {
-        let result = QueryResult {
-            columns: vec!["nullable".to_string()],
-            rows: vec![
-                vec![serde_json::Value::Null],
-            ],
-            row_count: 1,
-            execution_time_ms: 0,
-        };
-
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(json.contains("null"));
-    }
-
-    // =========================================================================
-    // File Size Limit Test
-    // =========================================================================
-
-    #[test]
-    fn test_max_query_rows_constant() {
-        // Verify the constant is reasonable (not too small, not too large)
-        assert!(MAX_QUERY_ROWS >= 1000, "Should allow at least 1000 rows");
-        assert!(MAX_QUERY_ROWS <= 100_000, "Should limit to reasonable size");
     }
 }
