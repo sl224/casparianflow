@@ -30,9 +30,18 @@ export interface ScannedFile {
   size: number;
   status: FileStatus;
   tag: string | null;
+  /** How the tag was assigned: "rule" or "manual" */
+  tagSource: "rule" | "manual" | null;
+  /** ID of the tagging rule that matched (if tagSource = "rule") */
+  ruleId: string | null;
+  /** Manual plugin override (null = use tag subscription) */
+  manualPlugin: string | null;
   error: string | null;
   sentinelJobId: number | null;
 }
+
+/** Filter types for file list */
+export type FilterType = "all" | "manual" | "pending" | "tagged" | "queued" | "processed" | "failed";
 
 export type FileStatus =
   | "pending"     // Discovered, awaiting tagging
@@ -187,6 +196,13 @@ class ScoutStore {
   // Selection state
   selectedSourceId = $state<string | null>(null);
 
+  // File selection state (for detail pane)
+  selectedFileId = $state<number | null>(null);
+  selectedFileIds = $state<Set<number>>(new Set());
+
+  // Filter state
+  currentFilter = $state<FilterType>("all");
+
   // Live preview state
   previewPattern = $state("");
   previewResult = $state<PatternPreview | null>(null);
@@ -320,17 +336,26 @@ class ScoutStore {
     this.lastScanStats = null;
 
     try {
+      console.log("[ScoutStore] Starting scan for source:", sourceId);
       const stats = await invoke<ScanStats>("scout_scan", { sourceId });
       this.lastScanStats = stats;
       console.log("[ScoutStore] Scan complete:", stats.filesDiscovered, "files");
 
       // Reload files and coverage after scan
+      console.log("[ScoutStore] Loading files...");
       await this.loadFiles(sourceId);
+      console.log("[ScoutStore] Files loaded:", this.files.length);
+
+      console.log("[ScoutStore] Loading status...");
       await this.loadStatus();
+
+      console.log("[ScoutStore] Loading coverage...");
       await this.loadCoverage(sourceId);
 
+      console.log("[ScoutStore] All post-scan loading complete");
       return stats;
     } catch (err) {
+      console.error("[ScoutStore] Scan error:", err);
       this.error = `Scan failed: ${err}`;
       throw err;
     } finally {
@@ -527,15 +552,15 @@ class ScoutStore {
   // Tagging Operations
   // --------------------------------------------------------------------------
 
-  /** Tag a single file manually */
+  /** Tag a single file manually (sets tagSource = 'manual') */
   async tagFile(fileId: number, tag: string): Promise<void> {
     this.error = null;
 
     try {
       await invoke("scout_tag_file", { fileId, tag });
-      // Update local state
+      // Update local state - manual tagging sets tagSource to 'manual'
       this.files = this.files.map(f =>
-        f.id === fileId ? { ...f, tag, status: "tagged" as FileStatus } : f
+        f.id === fileId ? { ...f, tag, tagSource: "manual" as const, ruleId: null, status: "tagged" as FileStatus } : f
       );
       console.log("[ScoutStore] Tagged file", fileId, "with", tag);
     } catch (err) {
@@ -544,17 +569,17 @@ class ScoutStore {
     }
   }
 
-  /** Tag multiple files manually */
+  /** Tag multiple files manually (sets tagSource = 'manual') */
   async tagFiles(fileIds: number[], tag: string): Promise<number> {
     this.error = null;
     this.tagging = true;
 
     try {
       const count = await invoke<number>("scout_tag_files", { fileIds, tag });
-      // Update local state
+      // Update local state - manual tagging sets tagSource to 'manual'
       const idSet = new Set(fileIds);
       this.files = this.files.map(f =>
-        idSet.has(f.id) ? { ...f, tag, status: "tagged" as FileStatus } : f
+        idSet.has(f.id) ? { ...f, tag, tagSource: "manual" as const, ruleId: null, status: "tagged" as FileStatus } : f
       );
       console.log("[ScoutStore] Tagged", count, "files with", tag);
       return count;
@@ -682,6 +707,17 @@ class ScoutStore {
         queuedIds.has(f.id) ? { ...f, status: "queued" as FileStatus } : f
       );
 
+      // Spawn worker processes for each job
+      for (const [, jobId] of result.jobIds) {
+        try {
+          await invoke("process_job_async", { jobId });
+          console.log("[ScoutStore] Spawned worker for job", jobId);
+        } catch (err) {
+          console.error("[ScoutStore] Failed to spawn worker for job", jobId, err);
+          // Don't fail the whole submission if spawning fails
+        }
+      }
+
       // Reload stats
       await this.loadTagStats();
 
@@ -718,11 +754,162 @@ class ScoutStore {
   }
 
   // --------------------------------------------------------------------------
+  // File Selection & Detail
+  // --------------------------------------------------------------------------
+
+  /** Select a file to show in detail pane */
+  selectFile(fileId: number | null): void {
+    this.selectedFileId = fileId;
+  }
+
+  /** Clear file selection */
+  clearFileSelection(): void {
+    this.selectedFileId = null;
+    this.selectedFileIds = new Set();
+  }
+
+  /** Toggle file selection for bulk operations */
+  toggleFileSelection(fileId: number): void {
+    const newSet = new Set(this.selectedFileIds);
+    if (newSet.has(fileId)) {
+      newSet.delete(fileId);
+    } else {
+      newSet.add(fileId);
+    }
+    this.selectedFileIds = newSet;
+  }
+
+  /** Select all visible files */
+  selectAllFiles(): void {
+    this.selectedFileIds = new Set(this.filteredFiles.map(f => f.id));
+  }
+
+  /** Get a single file by ID */
+  async getFile(fileId: number): Promise<ScannedFile | null> {
+    try {
+      return await invoke<ScannedFile | null>("scout_get_file", { fileId });
+    } catch (err) {
+      console.error("[ScoutStore] Failed to get file:", err);
+      return null;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Manual Override Operations
+  // --------------------------------------------------------------------------
+
+  /** Set manual plugin override for a file */
+  async setManualPlugin(fileId: number, pluginName: string): Promise<void> {
+    this.error = null;
+
+    try {
+      await invoke("scout_set_manual_plugin", { fileId, pluginName });
+      // Update local state
+      this.files = this.files.map(f =>
+        f.id === fileId ? { ...f, manualPlugin: pluginName } : f
+      );
+      console.log("[ScoutStore] Set manual plugin", pluginName, "for file", fileId);
+    } catch (err) {
+      this.error = `Failed to set manual plugin: ${err}`;
+      throw err;
+    }
+  }
+
+  /** Clear all manual overrides for a file (reset to auto) */
+  async clearManualOverrides(fileId: number): Promise<void> {
+    this.error = null;
+
+    try {
+      await invoke("scout_clear_manual_overrides", { fileId });
+      // Update local state
+      this.files = this.files.map(f =>
+        f.id === fileId
+          ? { ...f, tag: null, tagSource: null, ruleId: null, manualPlugin: null, status: "pending" as FileStatus }
+          : f
+      );
+      console.log("[ScoutStore] Cleared manual overrides for file", fileId);
+    } catch (err) {
+      this.error = `Failed to clear manual overrides: ${err}`;
+      throw err;
+    }
+  }
+
+  /** Load files with manual overrides */
+  async loadManualFiles(sourceId: string, limit?: number): Promise<void> {
+    this.loading = true;
+    this.error = null;
+
+    try {
+      this.files = await invoke<ScannedFile[]>("scout_list_manual_files", {
+        sourceId,
+        limit,
+      });
+      console.log("[ScoutStore] Loaded", this.files.length, "manual files");
+    } catch (err) {
+      this.error = `Failed to load manual files: ${err}`;
+      console.error("[ScoutStore]", this.error);
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Filtering
+  // --------------------------------------------------------------------------
+
+  /** Set the current filter */
+  setFilter(filter: FilterType): void {
+    this.currentFilter = filter;
+  }
+
+  /** Filter files based on current filter */
+  private filterFilesByType(files: ScannedFile[], filter: FilterType): ScannedFile[] {
+    switch (filter) {
+      case "all":
+        return files;
+      case "manual":
+        return files.filter(f => f.tagSource === "manual" || f.manualPlugin !== null);
+      case "pending":
+        return files.filter(f => f.status === "pending");
+      case "tagged":
+        return files.filter(f => f.status === "tagged");
+      case "queued":
+        return files.filter(f => f.status === "queued");
+      case "processed":
+        return files.filter(f => f.status === "processed");
+      case "failed":
+        return files.filter(f => f.status === "failed");
+      default:
+        return files;
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // Computed properties (getters are reactive when accessing $state)
   // --------------------------------------------------------------------------
 
   get selectedSource(): Source | null {
     return this.sources.find(s => s.id === this.selectedSourceId) ?? null;
+  }
+
+  /** Get the currently selected file for detail pane */
+  get selectedFile(): ScannedFile | null {
+    return this.files.find(f => f.id === this.selectedFileId) ?? null;
+  }
+
+  /** Get files filtered by current filter */
+  get filteredFiles(): ScannedFile[] {
+    return this.filterFilesByType(this.files, this.currentFilter);
+  }
+
+  /** Get files with manual overrides (tag or plugin) */
+  get manualFiles(): ScannedFile[] {
+    return this.files.filter(f => f.tagSource === "manual" || f.manualPlugin !== null);
+  }
+
+  /** Check if a file has any manual override */
+  isManualFile(file: ScannedFile): boolean {
+    return file.tagSource === "manual" || file.manualPlugin !== null;
   }
 
   get pendingFiles(): ScannedFile[] {

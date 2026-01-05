@@ -1,9 +1,23 @@
 <script lang="ts">
   import { systemStore } from "$lib/stores/system.svelte";
+  import { jobsStore } from "$lib/stores/jobs.svelte";
   import PublishWizard from "$lib/components/PublishWizard.svelte";
   import ScoutTab from "$lib/components/scout/ScoutTab.svelte";
+  import ParserLabTab from "$lib/components/parser-lab/ParserLabTab.svelte";
+  import JobsTab from "$lib/components/JobsTab.svelte";
+  import { onMount } from "svelte";
 
-  let activeTab = $state<"dashboard" | "pipelines" | "publish">("dashboard");
+  let activeTab = $state<"dashboard" | "pipelines" | "parser-lab" | "jobs" | "publish">("dashboard");
+
+  // Handle navigation from Scout to Jobs tab
+  onMount(() => {
+    const handler = (e: CustomEvent<{ jobId: number }>) => {
+      activeTab = 'jobs';
+      jobsStore.selectJobById(e.detail.jobId);
+    };
+    window.addEventListener('navigate-to-job', handler as EventListener);
+    return () => window.removeEventListener('navigate-to-job', handler as EventListener);
+  });
 </script>
 
 <div class="app">
@@ -28,6 +42,20 @@
         onclick={() => (activeTab = "pipelines")}
       >
         PIPELINES
+      </button>
+      <button
+        class="tab"
+        class:active={activeTab === "parser-lab"}
+        onclick={() => (activeTab = "parser-lab")}
+      >
+        PARSER LAB
+      </button>
+      <button
+        class="tab"
+        class:active={activeTab === "jobs"}
+        onclick={() => (activeTab = "jobs")}
+      >
+        JOBS
       </button>
       <button
         class="tab"
@@ -147,6 +175,16 @@
       <!-- Pipelines View - File Discovery, Routing & Transform -->
       <div class="pipelines-view">
         <ScoutTab />
+      </div>
+    {:else if activeTab === "parser-lab"}
+      <!-- Parser Lab - Parser Development Workspace -->
+      <div class="parser-lab-view">
+        <ParserLabTab />
+      </div>
+    {:else if activeTab === "jobs"}
+      <!-- Jobs View - Processing Queue -->
+      <div class="jobs-view">
+        <JobsTab />
       </div>
     {:else if activeTab === "publish"}
       <!-- Publish View -->
@@ -474,6 +512,19 @@
   /* Pipelines View */
   .pipelines-view {
     height: 100%;
+    overflow: hidden;
+  }
+
+  /* Shredder View */
+  .shredder-view {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  /* Jobs View */
+  .jobs-view {
+    height: 100%;
+    padding: var(--space-lg);
     overflow: hidden;
   }
 

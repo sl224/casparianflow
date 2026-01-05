@@ -3,11 +3,11 @@
  */
 
 :root {
-  /* Color palette - Cyberpunk inspired */
-  --color-bg-primary: #0a0a0f;
-  --color-bg-secondary: #12121a;
-  --color-bg-tertiary: #1a1a24;
-  --color-bg-card: #16161f;
+  /* Color palette - Cyberpunk inspired (lightened for readability) */
+  --color-bg-primary: #16161e;
+  --color-bg-secondary: #1e1e28;
+  --color-bg-tertiary: #262632;
+  --color-bg-card: #21212c;
 
   /* Accent colors */
   --color-accent-cyan: #00d4ff;
@@ -23,8 +23,8 @@
   --color-text-muted: #555566;
 
   /* Border colors */
-  --color-border: #2a2a3a;
-  --color-border-hover: #3a3a4a;
+  --color-border: #35354a;
+  --color-border-hover: #45455a;
 
   /* Status colors */
   --color-success: #00ff88;

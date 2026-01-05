@@ -13,7 +13,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "PATH=$HOME/.nvm/versions/node/v20.19.6/bin:$PATH playwright test",
-    "verify": "./scripts/verify-build.sh"
+    "test:e2e:bridge": "USE_BRIDGE=true PATH=$HOME/.nvm/versions/node/v20.19.6/bin:$PATH playwright test",
+    "verify": "./scripts/verify-build.sh",
+    "reset-db": "bun run scripts/reset-db.ts"
   },
   "license": "MIT",
   "dependencies": {

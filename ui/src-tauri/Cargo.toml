@@ -60,5 +60,14 @@ arrow.workspace = true
 # Parquet (for output file metadata reading)
 parquet.workspace = true
 
+# Binary path lookup
+which = "7.0"
+
+# UUID generation (for splitter sessions)
+uuid = { version = "1", features = ["v4"] }
+
+# SQLite (for splitter session persistence in Scout DB)
+rusqlite = "0.32"
+
 [dev-dependencies]
 tempfile = "3.14"

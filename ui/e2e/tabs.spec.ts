@@ -47,6 +47,21 @@ test.describe('Tab Navigation', () => {
     expect(errors).toHaveLength(0);
   });
 
+  test('Jobs tab loads without errors', async ({ page }) => {
+    const errors: string[] = [];
+    page.on('pageerror', err => errors.push(err.message));
+
+    await page.click('button:has-text("JOBS")');
+
+    await page.waitForTimeout(500);
+
+    // Verify jobs view content
+    await expect(page.locator('.jobs-view')).toBeVisible();
+    await expect(page.locator('.jobs-tab')).toBeVisible();
+
+    expect(errors).toHaveLength(0);
+  });
+
   test('Publish tab loads without errors', async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', err => errors.push(err.message));
@@ -65,8 +80,8 @@ test.describe('Tab Navigation', () => {
     const errors: string[] = [];
     page.on('pageerror', err => errors.push(err.message));
 
-    // Click through all tabs (3 tabs per UI plan)
-    const tabs = ['DASHBOARD', 'PIPELINES', 'PUBLISH'];
+    // Click through all tabs (4 tabs)
+    const tabs = ['DASHBOARD', 'PIPELINES', 'JOBS', 'PUBLISH'];
 
     for (const tab of tabs) {
       await page.click(`button:has-text("${tab}")`);

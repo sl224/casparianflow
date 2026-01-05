@@ -1,10 +1,10 @@
 /**
  * Scout (Pipelines) E2E Tests
  *
- * Tests the unified tree view for pipelines:
- * - Empty state shows correctly
- * - Add folder button is visible
- * - Source expansion works
+ * Tests the file-centric two-pane layout:
+ * - Empty state shows correctly when no sources
+ * - Header with source selector and Add Folder button
+ * - Filter bar, file list, and detail pane (when file selected)
  * - No JS errors during interaction
  */
 
@@ -53,12 +53,15 @@ test.describe('Scout Pipelines Tab', () => {
     expect(errors).toHaveLength(0);
   });
 
-  test('tree view container exists', async ({ page }) => {
+  test('scout tab container renders correctly', async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', err => errors.push(err.message));
 
-    // The unified tree view container should exist
-    await expect(page.locator('.tree-view')).toBeVisible();
+    // The main scout-tab container should exist
+    await expect(page.locator('.scout-tab')).toBeVisible();
+
+    // Header should be present
+    await expect(page.locator('.scout-tab .header')).toBeVisible();
 
     expect(errors).toHaveLength(0);
   });

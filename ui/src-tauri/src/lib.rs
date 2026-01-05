@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{oneshot, Mutex};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// System pulse event - emitted periodically with current metrics
 #[derive(Debug, Clone, Serialize)]
@@ -358,13 +358,19 @@ async fn get_job_outputs(
 
     let limit = limit.unwrap_or(50);
 
-    // Include both completed and failed jobs so users can debug failures
+    // Include all job statuses - RUNNING/QUEUED first, then recent completed/failed
     let jobs: Vec<(i32, String, String, Option<String>, Option<String>)> = sqlx::query_as(
         r#"
         SELECT id, plugin_name, status, result_summary, end_time
         FROM cf_processing_queue
-        WHERE status IN ('COMPLETED', 'FAILED')
-        ORDER BY end_time DESC
+        WHERE status IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED')
+        ORDER BY
+            CASE status
+                WHEN 'RUNNING' THEN 1
+                WHEN 'QUEUED' THEN 2
+                ELSE 3
+            END,
+            id DESC
         LIMIT ?
         "#,
     )
@@ -458,6 +464,46 @@ async fn get_job_details(
         retry_count: job.8,
         logs,
     })
+}
+
+/// Information about a deployed plugin
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployedPlugin {
+    pub plugin_name: String,
+    pub version: String,
+    pub status: String,
+    pub deployed_at: Option<String>,
+}
+
+/// List all deployed plugins from the manifest
+#[tauri::command]
+async fn list_deployed_plugins(
+    state: tauri::State<'_, SentinelState>,
+) -> Result<Vec<DeployedPlugin>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let plugins: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT plugin_name, version, status, deployed_at
+        FROM cf_plugin_manifest
+        ORDER BY deployed_at DESC, plugin_name
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to query plugins: {}", e))?;
+
+    Ok(plugins
+        .into_iter()
+        .map(|(name, version, status, deployed_at)| DeployedPlugin {
+            plugin_name: name,
+            version,
+            status,
+            deployed_at,
+        })
+        .collect())
 }
 
 // ============================================================================
@@ -645,6 +691,144 @@ pub struct SubmitResult {
     pub no_plugin: Vec<(i64, String)>,
 }
 
+/// Bridge a Scout file to Sentinel's file tracking tables.
+/// Creates entries in cf_source_root, cf_file_location, cf_file_hash_registry, cf_file_version.
+/// Returns the file_version_id to use in cf_processing_queue.
+async fn ensure_file_in_sentinel(
+    pool: &sqlx::SqlitePool,
+    source_path: &str,
+    rel_path: &str,
+    content_hash: &str,
+    size: u64,
+    mtime: i64,
+    tag: &str,
+) -> Result<i64, String> {
+    // 1. Ensure source_root exists (use path as unique key)
+    let source_root_id: i64 = match sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM cf_source_root WHERE path = ?"
+    )
+    .bind(source_path)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to query source_root: {}", e))?
+    {
+        Some(id) => id,
+        None => {
+            sqlx::query("INSERT INTO cf_source_root (path) VALUES (?)")
+                .bind(source_path)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("Failed to insert source_root: {}", e))?
+                .last_insert_rowid()
+        }
+    };
+
+    // 2. Ensure file_location exists
+    let filename = std::path::Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(rel_path);
+
+    let location_id: i64 = match sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM cf_file_location WHERE source_root_id = ? AND rel_path = ?"
+    )
+    .bind(source_root_id)
+    .bind(rel_path)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to query file_location: {}", e))?
+    {
+        Some(id) => {
+            // Update existing
+            sqlx::query(
+                "UPDATE cf_file_location SET last_known_mtime=?, last_known_size=?, last_seen_time=CURRENT_TIMESTAMP WHERE id=?"
+            )
+            .bind(mtime as f64)
+            .bind(size as i64)
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to update file_location: {}", e))?;
+            id
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO cf_file_location (source_root_id, rel_path, filename, last_known_mtime, last_known_size) VALUES (?, ?, ?, ?, ?)"
+            )
+            .bind(source_root_id)
+            .bind(rel_path)
+            .bind(filename)
+            .bind(mtime as f64)
+            .bind(size as i64)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to insert file_location: {}", e))?
+            .last_insert_rowid()
+        }
+    };
+
+    // 3. Ensure hash_registry entry exists (with correct column names and required size_bytes)
+    sqlx::query(
+        "INSERT OR IGNORE INTO cf_file_hash_registry (content_hash, first_seen, size_bytes)
+         VALUES (?, CURRENT_TIMESTAMP, ?)"
+    )
+    .bind(content_hash)
+    .bind(size as i64)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to insert hash_registry: {}", e))?;
+
+    // 4. Create or find file_version
+    let mtime_str = chrono::DateTime::from_timestamp(mtime, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "1970-01-01 00:00:00".to_string());
+
+    let file_version_id: i64 = match sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM cf_file_version WHERE location_id = ? AND content_hash = ?"
+    )
+    .bind(location_id)
+    .bind(content_hash)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to query file_version: {}", e))?
+    {
+        Some(id) => {
+            // Update tags
+            sqlx::query("UPDATE cf_file_version SET applied_tags = ? WHERE id = ?")
+                .bind(tag)
+                .bind(id)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("Failed to update file_version: {}", e))?;
+            id
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO cf_file_version (location_id, content_hash, size_bytes, modified_time, applied_tags) VALUES (?, ?, ?, ?, ?)"
+            )
+            .bind(location_id)
+            .bind(content_hash)
+            .bind(size as i64)
+            .bind(&mtime_str)
+            .bind(tag)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to insert file_version: {}", e))?
+            .last_insert_rowid()
+        }
+    };
+
+    // 5. Update location's current_version_id
+    sqlx::query("UPDATE cf_file_location SET current_version_id = ? WHERE id = ?")
+        .bind(file_version_id)
+        .bind(location_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to update current_version: {}", e))?;
+
+    Ok(file_version_id)
+}
+
 /// Submit tagged files to Sentinel's processing queue
 ///
 /// This is the bridge between Scout (discovery + tagging) and Sentinel (processing).
@@ -693,22 +877,70 @@ async fn submit_tagged_files(
             continue; // No tag, skip
         };
 
-        // Find plugin(s) that subscribe to this tag
-        let matching_plugins: Vec<&str> = plugin_configs
-            .iter()
-            .filter(|(_, tags)| tags.split(',').any(|t| t.trim() == tag))
-            .map(|(name, _)| name.as_str())
-            .collect();
+        // Get plugin to use: manual override takes precedence over tag-based matching
+        let plugin_name = if let Some(ref manual) = file.manual_plugin {
+            // manual_plugin should be a plugin NAME, not a path
+            // If it looks like a path, that's legacy data - reject it clearly
+            if manual.contains('/') || manual.contains('\\') {
+                no_plugin.push((file_id, format!(
+                    "Manual plugin is a file path '{}'. Please clear override and re-select from dropdown.",
+                    manual
+                )));
+                skipped += 1;
+                continue;
+            }
 
-        if matching_plugins.is_empty() {
-            no_plugin.push((file_id, tag.clone()));
-            skipped += 1;
-            continue;
-        }
+            // Verify plugin exists in registry
+            if !plugin_configs.iter().any(|(name, _)| name == manual) {
+                no_plugin.push((file_id, format!(
+                    "Plugin '{}' not registered. Available: {:?}",
+                    manual,
+                    plugin_configs.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                )));
+                skipped += 1;
+                continue;
+            }
+            manual.clone()
+        } else {
+            // Tag-based matching: exact match only
+            let matching_plugins: Vec<&str> = plugin_configs
+                .iter()
+                .filter(|(_, tags)| tags.split(',').any(|t| t.trim() == tag))
+                .map(|(name, _)| name.as_str())
+                .collect();
 
-        // For now, use the first matching plugin
-        // Future: could create multiple jobs for multiple plugins
-        let plugin_name = matching_plugins[0];
+            if matching_plugins.is_empty() {
+                no_plugin.push((file_id, tag.clone()));
+                skipped += 1;
+                continue;
+            }
+
+            // For now, use the first matching plugin
+            // Future: could create multiple jobs for multiple plugins
+            matching_plugins[0].to_string()
+        };
+
+        // Get source path for bridging to Sentinel
+        let source = scout_db
+            .get_source(&file.source_id)
+            .map_err(|e| format!("Failed to get source {}: {}", file.source_id, e))?
+            .ok_or_else(|| format!("Source {} not found", file.source_id))?;
+
+        // Bridge Scout file to Sentinel's file tracking tables
+        // Generate a pseudo-hash if Scout file doesn't have a real content hash
+        let content_hash = file.content_hash.clone().unwrap_or_else(|| {
+            format!("scout:{}:{}:{}", file.rel_path, file.mtime, file.size)
+        });
+        let file_version_id = ensure_file_in_sentinel(
+            pool,
+            &source.path,
+            &file.rel_path,
+            &content_hash,
+            file.size,
+            file.mtime,
+            tag,
+        )
+        .await?;
 
         // Insert job into Sentinel's queue
         let result = sqlx::query(
@@ -718,8 +950,8 @@ async fn submit_tagged_files(
             VALUES (?, ?, 'QUEUED', 0, NULL)
             "#,
         )
-        .bind(file_id) // Using file_id as file_version_id for now
-        .bind(plugin_name)
+        .bind(file_version_id)
+        .bind(&plugin_name)
         .execute(pool)
         .await
         .map_err(|e| format!("Failed to create job for file {}: {}", file_id, e))?;
@@ -750,6 +982,94 @@ async fn submit_tagged_files(
     })
 }
 
+/// Spawn a worker process to execute a job
+///
+/// This runs `casparian process-job <job_id> --db <db_path> --output <output_path>`
+/// in the background. The process runs independently and updates the job status
+/// in the database when done.
+#[tauri::command]
+async fn process_job_async(
+    state: tauri::State<'_, SentinelState>,
+    job_id: i64,
+) -> Result<(), String> {
+    // Get database path from state
+    let db_url = state.database_url.clone();
+
+    // Extract file path from URL like "sqlite:/path?mode=rwc"
+    let db_path = db_url
+        .strip_prefix("sqlite:")
+        .unwrap_or(&db_url)
+        .split('?')
+        .next()
+        .unwrap_or(&db_url)
+        .to_string();
+
+    // Set up output directory (relative to db location)
+    let db_parent = std::path::Path::new(&db_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let output_dir = db_parent.join("output");
+
+    info!(job_id, db = %db_path, output = %output_dir.display(), "Spawning job processor");
+
+    // Find the casparian binary
+    let casparian_path = find_casparian_binary()?;
+
+    // Spawn the process
+    let mut cmd = std::process::Command::new(&casparian_path);
+    cmd.arg("process-job")
+        .arg(job_id.to_string())
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--output")
+        .arg(&output_dir);
+
+    // Spawn without waiting
+    match cmd.spawn() {
+        Ok(child) => {
+            info!(job_id, pid = child.id(), "Worker process spawned");
+            Ok(())
+        }
+        Err(e) => {
+            error!(job_id, error = %e, "Failed to spawn worker process");
+            Err(format!("Failed to spawn worker: {}", e))
+        }
+    }
+}
+
+/// Find the casparian binary
+fn find_casparian_binary() -> Result<std::path::PathBuf, String> {
+    // First, try the current executable's directory (for bundled apps)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let bundled = exe_dir.join("casparian");
+            if bundled.exists() {
+                return Ok(bundled);
+            }
+        }
+    }
+
+    // Then try the target directory (for development)
+    for profile in ["release", "debug"] {
+        let dev_path = std::path::PathBuf::from(format!("target/{}/casparian", profile));
+        if dev_path.exists() {
+            return Ok(dev_path);
+        }
+        // Also try parent directories (ui/src-tauri runs from within ui/)
+        let parent_dev_path = std::path::PathBuf::from(format!("../../target/{}/casparian", profile));
+        if parent_dev_path.exists() {
+            return Ok(parent_dev_path);
+        }
+    }
+
+    // Finally, try PATH
+    if let Ok(path) = which::which("casparian") {
+        return Ok(path);
+    }
+
+    Err("casparian binary not found".to_string())
+}
+
 /// Get plugins available for a tag
 #[tauri::command]
 async fn get_plugins_for_tag(
@@ -766,6 +1086,7 @@ async fn get_plugins_for_tag(
     .await
     .map_err(|e| format!("Failed to query plugins: {}", e))?;
 
+    // Exact match only - tags are stored without prefix
     let matching: Vec<String> = plugins
         .into_iter()
         .filter(|(_, tags)| tags.split(',').any(|t| t.trim() == tag))
@@ -1237,6 +1558,201 @@ fn start_sentinel(
     shutdown_tx
 }
 
+/// Create Sentinel database tables if they don't exist
+async fn create_sentinel_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // Plugin manifest (source of truth for plugins)
+    // Columns used: plugin_name, version, source_code, source_hash, env_hash, status, created_at
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plugin_name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            source_code TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            env_hash TEXT,
+            status TEXT DEFAULT 'ACTIVE',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            deployed_at TEXT,
+            UNIQUE(plugin_name, version)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Plugin config (subscription tags)
+    // Columns used: plugin_name, subscription_tags, default_parameters, enabled
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_plugin_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plugin_name TEXT UNIQUE NOT NULL,
+            subscription_tags TEXT NOT NULL,
+            default_parameters TEXT,
+            enabled INTEGER DEFAULT 1
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Plugin subscriptions (used by topology view)
+    // Columns used: plugin_name, topic_name, is_active
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_plugin_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plugin_name TEXT NOT NULL,
+            topic_name TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(plugin_name, topic_name)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Topic config (output routing)
+    // Columns used: plugin_name, topic_name, uri, mode, sink_type, schema_json
+    // NOTE: schema_json is required by casparian_sentinel TopicConfig model
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_topic_config (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plugin_name TEXT NOT NULL,
+            topic_name TEXT NOT NULL,
+            uri TEXT NOT NULL,
+            mode TEXT DEFAULT 'write',
+            sink_type TEXT DEFAULT 'parquet',
+            schema_json TEXT,
+            enabled INTEGER DEFAULT 1,
+            UNIQUE(plugin_name, topic_name)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Migration: Add sink_type column if missing (for existing databases)
+    let _ = sqlx::query("ALTER TABLE cf_topic_config ADD COLUMN sink_type TEXT DEFAULT 'parquet'")
+        .execute(pool)
+        .await;
+
+    // Migration: Add schema_json column if missing (required by Sentinel)
+    let _ = sqlx::query("ALTER TABLE cf_topic_config ADD COLUMN schema_json TEXT")
+        .execute(pool)
+        .await;
+
+    // Routing rules (tag matching)
+    // Columns used: pattern, tag, priority, enabled, description
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_routing_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            enabled INTEGER DEFAULT 1,
+            description TEXT
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Processing queue
+    // Columns used: file_version_id, plugin_name, input_file, status, priority,
+    //               config_overrides, claim_time, end_time, result_summary, error_message, retry_count
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_processing_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_version_id INTEGER,
+            plugin_name TEXT NOT NULL,
+            input_file TEXT,
+            status TEXT DEFAULT 'QUEUED',
+            priority INTEGER DEFAULT 0,
+            config_overrides TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            started_at TEXT,
+            completed_at TEXT,
+            claim_time TEXT,
+            end_time TEXT,
+            result_summary TEXT,
+            error_message TEXT,
+            retry_count INTEGER DEFAULT 0,
+            logs TEXT,
+            FOREIGN KEY (file_version_id) REFERENCES cf_file_version(id)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Job logs (cold storage for job execution logs)
+    // Columns used: job_id, log_text
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_job_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER NOT NULL,
+            log_text TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES cf_processing_queue(id)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // File tracking tables (for submit_tagged_files)
+    // cf_source_root: path
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_source_root (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // cf_file_location: source_root_id, rel_path, filename, last_known_mtime, last_known_size,
+    //                   current_version_id, last_seen_time
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_file_location (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_root_id INTEGER NOT NULL,
+            rel_path TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            last_known_mtime REAL,
+            last_known_size INTEGER,
+            current_version_id INTEGER,
+            last_seen_time TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (source_root_id) REFERENCES cf_source_root(id)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // cf_file_hash_registry: content_hash, first_seen, size_bytes
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_file_hash_registry (
+            content_hash TEXT PRIMARY KEY,
+            first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+            size_bytes INTEGER NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // cf_file_version: location_id, content_hash, size_bytes, modified_time, applied_tags
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS cf_file_version (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location_id INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            modified_time TEXT,
+            applied_tags TEXT DEFAULT '',
+            FOREIGN KEY (location_id) REFERENCES cf_file_location(id),
+            FOREIGN KEY (content_hash) REFERENCES cf_file_hash_registry(content_hash)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    info!("Sentinel database tables created/verified");
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize logging
@@ -1260,15 +1776,17 @@ pub fn run() {
         format!("ipc://{}", socket_path.display())
     });
 
-    // Default to the database in the project root
+    // Default to the database in ~/.casparian_flow/
     let database_url = std::env::var("CASPARIAN_DATABASE").unwrap_or_else(|_| {
-        // Try to find database relative to executable or use absolute path
-        let project_db = std::path::Path::new("/Users/shan/workspace/casparianflow/casparian_flow.sqlite3");
-        if project_db.exists() {
-            format!("sqlite://{}", project_db.display())
-        } else {
-            "sqlite://casparian_flow.sqlite3".to_string()
-        }
+        // Use standard location - always absolute path
+        let cf_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".casparian_flow");
+        // Create directory if it doesn't exist
+        let _ = std::fs::create_dir_all(&cf_dir);
+        let db_path = cf_dir.join("casparian_flow.sqlite3");
+        // Use mode=rwc to auto-create
+        format!("sqlite:{}?mode=rwc", db_path.display())
     });
 
     // Shared running flag
@@ -1277,7 +1795,7 @@ pub fn run() {
     // Database pool (initialized lazily in setup)
     let db_pool = Arc::new(Mutex::new(None));
 
-    // Start the Sentinel
+    // Start the Sentinel (database will be created with ?mode=rwc)
     let shutdown_tx = start_sentinel(running.clone(), bind_addr.clone(), database_url.clone());
 
     // Create state
@@ -1305,6 +1823,7 @@ pub fn run() {
             get_topology,
             get_job_outputs,
             get_job_details,
+            list_deployed_plugins,
             read_plugin_file,
             write_plugin_file,
             list_plugins,
@@ -1320,6 +1839,7 @@ pub fn run() {
             // Scout-Sentinel Bridge
             submit_tagged_files,
             get_plugins_for_tag,
+            process_job_async,
             // Publish Wizard (Real I/O)
             analyze_plugin_manifest,
             publish_with_overrides,
@@ -1348,26 +1868,76 @@ pub fn run() {
             scout::scout_preview_pattern,
             scout::scout_analyze_coverage,
             scout::scout_retry_failed,
+            // Scout manual override commands
+            scout::scout_set_manual_plugin,
+            scout::scout_clear_manual_overrides,
+            scout::scout_list_manual_files,
+            scout::scout_get_file,
+            // Shredder commands
+            scout::shredder_analyze,
+            scout::shredder_analyze_smart,
+            scout::shredder_chat,
+            scout::shredder_analyze_full,
+            scout::shredder_run,
+            // Parser generation commands
+            scout::save_llm_config,
+            scout::load_llm_config,
+            scout::generate_parser_draft,
+            scout::validate_parser,
+            scout::parser_refinement_chat,
+            scout::propose_schema,
+            scout::publish_parser,
+            scout::validate_subscription_tag,
+            // Shard utility commands
+            scout::get_shredder_output_dir,
+            scout::get_parsers_dir,
+            scout::preview_shard,
+            // Splitter session persistence
+            scout::splitter_create_session,
+            scout::splitter_get_session,
+            scout::splitter_update_session,
+            scout::splitter_list_sessions,
+            scout::splitter_delete_session,
+            scout::splitter_save_parser_draft,
+            scout::splitter_get_parser_draft,
+            scout::splitter_list_parser_drafts,
+            // Parser Lab (v6 - parser-centric, no project layer)
+            scout::parser_lab_create_parser,
+            scout::parser_lab_get_parser,
+            scout::parser_lab_update_parser,
+            scout::parser_lab_delete_parser,
+            scout::parser_lab_list_parsers,
+            scout::parser_lab_add_test_file,
+            scout::parser_lab_remove_test_file,
+            scout::parser_lab_list_test_files,
+            scout::parser_lab_validate_parser,
+            scout::parser_lab_import_plugin,
+            scout::parser_lab_list_importable_plugins,
+            scout::parser_lab_load_sample,
+            scout::parser_lab_chat,
+            // Plugin registry commands (DB as source of truth)
+            scout::list_registered_plugins,
+            scout::ensure_plugin_cached,
         ])
         .setup(move |app| {
-            // Initialize database pool
+            // Initialize database pool (blocking to ensure ready before commands)
             let db_pool_clone = db_pool.clone();
             let database_url_clone = database_url.clone();
 
-            tauri::async_runtime::spawn(async move {
-                // Extract the file path from the URL
-                let db_path = database_url_clone
-                    .strip_prefix("sqlite://")
-                    .unwrap_or(&database_url_clone);
-
-                match SqlitePool::connect(&format!("sqlite:{}", db_path)).await {
+            tauri::async_runtime::block_on(async move {
+                // database_url already has ?mode=rwc, use it directly
+                match SqlitePool::connect(&database_url_clone).await {
                     Ok(pool) => {
+                        // Run migrations to create tables
+                        if let Err(e) = create_sentinel_tables(&pool).await {
+                            error!("Failed to create Sentinel tables: {}", e);
+                        }
                         let mut guard = db_pool_clone.lock().await;
                         *guard = Some(pool);
-                        info!("Database pool initialized");
+                        info!("Sentinel database pool initialized: {}", database_url_clone);
                     }
                     Err(e) => {
-                        warn!("Failed to initialize database pool: {}", e);
+                        error!("Failed to initialize Sentinel database pool: {} - {}", database_url_clone, e);
                     }
                 }
             });
@@ -1558,5 +2128,133 @@ mod tests {
         let json = serde_json::to_string(&topology).unwrap();
         assert!(json.contains("\"nodes\":[]"));
         assert!(json.contains("\"edges\":[]"));
+    }
+
+    // =========================================================================
+    // File Bridging Tests (Scout -> Sentinel)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_ensure_file_in_sentinel_creates_fk_chain() {
+        // Create in-memory SQLite database
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("Failed to create in-memory database");
+
+        // Create required tables (minimal schema for this test)
+        sqlx::query(
+            r#"
+            CREATE TABLE cf_source_root (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE cf_file_location (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_root_id INTEGER NOT NULL,
+                rel_path TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                last_known_mtime REAL,
+                last_known_size INTEGER,
+                current_version_id INTEGER,
+                FOREIGN KEY (source_root_id) REFERENCES cf_source_root(id)
+            );
+            CREATE TABLE cf_file_hash_registry (
+                content_hash TEXT PRIMARY KEY,
+                first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                size_bytes INTEGER NOT NULL
+            );
+            CREATE TABLE cf_file_version (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                location_id INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                modified_time TEXT NOT NULL,
+                applied_tags TEXT DEFAULT '',
+                FOREIGN KEY (location_id) REFERENCES cf_file_location(id),
+                FOREIGN KEY (content_hash) REFERENCES cf_file_hash_registry(content_hash)
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create schema");
+
+        // Enable foreign keys
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .expect("Failed to enable foreign keys");
+
+        // Call ensure_file_in_sentinel
+        let result = ensure_file_in_sentinel(
+            &pool,
+            "/test/source",
+            "data/test.csv",
+            "scout:data/test.csv:1704067200:1024",
+            1024,
+            1704067200,
+            "test-tag",
+        )
+        .await;
+
+        assert!(result.is_ok(), "ensure_file_in_sentinel failed: {:?}", result);
+        let file_version_id = result.unwrap();
+        assert!(file_version_id > 0, "file_version_id should be positive");
+
+        // Verify the FK chain was created correctly
+        let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cf_source_root")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(source_count, 1, "Should have 1 source_root");
+
+        let location_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cf_file_location")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(location_count, 1, "Should have 1 file_location");
+
+        let hash_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cf_file_hash_registry")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(hash_count, 1, "Should have 1 hash_registry entry");
+
+        let version_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cf_file_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version_count, 1, "Should have 1 file_version");
+
+        // Verify cf_processing_queue can reference this file_version_id
+        sqlx::query(
+            r#"
+            CREATE TABLE cf_processing_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_version_id INTEGER NOT NULL,
+                plugin_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'QUEUED',
+                FOREIGN KEY (file_version_id) REFERENCES cf_file_version(id)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create processing_queue table");
+
+        // This should NOT fail with FK constraint error
+        let insert_result = sqlx::query(
+            "INSERT INTO cf_processing_queue (file_version_id, plugin_name, status) VALUES (?, ?, 'QUEUED')",
+        )
+        .bind(file_version_id)
+        .bind("test-plugin")
+        .execute(&pool)
+        .await;
+
+        assert!(
+            insert_result.is_ok(),
+            "Should be able to insert into processing_queue with file_version_id: {:?}",
+            insert_result
+        );
     }
 }

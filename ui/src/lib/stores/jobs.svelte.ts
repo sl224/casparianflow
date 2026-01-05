@@ -144,6 +144,38 @@ class JobsStore {
     this.detailsError = null;
   }
 
+  /** Select a job by ID (for navigation from Scout) */
+  async selectJobById(jobId: number): Promise<void> {
+    // Try to find in existing list first
+    let job = this.jobs.find((j) => j.jobId === jobId);
+
+    if (!job) {
+      // Fetch from backend
+      try {
+        const details = await invoke<JobDetails>("get_job_details", { jobId });
+        if (details) {
+          // Create a JobOutput from details
+          job = {
+            jobId: details.jobId,
+            pluginName: details.pluginName,
+            status: details.status,
+            outputPath: details.outputPath,
+            completedAt: details.endTime,
+          };
+          // Add to list
+          this.jobs = [...this.jobs, job];
+        }
+      } catch (err) {
+        console.error("[JobsStore] Failed to fetch job by ID:", err);
+        return;
+      }
+    }
+
+    if (job) {
+      await this.selectJob(job);
+    }
+  }
+
   /** Get jobs that have queryable output files */
   get queryableJobs(): JobOutput[] {
     return this.jobs.filter(j => j.outputPath !== null);
