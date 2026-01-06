@@ -47,6 +47,8 @@ chrono = { version = "0.4", features = ["serde"] }
 glob = "0.3"
 dirs = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+indicatif = { version = "0.17", features = ["rayon"] }
 
 # Arrow/Parquet for preview
 arrow.workspace = true
