@@ -432,9 +432,7 @@ fn main() -> Result<()> {
             no_queue,
         }),
 
-        Commands::Untag { path: _ } => {
-            todo!("W2 implements this")
-        }
+        Commands::Untag { path } => cli::tag::run_untag(cli::tag::UntagArgs { path }),
 
         Commands::Files {
             topic,
