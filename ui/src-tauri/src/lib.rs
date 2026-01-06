@@ -1477,6 +1477,133 @@ async fn publish_with_overrides(
     })
 }
 
+/// Start the job processor loop
+///
+/// Polls the database every 2 seconds for QUEUED jobs and spawns worker processes.
+fn start_job_processor(pool: Arc<Mutex<Option<Pool<Sqlite>>>>, running: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create job processor runtime");
+
+        rt.block_on(async {
+            info!("Job processor loop started");
+
+            loop {
+                // Check if we should stop
+                if !running.load(Ordering::Relaxed) {
+                    info!("Job processor loop stopping (running=false)");
+                    break;
+                }
+
+                // Try to get the database pool
+                let pool_guard = pool.lock().await;
+                if let Some(db_pool) = pool_guard.as_ref() {
+                    // Query for oldest QUEUED job
+                    let job: Option<(i64, String)> = sqlx::query_as(
+                        "SELECT id, plugin_name FROM cf_processing_queue WHERE status = 'QUEUED' ORDER BY id LIMIT 1"
+                    )
+                    .fetch_optional(db_pool)
+                    .await
+                    .ok()
+                    .flatten();
+
+                    if let Some((job_id, plugin_name)) = job {
+                        info!(job_id, plugin = %plugin_name, "Found QUEUED job, marking as RUNNING");
+
+                        // Mark as RUNNING with started_at timestamp
+                        let update_result = sqlx::query(
+                            "UPDATE cf_processing_queue SET status = 'RUNNING', started_at = datetime('now') WHERE id = ? AND status = 'QUEUED'"
+                        )
+                        .bind(job_id)
+                        .execute(db_pool)
+                        .await;
+
+                        if let Err(e) = update_result {
+                            error!(job_id, error = %e, "Failed to mark job as RUNNING");
+                        } else {
+                            // Get database path for the worker
+                            // Extract path from the pool's connect options
+                            // We need to get the database path from environment or default location
+                            let db_path = std::env::var("CASPARIAN_DATABASE")
+                                .map(|url| {
+                                    url.strip_prefix("sqlite:")
+                                        .unwrap_or(&url)
+                                        .split('?')
+                                        .next()
+                                        .unwrap_or(&url)
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|_| {
+                                    dirs::home_dir()
+                                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                        .join(".casparian_flow")
+                                        .join("casparian_flow.sqlite3")
+                                        .to_string_lossy()
+                                        .to_string()
+                                });
+
+                            // Set up output directory
+                            let db_parent = std::path::Path::new(&db_path)
+                                .parent()
+                                .unwrap_or(std::path::Path::new("."));
+                            let output_dir = db_parent.join("output");
+
+                            // Find and spawn the casparian binary
+                            match find_casparian_binary() {
+                                Ok(casparian_path) => {
+                                    let mut cmd = std::process::Command::new(&casparian_path);
+                                    cmd.arg("process-job")
+                                        .arg(job_id.to_string())
+                                        .arg("--db")
+                                        .arg(&db_path)
+                                        .arg("--output")
+                                        .arg(&output_dir);
+
+                                    match cmd.spawn() {
+                                        Ok(child) => {
+                                            info!(job_id, pid = child.id(), "Worker process spawned by job loop");
+                                        }
+                                        Err(e) => {
+                                            error!(job_id, error = %e, "Failed to spawn worker process");
+                                            // Mark job as FAILED since we couldn't spawn worker
+                                            let _ = sqlx::query(
+                                                "UPDATE cf_processing_queue SET status = 'FAILED', error_message = ?, end_time = datetime('now') WHERE id = ?"
+                                            )
+                                            .bind(format!("Failed to spawn worker: {}", e))
+                                            .bind(job_id)
+                                            .execute(db_pool)
+                                            .await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(job_id, error = %e, "Failed to find casparian binary");
+                                    // Mark job as FAILED
+                                    let _ = sqlx::query(
+                                        "UPDATE cf_processing_queue SET status = 'FAILED', error_message = ?, end_time = datetime('now') WHERE id = ?"
+                                    )
+                                    .bind(format!("Casparian binary not found: {}", e))
+                                    .bind(job_id)
+                                    .execute(db_pool)
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(pool_guard);
+
+                // Sleep for 2 seconds before next poll
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+
+            info!("Job processor loop stopped");
+        });
+    });
+}
+
 /// Start the pulse emitter task
 fn start_pulse_emitter(app: AppHandle, running: Arc<AtomicBool>) {
     // Spawn a task that emits system pulse events every 500ms
@@ -1903,6 +2030,8 @@ pub fn run() {
         .setup(move |app| {
             // Initialize database pool (blocking to ensure ready before commands)
             let db_pool_clone = db_pool.clone();
+            let db_pool_for_jobs = db_pool.clone();
+            let running_for_jobs = running.clone();
             let database_url_clone = database_url.clone();
 
             tauri::async_runtime::block_on(async move {
@@ -1926,6 +2055,9 @@ pub fn run() {
             // Start the pulse emitter after app is ready
             let app_handle = app.handle().clone();
             start_pulse_emitter(app_handle, running);
+
+            // Start the job processor loop (polls for QUEUED jobs every 2 seconds)
+            start_job_processor(db_pool_for_jobs, running_for_jobs);
 
             info!("Casparian Deck setup complete");
             Ok(())
