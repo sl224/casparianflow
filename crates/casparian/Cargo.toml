@@ -35,6 +35,9 @@ serde_json.workspace = true
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
 
+# Database
+sqlx.workspace = true
+
 # CLI utilities
 comfy-table = "7"
 walkdir = "2"
