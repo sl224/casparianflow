@@ -15,6 +15,7 @@
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
+use serde::Deserialize;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
@@ -25,6 +26,10 @@ use tracing::{debug, error, info, warn};
 /// Embedded Python bridge shim source code.
 /// This is baked into the binary at compile time for single-file distribution.
 const BRIDGE_SHIM_SOURCE: &str = include_str!("../shim/bridge_shim.py");
+
+/// Embedded casparian_types.py - the Output NamedTuple contract for parsers.
+/// Must be materialized alongside bridge_shim.py so imports work.
+const CASPARIAN_TYPES_SOURCE: &str = include_str!("../shim/casparian_types.py");
 
 /// Crate version for shim cache path versioning.
 /// When the shim changes, the version bump ensures old cached shims are replaced.
@@ -158,6 +163,19 @@ pub struct BridgeConfig {
     pub shim_path: PathBuf,
 }
 
+/// Metadata about a single output from a parser
+#[derive(Debug, Clone, Deserialize)]
+pub struct OutputInfo {
+    /// Output identifier (topic name)
+    pub name: String,
+    /// Destination type: "parquet", "sqlite", or "csv"
+    pub sink: String,
+    /// For sqlite sink: custom table name (defaults to output name)
+    pub table: Option<String>,
+    /// For parquet sink: compression algorithm
+    pub compression: Option<String>,
+}
+
 /// Result of bridge execution including data and logs
 #[derive(Debug)]
 pub struct BridgeResult {
@@ -166,6 +184,8 @@ pub struct BridgeResult {
     /// Captured logs from the plugin (stdout, stderr, logging)
     /// This is O(1) memory during execution but loaded at end (capped at 10MB)
     pub logs: String,
+    /// Output metadata from the parser (sink routing info)
+    pub output_info: Vec<OutputInfo>,
 }
 
 /// Execute a bridge job. This is the only public entry point.
@@ -274,6 +294,32 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
         log_writer.write_log(log_level::STDERR, &stderr_output);
     }
 
+    // Capture stdout (contains JSON metrics with output_info)
+    let stdout_output = collect_stdout(&mut process);
+
+    // Parse output_info from JSON metrics
+    let output_info = if !stdout_output.is_empty() {
+        match serde_json::from_str::<serde_json::Value>(&stdout_output) {
+            Ok(json) => {
+                if let Some(info_array) = json.get("output_info").and_then(|v| v.as_array()) {
+                    info_array
+                        .iter()
+                        .filter_map(|v| serde_json::from_value::<OutputInfo>(v.clone()).ok())
+                        .collect()
+                } else {
+                    debug!("[Job {}] No output_info in metrics JSON", job_id);
+                    vec![]
+                }
+            }
+            Err(e) => {
+                warn!("[Job {}] Failed to parse metrics JSON: {} (stdout: {})", job_id, e, stdout_output);
+                vec![]
+            }
+        }
+    } else {
+        vec![]
+    };
+
     // Cleanup
     let _ = std::fs::remove_file(&socket_path);
 
@@ -281,10 +327,10 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     let logs = log_writer.read_and_cleanup()
         .with_context(|| format!("[Job {}] Failed to read logs", job_id))?;
 
-    info!("[Job {}] Bridge execution complete: {} batches, {} bytes logs",
-          job_id, batches.len(), logs.len());
+    info!("[Job {}] Bridge execution complete: {} batches, {} bytes logs, {} outputs",
+          job_id, batches.len(), logs.len(), output_info.len());
 
-    Ok(BridgeResult { batches, logs })
+    Ok(BridgeResult { batches, logs, output_info })
 }
 
 /// Accept a connection with timeout, checking if process is still alive
@@ -398,6 +444,19 @@ fn collect_stderr(process: &mut Child) -> String {
         match stderr.read_to_string(&mut output) {
             Ok(_) => output.trim().to_string(),
             Err(e) => format!("(failed to read stderr: {})", e),
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// Collect stdout from process (consumes the stdout handle)
+fn collect_stdout(process: &mut Child) -> String {
+    if let Some(mut stdout) = process.stdout.take() {
+        let mut output = String::new();
+        match stdout.read_to_string(&mut output) {
+            Ok(_) => output.trim().to_string(),
+            Err(e) => format!("(failed to read stdout: {})", e),
         }
     } else {
         String::new()
@@ -549,22 +608,38 @@ fn read_arrow_batches(
 
         debug!("[Job {}] Received {} bytes of Arrow IPC data", job_id, length);
 
-        // Parse Arrow IPC stream
+        // Parse Arrow IPC stream - each IPC message is ONE output
+        // Multiple internal batches are concatenated into a single batch
         let cursor = std::io::Cursor::new(ipc_buf);
         let reader = StreamReader::try_new(cursor, None)
             .with_context(|| format!(
-                "[Job {}] Failed to parse Arrow IPC stream (batch {})",
+                "[Job {}] Failed to parse Arrow IPC stream (output {})",
                 job_id, batch_count
             ))?;
 
+        // Collect all batches from this IPC message
+        let mut ipc_batches: Vec<RecordBatch> = Vec::new();
         for batch_result in reader {
             let batch = batch_result
                 .with_context(|| format!(
                     "[Job {}] Failed to read Arrow batch from IPC stream",
                     job_id
                 ))?;
-            debug!("[Job {}] Parsed batch {}: {} rows", job_id, batch_count, batch.num_rows());
-            batches.push(batch);
+            ipc_batches.push(batch);
+        }
+
+        // Concatenate all batches from this IPC message into one
+        // This preserves the 1:1 mapping between outputs and batches
+        if !ipc_batches.is_empty() {
+            let schema = ipc_batches[0].schema();
+            let combined = arrow::compute::concat_batches(&schema, &ipc_batches)
+                .with_context(|| format!(
+                    "[Job {}] Failed to concatenate batches for output {}",
+                    job_id, batch_count
+                ))?;
+            debug!("[Job {}] Output {}: {} rows (from {} internal batches)",
+                   job_id, batch_count, combined.num_rows(), ipc_batches.len());
+            batches.push(combined);
         }
 
         batch_count += 1;
@@ -647,13 +722,16 @@ fn read_error_message(
     Ok(String::from_utf8_lossy(&error_buf).to_string())
 }
 
-/// Materialize the embedded bridge shim to the filesystem.
+/// Materialize the embedded bridge shim and casparian_types to the filesystem.
 ///
-/// The shim is written to `~/.casparian_flow/shim/{version}/bridge_shim.py`.
+/// The files are written to `~/.casparian_flow/shim/{version}/`:
+/// - bridge_shim.py - Main bridge execution code
+/// - casparian_types.py - Output NamedTuple contract for parsers
+///
 /// This ensures the single binary can run from any location without
 /// needing the source repository.
 ///
-/// The function is idempotent: if the file exists and matches, it's reused.
+/// The function is idempotent: if files exist and match, they're reused.
 /// Version changes cause a new directory to be created.
 pub fn materialize_bridge_shim() -> Result<PathBuf> {
     // Resolve cache directory: ~/.casparian_flow/shim/{version}/
@@ -667,77 +745,85 @@ pub fn materialize_bridge_shim() -> Result<PathBuf> {
         .join(CRATE_VERSION);
 
     let shim_path = shim_dir.join("bridge_shim.py");
+    let types_path = shim_dir.join("casparian_types.py");
 
-    // Check if file exists and content matches (fast path)
-    if shim_path.exists() {
-        match std::fs::read_to_string(&shim_path) {
-            Ok(existing) if existing == BRIDGE_SHIM_SOURCE => {
-                debug!("Using cached bridge shim: {}", shim_path.display());
-                return Ok(shim_path);
-            }
-            Ok(_) => {
-                info!("Bridge shim content changed, updating: {}", shim_path.display());
-            }
-            Err(e) => {
-                warn!("Failed to read existing shim, will recreate: {}", e);
-            }
-        }
+    // Check if both files exist and content matches (fast path)
+    let shim_ok = shim_path.exists() && matches!(
+        std::fs::read_to_string(&shim_path),
+        Ok(existing) if existing == BRIDGE_SHIM_SOURCE
+    );
+    let types_ok = types_path.exists() && matches!(
+        std::fs::read_to_string(&types_path),
+        Ok(existing) if existing == CASPARIAN_TYPES_SOURCE
+    );
+
+    if shim_ok && types_ok {
+        debug!("Using cached bridge shim: {}", shim_path.display());
+        return Ok(shim_path);
     }
 
     // Create directory if needed
     std::fs::create_dir_all(&shim_dir)
         .with_context(|| format!("Failed to create shim directory: {}", shim_dir.display()))?;
 
-    // Write shim atomically (write to temp, then rename)
-    // Use PID + thread ID + timestamp to avoid collisions in concurrent scenarios
-    let unique_id = format!(
-        "{}.{:?}.{}",
-        std::process::id(),
-        std::thread::current().id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let temp_path = shim_dir.join(format!(".bridge_shim.py.{}.tmp", unique_id));
+    // Helper to write a file atomically
+    let write_file_atomic = |name: &str, content: &str, target: &PathBuf| -> Result<()> {
+        let unique_id = format!(
+            "{}.{:?}.{}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let temp_path = shim_dir.join(format!(".{}.{}.tmp", name, unique_id));
 
-    let mut file = std::fs::File::create(&temp_path)
-        .with_context(|| format!("Failed to create temp shim file: {}", temp_path.display()))?;
+        let mut file = std::fs::File::create(&temp_path)
+            .with_context(|| format!("Failed to create temp file: {}", temp_path.display()))?;
 
-    file.write_all(BRIDGE_SHIM_SOURCE.as_bytes())
-        .with_context(|| format!("Failed to write shim content to: {}", temp_path.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("Failed to write content to: {}", temp_path.display()))?;
 
-    file.sync_all()
-        .with_context(|| "Failed to sync shim file to disk")?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync {} to disk", name))?;
 
-    drop(file);
+        drop(file);
 
-    // Set executable permission on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&temp_path, perms)
-            .with_context(|| format!("Failed to set permissions on: {}", temp_path.display()))?;
-    }
-
-    // Atomic rename (handles race: if another process already created it, this succeeds)
-    // On Unix, rename is atomic and will overwrite the destination
-    match std::fs::rename(&temp_path, &shim_path) {
-        Ok(()) => {
-            info!("Materialized bridge shim v{}: {}", CRATE_VERSION, shim_path.display());
+        // Set permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o644);
+            std::fs::set_permissions(&temp_path, perms)
+                .with_context(|| format!("Failed to set permissions on: {}", temp_path.display()))?;
         }
-        Err(e) => {
-            // Clean up temp file if rename failed (another process might have won the race)
-            let _ = std::fs::remove_file(&temp_path);
-            // If the target now exists, we're fine (another process created it)
-            if !shim_path.exists() {
-                return Err(e).with_context(|| {
-                    format!("Failed to rename temp shim to: {}", shim_path.display())
-                });
+
+        // Atomic rename
+        match std::fs::rename(&temp_path, target) {
+            Ok(()) => {
+                info!("Materialized {} v{}: {}", name, CRATE_VERSION, target.display());
             }
-            debug!("Another process materialized shim, using existing: {}", shim_path.display());
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                if !target.exists() {
+                    return Err(e).with_context(|| {
+                        format!("Failed to rename temp file to: {}", target.display())
+                    });
+                }
+                debug!("Another process materialized {}, using existing", name);
+            }
         }
+
+        Ok(())
+    };
+
+    // Write both files
+    if !shim_ok {
+        write_file_atomic("bridge_shim.py", BRIDGE_SHIM_SOURCE, &shim_path)?;
+    }
+    if !types_ok {
+        write_file_atomic("casparian_types.py", CASPARIAN_TYPES_SOURCE, &types_path)?;
     }
 
     Ok(shim_path)
@@ -758,7 +844,7 @@ mod tests {
 
     #[test]
     fn test_materialize_bridge_shim() {
-        // This test verifies the shim can be materialized
+        // This test verifies both shim files can be materialized
         let path = materialize_bridge_shim().unwrap();
         assert!(path.exists(), "Shim should exist after materialization");
         assert!(
@@ -771,20 +857,15 @@ mod tests {
             CRATE_VERSION
         );
 
-        // Verify content matches
+        // Verify bridge_shim.py content matches
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, BRIDGE_SHIM_SOURCE, "Content should match embedded source");
 
-        // Verify permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::metadata(&path).unwrap().permissions();
-            assert!(
-                perms.mode() & 0o111 != 0,
-                "Shim should be executable"
-            );
-        }
+        // Verify casparian_types.py also exists alongside
+        let types_path = path.parent().unwrap().join("casparian_types.py");
+        assert!(types_path.exists(), "casparian_types.py should exist alongside bridge_shim.py");
+        let types_content = std::fs::read_to_string(&types_path).unwrap();
+        assert_eq!(types_content, CASPARIAN_TYPES_SOURCE, "casparian_types content should match");
     }
 
     #[test]
@@ -808,6 +889,15 @@ mod tests {
         assert!(
             BRIDGE_SHIM_SOURCE.contains("def main()"),
             "Shim should contain main function"
+        );
+        // casparian_types.py checks
+        assert!(
+            !CASPARIAN_TYPES_SOURCE.is_empty(),
+            "Embedded casparian_types source should not be empty"
+        );
+        assert!(
+            CASPARIAN_TYPES_SOURCE.contains("class Output"),
+            "casparian_types should contain Output class"
         );
     }
 

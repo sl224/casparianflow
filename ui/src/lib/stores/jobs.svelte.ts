@@ -68,13 +68,20 @@ class JobsStore {
   }
 
   /** Refresh job list from backend */
-  async refreshJobs(limit: number = 50): Promise<void> {
-    this.loadingJobs = true;
+  async refreshJobs(limit: number = 50, showLoading: boolean = true): Promise<void> {
+    // Only show loading indicator on initial load, not during polling
+    if (showLoading && this.jobs.length === 0) {
+      this.loadingJobs = true;
+    }
     this.jobsError = null;
 
     try {
-      this.jobs = await invoke<JobOutput[]>("get_job_outputs", { limit });
-      console.log("[JobsStore] Loaded", this.jobs.length, "jobs");
+      const newJobs = await invoke<JobOutput[]>("get_job_outputs", { limit });
+      // Only update if actually changed to prevent unnecessary re-renders
+      if (JSON.stringify(newJobs) !== JSON.stringify(this.jobs)) {
+        this.jobs = newJobs;
+        console.log("[JobsStore] Updated", this.jobs.length, "jobs");
+      }
     } catch (err) {
       this.jobsError = err instanceof Error ? err.message : String(err);
       console.error("[JobsStore] Failed to load jobs:", this.jobsError);

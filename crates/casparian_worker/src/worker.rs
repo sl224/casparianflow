@@ -29,6 +29,9 @@ use crate::venv_manager::VenvManager;
 /// Maximum concurrent jobs per worker
 const MAX_CONCURRENT_JOBS: usize = 4;
 
+/// Heartbeat interval (seconds) - worker sends heartbeat to Sentinel
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
 /// Worker configuration (plain data)
 pub struct WorkerConfig {
     pub sentinel_addr: String,
@@ -127,6 +130,13 @@ impl Worker {
     pub async fn run(mut self) -> Result<()> {
         info!("Entering event loop...");
 
+        // Create heartbeat interval timer
+        let mut heartbeat_interval = tokio::time::interval(
+            Duration::from_secs(HEARTBEAT_INTERVAL_SECS)
+        );
+        // First tick completes immediately, skip it
+        heartbeat_interval.tick().await;
+
         loop {
             // Clean up completed jobs
             self.reap_completed_jobs();
@@ -150,7 +160,25 @@ impl Worker {
                     }
                 }
 
-                // Branch 3: Control Plane Messages from Sentinel
+                // Branch 3: Proactive heartbeat (keep Sentinel informed)
+                _ = heartbeat_interval.tick() => {
+                    let active_job_ids: Vec<i64> = self.active_jobs.keys()
+                        .map(|&id| id as i64)
+                        .collect();
+                    let status = if active_job_ids.is_empty() { "IDLE" } else { "BUSY" };
+                    let payload = types::HeartbeatPayload {
+                        status: status.to_string(),
+                        current_job_id: active_job_ids.first().copied(),
+                        active_job_count: active_job_ids.len(),
+                        active_job_ids,
+                    };
+                    debug!("Sending heartbeat: {} ({} active jobs)", status, payload.active_job_count);
+                    if let Err(e) = send_message(&mut self.socket, OpCode::Heartbeat, 0, &payload).await {
+                        warn!("Failed to send heartbeat: {}", e);
+                    }
+                }
+
+                // Branch 4: Control Plane Messages from Sentinel
                 // Inline recv logic to avoid borrowing self twice
                 recv_result = tokio::time::timeout(Duration::from_millis(100), self.socket.recv()) => {
                     match recv_result {

@@ -41,6 +41,7 @@ clap.workspace = true
 
 # Utilities
 sha2 = "0.10"
+regex = "1.10"
 hex = "0.4"
 uuid = { version = "1.11", features = ["v4"] }
 walkdir = "2.5"

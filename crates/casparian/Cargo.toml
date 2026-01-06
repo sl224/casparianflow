@@ -10,6 +10,7 @@ license.workspace = true
 casparian_scout = { path = "../casparian_scout" }
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
+casparian_mcp = { path = "../casparian_mcp" }
 cf_protocol = { path = "../cf_protocol" }
 cf_security = { path = "../cf_security" }
 
@@ -38,6 +39,9 @@ uuid = { version = "1.11", features = ["v4"] }
 
 # Database
 sqlx.workspace = true
+
+# Parallel processing
+rayon.workspace = true
 
 # CLI utilities
 comfy-table = "7"

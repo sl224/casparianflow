@@ -1,63 +1,133 @@
 # Casparian Flow
 
-An Enterprise Artifact Registry with Bridge Mode Execution for data processing pipelines.
+Transform "dark data" into queryable datasets with AI assistance.
 
-## Overview
+## What is Casparian Flow?
 
-Casparian Flow transforms "dark data" (files on disk) into structured, queryable datasets through:
+Casparian Flow is a data processing platform that:
 
-- **Bridge Mode Execution**: Host/Guest privilege separation via isolated virtual environments
-- **Publish-to-Execute Lifecycle**: Signed artifacts with Ed25519, auto-wired routing
-- **Immutable Versioning**: Every file change creates a traceable version
-- **Code-First Configuration**: Plugin source code defines routing and schemas
+1. **Discovers** files (CSVs, JSON, logs) across your systems
+2. **Infers** schemas using constraint-based type detection
+3. **Validates** parsers against real data with fail-fast testing
+4. **Executes** pipelines in isolated environments
+5. **Outputs** clean, queryable datasets (Parquet, SQLite, CSV)
+
+The system integrates with Claude Code via MCP (Model Context Protocol), enabling AI-assisted data processing workflows.
 
 ## Quick Start
 
 ```bash
-# Build the unified binary
+# Build
 cargo build --release
 
-# Run both Sentinel and Worker (unified process)
+# Start the system
 ./target/release/casparian start
 
-# Publish a plugin (creates signed artifact)
-./target/release/casparian publish my_plugin.py --version 1.0.0
+# Initialize Scout (file discovery)
+./target/release/casparian scout init
+
+# Run file discovery
+./target/release/casparian scout run --config scout.toml
 ```
+
+## Core Concepts
+
+### Schema = Intent, then Contract
+
+- **Before approval**: Schema is a proposal
+- **After approval**: Schema is a CONTRACT - parser must conform
+- **Violations**: Hard failures, not silent coercion
+
+### Constraint-Based Type Inference
+
+Traditional: "70% look like dates, so it's a date" (voting)
+
+Casparian: "31/05/24 PROVES DD/MM/YY because 31 > 12" (elimination)
+
+### Fail-Fast Backtest
+
+Test high-failure files first. If they still fail, stop early.
+
+### Bridge Mode Execution
+
+Plugins run in isolated subprocesses. Host has credentials. Guest has only code.
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete system design.
+```
+Claude Code ──MCP──> Casparian MCP Server
+                           │
+         ┌─────────────────┼─────────────────┐
+         ▼                 ▼                 ▼
+    Schema Contracts   Backtest Engine   Type Inference
+         │                 │                 │
+         └─────────────────┼─────────────────┘
+                           ▼
+                   Worker (Bridge Mode)
+                           │
+                           ▼
+                     Output Sinks
+```
 
-### Key Components
+### Crates
 
-| Component | Description |
-|-----------|-------------|
-| **Publisher CLI** | End-to-end artifact publishing with Ed25519 signing |
-| **Sentinel** | Control plane broker for job orchestration |
-| **Worker** | Data plane executor (Bridge Mode only) |
-| **Architect** | Plugin deployment lifecycle management |
-| **Scout** | File discovery and versioning service |
-| **VenvManager** | Isolated environment lifecycle (LRU eviction) |
+| Crate | Purpose |
+|-------|---------|
+| `casparian` | Unified CLI binary |
+| `casparian_mcp` | MCP server (9 tools) |
+| `casparian_schema` | Schema contracts |
+| `casparian_backtest` | Multi-file validation |
+| `casparian_worker` | Type inference + execution |
+| `casparian_scout` | File discovery |
+| `cf_security` | Auth + signing |
+| `cf_protocol` | Binary protocol |
 
-### Execution Model
+## MCP Tools
 
-- **Bridge Mode Only**: All plugins run in isolated venv subprocesses
-- **Auto-Lockfile**: `uv.lock` auto-generated if missing
-- **Arrow IPC**: Data streams via AF_UNIX sockets
-- **Lineage Tracking**: `file_version_id` flows to guest process
-- **Zero Trust**: Guest has no credentials, no heavy drivers
+| Tool | Purpose |
+|------|---------|
+| `quick_scan` | Fast file metadata scan |
+| `apply_scope` | Group files for processing |
+| `discover_schemas` | Infer schema from files |
+| `approve_schemas` | Create locked contracts |
+| `propose_amendment` | Modify contracts |
+| `run_backtest` | Validate parser |
+| `fix_parser` | Generate fixes |
+| `execute_pipeline` | Run processing |
+| `query_output` | Query results |
 
-## Security
+## Development
 
-- **Local Mode**: Zero friction development with auto-generated Ed25519 keys
-- **Enterprise Mode**: Azure AD integration with JWT validation
-- **Gatekeeper**: AST-based validation blocks dangerous imports
-- **Isolation**: Guest processes have no access to credentials
+```bash
+# Type check
+cargo check
+cd ui && bun run check
+
+# Build
+cargo build
+cd ui && bun run build
+
+# Test (E2E, no mocks)
+cargo test --package casparian_worker --test e2e_type_inference
+cargo test --package casparian_schema --test e2e_contracts
+cargo test --package casparian_backtest --test e2e_backtest
+cargo test --package casparian_mcp --test e2e_tools
+
+# UI E2E
+cd ui && bun run test:e2e
+```
+
+## Documentation
+
+- **[CLAUDE.md](CLAUDE.md)** - Entry point for LLM context
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Detailed system design
+- **Crate docs**: Each crate has its own `CLAUDE.md`
 
 ## Requirements
 
-- Rust 1.75+ (for building from source)
-- [uv](https://github.com/astral-sh/uv) (for plugin venv management)
+- Rust 1.75+
+- [uv](https://github.com/astral-sh/uv) for Python environment management
+- Node 20+ (for UI development)
 
 ## License
 

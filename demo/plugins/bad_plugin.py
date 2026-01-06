@@ -10,6 +10,9 @@ import subprocess  # BANNED: process spawning
 import socket  # BANNED: network access
 from pathlib import Path
 
+TOPIC = "bad_output"
+SINK = "parquet"
+
 # This plugin should never be deployed - it's for testing the UI error display
 
 
@@ -20,7 +23,7 @@ def bad_function():
     socket.socket()              # BANNED
 
 
-class Handler:
-    def execute(self, file_path: str):
-        # This should never execute
-        pass
+def parse(file_path: str):
+    """This should never execute due to validation failures."""
+    bad_function()
+    return None

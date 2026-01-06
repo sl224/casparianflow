@@ -8,7 +8,8 @@
 
 use anyhow::{Context, Result};
 use casparian_sentinel::{Sentinel, SentinelArgs, SentinelConfig};
-use casparian_worker::{bridge, Worker, WorkerArgs, WorkerConfig};
+use casparian_worker::{bridge, analyzer, shredder, Worker, WorkerArgs, WorkerConfig};
+use cf_protocol::ShredStrategy;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -217,6 +218,15 @@ enum Commands {
         action: cli::topic::TopicAction,
     },
 
+    // === W7: MCP Server ===
+
+    /// Start MCP server for Claude Code integration
+    McpServer {
+        /// Bind address (default: stdio for MCP)
+        #[arg(long)]
+        addr: Option<String>,
+    },
+
     // === Existing Server Commands ===
 
     /// Start both Sentinel and Worker in one process (Split-Runtime)
@@ -225,13 +235,13 @@ enum Commands {
         #[arg(long)]
         addr: Option<String>,
 
-        /// Database connection string
-        #[arg(long, default_value = "sqlite://casparian_flow.db")]
-        database: String,
+        /// Database path (default: ~/.casparian_flow/casparian.db)
+        #[arg(long)]
+        database: Option<std::path::PathBuf>,
 
-        /// Parquet output directory
-        #[arg(long, default_value = "output")]
-        output: std::path::PathBuf,
+        /// Parquet output directory (default: ~/.casparian_flow/output)
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
 
         /// Number of worker threads for Data Plane (default: CPU cores - 1)
         #[arg(long)]
@@ -275,6 +285,73 @@ enum Commands {
         /// Publisher email (optional)
         #[arg(long)]
         email: Option<String>,
+    },
+    /// Process a single job from the queue (for UI-spawned processing)
+    ProcessJob {
+        /// Job ID from cf_processing_queue
+        job_id: i64,
+
+        /// Sentinel database path (casparian_flow.sqlite3)
+        #[arg(long)]
+        db: std::path::PathBuf,
+
+        /// Output directory for processed files
+        #[arg(long, default_value = "output")]
+        output: std::path::PathBuf,
+    },
+    /// Shredder: Split multiplexed files into homogeneous shards
+    Shred {
+        #[command(subcommand)]
+        action: ShredAction,
+    },
+
+    /// Show current configuration and paths
+    Config {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ShredAction {
+    /// Analyze a file to detect format and propose shred strategy
+    Analyze {
+        /// Path to the file to analyze
+        file: std::path::PathBuf,
+
+        /// Output format (text or json)
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Execute shredding with a given strategy
+    Run {
+        /// Path to the input file
+        file: std::path::PathBuf,
+
+        /// Output directory for shards
+        #[arg(long, default_value = "shards")]
+        output: std::path::PathBuf,
+
+        /// Strategy as JSON (e.g., '{"CsvColumn":{"delimiter":44,"col_index":1,"has_header":true}}')
+        #[arg(long)]
+        strategy: Option<String>,
+
+        /// Column index for CSV sharding (shorthand for CsvColumn strategy)
+        #[arg(long)]
+        column: Option<usize>,
+
+        /// Delimiter character (comma, tab, pipe, semicolon)
+        #[arg(long, default_value = ",")]
+        delimiter: String,
+
+        /// Whether file has a header row
+        #[arg(long, default_value = "true")]
+        has_header: bool,
+
+        /// Maximum number of dedicated shard files (rest go to _MISC)
+        #[arg(long, default_value = "5")]
+        top_n: usize,
     },
 }
 
@@ -475,6 +552,14 @@ fn main() -> Result<()> {
         Commands::Rule { action } => cli::rule::run(action),
         Commands::Topic { action } => cli::topic::run(action),
 
+        // === W7: MCP Server ===
+        Commands::McpServer { addr } => {
+            let rt = Runtime::new().context("Failed to create runtime")?;
+            rt.block_on(async {
+                cli::mcp::run(cli::mcp::McpArgs { addr }).await
+            })
+        }
+
         // === Existing Server Commands ===
         Commands::Start {
             addr,
@@ -482,7 +567,12 @@ fn main() -> Result<()> {
             output,
             data_threads,
             venvs_dir,
-        } => run_unified(addr, database, output, data_threads, venvs_dir),
+        } => {
+            // Use config module for defaults
+            let db_path = cli::config::resolve_db_path(database);
+            let output_dir = cli::config::resolve_output_dir(output);
+            run_unified(addr, db_path, output_dir, data_threads, venvs_dir)
+        }
 
         Commands::Sentinel { args } => run_sentinel_standalone(args),
 
@@ -500,20 +590,31 @@ fn main() -> Result<()> {
                 run_publish(file, version, addr, publisher, email).await
             })
         }
+        Commands::ProcessJob { job_id, db, output } => {
+            process_single_job(job_id, &db, &output)
+        }
+        Commands::Shred { action } => run_shred(action),
+        Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
     }
 }
 
 /// Run unified Sentinel + Worker with Split-Runtime Architecture
 fn run_unified(
     addr: Option<String>,
-    database: String,
+    db_path: std::path::PathBuf,
     output: std::path::PathBuf,
     data_threads: Option<usize>,
     venvs_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
+    // Ensure config directories exist
+    cli::config::ensure_casparian_home()?;
+    std::fs::create_dir_all(&output)?;
+
     let addr = addr.unwrap_or_else(get_default_ipc_addr);
     info!("Starting Unified Casparian Stack (Split-Runtime Architecture)");
     info!("Transport: {}", addr);
+    info!("Database: {}", db_path.display());
+    info!("Output: {}", output.display());
 
     // Setup signal handling
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -564,7 +665,7 @@ fn run_unified(
 
     // Start Sentinel on Control Plane runtime (in its own thread)
     let sentinel_addr = addr.clone();
-    let sentinel_db = database.clone();
+    let sentinel_db = format!("sqlite:{}?mode=rwc", db_path.display());
     let sentinel_thread = std::thread::spawn(move || {
         control_rt.block_on(async move {
             let config = SentinelConfig {
@@ -722,9 +823,17 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
     }
 
     rt.block_on(async move {
+        // Resolve database URL: if it's the default, use config module resolution
+        let database_url = if args.database == "sqlite://casparian_flow.db" {
+            let db_path = cli::config::resolve_db_path(None);
+            format!("sqlite:{}?mode=rwc", db_path.display())
+        } else {
+            args.database
+        };
+
         let config = SentinelConfig {
             bind_addr: args.bind,
-            database_url: args.database,
+            database_url,
         };
         let mut sentinel = Sentinel::bind(config).await?;
 
@@ -953,6 +1062,662 @@ async fn run_publish(
             response_msg.header.opcode
         ),
     }
+}
+
+/// Process a single job from cf_processing_queue
+///
+/// This is used by the Tauri UI to spawn a worker process for each job.
+/// The job runs the plugin via the bridge (Python subprocess).
+fn process_single_job(
+    job_id: i64,
+    db_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<()> {
+    use casparian_worker::bridge::{self, BridgeConfig};
+    use rusqlite::Connection;
+    use std::time::Instant;
+
+    info!(job_id, db = %db_path.display(), "Processing job");
+
+    // Open database
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
+
+    // Get job details - try two methods:
+    // 1. Production path: JOIN through file_version_id → file_location → source_root
+    // 2. Fallback: Direct input_file column (for tests/CLI jobs)
+    let (plugin_name, file_path): (String, String) = conn
+        .query_row(
+            r#"
+            SELECT
+                pq.plugin_name,
+                sr.path || '/' || fl.rel_path as full_path
+            FROM cf_processing_queue pq
+            JOIN cf_file_version fv ON pq.file_version_id = fv.id
+            JOIN cf_file_location fl ON fv.location_id = fl.id
+            JOIN cf_source_root sr ON fl.source_root_id = sr.id
+            WHERE pq.id = ?
+            "#,
+            [job_id],
+            |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .or_else(|_| {
+            // Fallback: use input_file directly (for test jobs or CLI-created jobs)
+            conn.query_row(
+                r#"
+                SELECT plugin_name, input_file
+                FROM cf_processing_queue
+                WHERE id = ? AND input_file IS NOT NULL
+                "#,
+                [job_id],
+                |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .with_context(|| format!("Job {} not found (no file_version_id or input_file)", job_id))?;
+
+    info!(plugin = %plugin_name, file = %file_path, "Starting job");
+
+    // Update status to RUNNING
+    conn.execute(
+        "UPDATE cf_processing_queue SET status = 'RUNNING', claim_time = datetime('now') WHERE id = ?",
+        [job_id],
+    )?;
+
+    // Get plugin source code AND env_hash from manifest (latest active/deployed version)
+    let (plugin_source, env_hash_opt): (String, Option<String>) = conn
+        .query_row(
+            r#"
+            SELECT pm.source_code, pm.env_hash
+            FROM cf_plugin_manifest pm
+            WHERE pm.plugin_name = ? AND pm.status IN ('ACTIVE', 'DEPLOYED')
+            ORDER BY pm.deployed_at DESC
+            LIMIT 1
+            "#,
+            [&plugin_name],
+            |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .with_context(|| format!("Plugin '{}' not found or not deployed", plugin_name))?;
+
+    // Execute plugin via bridge
+    let start = Instant::now();
+
+    // Try to get lockfile from cf_plugin_environment (proper deployment path)
+    let lockfile_content: Option<String> = env_hash_opt.as_ref().and_then(|hash| {
+        conn.query_row(
+            "SELECT lockfile_content FROM cf_plugin_environment WHERE hash = ?",
+            [hash],
+            |row| row.get(0),
+        ).ok()
+    });
+
+    // Determine venv setup strategy
+    let (env_hash, interpreter) = if let (Some(hash), Some(lockfile)) = (&env_hash_opt, &lockfile_content) {
+        // PROPER PATH: Use VenvManager with lockfile
+        info!(env_hash = %hash, "Using pre-computed environment from deployment");
+
+        let venv_manager = casparian_worker::venv_manager::VenvManager::new()
+            .context("Failed to initialize VenvManager")?;
+
+        let interp = venv_manager.get_or_create(hash, lockfile, None)
+            .context("Failed to get or create venv")?;
+
+        (hash.clone(), interp)
+    } else {
+        // ADHOC PATH: Generate minimal lockfile with plugin deps + bridge deps
+        use cf_security::signing::sha256;
+
+        let deps = parse_plugin_dependencies(&plugin_source);
+        info!(deps = ?deps, "Detected plugin dependencies (adhoc mode)");
+
+        // Bridge runtime deps - ALWAYS needed for IPC serialization
+        let mut all_deps = vec!["pyarrow".to_string(), "pandas".to_string()];
+        all_deps.extend(deps);
+        all_deps.sort();
+        all_deps.dedup();
+
+        // Generate deterministic hash from deps
+        let deps_str = all_deps.join(",");
+        let hash = sha256(deps_str.as_bytes());
+        let short_hash = &hash[..16];
+
+        info!(deps = ?all_deps, env_hash = %short_hash, "Using adhoc environment");
+
+        let venv_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".casparian_flow")
+            .join("venvs")
+            .join(short_hash);
+
+        // Create venv if needed
+        if !venv_path.join("bin").join("python").exists() {
+            std::fs::create_dir_all(&venv_path)?;
+
+            let output = std::process::Command::new("uv")
+                .args(["venv", venv_path.to_str().unwrap()])
+                .output()
+                .context("Failed to create venv with uv")?;
+
+            if !output.status.success() {
+                anyhow::bail!("uv venv failed: {}", String::from_utf8_lossy(&output.stderr));
+            }
+
+            // Install ALL dependencies (including bridge deps)
+            if !all_deps.is_empty() {
+                let mut cmd = std::process::Command::new("uv");
+                cmd.arg("pip").arg("install");
+                for dep in &all_deps {
+                    cmd.arg(dep);
+                }
+                cmd.env("VIRTUAL_ENV", &venv_path);
+
+                let output = cmd.output().context("Failed to install dependencies")?;
+                if !output.status.success() {
+                    anyhow::bail!("uv pip install failed: {}", String::from_utf8_lossy(&output.stderr));
+                }
+            }
+        }
+
+        (short_hash.to_string(), venv_path.join("bin").join("python"))
+    };
+    info!(interpreter = %interpreter.display(), env_hash = %env_hash, "Using Python interpreter");
+
+    // Materialize shim
+    let shim_path = bridge::materialize_bridge_shim()?;
+
+    // Configure bridge
+    let config = BridgeConfig {
+        interpreter_path: interpreter,
+        source_code: plugin_source,
+        file_path: file_path.clone(),
+        job_id: job_id as u64,
+        file_version_id: 0,
+        shim_path,
+    };
+
+    // Execute via bridge
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(bridge::execute_bridge(config));
+    let elapsed = start.elapsed();
+
+    match result {
+        Ok(bridge_result) => {
+            std::fs::create_dir_all(output_dir)?;
+
+            // Handle outputs based on output_info (multi-output support)
+            let mut output_paths: Vec<String> = vec![];
+
+            if bridge_result.output_info.is_empty() {
+                // Legacy: single parquet output (no output_info)
+                let output_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
+                if !bridge_result.batches.is_empty() {
+                    let batch_refs: Vec<&arrow::array::RecordBatch> = bridge_result.batches.iter().collect();
+                    write_parquet_output(&output_path, &batch_refs)?;
+                    info!(output = %output_path.display(), batches = bridge_result.batches.len(), "Wrote parquet output");
+                }
+                output_paths.push(output_path.to_string_lossy().to_string());
+            } else {
+                // Multi-output: route each output to its appropriate sink
+                // Note: Currently bridge sends all batches in order, one per output
+                // TODO: For multi-batch outputs, we'd need to track batch boundaries
+
+                // Group by sink type for efficiency
+                let mut sqlite_outputs: Vec<(String, &arrow::array::RecordBatch)> = vec![];
+                let mut parquet_batches: Vec<&arrow::array::RecordBatch> = vec![];
+
+                for (i, output_info) in bridge_result.output_info.iter().enumerate() {
+                    if i >= bridge_result.batches.len() {
+                        warn!("Output info {} has no corresponding batch", output_info.name);
+                        continue;
+                    }
+
+                    let batch = &bridge_result.batches[i];
+                    let table_name = output_info.table.as_ref().unwrap_or(&output_info.name);
+
+                    match output_info.sink.as_str() {
+                        "sqlite" => {
+                            sqlite_outputs.push((table_name.clone(), batch));
+                        }
+                        "parquet" => {
+                            parquet_batches.push(batch);
+                        }
+                        "csv" => {
+                            // Write CSV output
+                            let csv_path = output_dir.join(format!("{}_{}.csv", table_name, job_id));
+                            write_csv_output(&csv_path, batch)?;
+                            info!(output = %csv_path.display(), table = %table_name, "Wrote CSV output");
+                            output_paths.push(csv_path.to_string_lossy().to_string());
+                        }
+                        other => {
+                            warn!("Unknown sink type '{}', defaulting to parquet", other);
+                            parquet_batches.push(batch);
+                        }
+                    }
+                }
+
+                // Write all SQLite outputs to a single database
+                if !sqlite_outputs.is_empty() {
+                    let sqlite_path = output_dir.join(format!("{}_{}.db", plugin_name, job_id));
+                    write_sqlite_outputs(&sqlite_path, &sqlite_outputs)?;
+                    let table_count = sqlite_outputs.len();
+                    let row_count: usize = sqlite_outputs.iter().map(|(_, b)| b.num_rows()).sum();
+                    info!(output = %sqlite_path.display(), tables = table_count, rows = row_count, "Wrote SQLite output");
+                    output_paths.push(sqlite_path.to_string_lossy().to_string());
+                }
+
+                // Write parquet outputs
+                if !parquet_batches.is_empty() {
+                    let parquet_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
+                    write_parquet_output(&parquet_path, &parquet_batches)?;
+                    info!(output = %parquet_path.display(), batches = parquet_batches.len(), "Wrote parquet output");
+                    output_paths.push(parquet_path.to_string_lossy().to_string());
+                }
+            }
+
+            let result_summary = output_paths.join(";");
+            info!(job_id, elapsed_ms = elapsed.as_millis(), outputs = %result_summary, "Job completed");
+
+            conn.execute(
+                "UPDATE cf_processing_queue SET status = 'COMPLETED', end_time = datetime('now'), result_summary = ? WHERE id = ?",
+                rusqlite::params![result_summary, job_id],
+            )?;
+
+            // Log plugin output
+            if !bridge_result.logs.is_empty() {
+                info!(logs = %bridge_result.logs, "Plugin logs");
+            }
+
+            Ok(())
+        }
+        Err(e) => {
+            error!(job_id, error = %e, elapsed_ms = elapsed.as_millis(), "Job failed");
+
+            conn.execute(
+                "UPDATE cf_processing_queue SET status = 'FAILED', end_time = datetime('now'), error_message = ? WHERE id = ?",
+                rusqlite::params![e.to_string(), job_id],
+            )?;
+            Err(e)
+        }
+    }
+}
+
+/// Parse plugin dependencies from source code
+///
+/// Looks for patterns like:
+/// - `import pandas` -> "pandas"
+/// - `import pyarrow` -> "pyarrow"
+fn parse_plugin_dependencies(source: &str) -> Vec<String> {
+    let mut deps = vec![];
+
+    for line in source.lines() {
+        let line = line.trim();
+
+        // import X or import X as Y
+        if line.starts_with("import ") {
+            let rest = line.strip_prefix("import ").unwrap();
+            let module = rest.split_whitespace().next().unwrap_or("");
+            let module = module.split('.').next().unwrap_or("");
+            if !module.is_empty() && !is_stdlib_module(module) {
+                deps.push(module.to_string());
+            }
+        }
+        // from X import Y
+        else if line.starts_with("from ") {
+            if let Some(rest) = line.strip_prefix("from ") {
+                let module = rest.split_whitespace().next().unwrap_or("");
+                let module = module.split('.').next().unwrap_or("");
+                if !module.is_empty() && !is_stdlib_module(module) {
+                    deps.push(module.to_string());
+                }
+            }
+        }
+    }
+
+    // Deduplicate
+    deps.sort();
+    deps.dedup();
+    deps
+}
+
+/// Check if a module is in the Python standard library
+fn is_stdlib_module(module: &str) -> bool {
+    matches!(
+        module,
+        "os" | "sys" | "re" | "json" | "math" | "time" | "datetime"
+            | "collections" | "itertools" | "functools" | "typing"
+            | "pathlib" | "io" | "csv" | "tempfile" | "shutil"
+            | "subprocess" | "threading" | "multiprocessing"
+            | "hashlib" | "uuid" | "random" | "string" | "struct"
+            | "copy" | "enum" | "dataclasses" | "abc" | "contextlib"
+    )
+}
+
+/// Write Arrow batches to a Parquet file
+fn write_parquet_output(
+    path: &std::path::Path,
+    batches: &[&arrow::array::RecordBatch],
+) -> Result<()> {
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    if batches.is_empty() {
+        return Ok(());
+    }
+
+    let file = std::fs::File::create(path)?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, batches[0].schema(), Some(props))?;
+
+    for batch in batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+
+    Ok(())
+}
+
+/// Write Arrow batches to SQLite database tables
+fn write_sqlite_outputs(
+    path: &std::path::Path,
+    outputs: &[(String, &arrow::array::RecordBatch)],
+) -> Result<()> {
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::DataType;
+
+    let conn = rusqlite::Connection::open(path)?;
+
+    for (table_name, batch) in outputs {
+        // Create table based on schema
+        let schema = batch.schema();
+        let columns: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let sql_type = match f.data_type() {
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                    | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "INTEGER",
+                    DataType::Float32 | DataType::Float64 => "REAL",
+                    DataType::Boolean => "INTEGER",
+                    _ => "TEXT",
+                };
+                format!("\"{}\" {}", f.name(), sql_type)
+            })
+            .collect();
+
+        let create_sql = format!(
+            "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
+            table_name,
+            columns.join(", ")
+        );
+        conn.execute(&create_sql, [])?;
+
+        // Insert data
+        let placeholders: Vec<&str> = schema.fields().iter().map(|_| "?").collect();
+        let insert_sql = format!(
+            "INSERT INTO \"{}\" VALUES ({})",
+            table_name,
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn.prepare(&insert_sql)?;
+
+        for row_idx in 0..batch.num_rows() {
+            let values: Vec<rusqlite::types::Value> = batch
+                .columns()
+                .iter()
+                .zip(schema.fields().iter())
+                .map(|(col, field)| {
+                    if col.is_null(row_idx) {
+                        return rusqlite::types::Value::Null;
+                    }
+                    match field.data_type() {
+                        DataType::Int64 => {
+                            rusqlite::types::Value::Integer(col.as_primitive::<arrow::datatypes::Int64Type>().value(row_idx))
+                        }
+                        DataType::Int32 => {
+                            rusqlite::types::Value::Integer(col.as_primitive::<arrow::datatypes::Int32Type>().value(row_idx) as i64)
+                        }
+                        DataType::Float64 => {
+                            rusqlite::types::Value::Real(col.as_primitive::<arrow::datatypes::Float64Type>().value(row_idx))
+                        }
+                        DataType::Float32 => {
+                            rusqlite::types::Value::Real(col.as_primitive::<arrow::datatypes::Float32Type>().value(row_idx) as f64)
+                        }
+                        DataType::Boolean => {
+                            rusqlite::types::Value::Integer(if col.as_boolean().value(row_idx) { 1 } else { 0 })
+                        }
+                        DataType::Utf8 => {
+                            rusqlite::types::Value::Text(col.as_string::<i32>().value(row_idx).to_string())
+                        }
+                        DataType::LargeUtf8 => {
+                            rusqlite::types::Value::Text(col.as_string::<i64>().value(row_idx).to_string())
+                        }
+                        _ => {
+                            // Fallback: convert to string representation
+                            let array_data = col.to_data();
+                            rusqlite::types::Value::Text(format!("{:?}", array_data))
+                        }
+                    }
+                })
+                .collect();
+
+            stmt.execute(rusqlite::params_from_iter(values))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Write Arrow batch to CSV file
+fn write_csv_output(path: &std::path::Path, batch: &arrow::array::RecordBatch) -> Result<()> {
+    use arrow::csv::WriterBuilder;
+
+    let file = std::fs::File::create(path)?;
+    let mut writer = WriterBuilder::new().with_header(true).build(file);
+    writer.write(batch)?;
+
+    Ok(())
+}
+
+/// Run shredder commands (analyze or run)
+fn run_shred(action: ShredAction) -> Result<()> {
+    match action {
+        ShredAction::Analyze { file, format } => {
+            run_shred_analyze(&file, &format)
+        }
+        ShredAction::Run {
+            file,
+            output,
+            strategy,
+            column,
+            delimiter,
+            has_header,
+            top_n,
+        } => {
+            run_shred_execute(&file, &output, strategy, column, &delimiter, has_header, top_n)
+        }
+    }
+}
+
+/// Analyze a file and propose shred strategy
+fn run_shred_analyze(file: &std::path::Path, format: &str) -> Result<()> {
+    info!(file = %file.display(), "Analyzing file for shredding");
+
+    let result = analyzer::analyze_file_head(file)
+        .with_context(|| format!("Failed to analyze file: {}", file.display()))?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        // Text format for human readability
+        println!("═══════════════════════════════════════════════════════════");
+        println!("  SHRED ANALYSIS");
+        println!("═══════════════════════════════════════════════════════════");
+        println!();
+        println!("  File: {}", file.display());
+        println!("  Head bytes analyzed: {}", result.head_bytes);
+        println!();
+        println!("  Confidence: {:?}", result.confidence);
+        println!();
+        println!("  Strategy:");
+        match &result.strategy {
+            ShredStrategy::CsvColumn { delimiter, col_index, has_header } => {
+                let delim_char = *delimiter as char;
+                let delim_name = match delim_char {
+                    ',' => "comma",
+                    '\t' => "tab",
+                    '|' => "pipe",
+                    ';' => "semicolon",
+                    _ => "custom",
+                };
+                println!("    Type: CSV Column");
+                println!("    Delimiter: {} ('{}')", delim_name, delim_char);
+                println!("    Shard column: {}", col_index);
+                println!("    Has header: {}", has_header);
+            }
+            ShredStrategy::JsonKey { key_path } => {
+                println!("    Type: JSON Key");
+                println!("    Key path: {}", key_path);
+            }
+            ShredStrategy::Regex { pattern, key_group } => {
+                println!("    Type: Regex");
+                println!("    Pattern: {}", pattern);
+                println!("    Key group: {}", key_group);
+            }
+            ShredStrategy::Passthrough => {
+                println!("    Type: Passthrough (no shredding)");
+            }
+        }
+        println!();
+        println!("  Estimated shards: {}", result.estimated_shard_count);
+        println!("  Sample keys: {:?}", result.sample_keys);
+        println!();
+        println!("  Reasoning: {}", result.reasoning);
+
+        if let Some(warning) = &result.warning {
+            println!();
+            println!("  ⚠️  WARNING: {}", warning);
+        }
+
+        println!();
+        println!("═══════════════════════════════════════════════════════════");
+
+        // Print CLI command to execute
+        if let ShredStrategy::CsvColumn { delimiter, col_index, has_header } = &result.strategy {
+            let delim_char = *delimiter as char;
+            println!();
+            println!("  To shred with this strategy, run:");
+            println!();
+            println!("    casparian shred run {} --column {} --delimiter '{}' --has-header {} --output ./shards",
+                file.display(), col_index, delim_char, has_header);
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute shredding with given strategy
+fn run_shred_execute(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    strategy_json: Option<String>,
+    column: Option<usize>,
+    delimiter: &str,
+    has_header: bool,
+    top_n: usize,
+) -> Result<()> {
+    // Determine strategy
+    let strategy = if let Some(json) = strategy_json {
+        serde_json::from_str(&json)
+            .context("Failed to parse strategy JSON")?
+    } else if let Some(col_idx) = column {
+        let delim_byte = match delimiter {
+            "," => b',',
+            "\\t" | "tab" => b'\t',
+            "|" => b'|',
+            ";" => b';',
+            s if s.len() == 1 => s.as_bytes()[0],
+            _ => anyhow::bail!("Invalid delimiter: {}", delimiter),
+        };
+
+        ShredStrategy::CsvColumn {
+            delimiter: delim_byte,
+            col_index: col_idx,
+            has_header,
+        }
+    } else {
+        // Auto-detect
+        info!("No strategy specified, auto-detecting...");
+        let analysis = analyzer::analyze_file_head(file)
+            .context("Failed to analyze file")?;
+
+        if matches!(analysis.confidence, cf_protocol::DetectionConfidence::Unknown) {
+            anyhow::bail!(
+                "Could not detect file format. Please specify --column or --strategy.\n\
+                 Hint: Run `casparian shred analyze {}` to see detection results.",
+                file.display()
+            );
+        }
+
+        if let Some(warning) = &analysis.warning {
+            warn!("{}", warning);
+        }
+
+        info!("Detected strategy: {:?}", analysis.strategy);
+        analysis.strategy
+    };
+
+    info!(
+        file = %file.display(),
+        output = %output.display(),
+        strategy = ?strategy,
+        "Starting shred operation"
+    );
+
+    // Create shredder config
+    let config = cf_protocol::ShredConfig {
+        strategy,
+        output_dir: output.to_path_buf(),
+        max_handles: 200,
+        top_n_shards: top_n,
+        buffer_size: 65536,
+        promotion_threshold: 1000,
+    };
+
+    let shredder = shredder::Shredder::new(config);
+    let result = shredder.shred(file)?;
+
+    // Print results
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  SHRED COMPLETE");
+    println!("═══════════════════════════════════════════════════════════");
+    println!();
+    println!("  Total rows: {}", result.total_rows);
+    println!("  Duration: {}ms", result.duration_ms);
+    println!("  Lineage index: {}", result.lineage_index_path.display());
+    println!();
+    println!("  Shards created ({}):", result.shards.len());
+    for shard in &result.shards {
+        println!("    - {} ({} rows, {} bytes)",
+            shard.path.file_name().unwrap_or_default().to_string_lossy(),
+            shard.row_count,
+            shard.byte_size
+        );
+    }
+
+    if let Some(freezer_path) = &result.freezer_path {
+        println!();
+        println!("  Freezer: {} ({} rare types)",
+            freezer_path.display(),
+            result.freezer_key_count
+        );
+    }
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+
+    Ok(())
 }
 
 #[cfg(test)]

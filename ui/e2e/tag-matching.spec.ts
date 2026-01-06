@@ -39,7 +39,7 @@ test.describe('Tag Matching - Plugin Lookup', () => {
     try {
       const publishResult = await bridgeCall('publish_parser', {
         parserKey: 'MCDATA',
-        sourceCode: 'import polars as pl\ndef parse(input_path): return pl.read_csv(input_path)',
+        sourceCode: 'import polars as pl\n\nTOPIC = "mcdata"\nSINK = "parquet"\n\ndef parse(input_path): return pl.read_csv(input_path)',
         schema: [],
         sinkType: 'parquet',
         outputPath: '~/.casparian_flow/output/mcdata/',
@@ -91,7 +91,7 @@ test.describe('Tag Matching - Plugin Lookup', () => {
     try {
       const publishResult = await bridgeCall('publish_parser', {
         parserKey: 'MCDATA',
-        sourceCode: 'import polars as pl\ndef parse(input_path): return pl.read_csv(input_path)',
+        sourceCode: 'import polars as pl\n\nTOPIC = "mcdata"\nSINK = "parquet"\n\ndef parse(input_path): return pl.read_csv(input_path)',
         schema: [],
         sinkType: 'parquet',
         outputPath: '~/.casparian_flow/output/mcdata/',
@@ -143,7 +143,7 @@ test.describe('Tag Matching - Plugin Lookup', () => {
     try {
       await bridgeCall('publish_parser', {
         parserKey: 'DEBUG_TAG',
-        sourceCode: 'def parse(p): pass',
+        sourceCode: 'TOPIC = "debug_tag"\nSINK = "parquet"\n\ndef parse(p): pass',
         schema: [],
         sinkType: 'parquet',
         outputPath: '/tmp/debug/',

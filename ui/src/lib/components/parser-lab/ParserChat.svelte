@@ -146,19 +146,33 @@ SINGLE output if:
 
 SINGLE:
 \`\`\`python
+import polars as pl
+
+TOPIC = "topic_name"  # lowercase, alphanumeric + underscore
+SINK = "parquet"      # "parquet" | "sqlite" | "csv"
+
 def parse(input_path: str) -> pl.DataFrame:
+    df = pl.read_csv(input_path)
     return df
 \`\`\`
 
-DEMUX:
+DEMUX (multi-output):
 \`\`\`python
-def parse(input_path: str) -> dict[str, pl.DataFrame]:
-    return {
-        "topic_name": df,  # lowercase, underscores only
-    }
+import polars as pl
+from casparian_types import Output
+
+TOPIC = "parent_topic"
+
+def parse(input_path: str) -> list[Output]:
+    # Parse file into multiple outputs
+    # Each Output specifies: name, data, sink type
+    return [
+        Output("header", header_df, "parquet"),
+        Output("line_items", items_df, "parquet"),
+    ]
 \`\`\`
 
-Topic names must be: lowercase, alphanumeric + underscore, start with letter.
+Topic/output names must be: lowercase, alphanumeric + underscore, start with letter.
 Good: header, line_items, order_totals
 Bad: "Line Items", "Header!", lineItems`;
 

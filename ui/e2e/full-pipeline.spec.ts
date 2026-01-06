@@ -34,10 +34,12 @@ const MCDATA_FILE = path.resolve(
 
 // DEMUX parser for invoice MCDATA format
 const MCDATA_PARSER_CODE = `import polars as pl
-from typing import Dict
+from casparian_types import Output
 
-def parse(input_path: str) -> Dict[str, pl.DataFrame]:
-    """Parse MCDATA invoice file into separate tables."""
+TOPIC = "mcdata_invoice"
+
+def parse(input_path: str) -> list[Output]:
+    """Parse MCDATA invoice file into separate outputs."""
     headers = []
     line_items = []
     totals = []
@@ -75,11 +77,11 @@ def parse(input_path: str) -> Dict[str, pl.DataFrame]:
                     'grand_total': float(parts[4])
                 })
 
-    return {
-        'headers': pl.DataFrame(headers),
-        'line_items': pl.DataFrame(line_items),
-        'totals': pl.DataFrame(totals)
-    }
+    return [
+        Output('headers', pl.DataFrame(headers), 'parquet'),
+        Output('line_items', pl.DataFrame(line_items), 'parquet'),
+        Output('totals', pl.DataFrame(totals), 'parquet'),
+    ]
 `;
 
 async function bridgeCall(command: string, args: Record<string, unknown> = {}) {
@@ -325,20 +327,18 @@ test.describe("Full Pipeline Integration", () => {
 
   test("database paths are correct", async () => {
     // This test verifies the bridge uses the correct database paths
+    // SINGLE DATABASE: All tables in casparian_flow.sqlite3 (NO scout.db)
     console.log("Verifying database paths...");
 
-    // Scout DB should be at ~/.casparian_flow/scout.db
-    const scoutDbPath = path.join(CF_DIR, "scout.db");
-    expect(existsSync(scoutDbPath), "scout.db should exist").toBe(true);
-    console.log(`  - Scout DB: ${scoutDbPath} ✓`);
+    // SINGLE DATABASE at ~/.casparian_flow/casparian_flow.sqlite3
+    const dbPath = path.join(CF_DIR, "casparian_flow.sqlite3");
+    expect(existsSync(dbPath), "casparian_flow.sqlite3 should exist").toBe(true);
+    console.log(`  - Database: ${dbPath} ✓`);
 
-    // Sentinel DB should be at ~/.casparian_flow/casparian_flow.sqlite3
-    const sentinelDbPath = path.join(CF_DIR, "casparian_flow.sqlite3");
-    expect(
-      existsSync(sentinelDbPath),
-      "casparian_flow.sqlite3 should exist"
-    ).toBe(true);
-    console.log(`  - Sentinel DB: ${sentinelDbPath} ✓`);
+    // scout.db should NOT exist (we use single database)
+    const oldScoutDbPath = path.join(CF_DIR, "scout.db");
+    expect(existsSync(oldScoutDbPath), "scout.db should NOT exist").toBe(false);
+    console.log(`  - No scout.db: ✓`);
 
     // Parsers directory should exist
     const parsersDir = path.join(CF_DIR, "parsers");

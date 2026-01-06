@@ -1,4 +1,4 @@
-# Casparian Flow Architecture Guide (v5.0 - Bridge Mode)
+# Casparian Flow Architecture Guide (v7.0 - MCP-First)
 
 A comprehensive mental model for the Casparian Flow system.
 
@@ -6,315 +6,499 @@ A comprehensive mental model for the Casparian Flow system.
 
 ## High-Level Overview
 
-Casparian Flow is an **Enterprise Artifact Registry with Bridge Mode Execution**. It turns "dark data" (files on disk) into structured, queryable datasets (SQL/Parquet) through a distributed, isolated execution architecture.
+Casparian Flow is a **data processing platform** that transforms "dark data" (files on disk) into structured, queryable datasets (SQL/Parquet). The system is designed for AI-assisted workflows via the Model Context Protocol (MCP).
 
-**Core Principles:**
-1. **Bridge Mode Execution:** Host/Guest privilege separation via isolated virtual environments
-2. **Pull-Based Processing:** Workers explicitly request jobs when ready (load balancing)
-3. **Immutable Versioning:** Every file change creates a new version; jobs process specific versions
-4. **Code-First Configuration:** Plugin source code is the source of truth for routing and schemas
-5. **Publish-to-Execute Lifecycle:** Artifacts are signed, deployed, and auto-wired to the pipeline
+### Core Principles
+
+1. **Schema = Intent, then Contract**: Approved schemas become immutable contracts
+2. **Elimination-Based Type Inference**: Prove types by eliminating impossibilities
+3. **Fail-Fast Backtest**: Test high-failure files first for rapid feedback
+4. **Bridge Mode Execution**: Host/Guest privilege separation for security
+5. **MCP-First Integration**: AI-assisted data processing via Claude Code
+
+---
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           CLAUDE CODE (MCP Client)                              │
+│                     "Scan these CSV files and create a parser"                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        │ MCP Protocol (JSON-RPC)
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           CASPARIAN MCP SERVER                                  │
+│                                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                  │
+│  │   DISCOVERY     │  │     SCHEMA      │  │    BACKTEST     │                  │
+│  │  quick_scan     │  │ discover_schemas│  │  run_backtest   │                  │
+│  │  apply_scope    │  │ approve_schemas │  │  fix_parser     │                  │
+│  │                 │  │ propose_amend   │  │                 │                  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘                  │
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                          EXECUTION                                      │    │
+│  │              execute_pipeline     query_output                          │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+              ┌─────────────────────────┼─────────────────────────┐
+              ▼                         ▼                         ▼
+┌─────────────────────────┐ ┌─────────────────────────┐ ┌─────────────────────────┐
+│   SCHEMA CONTRACT       │ │   BACKTEST ENGINE       │ │   TYPE INFERENCE        │
+│   SYSTEM                │ │                         │ │   ENGINE                │
+│                         │ │                         │ │                         │
+│  - LockedSchema         │ │  - High-failure table   │ │  - ConstraintSolver     │
+│  - SchemaContract       │ │  - Fail-fast ordering   │ │  - Elimination logic    │
+│  - Approval workflow    │ │  - Plateau detection    │ │  - Date format detect   │
+│  - Amendment process    │ │  - Iteration loop       │ │  - Streaming inference  │
+└─────────────────────────┘ └─────────────────────────┘ └─────────────────────────┘
+              │                         │                         │
+              └─────────────────────────┼─────────────────────────┘
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              WORKER (BRIDGE MODE)                               │
+│                                                                                 │
+│  ┌─────────────────────────────────┐    ┌─────────────────────────────────────┐ │
+│  │         HOST PROCESS            │    │         GUEST PROCESS               │ │
+│  │                                 │    │         (isolated venv)             │ │
+│  │  - Credentials, secrets         │◀──▶│  - Plugin code only                 │ │
+│  │  - Heavy drivers (pyodbc)       │    │  - pandas, pyarrow                  │ │
+│  │  - Sink writers                 │    │  - No credentials                   │ │
+│  │                                 │    │                                     │ │
+│  └─────────────────────────────────┘    └─────────────────────────────────────┘ │
+│                    │                                   │                        │
+│                    │ AF_UNIX Socket                    │                        │
+│                    │ Arrow IPC Batches                 │                        │
+└────────────────────┼───────────────────────────────────┼────────────────────────┘
+                     ▼                                   │
+          ┌────────────────────┐                         │
+          │    OUTPUT SINKS    │◀────────────────────────┘
+          │  Parquet / SQLite  │
+          │  CSV / PostgreSQL  │
+          └────────────────────┘
+```
 
 ---
 
 ## Directory Structure
 
-### Rust Core (Control Plane)
 ```
-crates/
-├── casparian/             # Unified binary entry point
-│   └── src/
-│       ├── main.rs        # CLI: start, publish commands
-│       ├── runtime.rs     # Split Tokio runtime (control/data)
-│       └── server.rs      # Sentinel server implementation
-├── cf_security/           # Authentication & validation (Rust)
-│   └── src/
-│       ├── azure.rs       # Azure AD Device Code Flow
-│       ├── gatekeeper.rs  # AST-based validation
-│       └── signing.rs     # Ed25519 signatures
-└── cf_protocol/           # Binary protocol definitions
-    └── src/
-        └── lib.rs         # OpCodes, serialization
-```
-
-### Python Runtime (Data Plane)
-```
-src/casparian_flow/
-├── config.py              # Global Pydantic settings
-├── sdk.py                 # User-facing BasePlugin API
-├── main.py                # Legacy entry point (deprecated)
-├── protocol.py            # Binary Protocol v5 (Bridge Mode OpCodes)
-├── mcp_server.py          # MCP Server for LLM Integration
-├── db/
-│   ├── models.py          # SQLAlchemy Models (The Source of Truth)
-│   ├── access.py          # DB Engine & Bulk Loaders
-│   └── setup.py           # Schema Fingerprinting & Init
-├── engine/
-│   ├── sentinel.py        # Legacy Python Sentinel (deprecated)
-│   ├── worker_client.py   # Worker (Data Plane)
-│   ├── bridge.py          # Host-side execution bridge
-│   ├── bridge_shim.py     # Guest process in isolated venv
-│   ├── venv_manager.py    # Isolated venv lifecycle
-│   ├── queue.py           # Atomic Job Queue
-│   └── sinks.py           # Output Adapters (Parquet/SQLite/MSSQL)
-├── services/
-│   ├── scout.py           # Discovery Service (Inventory + Tagger)
-│   ├── architect.py       # Plugin Deployment & Governance
-│   └── ...                # Additional services
-└── ui/
-    └── app.py             # FastHTML UI Application
+casparian-flow/
+├── CLAUDE.md                 # Entry point for LLM context
+├── ARCHITECTURE.md           # This file
+├── README.md                 # Quick start
+│
+├── crates/                   # Rust core
+│   ├── casparian/            # Unified CLI binary
+│   │   └── src/
+│   │       ├── main.rs       # CLI entry (start, publish, scout)
+│   │       ├── runtime.rs    # Split Tokio runtime
+│   │       └── server.rs     # Sentinel server
+│   │
+│   ├── casparian_mcp/        # MCP Server
+│   │   ├── CLAUDE.md
+│   │   └── src/
+│   │       ├── tools/        # 9 MCP tools
+│   │       ├── server.rs     # JSON-RPC server
+│   │       ├── protocol.rs   # MCP protocol types
+│   │       └── types.rs      # Shared types
+│   │
+│   ├── casparian_schema/     # Schema Contracts
+│   │   ├── CLAUDE.md
+│   │   └── src/
+│   │       ├── contract.rs   # LockedSchema, SchemaContract
+│   │       ├── approval.rs   # Approval workflow
+│   │       ├── amendment.rs  # Schema evolution
+│   │       └── storage.rs    # SQLite persistence
+│   │
+│   ├── casparian_backtest/   # Backtest Engine
+│   │   ├── CLAUDE.md
+│   │   └── src/
+│   │       ├── high_failure.rs  # Failure tracking
+│   │       ├── failfast.rs      # Early termination
+│   │       ├── loop_.rs         # Iteration loop
+│   │       └── metrics.rs       # Pass rate, plateau
+│   │
+│   ├── casparian_worker/     # Worker + Type Inference
+│   │   ├── CLAUDE.md
+│   │   └── src/
+│   │       ├── type_inference/  # Constraint solver
+│   │       ├── bridge.rs        # Host/Guest comm
+│   │       ├── venv_manager.rs  # UV environments
+│   │       └── worker.rs        # Job execution
+│   │
+│   ├── casparian_scout/      # File Discovery
+│   │   ├── CLAUDE.md
+│   │   └── src/
+│   │       ├── db.rs         # SQLite state
+│   │       ├── scanner.rs    # Filesystem walking
+│   │       └── router.rs     # Pattern → tag
+│   │
+│   ├── cf_security/          # Auth + Signing
+│   │   └── src/
+│   │       ├── azure.rs      # Azure AD integration
+│   │       ├── signing.rs    # Ed25519 signatures
+│   │       └── gatekeeper.rs # AST validation
+│   │
+│   └── cf_protocol/          # Binary Protocol
+│       └── src/
+│           └── lib.rs        # OpCodes, serialization
+│
+├── ui/                       # Tauri Desktop App
+│   ├── CLAUDE.md
+│   ├── src/                  # SvelteKit frontend
+│   │   ├── routes/
+│   │   └── lib/
+│   │       ├── components/
+│   │       │   ├── parser-lab/
+│   │       │   ├── scout/
+│   │       │   └── shredder/  # deprecated
+│   │       └── stores/
+│   └── src-tauri/            # Rust backend
+│       └── src/
+│           ├── lib.rs
+│           └── scout.rs
+│
+└── demo/                     # Examples
+    ├── plugins/
+    ├── scout/
+    └── samples/
 ```
 
 ---
 
-## Process Architecture: Bridge Mode
+## Core Subsystems
 
-Casparian Flow v5.0 introduces **Bridge Mode** - a Host/Guest privilege separation model for secure, isolated plugin execution.
+### 1. MCP Server (casparian_mcp)
 
-```mermaid
-sequenceDiagram
-    participant Publisher as Publisher CLI
-    participant Sentinel as Sentinel (Control)
-    participant Architect as Architect Service
-    participant DB as Database
-    participant Worker as Worker (Host)
-    participant Guest as Guest Process
-    participant Sink as SQL/Parquet Storage
+Provides 9 tools for Claude Code integration:
 
-    Note over Publisher: 1. Publish Artifact
-    Publisher->>Publisher: Lock deps (uv lock)
-    Publisher->>Publisher: Hash & Sign (Ed25519)
-    Publisher->>Sentinel: DEPLOY (source + lockfile + signature)
-    Sentinel->>Architect: Process deployment
-    Architect->>DB: Persist PluginEnvironment
-    Architect->>DB: Persist PluginManifest (ACTIVE)
-    Architect->>DB: Auto-wire RoutingRules & TopicConfigs
+| Category | Tools | Purpose |
+|----------|-------|---------|
+| Discovery | `quick_scan`, `apply_scope` | Find and group files |
+| Schema | `discover_schemas`, `approve_schemas`, `propose_amendment` | Schema lifecycle |
+| Backtest | `run_backtest`, `fix_parser` | Validate parsers |
+| Execution | `execute_pipeline`, `query_output` | Run and query |
 
-    Note over Worker: 2. Environment Preparation
-    Worker->>Sentinel: HEARTBEAT (IDLE)
-    Sentinel->>Worker: PREPARE_ENV (env_hash)
-    Worker->>Worker: VenvManager.ensure()
-    Worker->>Sentinel: ENV_READY
+**Protocol**: JSON-RPC 2.0 over stdio
 
-    Note over Worker,Guest: 3. Bridge Mode Execution
-    Sentinel->>Worker: DISPATCH (job, sinks, plugin)
-    Worker->>Worker: Create AF_UNIX socket
-    Worker->>Guest: Spawn subprocess in isolated venv
-    Guest->>Guest: Execute plugin logic
-    Guest->>Worker: Stream Arrow IPC batches
-    Worker->>Sink: Write to storage
-    Worker->>Sentinel: CONCLUDE (receipt)
+```json
+// Tool invocation
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "quick_scan",
+    "arguments": { "path": "/data", "extensions": ["csv"] }
+  }
+}
 ```
 
-### Components
+### 2. Schema Contract System (casparian_schema)
 
-**1. Publisher CLI (`crates/casparian/src/main.rs publish`)**
-* **Role:** End-to-end artifact publishing (Rust implementation)
-* **Workflow:**
-  1. Discovery: Finds `pyproject.toml` or `uv.lock`
-  2. Locking: Runs `uv lock --universal` for cross-platform deps
-  3. Hashing: Computes `env_hash` (lockfile) and `artifact_hash` (source + lockfile)
-  4. Authentication: Local API key or Azure AD Device Code Flow (via `cf_security::AzureProvider`)
-  5. Signing: Ed25519 signature of artifact (via `cf_security::signing`)
-  6. Upload: Sends `DEPLOY` OpCode to Sentinel
+**Lifecycle:**
+```
+Discovery → Review → APPROVAL → Contract (Immutable)
+                                    │
+                                    ├── Enforcement (violations = failures)
+                                    │
+                                    └── Amendment (controlled evolution)
+```
 
-**2. Sentinel (`crates/casparian/src/server.rs` - Rust)**
-* **Role:** The "Brain". Manages Job Queue and Worker orchestration.
-* **Implementation:** Rust with split Tokio runtime (control/data planes)
-* **Responsibility:**
-  * Tracks connected workers and their capabilities
-  * Matches pending jobs to idle workers
-  * Routes `DEPLOY` messages to Architect
-  * Handles environment preparation via `PREPARE_ENV`/`ENV_READY`
-* **No Data:** Does *not* touch the data payload
+**Key Types:**
+- `SchemaContract`: Binding agreement with version tracking
+- `LockedSchema`: Immutable schema definition
+- `LockedColumn`: Column with type, nullability, format
+- `SchemaViolation`: Failure when contract is broken
 
-**3. Architect Service (`services/architect.py`)**
-* **Role:** Plugin deployment lifecycle ("Publish-to-Execute")
-* **Responsibility:**
-  * Receives deployment requests from Sentinel
-  * Persists `PluginEnvironment` (lockfile → content-addressable storage)
-  * Persists `PluginManifest` with ACTIVE status
-  * Extracts metadata via AST parsing (Data-Oriented Design - no execution)
-  * Auto-wires database: RoutingRules, PluginConfigs, TopicConfigs
+**Principle:** No silent fallbacks. Violations are failures.
 
-**4. Worker (Host Process)**
-* **Role:** The "Muscle". Privileged compute node.
-* **Responsibility:**
-  * Holds credentials: AWS keys, DB passwords, heavy drivers (pyodbc)
-  * Manages `VenvManager` for isolated environments
-  * Creates AF_UNIX socket for Guest IPC
-  * Receives Arrow IPC batches from Guest
-  * Writes to configured Sinks (Parquet, SQL, MSSQL)
-  * Reports `JobReceipt` to Sentinel
+### 3. Type Inference Engine (casparian_worker)
 
-**5. Guest Process (BridgeShim)**
-* **Role:** Sandboxed plugin execution
-* **Responsibility:**
-  * Runs in isolated virtual environment
-  * Minimal dependencies: pandas, pyarrow only
-  * No credentials, no heavy drivers
-  * Receives plugin code and file path via environment
-  * Streams Arrow IPC batches to Host via socket
-  * Minimal attack surface
+**Algorithm:** Constraint-based elimination
 
-**6. VenvManager (`engine/venv_manager.py`)**
-* **Role:** Virtual environment lifecycle
-* **Features:**
-  * Creates isolated venvs per `env_hash`
-  * Uses `uv` for fast, reproducible installs
-  * LRU eviction for disk space management
-  * Hardlinking for deduplication
-  * Content-addressable storage: `~/.casparian_flow/venvs/{env_hash}/`
+```
+Start with all possible types
+For each value:
+    Eliminate impossible interpretations
+Until:
+    One type remains (resolved)
+    OR all eliminated (contradiction)
+    OR data ends (ambiguous)
+```
+
+**Example:**
+```
+"15/06/24" → Could be DD/MM/YY or MM/DD/YY
+"31/05/24" → PROVES DD/MM/YY (31 > 12, can't be month)
+```
+
+**Key Types:**
+- `ConstraintSolver`: Per-column type resolver
+- `DataType`: Null, Boolean, Integer, Float, Date, DateTime, Time, Duration, String
+- `EliminationEvidence`: Why a type was ruled out
+
+### 4. Backtest Engine (casparian_backtest)
+
+**Algorithm:** Fail-fast with high-failure tracking
+
+```
+1. Get all files in scope
+2. Sort: high-failure → resolved → untested → passing
+3. For each file:
+   - Run parser
+   - Update high-failure table
+   - Check early termination
+4. Calculate metrics
+5. Continue or stop based on:
+   - Pass rate achieved
+   - Plateau detected
+   - Max iterations reached
+```
+
+**Key Types:**
+- `HighFailureTable`: SQLite-backed failure tracking
+- `FailureHistoryEntry`: Individual failure with context
+- `BacktestResult`: Complete or EarlyStopped with metrics
+
+### 5. Bridge Mode Execution (casparian_worker)
+
+**Architecture:**
+```
+Worker (Host)         Guest Process
+     │                     │
+     │ AF_UNIX Socket      │
+     │ ─────────────────── │
+     │                     │
+     │ Credentials         │ Plugin code
+     │ Heavy drivers       │ pandas, pyarrow
+     │ Sink writers        │ No secrets
+     │                     │
+     ▼                     ▼
+ Write to Sinks      Stream Arrow IPC
+```
+
+**Why?**
+- Security: Guest has no credentials
+- Isolation: Plugin crashes don't affect host
+- Dependencies: Each plugin has its own venv
+
+### 6. Virtual Environment Management
+
+All Python environments use [UV](https://github.com/astral-sh/uv):
+
+```
+~/.casparian_flow/venvs/
+├── {env_hash_1}/    # Content-addressable by lockfile
+├── {env_hash_2}/
+└── ...
+```
+
+**Features:**
+- Reproducible: `uv.lock` is the source of truth
+- Fast: UV is much faster than pip
+- Cached: Identical lockfiles share venvs
+- LRU Eviction: Old venvs cleaned up
 
 ---
 
-## Execution Architecture
+## Data Flow: Complete Pipeline
 
-### Bridge Mode (v5.0 - Only Mode)
 ```
-Worker (Host) <-- AF_UNIX --> Guest Process (isolated venv)
-     |                              |
-     v                              v
-   Sinks                    Plugin Execution
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 1. DISCOVERY                                                                    │
+│    quick_scan("/data", extensions=["csv"]) → 42 files                           │
+│    apply_scope(files, "transactions") → scope_id                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 2. SCHEMA DISCOVERY                                                             │
+│    discover_schemas(scope_id) → [LockedSchema(columns=[id, amount, date])]      │
+│                                                                                 │
+│    Type Inference:                                                              │
+│    - id: values [1, 2, 3] → Integer                                             │
+│    - amount: values [100, 150.50] → Float (decimal eliminated Integer)          │
+│    - date: values [31/05/24] → Date, format DD/MM/YY (31 > 12 proves it)        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 3. APPROVAL                                                                     │
+│    User reviews schema, clicks "Approve"                                        │
+│    approve_schemas(scope_id, approved_by="user@example.com")                    │
+│                                                                                 │
+│    → SchemaContract created (immutable, versioned)                              │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 4. BACKTEST                                                                     │
+│    run_backtest(scope_id, pass_threshold=0.95)                                  │
+│                                                                                 │
+│    Order: high_failure_1.csv → high_failure_2.csv → untested.csv → passing.csv  │
+│                                                                                 │
+│    If high-failure files still fail → EARLY STOP                                │
+│    If pass rate achieved → COMPLETE                                             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 5. EXECUTION                                                                    │
+│    execute_pipeline(scope_id, sink="parquet:///output/transactions.parquet")    │
+│                                                                                 │
+│    Bridge Mode:                                                                 │
+│    Host → spawn Guest in venv                                                   │
+│    Guest → read files, stream Arrow batches                                     │
+│    Host → receive batches, write to sink                                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ 6. QUERY                                                                        │
+│    query_output(scope_id, sql="SELECT * FROM output WHERE amount > 100")        │
+│                                                                                 │
+│    → Results ready for analysis                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
-* **All** plugins run in isolated venv subprocesses
-* Uses `uv.lock` for reproducible dependencies (auto-generated if missing)
-* Host holds credentials/drivers
-* Guest streams data via Arrow IPC
-* Complete isolation, full dependency control
-* Lineage tracking via `file_version_id` passed through environment
+
+---
+
+## Database Architecture
+
+### Single Database Rule
+
+**All data in ONE database:** `~/.casparian_flow/casparian_flow.sqlite3`
+
+```
+~/.casparian_flow/
+├── casparian_flow.sqlite3    # THE database
+├── venvs/                    # Content-addressable venv cache
+├── parsers/                  # Deployed .py files
+├── output/                   # Parquet, CSV output
+└── samples/                  # Demo files
+```
+
+### Table Prefixes
+
+| Prefix | Purpose |
+|--------|---------|
+| `parser_lab_*` | Parser development |
+| `scout_*` | File discovery, tagging |
+| `cf_*` | Sentinel, execution |
+| `schema_*` | Schema contracts |
+| `backtest_*` | High-failure tracking |
 
 ---
 
 ## Protocol v5 (OpCodes)
 
-Binary header format: `!BBHQI` (16 bytes)
-- Version (1 byte), OpCode (1 byte), Reserved (2 bytes), JobID (8 bytes), Length (4 bytes)
+Binary header: `!BBHQI` (16 bytes)
 
 | OpCode | Name | Direction | Purpose |
 |--------|------|-----------|---------|
-| 1 | `IDENTIFY` | Worker → Sentinel | Handshake with capabilities |
-| 2 | `DISPATCH` | Sentinel → Worker | Job command with sink configs |
-| 3 | `ABORT` | Sentinel → Worker | Cancel job |
-| 4 | `HEARTBEAT` | Worker → Sentinel | Keep-alive / Status |
-| 5 | `CONCLUDE` | Worker → Sentinel | Job finished + Receipt |
-| 6 | `ERR` | Bidirectional | Error reporting |
-| 8 | `PREPARE_ENV` | Sentinel → Worker | Provision isolated environment |
-| 9 | `ENV_READY` | Worker → Sentinel | Environment ready for use |
-| 10 | `DEPLOY` | Publisher → Sentinel | Deploy artifact |
-
----
-
-## Discovery Architecture: The Split Scout
-
-Discovery is decoupled into **I/O** and **Logic** phases to handle millions of files efficiently.
-
-### 1. Inventory Scanner (Fast I/O)
-* **Goal:** Mirror the filesystem state to the Database
-* **Action:** Walks directories using `ParallelFileScanner`
-* **Updates:** `FileLocation` table (path, filename, `last_known_mtime`, `last_known_size`)
-* **Constraint:** Never reads file content. Never hashes. Extremely fast.
-
-### 2. Tagger Service (Logic & CPU)
-* **Goal:** Determine what needs processing
-* **Action:** Polls DB for "Dirty" files
-  * *Dirty Criteria:* `FileLocation.last_known_mtime` != `FileVersion.modified_time`
-* **Processing:**
-  1. Calculates SHA-256 Hash
-  2. Creates immutable `FileVersion`
-  3. Matches path against `RoutingRule`s
-  4. Applies Tags
-  5. Queues `ProcessingJob` if tags match a `PluginConfig`
-
----
-
-## Data Models
-
-### Core Models
-
-| Model | Purpose |
-|-------|---------|
-| `SourceRoot` | Root directory being watched |
-| `FileLocation` | Mutable record of a file path on disk + Inventory state |
-| `FileVersion` | Immutable snapshot of content (SHA-256) + Tags |
-| `ProcessingJob` | Unit of work linking a Version to a Plugin |
-| `RoutingRule` | Glob Pattern (`*.csv`) → Tag (`finance_data`) |
-| `PluginConfig` | Plugin settings + Subscription (`finance_data`) |
-| `TopicConfig` | Logical Topic (`sales`) → Physical URI (`sqlite:///sales.db`) |
-
-### v5.0 New Models
-
-| Model | Purpose |
-|-------|---------|
-| `Publisher` | Audit trail: azure_oid, name, email, last_active |
-| `PluginEnvironment` | Content-addressable lockfile storage (hash → lockfile_content) |
-| `PluginManifest` | Extended with `env_hash`, `artifact_hash`, `publisher_id`, `system_requirements` |
-
-### PluginManifest Status Enum
-
-```python
-PENDING = "PENDING"      # Awaiting review
-STAGING = "STAGING"      # Intermediate state
-ACTIVE = "ACTIVE"        # Ready for execution
-REJECTED = "REJECTED"    # Blocked
-```
+| 1 | IDENTIFY | Worker → Sentinel | Handshake |
+| 2 | DISPATCH | Sentinel → Worker | Job command |
+| 3 | ABORT | Sentinel → Worker | Cancel |
+| 4 | HEARTBEAT | Worker → Sentinel | Status |
+| 5 | CONCLUDE | Worker → Sentinel | Job done |
+| 6 | ERR | Both | Error |
+| 8 | PREPARE_ENV | Sentinel → Worker | Setup venv |
+| 9 | ENV_READY | Worker → Sentinel | Venv ready |
+| 10 | DEPLOY | Publisher → Sentinel | Deploy artifact |
 
 ---
 
 ## Security Architecture
 
-### Dual-Mode Strategy (Rust Implementation)
+### Local Mode (Development)
+- Zero friction, auto-generated Ed25519 keys
+- Implicit trust for rapid iteration
 
-All security primitives implemented in `crates/cf_security/`:
-
-**Local Mode (Development)**
-* Zero friction, auto-generated Ed25519 keys
-* Implicit trust for rapid iteration
-* Implementation: `cf_security::signing::generate_keypair()`
-
-**Enterprise Mode (Production)**
-* Zero trust, Azure AD integration (raw HTTP, no SDK dependencies)
-* JWT validation, audit trails
-* Device Code Flow for CLI authentication
-* Implementation: `cf_security::azure::AzureProvider`
-* Real Azure tests: `cargo test -p cf_security --test test_azure_real -- --ignored`
+### Enterprise Mode (Production)
+- Azure AD integration (raw HTTP, no SDK)
+- JWT validation, audit trails
+- Device Code Flow for CLI auth
 
 ### Artifact Security
-
-1. **Signing:** Ed25519 signatures on all artifacts (`cf_security::signing`)
-2. **Hashing:** SHA-256 of (source + lockfile) = `artifact_hash`
-3. **Gatekeeper:** AST validation using `rustpython-parser` (banned imports: `os`, `subprocess`)
-4. **Isolation:** Guest process has no credentials
+1. **Signing**: Ed25519 signatures on all artifacts
+2. **Hashing**: SHA-256 of source + lockfile
+3. **Gatekeeper**: AST validation (banned imports)
+4. **Isolation**: Guest has no credentials
 
 ---
 
-## Configuration (Code-First)
+## Testing Strategy
 
-Plugins configure the system via `MANIFEST` in their source code. The Architect extracts this via AST parsing (no execution).
+### E2E Tests (No Mocks)
 
-```python
-# plugins/my_parser.py
-from casparian_flow.sdk import BasePlugin, PluginMetadata
+All E2E tests use real databases and real files:
 
-MANIFEST = PluginMetadata(
-    pattern="*.csv",           # Auto-creates RoutingRule
-    topic="sales_data",        # Auto-creates TopicConfig
-    priority=50,               # Routing priority
-    subscriptions=["csv"]      # Input topic subscriptions
-)
+```bash
+# Type Inference (25 tests)
+cargo test --package casparian_worker --test e2e_type_inference
 
-class Handler(BasePlugin):
-    def execute(self, path):
-        # ...
-        self.publish("sales_data", df)
+# Schema Contracts (24 tests)
+cargo test --package casparian_schema --test e2e_contracts
+
+# Backtest Engine (14 tests)
+cargo test --package casparian_backtest --test e2e_backtest
+
+# MCP Tools (20 tests)
+cargo test --package casparian_mcp --test e2e_tools
+```
+
+### UI E2E Tests
+
+```bash
+cd ui && bun run test:e2e
 ```
 
 ---
 
-## Integrity & Lineage
+## Key Decisions
 
-1. **Lineage:** Every row in output includes `_job_id` and `_file_version_id`, traceable to exact source file hash
-2. **Gatekeeper:** AI-generated code passes through AST validation and signature verification
-3. **Concurrency:** Output files use unique job-IDs to prevent race conditions
-4. **Atomic Promotion:** Data is written to `_stg` tables, promoted to production only on success
-5. **Audit Trail:** `Publisher` model tracks who deployed what and when
+### ADR-001: Schema as Contract
+Approved schemas are immutable. Violations fail the job.
+*Why:* Data quality and trust.
+
+### ADR-002: Elimination-Based Inference
+Prove types by eliminating impossibilities, not by voting.
+*Why:* Certainty when possible, explicit ambiguity otherwise.
+
+### ADR-003: Fail-Fast Backtest
+Test high-failure files first.
+*Why:* Rapid feedback during development.
+
+### ADR-004: Bridge Mode Only
+All plugins in isolated subprocesses.
+*Why:* Security and reproducibility.
+
+### ADR-005: MCP-First Integration
+Claude Code integration via standard protocol.
+*Why:* AI-assisted workflows without custom tooling.
+
+### ADR-006: UV for Environments
+UV instead of pip for venv management.
+*Why:* Speed and reproducibility.
+
+---
+
+## Glossary
+
+| Term | Definition |
+|------|------------|
+| **MCP** | Model Context Protocol - LLM tool standard |
+| **Schema Contract** | Immutable, approved schema definition |
+| **High-Failure File** | File that historically fails during backtest |
+| **Constraint Solver** | Type inference via elimination |
+| **Bridge Mode** | Host/Guest execution for isolation |
+| **Scope** | Group of files for processing |
+| **Amendment** | Controlled schema evolution |
+| **Sentinel** | Job orchestration service |
+| **Guest** | Isolated subprocess running plugin |
+| **Host** | Worker process with credentials |

@@ -44,6 +44,11 @@ from typing import Iterator, Any, Optional
 from pathlib import Path
 from io import BytesIO
 
+# Add shim directory to sys.path so casparian_types can be imported
+_shim_dir = Path(__file__).parent.resolve()
+if str(_shim_dir) not in sys.path:
+    sys.path.insert(0, str(_shim_dir))
+
 # Configure logging to stderr (keeps stdout for structured output)
 logging.basicConfig(
     level=logging.INFO,
@@ -247,6 +252,7 @@ class BridgeContext:
         Publish data via Arrow IPC.
 
         Supports:
+        - polars DataFrame
         - pandas DataFrame
         - pyarrow Table
         - pyarrow RecordBatch
@@ -256,7 +262,11 @@ class BridgeContext:
             import pyarrow as pa
 
             # Convert to Arrow Table
-            if isinstance(data, pd.DataFrame):
+            # Check for polars first (uses to_arrow() method)
+            if hasattr(data, "to_arrow") and callable(data.to_arrow):
+                # polars DataFrame
+                table = data.to_arrow()
+            elif isinstance(data, pd.DataFrame):
                 table = pa.Table.from_pandas(data)
             elif isinstance(data, pa.Table):
                 table = data
@@ -298,6 +308,10 @@ def execute_plugin(
     """
     Execute plugin code with the provided file path.
 
+    Supports two patterns:
+    1. parse() function (new) - returns DataFrame or list[Output]
+    2. Handler class (legacy) - execute()/consume() methods that yield batches
+
     Args:
         source_code: Plugin source code
         file_path: Path to input file
@@ -305,52 +319,113 @@ def execute_plugin(
         context: BridgeContext for IPC communication
 
     Returns:
-        dict with execution metrics
+        dict with execution metrics including output_info for multi-output parsers
     """
+    # Import Output class from casparian_types
+    from casparian_types import Output, validate_output
+
     # Create a module namespace for the plugin
     plugin_namespace = {
         "__name__": "__bridge_plugin__",
         "__file__": "<bridge>",
         "__builtins__": __builtins__,
+        "Output": Output,  # Inject Output class
     }
 
     # Execute the plugin source code to define classes/functions
     exec(source_code, plugin_namespace)
 
-    # Look for the Handler class
-    if "Handler" not in plugin_namespace:
-        raise ValueError("Plugin must define a 'Handler' class")
+    # Track output metadata for multi-output parsers
+    output_info = []
 
-    handler_class = plugin_namespace["Handler"]
-    handler = handler_class()
+    # Check for parse() function (new pattern)
+    if "parse" in plugin_namespace and callable(plugin_namespace["parse"]):
+        parse_fn = plugin_namespace["parse"]
 
-    # Configure the handler with context
-    if hasattr(handler, "configure"):
-        handler.configure(context, {})
+        # Get TOPIC and SINK constants for single-output wrapping
+        topic = plugin_namespace.get("TOPIC", "default")
+        sink = plugin_namespace.get("SINK", "parquet")
 
-    # Create file event with lineage tracking
-    file_event = type("FileEvent", (), {"path": file_path, "file_id": file_version_id})()
+        # Call the parse function
+        result = parse_fn(file_path)
 
-    # Execute the plugin
-    if hasattr(handler, "consume") and callable(handler.consume):
-        try:
-            result = handler.consume(file_event)
-        except NotImplementedError:
+        # Handle return type
+        if result is None:
+            # Empty result
+            pass
+        elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], Output):
+            # Multi-output: list[Output]
+            for out in result:
+                validate_output(out)
+                context.publish(1, out.data)
+                output_info.append({
+                    "name": out.name,
+                    "sink": out.sink,
+                    "table": out.table,
+                    "compression": out.compression,
+                })
+        elif hasattr(result, "to_arrow") or hasattr(result, "to_pandas") or hasattr(result, "schema"):
+            # Single output: bare DataFrame/Table - wrap with TOPIC/SINK constants
+            context.publish(1, result)
+            output_info.append({
+                "name": topic,
+                "sink": sink,
+                "table": None,
+                "compression": "snappy",
+            })
+        else:
+            raise TypeError(
+                f"parse() must return DataFrame, Table, or list[Output], got {type(result)}"
+            )
+
+    # Check for Handler class (legacy pattern)
+    elif "Handler" in plugin_namespace:
+        handler_class = plugin_namespace["Handler"]
+        handler = handler_class()
+
+        # Configure the handler with context
+        if hasattr(handler, "configure"):
+            handler.configure(context, {})
+
+        # Create file event with lineage tracking
+        file_event = type("FileEvent", (), {"path": file_path, "file_id": file_version_id})()
+
+        # Execute the plugin
+        if hasattr(handler, "consume") and callable(handler.consume):
+            try:
+                result = handler.consume(file_event)
+            except NotImplementedError:
+                result = handler.execute(file_path)
+        elif hasattr(handler, "execute"):
             result = handler.execute(file_path)
-    elif hasattr(handler, "execute"):
-        result = handler.execute(file_path)
-    else:
-        raise ValueError("Handler must have 'consume' or 'execute' method")
+        else:
+            raise ValueError("Handler must have 'consume' or 'execute' method")
 
-    # Handle generator results
-    if result:
-        for batch in result:
-            if batch is not None:
-                context.publish(1, batch)
+        # Handle generator results
+        if result:
+            for batch in result:
+                if batch is not None:
+                    # Check if batch is an Output object
+                    if isinstance(batch, Output):
+                        validate_output(batch)
+                        context.publish(1, batch.data)
+                        output_info.append({
+                            "name": batch.name,
+                            "sink": batch.sink,
+                            "table": batch.table,
+                            "compression": batch.compression,
+                        })
+                    else:
+                        # Legacy: bare DataFrame/Table
+                        context.publish(1, batch)
+
+    else:
+        raise ValueError("Plugin must define either a 'parse' function or a 'Handler' class")
 
     return {
         "rows_published": context.get_row_count(),
         "status": "SUCCESS",
+        "output_info": output_info,
     }
 
 

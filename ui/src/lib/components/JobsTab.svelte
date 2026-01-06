@@ -2,6 +2,7 @@
   import { jobsStore, type JobOutput } from "$lib/stores/jobs.svelte";
   import LogViewer from "./LogViewer.svelte";
   import { onMount, onDestroy } from "svelte";
+  import { invoke } from "@tauri-apps/api/core";
 
   let pollInterval: ReturnType<typeof setInterval> | null = null;
   let isPolling = $state(false);
@@ -17,7 +18,8 @@
     console.log("[JobsTab] Starting status polling");
     isPolling = true;
     pollInterval = setInterval(async () => {
-      await jobsStore.refreshJobs();
+      // Don't show loading indicator during polling to prevent flicker
+      await jobsStore.refreshJobs(50, false);
       // Stop polling when no more active jobs
       if (!hasActiveJobs()) {
         stopPolling();
@@ -52,7 +54,7 @@
   });
 
   // Status filter
-  let statusFilter = $state<"all" | "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED">("all");
+  let statusFilter = $state<"all" | "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED">("all");
 
   // Filtered jobs based on status
   function getFilteredJobs(): JobOutput[] {
@@ -78,8 +80,34 @@
       case "FAILED": return "var(--color-error)";
       case "RUNNING": return "#ffaa00";
       case "QUEUED": return "var(--color-accent-cyan)";
+      case "CANCELLED": return "var(--color-text-muted)";
       default: return "var(--color-text-muted)";
     }
+  }
+
+  // Cancel a job
+  let cancellingJobId = $state<number | null>(null);
+
+  async function cancelJob(jobId: number, event: MouseEvent) {
+    event.stopPropagation(); // Don't select the job when clicking cancel
+    if (cancellingJobId !== null) return; // Already cancelling
+
+    cancellingJobId = jobId;
+    try {
+      await invoke<string>("cancel_job", { jobId: jobId as unknown as bigint });
+      console.log(`[JobsTab] Job ${jobId} cancelled`);
+      await jobsStore.refreshJobs();
+    } catch (e) {
+      console.error(`[JobsTab] Failed to cancel job ${jobId}:`, e);
+      alert(`Failed to cancel job: ${e}`);
+    } finally {
+      cancellingJobId = null;
+    }
+  }
+
+  // Check if job can be cancelled
+  function canCancel(status: string): boolean {
+    return status === "RUNNING" || status === "QUEUED";
   }
 </script>
 
@@ -142,6 +170,14 @@
       RUNNING
       <span class="filter-count warning">{jobsStore.jobs.filter(j => j.status === "RUNNING").length}</span>
     </button>
+    <button
+      class="filter-btn"
+      class:active={statusFilter === "CANCELLED"}
+      onclick={() => statusFilter = "CANCELLED"}
+    >
+      CANCELLED
+      <span class="filter-count">{jobsStore.jobs.filter(j => j.status === "CANCELLED").length}</span>
+    </button>
   </div>
 
   <!-- Main Content -->
@@ -157,20 +193,35 @@
         </div>
       {:else}
         {#each getFilteredJobs() as job (job.jobId)}
-          <button
+          <div
             class="job-item"
             class:selected={jobsStore.selectedJob?.jobId === job.jobId}
+            role="button"
+            tabindex="0"
             onclick={() => jobsStore.selectJob(job)}
+            onkeydown={(e) => e.key === 'Enter' && jobsStore.selectJob(job)}
           >
             <div class="job-header">
               <span class="job-id">#{job.jobId}</span>
-              <span class="job-status" style="color: {getStatusColor(job.status)}">
-                {job.status}
-              </span>
+              <div class="job-header-right">
+                {#if canCancel(job.status)}
+                  <button
+                    class="cancel-btn"
+                    onclick={(e) => cancelJob(job.jobId, e)}
+                    disabled={cancellingJobId === job.jobId}
+                    title="Cancel job"
+                  >
+                    {cancellingJobId === job.jobId ? "..." : "X"}
+                  </button>
+                {/if}
+                <span class="job-status" style="color: {getStatusColor(job.status)}">
+                  {job.status}
+                </span>
+              </div>
             </div>
             <div class="job-plugin">{job.pluginName}</div>
             <div class="job-time">{formatTime(job.completedAt)}</div>
-          </button>
+          </div>
         {/each}
       {/if}
     </div>
@@ -393,6 +444,41 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+  }
+
+  .job-header-right {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+  }
+
+  .cancel-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    background: var(--color-error);
+    border: none;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    color: white;
+    cursor: pointer;
+    opacity: 0.8;
+    transition: all 0.15s ease;
+  }
+
+  .cancel-btn:hover:not(:disabled) {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+
+  .cancel-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .job-plugin {

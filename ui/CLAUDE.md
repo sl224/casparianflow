@@ -362,13 +362,57 @@ ls -la ~/.casparian_flow/scout.db  # Should not exist!
 
 ---
 
+## Plugin Status Values (CRITICAL)
+
+The `cf_plugin_manifest.status` field controls whether the job processor can find plugins.
+
+### Valid Status Values
+
+| Status | Description | Job Processor Finds It? |
+|--------|-------------|-------------------------|
+| `ACTIVE` | Plugin ready for job processing | **YES** |
+| `DEPLOYED` | Legacy, treated same as ACTIVE | **YES** |
+| `PENDING` | Not ready (NEVER USE) | **NO** |
+
+### The Bug (2025-01-05)
+
+`lib.rs deploy_plugin` used `'PENDING'` but `main.rs` job processor queries:
+```sql
+WHERE pm.status IN ('ACTIVE', 'DEPLOYED')
+```
+
+Result: Plugins deployed via UI were invisible to job processing.
+
+### Guard Rails
+
+Tests prevent regression:
+- `e2e/status-consistency.spec.ts` - Verifies deployed plugins have ACTIVE status
+- `e2e/deploy-plugin-guard.spec.ts` - Scans source code for wrong status values
+- `e2e/binary-job-processing.spec.ts` - Tests actual binary end-to-end
+
+### Code Patterns
+
+**CORRECT (lib.rs):**
+```rust
+VALUES (?, ?, ?, ?, 'ACTIVE', ?)
+// ...
+status = 'ACTIVE'
+```
+
+**WRONG:**
+```rust
+VALUES (?, ?, ?, ?, 'PENDING', ?)  // Job processor won't find it!
+```
+
+---
+
 ## Plugin Dependencies
 
 Parser validation runs Python code in an isolated environment:
 
-- **Location:** `~/.casparian_flow/shredder_env`
+- **Location:** `~/.casparian_flow/parser_env`
 - **Packages:** polars, pandas, pyarrow
-- **Manager:** `ShredderEnvManager` in `src-tauri/src/scout.rs`
+- **Manager:** `ParserEnvManager` in `src-tauri/src/scout.rs`
 - **Creation:** First validation takes 10-30 seconds (installs deps)
 - **Subsequent:** Instant (cached environment)
 

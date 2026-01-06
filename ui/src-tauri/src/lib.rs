@@ -490,6 +490,42 @@ async fn get_job_details(
     })
 }
 
+/// Cancel a running job
+///
+/// Marks the job as CANCELLED in the database. For ZMQ-based workers, this would
+/// also send an ABORT message, but for subprocess-based execution, the process
+/// will continue until completion (the status is just updated for display).
+#[tauri::command]
+async fn cancel_job(
+    state: tauri::State<'_, SentinelState>,
+    job_id: i64,
+) -> Result<String, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    // Only cancel jobs that are currently RUNNING or QUEUED
+    let result = sqlx::query(
+        r#"
+        UPDATE cf_processing_queue
+        SET status = 'CANCELLED',
+            error_message = 'Cancelled by user',
+            end_time = datetime('now')
+        WHERE id = ? AND status IN ('RUNNING', 'QUEUED')
+        "#,
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to cancel job: {}", e))?;
+
+    if result.rows_affected() > 0 {
+        info!(job_id, "Job cancelled by user");
+        Ok(format!("Job {} cancelled", job_id))
+    } else {
+        Err(format!("Job {} not found or not in cancellable state", job_id))
+    }
+}
+
 /// Information about a deployed plugin
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2404,6 +2440,8 @@ pub fn run() {
             // W4 - Parser Version Checking
             get_parser_version_info,
             check_job_parser_version,
+            // Job Management
+            cancel_job,
             // Publish Wizard (Real I/O)
             analyze_plugin_manifest,
             publish_with_overrides,

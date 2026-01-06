@@ -19,6 +19,13 @@
 pub mod error;
 pub mod types;
 
+// Re-export shredder types for convenience
+pub use types::{
+    AnalysisResult, ApprovedParser, BacktestResult, DetectionConfidence, LineageBlock,
+    LineageChain, LineageFileType, LineageHop, LlmConfig, LlmProvider, ParseFailure, ParserDraft,
+    ShardMeta, ShredCheckpoint, ShredConfig, ShredResult, ShredStrategy,
+};
+
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use error::{ProtocolError, Result};
 use std::io::Cursor;

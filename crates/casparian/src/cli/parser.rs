@@ -8,6 +8,7 @@
 //! - `parser unpublish <name>` - Remove parser from active duty
 //! - `parser backtest <name> [--limit N]` - Run parser against all files for its topic
 
+use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{print_table, print_table_colored};
 use chrono::{DateTime, Utc};
@@ -205,15 +206,9 @@ async fn run_async(action: ParserAction) -> anyhow::Result<()> {
 // Database Connection
 // ============================================================================
 
-/// Get database path (same as scout database)
+/// Get database path using config module
 fn get_db_path() -> PathBuf {
-    // Check for explicit path in env
-    if let Ok(path) = std::env::var("CASPARIAN_DB_PATH") {
-        return PathBuf::from(path);
-    }
-
-    // Default to current directory
-    PathBuf::from("casparian_flow.db")
+    config::resolve_db_path(None)
 }
 
 /// Connect to the database
@@ -225,7 +220,7 @@ async fn connect_db() -> anyhow::Result<SqlitePool> {
             .with_context(format!("Expected database at: {}", db_path.display()))
             .with_suggestions([
                 "TRY: Run 'casparian start' to initialize the database".to_string(),
-                "TRY: Set CASPARIAN_DB_PATH environment variable".to_string(),
+                "TRY: Set CASPARIAN_DB environment variable".to_string(),
                 format!("TRY: Check if {} exists", db_path.display()),
             ])
             .into());

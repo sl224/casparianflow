@@ -17,10 +17,10 @@
   }
 
   interface PublishedPlugin {
-    plugin_name: string;
+    pluginName: string;
     version: string;
     status: string;
-    deployed_at: string | null;
+    deployedAt: string | null;
   }
 
   // State
@@ -263,14 +263,14 @@
             {#each publishedPlugins as plugin}
               <div class="plugin-row">
                 <div class="plugin-info">
-                  <span class="plugin-name">{plugin.plugin_name}</span>
+                  <span class="plugin-name">{plugin.pluginName}</span>
                   <span class="plugin-meta">v{plugin.version}</span>
                 </div>
                 <div class="plugin-status">
                   <span class="status-badge" class:active={plugin.status === 'ACTIVE'}>
                     {plugin.status}
                   </span>
-                  <span class="plugin-time">{formatDeployTime(plugin.deployed_at)}</span>
+                  <span class="plugin-time">{formatDeployTime(plugin.deployedAt)}</span>
                 </div>
               </div>
             {/each}

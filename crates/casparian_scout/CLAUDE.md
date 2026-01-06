@@ -213,19 +213,23 @@ cargo test -p casparian_scout --test e2e
 - Bundled sample parser for onboarding
 - Tauri commands updated for new types
 - Frontend UI updated
+- Integration with new crates (casparian_mcp, casparian_schema, casparian_backtest)
 
-### Pending
+### Related Crates
 
-- Scout → Sentinel bridge for full job submission
-- Parser Lab → Plugin publishing flow
-- Multi-file validation against Scout files
+| Crate | Integration |
+|-------|-------------|
+| `casparian_mcp` | `quick_scan` tool uses Scout for file discovery |
+| `casparian_schema` | Schema contracts validate Scout-discovered files |
+| `casparian_backtest` | Backtest engine tests parsers against Scout files |
+| `casparian_worker` | Type inference analyzes Scout-discovered files |
 
 ---
 
 ## Configuration (TOML)
 
 ```toml
-database_path = "scout.db"
+database_path = "~/.casparian_flow/casparian_flow.sqlite3"
 workers = 4
 
 [[sources]]

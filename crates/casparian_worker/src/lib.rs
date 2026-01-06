@@ -1,5 +1,8 @@
+pub mod analyzer;
 pub mod bridge;
 pub mod metrics;
+pub mod shredder;
+pub mod type_inference;
 pub mod venv_manager;
 pub mod worker;
 

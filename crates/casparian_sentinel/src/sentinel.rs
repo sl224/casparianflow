@@ -104,6 +104,8 @@ pub struct Sentinel {
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     running: bool,
     last_cleanup: f64, // Last time we ran stale worker cleanup
+    /// Jobs orphaned by stale workers - need to be failed asynchronously
+    orphaned_jobs: Vec<i32>,
 }
 
 impl Sentinel {
@@ -153,6 +155,7 @@ impl Sentinel {
             topic_map,
             running: false,
             last_cleanup: current_time(),
+            orphaned_jobs: Vec::new(),
         })
     }
 
@@ -204,6 +207,22 @@ impl Sentinel {
             // Periodic cleanup of stale workers
             self.cleanup_stale_workers();
 
+            // Fail any orphaned jobs from stale workers
+            if !self.orphaned_jobs.is_empty() {
+                let jobs_to_fail: Vec<i32> = std::mem::take(&mut self.orphaned_jobs);
+                for job_id in jobs_to_fail {
+                    if let Err(e) = self.queue.fail_job(
+                        job_id,
+                        "Worker became unresponsive (stale heartbeat)"
+                    ).await {
+                        error!("Failed to mark orphaned job {} as failed: {}", job_id, e);
+                    } else {
+                        info!("Marked orphaned job {} as FAILED", job_id);
+                        METRICS.inc_jobs_failed();
+                    }
+                }
+            }
+
             // Dispatch loop (assign jobs to idle workers)
             if let Err(e) = self.dispatch_loop().await {
                 error!("Dispatch error: {}", e);
@@ -215,6 +234,7 @@ impl Sentinel {
     }
 
     /// Remove workers that haven't sent a heartbeat within WORKER_TIMEOUT_SECS
+    /// Also collects orphaned jobs from stale workers to be failed asynchronously
     fn cleanup_stale_workers(&mut self) {
         let now = current_time();
 
@@ -227,26 +247,41 @@ impl Sentinel {
         let cutoff = now - WORKER_TIMEOUT_SECS;
         let before_count = self.workers.len();
 
-        // Use retain() - no allocation for stale identities
-        self.workers.retain(|_, w| {
-            let keep = w.last_seen >= cutoff;
-            if !keep {
+        // Collect stale workers and their current jobs before removing
+        let stale_workers: Vec<(Vec<u8>, String, Option<i32>)> = self.workers
+            .iter()
+            .filter(|(_, w)| w.last_seen < cutoff)
+            .map(|(id, w)| (id.clone(), w.worker_id.clone(), w.current_job_id))
+            .collect();
+
+        // Remove stale workers and queue their jobs for failure
+        for (id, worker_id, job_id) in stale_workers {
+            if self.workers.remove(&id).is_some() {
                 warn!(
                     "Removing stale worker [{}]: last seen {:.0}s ago",
-                    w.worker_id,
-                    now - w.last_seen
+                    worker_id,
+                    now - cutoff + WORKER_TIMEOUT_SECS
                 );
                 METRICS.inc_workers_cleaned_up();
+
+                // Queue job for async failure if worker had an active job
+                if let Some(jid) = job_id {
+                    warn!(
+                        "Job {} orphaned by stale worker [{}] - will be failed",
+                        jid, worker_id
+                    );
+                    self.orphaned_jobs.push(jid);
+                }
             }
-            keep
-        });
+        }
 
         let removed = before_count - self.workers.len();
         if removed > 0 {
             info!(
-                "Cleanup: removed {} stale workers, {} remaining",
+                "Cleanup: removed {} stale workers, {} remaining, {} jobs to fail",
                 removed,
-                self.workers.len()
+                self.workers.len(),
+                self.orphaned_jobs.len()
             );
         } else {
             debug!("Cleanup: {} workers active", self.workers.len());

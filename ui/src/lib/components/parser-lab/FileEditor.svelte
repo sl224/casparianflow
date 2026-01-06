@@ -95,6 +95,7 @@
   let validationError = $state<string | null>(null);
   let tableOutputs = $state<TableOutput[]>([]);
   let isMultiOutput = $state(false);
+  let hasBeenValidated = $state(false);  // Track if validation has ever run
 
   // Track if parser is deployable (validation passed)
   // Using a derived value for more stable reactivity
@@ -111,6 +112,7 @@
 
   // Subscription tag state
   let subscriptionTag = $state("");
+  let pluginVersion = $state("1.0.0");
   let tagValidationStatus = $state<"idle" | "checking" | "valid" | "invalid" | "exists">("idle");
   let tagValidationMessage = $state<string | null>(null);
 
@@ -145,6 +147,9 @@
         sinkConfigJson = parser.sinkConfigJson;
         validationOutput = parser.validationOutput;
         validationError = parser.validationError;
+
+        // Track if parser was previously validated
+        hasBeenValidated = parser.validationStatus === "valid" || parser.validationStatus === "invalid";
 
         // Restore multi-output state
         isMultiOutput = parser.outputMode === "multi";
@@ -353,9 +358,14 @@
         testFileId: selectedTestFileId,
       });
 
+      hasBeenValidated = true;  // Mark as validated
+
       if (result.validationStatus === "valid") {
         validationOutput = result.validationOutput;
         validationError = null;
+
+        // Auto-switch to Output tab to show sink configuration
+        activeCodePanelTab = "output";
 
         // Check if this is a multi-output parser
         isMultiOutput = result.outputMode === "multi";
@@ -463,6 +473,7 @@
         outputPath,
         outputMode: isMultiOutput ? "multi" : "single",
         topicUrisJson,
+        version: pluginVersion || "1.0.0",
       });
 
       if (receipt.success) {
@@ -869,7 +880,7 @@
               {#if isMultiOutput && Object.keys(topicSinks).length > 0}
                 <!-- Multi-output: Expandable rows per topic -->
                 <div class="topic-config-header">
-                  <span>{Object.keys(topicSinks).length} topics</span>
+                  <span>{Object.keys(topicSinks).length} topics detected</span>
                 </div>
 
                 {#each Object.entries(topicSinks) as [topic, sink]}
@@ -935,6 +946,13 @@
                     {/if}
                   </div>
                 {/each}
+              {:else if isMultiOutput}
+                <!-- Multi-output parser but topics not yet detected -->
+                <div class="waiting-for-topics">
+                  <div class="waiting-icon">📊</div>
+                  <div class="waiting-title">Multi-Output Parser</div>
+                  <div class="waiting-desc">Run test to detect output topics and configure sinks for each.</div>
+                </div>
               {:else}
                 <!-- Single output: Standard sink config -->
                 <div class="single-output-config">
@@ -984,6 +1002,20 @@
                   <div class="tag-error">{tagValidationMessage}</div>
                 {/if}
                 <div class="tag-hint">Files tagged with <code>{subscriptionTag}</code> will be processed by this plugin</div>
+              </div>
+
+              <!-- Plugin Version -->
+              <div class="version-config">
+                <label class="version-label">
+                  <span>Version:</span>
+                  <input
+                    type="text"
+                    class="version-input"
+                    bind:value={pluginVersion}
+                    placeholder="1.0.0"
+                  />
+                </label>
+                <div class="version-hint">Semantic version (e.g., 1.0.0, 2.1.3)</div>
               </div>
 
               {#if isDeployable}
@@ -1099,8 +1131,10 @@
                   </div>
                 {/each}
               </div>
-            {:else if validationOutput}
+            {:else if validationOutput && validationOutput.trim()}
               <pre>{validationOutput}</pre>
+            {:else if hasBeenValidated}
+              <div class="empty">Parser ran successfully but produced no output</div>
             {:else}
               <div class="empty">Run test to see output</div>
             {/if}
@@ -1611,6 +1645,46 @@
     font-family: var(--font-mono);
   }
 
+  .version-config {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .version-label {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-size: 0.8rem;
+  }
+
+  .version-label > span:first-child {
+    color: var(--color-text-secondary);
+    min-width: 100px;
+  }
+
+  .version-input {
+    width: 100px;
+    padding: 0.375rem 0.5rem;
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-tertiary);
+    color: var(--color-text-primary);
+    border-radius: var(--radius-sm);
+    font-size: 0.85rem;
+    font-family: var(--font-mono);
+  }
+
+  .version-input:focus {
+    outline: none;
+    border-color: var(--color-accent-cyan);
+  }
+
+  .version-hint {
+    color: var(--color-text-muted);
+    font-size: 0.7rem;
+    margin-left: 100px;
+  }
+
   .deploy-hint {
     text-align: center;
     color: var(--color-text-muted);
@@ -1906,6 +1980,36 @@
     border-top: 1px solid var(--color-border);
     max-height: 200px;
     overflow-y: auto;
+  }
+
+  /* Waiting for topics state */
+  .waiting-for-topics {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    text-align: center;
+    background: var(--color-bg-secondary);
+    border: 1px dashed var(--color-border);
+    border-radius: var(--radius-md);
+  }
+
+  .waiting-icon {
+    font-size: 2rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .waiting-title {
+    font-weight: 600;
+    color: var(--color-text-primary);
+    margin-bottom: 0.5rem;
+  }
+
+  .waiting-desc {
+    font-size: 0.8rem;
+    color: var(--color-text-muted);
+    max-width: 250px;
   }
 
 </style>

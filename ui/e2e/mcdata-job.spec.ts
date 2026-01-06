@@ -25,10 +25,12 @@ const BRIDGE_URL = "http://localhost:9999";
 
 // DEMUX parser for invoice MCDATA format
 const MCDATA_PARSER_CODE = `import polars as pl
-from typing import Dict
+from casparian_types import Output
 
-def parse(input_path: str) -> Dict[str, pl.DataFrame]:
-    """Parse MCDATA invoice file into separate tables."""
+TOPIC = "mcdata_invoice"
+
+def parse(input_path: str) -> list[Output]:
+    """Parse MCDATA invoice file into separate outputs."""
     headers = []
     line_items = []
     totals = []
@@ -66,11 +68,11 @@ def parse(input_path: str) -> Dict[str, pl.DataFrame]:
                     'grand_total': float(parts[4])
                 })
 
-    return {
-        'headers': pl.DataFrame(headers),
-        'line_items': pl.DataFrame(line_items),
-        'totals': pl.DataFrame(totals)
-    }
+    return [
+        Output('headers', pl.DataFrame(headers), 'parquet'),
+        Output('line_items', pl.DataFrame(line_items), 'parquet'),
+        Output('totals', pl.DataFrame(totals), 'parquet'),
+    ]
 `;
 
 async function bridgeCall(command: string, args: Record<string, unknown> = {}) {

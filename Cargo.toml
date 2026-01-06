@@ -7,6 +7,9 @@ members = [
     "crates/casparian",
     "crates/cf_security",
     "crates/casparian_scout",
+    "crates/casparian_schema",
+    "crates/casparian_backtest",
+    "crates/casparian_mcp",
     "ui/src-tauri",
 ]
 

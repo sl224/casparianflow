@@ -1,0 +1,5 @@
+{"timestamp": "2024-01-15T10:30:00", "event_type": "purchase", "user_id": 1001, "amount": 299.90}
+{"timestamp": "2024-01-15T11:45:00", "event_type": "refund", "user_id": 1002, "amount": 49.99}
+{"timestamp": "2024-01-15T14:20:00", "event_type": "purchase", "user_id": 1003, "amount": 599.97}
+{"timestamp": "2024-01-16T09:15:00", "event_type": "purchase", "user_id": 1001, "amount": 149.95}
+{"timestamp": "2024-01-16T16:30:00", "event_type": "purchase", "user_id": 1004, "amount": 899.85}

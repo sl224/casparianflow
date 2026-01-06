@@ -133,6 +133,7 @@ function initDb() {
   `);
 
   // Processing queue (for job submission)
+  // NOTE: worker_host is required by casparian_sentinel QueueRow model
   db.run(`
     CREATE TABLE IF NOT EXISTS cf_processing_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +151,8 @@ function initDb() {
       result_summary TEXT,
       error_message TEXT,
       retry_count INTEGER DEFAULT 0,
+      worker_host TEXT,
+      worker_pid INTEGER,
       logs TEXT
     )
   `);
@@ -161,6 +164,76 @@ function initDb() {
       job_id INTEGER NOT NULL,
       log_text TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Source root (for file tracking)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cf_source_root (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      path TEXT NOT NULL UNIQUE
+    )
+  `);
+
+  // File location (for file tracking)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cf_file_location (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_root_id INTEGER NOT NULL,
+      rel_path TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      last_known_mtime REAL,
+      last_known_size INTEGER,
+      current_version_id INTEGER,
+      last_seen_time TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (source_root_id) REFERENCES cf_source_root(id)
+    )
+  `);
+
+  // File hash registry - MUST match lib.rs lines 1727-1731
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cf_file_hash_registry (
+      content_hash TEXT PRIMARY KEY,
+      first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+      size_bytes INTEGER NOT NULL
+    )
+  `);
+
+  // File version (for job processing)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cf_file_version (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      location_id INTEGER NOT NULL,
+      content_hash TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      modified_time TEXT,
+      applied_tags TEXT DEFAULT '',
+      FOREIGN KEY (location_id) REFERENCES cf_file_location(id),
+      FOREIGN KEY (content_hash) REFERENCES cf_file_hash_registry(content_hash)
+    )
+  `);
+
+  // Plugin subscriptions - MUST match lib.rs lines 1599-1606
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cf_plugin_subscriptions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      plugin_name TEXT NOT NULL,
+      topic_name TEXT NOT NULL,
+      is_active INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(plugin_name, topic_name)
+    )
+  `);
+
+  // Routing rules - MUST match lib.rs lines 1643-1650
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cf_routing_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pattern TEXT NOT NULL,
+      tag TEXT NOT NULL,
+      priority INTEGER DEFAULT 0,
+      enabled INTEGER DEFAULT 1,
+      description TEXT
     )
   `);
 
@@ -363,6 +436,95 @@ const commands: Record<string, (args: any) => any> = {
     return true;
   },
 
+  // Cancel a job (matches Tauri cancel_job command)
+  cancel_job: ({ jobId }: { jobId: number }) => {
+    const result = db.run(`
+      UPDATE cf_processing_queue
+      SET status = 'CANCELLED',
+          error_message = 'Cancelled by user',
+          end_time = datetime('now')
+      WHERE id = ? AND status IN ('RUNNING', 'QUEUED')
+    `, [jobId]);
+
+    if (result.changes > 0) {
+      return `Job ${jobId} cancelled`;
+    } else {
+      throw new Error(`Job ${jobId} not found or not in cancellable state`);
+    }
+  },
+
+  // Simulate stale worker cleanup (marks jobs as FAILED when worker goes stale)
+  simulate_stale_worker: ({ jobId }: { jobId: number }) => {
+    const result = db.run(`
+      UPDATE cf_processing_queue
+      SET status = 'FAILED',
+          error_message = 'Worker became unresponsive (stale heartbeat)',
+          end_time = datetime('now')
+      WHERE id = ? AND status = 'RUNNING'
+    `, [jobId]);
+
+    if (result.changes > 0) {
+      return `Job ${jobId} marked as failed due to stale worker`;
+    } else {
+      throw new Error(`Job ${jobId} not found or not running`);
+    }
+  },
+
+  // Clean up test jobs (for E2E test cleanup)
+  cleanup_test_jobs: () => {
+    const result = db.run(`
+      DELETE FROM cf_processing_queue WHERE plugin_name LIKE 'test_%'
+    `);
+    console.log(`[Bridge] Cleaned up ${result.changes} test jobs`);
+    return { deleted: result.changes };
+  },
+
+  // Validate plugin is processable (simulates main.rs:801 query)
+  // This is the EXACT query the job processor uses
+  validate_plugin_processable: ({ pluginName }: { pluginName: string }) => {
+    const row = db.query(`
+      SELECT plugin_name, status, source_code
+      FROM cf_plugin_manifest
+      WHERE plugin_name = ? AND status IN ('ACTIVE', 'DEPLOYED')
+      ORDER BY deployed_at DESC LIMIT 1
+    `).get(pluginName) as { plugin_name: string; status: string; source_code: string } | null;
+
+    if (!row) {
+      // Check if plugin exists with wrong status
+      const anyRow = db.query(
+        'SELECT plugin_name, status FROM cf_plugin_manifest WHERE plugin_name = ?'
+      ).get(pluginName) as { plugin_name: string; status: string } | null;
+
+      if (anyRow) {
+        return {
+          processable: false,
+          reason: `Plugin exists with status '${anyRow.status}' but job processor needs 'ACTIVE' or 'DEPLOYED'`,
+          actualStatus: anyRow.status,
+        };
+      }
+      return { processable: false, reason: "Plugin not found in database" };
+    }
+    return { processable: true, status: row.status };
+  },
+
+  // Get deployed plugin details
+  get_deployed_plugin: ({ name }: { name: string }) => {
+    return db.query(`
+      SELECT plugin_name, version, status, deployed_at, source_hash
+      FROM cf_plugin_manifest WHERE plugin_name = ?
+      ORDER BY deployed_at DESC LIMIT 1
+    `).get(name);
+  },
+
+  // List all plugins with their status
+  list_all_plugins: () => {
+    return db.query(`
+      SELECT plugin_name, version, status, deployed_at
+      FROM cf_plugin_manifest
+      ORDER BY deployed_at DESC
+    `).all();
+  },
+
   // Scout init
   scout_init_db: () => {
     initDb();
@@ -401,6 +563,9 @@ const commands: Record<string, (args: any) => any> = {
 
     // Sample parser code (matches Rust version in scout.rs)
     const sampleCode = `import polars as pl
+
+TOPIC = "transactions"
+SINK = "parquet"
 
 def parse(input_path: str) -> pl.DataFrame:
     """
@@ -639,11 +804,13 @@ def parse(input_path: str) -> pl.DataFrame:
 
 \`\`\`python
 import polars as pl
-from typing import Dict
+from casparian_types import Output
 
-def parse(input_path: str) -> Dict[str, pl.DataFrame]:
+TOPIC = "mcdata"
+
+def parse(input_path: str) -> list[Output]:
     """Parse MCDATA file with multiple record types."""
-    tables: Dict[str, list] = {}
+    tables: dict[str, list] = {}
 
     with open(input_path, 'r') as f:
         for line in f:
@@ -675,16 +842,19 @@ def parse(input_path: str) -> Dict[str, pl.DataFrame]:
                 'raw_data': line.strip()
             })
 
-    # Convert to DataFrames
-    result = {}
+    # Convert to Outputs with appropriate sink types
+    outputs = []
     for name, rows in tables.items():
         if rows:
-            result[name] = pl.DataFrame(rows)
+            df = pl.DataFrame(rows)
+            # Faults go to SQLite for querying, others to parquet
+            sink = "sqlite" if name.endswith('_faults') else "parquet"
+            outputs.append(Output(name, df, sink))
 
-    return result
+    return outputs
 \`\`\`
 
-This DEMUX parser groups records by type into separate tables. RFC and PFC faults should go to SQLite, config data to Parquet.`;
+This DEMUX parser groups records by type into separate outputs. RFC and PFC faults go to SQLite, other records to Parquet.`;
     }
 
     // Default CSV parser
@@ -692,6 +862,9 @@ This DEMUX parser groups records by type into separate tables. RFC and PFC fault
 
 \`\`\`python
 import polars as pl
+
+TOPIC = "data"
+SINK = "parquet"
 
 def parse(input_path: str) -> pl.DataFrame:
     """Parse the data file."""
@@ -727,7 +900,7 @@ This is a basic parser. Adjust as needed for your specific data format.`;
   },
 
   // Publish parser
-  publish_parser: ({ parserKey, sourceCode, sinkType, outputPath, outputMode, topicUrisJson }: any) => {
+  publish_parser: ({ parserKey, sourceCode, sinkType, outputPath, outputMode, topicUrisJson, version }: any) => {
     // Save parser to file
     const filename = `${parserKey.replace(/[^a-zA-Z0-9_]/g, '_')}.py`;
     const parserPath = join(PARSERS_DIR, filename);
@@ -738,13 +911,15 @@ This is a basic parser. Adjust as needed for your specific data format.`;
     const pluginName = parserKey;
     // Tags are stored as-is, no prefix
     const subscriptionTag = parserKey;
+    // Use provided version or default to 1.0.0
+    const pluginVersion = version || '1.0.0';
 
     // Insert into cf_plugin_manifest (Sentinel DB)
     db.run(`
       INSERT OR REPLACE INTO cf_plugin_manifest
         (plugin_name, version, source_code, source_hash, status, deployed_at)
       VALUES (?, ?, ?, ?, 'ACTIVE', datetime('now'))
-    `, [pluginName, '1.0.0', sourceCode, hash]);
+    `, [pluginName, pluginVersion, sourceCode, hash]);
 
     // Insert into cf_plugin_config with subscription_tags (Sentinel DB)
     db.run(`
@@ -991,6 +1166,7 @@ This is a basic parser. Adjust as needed for your specific data format.`;
   },
 
   // List deployed plugins with full details (matches Tauri list_deployed_plugins)
+  // NOTE: Transform snake_case DB columns to camelCase to match Rust serde output
   list_deployed_plugins: () => {
     const rows = db.query(`
       SELECT plugin_name, version, status, deployed_at
@@ -998,7 +1174,12 @@ This is a basic parser. Adjust as needed for your specific data format.`;
       ORDER BY deployed_at DESC, plugin_name
     `).all() as { plugin_name: string; version: string; status: string; deployed_at: string | null }[];
 
-    return rows;
+    return rows.map(r => ({
+      pluginName: r.plugin_name,
+      version: r.version,
+      status: r.status,
+      deployedAt: r.deployed_at
+    }));
   },
 
   // Ensure plugin cache file exists (regenerate from DB if missing)
@@ -1161,6 +1342,23 @@ async function runPythonValidation(code: string, testFilePath: string): Promise<
     const wrapperCode = `
 import sys
 import json
+from typing import NamedTuple, Union
+import polars as pl
+import pandas as pd
+import types
+
+# Define Output for parsers that import it
+class Output(NamedTuple):
+    name: str
+    data: Union[pl.DataFrame, pd.DataFrame]
+    sink: str
+    table: str = None
+    compression: str = "snappy"
+
+# Mock casparian_types module so parser imports work
+casparian_types = types.ModuleType('casparian_types')
+casparian_types.Output = Output
+sys.modules['casparian_types'] = casparian_types
 
 # User code
 ${code}
@@ -1169,8 +1367,27 @@ ${code}
 try:
     result = parse("${testFilePath.replace(/\\/g, '\\\\')}")
 
-    if isinstance(result, dict):
-        # Multi-output
+    # Check for list[Output] (new multi-output contract)
+    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], tuple) and hasattr(result[0], 'name'):
+        # Multi-output using Output NamedTuple
+        topics = [out.name for out in result]
+        output = {}
+        for out in result:
+            df = out.data
+            rows = len(df) if hasattr(df, '__len__') else 0
+            preview = str(df.head(5)) if hasattr(df, 'head') else str(df)
+            output[out.name] = {
+                "rows": rows,
+                "preview": preview
+            }
+        print(json.dumps({
+            "status": "valid",
+            "mode": "multi",
+            "topics": topics,
+            "output": output
+        }))
+    elif isinstance(result, dict):
+        # Legacy multi-output (dict[str, DataFrame])
         topics = list(result.keys())
         output = {}
         for topic, df in result.items():
@@ -1185,7 +1402,7 @@ try:
             "output": output
         }))
     else:
-        # Single output
+        # Single output (DataFrame)
         print(json.dumps({
             "status": "valid",
             "mode": "single",
@@ -1193,9 +1410,10 @@ try:
             "preview": str(result.head(10))
         }))
 except Exception as e:
+    import traceback
     print(json.dumps({
         "status": "invalid",
-        "error": str(e)
+        "error": str(e) + "\\n" + traceback.format_exc()
     }))
 `;
 
@@ -1296,6 +1514,23 @@ async function runParserJob(
 import sys
 import json
 import os
+from typing import NamedTuple, Union
+import polars as pl
+import pandas as pd
+import types
+
+# Define Output for parsers that import it
+class Output(NamedTuple):
+    name: str
+    data: Union[pl.DataFrame, pd.DataFrame]
+    sink: str
+    table: str = None
+    compression: str = "snappy"
+
+# Mock casparian_types module so parser imports work
+casparian_types = types.ModuleType('casparian_types')
+casparian_types.Output = Output
+sys.modules['casparian_types'] = casparian_types
 
 # User code
 ${code}
@@ -1303,56 +1538,58 @@ ${code}
 # Sink configuration
 sink_config = ${JSON.stringify(sinkConfig)}
 
+def write_output(topic: str, df, cfg: dict):
+    """Write a dataframe to the configured sink."""
+    sink_type = cfg['type']
+    sink_path = cfg['path']
+    os.makedirs(sink_path, exist_ok=True)
+
+    if sink_type == 'parquet':
+        out_file = os.path.join(sink_path, f"{topic}.parquet")
+        if hasattr(df, 'write_parquet'):
+            df.write_parquet(out_file)
+        else:
+            import pyarrow.parquet as pq
+            pq.write_table(df.to_arrow() if hasattr(df, 'to_arrow') else pa.Table.from_pandas(df), out_file)
+    elif sink_type == 'sqlite':
+        import sqlite3
+        db_file = os.path.join(sink_path, f"{topic}.db")
+        conn = sqlite3.connect(db_file)
+        pdf = df.to_pandas() if hasattr(df, 'to_pandas') else df
+        pdf.to_sql(topic, conn, if_exists='replace', index=False)
+        conn.close()
+    elif sink_type == 'csv':
+        out_file = os.path.join(sink_path, f"{topic}.csv")
+        if hasattr(df, 'write_csv'):
+            df.write_csv(out_file)
+        else:
+            df.to_pandas().to_csv(out_file, index=False)
+
 # Run parser
 try:
     result = parse("${inputFilePath.replace(/\\/g, '\\\\')}")
 
     outputs = []
-    if isinstance(result, dict):
-        # Multi-output
+
+    # Check for list[Output] (new multi-output contract)
+    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], tuple) and hasattr(result[0], 'name'):
+        for out in result:
+            topic = out.name
+            df = out.data
+            if topic in sink_config:
+                write_output(topic, df, sink_config[topic])
+                outputs.append({"topic": topic, "rows": len(df)})
+    elif isinstance(result, dict):
+        # Legacy multi-output (dict[str, DataFrame])
         for topic, df in result.items():
             if topic in sink_config:
-                cfg = sink_config[topic]
-                sink_type = cfg['type']
-                sink_path = cfg['path']
-                os.makedirs(sink_path, exist_ok=True)
-
-                if sink_type == 'parquet':
-                    out_file = os.path.join(sink_path, f"{topic}.parquet")
-                    df.write_parquet(out_file)
-                elif sink_type == 'sqlite':
-                    import sqlite3
-                    db_file = os.path.join(sink_path, f"{topic}.db")
-                    conn = sqlite3.connect(db_file)
-                    df.to_pandas().to_sql(topic, conn, if_exists='replace', index=False)
-                    conn.close()
-                elif sink_type == 'csv':
-                    out_file = os.path.join(sink_path, f"{topic}.csv")
-                    df.write_csv(out_file)
-
+                write_output(topic, df, sink_config[topic])
                 outputs.append({"topic": topic, "rows": len(df)})
     else:
         # Single output - use first topic config
         if sink_config:
             first_topic = list(sink_config.keys())[0]
-            cfg = sink_config[first_topic]
-            sink_type = cfg['type']
-            sink_path = cfg['path']
-            os.makedirs(sink_path, exist_ok=True)
-
-            if sink_type == 'parquet':
-                out_file = os.path.join(sink_path, f"{first_topic}.parquet")
-                result.write_parquet(out_file)
-            elif sink_type == 'sqlite':
-                import sqlite3
-                db_file = os.path.join(sink_path, f"{first_topic}.db")
-                conn = sqlite3.connect(db_file)
-                result.to_pandas().to_sql(first_topic, conn, if_exists='replace', index=False)
-                conn.close()
-            elif sink_type == 'csv':
-                out_file = os.path.join(sink_path, f"{first_topic}.csv")
-                result.write_csv(out_file)
-
+            write_output(first_topic, result, sink_config[first_topic])
             outputs.append({"topic": first_topic, "rows": len(result)})
 
     print(json.dumps({
@@ -1361,9 +1598,10 @@ try:
         "outputs": outputs
     }))
 except Exception as e:
+    import traceback
     print(json.dumps({
         "success": False,
-        "message": str(e),
+        "message": str(e) + "\\n" + traceback.format_exc(),
         "outputs": []
     }))
 `;

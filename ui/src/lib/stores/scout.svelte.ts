@@ -337,7 +337,7 @@ class ScoutStore {
 
     try {
       console.log("[ScoutStore] Starting scan for source:", sourceId);
-      const stats = await invoke<ScanStats>("scout_scan", { sourceId });
+      const stats = await invoke<ScanStats>("scout_scan_source", { sourceId });
       this.lastScanStats = stats;
       console.log("[ScoutStore] Scan complete:", stats.filesDiscovered, "files");
 
@@ -540,7 +540,7 @@ class ScoutStore {
 
   async loadTagStats(): Promise<void> {
     try {
-      this.tagStats = await invoke<TagStats[]>("scout_get_tag_stats");
+      this.tagStats = await invoke<TagStats[]>("scout_tag_stats");
       console.log("[ScoutStore] Loaded stats for", this.tagStats.length, "tags");
     } catch (err) {
       console.error("[ScoutStore] Failed to load tag stats:", err);
@@ -557,7 +557,8 @@ class ScoutStore {
     this.error = null;
 
     try {
-      await invoke("scout_tag_file", { fileId, tag });
+      // Use scout_tag_files (plural) - backend only has batch version
+      await invoke("scout_tag_files", { fileIds: [fileId], tag });
       // Update local state - manual tagging sets tagSource to 'manual'
       this.files = this.files.map(f =>
         f.id === fileId ? { ...f, tag, tagSource: "manual" as const, ruleId: null, status: "tagged" as FileStatus } : f

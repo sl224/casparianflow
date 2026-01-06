@@ -4,27 +4,28 @@ Slow Processor Plugin - E2E Demo
 Simulates a computationally expensive process by:
 1. Reading input data in chunks
 2. Sleeping between chunks to simulate processing time
-3. Yielding Arrow batches incrementally
+3. Yielding Output objects incrementally
 
 Watch the UI metrics update in real-time!
+
+Note: This plugin uses the Handler pattern (not parse()) to demonstrate
+streaming/batch processing with incremental yields.
 """
 
 import time
 import pandas as pd
 import pyarrow as pa
+from casparian_types import Output
 
-# Plugin manifest - defines routing and output
-MANIFEST = {
-    "pattern": "demo/data/*.csv",
-    "topic": "processed_output",
-}
+TOPIC = "processed_output"
+SINK = "parquet"
 
 
 class Handler:
     """
     Demo plugin that processes files slowly for UI testing.
 
-    Uses the standard execute() pattern that yields Arrow batches.
+    Uses the Handler execute() pattern that yields Output objects.
     """
 
     def execute(self, file_path: str):
@@ -35,7 +36,7 @@ class Handler:
             file_path: Path to input file
 
         Yields:
-            Arrow batches of processed data
+            Output objects with processed data
         """
         batch_size = 5  # Small batches for demo visibility
         delay_seconds = 1.5  # Delay between batches
@@ -64,8 +65,8 @@ class Handler:
             batch_df["_batch"] = batch_number
             batch_df["_processed_at"] = pd.Timestamp.now().isoformat()
 
-            # Yield as Arrow table
-            yield pa.Table.from_pandas(batch_df)
+            # Yield as Output with Arrow table
+            yield Output(TOPIC, pa.Table.from_pandas(batch_df), SINK)
 
             elapsed = time.time() - start_time
             processed = min((batch_number * batch_size), total_rows)

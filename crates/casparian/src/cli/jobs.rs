@@ -2,14 +2,12 @@
 //!
 //! Lists jobs from the cf_processing_queue table with filtering and formatting.
 
+use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::print_table_colored;
 use comfy_table::Color;
 use serde::Serialize;
 use std::path::PathBuf;
-
-/// Default database path
-const DEFAULT_DB_PATH: &str = "casparian_flow.db";
 
 /// Arguments for the jobs command
 #[derive(Debug)]
@@ -150,13 +148,7 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
 
 /// Get the database path from environment or default
 pub fn get_db_path() -> anyhow::Result<PathBuf> {
-    if let Ok(path) = std::env::var("CASPARIAN_DB") {
-        return Ok(PathBuf::from(path));
-    }
-
-    // Try current directory
-    let cwd = std::env::current_dir()?;
-    Ok(cwd.join(DEFAULT_DB_PATH))
+    Ok(config::resolve_db_path(None))
 }
 
 /// Build status filter from command flags

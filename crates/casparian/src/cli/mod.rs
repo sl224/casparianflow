@@ -28,6 +28,12 @@ pub mod source;
 pub mod rule;
 pub mod topic;
 
+// W7: MCP Server
+pub mod mcp;
+
+// Configuration
+pub mod config;
+
 // Re-exports are used by the scan and preview modules
 #[allow(unused_imports)]
 pub use error::HelpfulError;
