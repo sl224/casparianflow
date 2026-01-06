@@ -8,12 +8,20 @@ use casparian_scout::{
     Database as ScoutDatabase, FileStatus, ScannedFile, Scanner, Source, SourceType, TaggingRule, Tagger,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tauri::State;
 use tokio::sync::Mutex;
 use tracing::info;
+
+/// Compute SHA256 hash of source code for versioning (W4)
+fn compute_source_hash(source: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 // ============================================================================
 // State Management
@@ -887,6 +895,7 @@ pub struct ParserLabParser {
     pub file_pattern: String,
     pub pattern_type: String,
     pub source_code: Option<String>,
+    pub source_hash: Option<String>,  // W4: SHA256 hash of source_code for versioning
     pub validation_status: String,
     pub validation_error: Option<String>,
     pub validation_output: Option<String>,
@@ -936,7 +945,7 @@ pub struct ParserLabTestFile {
 
 /// SQL for selecting all parser fields
 const PARSER_SELECT_SQL: &str = r#"
-    SELECT id, name, file_pattern, pattern_type, source_code,
+    SELECT id, name, file_pattern, pattern_type, source_code, source_hash,
            validation_status, validation_error, validation_output, last_validated_at,
            messages_json, schema_json, sink_type, sink_config_json,
            published_at, published_plugin_id, is_sample, output_mode, detected_topics_json,
@@ -951,21 +960,22 @@ fn row_to_parser(row: &sqlx::sqlite::SqliteRow) -> ParserLabParser {
         file_pattern: row.get::<Option<String>, _>(2).unwrap_or_default(),
         pattern_type: row.get::<Option<String>, _>(3).unwrap_or_else(|| "all".to_string()),
         source_code: row.get(4),
-        validation_status: row.get::<Option<String>, _>(5).unwrap_or_else(|| "pending".to_string()),
-        validation_error: row.get(6),
-        validation_output: row.get(7),
-        last_validated_at: row.get(8),
-        messages_json: row.get(9),
-        schema_json: row.get(10),
-        sink_type: row.get::<Option<String>, _>(11).unwrap_or_else(|| "parquet".to_string()),
-        sink_config_json: row.get(12),
-        published_at: row.get(13),
-        published_plugin_id: row.get(14),
-        is_sample: row.get::<Option<i32>, _>(15).unwrap_or(0) != 0,
-        output_mode: row.get::<Option<String>, _>(16).unwrap_or_else(|| "single".to_string()),
-        detected_topics_json: row.get(17),
-        created_at: row.get(18),
-        updated_at: row.get(19),
+        source_hash: row.get(5),  // W4: source_hash for versioning
+        validation_status: row.get::<Option<String>, _>(6).unwrap_or_else(|| "pending".to_string()),
+        validation_error: row.get(7),
+        validation_output: row.get(8),
+        last_validated_at: row.get(9),
+        messages_json: row.get(10),
+        schema_json: row.get(11),
+        sink_type: row.get::<Option<String>, _>(12).unwrap_or_else(|| "parquet".to_string()),
+        sink_config_json: row.get(13),
+        published_at: row.get(14),
+        published_plugin_id: row.get(15),
+        is_sample: row.get::<Option<i32>, _>(16).unwrap_or(0) != 0,
+        output_mode: row.get::<Option<String>, _>(17).unwrap_or_else(|| "single".to_string()),
+        detected_topics_json: row.get(18),
+        created_at: row.get(19),
+        updated_at: row.get(20),
     }
 }
 
@@ -1003,6 +1013,7 @@ pub async fn parser_lab_create_parser(
         file_pattern: pattern,
         pattern_type: "all".to_string(),
         source_code: None,
+        source_hash: None,  // W4: No hash until source_code is set
         validation_status: "pending".to_string(),
         validation_error: None,
         validation_output: None,
@@ -1041,6 +1052,7 @@ pub async fn parser_lab_get_parser(
 }
 
 /// Update a parser
+/// W4: Automatically computes source_hash when source_code is present
 #[tauri::command]
 pub async fn parser_lab_update_parser(
     state: State<'_, ScoutState>,
@@ -1051,9 +1063,12 @@ pub async fn parser_lab_update_parser(
 
     let now = chrono::Utc::now().timestamp_millis();
 
+    // W4: Compute source_hash if source_code is present
+    let source_hash = parser.source_code.as_ref().map(|code| compute_source_hash(code));
+
     sqlx::query(
         r#"UPDATE parser_lab_parsers SET
-           name = ?, file_pattern = ?, pattern_type = ?, source_code = ?,
+           name = ?, file_pattern = ?, pattern_type = ?, source_code = ?, source_hash = ?,
            validation_status = ?, validation_error = ?, validation_output = ?,
            last_validated_at = ?, messages_json = ?, schema_json = ?,
            sink_type = ?, sink_config_json = ?, published_at = ?,
@@ -1065,6 +1080,7 @@ pub async fn parser_lab_update_parser(
     .bind(&parser.file_pattern)
     .bind(&parser.pattern_type)
     .bind(&parser.source_code)
+    .bind(&source_hash)
     .bind(&parser.validation_status)
     .bind(&parser.validation_error)
     .bind(&parser.validation_output)

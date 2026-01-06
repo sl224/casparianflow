@@ -145,6 +145,30 @@ pub struct JobDetails {
 }
 
 // ============================================================================
+// Processing Failure Types (W3 - Failure Capture)
+// ============================================================================
+
+/// Detailed processing failure with line context for debugging
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessingFailure {
+    pub id: i64,
+    pub job_id: Option<i64>,
+    pub parser_id: Option<String>,
+    pub test_file_id: Option<String>,
+    pub file_path: Option<String>,
+    pub line_number: Option<i64>,
+    pub column_number: Option<i64>,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub context_before: Option<String>,
+    pub context_after: Option<String>,
+    pub stack_trace: Option<String>,
+    pub raw_input_sample: Option<String>,
+    pub created_at: Option<String>,
+}
+
+// ============================================================================
 // Routing & Configuration Types
 // ============================================================================
 
@@ -1194,6 +1218,261 @@ async fn sync_scout_file_statuses(
     Ok(updated_count)
 }
 
+// ============================================================================
+// W3 - Processing Failure Capture Commands
+// ============================================================================
+
+/// Save a processing failure with detailed context for debugging
+#[tauri::command]
+async fn save_processing_failure(
+    state: tauri::State<'_, SentinelState>,
+    job_id: Option<i64>,
+    parser_id: Option<String>,
+    test_file_id: Option<String>,
+    file_path: Option<String>,
+    line_number: Option<i64>,
+    column_number: Option<i64>,
+    error_type: Option<String>,
+    error_message: Option<String>,
+    context_before: Option<String>,
+    context_after: Option<String>,
+    stack_trace: Option<String>,
+    raw_input_sample: Option<String>,
+) -> Result<i64, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let result = sqlx::query(
+        r#"INSERT INTO processing_failures
+           (job_id, parser_id, test_file_id, file_path, line_number, column_number,
+            error_type, error_message, context_before, context_after, stack_trace, raw_input_sample)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(job_id)
+    .bind(&parser_id)
+    .bind(&test_file_id)
+    .bind(&file_path)
+    .bind(line_number)
+    .bind(column_number)
+    .bind(&error_type)
+    .bind(&error_message)
+    .bind(&context_before)
+    .bind(&context_after)
+    .bind(&stack_trace)
+    .bind(&raw_input_sample)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to save processing failure: {}", e))?;
+
+    let failure_id = result.last_insert_rowid();
+    info!(
+        failure_id,
+        parser_id = ?parser_id,
+        error_type = ?error_type,
+        "Saved processing failure"
+    );
+    Ok(failure_id)
+}
+
+/// Get the most recent processing failure for a parser and test file
+#[tauri::command]
+async fn get_processing_failure(
+    state: tauri::State<'_, SentinelState>,
+    parser_id: String,
+    test_file_id: String,
+) -> Result<Option<ProcessingFailure>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let result: Option<(i64, Option<i64>, Option<String>, Option<String>, Option<String>,
+                        Option<i64>, Option<i64>, Option<String>, Option<String>,
+                        Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            r#"SELECT id, job_id, parser_id, test_file_id, file_path, line_number, column_number,
+                      error_type, error_message, context_before, context_after, stack_trace,
+                      raw_input_sample, created_at
+               FROM processing_failures
+               WHERE parser_id = ? AND test_file_id = ?
+               ORDER BY created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(&parser_id)
+        .bind(&test_file_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Failed to get processing failure: {}", e))?;
+
+    Ok(result.map(|row| ProcessingFailure {
+        id: row.0,
+        job_id: row.1,
+        parser_id: row.2,
+        test_file_id: row.3,
+        file_path: row.4,
+        line_number: row.5,
+        column_number: row.6,
+        error_type: row.7,
+        error_message: row.8,
+        context_before: row.9,
+        context_after: row.10,
+        stack_trace: row.11,
+        raw_input_sample: row.12,
+        created_at: row.13,
+    }))
+}
+
+/// Get the most recent processing failure for a job ID
+#[tauri::command]
+async fn get_processing_failure_by_job(
+    state: tauri::State<'_, SentinelState>,
+    job_id: i64,
+) -> Result<Option<ProcessingFailure>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    let result: Option<(i64, Option<i64>, Option<String>, Option<String>, Option<String>,
+                        Option<i64>, Option<i64>, Option<String>, Option<String>,
+                        Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
+        sqlx::query_as(
+            r#"SELECT id, job_id, parser_id, test_file_id, file_path, line_number, column_number,
+                      error_type, error_message, context_before, context_after, stack_trace,
+                      raw_input_sample, created_at
+               FROM processing_failures
+               WHERE job_id = ?
+               ORDER BY created_at DESC
+               LIMIT 1"#,
+        )
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Failed to get processing failure by job: {}", e))?;
+
+    Ok(result.map(|row| ProcessingFailure {
+        id: row.0,
+        job_id: row.1,
+        parser_id: row.2,
+        test_file_id: row.3,
+        file_path: row.4,
+        line_number: row.5,
+        column_number: row.6,
+        error_type: row.7,
+        error_message: row.8,
+        context_before: row.9,
+        context_after: row.10,
+        stack_trace: row.11,
+        raw_input_sample: row.12,
+        created_at: row.13,
+    }))
+}
+
+// ============================================================================
+// W4 - Parser Version Checking Commands
+// ============================================================================
+
+/// Parser version info for checking compatibility
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParserVersionInfo {
+    pub parser_id: String,
+    pub parser_name: String,
+    pub source_hash: Option<String>,
+    pub deployed_hash: Option<String>,
+    pub is_current: bool,
+}
+
+/// Get version info for a parser (comparing parser_lab vs deployed plugin)
+#[tauri::command]
+async fn get_parser_version_info(
+    state: tauri::State<'_, SentinelState>,
+    parser_id: String,
+) -> Result<Option<ParserVersionInfo>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    // Get parser info including source_hash
+    let parser_row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, name, source_hash FROM parser_lab_parsers WHERE id = ?"
+    )
+    .bind(&parser_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to get parser: {}", e))?;
+
+    let Some((id, name, source_hash)) = parser_row else {
+        return Ok(None);
+    };
+
+    // Get deployed plugin source_hash if exists (match by name)
+    let deployed_hash: Option<String> = sqlx::query_scalar(
+        "SELECT source_hash FROM cf_plugin_manifest WHERE plugin_name = ? AND status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1"
+    )
+    .bind(&name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to get deployed plugin: {}", e))?
+    .flatten();
+
+    let is_current = match (&source_hash, &deployed_hash) {
+        (Some(s), Some(d)) => s == d,
+        (None, None) => true,  // Both null = consider current
+        _ => false,
+    };
+
+    Ok(Some(ParserVersionInfo {
+        parser_id: id,
+        parser_name: name,
+        source_hash,
+        deployed_hash,
+        is_current,
+    }))
+}
+
+/// Check if a job used the current parser version
+#[tauri::command]
+async fn check_job_parser_version(
+    state: tauri::State<'_, SentinelState>,
+    job_id: i64,
+) -> Result<Option<ParserVersionInfo>, String> {
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    // Get job's plugin_name and parser_source_hash
+    let job_row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT plugin_name, parser_source_hash FROM cf_processing_queue WHERE id = ?"
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to get job: {}", e))?;
+
+    let Some((plugin_name, job_hash)) = job_row else {
+        return Ok(None);
+    };
+
+    // Get current deployed source_hash
+    let current_hash: Option<String> = sqlx::query_scalar(
+        "SELECT source_hash FROM cf_plugin_manifest WHERE plugin_name = ? AND status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1"
+    )
+    .bind(&plugin_name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to get deployed plugin: {}", e))?
+    .flatten();
+
+    let is_current = match (&job_hash, &current_hash) {
+        (Some(j), Some(c)) => j == c,
+        (None, None) => true,
+        _ => false,
+    };
+
+    Ok(Some(ParserVersionInfo {
+        parser_id: String::new(),  // Not available from job
+        parser_name: plugin_name,
+        source_hash: job_hash,
+        deployed_hash: current_hash,
+        is_current,
+    }))
+}
+
 /// Validate that a path is a safe plugin file path
 /// Returns the canonicalized path if valid
 fn validate_plugin_path(path: &str) -> Result<std::path::PathBuf, String> {
@@ -1974,6 +2253,58 @@ async fn create_sentinel_tables(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // =========================================================================
+    // W3 - Processing Failures (detailed error context for debugging)
+    // =========================================================================
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS processing_failures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id INTEGER,
+            parser_id TEXT,
+            test_file_id TEXT,
+            file_path TEXT,
+            line_number INTEGER,
+            column_number INTEGER,
+            error_type TEXT,
+            error_message TEXT,
+            context_before TEXT,
+            context_after TEXT,
+            stack_trace TEXT,
+            raw_input_sample TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES cf_processing_queue(id)
+        )"#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Index for quick lookup by parser_id and test_file_id
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_processing_failures_parser ON processing_failures(parser_id, test_file_id)"
+    )
+    .execute(pool)
+    .await;
+
+    // Index for job lookup
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_processing_failures_job ON processing_failures(job_id)"
+    )
+    .execute(pool)
+    .await;
+
+    // =========================================================================
+    // W4 - Parser Versioning (source_hash tracking)
+    // =========================================================================
+    // Add source_hash column to parser_lab_parsers if missing
+    let _ = sqlx::query("ALTER TABLE parser_lab_parsers ADD COLUMN source_hash TEXT")
+        .execute(pool)
+        .await;
+
+    // Add parser_source_hash to cf_processing_queue to track which version was used
+    let _ = sqlx::query("ALTER TABLE cf_processing_queue ADD COLUMN parser_source_hash TEXT")
+        .execute(pool)
+        .await;
+
     info!("Sentinel database tables created/verified");
     Ok(())
 }
@@ -2066,6 +2397,13 @@ pub fn run() {
             get_plugins_for_tag,
             process_job_async,
             sync_scout_file_statuses,
+            // W3 - Processing Failure Capture
+            save_processing_failure,
+            get_processing_failure,
+            get_processing_failure_by_job,
+            // W4 - Parser Version Checking
+            get_parser_version_info,
+            check_job_parser_version,
             // Publish Wizard (Real I/O)
             analyze_plugin_manifest,
             publish_with_overrides,
