@@ -2,7 +2,7 @@
   import { scoutStore, formatBytes } from "$lib/stores/scout.svelte";
   import { invoke } from "$lib/tauri";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
 
   import FilterBar from "./FilterBar.svelte";
   import FileList from "./FileList.svelte";
@@ -24,13 +24,32 @@
   let newRulePattern = $state("");
   let newRuleTag = $state("");
 
+  // Status sync interval
+  let statusSyncInterval: ReturnType<typeof setInterval> | null = null;
+
   onMount(async () => {
     try {
       await scoutStore.initDb();
       await scoutStore.loadSources();
       await scoutStore.loadStatus();
+
+      // Initial sync of file statuses from Sentinel
+      await scoutStore.syncStatuses();
+
+      // Set up periodic status sync every 3 seconds
+      statusSyncInterval = setInterval(() => {
+        scoutStore.syncStatuses();
+      }, 3000);
     } catch (e) {
       console.error("[ScoutTab] Init failed:", e);
+    }
+  });
+
+  onDestroy(() => {
+    // Clean up status sync interval
+    if (statusSyncInterval) {
+      clearInterval(statusSyncInterval);
+      statusSyncInterval = null;
     }
   });
 
