@@ -21,6 +21,95 @@ use std::path::Path;
 use uuid::Uuid;
 
 // =============================================================================
+// Constraint Visibility Types
+// =============================================================================
+
+/// A type that was eliminated during inference
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EliminatedType {
+    /// Name of the type that was eliminated (e.g., "int64", "date")
+    pub type_name: String,
+    /// Human-readable reason why this type was eliminated
+    pub reason: String,
+    /// Sample values that caused this type to be eliminated
+    pub counter_examples: Vec<String>,
+}
+
+/// Evidence for type inference decision
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeEvidence {
+    /// Sample values that informed this decision
+    pub sample_values: Vec<String>,
+    /// Types that were eliminated and why
+    pub eliminated_types: Vec<EliminatedType>,
+    /// Percentage of values that match this type (0.0 - 100.0)
+    pub match_percentage: f32,
+}
+
+/// A possible alternative type with confidence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlternativeType {
+    /// The alternative type name
+    pub type_name: String,
+    /// Confidence in this alternative (0.0 - 1.0)
+    pub confidence: f32,
+    /// What would change if this type were chosen
+    pub what_would_change: String,
+}
+
+/// Constraint reasoning for a column - explains WHY types were inferred
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnConstraint {
+    /// The resolved type
+    pub resolved_type: String,
+    /// Confidence in this decision (0.0 - 1.0)
+    pub confidence: f32,
+    /// Evidence that led to this decision
+    pub evidence: TypeEvidence,
+    /// Assumptions made (e.g., "no nulls", "decimal format")
+    pub assumptions: Vec<String>,
+    /// Whether this needs human decision
+    pub needs_human_decision: bool,
+    /// Question to ask human if ambiguous
+    pub human_question: Option<String>,
+    /// Possible alternative types if ambiguous
+    pub alternatives: Vec<AlternativeType>,
+}
+
+impl Default for ColumnConstraint {
+    fn default() -> Self {
+        Self {
+            resolved_type: "string".to_string(),
+            confidence: 1.0,
+            evidence: TypeEvidence {
+                sample_values: vec![],
+                eliminated_types: vec![],
+                match_percentage: 100.0,
+            },
+            assumptions: vec![],
+            needs_human_decision: false,
+            human_question: None,
+            alternatives: vec![],
+        }
+    }
+}
+
+/// A group of schemas with similar structure (for bulk approval)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaGroup {
+    /// Unique identifier for this group
+    pub group_id: String,
+    /// Human-readable name for the group
+    pub name: String,
+    /// Schema discovery IDs in this group
+    pub schema_ids: Vec<String>,
+    /// Columns common to all schemas in this group
+    pub common_columns: Vec<String>,
+    /// A representative sample file
+    pub sample_file: String,
+}
+
+// =============================================================================
 // Discover Schemas Tool
 // =============================================================================
 
@@ -39,6 +128,8 @@ pub struct DiscoveredColumn {
     pub is_ambiguous: bool,
     /// Possible alternative types if ambiguous
     pub alternative_types: Vec<String>,
+    /// Full constraint reasoning - explains WHY this type was inferred
+    pub constraint: ColumnConstraint,
 }
 
 /// A discovered schema from a file
@@ -73,6 +164,8 @@ pub struct DiscoverSchemasResult {
     pub failed_files: Vec<String>,
     /// Duration in milliseconds
     pub duration_ms: u64,
+    /// Groups of similar schemas for bulk approval workflow
+    pub schema_groups: Vec<SchemaGroup>,
 }
 
 /// Analyze files to discover their schema structure
@@ -81,18 +174,58 @@ pub struct DiscoverSchemasResult {
 /// data types, and nullability.
 pub struct DiscoverSchemasTool;
 
+/// Result of type inference with full constraint reasoning
+#[derive(Debug, Clone)]
+struct TypeInferenceResult {
+    /// The inferred type
+    data_type: String,
+    /// Whether the inference is ambiguous
+    is_ambiguous: bool,
+    /// Alternative types
+    alternatives: Vec<String>,
+    /// Full constraint reasoning
+    constraint: ColumnConstraint,
+}
+
 impl DiscoverSchemasTool {
     pub fn new() -> Self {
         Self
     }
 
-    /// Infer data type from a sample of values
-    fn infer_type(&self, values: &[&str]) -> (String, bool, Vec<String>) {
+    /// Infer data type from a sample of values with full constraint reasoning
+    fn infer_type_with_constraints(&self, column_name: &str, values: &[&str]) -> TypeInferenceResult {
         if values.is_empty() {
-            return ("string".to_string(), false, vec![]);
+            return TypeInferenceResult {
+                data_type: "string".to_string(),
+                is_ambiguous: false,
+                alternatives: vec![],
+                constraint: ColumnConstraint {
+                    resolved_type: "string".to_string(),
+                    confidence: 1.0,
+                    evidence: TypeEvidence {
+                        sample_values: vec![],
+                        eliminated_types: vec![],
+                        match_percentage: 100.0,
+                    },
+                    assumptions: vec!["No non-null values to analyze".to_string()],
+                    needs_human_decision: false,
+                    human_question: None,
+                    alternatives: vec![],
+                },
+            };
         }
 
+        // Track per-type statistics and counter-examples
         let mut type_counts: HashMap<&str, usize> = HashMap::new();
+        let mut type_failures: HashMap<&str, Vec<String>> = HashMap::new();
+        let candidate_types = ["int64", "float64", "boolean", "date", "timestamp"];
+
+        for type_name in &candidate_types {
+            type_failures.insert(type_name, Vec::new());
+        }
+
+        let mut date_format_counts: HashMap<&str, usize> = HashMap::new();
+        let mut ambiguous_date_values: Vec<String> = Vec::new();
 
         for value in values {
             let value = value.trim();
@@ -100,40 +233,218 @@ impl DiscoverSchemasTool {
                 continue;
             }
 
-            // Check types in order of specificity
-            if value.parse::<i64>().is_ok() {
+            // Check each type and track why it fails
+            let is_int = value.parse::<i64>().is_ok();
+            let is_float = value.parse::<f64>().is_ok();
+            let is_bool = Self::is_boolean(value);
+            let (is_date, date_format) = Self::check_date_with_format(value);
+            let is_timestamp = Self::is_timestamp(value);
+
+            // Track successful parses
+            if is_int {
                 *type_counts.entry("int64").or_insert(0) += 1;
-            } else if value.parse::<f64>().is_ok() {
+            } else if !is_float {
+                // Only record failure if not even a float
+                type_failures.get_mut("int64").unwrap().push(value.to_string());
+            }
+
+            if is_float && !is_int {
                 *type_counts.entry("float64").or_insert(0) += 1;
-            } else if Self::is_boolean(value) {
+            } else if !is_int && !is_float {
+                type_failures.get_mut("float64").unwrap().push(value.to_string());
+            }
+
+            if is_bool {
                 *type_counts.entry("boolean").or_insert(0) += 1;
-            } else if Self::is_date(value) {
+            } else {
+                type_failures.get_mut("boolean").unwrap().push(value.to_string());
+            }
+
+            if is_date {
                 *type_counts.entry("date").or_insert(0) += 1;
-            } else if Self::is_timestamp(value) {
+                if let Some(fmt) = date_format {
+                    *date_format_counts.entry(fmt).or_insert(0) += 1;
+                }
+                // Check for ambiguous date formats (could be MM/DD or DD/MM)
+                if Self::is_ambiguous_date_format(value) {
+                    ambiguous_date_values.push(value.to_string());
+                }
+            } else {
+                type_failures.get_mut("date").unwrap().push(value.to_string());
+            }
+
+            if is_timestamp {
                 *type_counts.entry("timestamp").or_insert(0) += 1;
             } else {
+                type_failures.get_mut("timestamp").unwrap().push(value.to_string());
+            }
+
+            // If nothing matches, it's a string
+            if !is_int && !is_float && !is_bool && !is_date && !is_timestamp {
                 *type_counts.entry("string").or_insert(0) += 1;
             }
         }
 
-        if type_counts.is_empty() {
-            return ("string".to_string(), false, vec![]);
+        // Build eliminated types with reasons
+        let total_values = values.iter().filter(|v| !v.trim().is_empty()).count();
+        let mut eliminated_types = Vec::new();
+
+        for type_name in &candidate_types {
+            let count = type_counts.get(type_name).copied().unwrap_or(0);
+            let failures = type_failures.get(type_name).unwrap();
+
+            if count == 0 && !failures.is_empty() {
+                // Type was completely eliminated
+                let reason = Self::describe_elimination_reason(type_name, failures);
+                eliminated_types.push(EliminatedType {
+                    type_name: type_name.to_string(),
+                    reason,
+                    counter_examples: failures.iter().take(3).cloned().collect(),
+                });
+            } else if count > 0 && count < total_values && !failures.is_empty() {
+                // Partial match - type possible but not for all values
+                let match_pct = (count as f32 / total_values as f32) * 100.0;
+                eliminated_types.push(EliminatedType {
+                    type_name: type_name.to_string(),
+                    reason: format!(
+                        "Only {:.1}% of values match this type ({} of {} values)",
+                        match_pct, count, total_values
+                    ),
+                    counter_examples: failures.iter().take(3).cloned().collect(),
+                });
+            }
         }
 
-        // Find most common type
+        // Determine best type
         let mut sorted: Vec<_> = type_counts.iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(a.1));
 
-        let best_type = sorted[0].0.to_string();
-        let is_ambiguous = sorted.len() > 1 && sorted[1].1 > &(values.len() / 10);
-        let alternatives: Vec<String> = sorted
+        let (best_type, match_percentage) = if sorted.is_empty() || *sorted[0].1 == 0 {
+            ("string".to_string(), 100.0)
+        } else {
+            let best = sorted[0].0.to_string();
+            let pct = (*sorted[0].1 as f32 / total_values as f32) * 100.0;
+            (best, pct)
+        };
+
+        // Calculate confidence and check for ambiguity
+        let is_ambiguous = sorted.len() > 1 && sorted[1].1 > &(total_values / 10);
+
+        let alternatives_vec: Vec<String> = sorted
             .iter()
             .skip(1)
-            .filter(|(_, count)| **count > values.len() / 20)
+            .filter(|(_, count)| **count > total_values / 20)
             .map(|(t, _)| t.to_string())
             .collect();
 
-        (best_type, is_ambiguous, alternatives)
+        // Build alternative types with confidence and what would change
+        let mut alternative_types = Vec::new();
+        for (type_name, count) in sorted.iter().skip(1) {
+            if **count > total_values / 20 {
+                let alt_confidence = **count as f32 / total_values as f32;
+                alternative_types.push(AlternativeType {
+                    type_name: type_name.to_string(),
+                    confidence: alt_confidence,
+                    what_would_change: Self::describe_type_change(&best_type, type_name),
+                });
+            }
+        }
+
+        // Calculate confidence
+        let confidence = if is_ambiguous {
+            match_percentage / 100.0 * 0.7  // Reduce confidence for ambiguous cases
+        } else {
+            match_percentage / 100.0
+        };
+
+        // Build assumptions
+        let mut assumptions = Vec::new();
+        if match_percentage < 100.0 {
+            assumptions.push(format!(
+                "Assuming {:.1}% non-matching values are data errors",
+                100.0 - match_percentage
+            ));
+        }
+        if best_type == "date" && !ambiguous_date_values.is_empty() {
+            assumptions.push("Date format assumed based on value patterns".to_string());
+        }
+
+        // Determine if human decision is needed
+        let needs_human_decision = is_ambiguous
+            || (best_type == "date" && !ambiguous_date_values.is_empty())
+            || match_percentage < 90.0;
+
+        // Generate human question if needed
+        let human_question = if best_type == "date" && !ambiguous_date_values.is_empty() {
+            Some(format!(
+                "Column '{}' has values like '{}'. Is this MM/DD (US format) or DD/MM (European format)?",
+                column_name,
+                ambiguous_date_values.first().unwrap_or(&"unknown".to_string())
+            ))
+        } else if is_ambiguous {
+            Some(format!(
+                "Column '{}' could be {} or {}. Sample values: {}. Which type should be used?",
+                column_name,
+                best_type,
+                alternatives_vec.join(", "),
+                values.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+            ))
+        } else if match_percentage < 90.0 {
+            Some(format!(
+                "Column '{}' has {:.1}% values that don't match type {}. Should these be treated as errors or should the type be string?",
+                column_name,
+                100.0 - match_percentage,
+                best_type
+            ))
+        } else {
+            None
+        };
+
+        TypeInferenceResult {
+            data_type: best_type.clone(),
+            is_ambiguous,
+            alternatives: alternatives_vec,
+            constraint: ColumnConstraint {
+                resolved_type: best_type,
+                confidence,
+                evidence: TypeEvidence {
+                    sample_values: values.iter().take(5).map(|s| s.to_string()).collect(),
+                    eliminated_types,
+                    match_percentage,
+                },
+                assumptions,
+                needs_human_decision,
+                human_question,
+                alternatives: alternative_types,
+            },
+        }
+    }
+
+    /// Describe why a type was eliminated
+    fn describe_elimination_reason(type_name: &str, failures: &[String]) -> String {
+        let sample = failures.first().map(|s| s.as_str()).unwrap_or("(none)");
+        match type_name {
+            "int64" => format!("Values contain non-integer characters (e.g., '{}')", sample),
+            "float64" => format!("Values contain non-numeric characters (e.g., '{}')", sample),
+            "boolean" => format!("Values are not boolean-like (e.g., '{}')", sample),
+            "date" => format!("Values don't match any supported date format (e.g., '{}')", sample),
+            "timestamp" => format!("Values don't match any supported timestamp format (e.g., '{}')", sample),
+            _ => format!("Values don't match type {} (e.g., '{}')", type_name, sample),
+        }
+    }
+
+    /// Describe what would change if a different type were chosen
+    fn describe_type_change(from_type: &str, to_type: &str) -> String {
+        match (from_type, to_type) {
+            ("int64", "float64") => "Values would be stored as decimals; integer arithmetic preserved".to_string(),
+            ("int64", "string") => "Numeric operations would not be available; lexicographic sorting".to_string(),
+            ("float64", "string") => "Numeric operations would not be available; values stored as text".to_string(),
+            ("date", "string") => "Date operations not available; values stored as plain text".to_string(),
+            ("date", "timestamp") => "Values would include time component (midnight assumed)".to_string(),
+            ("boolean", "string") => "Boolean logic not available; values stored as text".to_string(),
+            ("boolean", "int64") => "true/false would become 1/0; numeric operations available".to_string(),
+            _ => format!("Values would be interpreted as {} instead of {}", to_type, from_type),
+        }
     }
 
     fn is_boolean(value: &str) -> bool {
@@ -143,16 +454,53 @@ impl DiscoverSchemasTool {
         )
     }
 
-    fn is_date(value: &str) -> bool {
-        // Simple date patterns
-        chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
-            || chrono::NaiveDate::parse_from_str(value, "%m/%d/%Y").is_ok()
-            || chrono::NaiveDate::parse_from_str(value, "%d/%m/%Y").is_ok()
+    /// Check if a value is a date and return the detected format
+    fn check_date_with_format(value: &str) -> (bool, Option<&'static str>) {
+        if chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok() {
+            return (true, Some("YYYY-MM-DD"));
+        }
+        if chrono::NaiveDate::parse_from_str(value, "%m/%d/%Y").is_ok() {
+            return (true, Some("MM/DD/YYYY"));
+        }
+        if chrono::NaiveDate::parse_from_str(value, "%d/%m/%Y").is_ok() {
+            return (true, Some("DD/MM/YYYY"));
+        }
+        if chrono::NaiveDate::parse_from_str(value, "%d-%m-%Y").is_ok() {
+            return (true, Some("DD-MM-YYYY"));
+        }
+        if chrono::NaiveDate::parse_from_str(value, "%m-%d-%Y").is_ok() {
+            return (true, Some("MM-DD-YYYY"));
+        }
+        (false, None)
+    }
+
+    /// Check if a date value has an ambiguous format (could be MM/DD or DD/MM)
+    fn is_ambiguous_date_format(value: &str) -> bool {
+        // Parse the value to extract components
+        let parts: Vec<&str> = if value.contains('/') {
+            value.split('/').collect()
+        } else if value.contains('-') {
+            value.split('-').collect()
+        } else {
+            return false;
+        };
+
+        if parts.len() < 3 {
+            return false;
+        }
+
+        // Try to parse the first two components as numbers
+        let first: i32 = parts[0].parse().unwrap_or(0);
+        let second: i32 = parts[1].parse().unwrap_or(0);
+
+        // If both are <= 12, it's ambiguous (could be month or day)
+        first > 0 && first <= 12 && second > 0 && second <= 12 && first != second
     }
 
     fn is_timestamp(value: &str) -> bool {
         chrono::DateTime::parse_from_rfc3339(value).is_ok()
             || chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").is_ok()
+            || chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").is_ok()
     }
 
     /// Analyze a CSV file
@@ -199,13 +547,13 @@ impl DiscoverSchemasTool {
             }
         }
 
-        // Build columns
+        // Build columns with constraint reasoning
         let mut columns = Vec::new();
         let mut warnings = Vec::new();
 
         for (i, name) in column_names.iter().enumerate() {
             let values_refs: Vec<&str> = column_values[i].iter().map(|s| s.as_str()).collect();
-            let (data_type, is_ambiguous, alternatives) = self.infer_type(&values_refs);
+            let inference_result = self.infer_type_with_constraints(name, &values_refs);
 
             let null_percentage = if rows_analyzed > 0 {
                 (null_counts[i] as f32 / rows_analyzed as f32) * 100.0
@@ -213,12 +561,12 @@ impl DiscoverSchemasTool {
                 0.0
             };
 
-            if is_ambiguous {
+            if inference_result.is_ambiguous {
                 warnings.push(format!(
                     "Column '{}' has ambiguous type: {} (could also be: {})",
                     name,
-                    data_type,
-                    alternatives.join(", ")
+                    inference_result.data_type,
+                    inference_result.alternatives.join(", ")
                 ));
             }
 
@@ -229,22 +577,29 @@ impl DiscoverSchemasTool {
                 ));
             }
 
+            // Add warning for columns needing human decision
+            if inference_result.constraint.needs_human_decision {
+                if let Some(ref question) = inference_result.constraint.human_question {
+                    warnings.push(format!("HUMAN DECISION NEEDED: {}", question));
+                }
+            }
+
             columns.push(DiscoveredColumn {
                 name: name.clone(),
-                data_type,
+                data_type: inference_result.data_type,
                 sample_values: column_values[i].iter().take(5).cloned().collect(),
                 null_percentage,
-                is_ambiguous,
-                alternative_types: alternatives,
+                is_ambiguous: inference_result.is_ambiguous,
+                alternative_types: inference_result.alternatives,
+                constraint: inference_result.constraint,
             });
         }
 
-        // Calculate confidence
-        let ambiguous_count = columns.iter().filter(|c| c.is_ambiguous).count();
-        let confidence = if columns.is_empty() {
+        // Calculate confidence (average of column confidences)
+        let avg_confidence = if columns.is_empty() {
             0.0
         } else {
-            1.0 - (ambiguous_count as f32 / columns.len() as f32) * 0.5
+            columns.iter().map(|c| c.constraint.confidence).sum::<f32>() / columns.len() as f32
         };
 
         let name = path
@@ -259,9 +614,50 @@ impl DiscoverSchemasTool {
             columns,
             rows_analyzed,
             format: "csv".to_string(),
-            confidence,
+            confidence: avg_confidence,
             warnings,
         })
+    }
+
+    /// Group schemas by similarity for bulk approval workflow
+    fn group_schemas(schemas: &[DiscoveredSchema]) -> Vec<SchemaGroup> {
+        if schemas.is_empty() {
+            return vec![];
+        }
+
+        // Simple grouping: schemas with same column names (order matters)
+        let mut groups: HashMap<String, Vec<&DiscoveredSchema>> = HashMap::new();
+
+        for schema in schemas {
+            let column_key: String = schema
+                .columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            groups.entry(column_key).or_default().push(schema);
+        }
+
+        // Convert to SchemaGroup structs
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (column_key, schemas_in_group))| {
+                let common_columns: Vec<String> = column_key.split(',').map(String::from).collect();
+                let sample_file = schemas_in_group
+                    .first()
+                    .map(|s| s.source_file.clone())
+                    .unwrap_or_default();
+
+                SchemaGroup {
+                    group_id: Uuid::new_v4().to_string(),
+                    name: format!("Group {} ({} columns)", idx + 1, common_columns.len()),
+                    schema_ids: schemas_in_group.iter().map(|s| s.discovery_id.clone()).collect(),
+                    common_columns,
+                    sample_file,
+                }
+            })
+            .collect()
     }
 }
 
@@ -354,11 +750,15 @@ impl Tool for DiscoverSchemasTool {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Group schemas by similarity for bulk approval workflow
+        let schema_groups = Self::group_schemas(&schemas);
+
         let result = DiscoverSchemasResult {
             files_analyzed: schemas.len(),
             schemas,
             failed_files,
             duration_ms,
+            schema_groups,
         };
 
         ToolResult::json(&result)
@@ -963,5 +1363,216 @@ mod tests {
         let required = schema.required.as_ref().unwrap();
         assert!(required.contains(&"contract_id".to_string()));
         assert!(required.contains(&"amendment_type".to_string()));
+    }
+
+    // =========================================================================
+    // Constraint Visibility Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_constraint_visibility_int_column() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = temp_dir.path().join("integers.csv");
+
+        // Use larger numbers that are clearly not booleans
+        fs::write(
+            &csv_path,
+            "id,count\n10,100\n20,200\n30,300\n40,400\n50,500",
+        )
+        .unwrap();
+
+        let tool = DiscoverSchemasTool::new();
+        let args = json!({
+            "files": [csv_path.to_string_lossy().to_string()],
+            "max_rows": 100
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.is_error);
+
+        if let Some(crate::types::ToolContent::Text { text }) = result.content.first() {
+            let discover_result: DiscoverSchemasResult = serde_json::from_str(text).unwrap();
+            let schema = &discover_result.schemas[0];
+
+            // Check constraint reasoning for int column
+            let id_col = &schema.columns[0];
+            assert_eq!(id_col.data_type, "int64");
+            // High confidence for clean integer data
+            assert!(id_col.constraint.confidence > 0.9);
+
+            // Verify eliminated types are recorded
+            let eliminated_types: Vec<&str> = id_col.constraint.evidence.eliminated_types
+                .iter()
+                .map(|e| e.type_name.as_str())
+                .collect();
+            // Date, timestamp, and boolean should be eliminated for these integer values
+            assert!(eliminated_types.contains(&"date") || eliminated_types.contains(&"timestamp") || eliminated_types.contains(&"boolean"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_constraint_visibility_ambiguous_date() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = temp_dir.path().join("dates.csv");
+
+        // 03/04/2024 is ambiguous: March 4 or April 3?
+        fs::write(
+            &csv_path,
+            "date_field\n03/04/2024\n05/06/2024\n01/02/2024",
+        )
+        .unwrap();
+
+        let tool = DiscoverSchemasTool::new();
+        let args = json!({
+            "files": [csv_path.to_string_lossy().to_string()],
+            "max_rows": 100
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.is_error);
+
+        if let Some(crate::types::ToolContent::Text { text }) = result.content.first() {
+            let discover_result: DiscoverSchemasResult = serde_json::from_str(text).unwrap();
+            let schema = &discover_result.schemas[0];
+
+            // Ambiguous dates should trigger human decision
+            let date_col = &schema.columns[0];
+            assert_eq!(date_col.data_type, "date");
+            assert!(date_col.constraint.needs_human_decision);
+            assert!(date_col.constraint.human_question.is_some());
+
+            // Question should mention MM/DD vs DD/MM
+            let question = date_col.constraint.human_question.as_ref().unwrap();
+            assert!(question.contains("MM/DD") || question.contains("DD/MM"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_constraint_visibility_mixed_types() {
+        let temp_dir = TempDir::new().unwrap();
+        let csv_path = temp_dir.path().join("mixed.csv");
+
+        // Column with mix of integers and strings
+        fs::write(
+            &csv_path,
+            "value\n1\n2\nN/A\n4\nunknown",
+        )
+        .unwrap();
+
+        let tool = DiscoverSchemasTool::new();
+        let args = json!({
+            "files": [csv_path.to_string_lossy().to_string()],
+            "max_rows": 100
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.is_error);
+
+        if let Some(crate::types::ToolContent::Text { text }) = result.content.first() {
+            let discover_result: DiscoverSchemasResult = serde_json::from_str(text).unwrap();
+            let schema = &discover_result.schemas[0];
+
+            let value_col = &schema.columns[0];
+
+            // Should note the mixed types
+            assert!(value_col.constraint.evidence.match_percentage < 100.0);
+
+            // Should have counter-examples in eliminated types
+            let has_counter_examples = value_col.constraint.evidence.eliminated_types
+                .iter()
+                .any(|e| !e.counter_examples.is_empty());
+            assert!(has_counter_examples || value_col.constraint.alternatives.len() > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schema_grouping() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create two files with same columns
+        let csv1_path = temp_dir.path().join("orders_jan.csv");
+        let csv2_path = temp_dir.path().join("orders_feb.csv");
+        let csv3_path = temp_dir.path().join("products.csv");
+
+        fs::write(
+            &csv1_path,
+            "order_id,customer,amount\n1,Alice,100\n2,Bob,200",
+        )
+        .unwrap();
+        fs::write(
+            &csv2_path,
+            "order_id,customer,amount\n3,Carol,300\n4,Dave,400",
+        )
+        .unwrap();
+        fs::write(
+            &csv3_path,
+            "product_id,name,price\n1,Widget,10\n2,Gadget,20",
+        )
+        .unwrap();
+
+        let tool = DiscoverSchemasTool::new();
+        let args = json!({
+            "files": [
+                csv1_path.to_string_lossy().to_string(),
+                csv2_path.to_string_lossy().to_string(),
+                csv3_path.to_string_lossy().to_string()
+            ],
+            "max_rows": 100
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.is_error);
+
+        if let Some(crate::types::ToolContent::Text { text }) = result.content.first() {
+            let discover_result: DiscoverSchemasResult = serde_json::from_str(text).unwrap();
+
+            // Should have 3 schemas
+            assert_eq!(discover_result.schemas.len(), 3);
+
+            // Should have 2 groups (orders and products)
+            assert_eq!(discover_result.schema_groups.len(), 2);
+
+            // Find the orders group (should have 2 schemas)
+            let orders_group = discover_result.schema_groups.iter()
+                .find(|g| g.schema_ids.len() == 2);
+            assert!(orders_group.is_some());
+
+            let orders_group = orders_group.unwrap();
+            assert_eq!(orders_group.common_columns, vec!["order_id", "customer", "amount"]);
+        }
+    }
+
+    #[test]
+    fn test_type_evidence_serialization() {
+        let evidence = TypeEvidence {
+            sample_values: vec!["1".to_string(), "2".to_string()],
+            eliminated_types: vec![
+                EliminatedType {
+                    type_name: "date".to_string(),
+                    reason: "Values don't match date format".to_string(),
+                    counter_examples: vec!["1".to_string()],
+                }
+            ],
+            match_percentage: 100.0,
+        };
+
+        let json = serde_json::to_string(&evidence).unwrap();
+        assert!(json.contains("sample_values"));
+        assert!(json.contains("eliminated_types"));
+        assert!(json.contains("match_percentage"));
+
+        // Deserialize back
+        let parsed: TypeEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.sample_values.len(), 2);
+        assert_eq!(parsed.eliminated_types.len(), 1);
+    }
+
+    #[test]
+    fn test_column_constraint_default() {
+        let constraint = ColumnConstraint::default();
+        assert_eq!(constraint.resolved_type, "string");
+        assert_eq!(constraint.confidence, 1.0);
+        assert!(!constraint.needs_human_decision);
+        assert!(constraint.human_question.is_none());
     }
 }
