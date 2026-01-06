@@ -5,7 +5,7 @@
 //! - `execute_pipeline`: Execute full pipeline with approved schema
 //! - `query_output`: Query processed output data
 
-use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult};
+use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult, WorkflowMetadata};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -149,6 +149,8 @@ pub struct ExecutePipelineResultOutput {
     pub output_dir: String,
     /// Errors encountered
     pub errors: Vec<String>,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Execute full pipeline with approved schema
@@ -398,11 +400,15 @@ impl Tool for ExecutePipelineTool {
             OutputFormat::DuckDb => "duckdb",
         };
 
+        // Build workflow metadata based on success/failure
+        let success = files_failed == 0;
+        let workflow = WorkflowMetadata::execution_complete(success);
+
         let result = ExecutePipelineResultOutput {
             execution_id,
             scope_id,
             contract_id,
-            success: files_failed == 0,
+            success,
             mode: mode_str.to_string(),
             output_format: format_str.to_string(),
             files_processed: file_results.len(),
@@ -414,6 +420,7 @@ impl Tool for ExecutePipelineTool {
             file_results,
             output_dir,
             errors,
+            workflow,
         };
 
         ToolResult::json(&result)
@@ -444,6 +451,8 @@ pub struct QueryOutputResultOutput {
     pub duration_ms: u64,
     /// Source file/table queried
     pub source: String,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Query processed output data
@@ -513,6 +522,9 @@ impl QueryOutputTool {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Build workflow metadata - query complete, can run more queries
+        let workflow = WorkflowMetadata::query_complete();
+
         Ok(QueryOutputResultOutput {
             column_count: columns.len(),
             columns,
@@ -521,6 +533,7 @@ impl QueryOutputTool {
             rows,
             duration_ms,
             source: file_path.to_string(),
+            workflow,
         })
     }
 }
