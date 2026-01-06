@@ -5,7 +5,7 @@
 //! - `quick_scan`: Fast metadata scan of a directory (stat only, no content reading)
 //! - `apply_scope`: Apply a scope to selected files for processing
 
-use crate::types::{ScopeId, Tool, ToolError, ToolInputSchema, ToolResult};
+use crate::types::{BulkApprovalOption, ScopeId, Tool, ToolError, ToolInputSchema, ToolResult, WorkflowMetadata};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,8 @@ pub struct QuickScanResult {
     pub truncated: bool,
     /// Maximum depth reached during scan
     pub max_depth_reached: usize,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Fast metadata scan of a directory (stat only, no content reading)
@@ -192,6 +194,19 @@ impl QuickScanTool {
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
+        // Build workflow metadata with bulk approval options for each file type
+        let mut workflow = WorkflowMetadata::discovery();
+
+        for (ext, ext_files) in &by_extension {
+            if ext_files.len() > 1 {
+                workflow = workflow.with_bulk_approval(BulkApprovalOption::new(
+                    ext.clone(),
+                    ext_files.len(),
+                    format!("{} {} files", ext_files.len(), ext),
+                ));
+            }
+        }
+
         Ok(QuickScanResult {
             directory: path.to_string_lossy().to_string(),
             file_count: files.len(),
@@ -200,6 +215,7 @@ impl QuickScanTool {
             duration_ms,
             truncated,
             max_depth_reached,
+            workflow,
         })
     }
 }
@@ -328,6 +344,8 @@ pub struct ApplyScopeResult {
     pub files_skipped: usize,
     /// Reason for skipped files
     pub skip_reasons: Vec<String>,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Apply a scope to selected files for processing
@@ -478,12 +496,16 @@ impl Tool for ApplyScopeTool {
             tags,
         };
 
+        // Build workflow metadata - scope applied, ready for schema discovery
+        let workflow = WorkflowMetadata::scope_applied();
+
         let result = ApplyScopeResult {
             scope,
             file_count: valid_files.len(),
             total_size,
             files_skipped: skipped.len(),
             skip_reasons: reasons,
+            workflow,
         };
 
         ToolResult::json(&result)

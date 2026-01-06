@@ -5,7 +5,7 @@
 //! - `run_backtest`: Run parser against multiple files with fail-fast optimization
 //! - `fix_parser`: Generate parser fixes based on failure analysis
 
-use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult};
+use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult, WorkflowMetadata};
 use async_trait::async_trait;
 use casparian_backtest::{
     failfast::{FailFastConfig, FileTestResult, ParserRunner},
@@ -110,6 +110,8 @@ pub struct RunBacktestResultOutput {
     pub failure_categories: Vec<FailureCategoryCount>,
     /// Top failing files
     pub top_failing_files: Vec<String>,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Failure category with count
@@ -382,8 +384,12 @@ impl Tool for RunBacktestTool {
             .map(|(path, _)| path.clone())
             .collect();
 
+        // Build workflow metadata based on success/failure
+        let success = metrics.pass_rate >= target_pass_rate;
+        let workflow = WorkflowMetadata::backtest_complete(success);
+
         let result = RunBacktestResultOutput {
-            success: metrics.pass_rate >= target_pass_rate,
+            success,
             final_pass_rate: metrics.pass_rate,
             target_pass_rate,
             iterations_run: 1,
@@ -395,6 +401,7 @@ impl Tool for RunBacktestTool {
             early_stopped,
             failure_categories,
             top_failing_files,
+            workflow,
         };
 
         ToolResult::json(&result)
@@ -431,6 +438,8 @@ pub struct FixParserResultOutput {
     pub recommendations: Vec<String>,
     /// Most common failure category
     pub primary_issue: Option<String>,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Generate parser fixes based on failure analysis
@@ -663,11 +672,15 @@ impl Tool for FixParserTool {
             .max_by_key(|(_, count)| *count)
             .map(|(cat, _)| cat.clone());
 
+        // Build workflow metadata - fixes suggested, ready for re-test
+        let workflow = WorkflowMetadata::parser_fix_suggested();
+
         let result = FixParserResultOutput {
             issues_analyzed: total_failures,
             fixes,
             recommendations,
             primary_issue,
+            workflow,
         };
 
         ToolResult::json(&result)

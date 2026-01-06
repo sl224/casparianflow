@@ -6,7 +6,10 @@
 //! - `approve_schemas`: Approve discovered schemas and create contracts
 //! - `propose_amendment`: Propose changes to existing schema contracts
 
-use crate::types::{Tool, ToolError, ToolInputSchema, ToolResult};
+use crate::types::{
+    BulkApprovalOption, DecisionOption, HumanDecision, Tool, ToolError, ToolInputSchema, ToolResult,
+    WorkflowMetadata,
+};
 use async_trait::async_trait;
 use casparian_schema::{
     approval::{ApprovedColumn, ApprovedSchemaVariant, SchemaApprovalRequest},
@@ -166,6 +169,8 @@ pub struct DiscoverSchemasResult {
     pub duration_ms: u64,
     /// Groups of similar schemas for bulk approval workflow
     pub schema_groups: Vec<SchemaGroup>,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Analyze files to discover their schema structure
@@ -753,12 +758,71 @@ impl Tool for DiscoverSchemasTool {
         // Group schemas by similarity for bulk approval workflow
         let schema_groups = Self::group_schemas(&schemas);
 
+        // Build workflow metadata with decisions for ambiguous columns
+        let mut workflow = WorkflowMetadata::schema_approval_needed();
+
+        // Add decisions for ambiguous columns
+        for schema in &schemas {
+            for col in &schema.columns {
+                if col.is_ambiguous {
+                    let mut options = vec![DecisionOption::new(
+                        &col.data_type,
+                        &col.data_type,
+                        format!("Use {} (inferred)", col.data_type),
+                    )];
+
+                    for alt in &col.alternative_types {
+                        options.push(DecisionOption::new(
+                            alt,
+                            alt,
+                            format!("Use {} instead", alt),
+                        ));
+                    }
+
+                    let decision = HumanDecision::new(format!(
+                        "Column '{}' type is ambiguous. Choose: {} or {}?",
+                        col.name,
+                        col.data_type,
+                        col.alternative_types.join("/")
+                    ))
+                    .with_options(options)
+                    .with_default(&col.data_type)
+                    .with_context(format!("schema: {}, column: {}", schema.name, col.name));
+
+                    workflow = workflow.with_decision(decision);
+                }
+            }
+
+            // Add bulk approval option if schema has multiple similar columns
+            if schema.columns.len() > 3 {
+                let type_counts: std::collections::HashMap<&str, usize> = schema
+                    .columns
+                    .iter()
+                    .fold(std::collections::HashMap::new(), |mut acc, c| {
+                        *acc.entry(c.data_type.as_str()).or_insert(0) += 1;
+                        acc
+                    });
+
+                let most_common = type_counts.iter().max_by_key(|(_, count)| *count);
+                if let Some((dtype, count)) = most_common {
+                    if *count > 2 {
+                        workflow = workflow.with_bulk_approval(BulkApprovalOption::new(
+                            format!("{}_{}", schema.name, dtype),
+                            *count,
+                            format!("{} columns of type {} in schema '{}'", count, dtype, schema.name),
+                        ));
+                    }
+                }
+            }
+        }
+
         let result = DiscoverSchemasResult {
             files_analyzed: schemas.len(),
             schemas,
             failed_files,
             duration_ms,
             schema_groups,
+            workflow,
         };
 
         ToolResult::json(&result)
@@ -812,6 +876,8 @@ pub struct ApproveSchemaResultOutput {
     pub schemas_approved: usize,
     /// Any warnings generated
     pub warnings: Vec<String>,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Approve discovered schemas and create contracts
@@ -975,12 +1041,16 @@ impl Tool for ApproveSchemasTool {
             warnings.push(w.message.clone());
         }
 
+        // Build workflow metadata - schema is now approved, move to backtest phase
+        let workflow = WorkflowMetadata::schema_approved();
+
         let result = ApproveSchemaResultOutput {
             contract_id: approval_result.contract.contract_id.to_string(),
             scope_id: scope_id.to_string(),
             version: approval_result.contract.version,
             schemas_approved: approval_result.contract.schemas.len(),
             warnings,
+            workflow,
         };
 
         ToolResult::json(&result)
@@ -1015,6 +1085,8 @@ pub struct ProposeAmendmentResultOutput {
     pub changes: Vec<String>,
     /// Status
     pub status: String,
+    /// Workflow metadata for human-in-loop orchestration
+    pub workflow: WorkflowMetadata,
 }
 
 /// Propose changes to existing schema contracts
@@ -1189,12 +1261,25 @@ impl Tool for ProposeAmendmentTool {
         // Create amendment ID
         let amendment_id = Uuid::new_v4();
 
+        // Build workflow metadata - amendment proposed, needs approval
+        let decision = HumanDecision::new(format!("Approve amendment: {}?", reason))
+            .with_options(vec![
+                DecisionOption::new("approve", "Approve", "Accept the proposed changes"),
+                DecisionOption::new("reject", "Reject", "Reject the proposed changes"),
+                DecisionOption::new("modify", "Modify", "Modify the proposal before approving"),
+            ])
+            .with_context(format!("contract: {}", contract_id));
+
+        let workflow = WorkflowMetadata::schema_approval_needed()
+            .with_decision(decision);
+
         let result = ProposeAmendmentResultOutput {
             amendment_id: amendment_id.to_string(),
             contract_id: contract_id.to_string(),
             reason,
             changes,
             status: "pending".to_string(),
+            workflow,
         };
 
         ToolResult::json(&result)
