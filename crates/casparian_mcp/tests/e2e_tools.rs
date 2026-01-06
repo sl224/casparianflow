@@ -29,12 +29,12 @@ fn extract_text(content: &ToolContent) -> Option<&str> {
 // TOOL REGISTRY TESTS
 // =============================================================================
 
-/// Test that all 9 tools are registered
+/// Test that all 10 tools are registered
 #[test]
 fn test_all_tools_registered() {
     let registry = create_default_registry();
 
-    assert_eq!(registry.len(), 9, "Should have exactly 9 tools registered");
+    assert_eq!(registry.len(), 10, "Should have exactly 10 tools registered");
 
     let expected_tools = [
         "quick_scan",
@@ -44,6 +44,7 @@ fn test_all_tools_registered() {
         "propose_amendment",
         "run_backtest",
         "fix_parser",
+        "refine_parser",
         "execute_pipeline",
         "query_output",
     ];
@@ -60,7 +61,7 @@ fn test_tool_listing() {
     let registry = create_default_registry();
     let tools = registry.list();
 
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 10);
 
     // Verify each tool has required metadata
     for tool in tools {
