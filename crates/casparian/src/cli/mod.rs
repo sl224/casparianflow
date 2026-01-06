@@ -31,6 +31,9 @@ pub mod topic;
 // W7: MCP Server
 pub mod mcp;
 
+// W8: TUI
+pub mod tui;
+
 // Configuration
 pub mod config;
 
