@@ -4,11 +4,13 @@
 //! - **Split-Runtime Architecture**: Control Plane and Data Plane on separate Tokio runtimes
 //! - **IPC Transport**: Defaults to Unix Domain Sockets (no firewall popups)
 //! - **Graceful Shutdown**: SIGINT/SIGTERM handling with timeout
+//! - **CLI Commands**: Standalone utilities for file discovery and preview
 
 use anyhow::{Context, Result};
 use casparian_sentinel::{Sentinel, SentinelArgs, SentinelConfig};
 use casparian_worker::{bridge, Worker, WorkerArgs, WorkerConfig};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +18,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod cli;
 
 /// Shutdown timeout in seconds
 const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
@@ -29,6 +33,192 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    // === W1: Core Standalone Commands ===
+
+    /// Discover files in a directory (no database required)
+    Scan {
+        /// Directory to scan
+        path: PathBuf,
+
+        /// Filter by file type (e.g., csv, json, parquet)
+        #[arg(short = 't', long = "type")]
+        types: Vec<String>,
+
+        /// Scan subdirectories recursively
+        #[arg(short, long)]
+        recursive: bool,
+
+        /// Maximum directory depth to scan
+        #[arg(short, long)]
+        depth: Option<usize>,
+
+        /// Minimum file size (e.g., 1KB, 10MB)
+        #[arg(long)]
+        min_size: Option<String>,
+
+        /// Maximum file size (e.g., 100MB, 1GB)
+        #[arg(long)]
+        max_size: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Show statistics summary only
+        #[arg(long)]
+        stats: bool,
+
+        /// Output file paths only (quiet mode)
+        #[arg(short, long)]
+        quiet: bool,
+    },
+
+    /// Preview file contents and infer schema
+    Preview {
+        /// File to preview
+        file: PathBuf,
+
+        /// Number of rows to preview
+        #[arg(short = 'n', long, default_value = "20")]
+        rows: usize,
+
+        /// Show schema only (no data preview)
+        #[arg(long)]
+        schema: bool,
+
+        /// View raw bytes (hex dump)
+        #[arg(long)]
+        raw: bool,
+
+        /// Show first N lines (text mode)
+        #[arg(long)]
+        head: Option<usize>,
+
+        /// CSV delimiter character
+        #[arg(long)]
+        delimiter: Option<char>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    // === W2: Tagging Commands (stubs) ===
+
+    /// Assign a topic to file(s)
+    Tag {
+        /// File or directory to tag
+        path: Option<PathBuf>,
+
+        /// Topic to assign
+        topic: Option<String>,
+
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Tag without creating jobs
+        #[arg(long)]
+        no_queue: bool,
+    },
+
+    /// Remove topic from a file
+    Untag {
+        /// File to untag
+        path: PathBuf,
+    },
+
+    /// List discovered files
+    Files {
+        /// Filter by topic
+        #[arg(long)]
+        topic: Option<String>,
+
+        /// Filter by status (pending, processing, done, failed)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Show only untagged files
+        #[arg(long)]
+        untagged: bool,
+
+        /// Maximum files to display
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+
+    // === W3: Parser Commands (stubs) ===
+
+    /// Manage parsers
+    Parser {
+        #[command(subcommand)]
+        action: cli::parser::ParserAction,
+    },
+
+    // === W4: Job Commands (stubs) ===
+
+    /// List processing jobs
+    Jobs {
+        /// Filter by topic
+        #[arg(long)]
+        topic: Option<String>,
+
+        /// Show only pending jobs
+        #[arg(long)]
+        pending: bool,
+
+        /// Show only running jobs
+        #[arg(long)]
+        running: bool,
+
+        /// Show only failed jobs
+        #[arg(long)]
+        failed: bool,
+
+        /// Show only completed jobs
+        #[arg(long)]
+        done: bool,
+
+        /// Maximum jobs to display
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Manage a specific job
+    Job {
+        #[command(subcommand)]
+        action: cli::job::JobAction,
+    },
+
+    /// Manage workers (CLI version)
+    #[command(name = "worker-cli")]
+    WorkerCli {
+        #[command(subcommand)]
+        action: cli::worker::WorkerAction,
+    },
+
+    // === W5: Resource Commands (stubs) ===
+
+    /// Manage data sources
+    Source {
+        #[command(subcommand)]
+        action: cli::source::SourceAction,
+    },
+
+    /// Manage tagging rules
+    Rule {
+        #[command(subcommand)]
+        action: cli::rule::RuleAction,
+    },
+
+    /// Manage topics
+    Topic {
+        #[command(subcommand)]
+        action: cli::topic::TopicAction,
+    },
+
+    // === Existing Server Commands ===
+
     /// Start both Sentinel and Worker in one process (Split-Runtime)
     Start {
         /// ZMQ bind/connect address (default: IPC socket)
@@ -52,16 +242,19 @@ enum Commands {
         #[arg(long, env = "CASPARIAN_VENVS_DIR")]
         venvs_dir: Option<std::path::PathBuf>,
     },
+
     /// Start only the Sentinel (Control Plane)
     Sentinel {
         #[command(flatten)]
         args: SentinelArgs,
     },
+
     /// Start only the Worker (Data Plane)
     Worker {
         #[command(flatten)]
         args: WorkerArgs,
     },
+
     /// Publish a plugin to the Sentinel registry
     Publish {
         /// Path to the Python plugin file
@@ -185,6 +378,106 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // === W1: Core Standalone Commands ===
+        Commands::Scan {
+            path,
+            types,
+            recursive,
+            depth,
+            min_size,
+            max_size,
+            json,
+            stats,
+            quiet,
+        } => cli::scan::run(cli::scan::ScanArgs {
+            path,
+            types,
+            recursive,
+            depth,
+            min_size,
+            max_size,
+            json,
+            stats,
+            quiet,
+        }),
+
+        Commands::Preview {
+            file,
+            rows,
+            schema,
+            raw,
+            head,
+            delimiter,
+            json,
+        } => cli::preview::run(cli::preview::PreviewArgs {
+            file,
+            rows,
+            schema,
+            raw,
+            head,
+            delimiter,
+            json,
+        }),
+
+        // === W2: Tagging Commands (stubs) ===
+        Commands::Tag {
+            path,
+            topic,
+            dry_run,
+            no_queue,
+        } => cli::tag::run(cli::tag::TagArgs {
+            path,
+            topic,
+            dry_run,
+            no_queue,
+        }),
+
+        Commands::Untag { path: _ } => {
+            todo!("W2 implements this")
+        }
+
+        Commands::Files {
+            topic,
+            status,
+            untagged,
+            limit,
+        } => cli::files::run(cli::files::FilesArgs {
+            topic,
+            status,
+            untagged,
+            limit,
+        }),
+
+        // === W3: Parser Commands (stubs) ===
+        Commands::Parser { action } => cli::parser::run(action),
+
+        // === W4: Job Commands (stubs) ===
+        Commands::Jobs {
+            topic,
+            pending,
+            running,
+            failed,
+            done,
+            limit,
+        } => cli::jobs::run(cli::jobs::JobsArgs {
+            topic,
+            pending,
+            running,
+            failed,
+            done,
+            limit,
+        }),
+
+        Commands::Job { action } => cli::job::run(action),
+
+        Commands::WorkerCli { action } => cli::worker::run(action),
+
+        // === W5: Resource Commands (stubs) ===
+        Commands::Source { action } => cli::source::run(action),
+        Commands::Rule { action } => cli::rule::run(action),
+        Commands::Topic { action } => cli::topic::run(action),
+
+        // === Existing Server Commands ===
         Commands::Start {
             addr,
             database,
@@ -192,8 +485,11 @@ fn main() -> Result<()> {
             data_threads,
             venvs_dir,
         } => run_unified(addr, database, output, data_threads, venvs_dir),
+
         Commands::Sentinel { args } => run_sentinel_standalone(args),
+
         Commands::Worker { args } => run_worker_standalone(args),
+
         Commands::Publish {
             file,
             version,
