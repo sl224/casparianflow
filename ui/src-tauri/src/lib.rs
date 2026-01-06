@@ -843,7 +843,7 @@ async fn submit_tagged_files(
     file_ids: Vec<i64>,
 ) -> Result<SubmitResult, String> {
     // Get Scout database
-    let scout_db = scout_state.get_db()?;
+    let scout_db = scout_state.get_db().await?;
 
     // Get Sentinel database pool
     let pool_guard = sentinel_state.db_pool.lock().await;
@@ -866,6 +866,7 @@ async fn submit_tagged_files(
         // Get file info from Scout
         let file = scout_db
             .get_file(file_id)
+            .await
             .map_err(|e| format!("Failed to get file {}: {}", file_id, e))?;
 
         let Some(file) = file else {
@@ -923,6 +924,7 @@ async fn submit_tagged_files(
         // Get source path for bridging to Sentinel
         let source = scout_db
             .get_source(&file.source_id)
+            .await
             .map_err(|e| format!("Failed to get source {}: {}", file.source_id, e))?
             .ok_or_else(|| format!("Source {} not found", file.source_id))?;
 
@@ -961,6 +963,7 @@ async fn submit_tagged_files(
         // Update Scout file status to queued
         scout_db
             .mark_file_queued(file_id, job_id)
+            .await
             .map_err(|e| format!("Failed to mark file {} as queued: {}", file_id, e))?;
 
         job_ids.push((file_id, job_id));
@@ -1247,11 +1250,11 @@ async fn deploy_plugin(
         r#"
         INSERT INTO cf_plugin_manifest
             (plugin_name, version, source_code, source_hash, status, created_at)
-        VALUES (?, ?, ?, ?, 'PENDING', ?)
+        VALUES (?, ?, ?, ?, 'ACTIVE', ?)
         ON CONFLICT(plugin_name, version)
         DO UPDATE SET source_code = excluded.source_code,
                       source_hash = excluded.source_hash,
-                      status = 'PENDING'
+                      status = 'ACTIVE'
         "#,
     )
     .bind(&plugin_name)
@@ -1848,10 +1851,11 @@ pub fn run() {
             scout::scout_list_sources,
             scout::scout_add_source,
             scout::scout_remove_source,
-            scout::scout_scan,
+            scout::scout_scan_source,
             scout::scout_status,
             // Scout file commands
             scout::scout_list_files,
+            scout::scout_list_files_by_tag,
             scout::scout_list_untagged_files,
             scout::scout_list_failed_files,
             // Scout tagging rule commands
@@ -1860,10 +1864,9 @@ pub fn run() {
             scout::scout_add_tagging_rule,
             scout::scout_remove_tagging_rule,
             // Scout tagging commands
-            scout::scout_tag_file,
             scout::scout_tag_files,
             scout::scout_auto_tag,
-            scout::scout_get_tag_stats,
+            scout::scout_tag_stats,
             // Scout analysis commands
             scout::scout_preview_pattern,
             scout::scout_analyze_coverage,
@@ -1873,34 +1876,14 @@ pub fn run() {
             scout::scout_clear_manual_overrides,
             scout::scout_list_manual_files,
             scout::scout_get_file,
-            // Shredder commands
-            scout::shredder_analyze,
-            scout::shredder_analyze_smart,
-            scout::shredder_chat,
-            scout::shredder_analyze_full,
-            scout::shredder_run,
-            // Parser generation commands
-            scout::save_llm_config,
-            scout::load_llm_config,
-            scout::generate_parser_draft,
-            scout::validate_parser,
-            scout::parser_refinement_chat,
-            scout::propose_schema,
+            // Parser publishing
             scout::publish_parser,
             scout::validate_subscription_tag,
-            // Shard utility commands
-            scout::get_shredder_output_dir,
+            // Utility commands
             scout::get_parsers_dir,
             scout::preview_shard,
-            // Splitter session persistence
-            scout::splitter_create_session,
-            scout::splitter_get_session,
-            scout::splitter_update_session,
-            scout::splitter_list_sessions,
-            scout::splitter_delete_session,
-            scout::splitter_save_parser_draft,
-            scout::splitter_get_parser_draft,
-            scout::splitter_list_parser_drafts,
+            scout::ensure_parser_env,
+            scout::query_parquet,
             // Parser Lab (v6 - parser-centric, no project layer)
             scout::parser_lab_create_parser,
             scout::parser_lab_get_parser,
@@ -1912,12 +1895,10 @@ pub fn run() {
             scout::parser_lab_list_test_files,
             scout::parser_lab_validate_parser,
             scout::parser_lab_import_plugin,
-            scout::parser_lab_list_importable_plugins,
             scout::parser_lab_load_sample,
             scout::parser_lab_chat,
-            // Plugin registry commands (DB as source of truth)
+            // Plugin registry commands
             scout::list_registered_plugins,
-            scout::ensure_plugin_cached,
         ])
         .setup(move |app| {
             // Initialize database pool (blocking to ensure ready before commands)
