@@ -6,6 +6,7 @@ members = [
     "crates/casparian_sentinel",
     "crates/casparian",
     "crates/cf_security",
+    "crates/casparian_scout",
     "ui/src-tauri",
 ]
 
@@ -45,3 +46,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI parsing (for future use)
 clap = { version = "4.5", features = ["derive", "env"] }
+
+# Parallel processing
+rayon = "1.10"
