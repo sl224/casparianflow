@@ -41,6 +41,11 @@ walkdir = "2"
 csv = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+indicatif = { version = "0.17", features = ["rayon"] }
+
+# Database
+sqlx.workspace = true
 
 # Arrow/Parquet for preview
 arrow.workspace = true
