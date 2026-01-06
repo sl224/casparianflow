@@ -59,6 +59,12 @@ indicatif = { version = "0.17", features = ["rayon"] }
 arrow.workspace = true
 parquet.workspace = true
 
+# TUI LLM Integration
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+thiserror.workspace = true
+
 # Signal handling (Unix)
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
