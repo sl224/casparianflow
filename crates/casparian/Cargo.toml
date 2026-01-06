@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+casparian_scout = { path = "../casparian_scout" }
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
 cf_protocol = { path = "../cf_protocol" }
@@ -41,6 +42,11 @@ walkdir = "2"
 csv = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
+glob = "0.3"
+dirs = "5.0"
+
+# Database (for CLI topic queries)
+sqlx.workspace = true
 
 # Arrow/Parquet for preview
 arrow.workspace = true
