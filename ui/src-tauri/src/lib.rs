@@ -1099,6 +1099,101 @@ async fn get_plugins_for_tag(
     Ok(matching)
 }
 
+/// Sync job statuses from Sentinel (cf_processing_queue) back to Scout (scout_files).
+///
+/// This is called periodically to update Scout's file status based on job completion.
+/// For each file with status IN ('queued', 'processing') and a sentinel_job_id:
+/// - Query cf_processing_queue by job_id
+/// - Update scout_files.status based on job status:
+///   * QUEUED -> 'queued'
+///   * RUNNING -> 'processing'
+///   * COMPLETED -> 'processed'
+///   * FAILED -> 'failed' (with error message)
+///
+/// Returns the count of files updated.
+#[tauri::command]
+async fn sync_scout_file_statuses(
+    state: tauri::State<'_, SentinelState>,
+) -> Result<u64, String> {
+    // Get database pool (same database for Scout and Sentinel tables)
+    let pool_guard = state.db_pool.lock().await;
+    let pool = pool_guard.as_ref().ok_or("Database not connected")?;
+
+    // Query all scout files that need status sync:
+    // status IN ('queued', 'processing') AND sentinel_job_id IS NOT NULL
+    let files_to_sync: Vec<(i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT id, sentinel_job_id
+        FROM scout_files
+        WHERE status IN ('queued', 'processing')
+          AND sentinel_job_id IS NOT NULL
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to query files for sync: {}", e))?;
+
+    if files_to_sync.is_empty() {
+        return Ok(0);
+    }
+
+    let mut updated_count: u64 = 0;
+
+    for (file_id, sentinel_job_id) in files_to_sync {
+        // Query job status from Sentinel
+        let job_result: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT status, error_message FROM cf_processing_queue WHERE id = ?"
+        )
+        .bind(sentinel_job_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Failed to query job {}: {}", sentinel_job_id, e))?;
+
+        let Some((job_status, error_message)) = job_result else {
+            // Job not found - leave file status as-is
+            continue;
+        };
+
+        // Map Sentinel job status to Scout file status
+        let (new_status, new_error): (&str, Option<&str>) = match job_status.as_str() {
+            "QUEUED" => ("queued", None),
+            "RUNNING" => ("processing", None),
+            "COMPLETED" => ("processed", None),
+            "FAILED" => ("failed", error_message.as_deref()),
+            _ => continue, // Unknown status, skip
+        };
+
+        // Update scout_files with new status
+        if new_status == "processed" {
+            let now = chrono::Utc::now().timestamp_millis();
+            sqlx::query("UPDATE scout_files SET status = ?, error = ?, processed_at = ? WHERE id = ?")
+                .bind(new_status)
+                .bind(new_error)
+                .bind(now)
+                .bind(file_id)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("Failed to update file {}: {}", file_id, e))?;
+        } else {
+            sqlx::query("UPDATE scout_files SET status = ?, error = ? WHERE id = ?")
+                .bind(new_status)
+                .bind(new_error)
+                .bind(file_id)
+                .execute(pool)
+                .await
+                .map_err(|e| format!("Failed to update file {}: {}", file_id, e))?;
+        }
+
+        updated_count += 1;
+    }
+
+    if updated_count > 0 {
+        info!("Synced {} file statuses from Sentinel", updated_count);
+    }
+
+    Ok(updated_count)
+}
+
 /// Validate that a path is a safe plugin file path
 /// Returns the canonicalized path if valid
 fn validate_plugin_path(path: &str) -> Result<std::path::PathBuf, String> {
@@ -1970,6 +2065,7 @@ pub fn run() {
             submit_tagged_files,
             get_plugins_for_tag,
             process_job_async,
+            sync_scout_file_statuses,
             // Publish Wizard (Real I/O)
             analyze_plugin_manifest,
             publish_with_overrides,

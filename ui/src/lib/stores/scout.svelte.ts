@@ -754,6 +754,32 @@ class ScoutStore {
   }
 
   // --------------------------------------------------------------------------
+  // Status Sync (Sentinel -> Scout)
+  // --------------------------------------------------------------------------
+
+  /** Current source ID for status sync */
+  get currentSourceId(): string | null {
+    return this.selectedSourceId;
+  }
+
+  /** Sync file statuses from Sentinel job statuses */
+  async syncStatuses(): Promise<void> {
+    try {
+      const updated = await invoke<number>("sync_scout_file_statuses");
+      if (updated > 0) {
+        console.log("[ScoutStore] Synced", updated, "file statuses from Sentinel");
+        // Reload files to reflect updated statuses
+        if (this.currentSourceId) {
+          await this.loadFiles(this.currentSourceId);
+        }
+      }
+    } catch (err) {
+      // Don't show error to user - this is a background sync
+      console.error("[ScoutStore] Failed to sync statuses:", err);
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // File Selection & Detail
   // --------------------------------------------------------------------------
 
