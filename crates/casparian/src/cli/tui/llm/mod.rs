@@ -1,14 +1,20 @@
 //! LLM Provider Abstraction
 //!
 //! This module provides a trait-based abstraction for LLM providers,
-//! enabling support for multiple backends (Claude, OpenAI, Ollama, etc.).
+//! enabling support for multiple backends (Claude API, Claude Code, etc.).
 //!
 //! The design prioritizes:
 //! - **Streaming**: All responses stream token-by-token for responsive UI
 //! - **Tool Calling**: Full support for MCP tool definitions and execution
 //! - **Extensibility**: Easy to add new providers via the trait
+//!
+//! ## Available Providers
+//!
+//! - `claude`: Direct API calls (requires ANTHROPIC_API_KEY)
+//! - `claude_code`: Spawns `claude` CLI (uses claude-code's auth, no API key needed)
 
 pub mod claude;
+pub mod claude_code;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;

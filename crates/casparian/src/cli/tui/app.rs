@@ -4,8 +4,11 @@ use casparian_mcp::tools::{create_default_registry, ToolRegistry};
 use casparian_mcp::types::{ToolResult, WorkflowMetadata};
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use futures::StreamExt;
 use serde_json::Value;
 
+use super::llm::claude_code::ClaudeCodeProvider;
+use super::llm::{registry_to_definitions, LlmProvider, StreamChunk};
 use super::TuiArgs;
 
 /// Maximum number of messages to keep in input history
@@ -265,6 +268,8 @@ pub struct App {
     pub monitor: MonitorState,
     /// Tool registry for executing MCP tools
     pub tools: ToolRegistry,
+    /// LLM provider (Claude Code if available)
+    pub llm: Option<ClaudeCodeProvider>,
     /// Configuration
     pub config: TuiArgs,
     /// Last error message
@@ -274,12 +279,34 @@ pub struct App {
 impl App {
     /// Create new app with given args
     pub fn new(args: TuiArgs) -> Self {
+        // Check if Claude Code is available
+        let llm = if ClaudeCodeProvider::is_available() {
+            Some(
+                ClaudeCodeProvider::new()
+                    .allowed_tools(vec![
+                        "Read".to_string(),
+                        "Grep".to_string(),
+                        "Glob".to_string(),
+                        "Bash".to_string(),
+                    ])
+                    .system_prompt(
+                        "You are helping the user with Casparian Flow, a data pipeline tool. \
+                         You have access to MCP tools for scanning files, discovering schemas, \
+                         and building data pipelines. Be concise and helpful.",
+                    )
+                    .max_turns(5),
+            )
+        } else {
+            None
+        };
+
         Self {
             running: true,
             view: View::Chat,
             chat: ChatState::default(),
             monitor: MonitorState::default(),
             tools: create_default_registry(),
+            llm,
             config: args,
             error: None,
         }
@@ -293,6 +320,7 @@ impl App {
             chat: ChatState::default(),
             monitor: MonitorState::default(),
             tools: registry,
+            llm: None,
             config: args,
             error: None,
         }
@@ -512,12 +540,95 @@ impl App {
         // Auto-scroll to bottom
         self.chat.scroll = 0;
 
-        // For now, add a placeholder response
-        // TODO: Integrate with LLM provider
-        self.chat.messages.push(Message::new(
-            MessageRole::Assistant,
-            format!("Echo: {}\n\n(LLM integration coming soon - use F2 for Monitor view)", content),
-        ));
+        // Mark as awaiting response
+        self.chat.awaiting_response = true;
+
+        // Try to use Claude Code if available
+        if let Some(ref provider) = self.llm {
+            // Build LLM messages from our chat messages
+            let llm_messages: Vec<super::llm::Message> = self
+                .chat
+                .messages
+                .iter()
+                .filter_map(|m| match m.role {
+                    MessageRole::User => Some(super::llm::Message::user(&m.content)),
+                    MessageRole::Assistant => Some(super::llm::Message::assistant(&m.content)),
+                    _ => None,
+                })
+                .collect();
+
+            // Get tool definitions
+            let tool_defs = registry_to_definitions(&self.tools);
+
+            // Stream response
+            match provider.chat_stream(&llm_messages, &tool_defs, None).await {
+                Ok(mut stream) => {
+                    let mut response_text = String::new();
+
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            StreamChunk::Text(text) => {
+                                response_text.push_str(&text);
+                            }
+                            StreamChunk::ToolCall { name, arguments, .. } => {
+                                // Execute MCP tool
+                                response_text.push_str(&format!("\n[Calling {}...]\n", name));
+
+                                match self.execute_tool(&name, arguments.clone()).await {
+                                    Ok(result) => {
+                                        if let Some(content) = result.content.first() {
+                                            if let casparian_mcp::types::ToolContent::Text { text } = content {
+                                                response_text.push_str(&format!("[Result: {}]\n",
+                                                    if text.len() > 200 {
+                                                        format!("{}...", &text[..200])
+                                                    } else {
+                                                        text.clone()
+                                                    }
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        response_text.push_str(&format!("[Tool error: {}]\n", e));
+                                    }
+                                }
+                            }
+                            StreamChunk::Done { .. } => break,
+                            StreamChunk::Error(e) => {
+                                response_text.push_str(&format!("\n[Error: {}]\n", e));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if response_text.is_empty() {
+                        response_text = "(No response from Claude Code)".to_string();
+                    }
+
+                    self.chat.messages.push(Message::new(
+                        MessageRole::Assistant,
+                        response_text,
+                    ));
+                }
+                Err(e) => {
+                    self.chat.messages.push(Message::new(
+                        MessageRole::System,
+                        format!("LLM Error: {}", e),
+                    ));
+                }
+            }
+        } else {
+            // No Claude Code available - show helpful message
+            self.chat.messages.push(Message::new(
+                MessageRole::System,
+                "Claude Code not available. Install Claude Code (`npm install -g @anthropic-ai/claude-code`) \
+                 to enable AI chat.\n\nFor now, you can use the MCP tools directly or try:\n  \
+                 F2 - Monitor view\n  F3 - Help".to_string(),
+            ));
+        }
+
+        self.chat.awaiting_response = false;
     }
 
     /// Execute a tool directly

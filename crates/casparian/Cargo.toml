@@ -68,6 +68,7 @@ async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 thiserror.workspace = true
+tokio-stream = "0.1"
 
 # Signal handling (Unix)
 [target.'cfg(unix)'.dependencies]
@@ -80,3 +81,6 @@ ctrlc = "3.4"
 
 [dev-dependencies]
 tempfile = "3.14"
+ureq = "2"
+futures = "0.3"
+portable-pty = "0.8"

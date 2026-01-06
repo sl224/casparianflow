@@ -311,6 +311,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Interactive TUI for chat and monitoring
+    Tui {
+        #[command(flatten)]
+        args: cli::tui::TuiArgs,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -595,6 +601,10 @@ fn main() -> Result<()> {
         }
         Commands::Shred { action } => run_shred(action),
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
+        Commands::Tui { args } => {
+            let rt = Runtime::new().context("Failed to create runtime")?;
+            rt.block_on(async { cli::tui::run(args).await })
+        }
     }
 }
 

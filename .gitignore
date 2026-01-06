@@ -42,6 +42,11 @@ test_env_*/
 tests/static_assets/
 *_test.db
 
+# Playwright test results
+ui/test-results/
+ui/playwright-report/
+ui/playwright/.cache/
+
 # DB
 *.sqlite*
 data/
