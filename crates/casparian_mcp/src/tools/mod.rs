@@ -6,9 +6,11 @@
 //! - **Discovery**: quick_scan, apply_scope
 //! - **Schema**: discover_schemas, approve_schemas, propose_amendment
 //! - **Backtest**: run_backtest, fix_parser
+//! - **Codegen**: refine_parser
 //! - **Execution**: execute_pipeline, query_output
 
 pub mod backtest;
+pub mod codegen;
 pub mod discovery;
 pub mod execution;
 pub mod schema;
@@ -94,10 +96,11 @@ impl Default for ToolRegistry {
 
 /// Register all available MCP tools with the registry
 ///
-/// This function registers all 9 tools:
+/// This function registers all 10 tools:
 /// - Discovery: quick_scan, apply_scope
 /// - Schema: discover_schemas, approve_schemas, propose_amendment
 /// - Backtest: run_backtest, fix_parser
+/// - Codegen: refine_parser
 /// - Execution: execute_pipeline, query_output
 pub fn register_all_tools(registry: &mut ToolRegistry) {
     // Discovery tools
@@ -112,6 +115,9 @@ pub fn register_all_tools(registry: &mut ToolRegistry) {
     // Backtest tools
     registry.register(backtest::RunBacktestTool::new());
     registry.register(backtest::FixParserTool::new());
+
+    // Codegen tools
+    registry.register(codegen::RefineParserTool::new());
 
     // Execution tools
     registry.register(execution::ExecutePipelineTool::new());
@@ -244,8 +250,8 @@ mod tests {
     fn test_register_all_tools() {
         let registry = create_default_registry();
 
-        // Should have all 9 tools
-        assert_eq!(registry.len(), 9);
+        // Should have all 10 tools
+        assert_eq!(registry.len(), 10);
 
         // Check each tool is registered
         assert!(registry.contains("quick_scan"));
@@ -255,6 +261,7 @@ mod tests {
         assert!(registry.contains("propose_amendment"));
         assert!(registry.contains("run_backtest"));
         assert!(registry.contains("fix_parser"));
+        assert!(registry.contains("refine_parser"));
         assert!(registry.contains("execute_pipeline"));
         assert!(registry.contains("query_output"));
     }
