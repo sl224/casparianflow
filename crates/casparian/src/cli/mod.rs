@@ -31,7 +31,7 @@ pub mod topic;
 // W7: MCP Server
 pub mod mcp;
 
-// W8: TUI
+// W8: TUI with LLM Integration
 pub mod tui;
 
 // Configuration

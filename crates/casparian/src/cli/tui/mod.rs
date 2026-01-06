@@ -14,6 +14,7 @@
 
 pub mod app;
 pub mod event;
+pub mod llm;
 pub mod ui;
 
 use anyhow::Result;
