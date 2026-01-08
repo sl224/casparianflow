@@ -42,28 +42,61 @@ Users interact with Tags in the sidebar. Rules are managed separately via Rules 
 ### 2.1 Primary Workflow: Browse by Tag
 
 ```
-1. User enters Discover mode (Alt+D)
+1. User enters Discover mode (press D from Home)
 2. Sources dropdown shows scanned directories
 3. User presses 1 to open Sources dropdown
 4. User selects a source, files appear
 5. User presses 2 to open Tags dropdown
 6. Tags show: "All files", "sales (89)", "logs (34)", "untagged (19)"
-7. User selects "sales" → files filtered to show only sales-tagged files
+7. User navigates with ↑/↓ → files filter LIVE as they browse
+8. User presses Enter to confirm selection
 ```
 
-### 2.2 Create Tagging Rule (Quick Flow)
+**Live Preview:** While the Tags dropdown is open, the Files panel updates
+instantly as you navigate through tags. This lets you preview what files
+are in each category before committing to a selection.
+
+### 2.2 Create Tagging Rule (Primary Flow)
+
+The `n` key opens rule creation from anywhere in Discover mode:
 
 ```
-1. User types filter in Files panel: "*.csv"
-2. User sees filtered files
-3. User presses Ctrl+S (save filter as rule)
-4. Prompt: "Tag for files matching *.csv: [____]"
-5. User types "sales", presses Enter
+1. User presses 'n' to create a new rule
+2. Dialog opens with two fields: Pattern and Tag
+   - Pattern is prefilled based on context (current filter, file extension)
+   - Live preview shows files that will match
+3. User enters pattern (e.g., "*.csv") and tag (e.g., "sales")
+4. Tab switches between fields
+5. Enter creates rule, Esc cancels
 6. Rule created, matching files tagged
 7. "sales" appears in Tags dropdown
 ```
 
-### 2.3 Manage Rules (Full Control)
+**Context-aware prefilling:**
+- From Files panel with filter active → Pattern prefilled with filter
+- From Files panel with file selected → Pattern prefilled with file extension (e.g., `*.csv`)
+- From Tags panel with tag selected → Tag field prefilled
+
+### 2.3 First-Time Wizard (Onboarding)
+
+When entering Discover mode with untagged files, a wizard appears:
+
+```
+┌─ Quick Setup ─────────────────────────────────────────┐
+│   📁 Source: sales_data                               │
+│   142 files discovered, 47 untagged                   │
+│                                                       │
+│   [n] Create a tagging rule                           │
+│   [Enter] Browse files first                          │
+│                                                       │
+│   [ ] Don't show this again    [Space] toggle         │
+└───────────────────────────────────────────────────────┘
+```
+
+- Shown once per session when source has untagged files
+- User can dismiss permanently with checkbox
+
+### 2.4 Manage Rules (Full Control)
 
 ```
 1. User presses R to open Rules Manager
@@ -328,6 +361,7 @@ pub struct FileInfo {
 | `1` | Open Sources dropdown |
 | `2` | Open Tags dropdown |
 | `3` | Focus Files panel |
+| `n` | **Create new tagging rule** (opens dialog) |
 | `s` | Scan new directory |
 | `p` | Toggle preview pane |
 | `R` | Open Rules Manager dialog |
@@ -348,11 +382,18 @@ pub struct FileInfo {
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Navigate tags (filters files by tag) |
+| `↑` / `↓` | Navigate tags (**live preview**: files filter instantly) |
 | `Char(c)` | Append to filter |
-| `Backspace` | Remove from filter |
+| `Backspace` | Remove from filter / go to "All files" |
 | `Enter` | Confirm selection, close dropdown, focus Files |
-| `Esc` | Close dropdown, show all files |
+| `Esc` | Close dropdown, reset to "All files" |
+
+**Live Preview Behavior:**
+- As you navigate through tags with `↑`/`↓`, the Files panel updates in real-time
+- "All files" shows all files (no tag filter)
+- "untagged" shows only files without tags
+- Specific tags show only files with that tag
+- Text filter (`/`) stacks on top of tag filter
 
 ### 6.4 Files Panel
 
@@ -361,12 +402,30 @@ pub struct FileInfo {
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
 | `/` | Enter filter mode (type to filter by path) |
-| `t` | Tag selected file |
+| `t` | Tag selected file (or filtered files if filter active) |
 | `T` | Bulk tag filtered files |
-| `Ctrl+S` | Save current filter as tagging rule |
 | `Enter` | Drill into directory OR show file details |
 
-### 6.5 Rules Manager Dialog
+### 6.5 Rule Creation Dialog
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Switch between Pattern and Tag fields |
+| `Char(c)` | Type into focused field |
+| `Backspace` | Delete from focused field |
+| `Enter` | Create rule |
+| `Esc` | Cancel and close |
+
+### 6.6 Wizard Dialog (Onboarding)
+
+| Key | Action |
+|-----|--------|
+| `n` | Create a tagging rule (opens rule dialog) |
+| `Enter` | Browse files first (close wizard) |
+| `Space` | Toggle "Don't show again" checkbox |
+| `Esc` | Close wizard |
+
+### 6.7 Rules Manager Dialog
 
 | Key | Action |
 |-----|--------|
