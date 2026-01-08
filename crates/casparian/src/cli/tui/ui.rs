@@ -5,10 +5,191 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs, Wrap},
 };
 
-use super::app::{App, MessageRole, View};
+use super::app::{App, MessageRole, TuiMode, View};
 
 /// Draw the entire UI
 pub fn draw(frame: &mut Frame, app: &App) {
+    // Route based on current mode
+    match app.mode {
+        TuiMode::Home => draw_home_screen(frame, app),
+        TuiMode::Discover => draw_discover_screen(frame, app),
+        TuiMode::Process => draw_placeholder_screen(frame, "Process", "Run parsers on discovered files", "Alt+P"),
+        TuiMode::Inspect => draw_placeholder_screen(frame, "Inspect", "View and query output data", "Alt+I"),
+        TuiMode::Jobs => draw_placeholder_screen(frame, "Jobs", "Manage job queue and workers", "Alt+J"),
+    }
+}
+
+/// Draw the home hub screen with 4 cards
+fn draw_home_screen(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+
+    // Layout: title bar, main content (4 cards), footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title bar
+            Constraint::Min(0),     // Main content (cards)
+            Constraint::Length(3),  // Footer/status
+        ])
+        .split(area);
+
+    // Title bar
+    let title = Paragraph::new(" Casparian Flow - Home Hub ")
+        .style(Style::default().fg(Color::Cyan).bold())
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(title, chunks[0]);
+
+    // Draw the 4 cards in a 2x2 grid
+    draw_home_cards(frame, app, chunks[1]);
+
+    // Footer with shortcuts
+    let footer = Paragraph::new(" [Arrow keys/hjkl] Navigate  [Enter] Select  [1-4] Quick select  [Ctrl+C] Quit ")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Draw the 4 home hub cards in a 2x2 grid
+fn draw_home_cards(frame: &mut Frame, app: &App, area: Rect) {
+    // Split area into 2 rows
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    // Split each row into 2 columns
+    let top_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[0]);
+    let bottom_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+
+    let areas = [top_row[0], top_row[1], bottom_row[0], bottom_row[1]];
+
+    // Card definitions: (title, description, stats, shortcut, number)
+    let cards: [(&str, &str, String, &str, &str); 4] = [
+        (
+            "Discover",
+            "Find and tag files for processing",
+            format!(
+                "{} files, {} sources",
+                app.home.stats.file_count, app.home.stats.source_count
+            ),
+            "Alt+D",
+            "1",
+        ),
+        (
+            "Process",
+            "Run parsers on discovered files",
+            format!(
+                "{} parsers, {} paused",
+                app.home.stats.parser_count, app.home.stats.paused_parsers
+            ),
+            "Alt+P",
+            "2",
+        ),
+        (
+            "Inspect",
+            "View and query output data",
+            "Query tables and view results".to_string(),
+            "Alt+I",
+            "3",
+        ),
+        (
+            "Jobs",
+            "Manage job queue and workers",
+            format!(
+                "{} running, {} pending, {} failed",
+                app.home.stats.running_jobs,
+                app.home.stats.pending_jobs,
+                app.home.stats.failed_jobs
+            ),
+            "Alt+J",
+            "4",
+        ),
+    ];
+
+    for (i, card_area) in areas.iter().enumerate() {
+        let (title, desc, stats, shortcut, number) = &cards[i];
+        let is_selected = app.home.selected_card == i;
+
+        draw_card(frame, *card_area, title, desc, stats, shortcut, number, is_selected);
+    }
+}
+
+/// Draw a single card
+fn draw_card(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    description: &str,
+    stats: &str,
+    shortcut: &str,
+    number: &str,
+    is_selected: bool,
+) {
+    let border_style = if is_selected {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let title_style = if is_selected {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let block = Block::default()
+        .title(format!(" [{}] {} [{}] ", number, title, shortcut))
+        .title_style(title_style)
+        .borders(Borders::ALL)
+        .border_style(border_style);
+
+    // Calculate inner area for content
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Content layout
+    let content_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Spacer
+            Constraint::Length(2), // Description
+            Constraint::Min(0),    // Stats
+        ])
+        .split(inner);
+
+    // Description
+    let desc_style = Style::default().fg(if is_selected {
+        Color::White
+    } else {
+        Color::Gray
+    });
+    let desc_para = Paragraph::new(description)
+        .style(desc_style)
+        .alignment(Alignment::Center);
+    frame.render_widget(desc_para, content_chunks[1]);
+
+    // Stats
+    let stats_style = Style::default().fg(if is_selected {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    });
+    let stats_para = Paragraph::new(stats)
+        .style(stats_style)
+        .alignment(Alignment::Center);
+    frame.render_widget(stats_para, content_chunks[2]);
+}
+
+/// Draw the Discover mode screen (uses existing chat/monitor/help views)
+fn draw_discover_screen(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -25,6 +206,46 @@ pub fn draw(frame: &mut Frame, app: &App) {
         View::Monitor => draw_monitor(frame, app, chunks[1], chunks[2]),
         View::Help => draw_help(frame, chunks[1], chunks[2]),
     }
+}
+
+/// Draw a placeholder screen for modes not yet implemented
+fn draw_placeholder_screen(frame: &mut Frame, title: &str, description: &str, shortcut: &str) {
+    let area = frame.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(0),     // Content
+            Constraint::Length(3),  // Footer
+        ])
+        .split(area);
+
+    // Title
+    let title_widget = Paragraph::new(format!(" {} Mode ", title))
+        .style(Style::default().fg(Color::Cyan).bold())
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(title_widget, chunks[0]);
+
+    // Content
+    let content = format!(
+        "\n\n{}\n\n\n(Coming Soon)\n\nThis mode will allow you to {}.\n\nPress Esc or Alt+H to return to Home.",
+        description,
+        description.to_lowercase()
+    );
+    let content_widget = Paragraph::new(content)
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title(format!(" {} [{}] ", title, shortcut)));
+    frame.render_widget(content_widget, chunks[1]);
+
+    // Footer
+    let footer = Paragraph::new(" [Esc/Alt+H] Home  [Alt+D] Discover  [Alt+P] Process  [Alt+I] Inspect  [Alt+J] Jobs ")
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, chunks[2]);
 }
 
 /// Draw header with tabs
@@ -460,11 +681,37 @@ mod tests {
     }
 
     #[test]
-    fn test_draw_chat_view() {
+    fn test_draw_home_view() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
         let app = App::new(test_args());
+
+        terminal.draw(|f| draw(f, &app)).unwrap();
+
+        // Check that home hub elements are rendered
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        assert!(content.contains("Discover"));
+        assert!(content.contains("Process"));
+        assert!(content.contains("Inspect"));
+        assert!(content.contains("Jobs"));
+    }
+
+    #[test]
+    fn test_draw_chat_view() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new(test_args());
+        // Must be in Discover mode to see Chat view
+        app.mode = TuiMode::Discover;
+        app.view = View::Chat;
 
         terminal.draw(|f| draw(f, &app)).unwrap();
 
@@ -487,6 +734,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = App::new(test_args());
+        // Must be in Discover mode to see Monitor view
+        app.mode = TuiMode::Discover;
         app.view = View::Monitor;
 
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -508,6 +757,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = App::new(test_args());
+        // Must be in Discover mode to see Help view
+        app.mode = TuiMode::Discover;
         app.view = View::Help;
 
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -521,6 +772,27 @@ mod tests {
 
         assert!(content.contains("Help"));
         assert!(content.contains("GLOBAL"));
+    }
+
+    #[test]
+    fn test_draw_placeholder_modes() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Test Process mode placeholder
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Process;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect();
+
+        assert!(content.contains("Process"));
+        assert!(content.contains("Coming Soon"));
     }
 
     #[test]

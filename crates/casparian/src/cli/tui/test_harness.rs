@@ -11,7 +11,7 @@ use ratatui::{backend::TestBackend, Terminal};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::app::{App, Message, MessageRole, View};
+use super::app::{App, Message, MessageRole, TuiMode, View};
 use super::llm::mock::{CannedResponse, MockClaudeProvider};
 use super::ui;
 use super::TuiArgs;
@@ -143,7 +143,9 @@ impl TuiTestHarness {
             model: "mock-test".into(),
         };
 
-        let app = App::new(args);
+        let mut app = App::new(args);
+        // Start in Discover mode for chat functionality testing
+        app.mode = TuiMode::Discover;
 
         Self { terminal, app }
     }
@@ -159,7 +161,9 @@ impl TuiTestHarness {
             model: "mock-test".into(),
         };
 
-        let app = App::new_with_provider(args, provider);
+        let mut app = App::new_with_provider(args, provider);
+        // Start in Discover mode for chat functionality testing
+        app.mode = TuiMode::Discover;
 
         Self { terminal, app }
     }
@@ -381,6 +385,9 @@ impl TuiTestBuilder {
         // Create app with mock provider
         let mut app = App::new_with_provider(args, mock_provider);
 
+        // Start in Discover mode for chat functionality testing
+        app.mode = TuiMode::Discover;
+
         // Add initial messages
         for msg in self.initial_messages {
             app.chat.messages.push(msg);
@@ -472,14 +479,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_escape_clears_input() {
+    async fn test_escape_returns_to_home() {
         let mut harness = TuiTestHarness::new();
+        // Harness starts in Discover mode
 
         harness.type_text("some text").await;
         assert_eq!(harness.input(), "some text");
 
         harness.press_escape().await;
-        assert!(harness.input().is_empty());
+        // Esc now returns to Home mode instead of clearing input
+        assert!(matches!(harness.app.mode, TuiMode::Home));
     }
 
     // =========================================================================

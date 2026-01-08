@@ -12,6 +12,39 @@ use super::llm::claude_code::ClaudeCodeProvider;
 use super::llm::{registry_to_definitions, LlmProvider, StreamChunk};
 use super::TuiArgs;
 
+/// Current TUI mode/screen
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TuiMode {
+    #[default]
+    Home,     // Home hub with 4 cards
+    Discover, // File discovery and tagging
+    Process,  // Parser execution
+    Inspect,  // Output inspection
+    Jobs,     // Job queue management
+}
+
+/// Statistics shown on home hub cards
+#[derive(Debug, Clone, Default)]
+pub struct HomeStats {
+    pub file_count: usize,
+    pub source_count: usize,
+    pub running_jobs: usize,
+    pub pending_jobs: usize,
+    pub failed_jobs: usize,
+    pub completed_jobs: usize,
+    pub parser_count: usize,
+    pub paused_parsers: usize,
+}
+
+/// State for the home hub screen
+#[derive(Debug, Clone, Default)]
+pub struct HomeState {
+    /// Currently selected card index (0-3)
+    pub selected_card: usize,
+    /// Statistics displayed on cards
+    pub stats: HomeStats,
+}
+
 /// Result from a pending Claude response
 pub enum PendingResponse {
     /// Response text received with tool calls info
@@ -322,8 +355,12 @@ pub struct MonitorState {
 pub struct App {
     /// Whether app is running
     pub running: bool,
-    /// Current view
+    /// Current TUI mode/screen
+    pub mode: TuiMode,
+    /// Current view (within mode - for Discover mode's chat/monitor/help)
     pub view: View,
+    /// Home hub state
+    pub home: HomeState,
     /// Chat state
     pub chat: ChatState,
     /// Monitor state
@@ -371,7 +408,9 @@ impl App {
 
         Self {
             running: true,
+            mode: TuiMode::Home,
             view: View::Chat,
+            home: HomeState::default(),
             chat: ChatState::default(),
             monitor: MonitorState::default(),
             tools: create_default_registry(),
@@ -389,7 +428,9 @@ impl App {
     pub fn new_with_registry(registry: ToolRegistry, args: TuiArgs) -> Self {
         Self {
             running: true,
+            mode: TuiMode::Home,
             view: View::Chat,
+            home: HomeState::default(),
             chat: ChatState::default(),
             monitor: MonitorState::default(),
             tools: registry,
@@ -409,7 +450,9 @@ impl App {
     ) -> Self {
         Self {
             running: true,
+            mode: TuiMode::Home,
             view: View::Chat,
+            home: HomeState::default(),
             chat: ChatState::default(),
             monitor: MonitorState::default(),
             tools: create_default_registry(),
@@ -423,36 +466,117 @@ impl App {
 
     /// Handle key event
     pub async fn handle_key(&mut self, key: KeyEvent) {
-        // Global keys
+        // Global keys - always active
         match key.code {
-            KeyCode::F(1) => {
-                self.view = View::Chat;
-                return;
-            }
-            KeyCode::F(2) => {
-                self.view = View::Monitor;
-                return;
-            }
-            KeyCode::F(3) => {
-                self.view = View::Help;
-                return;
-            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.running = false;
                 return;
             }
-            KeyCode::Char('q') if self.view == View::Help => {
-                self.view = View::Chat;
+            // Alt+D: Switch to Discover mode
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::Discover;
+                return;
+            }
+            // Alt+P: Switch to Process mode
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::Process;
+                return;
+            }
+            // Alt+I: Switch to Inspect mode
+            KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::Inspect;
+                return;
+            }
+            // Alt+J: Switch to Jobs mode
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::Jobs;
+                return;
+            }
+            // Alt+H: Return to Home
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::Home;
+                return;
+            }
+            // Esc: Return to Home from any mode (except Home itself)
+            KeyCode::Esc if self.mode != TuiMode::Home => {
+                self.mode = TuiMode::Home;
                 return;
             }
             _ => {}
         }
 
-        // View-specific keys
-        match self.view {
-            View::Chat => self.handle_chat_key(key).await,
-            View::Monitor => self.handle_monitor_key(key),
-            View::Help => {} // Handled above
+        // Mode-specific keys
+        match self.mode {
+            TuiMode::Home => self.handle_home_key(key),
+            TuiMode::Discover => {
+                // F-keys for view switching within Discover mode
+                match key.code {
+                    KeyCode::F(1) => self.view = View::Chat,
+                    KeyCode::F(2) => self.view = View::Monitor,
+                    KeyCode::F(3) => self.view = View::Help,
+                    KeyCode::Char('q') if self.view == View::Help => self.view = View::Chat,
+                    _ => match self.view {
+                        View::Chat => self.handle_chat_key(key).await,
+                        View::Monitor => self.handle_monitor_key(key),
+                        View::Help => {}
+                    },
+                }
+            }
+            TuiMode::Process | TuiMode::Inspect | TuiMode::Jobs => {
+                // Placeholder modes - just show placeholder screen
+                // No additional key handling for now
+            }
+        }
+    }
+
+    /// Handle home hub keys
+    fn handle_home_key(&mut self, key: KeyEvent) {
+        match key.code {
+            // Arrow key navigation
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.home.selected_card % 2 != 0 {
+                    self.home.selected_card -= 1;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.home.selected_card % 2 == 0 && self.home.selected_card < 3 {
+                    self.home.selected_card += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.home.selected_card >= 2 {
+                    self.home.selected_card -= 2;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.home.selected_card < 2 {
+                    self.home.selected_card += 2;
+                }
+            }
+            // Enter: Navigate to selected mode
+            KeyCode::Enter => {
+                self.mode = match self.home.selected_card {
+                    0 => TuiMode::Discover,
+                    1 => TuiMode::Process,
+                    2 => TuiMode::Inspect,
+                    3 => TuiMode::Jobs,
+                    _ => TuiMode::Home,
+                };
+            }
+            // Number keys for quick access
+            KeyCode::Char('1') => {
+                self.mode = TuiMode::Discover;
+            }
+            KeyCode::Char('2') => {
+                self.mode = TuiMode::Process;
+            }
+            KeyCode::Char('3') => {
+                self.mode = TuiMode::Inspect;
+            }
+            KeyCode::Char('4') => {
+                self.mode = TuiMode::Jobs;
+            }
+            _ => {}
         }
     }
 
@@ -893,6 +1017,8 @@ mod tests {
     #[test]
     fn test_view_switching() {
         let mut app = App::new(test_args());
+        // Must be in Discover mode for view switching to work
+        app.mode = TuiMode::Discover;
 
         assert!(matches!(app.view, View::Chat));
 
@@ -912,8 +1038,64 @@ mod tests {
     }
 
     #[test]
+    fn test_mode_switching() {
+        let mut app = App::new(test_args());
+        assert!(matches!(app.mode, TuiMode::Home));
+
+        // Alt+D should switch to Discover
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT))
+                .await;
+        });
+        assert!(matches!(app.mode, TuiMode::Discover));
+
+        // Alt+P should switch to Process
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT))
+                .await;
+        });
+        assert!(matches!(app.mode, TuiMode::Process));
+
+        // Esc should return to Home
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .await;
+        });
+        assert!(matches!(app.mode, TuiMode::Home));
+    }
+
+    #[test]
+    fn test_home_card_navigation() {
+        let mut app = App::new(test_args());
+        assert_eq!(app.home.selected_card, 0);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // Right arrow should move to card 1
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+                .await;
+        });
+        assert_eq!(app.home.selected_card, 1);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // Down arrow should move to card 3
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .await;
+        });
+        assert_eq!(app.home.selected_card, 3);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            // Enter should navigate to Jobs mode (card 3)
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await;
+        });
+        assert!(matches!(app.mode, TuiMode::Jobs));
+    }
+
+    #[test]
     fn test_chat_input() {
         let mut app = App::new(test_args());
+        // Must be in Discover mode for chat input to work
+        app.mode = TuiMode::Discover;
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             // Type "hello"
@@ -930,6 +1112,8 @@ mod tests {
     #[test]
     fn test_chat_backspace() {
         let mut app = App::new(test_args());
+        // Must be in Discover mode for chat input to work
+        app.mode = TuiMode::Discover;
         app.chat.input = "hello".into();
         app.chat.cursor = 5;
 
@@ -945,6 +1129,8 @@ mod tests {
     #[test]
     fn test_multiline_input() {
         let mut app = App::new(test_args());
+        // Must be in Discover mode for chat input to work
+        app.mode = TuiMode::Discover;
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             // Type "line1"
@@ -1057,8 +1243,10 @@ mod tests {
     }
 
     #[test]
-    fn test_esc_clears_input() {
+    fn test_esc_returns_to_home() {
         let mut app = App::new(test_args());
+        // Start in Discover mode
+        app.mode = TuiMode::Discover;
         app.chat.input = "some text".into();
         app.chat.cursor = 9;
 
@@ -1067,8 +1255,8 @@ mod tests {
                 .await;
         });
 
-        assert_eq!(app.chat.input, "");
-        assert_eq!(app.chat.cursor, 0);
+        // Esc returns to Home mode from Discover
+        assert!(matches!(app.mode, TuiMode::Home));
     }
 
     #[tokio::test]
@@ -1207,6 +1395,8 @@ mod tests {
         }
 
         let mut app = App::new(test_args());
+        // Must be in Discover mode for chat to work
+        app.mode = TuiMode::Discover;
 
         // Verify Claude Code is available in the app
         if app.llm.is_none() {

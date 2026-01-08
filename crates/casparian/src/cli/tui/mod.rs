@@ -107,13 +107,14 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
-    fn test_app_starts_in_chat_view() {
+    fn test_app_starts_in_home_mode() {
         let args = TuiArgs {
             database: None,
             api_key: None,
             model: "test".into(),
         };
         let app = App::new(args);
+        assert!(matches!(app.mode, app::TuiMode::Home));
         assert!(matches!(app.view, app::View::Chat));
         assert!(app.running);
     }
