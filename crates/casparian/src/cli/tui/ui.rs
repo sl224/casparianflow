@@ -395,6 +395,11 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, chunks[2]);
+
+    // Rules Manager dialog (overlay)
+    if app.discover.rules_manager_open {
+        draw_rules_manager_dialog(frame, app, area);
+    }
 }
 
 /// Get contextual footer text and style for Discover mode
@@ -439,30 +444,30 @@ fn get_discover_footer(app: &App, filtered_count: usize) -> (String, Style) {
         DiscoverFocus::Files => {
             if !app.discover.filter.is_empty() {
                 (
-                    format!(" [t] Tag {} files  [R] Rule  [/] Edit  [Esc] Clear  │ 1:Src 2:Rules ", filtered_count),
+                    format!(" [t] Tag {} files  [R] Rules  [/] Edit  [Esc] Clear  │ 1:Src 2:Tags ", filtered_count),
                     Style::default().fg(Color::DarkGray),
                 )
             } else {
-                (" [/] Filter  [t] Tag  [Tab] Preview  [s] Scan  │ 1:Sources 2:Rules ".to_string(), Style::default().fg(Color::DarkGray))
+                (" [/] Filter  [t] Tag  [Tab] Preview  [s] Scan  [R] Rules  │ 1:Sources 2:Tags ".to_string(), Style::default().fg(Color::DarkGray))
             }
         }
         DiscoverFocus::Sources => {
-            (" [Tab] Select→Files  [Enter] Load  [n] New  [d] Delete  │ 2:Rules 3:Files ".to_string(), Style::default().fg(Color::DarkGray))
+            (" [Enter] Select  [↑↓] Navigate  [Esc] Cancel  │ 2:Tags 3:Files ".to_string(), Style::default().fg(Color::DarkGray))
         }
-        DiscoverFocus::Rules => {
-            (" [Tab] Filter→Files  [Enter] Edit  [n] New  [d] Delete  │ 1:Sources 3:Files ".to_string(), Style::default().fg(Color::DarkGray))
+        DiscoverFocus::Tags => {
+            (" [Enter] Select  [↑↓] Navigate  [Esc] All files  │ 1:Sources 3:Files ".to_string(), Style::default().fg(Color::DarkGray))
         }
     }
 }
 
-/// Draw the Discover mode sidebar with Sources and Rules sections (scrollable)
+/// Draw the Discover mode sidebar with Sources and Tags sections (scrollable)
 fn draw_discover_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     // Dynamic layout based on dropdown state
     let sources_open = app.discover.sources_dropdown_open;
-    let rules_open = app.discover.rules_dropdown_open;
+    let tags_open = app.discover.tags_dropdown_open;
 
     // Calculate heights: collapsed = 3 lines (1 content + 2 border), expanded = remaining space
-    let (sources_constraint, rules_constraint) = match (sources_open, rules_open) {
+    let (sources_constraint, tags_constraint) = match (sources_open, tags_open) {
         (true, false) => (Constraint::Min(10), Constraint::Length(3)),
         (false, true) => (Constraint::Length(3), Constraint::Min(10)),
         (true, true) => (Constraint::Percentage(50), Constraint::Percentage(50)),
@@ -471,14 +476,14 @@ fn draw_discover_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([sources_constraint, rules_constraint])
+        .constraints([sources_constraint, tags_constraint])
         .split(area);
 
     // === SOURCES DROPDOWN ===
     draw_sources_dropdown(frame, app, v_chunks[0]);
 
-    // === RULES DROPDOWN ===
-    draw_rules_dropdown(frame, app, v_chunks[1]);
+    // === TAGS DROPDOWN ===
+    draw_tags_dropdown(frame, app, v_chunks[1]);
 }
 
 /// Draw the Sources dropdown (collapsed or expanded)
@@ -583,10 +588,10 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Draw the Rules dropdown (collapsed or expanded)
-fn draw_rules_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    let is_open = app.discover.rules_dropdown_open;
-    let is_focused = app.discover.focus == DiscoverFocus::Rules;
+/// Draw the Tags dropdown (collapsed or expanded)
+fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
+    let is_open = app.discover.tags_dropdown_open;
+    let is_focused = app.discover.focus == DiscoverFocus::Tags;
 
     let style = if is_focused {
         Style::default().fg(Color::Cyan)
@@ -603,48 +608,39 @@ fn draw_rules_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             .split(area);
 
         // Filter input line
-        let filter_text = format!("Filter: {}█", app.discover.rules_filter);
+        let filter_text = format!("Filter: {}█", app.discover.tags_filter);
         let filter_line = Paragraph::new(filter_text)
             .style(Style::default().fg(Color::Yellow));
         frame.render_widget(filter_line, inner_chunks[0]);
 
         // Filtered list
-        let filtered: Vec<_> = app.discover.rules.iter()
+        let filtered: Vec<_> = app.discover.tags.iter()
             .enumerate()
-            .filter(|(_, r)| {
-                app.discover.rules_filter.is_empty()
-                    || r.pattern.to_lowercase().contains(&app.discover.rules_filter.to_lowercase())
-                    || r.tag.to_lowercase().contains(&app.discover.rules_filter.to_lowercase())
+            .filter(|(_, t)| {
+                app.discover.tags_filter.is_empty()
+                    || t.name.to_lowercase().contains(&app.discover.tags_filter.to_lowercase())
             })
             .collect();
 
         let mut lines: Vec<Line> = Vec::new();
         let visible_height = inner_chunks[1].height as usize;
 
-        // "All files" option at top
-        let no_rule_selected = app.discover.preview_rule.is_none();
-        let all_files_style = if no_rule_selected {
-            Style::default().fg(Color::White).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let all_prefix = if no_rule_selected { "► " } else { "  " };
-        lines.push(Line::from(Span::styled(
-            format!("{}(All files)", all_prefix),
-            all_files_style,
-        )));
-
-        if filtered.is_empty() && !app.discover.rules.is_empty() {
+        if filtered.is_empty() && !app.discover.tags.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No matches",
                 Style::default().fg(Color::DarkGray).italic(),
             )));
+        } else if filtered.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No tags yet",
+                Style::default().fg(Color::DarkGray).italic(),
+            )));
         } else {
             // Find scroll offset based on preview position
-            let scroll_offset = if let Some(preview_idx) = app.discover.preview_rule {
+            let scroll_offset = if let Some(preview_idx) = app.discover.preview_tag {
                 let preview_pos = filtered.iter().position(|(i, _)| *i == preview_idx).unwrap_or(0);
-                if preview_pos + 1 >= visible_height { // +1 for "All files" row
-                    preview_pos + 2 - visible_height
+                if preview_pos >= visible_height {
+                    preview_pos + 1 - visible_height
                 } else {
                     0
                 }
@@ -652,20 +648,22 @@ fn draw_rules_dropdown(frame: &mut Frame, app: &App, area: Rect) {
                 0
             };
 
-            for (i, rule) in filtered.iter().skip(scroll_offset).take(visible_height.saturating_sub(1)) {
-                let is_preview = app.discover.preview_rule == Some(*i);
-                let is_selected = app.discover.selected_rule == Some(*i);
+            for (i, tag) in filtered.iter().skip(scroll_offset).take(visible_height) {
+                let is_preview = app.discover.preview_tag == Some(*i);
+                let is_selected = app.discover.selected_tag == Some(*i);
                 let prefix = if is_preview { "► " } else { "  " };
 
                 let item_style = if is_preview {
                     Style::default().fg(Color::White).bold()
                 } else if is_selected {
                     Style::default().fg(Color::Magenta)
+                } else if tag.is_special {
+                    Style::default().fg(Color::Blue)
                 } else {
                     Style::default().fg(Color::Gray)
                 };
 
-                let text = format!("{}{} → {}", prefix, rule.pattern, rule.tag);
+                let text = format!("{}{} ({})", prefix, tag.name, tag.count);
                 lines.push(Line::from(Span::styled(text, item_style)));
             }
         }
@@ -677,18 +675,20 @@ fn draw_rules_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(style)
-            .title(Span::styled(" [2] RULE ▲ ", style));
+            .title(Span::styled(" [2] TAGS ▲ ", style));
         frame.render_widget(block, area);
     } else {
-        // Collapsed: show selected rule or "All files"
-        let selected_text = if let Some(rule_idx) = app.discover.selected_rule {
-            if let Some(rule) = app.discover.rules.get(rule_idx) {
-                format!("▼ {} → {}", rule.pattern, rule.tag)
+        // Collapsed: show selected tag or "All files"
+        let selected_text = if let Some(tag_idx) = app.discover.selected_tag {
+            if let Some(tag) = app.discover.tags.get(tag_idx) {
+                format!("▼ {} ({})", tag.name, tag.count)
             } else {
                 "▼ All files".to_string()
             }
         } else {
-            "▼ All files".to_string()
+            // Get total count from first tag if available
+            let count = app.discover.tags.first().map(|t| t.count).unwrap_or(0);
+            format!("▼ All files ({})", count)
         };
 
         let block = Block::default()
@@ -702,6 +702,124 @@ fn draw_rules_dropdown(frame: &mut Frame, app: &App, area: Rect) {
 
         frame.render_widget(content, area);
     }
+}
+
+/// Draw the Rules Manager dialog as an overlay
+fn draw_rules_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the dialog
+    let dialog_width = area.width.min(60);
+    let dialog_height = area.height.min(20);
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    // Clear the area behind the dialog
+    frame.render_widget(Clear, dialog_area);
+
+    // Dialog block
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" Tagging Rules ", Style::default().fg(Color::Cyan).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Split inner area: list + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner_area);
+
+    // Rules list
+    let mut lines: Vec<Line> = Vec::new();
+
+    if app.discover.rules.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  No tagging rules yet",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Press [n] to create one",
+            Style::default().fg(Color::Cyan),
+        )));
+    } else {
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled("  Pattern", Style::default().fg(Color::DarkGray)),
+            Span::raw("              "),
+            Span::styled("Tag", Style::default().fg(Color::DarkGray)),
+            Span::raw("        "),
+            Span::styled("On", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "  ────────────────────────────────────────────",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        for (i, rule) in app.discover.rules.iter().enumerate() {
+            let is_selected = i == app.discover.selected_rule;
+            let prefix = if is_selected { "► " } else { "  " };
+
+            let enabled_mark = if rule.enabled { "✓" } else { " " };
+
+            let style = if is_selected {
+                Style::default().fg(Color::White).bold()
+            } else if !rule.enabled {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            // Truncate pattern if too long
+            let pattern = if rule.pattern.len() > 18 {
+                format!("{}...", &rule.pattern[..15])
+            } else {
+                format!("{:<18}", rule.pattern)
+            };
+
+            let tag = if rule.tag.len() > 10 {
+                format!("{}...", &rule.tag[..7])
+            } else {
+                format!("{:<10}", rule.tag)
+            };
+
+            lines.push(Line::from(Span::styled(
+                format!("{}{}  {}  {}", prefix, pattern, tag, enabled_mark),
+                style,
+            )));
+        }
+    }
+
+    let rules_list = Paragraph::new(lines);
+    frame.render_widget(rules_list, chunks[0]);
+
+    // Footer with keybindings
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" [n]", Style::default().fg(Color::Cyan)),
+        Span::raw(" New  "),
+        Span::styled("[e]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Edit  "),
+        Span::styled("[d]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Del  "),
+        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Toggle  "),
+        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Close"),
+    ]))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
 }
 
 fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::FileInfo], area: Rect) {
