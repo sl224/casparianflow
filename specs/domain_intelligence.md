@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Purpose:** Guide UI/API design based on where and how data files are stored across verticals
-**Version:** 0.1
+**Version:** 0.2
 **Date:** January 8, 2026
 
 ---
@@ -108,10 +108,17 @@ This document catalogs file formats across all target verticals with specific fo
 | Format | Extension | Value | Storage Location | Naming Pattern | Detection Signature |
 |--------|-----------|-------|------------------|----------------|---------------------|
 | **CoT (Cursor on Target)** | `.cot`, `.xml` | ⭐⭐⭐⭐⭐ | `/mnt/mission_data/tracks/` | `patrol_*.cot` | Root element `<event>` with `uid`, `type` attrs |
+| **PCAP (Network Capture)** | `.pcap`, `.pcapng` | ⭐⭐⭐⭐⭐ | `/mnt/mission_data/network/` | `capture_*.pcap` | Magic bytes: `0xd4c3b2a1` (pcap) or `0x0a0d0d0a` (pcapng) |
 | **NITF (Imagery)** | `.ntf`, `.nitf` | ⭐⭐⭐⭐⭐ | `/mnt/mission_data/imagery/` | `img_*.ntf` | Magic bytes: `NITF` or `NSIF` at offset 0 |
 | **STANAG 4609 Video** | `.ts`, `.mpg` | ⭐⭐⭐⭐ | `/mnt/mission_data/fmv/` | `mission_*.ts` | KLV metadata in MPEG-TS stream |
-| **KML/KMZ** | `.kml`, `.kmz` | ⭐⭐⭐ | `/mnt/mission_data/exports/` | `route_*.kml` | Root element `<kml>` |
+| **KML/KMZ** | `.kml`, `.kmz` | ⭐⭐⭐⭐ | `/mnt/mission_data/exports/` | `route_*.kml` | Root element `<kml>` or ZIP containing .kml |
 | **GeoJSON** | `.geojson`, `.json` | ⭐⭐⭐ | `/mnt/mission_data/exports/` | `tracks_*.geojson` | Contains `"type": "FeatureCollection"` |
+
+**PCAP Special Notes:**
+- **Bridges defense + enterprise IT** - Same format used by SOC analysts
+- PCAP files accumulate on air-gapped systems for post-mission analysis
+- Contains network flows, DNS queries, HTTP traffic
+- Wireshark is interactive-only; no good batch pipeline exists
 
 **Folder Structure Pattern:**
 ```
@@ -121,6 +128,8 @@ This document catalogs file formats across all target verticals with specific fo
 │       └── img_*.ntf
 ├── tracks/
 │   └── patrol_*.cot
+├── network/
+│   └── capture_*.pcap         # NEW: Network captures
 ├── fmv/
 │   └── mission_*.ts
 └── reports/
@@ -132,6 +141,7 @@ This document catalogs file formats across all target verticals with specific fo
 - Map preview for CoT/NITF (show bounding box)
 - Offline-first design (no network calls)
 - Security classification indicator (if detectable from metadata)
+- PCAP: Show flow counts, top talkers summary
 
 ---
 
@@ -234,15 +244,65 @@ C:\Users\Controller\Downloads\
 
 ---
 
+### 3.6 Legal Tech/eDiscovery
+
+| Format | Extension | Value | Storage Location | Naming Pattern | Detection Signature |
+|--------|-----------|-------|------------------|----------------|---------------------|
+| **PST (Outlook Archive)** | `.pst`, `.ost` | ⭐⭐⭐⭐⭐ | `\\server\departing_employees\` | `archive*.pst` | Magic bytes: `!BDN` at offset 0 |
+| **MBOX (Unix Mail)** | `.mbox`, `.mbx` | ⭐⭐⭐⭐ | `~/mail/` or Google Takeout | `All mail.mbox` | Lines start with `From ` (mbox format) |
+| **Load File (.dat)** | `.dat`, `.lfp` | ⭐⭐⭐⭐⭐ | `\\server\productions\` | `production_*.dat` | Uses þ (thorn) as delimiter |
+| **OPT File** | `.opt` | ⭐⭐⭐⭐ | `\\server\productions\` | `production_*.opt` | BATES → image path mapping |
+| **Slack Export** | `.json` | ⭐⭐⭐⭐ | `~/Downloads/slack_export/` | `channels/*.json` | Contains `"type": "message"` |
+| **Teams Export** | `.json` | ⭐⭐⭐ | M365 compliance export | `Messages/*.json` | Contains Teams-specific schema |
+
+**Folder Structure Pattern:**
+```
+\\fileserver\departing_employees\
+├── jsmith_2019/
+│   ├── outlook_archive.pst      # 15GB email archive
+│   └── desktop_backup.zip
+└── mwilliams_2020/
+    └── archive_2015_2020.pst
+
+\\server\productions\
+├── production_001/
+│   ├── DATA/
+│   │   └── production_001.dat   # Tab-delimited metadata
+│   ├── IMAGES/
+│   │   └── 0001/
+│   │       └── DOC0001_*.tif
+│   ├── NATIVES/
+│   │   └── *.pdf, *.docx
+│   └── TEXT/
+│       └── *.txt
+
+slack_export_YYYYMMDD/
+├── channels/
+│   └── general/
+│       └── YYYY-MM-DD.json
+├── users.json
+└── channels.json
+```
+
+**UI Recommendations:**
+- Custodian picker (group by person whose data was collected)
+- Email thread visualization
+- Attachment extraction preview
+- BATES number range display for load files
+- Slack: Channel/thread navigation
+
+---
+
 ## 4. Value Ranking Summary (Cross-Vertical)
 
 ### Tier 1: Killer Apps (Ship Day 1)
 
 | Format | Vertical | Why Critical |
 |--------|----------|--------------|
+| **FIX Logs** | Finance | Trade Break Workbench; quantifiable ROI |
 | **HL7 ADT/ORU** | Healthcare | 95% of hospitals use it; Mirth disruption |
 | **CoT XML** | Defense | 500K+ TAK users; simple XML |
-| **FIX Logs** | Finance | Every trading desk has them; no good tools |
+| **PCAP** | Defense/Enterprise IT | Bridges two markets; Wireshark pipeline gap |
 | **Historian CSV** | Manufacturing | Universal export format; PI disruption |
 | **QuickBooks IIF/CSV** | Mid-biz | 80%+ market share; export pain is real |
 
@@ -250,8 +310,11 @@ C:\Users\Controller\Downloads\
 
 | Format | Vertical | Why Important |
 |--------|----------|---------------|
+| **PST/MBOX** | Legal | Universal email archive; $5-15K savings per matter |
+| **Load Files (.dat)** | Legal | eDiscovery interchange; platform bridge |
 | **SEC EDGAR XBRL** | Finance | Free data; Bloomberg alternative |
 | **NITF Metadata** | Defense | Critical for GEOINT; GDAL makes it easy |
+| **KML/KMZ** | Defense/General | Universal geospatial; bridges civilian/military |
 | **MTConnect XML** | Manufacturing | Open standard; Industry 4.0 |
 | **Salesforce CSV** | Mid-biz | 60%+ CRM adoption; common combo with QB |
 | **HL7 ORM** | Healthcare | Orders data; links to ADT/ORU |
@@ -260,6 +323,7 @@ C:\Users\Controller\Downloads\
 
 | Format | Vertical | Why Defer |
 |--------|----------|-----------|
+| **Slack/Teams JSON** | Legal | Growing eDiscovery importance; courts require |
 | **ISO 20022 (MX)** | Finance | Complex XML; specialized market |
 | **STANAG 4609 KLV** | Defense | Video telemetry; niche |
 | **SPC/Quality Excel** | Manufacturing | Highly variable formats |
@@ -270,6 +334,8 @@ C:\Users\Controller\Downloads\
 | Format | Vertical | Why Defer |
 |--------|----------|-----------|
 | **VMF/USMTF** | Defense | Thousands of message types; classified specs |
+| **MDF4/BLF** | Automotive | Niche market; specialized tools exist |
+| **ASN.1/CDR** | Telecom | Enterprise market; wrong buyer profile |
 | **OPC-UA Real-time** | Manufacturing | Requires OT network access |
 | **CAT Audit Trail** | Finance | Regulatory complexity; enterprise only |
 
@@ -297,6 +363,21 @@ CONTENT_SIGNATURES = {
     "nitf": {
         "magic_bytes": [b"NITF", b"NSIF"],
         "confidence": 0.99,
+        "vertical": "defense"
+    },
+    "pcap": {
+        "magic_bytes": [b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4"],  # pcap little/big endian
+        "confidence": 0.99,
+        "vertical": "defense"  # Also enterprise_it
+    },
+    "pcapng": {
+        "magic_bytes": [b"\x0a\x0d\x0d\x0a"],
+        "confidence": 0.99,
+        "vertical": "defense"
+    },
+    "kml": {
+        "pattern": r"<kml\s+xmlns=",
+        "confidence": 0.95,
         "vertical": "defense"
     },
 
@@ -339,6 +420,28 @@ CONTENT_SIGNATURES = {
         "pattern": r"[a-zA-Z0-9]{18}",  # In Id column
         "confidence": 0.70,
         "vertical": "midsize_business"
+    },
+
+    # Legal/eDiscovery
+    "pst": {
+        "magic_bytes": [b"!BDN"],  # PST signature
+        "confidence": 0.99,
+        "vertical": "legal"
+    },
+    "mbox": {
+        "pattern": r"^From \S+@\S+",  # mbox From line
+        "confidence": 0.90,
+        "vertical": "legal"
+    },
+    "loadfile_dat": {
+        "pattern": r"þ[A-Z]+þ",  # Thorn delimiter with field names
+        "confidence": 0.95,
+        "vertical": "legal"
+    },
+    "slack_message": {
+        "pattern": r'"type"\s*:\s*"message".*"user"\s*:',
+        "confidence": 0.85,
+        "vertical": "legal"
     }
 }
 ```
@@ -352,9 +455,10 @@ PATH_HINTS = {
     r"(ADT|ORU|ORM)_(In|Out)bound": {"vertical": "healthcare", "formats": ["hl7"]},
 
     # Defense
-    r"mission_data": {"vertical": "defense", "formats": ["cot", "nitf"]},
+    r"mission_data": {"vertical": "defense", "formats": ["cot", "nitf", "pcap"]},
     r"imagery.*pass": {"vertical": "defense", "formats": ["nitf"]},
     r"tracks": {"vertical": "defense", "formats": ["cot", "kml"]},
+    r"network|capture": {"vertical": "defense", "formats": ["pcap"]},
 
     # Finance
     r"/var/log/fix": {"vertical": "finance", "formats": ["fix"]},
@@ -370,6 +474,12 @@ PATH_HINTS = {
     r"quickbooks|qb_": {"vertical": "midsize_business", "formats": ["quickbooks"]},
     r"salesforce|sf_": {"vertical": "midsize_business", "formats": ["salesforce"]},
     r"payroll|adp|gusto": {"vertical": "midsize_business", "formats": ["payroll"]},
+
+    # Legal/eDiscovery
+    r"departing_employee|litigation|matter": {"vertical": "legal", "formats": ["pst"]},
+    r"production|discovery": {"vertical": "legal", "formats": ["loadfile"]},
+    r"slack_export": {"vertical": "legal", "formats": ["slack"]},
+    r"teams_export|compliance_export": {"vertical": "legal", "formats": ["teams"]},
 }
 ```
 
@@ -377,16 +487,37 @@ PATH_HINTS = {
 
 ```python
 EXTENSION_MAP = {
+    # Healthcare
     ".hl7": {"vertical": "healthcare", "parser": "hl7_parser"},
+
+    # Defense
     ".cot": {"vertical": "defense", "parser": "cot_parser"},
     ".ntf": {"vertical": "defense", "parser": "nitf_parser"},
     ".nitf": {"vertical": "defense", "parser": "nitf_parser"},
+    ".pcap": {"vertical": "defense", "parser": "pcap_parser"},
+    ".pcapng": {"vertical": "defense", "parser": "pcap_parser"},
+    ".kml": {"vertical": "defense", "parser": "kml_parser"},
+    ".kmz": {"vertical": "defense", "parser": "kml_parser"},  # ZIP containing KML
+
+    # Finance
     ".fix": {"vertical": "finance", "parser": "fix_parser"},
+
+    # Mid-biz
     ".iif": {"vertical": "midsize_business", "parser": "quickbooks_parser"},
+
+    # Legal/eDiscovery
+    ".pst": {"vertical": "legal", "parser": "pst_parser"},
+    ".ost": {"vertical": "legal", "parser": "pst_parser"},
+    ".mbox": {"vertical": "legal", "parser": "mbox_parser"},
+    ".dat": None,  # Could be load file OR other data
+    ".opt": {"vertical": "legal", "parser": "loadfile_parser"},
+    ".lfp": {"vertical": "legal", "parser": "loadfile_parser"},
+
     # Generic extensions need content inspection
-    ".xml": None,  # Could be CoT, MTConnect, XBRL, ISO20022
+    ".xml": None,  # Could be CoT, MTConnect, XBRL, ISO20022, KML
     ".csv": None,  # Could be anything
     ".log": None,  # Could be FIX or generic
+    ".json": None,  # Could be Slack, Teams, GeoJSON, etc.
 }
 ```
 
@@ -529,3 +660,4 @@ class FormatDetection:
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-01-08 | 0.1 | Initial draft aggregating all vertical strategies |
+| 2026-01-08 | 0.2 | Gap analysis integration: Added Legal/eDiscovery vertical (PST, load files, Slack); Added PCAP to Defense; Enhanced KML; Updated value rankings and detection patterns |
