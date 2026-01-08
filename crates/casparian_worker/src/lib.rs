@@ -7,7 +7,7 @@ pub mod venv_manager;
 pub mod worker;
 
 pub use metrics::METRICS;
-pub use worker::{Worker, WorkerConfig};
+pub use worker::{Worker, WorkerConfig, WorkerError};
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "casparian-worker", about = "Rust Worker for Casparian Flow")]

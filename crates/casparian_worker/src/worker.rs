@@ -8,6 +8,7 @@
 //! - Graceful shutdown via shutdown channel
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 use arrow::array::RecordBatch;
 use casparian_protocol::types::{self, DispatchCommand, HeartbeatStatus, JobStatus, PrepareEnvCommand};
 use casparian_protocol::{Message, OpCode};
@@ -25,6 +26,88 @@ use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::bridge::{self, BridgeConfig};
 use crate::venv_manager::VenvManager;
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/// Worker execution errors with retry classification.
+///
+/// Exit code conventions for Python parsers:
+/// - 0: Success
+/// - 1: Permanent error (no retry) - e.g., invalid parser code, schema mismatch
+/// - 2: Transient error (retry eligible) - e.g., network timeout, resource unavailable
+/// - Other: Treated as transient (may retry)
+#[derive(Debug, Error)]
+pub enum WorkerError {
+    /// Permanent error - retrying will not help (e.g., invalid parser, schema violation)
+    #[error("Permanent error (no retry): {message}")]
+    Permanent { message: String },
+
+    /// Transient error - may succeed on retry (e.g., network timeout, resource busy)
+    #[error("Transient error (retry eligible): {message}")]
+    Transient { message: String },
+
+    /// Bridge communication error
+    #[error("Bridge error: {0}")]
+    Bridge(#[from] anyhow::Error),
+}
+
+impl WorkerError {
+    /// Check if this error is transient (eligible for retry)
+    pub fn is_transient(&self) -> bool {
+        matches!(self, WorkerError::Transient { .. })
+    }
+
+    /// Check if this error is permanent (no retry)
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, WorkerError::Permanent { .. })
+    }
+
+    /// Create from exit code using the Casparian convention:
+    /// - 0: Success (not an error)
+    /// - 1: Permanent error
+    /// - 2: Transient error
+    /// - Other: Transient (default to retry)
+    pub fn from_exit_code(code: i32, stderr: &str) -> Self {
+        let message = if stderr.is_empty() {
+            format!("Parser exited with code {}", code)
+        } else {
+            // Truncate stderr to avoid huge error messages
+            let truncated = if stderr.len() > 500 {
+                format!("{}... (truncated)", &stderr[..500])
+            } else {
+                stderr.to_string()
+            };
+            format!("Parser exited with code {}: {}", code, truncated)
+        };
+
+        match code {
+            1 => WorkerError::Permanent { message },
+            2 => WorkerError::Transient { message },
+            _ => WorkerError::Transient { message },
+        }
+    }
+
+    /// Create from signal termination
+    pub fn from_signal(stderr: &str) -> Self {
+        let message = if stderr.is_empty() {
+            "Parser terminated by signal".to_string()
+        } else {
+            let truncated = if stderr.len() > 500 {
+                format!("{}... (truncated)", &stderr[..500])
+            } else {
+                stderr.to_string()
+            };
+            format!("Parser terminated by signal: {}", truncated)
+        };
+        WorkerError::Transient { message }
+    }
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
 
 /// Maximum concurrent jobs per worker
 const MAX_CONCURRENT_JOBS: usize = 4;
@@ -430,6 +513,10 @@ fn truncate_hash(hash: &str) -> &str {
 }
 
 /// Execute a job and return receipt
+///
+/// The receipt includes error classification for retry decisions:
+/// - `error_message` contains the error details
+/// - `metrics["is_transient"]` indicates if the error is retry-eligible (1 = transient, 0 = permanent)
 async fn execute_job(
     job_id: u64,
     cmd: DispatchCommand,
@@ -449,31 +536,46 @@ async fn execute_job(
                 error_message: None,
             }
         }
-        Err(e) => {
-            error!("Job {} failed: {}", job_id, e);
+        Err(worker_err) => {
+            let is_transient = worker_err.is_transient();
+            let error_message = worker_err.to_string();
+
+            if is_transient {
+                warn!("Job {} failed (transient, retry eligible): {}", job_id, error_message);
+            } else {
+                error!("Job {} failed (permanent, no retry): {}", job_id, error_message);
+            }
+
+            let mut metrics = HashMap::new();
+            // Include error classification in metrics for Sentinel to read
+            metrics.insert("is_transient".to_string(), if is_transient { 1 } else { 0 });
+
             types::JobReceipt {
                 status: JobStatus::Failed,
-                metrics: HashMap::new(),
+                metrics,
                 artifacts: vec![],
-                error_message: Some(e.to_string()),
+                error_message: Some(error_message),
             }
         }
     }
 }
 
+/// Execute a job, returning WorkerError with retry classification on failure
 async fn execute_job_inner(
     job_id: u64,
     cmd: &DispatchCommand,
     venv_manager: &VenvManager,
     parquet_root: &std::path::Path,
     shim_path: &std::path::Path,
-) -> Result<(usize, Vec<HashMap<String, String>>)> {
+) -> std::result::Result<(usize, Vec<HashMap<String, String>>), WorkerError> {
     // Determine interpreter path
     let interpreter = if cmd.env_hash == "system" {
         // Use system Python for legacy plugins without lockfile
         which::which("python3")
             .or_else(|_| which::which("python"))
-            .context("No system Python found")?
+            .map_err(|e| WorkerError::Permanent {
+                message: format!("No system Python found: {}", e),
+            })?
     } else {
         // Use venv interpreter
         let interp = venv_manager.interpreter_path(&cmd.env_hash);
@@ -483,12 +585,15 @@ async fn execute_job_inner(
                 job_id,
                 truncate_hash(&cmd.env_hash)
             );
-            // Can't provision without lockfile content in DispatchCommand
-            anyhow::bail!(
-                "Environment {} not provisioned. Worker cannot auto-provision without lockfile. \
-                 Either send PREPARE_ENV first, or include lockfile in DISPATCH.",
-                truncate_hash(&cmd.env_hash)
-            );
+            // Environment not provisioned - this is a transient error, worker can retry
+            // after sentinel sends PREPARE_ENV
+            return Err(WorkerError::Transient {
+                message: format!(
+                    "Environment {} not provisioned. Worker cannot auto-provision without lockfile. \
+                     Either send PREPARE_ENV first, or include lockfile in DISPATCH.",
+                    truncate_hash(&cmd.env_hash)
+                ),
+            });
         }
         interp
     };
@@ -503,7 +608,45 @@ async fn execute_job_inner(
         shim_path: shim_path.to_path_buf(),
     };
 
-    let bridge_result = bridge::execute_bridge(config).await?;
+    let bridge_result = bridge::execute_bridge(config).await.map_err(|e| {
+        // Classify bridge errors by examining the error message
+        let error_str = e.to_string().to_lowercase();
+
+        // Permanent errors: syntax errors, import errors, schema violations
+        if error_str.contains("syntaxerror")
+            || error_str.contains("importerror")
+            || error_str.contains("modulenotfounderror")
+            || error_str.contains("schema")
+            || error_str.contains("exited with exit status: 1")
+        {
+            WorkerError::Permanent {
+                message: e.to_string(),
+            }
+        }
+        // Exit code 2 explicitly indicates transient
+        else if error_str.contains("exited with exit status: 2") {
+            WorkerError::Transient {
+                message: e.to_string(),
+            }
+        }
+        // Transient errors: timeouts, network issues, resource unavailable
+        else if error_str.contains("timeout")
+            || error_str.contains("connection")
+            || error_str.contains("resource")
+            || error_str.contains("signal")
+        {
+            WorkerError::Transient {
+                message: e.to_string(),
+            }
+        }
+        // Default to transient (conservative - allow retry)
+        else {
+            WorkerError::Transient {
+                message: e.to_string(),
+            }
+        }
+    })?;
+
     let batches = bridge_result.batches;
 
     // Log the captured logs for debugging (will be stored in DB in Phase 3)
@@ -511,12 +654,15 @@ async fn execute_job_inner(
         debug!("Job {} logs ({} bytes):\n{}", job_id, bridge_result.logs.len(), bridge_result.logs);
     }
 
-    // Write to Parquet
+    // Write to Parquet - I/O errors are transient
     let mut total_rows = 0;
     let mut artifacts = Vec::new();
 
     for sink_config in &cmd.sinks {
-        let output_path = write_parquet(parquet_root, job_id, &sink_config.topic, &batches)?;
+        let output_path = write_parquet(parquet_root, job_id, &sink_config.topic, &batches)
+            .map_err(|e| WorkerError::Transient {
+                message: format!("Failed to write parquet: {}", e),
+            })?;
 
         total_rows = batches.iter().map(|b| b.num_rows()).sum();
 
@@ -680,5 +826,66 @@ mod tests {
         assert_eq!(truncate_hash("123456789012"), "123456789012");
         assert_eq!(truncate_hash("1234567890123"), "123456789012");
         assert_eq!(truncate_hash("abcdefghijklmnop"), "abcdefghijkl");
+    }
+
+    // ========================================================================
+    // WorkerError tests
+    // ========================================================================
+
+    #[test]
+    fn test_worker_error_from_exit_code_permanent() {
+        // Exit code 1 = permanent error
+        let err = WorkerError::from_exit_code(1, "Invalid syntax");
+        assert!(err.is_permanent());
+        assert!(!err.is_transient());
+        assert!(err.to_string().contains("Invalid syntax"));
+    }
+
+    #[test]
+    fn test_worker_error_from_exit_code_transient() {
+        // Exit code 2 = transient error
+        let err = WorkerError::from_exit_code(2, "Network timeout");
+        assert!(err.is_transient());
+        assert!(!err.is_permanent());
+        assert!(err.to_string().contains("Network timeout"));
+    }
+
+    #[test]
+    fn test_worker_error_from_exit_code_other() {
+        // Other exit codes default to transient (conservative)
+        let err = WorkerError::from_exit_code(137, "");
+        assert!(err.is_transient());
+        assert!(err.to_string().contains("137"));
+    }
+
+    #[test]
+    fn test_worker_error_from_signal() {
+        let err = WorkerError::from_signal("SIGKILL");
+        assert!(err.is_transient());
+        assert!(err.to_string().contains("signal"));
+    }
+
+    #[test]
+    fn test_worker_error_from_exit_code_truncates_long_stderr() {
+        // Long stderr should be truncated
+        let long_stderr = "x".repeat(1000);
+        let err = WorkerError::from_exit_code(1, &long_stderr);
+        assert!(err.to_string().len() < 700); // Should be truncated + some overhead
+        assert!(err.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn test_worker_error_variants() {
+        let permanent = WorkerError::Permanent {
+            message: "test".to_string(),
+        };
+        let transient = WorkerError::Transient {
+            message: "test".to_string(),
+        };
+
+        assert!(permanent.is_permanent());
+        assert!(!permanent.is_transient());
+        assert!(transient.is_transient());
+        assert!(!transient.is_permanent());
     }
 }

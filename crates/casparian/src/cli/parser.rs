@@ -97,6 +97,19 @@ pub enum ParserAction {
         #[arg(long)]
         json: bool,
     },
+    /// Resume a paused parser (reset circuit breaker)
+    Resume {
+        /// Parser name to resume
+        name: String,
+    },
+    /// Show health statistics for a parser
+    Health {
+        /// Parser name
+        name: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ============================================================================
@@ -216,6 +229,8 @@ async fn run_async(action: ParserAction) -> anyhow::Result<()> {
         ParserAction::Register { path, output, json } => {
             cmd_register(&path, output.as_deref(), json).await
         }
+        ParserAction::Resume { name } => cmd_resume(&name).await,
+        ParserAction::Health { name, json } => cmd_health(&name, json).await,
     }
 }
 
@@ -1161,6 +1176,169 @@ async fn cmd_register(
         println!("Next steps:");
         println!("  1. Subscribe to topics: casparian parser subscribe {} --topic <topic>", bundle.name);
         println!("  2. Backfill files: casparian backfill {}", bundle.name);
+    }
+
+    Ok(())
+}
+
+/// Resume a paused parser (reset circuit breaker)
+async fn cmd_resume(name: &str) -> anyhow::Result<()> {
+    let pool = connect_db().await?;
+
+    // Check if cf_parser_health table exists
+    let table_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='cf_parser_health'"
+    )
+    .fetch_optional(&pool)
+    .await?;
+
+    if table_exists.is_none() {
+        return Err(HelpfulError::new("Parser health table not found")
+            .with_context("No circuit breaker data exists yet")
+            .with_suggestion("TRY: Run some jobs first to generate health data")
+            .into());
+    }
+
+    // Check if parser exists in health table
+    let health: Option<(i32, Option<String>)> = sqlx::query_as(
+        "SELECT consecutive_failures, paused_at FROM cf_parser_health WHERE parser_name = ?"
+    )
+    .bind(name)
+    .fetch_optional(&pool)
+    .await?;
+
+    match health {
+        Some((failures, paused_at)) => {
+            if paused_at.is_none() && failures == 0 {
+                println!("Parser '{}' is already healthy (not paused)", name);
+                return Ok(());
+            }
+
+            // Reset the circuit breaker
+            sqlx::query(
+                "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0, updated_at = datetime('now') WHERE parser_name = ?"
+            )
+            .bind(name)
+            .execute(&pool)
+            .await?;
+
+            println!("Parser '{}' resumed", name);
+            println!("  - Circuit breaker reset");
+            println!("  - Consecutive failures cleared");
+            println!();
+            println!("The parser will now accept new jobs.");
+        }
+        None => {
+            return Err(HelpfulError::new(format!("No health data for parser: {}", name))
+                .with_context("This parser has never been executed")
+                .with_suggestions([
+                    "TRY: casparian jobs create --parser <name> --input <file>".to_string(),
+                    "TRY: casparian parser ls  (list all parsers)".to_string(),
+                ])
+                .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Show health statistics for a parser
+async fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
+    let pool = connect_db().await?;
+
+    // Check if cf_parser_health table exists
+    let table_exists: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='cf_parser_health'"
+    )
+    .fetch_optional(&pool)
+    .await?;
+
+    if table_exists.is_none() {
+        return Err(HelpfulError::new("Parser health table not found")
+            .with_context("No circuit breaker data exists yet")
+            .with_suggestion("TRY: Run some jobs first to generate health data")
+            .into());
+    }
+
+    // Get parser health data
+    let health: Option<(String, i64, i64, i32, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT parser_name, total_executions, successful_executions, consecutive_failures,
+               last_failure_reason, paused_at
+        FROM cf_parser_health
+        WHERE parser_name = ?
+        "#
+    )
+    .bind(name)
+    .fetch_optional(&pool)
+    .await?;
+
+    match health {
+        Some((parser_name, total, success, failures, last_error, paused_at)) => {
+            let success_rate = if total > 0 {
+                (success as f64 / total as f64) * 100.0
+            } else {
+                100.0
+            };
+
+            if json_output {
+                let result = serde_json::json!({
+                    "parser_name": parser_name,
+                    "total_executions": total,
+                    "successful_executions": success,
+                    "consecutive_failures": failures,
+                    "success_rate": success_rate,
+                    "last_failure_reason": last_error,
+                    "paused": paused_at.is_some(),
+                    "paused_at": paused_at,
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+
+            println!("Parser Health: {}", parser_name);
+            println!("========================================");
+            println!();
+            println!("Execution Stats:");
+            println!("  Total:       {}", total);
+            println!("  Successful:  {}", success);
+            println!("  Failed:      {}", total - success);
+            println!("  Success Rate: {:.1}%", success_rate);
+            println!();
+            println!("Circuit Breaker:");
+            println!("  Consecutive Failures: {}", failures);
+            if let Some(paused) = paused_at {
+                println!("  Status:               PAUSED (tripped at {})", paused);
+                println!();
+                println!("To resume this parser:");
+                println!("  casparian parser resume {}", parser_name);
+            } else if failures > 0 {
+                println!("  Status:               WARNING ({}/5 failures)", failures);
+            } else {
+                println!("  Status:               HEALTHY");
+            }
+
+            if let Some(error) = last_error {
+                println!();
+                println!("Last Failure Reason:");
+                // Truncate long error messages
+                let error_display = if error.len() > 200 {
+                    format!("{}...", &error[..200])
+                } else {
+                    error
+                };
+                println!("  {}", error_display);
+            }
+        }
+        None => {
+            return Err(HelpfulError::new(format!("No health data for parser: {}", name))
+                .with_context("This parser has never been executed")
+                .with_suggestions([
+                    "TRY: casparian jobs create --parser <name> --input <file>".to_string(),
+                    "TRY: casparian parser ls  (list all parsers)".to_string(),
+                ])
+                .into());
+        }
     }
 
     Ok(())
