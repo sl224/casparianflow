@@ -40,6 +40,18 @@ pub fn venvs_dir() -> PathBuf {
     casparian_home().join("venvs")
 }
 
+/// Get parsers directory: ~/.casparian_flow/parsers
+pub fn parsers_dir() -> PathBuf {
+    casparian_home().join("parsers")
+}
+
+/// Ensure parsers directory exists and return its path
+pub fn ensure_parsers_dir() -> std::io::Result<PathBuf> {
+    let dir = parsers_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Arguments for the config command
 #[derive(Debug, clap::Args)]
 pub struct ConfigArgs {
@@ -54,6 +66,7 @@ pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
     let db = default_db_path();
     let output = output_dir();
     let venvs = venvs_dir();
+    let parsers = parsers_dir();
 
     if args.json {
         let config = serde_json::json!({
@@ -69,6 +82,10 @@ pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
             "venvs": {
                 "path": venvs.to_string_lossy(),
                 "exists": venvs.exists(),
+            },
+            "parsers": {
+                "path": parsers.to_string_lossy(),
+                "exists": parsers.exists(),
             },
         });
         println!("{}", serde_json::to_string_pretty(&config)?);
@@ -86,6 +103,9 @@ pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
         println!();
         println!("Venvs:    {}", venvs.display());
         println!("          exists: {}", if venvs.exists() { "yes" } else { "no" });
+        println!();
+        println!("Parsers:  {}", parsers.display());
+        println!("          exists: {}", if parsers.exists() { "yes" } else { "no" });
     }
 
     Ok(())

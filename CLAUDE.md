@@ -218,6 +218,11 @@ casparian-flow/
 ├── CLAUDE.md                 # YOU ARE HERE
 ├── ARCHITECTURE.md           # Detailed system design
 ├── README.md                 # Quick start
+├── spec.md                   # Master product specification
+│
+├── specs/                    # Component subspecs (see below)
+│   ├── discover.md           # Discover mode TUI spec
+│   └── parser_bench.md       # Parser Bench mode TUI spec
 │
 ├── crates/                   # Rust core
 │   ├── casparian/            # Unified binary (CLI + TUI)
@@ -261,6 +266,43 @@ casparian-flow/
 │
 └── demo/                     # Example files and plugins
 ```
+
+### Specification Organization (Subspecs)
+
+Complex components have detailed specifications in `specs/` subdirectory. This keeps `spec.md` readable while providing comprehensive documentation for implementation.
+
+**Pattern:**
+- **`spec.md`**: Master specification with high-level summaries
+- **`specs/*.md`**: Detailed subspecs for complex components
+
+**Bidirectional References:**
+```
+spec.md                          specs/discover.md
+─────────                        ─────────────────
+#### Mode: Discover              # Discover Mode - TUI Subspec
+> Full Specification:
+> See specs/discover.md    ◄────► Parent: spec.md Section 5.3
+```
+
+**Subspec Structure:**
+| Section | Purpose |
+|---------|---------|
+| Header | Status, Parent reference, Version |
+| Overview | Philosophy, core entities |
+| User Workflows | Step-by-step user journeys |
+| Layout Specification | ASCII diagrams, component descriptions |
+| State Machine | State transitions, definitions |
+| Data Model | Rust struct definitions |
+| Keybindings | Key → action tables by context |
+| Implementation Phases | Checkbox task lists |
+| Decisions Made | Decision → choice → rationale |
+| Revision History | Date → version → changes |
+
+**When to Create a Subspec:**
+- TUI mode with complex state machine
+- Component with >50 lines of specification
+- Feature requiring detailed layout diagrams
+- Anything with multiple implementation phases
 
 ---
 

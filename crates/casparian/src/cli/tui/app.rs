@@ -16,11 +16,11 @@ use super::TuiArgs;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TuiMode {
     #[default]
-    Home,     // Home hub with 4 cards
-    Discover, // File discovery and tagging
-    Process,  // Parser execution
-    Inspect,  // Output inspection
-    Jobs,     // Job queue management
+    Home,        // Home hub with 4 cards
+    Discover,    // File discovery and tagging
+    ParserBench, // Parser development workbench
+    Inspect,     // Output inspection
+    Jobs,        // Job queue management
 }
 
 /// Statistics shown on home hub cards
@@ -149,6 +149,157 @@ pub struct HomeState {
     pub selected_card: usize,
     /// Statistics displayed on cards
     pub stats: HomeStats,
+}
+
+// =============================================================================
+// Parser Bench Types
+// =============================================================================
+
+/// State for Parser Bench mode (parser development workbench)
+#[derive(Debug, Clone, Default)]
+pub struct ParserBenchState {
+    /// View mode within Parser Bench
+    pub view: ParserBenchView,
+    /// Whether right panel is fullscreen (focus mode)
+    pub focus_mode: bool,
+    /// List of parsers from ~/.casparian_flow/parsers/
+    pub parsers: Vec<ParserInfo>,
+    /// Currently selected parser index
+    pub selected_parser: usize,
+    /// Whether parsers have been loaded
+    pub parsers_loaded: bool,
+    /// Quick test path (for testing arbitrary files)
+    pub quick_test_path: Option<std::path::PathBuf>,
+    /// Files matched to selected parser via topics
+    pub bound_files: Vec<BoundFileInfo>,
+    /// Currently selected bound file index
+    pub selected_file: usize,
+    /// Test result from last run
+    pub test_result: Option<ParserTestResult>,
+    /// Whether a test is currently running
+    pub test_running: bool,
+    /// Last file used for testing (for re-run)
+    pub last_test_file: Option<std::path::PathBuf>,
+    /// Filter text for parser list
+    pub filter: String,
+    /// Whether filter input is active
+    pub is_filtering: bool,
+}
+
+/// View modes within Parser Bench
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParserBenchView {
+    #[default]
+    ParserList,
+    FilePicker,
+    FilesView,
+    ResultView,
+}
+
+/// Parser information discovered from parsers directory
+#[derive(Debug, Clone)]
+pub struct ParserInfo {
+    /// Full path to the parser file
+    pub path: std::path::PathBuf,
+    /// Parser name (from metadata or filename)
+    pub name: String,
+    /// Parser version (from metadata)
+    pub version: Option<String>,
+    /// Topics the parser subscribes to
+    pub topics: Vec<String>,
+    /// Last modified time
+    pub modified: DateTime<Local>,
+    /// Parser health status
+    pub health: ParserHealth,
+    /// Whether this is a symlink
+    pub is_symlink: bool,
+    /// Whether the symlink is broken (target doesn't exist)
+    pub symlink_broken: bool,
+}
+
+/// Parser health state
+#[derive(Debug, Clone, Default)]
+pub enum ParserHealth {
+    /// Parser is working well
+    Healthy {
+        success_rate: f64,
+        total_runs: usize,
+    },
+    /// Parser has some failures
+    Warning {
+        consecutive_failures: u32,
+    },
+    /// Circuit breaker tripped
+    Paused {
+        reason: String,
+    },
+    /// Never run / unknown
+    #[default]
+    Unknown,
+    /// Symlink target doesn't exist
+    BrokenLink,
+}
+
+impl ParserHealth {
+    /// Get display symbol for this health state
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            ParserHealth::Healthy { .. } => "●",
+            ParserHealth::Warning { .. } => "⚠",
+            ParserHealth::Paused { .. } => "⏸",
+            ParserHealth::Unknown => "○",
+            ParserHealth::BrokenLink => "✗",
+        }
+    }
+}
+
+/// File bound to a parser via topic matching
+#[derive(Debug, Clone)]
+pub struct BoundFileInfo {
+    pub path: std::path::PathBuf,
+    pub size: u64,
+    pub status: BoundFileStatus,
+}
+
+/// Processing status of a bound file
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoundFileStatus {
+    #[default]
+    Pending,
+    Processed,
+    Failed,
+}
+
+impl BoundFileStatus {
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            BoundFileStatus::Pending => "○",
+            BoundFileStatus::Processed => "✓",
+            BoundFileStatus::Failed => "✗",
+        }
+    }
+}
+
+/// Result from running a parser test
+#[derive(Debug, Clone)]
+pub struct ParserTestResult {
+    pub success: bool,
+    pub rows_processed: usize,
+    pub execution_time_ms: u64,
+    pub schema: Option<Vec<SchemaColumn>>,
+    pub preview_rows: Vec<Vec<String>>,
+    pub headers: Vec<String>,
+    pub errors: Vec<String>,
+    pub suggestions: Vec<String>,
+    pub error_type: Option<String>,
+    pub truncated: bool,
+}
+
+/// Schema column info from parser test
+#[derive(Debug, Clone)]
+pub struct SchemaColumn {
+    pub name: String,
+    pub dtype: String,
 }
 
 /// Focus areas for input handling
@@ -597,6 +748,8 @@ pub struct App {
     pub home: HomeState,
     /// Discover mode state
     pub discover: DiscoverState,
+    /// Parser Bench mode state
+    pub parser_bench: ParserBenchState,
     /// Chat state
     pub chat: ChatState,
     /// Inspect mode state
@@ -651,6 +804,7 @@ impl App {
             focus: AppFocus::Main,
             home: HomeState::default(),
             discover: DiscoverState::default(),
+            parser_bench: ParserBenchState::default(),
             chat: ChatState::default(),
             inspect: InspectState::default(),
             jobs_state: JobsState::default(),
@@ -677,6 +831,7 @@ impl App {
             focus: AppFocus::Main,
             home: HomeState::default(),
             discover: DiscoverState::default(),
+            parser_bench: ParserBenchState::default(),
             chat: ChatState::default(),
             inspect: InspectState::default(),
             jobs_state: JobsState::default(),
@@ -702,9 +857,9 @@ impl App {
                 self.mode = TuiMode::Discover;
                 return;
             }
-            // Alt+P: Switch to Process mode
+            // Alt+P: Switch to Parser Bench mode
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.mode = TuiMode::Process;
+                self.mode = TuiMode::ParserBench;
                 return;
             }
             // Alt+I: Switch to Inspect mode
@@ -782,10 +937,7 @@ impl App {
         match self.mode {
             TuiMode::Home => self.handle_home_key(key),
             TuiMode::Discover => self.handle_discover_key(key),
-            TuiMode::Process => {
-                // Placeholder mode - just show placeholder screen
-                // No additional key handling for now
-            }
+            TuiMode::ParserBench => self.handle_parser_bench_key(key),
             TuiMode::Inspect => self.handle_inspect_key(key),
             TuiMode::Jobs => self.handle_jobs_key(key),
         }
@@ -1970,7 +2122,7 @@ impl App {
             KeyCode::Enter => {
                 self.mode = match self.home.selected_card {
                     0 => TuiMode::Discover,
-                    1 => TuiMode::Process,
+                    1 => TuiMode::ParserBench,
                     2 => TuiMode::Inspect,
                     3 => TuiMode::Jobs,
                     _ => TuiMode::Home,
@@ -1981,7 +2133,7 @@ impl App {
                 self.mode = TuiMode::Discover;
             }
             KeyCode::Char('2') => {
-                self.mode = TuiMode::Process;
+                self.mode = TuiMode::ParserBench;
             }
             KeyCode::Char('3') => {
                 self.mode = TuiMode::Inspect;
@@ -2516,6 +2668,480 @@ impl App {
         }
 
         // TODO: Poll job status, refresh metrics
+
+        // Load parsers if in ParserBench mode
+        if self.mode == TuiMode::ParserBench && !self.parser_bench.parsers_loaded {
+            self.load_parsers();
+        }
+    }
+
+    // =========================================================================
+    // Parser Bench Methods
+    // =========================================================================
+
+    /// Python script for extracting parser metadata via AST (no execution).
+    /// This is embedded as a const to avoid external file dependencies.
+    /// Supports batch mode: reads JSON array of paths from stdin, outputs JSON object keyed by path.
+    const METADATA_EXTRACTOR_SCRIPT: &'static str = r#"
+import ast
+import json
+import sys
+import os
+
+def extract_metadata(path):
+    """Extract parser metadata via AST parsing (no execution)."""
+    try:
+        source = open(path).read()
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return {"error": f"Syntax error: {e}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+    result = {
+        "name": None,
+        "version": None,
+        "topics": [],
+        "has_transform": False,
+        "has_parse": False,
+    }
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                # Class attributes (name = 'value')
+                if isinstance(item, ast.Assign):
+                    for target in item.targets:
+                        if isinstance(target, ast.Name):
+                            try:
+                                value = ast.literal_eval(item.value)
+                                if target.id == "name":
+                                    result["name"] = value
+                                elif target.id == "version":
+                                    result["version"] = value
+                                elif target.id == "topics":
+                                    result["topics"] = value if isinstance(value, list) else [value]
+                            except:
+                                pass
+                # Methods
+                elif isinstance(item, ast.FunctionDef):
+                    if item.name == "transform":
+                        result["has_transform"] = True
+                    elif item.name == "parse":
+                        result["has_parse"] = True
+
+        # Also check for module-level parse() function
+        elif isinstance(node, ast.FunctionDef) and node.name == "parse":
+            result["has_parse"] = True
+
+    # Fallback: use filename if no name attribute
+    if result["name"] is None:
+        result["name"] = os.path.splitext(os.path.basename(path))[0]
+
+    return result
+
+if __name__ == "__main__":
+    # Batch mode: read JSON array of paths from stdin
+    paths = json.load(sys.stdin)
+    results = {}
+    for path in paths:
+        results[path] = extract_metadata(path)
+    print(json.dumps(results))
+"#;
+
+    /// Maximum number of parser files to process in a single Python subprocess.
+    /// Prevents command line overflow and keeps memory usage reasonable.
+    const METADATA_BATCH_SIZE: usize = 50;
+
+    /// Extract metadata from multiple Python parser files in a single subprocess.
+    /// Returns a map from path string to (name, version, topics).
+    /// Uses stdin to pass paths as JSON array, avoiding command line length limits.
+    fn extract_parser_metadata_batch(
+        paths: &[std::path::PathBuf],
+    ) -> std::collections::HashMap<String, (String, Option<String>, Vec<String>)> {
+        use std::collections::HashMap;
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut results = HashMap::new();
+
+        if paths.is_empty() {
+            return results;
+        }
+
+        // Convert paths to strings for JSON
+        let path_strings: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.to_str().map(|s| s.to_string()))
+            .collect();
+
+        let json_input = match serde_json::to_string(&path_strings) {
+            Ok(j) => j,
+            Err(_) => {
+                // Fallback: return defaults for all paths
+                for path in paths {
+                    let fallback_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if let Some(path_str) = path.to_str() {
+                        results.insert(path_str.to_string(), (fallback_name, None, vec![]));
+                    }
+                }
+                return results;
+            }
+        };
+
+        // Try python3, then python
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(Self::METADATA_EXTRACTOR_SCRIPT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+
+        if child.is_err() {
+            child = Command::new("python")
+                .arg("-c")
+                .arg(Self::METADATA_EXTRACTOR_SCRIPT)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(_) => {
+                // Python not available, return defaults
+                for path in paths {
+                    let fallback_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if let Some(path_str) = path.to_str() {
+                        results.insert(path_str.to_string(), (fallback_name, None, vec![]));
+                    }
+                }
+                return results;
+            }
+        };
+
+        // Write JSON input to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(json_input.as_bytes());
+        }
+
+        // Read output
+        let output = match child.wait_with_output() {
+            Ok(o) => o,
+            Err(_) => {
+                for path in paths {
+                    let fallback_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    if let Some(path_str) = path.to_str() {
+                        results.insert(path_str.to_string(), (fallback_name, None, vec![]));
+                    }
+                }
+                return results;
+            }
+        };
+
+        if !output.status.success() {
+            for path in paths {
+                let fallback_name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                if let Some(path_str) = path.to_str() {
+                    results.insert(path_str.to_string(), (fallback_name, None, vec![]));
+                }
+            }
+            return results;
+        }
+
+        // Parse JSON output: {"path": {"name": ..., "version": ..., "topics": [...]}, ...}
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
+
+        match parsed {
+            Ok(json) => {
+                if let Some(obj) = json.as_object() {
+                    for (path_str, metadata) in obj {
+                        let fallback_name = std::path::Path::new(path_str)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        let name = metadata
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| fallback_name.clone());
+
+                        let version = metadata
+                            .get("version")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+
+                        let topics = metadata
+                            .get("topics")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        results.insert(path_str.clone(), (name, version, topics));
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+
+        // Fill in any missing paths with defaults
+        for path in paths {
+            if let Some(path_str) = path.to_str() {
+                results.entry(path_str.to_string()).or_insert_with(|| {
+                    let fallback_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    (fallback_name, None, vec![])
+                });
+            }
+        }
+
+        results
+    }
+
+    /// Load parsers from the parsers directory
+    fn load_parsers(&mut self) {
+        use std::fs;
+
+        let parsers_dir = crate::cli::config::parsers_dir();
+
+        // Ensure directory exists
+        if let Err(_) = fs::create_dir_all(&parsers_dir) {
+            self.parser_bench.parsers_loaded = true;
+            return;
+        }
+
+        // First pass: collect all .py files with their filesystem metadata
+        struct ParserEntry {
+            path: std::path::PathBuf,
+            is_symlink: bool,
+            symlink_broken: bool,
+            modified: DateTime<Local>,
+        }
+
+        let mut entries_to_process: Vec<ParserEntry> = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(&parsers_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                // Only process .py files
+                if path.extension().and_then(|e| e.to_str()) != Some("py") {
+                    continue;
+                }
+
+                // Check if it's a symlink and if it's broken
+                let metadata = fs::symlink_metadata(&path);
+                let (is_symlink, symlink_broken) = match metadata {
+                    Ok(m) => {
+                        let is_symlink = m.file_type().is_symlink();
+                        let symlink_broken = if is_symlink {
+                            !path.exists() // Symlink exists but target doesn't
+                        } else {
+                            false
+                        };
+                        (is_symlink, symlink_broken)
+                    }
+                    Err(_) => (false, false),
+                };
+
+                // Get modification time
+                let modified = if symlink_broken {
+                    // Can't get metadata from broken symlink
+                    Local::now()
+                } else {
+                    fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .map(DateTime::<Local>::from)
+                        .unwrap_or_else(Local::now)
+                };
+
+                entries_to_process.push(ParserEntry {
+                    path,
+                    is_symlink,
+                    symlink_broken,
+                    modified,
+                });
+            }
+        }
+
+        // Collect paths that need metadata extraction (non-broken files)
+        let paths_for_metadata: Vec<std::path::PathBuf> = entries_to_process
+            .iter()
+            .filter(|e| !e.symlink_broken)
+            .map(|e| e.path.clone())
+            .collect();
+
+        // Extract metadata in batches to avoid spawning too many Python processes
+        let mut all_metadata = std::collections::HashMap::new();
+        for chunk in paths_for_metadata.chunks(Self::METADATA_BATCH_SIZE) {
+            let batch_results = Self::extract_parser_metadata_batch(chunk);
+            all_metadata.extend(batch_results);
+        }
+
+        // Build ParserInfo structs
+        let mut parsers = Vec::new();
+        for entry in entries_to_process {
+            let (name, version, topics) = if entry.symlink_broken {
+                // Broken symlink: use fallback name
+                let fallback_name = entry
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                (fallback_name, None, vec![])
+            } else {
+                // Look up from batch results
+                entry
+                    .path
+                    .to_str()
+                    .and_then(|path_str| all_metadata.get(path_str).cloned())
+                    .unwrap_or_else(|| {
+                        let fallback_name = entry
+                            .path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        (fallback_name, None, vec![])
+                    })
+            };
+
+            // Set health based on symlink status
+            let health = if entry.symlink_broken {
+                ParserHealth::BrokenLink
+            } else {
+                ParserHealth::Unknown
+            };
+
+            parsers.push(ParserInfo {
+                path: entry.path,
+                name,
+                version,
+                topics,
+                modified: entry.modified,
+                health,
+                is_symlink: entry.is_symlink,
+                symlink_broken: entry.symlink_broken,
+            });
+        }
+
+        // Sort by name
+        parsers.sort_by(|a, b| a.name.cmp(&b.name));
+
+        self.parser_bench.parsers = parsers;
+        self.parser_bench.parsers_loaded = true;
+    }
+
+    /// Handle Parser Bench mode keys
+    fn handle_parser_bench_key(&mut self, key: KeyEvent) {
+        match self.parser_bench.view {
+            ParserBenchView::ParserList => {
+                match key.code {
+                    // Navigation
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if !self.parser_bench.parsers.is_empty() {
+                            self.parser_bench.selected_parser =
+                                (self.parser_bench.selected_parser + 1) % self.parser_bench.parsers.len();
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if !self.parser_bench.parsers.is_empty() {
+                            if self.parser_bench.selected_parser == 0 {
+                                self.parser_bench.selected_parser = self.parser_bench.parsers.len() - 1;
+                            } else {
+                                self.parser_bench.selected_parser -= 1;
+                            }
+                        }
+                    }
+                    // Test parser
+                    KeyCode::Char('t') | KeyCode::Enter => {
+                        // TODO: Start test flow
+                    }
+                    // Quick test
+                    KeyCode::Char('n') => {
+                        // TODO: Open file picker for quick test
+                    }
+                    // Refresh
+                    KeyCode::Char('r') => {
+                        self.parser_bench.parsers_loaded = false;
+                    }
+                    // Delete broken symlink
+                    KeyCode::Char('d') => {
+                        if !self.parser_bench.parsers.is_empty() {
+                            let parser = &self.parser_bench.parsers[self.parser_bench.selected_parser];
+                            if parser.symlink_broken {
+                                // Remove the broken symlink
+                                let _ = std::fs::remove_file(&parser.path);
+                                self.parser_bench.parsers_loaded = false; // Trigger reload
+                            }
+                        }
+                    }
+                    // Clear test result
+                    KeyCode::Esc => {
+                        if self.parser_bench.test_result.is_some() {
+                            self.parser_bench.test_result = None;
+                        } else {
+                            self.mode = TuiMode::Home;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ParserBenchView::ResultView => {
+                match key.code {
+                    // Re-run test
+                    KeyCode::Char('r') => {
+                        // TODO: Re-run last test
+                    }
+                    // Different file
+                    KeyCode::Char('f') => {
+                        self.parser_bench.view = ParserBenchView::ParserList;
+                        self.parser_bench.test_result = None;
+                    }
+                    // Back to list
+                    KeyCode::Esc => {
+                        self.parser_bench.view = ParserBenchView::ParserList;
+                        self.parser_bench.test_result = None;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                if key.code == KeyCode::Esc {
+                    self.parser_bench.view = ParserBenchView::ParserList;
+                }
+            }
+        }
     }
 }
 
@@ -2543,12 +3169,12 @@ mod tests {
         });
         assert!(matches!(app.mode, TuiMode::Discover));
 
-        // Alt+P should switch to Process
+        // Alt+P should switch to Parser Bench
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT))
                 .await;
         });
-        assert!(matches!(app.mode, TuiMode::Process));
+        assert!(matches!(app.mode, TuiMode::ParserBench));
 
         // Esc should return to Home
         tokio::runtime::Runtime::new().unwrap().block_on(async {

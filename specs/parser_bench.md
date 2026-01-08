@@ -8,271 +8,450 @@
 
 ## 1. Overview
 
-The **Parser Bench** (formerly "Process") is the TUI mode for parser development, testing, and monitoring. Unlike Discover (file organization) or Jobs (queue management), Parser Bench focuses on the **parser-centric view** of the data pipeline.
+The **Parser Bench** (formerly "Process") is the TUI mode for parser development, testing, and monitoring. It provides a workbench for iterating on parsers with immediate feedback.
 
 ### 1.1 Design Philosophy
 
-- **Parser is the protagonist**: All views center around parsers, not files
-- **Test-driven development**: Encourage rapid iteration with immediate feedback
-- **Zero-friction dry runs**: Test any .py file against any data file with minimal setup
-- **Progressive disclosure**: Start simple (parser list), drill into details on demand
+- **Filesystem-first**: Parsers live in a standard directory (`~/.casparian_flow/parsers/`)
+- **Zero ceremony**: Drop a file in the directory, it appears in the list
+- **Symlinks for development**: Symlink from your project for live editing
+- **Test-driven iteration**: Run, see results, edit in IDE, re-run
 
-### 1.2 Name Rationale
+### 1.2 Parsers Directory
 
-"Parser Bench" evokes:
-- A **workbench** where you test and refine tools
-- A **test bench** from electronics (probe, measure, iterate)
-- Clear distinction from "Process" (which sounds like batch execution)
+```
+~/.casparian_flow/
+├── parsers/                    # <-- Parser plugins directory
+│   ├── sales_parser.py         # User copies or symlinks here
+│   ├── invoice_parser.py       # Flat structure only
+│   └── log_analyzer.py         # No subdirectories
+├── casparian_flow.sqlite3
+└── output/
+```
+
+**Rules**:
+- Only `.py` files directly in `parsers/` are discovered
+- No subdirectories (flat structure)
+- Symlinks are fully supported (encouraged for development)
+- Broken symlinks shown with error state (user can delete)
+- User manages files manually (cp, ln -s, mv, rm)
 
 ---
 
 ## 2. User Workflows
 
-### 2.1 Primary Workflow: Quick Test (Any Parser File)
-
-The core workflow allows testing ANY .py parser file, not just registered parsers.
+### 2.1 Primary Workflow: Test a Parser
 
 ```
-1. User enters Parser Bench (Alt+P)
-2. User presses 'n' for new/quick test
-3. System shows recent parser files OR file picker
-4. User selects parser .py file (or browses to new one)
-5. System shows compatible files (smart sampling: failed files first)
-6. User selects data file or accepts suggested sample
-7. User presses Enter to execute test
-8. Results display inline: schema, preview rows, errors with suggestions
-9. User iterates (edit parser in IDE, press 'r' to re-run)
+1. User copies/symlinks parser to ~/.casparian_flow/parsers/
+2. User enters Parser Bench (Alt+P)
+3. Parser appears in list automatically
+4. User selects parser, presses 't' to test
+5. System shows compatible files (smart sampling: failed first)
+6. User selects data file
+7. Results display: schema, preview rows, errors with suggestions
+8. User edits parser in IDE, presses 'r' to re-run
 ```
 
-### 2.2 Secondary Workflow: Test Registered Parser
+### 2.2 Quick Test (Arbitrary File)
+
+For one-off testing without adding to parsers directory:
 
 ```
-1. User sees list of registered parsers with health badges
-2. User selects a parser (j/k navigation)
-3. User presses 't' to enter test mode
-4. System shows bound files (smart sampling: high-failure first)
-5. User selects sample file or accepts suggestion
-6. User presses Enter to execute dry run
-7. Results display inline
+1. User presses 'n' for new/quick test
+2. File picker opens
+3. User navigates to any .py file
+4. User selects data file
+5. Results display
+6. (Optional) "Add to parsers directory?" prompt on success
 ```
 
-### 2.3 Tertiary Workflow: Monitor Parser Health
+### 2.3 Monitor Parser Health
 
 ```
-1. User sees parser list with health indicators
-2. Red indicator on paused/unhealthy parsers
-3. User selects unhealthy parser
-4. Detail pane shows: consecutive failures, last error, success rate
-5. User presses 'R' to resume paused parser
+1. Parser list shows health badges (●/⚠/⏸/✗)
+2. User sees paused parser (circuit breaker tripped)
+3. User presses 'R' to resume
 ```
 
 ### 2.4 Background Backtest
 
 ```
-1. User selects a registered parser
-2. User presses 'b' to start backtest
-3. Progress bar displays in right panel
-4. User can press Esc to send to background and continue working
-5. Progress visible in Jobs mode
+1. User selects parser, presses 'b'
+2. Progress bar displays
+3. User presses Esc to background and continue working
+4. Results visible in Jobs mode
+```
+
+### 2.5 File Watcher Mode (Optional)
+
+```
+1. User presses 'w' to enable watch mode on selected parser
+2. "Watching..." indicator appears
+3. User edits parser in IDE, saves
+4. TUI auto-detects save, re-runs last test
+5. Results update automatically
+6. Press 'w' again to disable
 ```
 
 ---
 
-## 3. Layout Specification
+## 3. Parser Metadata Discovery
 
-### 3.1 Three-Panel Design
+**CRITICAL IMPLEMENTATION NOTE**: Metadata extraction MUST happen via Python subprocess, NOT Rust AST parsing. The TUI is Rust; you cannot `import ast` in Rust.
 
+### 3.1 Parser Class Format
+
+```python
+class SalesParser:
+    name = 'sales_parser'           # Required: logical name
+    version = '1.0.0'               # Required: semver
+    topics = ['sales_data']         # Required: subscribed topics
+
+    def transform(self, df):
+        # ... transformation logic
+        return df
+```
+
+### 3.2 Metadata Extraction (Batch Processing)
+
+**CRITICAL**: Metadata extraction uses **batch processing** to avoid spawning one Python subprocess per file. The TUI collects all parser paths, then processes them in chunks of 50.
+
+**Implementation**: Embedded Python script in `app.rs` as `METADATA_EXTRACTOR_SCRIPT`. The script reads a JSON array of paths from stdin and outputs a JSON object keyed by path.
+
+```python
+#!/usr/bin/env python3
+"""Extract parser metadata via AST parsing (no execution).
+Batch mode: reads JSON array of paths from stdin."""
+import ast
+import json
+import sys
+import os
+
+def extract_metadata(path: str) -> dict:
+    try:
+        source = open(path).read()
+        tree = ast.parse(source)
+    except Exception as e:
+        return {"error": str(e)}
+
+    result = {
+        "name": None,
+        "version": None,
+        "topics": [],
+        "has_transform": False,
+        "has_parse": False,
+    }
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                # Class attributes
+                if isinstance(item, ast.Assign):
+                    for target in item.targets:
+                        if isinstance(target, ast.Name):
+                            try:
+                                value = ast.literal_eval(item.value)
+                                if target.id == "name":
+                                    result["name"] = value
+                                elif target.id == "version":
+                                    result["version"] = value
+                                elif target.id == "topics":
+                                    result["topics"] = value if isinstance(value, list) else [value]
+                            except:
+                                pass
+                # Methods
+                elif isinstance(item, ast.FunctionDef):
+                    if item.name == "transform":
+                        result["has_transform"] = True
+                    elif item.name == "parse":
+                        result["has_parse"] = True
+
+    # Fallback: use filename if no name attribute
+    if result["name"] is None:
+        result["name"] = os.path.splitext(os.path.basename(path))[0]
+
+    return result
+
+if __name__ == "__main__":
+    # Batch mode: read JSON array of paths from stdin
+    paths = json.load(sys.stdin)
+    results = {}
+    for path in paths:
+        results[path] = extract_metadata(path)
+    print(json.dumps(results))
+```
+
+**Rust Integration** (in `app.rs`):
+
+```rust
+const METADATA_BATCH_SIZE: usize = 50;
+
+fn extract_parser_metadata_batch(
+    paths: &[PathBuf],
+) -> HashMap<String, (String, Option<String>, Vec<String>)> {
+    // Spawn python3 (fallback to python)
+    // Write JSON array of paths to stdin
+    // Read JSON object from stdout
+    // Parse: {"path": {"name": ..., "version": ..., "topics": [...]}, ...}
+}
+
+fn load_parsers(&mut self) {
+    // 1. Scan directory, collect paths + filesystem metadata
+    // 2. Filter out broken symlinks (they get fallback name)
+    // 3. Process in chunks of METADATA_BATCH_SIZE
+    for chunk in paths.chunks(METADATA_BATCH_SIZE) {
+        let batch_results = Self::extract_parser_metadata_batch(chunk);
+        all_metadata.extend(batch_results);
+    }
+    // 4. Build ParserInfo structs
+}
+```
+
+**Benefits**:
+- 222 parsers = 5 subprocess calls (not 222)
+- Uses stdin/stdout to avoid command line length limits
+- Graceful fallback if any batch fails
+
+### 3.3 Fallback Behavior
+
+If metadata extraction fails or returns partial data:
+- **name**: Use filename without extension
+- **version**: Display as "—" (unknown)
+- **topics**: Empty list (manual file selection only)
+
+---
+
+## 4. Preview Mode Safety
+
+**CRITICAL**: Prevent OOM on large files by limiting rows read.
+
+### 4.1 Protocol Extension
+
+```rust
+// In casparian_protocol/src/types.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewRequest {
+    pub parser_path: String,
+    pub data_path: String,
+    pub row_limit: usize,  // CRITICAL: limits pd.read_csv(nrows=...)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewResult {
+    pub success: bool,
+    pub rows_processed: usize,
+    pub execution_time_ms: u64,
+    pub schema: Vec<SchemaColumn>,
+    pub preview_rows: Vec<Vec<String>>,
+    pub headers: Vec<String>,
+    pub errors: Vec<String>,
+    pub error_type: Option<String>,
+    pub suggestions: Vec<String>,
+    pub truncated: bool,  // True if row_limit was hit
+}
+```
+
+### 4.2 Python Implementation
+
+The wrapper script in `run_parser_test` MUST pass `nrows`:
+
+```python
+# CRITICAL: Limit rows to prevent OOM
+ROW_LIMIT = {row_limit}
+
+if USE_POLARS:
+    if input_path.endswith('.csv'):
+        df = pl.read_csv(input_path, n_rows=ROW_LIMIT)
+    # ... etc
+else:
+    if input_path.endswith('.csv'):
+        df = pd.read_csv(input_path, nrows=ROW_LIMIT)
+    # ... etc
+
+# Track if we truncated
+truncated = len(df) >= ROW_LIMIT
+```
+
+### 4.3 Default Limits
+
+| Context | Row Limit | Rationale |
+|---------|-----------|-----------|
+| Quick test (TUI) | 1,000 | Fast feedback, low memory |
+| Backtest preview | 100 | Just checking schema |
+| CLI `parser test` | 10,000 | More thorough but bounded |
+| Full run | Unlimited | Production execution |
+
+---
+
+## 5. Layout Specification
+
+### 5.1 Two-Panel Design with Focus Mode
+
+Normal mode:
 ```
 ┌───────────────────────────────────────────────────────────────────────────────┐
-│  PARSER BENCH                                                      [Alt+P]    │
+│  PARSER BENCH                                             [w] watching  Alt+P │
 ├────────────────────┬──────────────────────────────────────────────────────────┤
-│  PARSERS           │  DETAIL / TEST RESULTS                                   │
-│  ────────          │  ──────────────────────                                  │
-│  RECENT            │  sales_parser v1.0.2                                     │
-│  ► my_parser.py    │  ───────────────────────────────────────                 │
-│    invoice.py      │  Topics: [sales_data, invoices]                          │
-│                    │  Files:  142 matched, 138 processed                      │
-│  REGISTERED        │  Health: ● HEALTHY (98.5% success)                       │
-│  ● sales_parser    │                                                          │
-│  ○ invoice_parser  │  SCHEMA (6 columns)                                      │
-│  ⏸ log_analyzer    │  ─────────────────────────────────────────               │
-│                    │  │ Column       │ Type     │ Nullable │                  │
-│  ────────          │  ├──────────────┼──────────┼──────────┤                  │
-│  [n] New test      │  │ id           │ Int64    │ No       │                  │
-│  [t] Test          │  │ customer     │ String   │ Yes      │                  │
-│  [f] Files         │  │ amount       │ Float64  │ No       │                  │
-│  [b] Backtest      │  │ date         │ Date     │ No       │                  │
-│  [R] Resume        │  └──────────────┴──────────┴──────────┘                  │
+│  PARSERS           │  sales_parser v1.0.0                                     │
+│  ~/.../parsers/    │  ───────────────────────────────────────                 │
+│  ────────────────  │  File:    ~/.casparian_flow/parsers/sales_parser.py     │
+│  ► sales_parser    │  Topics:  sales_data, invoices                          │
+│    invoice_parser  │  Modified: 2 hours ago                                   │
+│  ● log_analyzer    │  Health:  ● HEALTHY (142 runs, 98.5%)                   │
+│  ⏸ csv_cleaner     │                                                          │
+│  ✗ broken_link.py  │  BOUND FILES (12 matched)                                │
+│                    │  ─────────────────────────────────────────               │
+│                    │  data/sales/jan.csv         2.1KB  ✓ processed          │
+│                    │  data/sales/feb.csv         1.8KB  ○ pending            │
+│  ────────────────  │  data/invoices/inv_001.csv  3.2KB  ✗ failed             │
+│  [n] Quick test    │                                                          │
+│  [t] Test parser   │  [Enter] Test with selected file                         │
+│  [w] Watch mode    │                                                          │
+│  [z] Focus mode    │                                                          │
 └────────────────────┴──────────────────────────────────────────────────────────┘
-│  [n] New test  [j/k] Navigate  [t] Test  [f] Files  [b] Backtest  [Esc] Home  │
+```
+
+Focus mode (`z` pressed - right panel fullscreen):
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│  PARSER BENCH > sales_parser                              [z] exit focus Alt+P│
+├───────────────────────────────────────────────────────────────────────────────┤
+│  TEST RESULT                                                                  │
+│  ───────────────────────────────────────                                      │
+│  ✗ FAILED                                              12ms   SCHEMA_MISMATCH │
+│                                                                               │
+│  ERROR                                                                        │
+│  ─────                                                                        │
+│  KeyError: 'customer_id'                                                      │
+│                                                                               │
+│  File "sales_parser.py", line 12, in transform                                │
+│    return df[['customer_id', 'amount', 'date']]                               │
+│               ^^^^^^^^^^^^^^                                                  │
+│                                                                               │
+│  SUGGESTIONS                                                                  │
+│  ───────────                                                                  │
+│  • Column 'customer_id' not found in data                                     │
+│  • Available columns: id, cust_id, amount, date, status                       │
+│  • Did you mean 'cust_id'?                                                    │
+│                                                                               │
+├───────────────────────────────────────────────────────────────────────────────┤
+│  [r] Re-run  [f] Different file  [a] Analyze with AI  [z] Exit focus  [Esc]  │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Panel Descriptions
+### 5.2 Parser States
 
-#### Left Panel: Parser List (Two Sections)
+| Icon | State | Description |
+|------|-------|-------------|
+| `►` | Selected | Currently highlighted |
+| `●` | Healthy | Green, success rate > 90% |
+| `○` | Unknown | Gray, never run |
+| `⚠` | Warning | Yellow, consecutive failures |
+| `⏸` | Paused | Red, circuit breaker tripped |
+| `✗` | Broken | Red, broken symlink |
 
-**Recent Section**:
-- Recently tested parser files (not necessarily registered)
-- Stored in local state file (`~/.casparian_flow/recent_parsers.json`)
-- Maximum 5 entries, LRU eviction
-- Shows filename only (hover/select for full path)
+### 5.3 Test Result Views
 
-**Registered Section**:
-- All parsers from `parser_lab_parsers` + `cf_parsers`
-- Columns: Name, Version, Topics (collapsed), Health badge
-- Health Icons:
-  - `●` = Healthy (green)
-  - `○` = Pending validation (yellow)
-  - `⚠` = Warning - consecutive failures (orange)
-  - `⏸` = Paused - circuit breaker tripped (red)
+**Success View**:
+```
+┌─ TEST RESULT ─────────────────────────────────────────────────────────────────┐
+│                                                                               │
+│  ✓ PASSED                                              45ms    1,234 rows    │
+│  (showing first 1,000 rows - file has more)                                  │
+│                                                                               │
+├─ SCHEMA (6 columns) ──────────────────────────────────────────────────────────┤
+│  id: Int64  customer: String  amount: Float64  date: Date  status: String    │
+│                                                                               │
+├─ PREVIEW (first 5 rows) ──────────────────────────────────────────────────────┤
+│  │ id │ customer  │ amount  │ date       │ status  │                         │
+│  ├────┼───────────┼─────────┼────────────┼─────────┤                         │
+│  │ 1  │ Acme Inc  │ 1500.00 │ 2024-01-15 │ pending │                         │
+│  │ 2  │ Beta LLC  │  750.50 │ 2024-01-16 │ shipped │                         │
+│  │ 3  │ Gamma Co  │ 2100.00 │ 2024-01-17 │ pending │                         │
+│                                                                               │
+├───────────────────────────────────────────────────────────────────────────────┤
+│  [r] Re-run  [f] Different file  [Esc] Back                                   │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
 
-#### Right Panel: Detail View (Context-Dependent)
+**Failure View with AI Analyze Option** (Phase 6):
+```
+├───────────────────────────────────────────────────────────────────────────────┤
+│  [r] Re-run  [f] Different file  [a] Analyze with AI  [Esc] Back             │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
 
-**Parser Info View (default when parser selected)**:
-- Parser name and version
-- Subscribed topics (comma-separated)
-- File statistics: matched / processed / failed
-- Health status with success rate
-- Schema preview (if available)
-
-**Test Results View (after running test)**:
-- Success/Failure status with icon
-- Execution time
-- Rows processed
-- Schema (columns with types)
-- Output preview (first 5 rows as table)
-- On failure: error message + suggestions
-
-**File Picker View (when selecting data file)**:
-- Smart sampling: show failed files first, then random
-- Filter by path substring
-- File info: path, size, status
-
-### 3.3 Quick Actions Bar (Bottom)
-
-Context-sensitive keyboard shortcuts:
-- Always: `[n] New test  [Esc] Home  [?] Help`
-- Parser selected: `[t] Test  [f] Files  [b] Backtest`
-- Paused parser: `[R] Resume`
+When `[a]` pressed, sends to Claude Code sidebar:
+- Parser source code
+- Error traceback
+- First 5 lines of input data
 
 ---
 
-## 4. State Machine
-
-```
-                    ┌───────────────────┐
-                    │                   │
-     ┌─────────────►│   PARSER_LIST     │◄─────────────┐
-     │              │    (default)      │              │
-     │              │                   │              │
-     │              └─────────┬─────────┘              │
-     │                        │                        │
-     │    ┌───────────────────┼───────────────────┐    │
-     │    │         │         │         │         │    │
-     │    ▼         ▼         ▼         ▼         ▼    │
-     │ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐   │
-     │ │PARSER│ │ FILE │ │ TEST │ │FILES │ │BACK- │   │
-Esc  │ │PICKER│ │PICKER│ │ MODE │ │ VIEW │ │ TEST │   │ Esc
-     │ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘ └──┬───┘   │
-     │    │        │        │        │        │       │
-     │    │ select │ select │ Enter  │ Enter  │ Esc   │
-     │    ▼        ▼        ▼        ▼        ▼       │
-     │ ┌──────────────────────────────────────────┐   │
-     │ │              TEST_RUNNING                │   │
-     └─│          (async, can background)         │───┘
-       └──────────────────────────────────────────┘
-```
-
-### 4.1 State Definitions
-
-| State | Entry | Description | Exit |
-|-------|-------|-------------|------|
-| `PARSER_LIST` | Default, Esc from any | Show recent + registered parsers | n, t, f, b, Enter |
-| `PARSER_PICKER` | 'n' from list | Browse for .py file | Select or Esc |
-| `FILE_PICKER` | After parser selected | Choose data file for test | Select or Esc |
-| `TEST_MODE` | 't' on registered parser | View bound files, select for test | Enter or Esc |
-| `FILES_VIEW` | 'f' on registered parser | Browse all bound files | Enter (dry run) or Esc |
-| `BACKTEST` | 'b' on registered parser | Progress view, can background | Esc (backgrounds it) |
-| `TEST_RUNNING` | Enter on file | Async execution | Completes or Ctrl+C |
-
----
-
-## 5. Data Model
-
-### 5.1 ParserBenchState
+## 6. Data Model
 
 ```rust
 pub struct ParserBenchState {
     // View mode
     pub view: ParserBenchView,
+    pub focus_mode: bool,  // Right panel fullscreen
 
-    // Parser lists
-    pub recent_parsers: Vec<RecentParser>,
-    pub registered_parsers: Vec<RegisteredParser>,
-    pub selected_index: usize,
-    pub in_recent_section: bool,  // true = navigating recent, false = registered
+    // Parser list (from ~/.casparian_flow/parsers/)
+    pub parsers: Vec<ParserInfo>,
+    pub selected_parser: usize,
+    pub parsers_loaded: bool,
 
-    // File picker state
+    // Quick test state (for arbitrary files)
+    pub quick_test_path: Option<PathBuf>,
+
+    // File picker
     pub picker_files: Vec<FileInfo>,
     pub picker_selected: usize,
     pub picker_filter: String,
 
     // Test state
-    pub current_parser: Option<ParserSelection>,
-    pub current_data_file: Option<PathBuf>,
-    pub test_result: Option<TestResult>,
     pub test_running: bool,
+    pub test_result: Option<TestResult>,
+    pub last_test_file: Option<PathBuf>,  // For re-run
 
-    // Backtest state
+    // Watch mode
+    pub watch_enabled: bool,
+    pub watcher: Option<notify::RecommendedWatcher>,
+
+    // Backtest
     pub backtest: Option<BacktestProgress>,
-
-    // Loaded flags
-    pub data_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum ParserBenchView {
     ParserList,
-    ParserPicker,
+    QuickTestPicker,
     FilePicker,
-    TestMode,
     FilesView,
     Backtest,
+    ResultView,
 }
 
 #[derive(Debug, Clone)]
-pub struct RecentParser {
+pub struct ParserInfo {
     pub path: PathBuf,
-    pub name: String,  // filename without extension
-    pub last_used: DateTime<Local>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RegisteredParser {
-    pub id: String,
-    pub name: String,
+    pub name: String,               // From metadata or filename
     pub version: Option<String>,
     pub topics: Vec<String>,
+    pub modified: DateTime<Local>,
     pub health: ParserHealth,
-    pub file_count: usize,
-    pub processed_count: usize,
-    pub failed_count: usize,
-    pub schema: Option<Vec<SchemaColumn>>,
+    pub is_symlink: bool,
+    pub symlink_broken: bool,       // NEW: broken symlink detection
 }
 
 #[derive(Debug, Clone)]
 pub enum ParserHealth {
-    Healthy { success_rate: f64 },
-    Warning { consecutive_failures: u32, threshold: u32 },
-    Paused { reason: String, paused_at: DateTime<Local> },
-    Pending,  // Not yet validated
-}
-
-#[derive(Debug, Clone)]
-pub enum ParserSelection {
-    Recent(PathBuf),
-    Registered { name: String, source_code: String },
+    Healthy { success_rate: f64, total_runs: usize },
+    Warning { consecutive_failures: u32 },
+    Paused { reason: String },
+    Unknown,
+    BrokenLink,  // NEW: for broken symlinks
 }
 
 #[derive(Debug, Clone)]
@@ -285,104 +464,131 @@ pub struct TestResult {
     pub headers: Vec<String>,
     pub errors: Vec<String>,
     pub suggestions: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BacktestProgress {
-    pub parser_name: String,
-    pub total_files: usize,
-    pub processed: usize,
-    pub passed: usize,
-    pub failed: usize,
-    pub current_file: Option<String>,
-    pub started_at: DateTime<Local>,
-    pub is_background: bool,
+    pub error_type: Option<String>,
+    pub truncated: bool,  // NEW: row limit was hit
 }
 ```
 
 ---
 
-## 6. Keybindings
+## 7. Keybindings
 
-### 6.1 Parser List View
+### 7.1 Parser List View
 
 | Key | Action |
 |-----|--------|
 | `j` / `↓` | Move down |
 | `k` / `↑` | Move up |
-| `Tab` | Toggle between Recent and Registered sections |
-| `n` | New quick test (open parser picker) |
-| `t` | Test selected parser |
-| `f` | View files bound to parser (registered only) |
-| `b` | Start backtest (registered only) |
+| `n` | Quick test (pick any .py file) |
+| `t` / `Enter` | Test selected parser |
+| `f` | View files bound to parser |
+| `b` | Start backtest |
 | `R` | Resume paused parser |
-| `Enter` | Quick action: test if recent, details if registered |
-| `/` | Filter parsers by name |
+| `w` | Toggle watch mode |
+| `z` | Toggle focus mode |
+| `/` | Filter by name |
+| `d` | Delete broken symlink |
 | `Esc` | Return to Home |
-| `?` | Show help overlay |
+| `?` | Help overlay |
 
-### 6.2 Parser Picker (File Browser)
-
-| Key | Action |
-|-----|--------|
-| `j/k` | Navigate files |
-| `Enter` | Select .py file |
-| `/` | Filter by path |
-| `Tab` | Toggle hidden files |
-| `Esc` | Cancel, back to list |
-
-### 6.3 File Picker (Data File Selection)
+### 7.2 Result View
 
 | Key | Action |
 |-----|--------|
-| `j/k` | Navigate files |
-| `Enter` | Select file and run test |
-| `/` | Filter by path |
-| `1-4` | Filter by status (all/pending/processed/failed) |
-| `Esc` | Cancel, back to list |
+| `r` | Re-run test |
+| `f` | Pick different file |
+| `a` | Analyze with AI (Phase 6) |
+| `z` | Toggle focus mode |
+| `Esc` | Back to list |
 
-### 6.4 Test Running / Results View
-
-| Key | Action |
-|-----|--------|
-| `r` | Re-run test with same files |
-| `f` | Pick different data file |
-| `Esc` | Back to parser list |
-
-### 6.5 Backtest Progress
+### 7.3 Watch Mode Active
 
 | Key | Action |
 |-----|--------|
-| `Esc` | Send to background, return to list |
-| `Ctrl+C` | Cancel backtest |
+| `w` | Disable watch mode |
+| (auto) | Re-run on file save |
 
 ---
 
-## 7. Smart Sampling Algorithm
+## 8. File Watcher Implementation
 
-When selecting sample files for testing, prioritize in this order:
+Use `notify` crate with debouncing:
 
 ```rust
-fn smart_sample_files(files: &[FileInfo], limit: usize) -> Vec<&FileInfo> {
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, Config};
+use std::time::Duration;
+
+fn setup_watcher(parser_path: &Path, tx: Sender<()>) -> Result<RecommendedWatcher> {
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            if let Ok(event) = res {
+                // Debounce: only trigger on actual content changes
+                if event.kind.is_modify() {
+                    let _ = tx.send(());
+                }
+            }
+        },
+        Config::default()
+            .with_poll_interval(Duration::from_millis(500))
+    )?;
+
+    watcher.watch(parser_path, RecursiveMode::NonRecursive)?;
+    Ok(watcher)
+}
+```
+
+**Debounce Logic**: Editors often write multiple times on save. Use 200ms debounce.
+
+---
+
+## 9. Broken Symlink Detection
+
+```rust
+fn detect_symlink_status(path: &Path) -> (bool, bool) {
+    let is_symlink = path.symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+
+    let is_broken = if is_symlink {
+        !path.exists()  // Symlink exists but target doesn't
+    } else {
+        false
+    };
+
+    (is_symlink, is_broken)
+}
+```
+
+---
+
+## 10. Smart Sampling
+
+When selecting files for testing, prioritize:
+
+```rust
+fn smart_sample(files: &[FileInfo], limit: usize) -> Vec<&FileInfo> {
     let mut result = Vec::new();
 
-    // 1. Files that failed in previous runs (high-failure tracking)
+    // 1. Previously failed files (50%)
     let failed: Vec<_> = files.iter()
-        .filter(|f| f.status == "failed")
+        .filter(|f| f.status == FileStatus::Failed)
+        .take(limit / 2)
         .collect();
-    result.extend(failed.iter().take(limit / 2));
+    result.extend(failed);
 
-    // 2. Files never processed
+    // 2. Never processed (25%)
     let pending: Vec<_> = files.iter()
-        .filter(|f| f.status == "pending")
+        .filter(|f| f.status == FileStatus::Pending)
+        .take(limit / 4)
         .collect();
-    result.extend(pending.iter().take(limit / 4));
+    result.extend(pending);
 
-    // 3. Random sample from processed (sanity check)
+    // 3. Random from processed (25%)
     let processed: Vec<_> = files.iter()
-        .filter(|f| f.status == "processed")
+        .filter(|f| f.status == FileStatus::Processed)
+        .take(limit / 4)
         .collect();
-    result.extend(processed.iter().take(limit / 4));
+    result.extend(processed);
 
     result.truncate(limit);
     result
@@ -391,222 +597,119 @@ fn smart_sample_files(files: &[FileInfo], limit: usize) -> Vec<&FileInfo> {
 
 ---
 
-## 8. UI Components
-
-### 8.1 Health Badge (Inline in List)
-
-```
-● sales_parser v1.2  [sales] 98%     <- Healthy, green
-⚠ invoice_parser     [inv]   3/5     <- Warning, 3 consecutive failures
-⏸ log_analyzer       [logs]  PAUSED  <- Circuit breaker tripped, red
-○ csv_cleaner        [csv]   --      <- Pending validation, gray
-```
-
-### 8.2 Test Result: Success
-
-```
-┌─ TEST RESULT ─────────────────────────────────────────────────┐
-│                                                               │
-│  ✓ PASSED                                    45ms  1,234 rows │
-│                                                               │
-├─ SCHEMA (6 columns) ──────────────────────────────────────────┤
-│  id: Int64  customer: String  amount: Float64  date: Date     │
-│  status: String  _cf_source_hash: String                      │
-├─ PREVIEW ─────────────────────────────────────────────────────┤
-│  │ id │ customer  │ amount  │ date       │ status  │          │
-│  ├────┼───────────┼─────────┼────────────┼─────────┤          │
-│  │ 1  │ Acme Inc  │ 1500.00 │ 2024-01-15 │ pending │          │
-│  │ 2  │ Beta LLC  │  750.50 │ 2024-01-16 │ shipped │          │
-│  │ 3  │ Gamma Co  │ 2100.00 │ 2024-01-17 │ pending │          │
-├───────────────────────────────────────────────────────────────┤
-│  [r] Re-run  [f] Different file  [Esc] Back                   │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### 8.3 Test Result: Failure
-
-```
-┌─ TEST RESULT ─────────────────────────────────────────────────┐
-│                                                               │
-│  ✗ FAILED                                   12ms  SCHEMA_MISMATCH
-│                                                               │
-├─ ERROR ───────────────────────────────────────────────────────┤
-│  KeyError: 'customer_id'                                      │
-│                                                               │
-│  File "my_parser.py", line 12, in transform                   │
-│    return df[['customer_id', 'amount', 'date']]               │
-│           ~~~^^^^^^^^^^^^^^^                                  │
-├─ SUGGESTIONS ─────────────────────────────────────────────────┤
-│  • Column 'customer_id' not found in data                     │
-│  • Available columns: id, cust_id, amount, date, status       │
-│  • Did you mean 'cust_id'?                                    │
-├───────────────────────────────────────────────────────────────┤
-│  [r] Re-run  [f] Different file  [Esc] Back                   │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### 8.4 Backtest Progress
-
-```
-┌─ BACKTEST: sales_parser ──────────────────────────────────────┐
-│                                                               │
-│  [████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 52/142 (36.6%)   │
-│                                                               │
-│  Passed: 48    Failed: 4    ETA: ~45s                        │
-│                                                               │
-│  Current: data/invoices/inv_2024_052.csv                      │
-│                                                               │
-├───────────────────────────────────────────────────────────────┤
-│  [Esc] Run in background   [Ctrl+C] Cancel                    │
-└───────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 9. Recent Parsers Storage
-
-Recent parsers are stored locally for quick access:
-
-**File**: `~/.casparian_flow/recent_parsers.json`
-
-```json
-{
-  "version": 1,
-  "parsers": [
-    {
-      "path": "/Users/dev/parsers/my_parser.py",
-      "last_used": "2026-01-07T10:30:00Z"
-    },
-    {
-      "path": "/Users/dev/project/invoice_parser.py",
-      "last_used": "2026-01-06T15:45:00Z"
-    }
-  ]
-}
-```
-
-**Rules**:
-- Maximum 5 entries (configurable)
-- LRU eviction when full
-- Entries removed if file no longer exists (checked on load)
-- Updated when test is run (not just selected)
-
----
-
-## 10. Integration with Existing Code
-
-### 10.1 Reuse `run_parser_test`
-
-The existing `run_parser_test` function in `cli/parser.rs` provides exactly what we need:
-
-```rust
-// From parser.rs - already handles:
-// - Python subprocess execution
-// - Schema inference
-// - Preview row extraction
-// - Error classification (SCHEMA_MISMATCH, etc.)
-// - Structured error codes
-fn run_parser_test(
-    parser_path: &PathBuf,
-    input_path: &PathBuf,
-    preview_rows: usize,
-) -> Result<(bool, usize, Option<Vec<SchemaColumn>>, Vec<Vec<String>>, Vec<String>, Vec<String>, Option<String>)>
-```
-
-### 10.2 Reuse Parser Health Queries
-
-```rust
-// From parser.rs cmd_health - query pattern:
-let health: Option<(String, i64, i64, i32, Option<String>, Option<String>)> = sqlx::query_as(
-    r#"
-    SELECT parser_name, total_executions, successful_executions, consecutive_failures,
-           last_failure_reason, paused_at
-    FROM cf_parser_health
-    WHERE parser_name = ?
-    "#
-)
-.bind(name)
-.fetch_optional(&pool)
-.await?;
-```
-
-### 10.3 Reuse Backtest Logic
-
-Trigger CLI backtest in background and poll for progress:
-
-```rust
-// Spawn backtest as background process
-let child = Command::new("casparian")
-    .args(["parser", "backtest", &parser_name, "--json"])
-    .stdout(Stdio::piped())
-    .spawn()?;
-
-// Track in BacktestProgress, poll stdout for JSON progress updates
-```
-
----
-
 ## 11. Implementation Phases
 
-### Phase 1: Core Structure
-- [ ] Add `ParserBenchState` to `app.rs`
-- [ ] Add `ParserBenchView` enum
-- [ ] Stub out `draw_parser_bench_screen` in `ui.rs`
-- [ ] Basic navigation between views
+### Phase 1: Core Structure ✓
+- [x] Add `ParserBenchState` to `app.rs`
+- [x] Scan `~/.casparian_flow/parsers/` for .py files
+- [x] Detect broken symlinks
+- [x] Render parser list with states
 
-### Phase 2: Parser List
-- [ ] Load registered parsers from DB
-- [ ] Load recent parsers from JSON file
-- [ ] Render two-section list with health badges
-- [ ] Tab to switch sections
-- [ ] j/k navigation, Enter selection
+### Phase 2: Metadata Extraction ✓
+- [x] Embed metadata extraction Python script in `app.rs`
+- [x] **Batch processing**: Process up to 50 files per subprocess
+- [x] Call from Rust via subprocess with stdin/stdout
+- [x] Parse JSON response for name/version/topics
+- [x] Fallback to filename
 
-### Phase 3: Quick Test Flow
-- [ ] Parser picker (simple file browser for .py)
-- [ ] File picker (data file selection with smart sampling)
-- [ ] Integration with `run_parser_test`
-- [ ] Results display (success/failure)
-- [ ] Re-run functionality (`r` key)
-- [ ] Update recent parsers on successful test
+### Phase 3: Test Flow with Safety
+- [ ] Add `row_limit` parameter to test execution
+- [ ] Modify `run_parser_test` to pass `nrows` to Python
+- [ ] File picker with smart sampling
+- [ ] Results display with truncation indicator
 
-### Phase 4: Registered Parser Features
-- [ ] Test mode for registered parsers
-- [ ] Files view (bound files with status filter)
-- [ ] Resume paused parser (`R` key)
+### Phase 4: Focus Mode
+- [ ] `z` key toggles right panel fullscreen
+- [ ] Hide left panel when focused
+- [ ] Preserve keybindings in focus mode
 
-### Phase 5: Backtest
-- [ ] Backtest trigger
-- [ ] Progress view with progress bar
-- [ ] Background mode (Esc to continue working)
-- [ ] Integration with Jobs mode for tracking
+### Phase 5: Watch Mode
+- [ ] Integrate `notify` crate
+- [ ] Watch selected parser file
+- [ ] Debounce file changes (200ms)
+- [ ] Auto re-run on change
 
-### Phase 6: Polish
+### Phase 6: AI Integration
+- [ ] `[a]` key in result view
+- [ ] Build context: parser code + error + data sample
+- [ ] Send to Claude Code sidebar
+- [ ] Stream response
+
+### Phase 7: Polish
 - [ ] Filter/search (`/` key)
 - [ ] Help overlay (`?` key)
-- [ ] Error suggestions (column name matching, etc.)
-- [ ] Keyboard shortcuts in footer
+- [ ] Delete broken symlinks (`d` key)
+- [ ] Error suggestions
+
+### Future (v2)
+- [ ] Tabbed result view (Preview / Schema / Logs / Raw)
+- [ ] Diff view for regression testing
+- [ ] Syntax highlighting in error traces
 
 ---
 
 ## 12. Decisions Made
 
-Based on requirements gathering:
-
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Sample file selection | Smart sampling | Prioritize failed files first for faster iteration |
-| Parser input | Recent files + picker | Balance convenience with flexibility |
-| Test flow | Quick test any .py file | Zero friction for development workflow |
-| List columns | Name + Version + Topics + Health | Complete picture without clutter |
-| Backtest mode | Background with progress | User can continue working |
-| Result diff | No diff (v1) | Keep simple, show latest result only |
-| Error actions | Show + suggestions | IDE is for editing, TUI for running |
+| Parser location | `~/.casparian_flow/parsers/` | Standard, predictable |
+| Directory structure | Flat only | Simpler, no nesting |
+| Metadata extraction | Embedded Python script | Can't do AST in Rust |
+| Metadata batching | 50 files per subprocess | Avoid spawning N processes |
+| Row limit default | 1,000 | Prevent OOM, fast feedback |
+| Watch mode | Opt-in with `w` | Some users find auto-run annoying |
+| Focus mode | `z` key | Standard vim-like toggle |
+| AI analyze | Phase 6 | Infrastructure exists (claude_code.rs) |
+| Broken symlinks | Show with ✗, allow delete | Clear error state |
 
 ---
 
-## 13. Revision History
+## 13. Protocol Additions
+
+Add to `crates/casparian_protocol/src/types.rs`:
+
+> **Note**: `GetMetadataRequest`/`ParserMetadata` are NOT needed - metadata extraction
+> is handled by embedded Python script in `app.rs` with batch processing (see Section 3.2).
+
+```rust
+/// Preview request with row limit
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewRequest {
+    pub parser_path: String,
+    pub data_path: String,
+    pub row_limit: usize,
+}
+
+/// Preview response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewResult {
+    pub success: bool,
+    pub rows_processed: usize,
+    pub execution_time_ms: u64,
+    pub schema: Vec<SchemaColumn>,
+    pub preview_rows: Vec<Vec<String>>,
+    pub headers: Vec<String>,
+    pub errors: Vec<String>,
+    pub error_type: Option<String>,
+    pub suggestions: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaColumn {
+    pub name: String,
+    pub dtype: String,
+}
+```
+
+---
+
+## 14. Revision History
 
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-01-07 | 0.1 | Initial draft |
-| 2026-01-07 | 0.2 | Incorporated decisions: quick test flow, smart sampling, recent files list, background backtest |
+| 2026-01-07 | 0.2 | Quick test flow, smart sampling |
+| 2026-01-08 | 0.3 | Plugins directory approach |
+| 2026-01-08 | 0.4 | Critical fixes from review: row limits, Python AST extraction, broken symlinks, watch mode, focus mode, AI analyze |
+| 2026-01-08 | 0.5 | Phase 1 & 2 implemented; batch metadata extraction (50 files/subprocess); removed GetMetadataRequest protocol types |

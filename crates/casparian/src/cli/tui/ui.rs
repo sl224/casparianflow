@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::cli::output::format_number;
-use super::app::{App, DiscoverFocus, JobStatus, MessageRole, TuiMode};
+use super::app::{App, DiscoverFocus, JobStatus, MessageRole, ParserBenchView, ParserHealth, TuiMode};
 
 // ============================================================================
 // Helper Functions for Truncation
@@ -93,7 +93,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
         TuiMode::Home => draw_home_screen(frame, app, main_area),
         TuiMode::Discover => draw_discover_screen(frame, app, main_area),
-        TuiMode::Process => draw_placeholder_screen(frame, main_area, "Process", "Run parsers on discovered files", "Alt+P"),
+        TuiMode::ParserBench => draw_parser_bench_screen(frame, app, main_area),
         TuiMode::Inspect => draw_inspect_screen(frame, app, main_area),
         TuiMode::Jobs => draw_jobs_screen(frame, app, main_area),
     }
@@ -1001,11 +1001,320 @@ fn draw_placeholder_screen(frame: &mut Frame, area: Rect, title: &str, descripti
     frame.render_widget(content_widget, chunks[1]);
 
     // Footer
-    let footer = Paragraph::new(" [Esc/Alt+H] Home  [Alt+D] Discover  [Alt+P] Process  [Alt+I] Inspect  [Alt+J] Jobs ")
+    let footer = Paragraph::new(" [Esc/Alt+H] Home  [Alt+D] Discover  [Alt+P] Parser Bench  [Alt+I] Inspect  [Alt+J] Jobs ")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, chunks[2]);
+}
+
+// =============================================================================
+// Parser Bench Screen
+// =============================================================================
+
+/// Draw the Parser Bench screen - parser development workbench
+fn draw_parser_bench_screen(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(0),     // Content
+            Constraint::Length(3),  // Footer
+        ])
+        .split(area);
+
+    // Title
+    let title = Paragraph::new(" Parser Bench ")
+        .style(Style::default().fg(Color::Cyan).bold())
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(title, chunks[0]);
+
+    // Main content - two-panel layout
+    let content_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(35), // Left panel: parser list
+            Constraint::Percentage(65), // Right panel: details/results
+        ])
+        .split(chunks[1]);
+
+    // Left panel: Parser List
+    draw_parser_list(frame, app, content_chunks[0]);
+
+    // Right panel: Details or results
+    draw_parser_details(frame, app, content_chunks[1]);
+
+    // Footer with keybindings
+    let footer_text = match app.parser_bench.view {
+        ParserBenchView::ParserList => {
+            " [j/k] Navigate  [t] Test  [n] Quick test  [/] Filter  [?] Help  [Esc] Home "
+        }
+        ParserBenchView::ResultView => {
+            " [r] Re-run  [f] Different file  [Esc] Back "
+        }
+        _ => " [Esc] Back ",
+    };
+    let footer = Paragraph::new(footer_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Draw the parser list panel (left side)
+fn draw_parser_list(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::{List, ListItem, ListState};
+
+    let parsers_dir = crate::cli::config::parsers_dir();
+    let title = format!(" Parsers ({}) ", parsers_dir.display());
+
+    if app.parser_bench.parsers.is_empty() {
+        // Show empty state with instructions
+        let parsers_path_line = format!("  {}", parsers_dir.display());
+        let empty_msg = vec![
+            "",
+            "  No parsers found.",
+            "",
+            "  Add parsers to:",
+            &parsers_path_line,
+            "",
+            "  Parsers are .py files with:",
+            "    name = 'my_parser'",
+            "    version = '1.0.0'",
+            "    topics = ['data']",
+            "",
+            "  [n] Quick test any .py file",
+        ];
+        let content = empty_msg.join("\n");
+        let widget = Paragraph::new(content)
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title(title));
+        frame.render_widget(widget, area);
+        return;
+    }
+
+    // Build list items
+    let items: Vec<ListItem> = app
+        .parser_bench
+        .parsers
+        .iter()
+        .enumerate()
+        .map(|(i, parser)| {
+            let symbol = parser.health.symbol();
+            let version = parser.version.as_deref().unwrap_or("—");
+            let name = &parser.name;
+
+            // Format: ● parser_name     v1.0.0
+            let line = format!(
+                " {} {:<20} {}",
+                symbol,
+                truncate_end(name, 20),
+                version
+            );
+
+            let style = if i == app.parser_bench.selected_parser {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else if parser.symlink_broken {
+                Style::default().fg(Color::Red)
+            } else {
+                match &parser.health {
+                    ParserHealth::Healthy { .. } => Style::default().fg(Color::Green),
+                    ParserHealth::Warning { .. } => Style::default().fg(Color::Yellow),
+                    ParserHealth::Paused { .. } => Style::default().fg(Color::Red),
+                    ParserHealth::Unknown => Style::default().fg(Color::Gray),
+                    ParserHealth::BrokenLink => Style::default().fg(Color::Red),
+                }
+            };
+
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+
+    let mut state = ListState::default();
+    state.select(Some(app.parser_bench.selected_parser));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Truncate string at the end if too long
+fn truncate_end(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max_len - 3).collect::<String>())
+    }
+}
+
+/// Draw the details/results panel (right side)
+fn draw_parser_details(frame: &mut Frame, app: &App, area: Rect) {
+    if app.parser_bench.parsers.is_empty() {
+        // No parser selected, show instructions
+        let content = Paragraph::new("\n\n  Select a parser to see details\n\n  or press [n] to quick test any .py file")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title(" Details "));
+        frame.render_widget(content, area);
+        return;
+    }
+
+    let parser = &app.parser_bench.parsers[app.parser_bench.selected_parser];
+
+    // Show test result if available, otherwise show parser details
+    if let Some(ref result) = app.parser_bench.test_result {
+        draw_test_result(frame, result, area);
+    } else {
+        draw_parser_info(frame, parser, &app.parser_bench.bound_files, area);
+    }
+}
+
+/// Draw parser info when no test result is showing
+fn draw_parser_info(frame: &mut Frame, parser: &super::app::ParserInfo, bound_files: &[super::app::BoundFileInfo], area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),  // Parser info
+            Constraint::Min(0),     // Bound files
+        ])
+        .split(area);
+
+    // Parser info section
+    let version = parser.version.as_deref().unwrap_or("—");
+    let topics = if parser.topics.is_empty() {
+        "none".to_string()
+    } else {
+        parser.topics.join(", ")
+    };
+    let health_str = match &parser.health {
+        ParserHealth::Healthy { success_rate, total_runs } => {
+            format!("Healthy ({:.1}%, {} runs)", success_rate * 100.0, total_runs)
+        }
+        ParserHealth::Warning { consecutive_failures } => {
+            format!("Warning ({} failures)", consecutive_failures)
+        }
+        ParserHealth::Paused { reason } => format!("Paused: {}", reason),
+        ParserHealth::Unknown => "Unknown".to_string(),
+        ParserHealth::BrokenLink => "Broken symlink".to_string(),
+    };
+
+    let info_lines = vec![
+        format!("  Name:     {}", parser.name),
+        format!("  Version:  {}", version),
+        format!("  Topics:   {}", topics),
+        format!("  Path:     {}", truncate_path_start(&parser.path.display().to_string(), 50)),
+        format!("  Health:   {} {}", parser.health.symbol(), health_str),
+        format!("  Modified: {}", parser.modified.format("%Y-%m-%d %H:%M")),
+    ];
+
+    let info_widget = Paragraph::new(info_lines.join("\n"))
+        .block(Block::default().borders(Borders::ALL).title(format!(" {} ", parser.name)));
+    frame.render_widget(info_widget, chunks[0]);
+
+    // Bound files section
+    let files_title = format!(" Bound Files ({}) ", bound_files.len());
+    if bound_files.is_empty() {
+        let empty_msg = "\n  No files match this parser's topics.\n\n  Use Discover mode to tag files.";
+        let widget = Paragraph::new(empty_msg)
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title(files_title));
+        frame.render_widget(widget, chunks[1]);
+    } else {
+        use ratatui::widgets::{List, ListItem};
+
+        let items: Vec<ListItem> = bound_files
+            .iter()
+            .take(20) // Limit display
+            .map(|f| {
+                let status_sym = f.status.symbol();
+                let path = truncate_path_start(&f.path.display().to_string(), 40);
+                let size = format_size(f.size);
+                ListItem::new(format!(" {} {} {}", status_sym, path, size))
+            })
+            .collect();
+
+        let list = List::new(items).block(Block::default().borders(Borders::ALL).title(files_title));
+        frame.render_widget(list, chunks[1]);
+    }
+}
+
+/// Draw test result panel
+fn draw_test_result(frame: &mut Frame, result: &super::app::ParserTestResult, area: Rect) {
+    let title = if result.success {
+        format!(" Test Result - PASSED ({} rows, {}ms) ", result.rows_processed, result.execution_time_ms)
+    } else {
+        format!(" Test Result - FAILED ({}ms) ", result.execution_time_ms)
+    };
+
+    let title_style = if result.success {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+
+    if result.success {
+        // Show schema and preview
+        let mut lines = vec![];
+        lines.push(String::new());
+
+        // Schema
+        if let Some(ref schema) = result.schema {
+            lines.push("  SCHEMA".to_string());
+            lines.push("  ------".to_string());
+            for col in schema {
+                lines.push(format!("    {}: {}", col.name, col.dtype));
+            }
+            lines.push(String::new());
+        }
+
+        // Preview rows
+        if !result.preview_rows.is_empty() {
+            lines.push("  PREVIEW".to_string());
+            lines.push("  -------".to_string());
+            // Headers
+            if !result.headers.is_empty() {
+                lines.push(format!("    {}", result.headers.join(" | ")));
+                lines.push(format!("    {}", "-".repeat(50)));
+            }
+            for row in result.preview_rows.iter().take(5) {
+                lines.push(format!("    {}", row.join(" | ")));
+            }
+            if result.truncated {
+                lines.push("    ... (truncated)".to_string());
+            }
+        }
+
+        let widget = Paragraph::new(lines.join("\n"))
+            .block(Block::default().borders(Borders::ALL).title(title).title_style(title_style));
+        frame.render_widget(widget, area);
+    } else {
+        // Show errors
+        let mut lines = vec![];
+        lines.push(String::new());
+
+        if let Some(ref error_type) = result.error_type {
+            lines.push(format!("  Error Type: {}", error_type));
+            lines.push(String::new());
+        }
+
+        lines.push("  ERRORS".to_string());
+        lines.push("  ------".to_string());
+        for err in &result.errors {
+            lines.push(format!("    {}", err));
+        }
+
+        if !result.suggestions.is_empty() {
+            lines.push(String::new());
+            lines.push("  SUGGESTIONS".to_string());
+            lines.push("  -----------".to_string());
+            for sug in &result.suggestions {
+                lines.push(format!("    - {}", sug));
+            }
+        }
+
+        let widget = Paragraph::new(lines.join("\n"))
+            .block(Block::default().borders(Borders::ALL).title(title).title_style(title_style));
+        frame.render_widget(widget, area);
+    }
 }
 
 /// Draw the Inspect mode screen - browse output tables and run queries
@@ -1721,13 +2030,13 @@ mod tests {
 
 
     #[test]
-    fn test_draw_placeholder_modes() {
+    fn test_draw_parser_bench_mode() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Test Process mode placeholder
+        // Test Parser Bench mode
         let mut app = App::new(test_args());
-        app.mode = TuiMode::Process;
+        app.mode = TuiMode::ParserBench;
         terminal.draw(|f| draw(f, &app)).unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -1737,8 +2046,8 @@ mod tests {
             .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        assert!(content.contains("Process"));
-        assert!(content.contains("Coming Soon"));
+        assert!(content.contains("Parser"));
+        assert!(content.contains("Bench"));
     }
 
     #[test]

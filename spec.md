@@ -289,59 +289,31 @@ The landing view is a **card grid with stats** showing the four workflow modes:
 
 **Purpose**: File *organization* - scan, tag, preview. Prepares files for processing.
 
-**Design**: Source-first workflow. Users must select a source before seeing files. This enforces clear data organization and prevents orphan files.
+> **Full Specification**: See [specs/discover.md](specs/discover.md) for complete details.
 
-*   **Layout**: Three-panel design with Tab navigation:
-    ```
-    ┌─────────────────┬────────────────────────────────────────┬─────────────┐
-    │  SOURCES        │           FILES                        │  PREVIEW    │
-    │  ─────────      │           ─────                        │  (toggle p) │
-    │  > sales_data   │  invoices/jan.csv          [sales] 2KB │             │
-    │    logs         │  invoices/feb.csv          [sales] 3KB │  [content]  │
-    │                 │  reports/q1.xlsx                   15KB│             │
-    │  ─────────      │                                        │             │
-    │  RULES          │                                        │             │
-    │  ─────────      │                                        │             │
-    │  *.csv → sales  │                                        │             │
-    │  *.log → logs   │                                        │             │
-    └─────────────────┴────────────────────────────────────────┴─────────────┘
-    ```
-*   **Panel Navigation**: Number keys for direct jump, Tab for flow-forward action.
-    *   `1` = jump to Sources panel
-    *   `2` = jump to Rules panel
-    *   `3` = jump to Files panel
-    *   `Tab` = context action (Sources: select→Files, Rules: filter→Files, Files: toggle preview)
-    *   `Esc` = return to Files panel (home base)
-*   **Source-First Loading**:
-    *   On mode entry, loads sources from `scout_sources` table.
-    *   Files only shown for the selected source (filtered by `source_id`).
-    *   No source selected = empty file list with guidance message.
-*   **Sources Panel** (`1` to focus):
-    *   `j/k` = navigate sources (scrollable)
-    *   `Tab` = select source AND jump to Files (flow forward)
-    *   `Enter` = select source (stay in Sources)
-    *   `n` = create new source (scan dialog)
-    *   `d` = delete source
-*   **Rules Panel** (`2` to focus):
-    *   Shows tagging rules for the selected source (scrollable)
-    *   `j/k` = navigate rules
-    *   `Tab` = apply rule pattern as filter AND jump to Files (flow forward)
-    *   `n` or `R` = create rule from current filter pattern
-    *   `d` = delete rule
-*   **Files Panel** (`3` to focus, default):
-    *   `j/k` or arrows = navigate file list
-    *   `Tab` = toggle preview pane
-    *   `p` = toggle preview pane (alternative)
-    *   `t` = tag selected file (opens tag dialog)
-    *   `T` = bulk tag filtered files
-    *   `/` = enter filter mode (live filter by path substring)
-    *   `s` = scan a new folder (creates source + scans)
-    *   `Enter` = drill into directory OR show file details
-*   **Empty States**:
-    *   No sources: "No sources found. Press 's' to scan a folder."
-    *   Source selected, no files: "No files in this source."
-*   **AI**: Context-aware suggestions via chat sidebar ("These look like invoice files. Tag as 'invoices'?").
-*   **NOT in Discover**: Running parsers (that's Parser Bench mode). Discover organizes; Parser Bench tests and executes.
+**Design**: Source-first workflow with dropdown navigation (telescope.nvim style).
+- Sources and Rules as collapsible, filterable dropdowns
+- Live file preview as you navigate sources/rules
+- Enter confirms selection and moves focus to Files
+
+**Layout**: Three-panel design (Sidebar + Files + Preview).
+
+**Key Features**:
+*   **Dropdown Navigation**: Press `1` for Sources, `2` for Rules - opens filterable dropdown
+*   **Live Preview**: Navigating sources updates file list in real-time
+*   **Immediate Filtering**: Type to filter (no `/` required), including numbers
+*   **Source-First Loading**: Files only shown for selected source
+
+**Core Workflow**:
+1.  Press `1` to open Sources dropdown
+2.  Type to filter, arrows to navigate
+3.  Files update as you move (live preview)
+4.  Press Enter to confirm and focus Files
+5.  Tag files with `t` or bulk tag with `T`
+
+**Connection to Parser Bench**: Files tagged in Discover bind to parsers via topic matching.
+
+**NOT in Discover**: Running parsers (that's Parser Bench mode). Discover organizes; Parser Bench tests and executes.
 
 #### Mode: Parser Bench (Alt+p)
 
@@ -349,23 +321,28 @@ The landing view is a **card grid with stats** showing the four workflow modes:
 
 > **Full Specification**: See [specs/parser_bench.md](specs/parser_bench.md) for complete details.
 
-**Key Features**:
-*   **Quick Test Any Parser**: Test any `.py` file against any data file without registration
-*   **Recent Parsers**: Quick access to recently tested parser files
-*   **Registered Parsers**: View parsers published to the system with health badges
-*   **Smart Sampling**: Prioritize failed files first when selecting test data
-*   **Background Backtest**: Run full backtest while continuing to work
+**Parsers Directory**: `~/.casparian_flow/parsers/`
+- Drop `.py` files here (or symlink from your project)
+- Flat structure only, no subdirectories
+- Metadata (name, version, topics) extracted via AST parsing
 
-**Layout**: Two-section list (Recent + Registered) with detail/results panel.
+**Key Features**:
+*   **Filesystem-first**: Parsers in `parsers/` directory appear automatically
+*   **Symlinks for dev**: Symlink from project for live editing workflow
+*   **Quick Test**: Press `n` to test any `.py` file (not just in parsers dir)
+*   **Smart Sampling**: Prioritize failed files first when selecting test data
+*   **Health Tracking**: Circuit breaker status, success rates
+
+**Layout**: Parser list (left) + Detail/Results panel (right).
 
 **Core Workflow**:
-1.  Press `n` to start new test (or select from recent)
-2.  Pick parser `.py` file
-3.  Select data file (smart sampling suggests failed files first)
-4.  View results: schema, preview rows, errors with suggestions
+1.  Copy/symlink parser to `~/.casparian_flow/parsers/`
+2.  Select parser in list, press `t` to test
+3.  Select data file (failed files shown first)
+4.  View results: schema, preview, errors with suggestions
 5.  Edit in IDE, press `r` to re-run
 
-**Connection to Discover**: Files tagged in Discover appear as test candidates for registered parsers.
+**Connection to Discover**: Files tagged in Discover bind to parsers via topic matching.
 
 #### Mode: Inspect (Alt+i)
 
