@@ -396,9 +396,13 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, chunks[2]);
 
-    // Rules Manager dialog (overlay)
+    // Dialogs (overlays) - render in priority order
     if app.discover.rules_manager_open {
         draw_rules_manager_dialog(frame, app, area);
+    } else if app.discover.is_creating_rule {
+        draw_rule_creation_dialog(frame, app, area);
+    } else if app.discover.show_wizard {
+        draw_wizard_dialog(frame, app, area);
     }
 }
 
@@ -444,18 +448,18 @@ fn get_discover_footer(app: &App, filtered_count: usize) -> (String, Style) {
         DiscoverFocus::Files => {
             if !app.discover.filter.is_empty() {
                 (
-                    format!(" [t] Tag {} files  [R] Rules  [/] Edit  [Esc] Clear  │ 1:Src 2:Tags ", filtered_count),
+                    format!(" [n] New Rule  [t] Tag {} files  [Esc] Clear  │ 1:Source 2:Tags ", filtered_count),
                     Style::default().fg(Color::DarkGray),
                 )
             } else {
-                (" [/] Filter  [t] Tag  [Tab] Preview  [s] Scan  [R] Rules  │ 1:Sources 2:Tags ".to_string(), Style::default().fg(Color::DarkGray))
+                (" [n] New Rule  [/] Filter  [t] Tag  [s] Scan  [R] Rules  │ 1:Source 2:Tags ".to_string(), Style::default().fg(Color::DarkGray))
             }
         }
         DiscoverFocus::Sources => {
-            (" [Enter] Select  [↑↓] Navigate  [Esc] Cancel  │ 2:Tags 3:Files ".to_string(), Style::default().fg(Color::DarkGray))
+            (" [n] New Rule  [Enter] Select  [↑↓] Navigate  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray))
         }
         DiscoverFocus::Tags => {
-            (" [Enter] Select  [↑↓] Navigate  [Esc] All files  │ 1:Sources 3:Files ".to_string(), Style::default().fg(Color::DarkGray))
+            (" [n] New Rule  [Enter] Select  [↑↓] Navigate  [Esc] All files ".to_string(), Style::default().fg(Color::DarkGray))
         }
     }
 }
@@ -563,22 +567,22 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(style)
-            .title(Span::styled(" [1] SOURCE ▲ ", style));
+            .title(Span::styled(" [1] Source ▲ ", style));
         frame.render_widget(block, area);
     } else {
         // Collapsed: show selected source
         let selected_text = if app.discover.sources.is_empty() {
-            "▼ No sources (press 's')".to_string()
+            "No sources (press 's')".to_string()
         } else if let Some(source) = app.discover.sources.get(app.discover.selected_source) {
-            format!("▼ {} ({})", source.name, source.file_count)
+            format!("{} ({})", source.name, source.file_count)
         } else {
-            "▼ Select source".to_string()
+            "Select source...".to_string()
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(style)
-            .title(Span::styled(" [1] ", style));
+            .title(Span::styled(" [1] Source ", style));
 
         let content = Paragraph::new(selected_text)
             .style(if is_focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::Gray) })
@@ -675,26 +679,26 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(style)
-            .title(Span::styled(" [2] TAGS ▲ ", style));
+            .title(Span::styled(" [2] Tags ▲ ", style));
         frame.render_widget(block, area);
     } else {
         // Collapsed: show selected tag or "All files"
         let selected_text = if let Some(tag_idx) = app.discover.selected_tag {
             if let Some(tag) = app.discover.tags.get(tag_idx) {
-                format!("▼ {} ({})", tag.name, tag.count)
+                format!("{} ({})", tag.name, tag.count)
             } else {
-                "▼ All files".to_string()
+                "All files".to_string()
             }
         } else {
             // Get total count from first tag if available
             let count = app.discover.tags.first().map(|t| t.count).unwrap_or(0);
-            format!("▼ All files ({})", count)
+            format!("All files ({})", count)
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(style)
-            .title(Span::styled(" [2] ", style));
+            .title(Span::styled(" [2] Tags ", style));
 
         let content = Paragraph::new(selected_text)
             .style(if is_focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::Gray) })
@@ -820,6 +824,266 @@ fn draw_rules_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
         .alignment(Alignment::Center)
         .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, chunks[1]);
+}
+
+/// Draw the Rule Creation dialog as an overlay (two-field version with live preview)
+fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+    use super::app::RuleDialogFocus;
+
+    // Center the dialog
+    let dialog_width = area.width.min(70);
+    let dialog_height = area.height.min(18);
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    // Clear the area behind the dialog
+    frame.render_widget(Clear, dialog_area);
+
+    // Dialog block
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" New Tagging Rule ", Style::default().fg(Color::Cyan).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Split inner area: fields + preview + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Pattern field
+            Constraint::Length(3),  // Tag field
+            Constraint::Length(1),  // Separator
+            Constraint::Min(1),     // Preview
+            Constraint::Length(2),  // Footer
+        ])
+        .split(inner_area);
+
+    // Pattern field
+    let pattern_focused = app.discover.rule_dialog_focus == RuleDialogFocus::Pattern;
+    let pattern_style = if pattern_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let pattern_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pattern_style)
+        .title(Span::styled(" Pattern ", pattern_style));
+
+    let pattern_text = if pattern_focused {
+        format!("{}█", app.discover.rule_pattern_input)
+    } else {
+        app.discover.rule_pattern_input.clone()
+    };
+    let pattern_para = Paragraph::new(pattern_text)
+        .style(Style::default().fg(Color::White))
+        .block(pattern_block);
+    frame.render_widget(pattern_para, chunks[0]);
+
+    // Tag field
+    let tag_focused = app.discover.rule_dialog_focus == RuleDialogFocus::Tag;
+    let tag_style = if tag_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let tag_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(tag_style)
+        .title(Span::styled(" Tag ", tag_style));
+
+    let tag_text = if tag_focused {
+        format!("{}█", app.discover.rule_tag_input)
+    } else {
+        app.discover.rule_tag_input.clone()
+    };
+    let tag_para = Paragraph::new(tag_text)
+        .style(Style::default().fg(Color::White))
+        .block(tag_block);
+    frame.render_widget(tag_para, chunks[1]);
+
+    // Separator
+    let sep = Paragraph::new("─".repeat(inner_area.width.saturating_sub(2) as usize))
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(sep, chunks[2]);
+
+    // Preview section
+    let preview_count = app.discover.rule_preview_count;
+    let preview_title = if preview_count > 0 {
+        format!(" Preview ({} files match) ", preview_count)
+    } else if app.discover.rule_pattern_input.is_empty() {
+        " Preview (enter a pattern) ".to_string()
+    } else {
+        " Preview (no matches) ".to_string()
+    };
+
+    let mut preview_lines: Vec<Line> = Vec::new();
+    if app.discover.rule_preview_files.is_empty() && !app.discover.rule_pattern_input.is_empty() {
+        preview_lines.push(Line::from(Span::styled(
+            "  No files match this pattern",
+            Style::default().fg(Color::DarkGray).italic(),
+        )));
+    } else {
+        for (i, path) in app.discover.rule_preview_files.iter().take(5).enumerate() {
+            let display_path = truncate_path_start(path, 50);
+            preview_lines.push(Line::from(Span::styled(
+                format!("  {}", display_path),
+                Style::default().fg(Color::Gray),
+            )));
+            if i == 4 && preview_count > 5 {
+                preview_lines.push(Line::from(Span::styled(
+                    format!("  ... and {} more", preview_count - 5),
+                    Style::default().fg(Color::DarkGray).italic(),
+                )));
+            }
+        }
+    }
+
+    let preview_block = Block::default()
+        .borders(Borders::NONE)
+        .title(Span::styled(preview_title, Style::default().fg(Color::Yellow)));
+    let preview_para = Paragraph::new(preview_lines).block(preview_block);
+    frame.render_widget(preview_para, chunks[3]);
+
+    // Footer with keybindings
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" [Tab]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Switch field  "),
+        Span::styled("[Enter]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Create  "),
+        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Cancel"),
+    ]))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[4]);
+}
+
+/// Draw the onboarding wizard dialog as an overlay
+fn draw_wizard_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the dialog
+    let dialog_width = area.width.min(60);
+    let dialog_height = area.height.min(16);
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    // Clear the area behind the dialog
+    frame.render_widget(Clear, dialog_area);
+
+    // Dialog block
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(" Quick Setup ", Style::default().fg(Color::Yellow).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Get source and file counts
+    let source_name = app.discover.sources
+        .get(app.discover.selected_source)
+        .map(|s| s.name.as_str())
+        .unwrap_or("Unknown");
+
+    let total_files = app.discover.files.len();
+    let untagged_count = app.discover.files.iter()
+        .filter(|f| f.tags.is_empty())
+        .count();
+
+    // Split inner area
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),  // Header info
+            Constraint::Length(3),  // Explanation
+            Constraint::Length(4),  // Options
+            Constraint::Length(2),  // Checkbox
+            Constraint::Min(0),     // Footer
+        ])
+        .split(inner_area);
+
+    // Header info
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled("  📁 Source: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(source_name, Style::default().fg(Color::White).bold()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("  {} files discovered, {} untagged", total_files, untagged_count),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    ];
+    let header = Paragraph::new(header_lines);
+    frame.render_widget(header, chunks[0]);
+
+    // Explanation
+    let explanation = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Tagging rules automatically categorize files.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "  Example: *.csv → \"sales\"",
+            Style::default().fg(Color::DarkGray).italic(),
+        )),
+    ]);
+    frame.render_widget(explanation, chunks[1]);
+
+    // Options
+    let options = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("    [n]", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(" Create a tagging rule", Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled("    [Enter]", Style::default().fg(Color::Green).bold()),
+            Span::styled(" Browse files first", Style::default().fg(Color::White)),
+        ]),
+    ]);
+    frame.render_widget(options, chunks[2]);
+
+    // Checkbox
+    let checkbox = if app.discover.wizard_dont_show_checked { "[x]" } else { "[ ]" };
+    let checkbox_line = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("    {} ", checkbox), Style::default().fg(Color::DarkGray)),
+            Span::styled("Don't show this again", Style::default().fg(Color::DarkGray)),
+            Span::styled("  [Space] toggle", Style::default().fg(Color::DarkGray).italic()),
+        ]),
+    ]);
+    frame.render_widget(checkbox_line, chunks[3]);
+
+    // Footer
+    let footer = Paragraph::new(Line::from(Span::styled(
+        " [Esc] Close ",
+        Style::default().fg(Color::DarkGray),
+    )))
+        .alignment(Alignment::Center);
+    frame.render_widget(footer, chunks[4]);
 }
 
 fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::FileInfo], area: Rect) {

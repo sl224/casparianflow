@@ -1,59 +1,65 @@
 # Casparian Flow: Product Strategy
 
-> Last updated: January 2025
+> Last updated: January 2026
 
 ## Executive Summary
 
-Casparian Flow is an **AI-native data platform** that transforms unstructured files into production-quality datasets through conversational interaction with Claude Code. Unlike traditional ETL tools, Casparian provides the infrastructure, safety rails, and audit trails needed for AI-assisted data engineering in regulated industries.
+Casparian Flow is a **local-first data platform** that transforms industry-specific file formats (FIX logs, HL7 messages, CoT tracks, PST archives) into queryable SQL/Parquet datasets. Unlike cloud ETL tools that require data to leave premises, Casparian runs entirely on local machines—critical for regulated industries with compliance, air-gap, or data sovereignty requirements.
 
-**Core insight:** The bronze layer (raw file → structured data) for custom formats is underserved. Teams with Python knowledge but no data engineering infrastructure struggle to operationalize custom parsers.
+**Core insight:** The bronze layer (raw file → structured data) for industry-specific formats is underserved. Enterprise tools (Databricks, Relativity, Palantir) are overkill for many use cases, while DIY Python lacks governance.
 
-**Key differentiator:** Full MCP integration with human-in-the-loop governance. Users have a conversation with Claude; Casparian ensures safety, traceability, and compliance.
+**Key differentiators:**
+1. **Premade parsers** for arcane formats (FIX, HL7, CoT, PST, load files)
+2. **Local-first execution** - data never leaves the machine
+3. **Schema contracts** - governance and audit trails for compliance
+4. **AI-assisted development** (Phase 2) - Claude helps build custom parsers
 
 ---
 
 ## Vision
 
 ### North Star
-**"Have a conversation with Claude, get production data pipelines with full governance."**
+**"Query your dark data in SQL. Locally. With full audit trails."**
 
 ### The Problem
 
-Teams with proprietary file formats (defense logs, medical exports, financial reports) face a painful reality:
+Teams with industry-specific file formats face a painful choice:
 
-| Current State | Pain |
-|---------------|------|
-| Write parser scripts | No monitoring, retry, versioning |
-| Run manually or via cron | Failures go unnoticed |
-| Schema changes break everything | No drift detection |
-| Original author leaves | Knowledge lost |
-| Compliance asks "who changed what?" | No audit trail |
+| Option | Problem |
+|--------|---------|
+| **Enterprise platforms** (Databricks, Relativity, Palantir) | $50K-$150K+/year; cloud-only; requires data team |
+| **DIY Python scripts** | No governance; knowledge lost when author leaves; no audit trail |
+| **Vendor services** | $5-15K per engagement; slow turnaround; recurring cost |
+| **Manual analysis** (grep, Excel) | 30-45 minutes per query; error-prone; doesn't scale |
 
-**The bronze layer gap:** Tools like Fivetran/Airbyte assume standard formats and API sources. Custom formats = DIY.
+**The format gap:** ETL tools (Fivetran, Airbyte) support APIs and standard formats. Industry formats (FIX, HL7, CoT, PST) = DIY.
 
 ### The Solution
 
 Casparian provides:
-1. **AI-assisted parser development** - Claude writes parsers, humans approve
-2. **Schema contracts** - Immutable after approval, violations are hard failures
-3. **File discovery (Scout)** - Automatic scanning and tagging
-4. **Isolated execution (Bridge Mode)** - AI-generated code runs safely
-5. **Full traceability** - Parser versions, schema history, processing logs
+1. **Premade parsers** for industry formats - FIX logs, HL7 messages, CoT tracks, PST archives, load files
+2. **Local-first execution** - Data never leaves the machine; works air-gapped
+3. **Schema contracts** - Governance layer for compliance; violations are hard failures
+4. **SQL/Parquet output** - Query results with familiar tools
+5. **Full traceability** - Parser versions, schema history, processing lineage
+
+**AI Enhancement (Phase 2):**
+- Claude-assisted custom parser development for formats we don't ship
+- AI proposes, humans approve - no AI in the execution hot path
 
 ### Core Philosophy
 
 **What We Believe:**
-1. **AI generates, humans approve.** AI is a proposal engine, not an autonomous agent. Every AI-generated artifact (parser code) requires human approval of its *output*, not its implementation.
-2. **Show output, not code.** Users care about results. "Did my messy CSV become a clean table?" They don't need to read Python to answer that question.
-3. **Sandbox everything.** AI-generated code runs in isolation (Bridge Mode). It cannot escape, cannot corrupt, cannot cause damage outside its boundary.
-4. **Make the safe path easy.** Manual approval is the default. Auto-approve is opt-in, hard to enable, and fully logged.
-5. **Deterministic after approval.** Once a parser is approved, execution is deterministic. No AI in the hot path.
+1. **Parsers are the product.** The core value is transforming arcane formats to SQL. Everything else is infrastructure.
+2. **Local-first, always.** Data sovereignty isn't negotiable. Cloud is optional, local is default.
+3. **Governance built-in.** Schema contracts, audit trails, and versioning aren't enterprise add-ons—they're core.
+4. **AI enhances, humans decide.** AI can help build parsers, but execution is deterministic. No AI in production data paths.
+5. **Show results, not code.** Users care about output tables, not parser implementation.
 
 **What We Don't Believe:**
-- "Agents all the way down" - Agents talking to agents is unpredictable. AI has ONE job: generate parser code.
-- "AI can figure it out" - AI is wrong 10-30% of the time. Always show the user what happened.
-- "Users will read the code" - They won't. Show them input vs output.
-- "More automation is better" - More automation without visibility destroys trust.
+- "Cloud is always better" - Regulated industries need local options
+- "AI can figure it out" - Premade parsers for known formats beat AI improvisation
+- "One tool fits all" - Different verticals have different competitors (see below)
 
 ---
 
@@ -75,12 +81,45 @@ Casparian provides:
 
 | Segment | Technical Buyer | Format Examples | Why Casparian |
 |---------|-----------------|-----------------|---------------|
-| **Defense/Aerospace** | In-house dev teams | Mission logs, telemetry, sensor data | Air-gapped; compliance; custom formats |
-| **Healthcare IT** | Hospital IT departments | HL7 exports, EHR dumps, lab systems | HIPAA; can't use cloud; legacy formats |
-| **Financial Services** | Quant teams, compliance IT | Trading logs, SEC filings, risk data | Audit trails; data sovereignty |
-| **Manufacturing (mid-market+)** | Plant IT teams | Equipment logs, quality data, SCADA | No cloud on factory floor; proprietary formats |
+| **Financial Services** | Trade ops, quant teams | FIX logs, SEC filings, ISO 20022 | Trade break resolution; audit trails | [→ Deep Dive](strategies/finance.md) |
+| **Defense/Aerospace** | In-house dev teams | CoT, NITF, PCAP, KLV telemetry | Air-gapped; compliance; custom formats | [→ Deep Dive](strategies/defense_tactical.md) |
+| **Healthcare IT** | Hospital IT departments | HL7 exports, EHR dumps, lab systems | HIPAA; can't use cloud; legacy formats | [→ Deep Dive](strategies/healthcare_hl7.md) |
+| **Legal Tech/eDiscovery** | Litigation support | PST archives, load files, Slack | Pre-processing tier; cost reduction | [→ Deep Dive](strategies/legal_ediscovery.md) |
+| **Manufacturing (mid-market+)** | Plant IT teams | Historian exports, MTConnect, SPC | No cloud on factory floor; proprietary formats | [→ Deep Dive](strategies/manufacturing.md) |
+| **Mid-Size Business** | FP&A analysts, IT generalists | QuickBooks, Salesforce, ERP exports | Can't afford enterprise ETL; Excel hell | [→ Deep Dive](strategies/midsize_business.md) |
 | **Government/Public Sector** | Agency IT teams | Permit systems, legacy databases | Budget constraints; data must stay local |
 | **Technical Consultants** | Themselves | Client data projects | 10x productivity; reusable parsers |
+
+### Strategic Positioning: "Universal Local ETL"
+
+**Core Positioning:** Casparian is the **"Cold Data Browser"** - a Splunk alternative for data that can't go to the cloud.
+
+```
+Hot Data (real-time) → Splunk, Datadog, cloud SIEM
+                           ↑
+                     (network connection)
+                           ↓
+Cold Data (historical) → [CASPARIAN] → Local SQL/Parquet
+```
+
+**Why "Universal Local ETL" wins:**
+1. **Horizontal appeal:** Every industry has "dark data" on local drives
+2. **Cloud cost savings:** Pre-filter before sending to expensive cloud storage
+3. **Air-gap compatible:** Works where cloud tools can't
+4. **Compliance friendly:** Data never leaves premises
+
+**Strategic Grid:**
+
+| | **Low Complexity** | **High Complexity** |
+|---|---|---|
+| **High $$$** | **FINANCE** (Trade Break Workbench) | Defense (SBIR pathway) |
+| **Low $$$** | Mid-size Business (PLG) | Healthcare (long sales cycle) |
+
+**Recommended Priority:**
+1. **Phase 1:** Finance (Trade Break Workbench) - Fastest path to revenue
+2. **Phase 2:** Legal eDiscovery - Adjacent to finance, similar buyers
+3. **Phase 3:** Defense - SBIR pathway, longer timeline
+4. **Phase 4:** Healthcare - Requires compliance certifications
 
 ### MSP Channel: B2B2B Opportunity (Researched)
 
@@ -166,31 +205,57 @@ Casparian provides:
 
 ## Value Proposition
 
-### For Data Teams
-> "10x productivity on custom formats. Claude writes the parsers, you approve the schemas, Casparian handles the infrastructure."
+### By Vertical
 
-### For Compliance Officers
-> "AI-assisted data processing with full governance. Every schema change requires human approval. Complete audit trail."
+| Vertical | Value Proposition | Quantified ROI |
+|----------|-------------------|----------------|
+| **Finance (Trade Ops)** | "Debug trade breaks in 5 minutes, not 45" | 6+ hours/day saved per analyst |
+| **Legal (Litigation Support)** | "Process PSTs in-house, stop paying vendors" | $5-15K saved per matter |
+| **Healthcare (IT)** | "Query 5 years of HL7 archives with SQL - analytics Mirth can't do" | SQL access to historical data |
+| **Defense (Analysts)** | "SQL for CoT/NITF/PCAP on your laptop, air-gapped" | Mission-critical; no alternative |
+| **Manufacturing (Engineers)** | "Analyze historian exports without PI licenses" | $50K+/year vs. enterprise |
 
-### For CTOs
-> "An AI data engineer that costs $200/month instead of $200K/year. Production-quality pipelines from day one."
+### Generic Value Props
+
+**For Operations Teams:**
+> "Turn file formats your vendors create into SQL you can actually query. Locally. In minutes."
+
+**For Compliance Officers:**
+> "Full audit trail: who processed what, when, with which parser version. Schema contracts prevent silent data drift."
+
+**For CTOs:**
+> "Process industry-specific formats without $150K/year platform licenses or building a data team."
 
 ---
 
 ## Product Architecture
 
-### Core Subsystems
+### Phase 1: Core Product (No AI Required)
 
-| Subsystem | Purpose | AI Integration |
-|-----------|---------|----------------|
-| **Scout** | File discovery + tagging | `quick_scan`, `apply_scope` |
-| **Parser Lab** | Parser development + testing | `discover_schemas`, `fix_parser` |
-| **Schema Contracts** | Governance + validation | `approve_schemas`, `propose_amendment` |
-| **Backtest Engine** | Multi-file validation | `run_backtest` |
-| **Sentinel** | Job orchestration | `execute_pipeline` |
-| **Query Layer** | Result exploration | `query_output` |
+| Component | Purpose | Status |
+|-----------|---------|--------|
+| **Premade Parsers** | FIX, HL7, CoT, PST, load files → SQL/Parquet | Core value |
+| **Scout** | File discovery + tagging by pattern | Core |
+| **Schema Contracts** | Governance + validation; violations = hard failures | Core |
+| **`casparian run`** | Execute parser against files | Core |
+| **`casparian scan`** | Discover and tag files | Core |
+| **SQL/Parquet Output** | Query results with DuckDB, pandas, etc. | Core |
+| **Parser Versioning** | Audit trail; lineage columns | Core |
 
-### MCP Tools (9 Total)
+### Phase 2: AI Enhancement (Future)
+
+| Component | Purpose | Status |
+|-----------|---------|--------|
+| **MCP Tools** | Claude Code integration for custom parser development | Future |
+| **Parser Lab** | AI-assisted parser generation | Future |
+| **`discover_schemas`** | AI proposes schema from sample data | Future |
+| **`fix_parser`** | AI suggests fixes for failing parsers | Future |
+
+**Key Principle:** AI helps BUILD parsers, but execution is deterministic. No AI in the production data path.
+
+### MCP Tools (Phase 2)
+
+When AI features ship, 9 MCP tools will enable Claude Code integration:
 
 | Category | Tools | Human Approval Required |
 |----------|-------|-------------------------|
@@ -204,110 +269,203 @@ Casparian provides:
 | Decision | Rationale |
 |----------|-----------|
 | **Local-first (CLI)** | Defense/healthcare can't use cloud; data never leaves machine |
-| **Schema contracts are immutable** | AI safety; prevents silent schema drift |
-| **Human approval for schema changes** | Governance requirement for regulated industries |
-| **Bridge Mode (isolated execution)** | AI-generated code runs in subprocess; security |
+| **Premade parsers first** | Known formats don't need AI; faster time-to-value |
+| **Schema contracts are immutable** | Prevents silent schema drift; compliance requirement |
 | **Parser versioning** | Audit trail; rollback capability |
+| **SQL/Parquet output** | Users query with familiar tools |
 | **SQLite default, Postgres for enterprise** | Simple start, enterprise scalability |
+| **AI in Phase 2** | Core value doesn't depend on AI; AI is productivity multiplier |
 
 ---
 
 ## Competitive Landscape
 
-### Category: AI-Native Data Operations
+### Key Insight: Competitors Differ by Vertical
 
-Casparian is creating a new category. Traditional comparisons don't apply.
+Generic comparisons (Fivetran, Airbyte) are misleading. A Trade Support Engineer debugging FIX logs doesn't compare us to Fivetran—they compare us to manual grep, Excel, or enterprise TCA tools.
 
-| Competitor | Custom Parsers | AI Integration | Human-in-Loop | Local-First |
-|------------|----------------|----------------|---------------|-------------|
-| Fivetran | No | None | No | No |
-| Airbyte | Limited | Basic | No | No |
-| Databricks | Yes | Copilot | No | No |
-| dbt | No (SQL) | None | No | No |
-| Manual Python | Yes | None | N/A | Yes |
-| **Casparian** | **Yes** | **Full MCP** | **Yes** | **Yes** |
+### Finance: FIX Log Analysis
 
-### Moat Analysis
+| Competitor | What It Does | Price | Why It's Not Enough |
+|------------|--------------|-------|---------------------|
+| [QuantScope](https://quantscopeapp.com/) | FIX log viewer/analyzer | Free | Visualization focus; no SQL output; no batch processing |
+| [OnixS FIX Analyser](https://www.onixs.biz/fix-analyser.html) | Query builder for FIX | Commercial | Testing/QA focus, not operations |
+| [B2BITS FIXEye](https://www.b2bits.com/trading_solutions/fix_log_analyzers) | Enterprise log search | Enterprise | $$$; monitoring focus, not break resolution |
+| [Databricks](https://www.databricks.com/solutions/industries/financial-services) | Data lakehouse | $50K+/year | For data teams, not operations; requires cloud |
+| Manual grep + Excel | DIY | "Free" | 30-45 min per trade break; no governance |
+| **Casparian** | FIX → SQL locally | $75-400/mo | **Trade lifecycle in 5 minutes; local-first** |
 
-| Asset | Defensibility | Duration |
-|-------|---------------|----------|
-| MCP integration (9 tools) | High | 12-18 months to replicate |
-| Schema contract system | Medium | Architecture is novel |
-| Local-first + governance | High | Rare combination |
-| Parser IP accumulation | High | Switching cost increases over time |
+**Why Databricks isn't the answer:** Trade Support Engineers don't have Databricks access. They need tools that work NOW, not data pipelines that take weeks to build.
+
+### Legal: PST/eDiscovery Processing
+
+| Competitor | What It Does | Price | Why It's Not Enough |
+|------------|--------------|-------|---------------------|
+| [Relativity](https://www.relativity.com/) | Full eDiscovery platform | $150K+/year | Overkill for small firms |
+| [GoldFynch](https://goldfynch.com/) | Cloud PST processing | Per-GB | Requires cloud; adds up at scale |
+| [Logikcull](https://www.logikcull.com/) | Cloud eDiscovery | $250-500/GB | Per-GB expensive on large matters |
+| [Aid4Mail](https://www.aid4mail.com/) | Desktop PST processing | License | Processing only; no SQL output |
+| Vendor outsourcing | Processing service | $5-15K/matter | Slow; recurring cost per matter |
+| **Casparian** | PST → SQL locally | $75-300/mo | **Process in-house; fixed cost; local** |
+
+**Why small firms can't use Relativity:** 80,000+ law firms with <10 attorneys can't justify $150K/year. They outsource or use manual methods.
+
+### Healthcare: HL7 Archive Analysis
+
+| Competitor | What It Does | Price | Why It's Not Enough |
+|------------|--------------|-------|---------------------|
+| [Mirth Connect](https://github.com/nextgenhealthcare/connect) | Integration engine | **Commercial (Mar 2025)** | Real-time focus; archive analysis is DIY |
+| [Rhapsody](https://www.orionhealth.com/global/platform/rhapsody/) | Enterprise integration | $150K+/year | Enterprise scale; overkill for archives |
+| [HL7 Soup](https://www.integrationsoup.com/) | HL7 viewer/editor | License | Viewing, not analytics; no SQL |
+| Manual Python | DIY parsing | "Free" | No governance; knowledge lost |
+| **Casparian** | HL7 archives → SQL | $X | **Query historical data; local-first** |
+
+**Market context:** Mirth Connect went commercial in March 2025. Organizations paying $20-30K/year want more value from their HL7 data. Casparian is **complementary** - we analyze Mirth's archives, not replace its routing function.
+
+### Defense: Tactical Edge Data
+
+| Competitor | What It Does | Price | Why It's Not Enough |
+|------------|--------------|-------|---------------------|
+| [Palantir](https://www.palantir.com/) | AI/ML analytics | $10B contract | Requires STRUCTURED data as input |
+| ArcGIS Enterprise | GIS platform | $100K+/year | Server required; not edge-capable |
+| [NetworkMiner](https://www.netresec.com/?page=NetworkMiner) | PCAP forensics | Free/Commercial | Interactive; no batch pipeline |
+| Wireshark/tshark | Packet analysis | Free | Interactive; no SQL output |
+| Custom Python | DIY | "Free" | Brittle; no governance |
+| **Casparian** | CoT/NITF/PCAP → SQL | $X | **Runs on laptop; air-gapped; upstream of Palantir** |
+
+**Key insight:** We are UPSTREAM of Palantir. Palantir analyzes structured data. Casparian structures the raw files so ANY downstream tool can use them.
 
 ### Why Not Just Write Python?
 
 | Casparian Adds | DIY Alternative | Delta |
 |----------------|-----------------|-------|
-| AI writes parsers | You write parsers | **10x faster** |
+| Premade parsers | You build from scratch | **Weeks → minutes** |
 | Schema governance | None | **Required for compliance** |
 | Automatic versioning | Git (manual) | **Built-in audit trail** |
-| Isolated execution | subprocess (manual) | **Security by default** |
+| SQL/Parquet output | Custom code | **Query with any tool** |
 | File discovery | glob + watchdog | **Pattern-based tagging** |
-| Human approval workflow | None | **AI safety** |
+
+### Moat Analysis
+
+| Asset | Defensibility | Duration |
+|-------|---------------|----------|
+| Premade parsers for arcane formats | High | Domain expertise required |
+| Local-first + governance | High | Rare combination |
+| Schema contract system | Medium | Architecture is novel |
+| Parser IP accumulation | High | Switching cost increases over time |
+| (Phase 2) MCP integration | Medium | 12-18 months to replicate |
 
 ---
 
 ## Go-to-Market Strategy
 
-### Phase 1: Prove Value (0-3 months)
+### GTM Philosophy: Vertical-First, Not Horizontal
 
-**Goal:** 10 design partners actively using the product
+Generic "data platform" positioning fails. Each vertical has different:
+- **Competitors** (Databricks vs. Relativity vs. Palantir)
+- **Buyers** (Trade Support vs. Litigation Support vs. Intel Analyst)
+- **Sales cycles** (30 days vs. 18 months)
+- **Pricing tolerance** ($75/mo vs. $150K/year)
 
+**Priority Order:** Finance → Legal → Defense → Healthcare
+
+### Phase 1: Finance / Trade Break Workbench (Months 0-6)
+
+**Why Finance First:**
+- Highest willingness to pay
+- Fastest sales cycle (operations budget, not IT budget)
+- Quantifiable ROI (40 min saved × 10 breaks/day = 6+ hours)
+- T+1 settlement pressure creates urgency
+
+**Target Persona:** Trade Support Engineer / Middle Office
+
+**Go-to-Market:**
 | Action | Target |
 |--------|--------|
-| Create 2-minute demo video | Claude → data pipeline in action |
-| Direct outreach | 50 target companies in defense/healthcare/finance |
-| Claude Code community | Power users building MCP tools |
-| Document case studies | "How X processes Y format with Casparian" |
+| Ship FIX parser with `fix_order_lifecycle` table | Core product |
+| Demo: "Debug trade break in 5 minutes" | 2-minute video |
+| Direct outreach to prop trading firms, broker-dealers | 50 companies |
+| Content: "T+1 is killing your Trade Support team" | SEO + thought leadership |
+| Partner with FIX protocol consultants | Channel |
 
-**Success metric:** 5 teams using Casparian weekly
+**Pricing:**
+| Tier | Price | Features |
+|------|-------|----------|
+| **Pro** | $75/user/month | FIX parser, unlimited files |
+| **Trading Team** | $400/month | Multi-venue, custom tags |
+| **Enterprise** | Custom | Audit trails, SSO, support |
 
-### Phase 2: MSP Channel Development (3-6 months)
+**Success Metrics:**
+- 10 trading desks using weekly
+- $10K MRR from finance vertical
+- 3 case studies published
 
-**Goal:** 5 MSP partners, $15K MRR
+### Phase 2: Legal / eDiscovery (Months 6-12)
 
+**Why Legal Second:**
+- Adjacent to finance (similar buyer profile)
+- Clear ROI ($5-15K saved per matter)
+- Small firm market underserved (80K+ firms)
+
+**Target Persona:** Litigation Support Specialist
+
+**Go-to-Market:**
 | Action | Target |
 |--------|--------|
-| Identify 50 Tier 2 MSPs (healthcare, accounting focus) | LinkedIn, MSP communities |
-| Build MSP demo: "Process 10 client data exports in 1 hour" | Operational efficiency angle |
-| Create per-client pricing model | $15-25/client/month |
-| Partner onboarding: 30-minute setup to first client | Low-friction trial |
-| MSP-specific features: multi-tenant dashboard, white-label option | Roadmap items |
+| Ship PST parser with email/attachment extraction | Core product |
+| Demo: "Process 50GB PST in 30 minutes" | Cost savings angle |
+| Target litigation support communities (ACEDS) | Direct outreach |
+| Partner with legal tech consultants | Channel |
 
-**MSP Value Prop:**
-> "Offer data services to every client without hiring a data engineer. Casparian + your technician = premium analytics offering."
+**Pricing:**
+| Tier | Price | Features |
+|------|-------|----------|
+| **Pro** | $75/user/month | PST + load file parsers |
+| **Team** | $300/month | Multi-custodian, export |
+| **Consultant** | $500/month | White-label, multi-client |
 
-| Pricing Tier | Price | For |
-|--------------|-------|-----|
-| **MSP Starter** | $200/month flat | Up to 10 clients |
-| **MSP Growth** | $20/client/month | 10+ clients, volume discount |
-| **MSP White-Label** | $1,500/month | Full rebrand, priority support |
+**Success Metrics:**
+- 25 legal customers
+- $5K MRR from legal vertical
 
-**Success metric:** 5 MSPs processing client data weekly
+### Phase 3: Defense / SBIR Pathway (Months 6-18)
 
-### Phase 2b: Direct Sales (Parallel Track)
+**Why Defense Third:**
+- Longer sales cycle (SBIR process)
+- Requires air-gap features (bundle mode)
+- High value but slow to close
 
-**Goal:** $5K MRR from non-MSP customers
+**Target:** AFWERX, DIU, SOCOM SBIR topics
 
-| Pricing Tier | Price | Features |
-|--------------|-------|----------|
-| **Free** | $0 | Parser Lab, 3 parsers, local only |
-| **Pro** | $50/user/month | Unlimited parsers, Scout, team sharing |
-| **Team** | $200/month + $20/user | Sentinel orchestration, audit logs |
+> **SBIR Program Status (Jan 2026):** Programs expired Sept 30, 2025; awaiting congressional reauthorization (expected late Jan 2026). Best-fit topic identified: **A254-011 "AI for Interoperability"** - almost a verbatim description of Casparian's capabilities. See [strategies/dod_sbir_opportunities.md](strategies/dod_sbir_opportunities.md) for detailed analysis.
 
-**Success metric:** 50 paying direct users
+**Go-to-Market:**
+| Action | Target |
+|--------|--------|
+| Ship CoT + PCAP + NITF parsers | Core product |
+| `casparian bundle` for air-gapped deployment | Required feature |
+| Register in SAM.gov + DSIP Portal | Required for federal work |
+| SBIR Phase I application | $50-250K funding |
+| Demo to DoD stakeholders | Build relationships |
 
-### Phase 3: Scale Both Channels (6-12 months)
+**Success Metrics:**
+- 1 SBIR Phase I award
+- 5 DoD pilot users
 
-**Goal:** $100K ARR
+### Phase 4: Healthcare / HL7 Archive Analytics (Months 12-24)
 
-| Channel | Target | Revenue |
-|---------|--------|---------|
-| MSP partners | 25 MSPs, 500 end clients | $60K ARR |
-| Direct mid-market | 20 Team accounts | $25K ARR |
-| Enterprise | 2 contracts | $40K ARR |
+**Why Healthcare Fourth:**
+- Long sales cycle (12-18 months)
+- Requires compliance certifications (HIPAA)
+- Mirth went commercial (Mar 2025) - organizations want more value from HL7 data
+
+**Defer until:** Finance + Legal revenue covers runway
+
+### MSP Channel (Parallel, Lower Priority)
+
+MSP channel is viable for mid-market business formats (QuickBooks, Salesforce), but NOT primary focus. Vertical-specific enterprise sales come first.
+
+**When to activate:** After $50K MRR from direct vertical sales.
 
 **Enterprise Features (required for large deals):**
 
@@ -557,6 +715,10 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 |------|---------|---------|
 | 2025-01 | 1.0 | Initial strategy document |
 | 2025-01 | 1.1 | Added MSP channel analysis, revised revenue projections, updated GTM phases |
+| 2026-01 | 1.2 | Gap analysis integration: Universal Local ETL positioning; Strategic Grid; Vertical priority; Added Legal eDiscovery vertical |
+| 2026-01 | 2.0 | **Major revision:** Repositioned from "AI-native" to "local-first format parser"; Added vertical-specific competitor analysis; Restructured GTM to vertical-first (Finance → Legal → Defense → Healthcare); Clarified AI as Phase 2 enhancement, not core requirement; Added research-backed competitor tables |
+| 2026-01 | 2.1 | **Healthcare positioning fix:** Clarified Casparian is complementary to Mirth (archive analytics), not a replacement for real-time routing |
+| 2026-01 | 2.2 | **SBIR research:** Added program status note (expired Sept 2025, pending reauth); Identified best-fit topic A254-011; Created [dod_sbir_opportunities.md](strategies/dod_sbir_opportunities.md) |
 
 ---
 

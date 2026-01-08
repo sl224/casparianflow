@@ -216,13 +216,20 @@ When you change parser code:
 ```
 casparian-flow/
 ├── CLAUDE.md                 # YOU ARE HERE
-├── ARCHITECTURE.md           # Detailed system design
 ├── README.md                 # Quick start
-├── spec.md                   # Master product specification
 │
-├── specs/                    # Component subspecs (see below)
+├── spec.md                   # MASTER: Product specification
+├── specs/                    # SUBSPECS: Feature implementation details
 │   ├── discover.md           # Discover mode TUI spec
-│   └── parser_bench.md       # Parser Bench mode TUI spec
+│   ├── parser_bench.md       # Parser Bench mode TUI spec
+│   └── hl7_parser.md         # HL7 v2.x parser technical spec
+│
+├── STRATEGY.md               # MASTER: Business strategy (platform-level)
+├── strategies/               # SUBSTRATEGIES: Vertical-specific GTM
+│   └── healthcare_hl7.md     # Healthcare/HL7 market strategy
+│
+├── docs/                     # Technical decisions, ADRs
+├── archive/                  # Historical documents
 │
 ├── crates/                   # Rust core
 │   ├── casparian/            # Unified binary (CLI + TUI)
@@ -267,6 +274,17 @@ casparian-flow/
 └── demo/                     # Example files and plugins
 ```
 
+### Documentation Organization Pattern
+
+This project uses a **master/sub-document pattern** for both specifications and strategy:
+
+| Master Doc | Sub-Docs | Focus |
+|------------|----------|-------|
+| `spec.md` | `specs/*.md` | **What to build** (features, schemas, TUI) |
+| `STRATEGY.md` | `strategies/*.md` | **How to win** (markets, competitors, GTM) |
+
+---
+
 ### Specification Organization (Subspecs)
 
 Complex components have detailed specifications in `specs/` subdirectory. This keeps `spec.md` readable while providing comprehensive documentation for implementation.
@@ -303,6 +321,52 @@ spec.md                          specs/discover.md
 - Component with >50 lines of specification
 - Feature requiring detailed layout diagrams
 - Anything with multiple implementation phases
+
+---
+
+### Strategy Organization (Substrategies)
+
+Vertical-specific market strategies live in `strategies/` subdirectory. This keeps `STRATEGY.md` focused on platform-level strategy while enabling deep dives into specific markets.
+
+**Pattern:**
+- **`STRATEGY.md`**: Master business strategy (vision, ICP, pricing, GTM phases)
+- **`strategies/*.md`**: Vertical-specific go-to-market strategies
+
+**Bidirectional References:**
+```
+STRATEGY.md                           strategies/healthcare_hl7.md
+───────────                           ────────────────────────────
+| Healthcare IT | ... |               # Healthcare HL7 Market Strategy
+[→ Deep Dive](strategies/...)   ◄────► Parent: STRATEGY.md Section 2
+                                       Related Spec: specs/hl7_parser.md
+```
+
+**Substrategy Structure:**
+| Section | Purpose |
+|---------|---------|
+| Header | Status, Parent reference, Related Spec, Version |
+| Market Overview | Size, players, regulatory environment |
+| Target Personas | Buyer, user, influencer profiles |
+| Pain Points | What hurts today, current alternatives |
+| Competitive Positioning | Incumbents, our differentiation |
+| Attack Strategies | Multiple approaches to win |
+| Product Roadmap Implications | What features this market needs |
+| Go-to-Market | Channels, pricing, messaging |
+| Success Metrics | How we measure winning |
+| Risks & Mitigations | What could go wrong |
+
+**When to Create a Substrategy:**
+- Entering a new vertical market (healthcare, defense, finance)
+- Facing a major competitor requiring specific positioning
+- Market with unique regulatory or technical requirements
+- Vertical needing dedicated pricing or GTM approach
+
+**Linking Specs and Strategies:**
+Technical specs and market strategies are **related but separate**:
+- `specs/hl7_parser.md` → How to build the HL7 parser (technical)
+- `strategies/healthcare_hl7.md` → How to win the healthcare market (business)
+
+Both should cross-reference each other in their headers.
 
 ---
 

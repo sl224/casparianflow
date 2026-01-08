@@ -319,6 +319,14 @@ pub enum DiscoverFocus {
     Tags,  // Renamed from Rules - users browse by tag category
 }
 
+/// Which field is focused in the rule creation dialog
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuleDialogFocus {
+    #[default]
+    Pattern,
+    Tag,
+}
+
 /// Source information for Discover mode sidebar
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
@@ -434,6 +442,28 @@ pub struct DiscoverState {
     pub rule_pattern_input: String,
     /// Rule being edited (None = creating new)
     pub editing_rule_id: Option<i64>,
+    /// Which field is focused in rule dialog (Pattern or Tag)
+    pub rule_dialog_focus: RuleDialogFocus,
+    /// Live preview of files matching current pattern
+    pub rule_preview_files: Vec<String>,
+    /// Count of files matching current pattern
+    pub rule_preview_count: usize,
+
+    // --- Onboarding wizard ---
+    /// Whether to show the onboarding wizard dialog
+    pub show_wizard: bool,
+    /// User preference: never show wizard again (persisted)
+    pub hide_wizard_forever: bool,
+    /// Checkbox state in wizard dialog (toggled with Space)
+    pub wizard_dont_show_checked: bool,
+    /// Whether wizard has been dismissed this session (don't show again until restart)
+    pub wizard_dismissed_this_session: bool,
+
+    // --- Pending DB writes ---
+    /// File tags to persist to DB: (file_path, tag)
+    pub pending_tag_writes: Vec<(String, String)>,
+    /// Rules to persist to DB: (pattern, tag, source_id)
+    pub pending_rule_writes: Vec<(String, String, String)>,
 }
 
 /// File information for Discover mode
@@ -914,6 +944,8 @@ impl App {
                     self.discover.is_creating_source ||
                     self.discover.is_bulk_tagging ||
                     self.discover.is_creating_rule ||
+                    self.discover.show_wizard ||
+                    self.discover.rules_manager_open ||
                     !self.discover.filter.is_empty() ||
                     self.discover.focus != DiscoverFocus::Files
                 );
@@ -1059,43 +1091,107 @@ impl App {
             return;
         }
 
-        // If creating rule, handle rule tag input
+        // If wizard dialog is open, handle wizard keys
+        if self.discover.show_wizard {
+            match key.code {
+                KeyCode::Char('n') => {
+                    // Close wizard, open rule creation dialog
+                    self.close_wizard_and_save_preference();
+                    self.open_rule_creation_dialog();
+                }
+                KeyCode::Enter => {
+                    // Close wizard, browse files
+                    self.close_wizard_and_save_preference();
+                    self.discover.focus = DiscoverFocus::Files;
+                }
+                KeyCode::Char(' ') => {
+                    // Toggle "don't show again" checkbox
+                    self.discover.wizard_dont_show_checked = !self.discover.wizard_dont_show_checked;
+                }
+                KeyCode::Esc => {
+                    self.close_wizard_and_save_preference();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // If creating rule, handle rule dialog input (two-field version)
         if self.discover.is_creating_rule {
             match key.code {
                 KeyCode::Enter => {
-                    // Save rule with pattern from filter and entered tag
+                    // Save rule with pattern and tag
                     let tag = self.discover.rule_tag_input.trim().to_string();
-                    let pattern = self.discover.rule_pattern_input.clone();
+                    let pattern = self.discover.rule_pattern_input.trim().to_string();
                     if !tag.is_empty() && !pattern.is_empty() {
-                        // TODO: Actually save to database
-                        self.discover.status_message = Some((
-                            format!("Created rule: {} -> {}", pattern, tag),
-                            false,
-                        ));
+                        // Apply the rule: tag all matching files
+                        let tagged_count = self.apply_rule_to_files(&pattern, &tag);
+
                         // Add to local rules list for immediate feedback
                         self.discover.rules.push(RuleInfo {
                             id: -1, // Temporary ID until saved to DB
-                            pattern,
-                            tag,
+                            pattern: pattern.clone(),
+                            tag: tag.clone(),
                             priority: 100,
                             enabled: true,
                         });
+
+                        // Update the tags dropdown
+                        self.refresh_tags_list();
+
+                        // Show success message
+                        self.discover.status_message = Some((
+                            format!("Created rule: {} → {} ({} files tagged)", pattern, tag, tagged_count),
+                            false,
+                        ));
+                    } else if tag.is_empty() && !pattern.is_empty() {
+                        self.discover.status_message = Some((
+                            "Please enter a tag name".to_string(),
+                            true,
+                        ));
+                        return;
+                    } else if pattern.is_empty() {
+                        self.discover.status_message = Some((
+                            "Please enter a pattern".to_string(),
+                            true,
+                        ));
+                        return;
                     }
-                    self.discover.is_creating_rule = false;
-                    self.discover.rule_tag_input.clear();
-                    self.discover.rule_pattern_input.clear();
+                    self.close_rule_creation_dialog();
                 }
                 KeyCode::Esc => {
-                    self.discover.is_creating_rule = false;
-                    self.discover.rule_tag_input.clear();
-                    self.discover.rule_pattern_input.clear();
-                    self.discover.editing_rule_id = None;
+                    self.close_rule_creation_dialog();
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    // Toggle between Pattern and Tag fields
+                    self.discover.rule_dialog_focus = match self.discover.rule_dialog_focus {
+                        RuleDialogFocus::Pattern => RuleDialogFocus::Tag,
+                        RuleDialogFocus::Tag => RuleDialogFocus::Pattern,
+                    };
                 }
                 KeyCode::Char(c) => {
-                    self.discover.rule_tag_input.push(c);
+                    // Type into the focused field
+                    match self.discover.rule_dialog_focus {
+                        RuleDialogFocus::Pattern => {
+                            self.discover.rule_pattern_input.push(c);
+                            self.update_rule_preview();
+                        }
+                        RuleDialogFocus::Tag => {
+                            self.discover.rule_tag_input.push(c);
+                        }
+                    }
                 }
                 KeyCode::Backspace => {
-                    self.discover.rule_tag_input.pop();
+                    // Delete from the focused field
+                    match self.discover.rule_dialog_focus {
+                        RuleDialogFocus::Pattern => {
+                            self.discover.rule_pattern_input.pop();
+                            self.update_rule_preview();
+                        }
+                        RuleDialogFocus::Tag => {
+                            self.discover.rule_tag_input.pop();
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1199,6 +1295,11 @@ impl App {
             }
             KeyCode::Char('3') => {
                 self.discover.focus = DiscoverFocus::Files;
+                return;
+            }
+            KeyCode::Char('n') => {
+                // Open rule creation dialog from anywhere (primary action)
+                self.open_rule_creation_dialog();
                 return;
             }
             KeyCode::Char('R') => {
@@ -1440,7 +1541,7 @@ impl App {
     /// Handle keys when Sources panel is focused (dropdown closed)
     fn handle_discover_sources_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('n') => {
+            KeyCode::Char('s') => {
                 // Create new source (open scan dialog)
                 self.discover.is_entering_path = true;
                 self.discover.scan_path_input.clear();
@@ -1452,6 +1553,7 @@ impl App {
 
     /// Handle keys when Tags dropdown is open
     /// Arrow keys navigate, all other chars go to filter
+    /// Note: File filtering by tag is done in-memory via filtered_files()
     fn handle_tags_dropdown_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Down => {
@@ -1462,15 +1564,15 @@ impl App {
                         if pos + 1 < filtered.len() {
                             let new_idx = filtered[pos + 1].0;
                             self.discover.preview_tag = Some(new_idx);
-                            // Trigger file reload with tag filter
-                            self.discover.data_loaded = false;
+                            // Reset file selection when tag changes
+                            self.discover.selected = 0;
                         }
                     }
                 } else if !filtered.is_empty() {
                     // Select first tag
                     let new_idx = filtered[0].0;
                     self.discover.preview_tag = Some(new_idx);
-                    self.discover.data_loaded = false;
+                    self.discover.selected = 0;
                 }
             }
             KeyCode::Up => {
@@ -1480,11 +1582,11 @@ impl App {
                         if pos > 0 {
                             let new_idx = filtered[pos - 1].0;
                             self.discover.preview_tag = Some(new_idx);
-                            self.discover.data_loaded = false;
+                            self.discover.selected = 0;
                         } else {
                             // At top of list, select "All files" (None)
                             self.discover.preview_tag = None;
-                            self.discover.data_loaded = false;
+                            self.discover.selected = 0;
                         }
                     }
                 }
@@ -1496,7 +1598,7 @@ impl App {
                 self.discover.tags_filter.clear();
                 self.discover.preview_tag = None;
                 self.discover.focus = DiscoverFocus::Files;
-                self.discover.data_loaded = false; // Reload files with selected tag
+                self.discover.selected = 0;
             }
             KeyCode::Esc => {
                 // Close dropdown, show all files
@@ -1505,20 +1607,20 @@ impl App {
                 self.discover.tags_filter.clear();
                 self.discover.preview_tag = None;
                 self.discover.focus = DiscoverFocus::Files;
-                self.discover.data_loaded = false;
+                self.discover.selected = 0;
             }
             KeyCode::Backspace => {
                 if self.discover.tags_filter.is_empty() {
                     // Empty filter + backspace: move to "All files" or close
                     if self.discover.preview_tag.is_some() {
                         self.discover.preview_tag = None;
-                        self.discover.data_loaded = false;
+                        self.discover.selected = 0;
                     } else {
                         // Already at "all files", close dropdown
                         self.discover.selected_tag = None;
                         self.discover.tags_dropdown_open = false;
                         self.discover.focus = DiscoverFocus::Files;
-                        self.discover.data_loaded = false;
+                        self.discover.selected = 0;
                     }
                 } else {
                     self.discover.tags_filter.pop();
@@ -1527,7 +1629,7 @@ impl App {
                     if let Some(preview_idx) = self.discover.preview_tag {
                         if !filtered.iter().any(|(i, _)| *i == preview_idx) {
                             self.discover.preview_tag = filtered.first().map(|(i, _)| *i);
-                            self.discover.data_loaded = false;
+                            self.discover.selected = 0;
                         }
                     }
                 }
@@ -1540,7 +1642,7 @@ impl App {
                 if let Some(preview_idx) = self.discover.preview_tag {
                     if !filtered.iter().any(|(i, _)| *i == preview_idx) {
                         self.discover.preview_tag = filtered.first().map(|(i, _)| *i);
-                        self.discover.data_loaded = false;
+                        self.discover.selected = 0;
                     }
                 }
             }
@@ -1661,25 +1763,330 @@ impl App {
         // For now this updates local state immediately
     }
 
-    /// Get files filtered by current filter
+    /// Open the rule creation dialog with context-aware prefilling
+    fn open_rule_creation_dialog(&mut self) {
+        self.discover.is_creating_rule = true;
+        self.discover.rule_dialog_focus = RuleDialogFocus::Pattern;
+
+        // Context-aware prefilling
+        if !self.discover.filter.is_empty() {
+            // From Files panel with filter: prefill pattern
+            self.discover.rule_pattern_input = self.discover.filter.clone();
+        } else if let Some(file) = self.filtered_files().get(self.discover.selected) {
+            // From Files panel with file selected: prefill with extension pattern
+            if let Some(ext) = std::path::Path::new(&file.path).extension() {
+                self.discover.rule_pattern_input = format!("*.{}", ext.to_string_lossy());
+            } else {
+                self.discover.rule_pattern_input.clear();
+            }
+        } else {
+            self.discover.rule_pattern_input.clear();
+        }
+
+        // If in Tags dropdown with a tag selected, prefill tag
+        if self.discover.focus == DiscoverFocus::Tags {
+            if let Some(tag_idx) = self.discover.selected_tag {
+                if let Some(tag) = self.discover.tags.get(tag_idx) {
+                    if !tag.is_special {
+                        self.discover.rule_tag_input = tag.name.clone();
+                    } else {
+                        self.discover.rule_tag_input.clear();
+                    }
+                } else {
+                    self.discover.rule_tag_input.clear();
+                }
+            } else {
+                self.discover.rule_tag_input.clear();
+            }
+        } else {
+            self.discover.rule_tag_input.clear();
+        }
+
+        // Update preview with current pattern
+        self.update_rule_preview();
+    }
+
+    /// Close the rule creation dialog and reset state
+    fn close_rule_creation_dialog(&mut self) {
+        self.discover.is_creating_rule = false;
+        self.discover.rule_pattern_input.clear();
+        self.discover.rule_tag_input.clear();
+        self.discover.rule_preview_files.clear();
+        self.discover.rule_preview_count = 0;
+        self.discover.rule_dialog_focus = RuleDialogFocus::Pattern;
+        self.discover.editing_rule_id = None;
+    }
+
+    /// Update the live preview of files matching the current pattern
+    fn update_rule_preview(&mut self) {
+        let pattern = &self.discover.rule_pattern_input;
+
+        if pattern.is_empty() {
+            self.discover.rule_preview_files.clear();
+            self.discover.rule_preview_count = 0;
+            return;
+        }
+
+        // Use globset for matching
+        use globset::GlobBuilder;
+
+        // Wrap pattern to match anywhere in path if not already a path pattern
+        let glob_pattern = if pattern.contains('/') {
+            pattern.clone()
+        } else {
+            format!("**/{}", pattern)
+        };
+
+        match GlobBuilder::new(&glob_pattern)
+            .case_insensitive(true)
+            .build()
+            .map(|g| g.compile_matcher())
+        {
+            Ok(matcher) => {
+                let matches: Vec<String> = self.discover.files
+                    .iter()
+                    .filter(|f| {
+                        let path = f.path.strip_prefix('/').unwrap_or(&f.path);
+                        matcher.is_match(path)
+                    })
+                    .map(|f| f.rel_path.clone())
+                    .collect();
+
+                self.discover.rule_preview_count = matches.len();
+                self.discover.rule_preview_files = matches.into_iter().take(10).collect();
+            }
+            Err(_) => {
+                // Invalid pattern, try substring match
+                let pattern_lower = pattern.to_lowercase();
+                let matches: Vec<String> = self.discover.files
+                    .iter()
+                    .filter(|f| f.path.to_lowercase().contains(&pattern_lower))
+                    .map(|f| f.rel_path.clone())
+                    .collect();
+
+                self.discover.rule_preview_count = matches.len();
+                self.discover.rule_preview_files = matches.into_iter().take(10).collect();
+            }
+        }
+    }
+
+    /// Close the wizard dialog and save preference if checkbox is checked
+    fn close_wizard_and_save_preference(&mut self) {
+        self.discover.show_wizard = false;
+        self.discover.wizard_dismissed_this_session = true;
+
+        if self.discover.wizard_dont_show_checked {
+            self.discover.hide_wizard_forever = true;
+            // TODO: Persist to database
+            // For now, just set the local flag
+        }
+
+        self.discover.wizard_dont_show_checked = false;
+    }
+
+    /// Check if wizard should be shown (source selected, untagged files, not hidden)
+    fn should_show_wizard(&self) -> bool {
+        // Don't show if user has hidden it forever
+        if self.discover.hide_wizard_forever {
+            return false;
+        }
+
+        // Don't show if already dismissed this session
+        if self.discover.wizard_dismissed_this_session {
+            return false;
+        }
+
+        // Don't show if no sources
+        if self.discover.sources.is_empty() {
+            return false;
+        }
+
+        // Don't show if no files
+        if self.discover.files.is_empty() {
+            return false;
+        }
+
+        // Show if there are untagged files
+        let untagged_count = self.discover.files.iter()
+            .filter(|f| f.tags.is_empty())
+            .count();
+
+        untagged_count > 0
+    }
+
+    /// Trigger wizard check after source selection
+    fn maybe_show_wizard(&mut self) {
+        if self.should_show_wizard() && !self.discover.show_wizard {
+            self.discover.show_wizard = true;
+            self.discover.wizard_dont_show_checked = false;
+        }
+    }
+
+    /// Apply a rule (pattern → tag) to all matching files
+    /// Returns the number of files tagged
+    /// Also queues DB writes for persistence
+    fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> usize {
+        use globset::GlobBuilder;
+
+        // Build the glob matcher
+        let glob_pattern = if pattern.contains('/') {
+            pattern.to_string()
+        } else {
+            format!("**/{}", pattern)
+        };
+
+        let matcher = match GlobBuilder::new(&glob_pattern)
+            .case_insensitive(true)
+            .build()
+            .map(|g| g.compile_matcher())
+        {
+            Ok(m) => m,
+            Err(_) => return 0,
+        };
+
+        // Find and tag matching files
+        let mut tagged_count = 0;
+        for file in &mut self.discover.files {
+            let path = file.path.strip_prefix('/').unwrap_or(&file.path);
+            if matcher.is_match(path) {
+                // Add tag if not already present
+                if !file.tags.contains(&tag.to_string()) {
+                    file.tags.push(tag.to_string());
+                    tagged_count += 1;
+                    // Queue DB write
+                    self.discover.pending_tag_writes.push((file.path.clone(), tag.to_string()));
+                }
+            }
+        }
+
+        // Add to available tags if new
+        if tagged_count > 0 && !self.discover.available_tags.contains(&tag.to_string()) {
+            self.discover.available_tags.push(tag.to_string());
+        }
+
+        // Queue rule write
+        if tagged_count > 0 {
+            let source_id = self.discover.sources
+                .get(self.discover.selected_source)
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
+            if !source_id.is_empty() {
+                self.discover.pending_rule_writes.push((pattern.to_string(), tag.to_string(), source_id));
+            }
+        }
+
+        tagged_count
+    }
+
+    /// Refresh the tags dropdown list based on current file tags
+    fn refresh_tags_list(&mut self) {
+        use std::collections::HashMap;
+
+        // Count files per tag
+        let mut tag_counts: HashMap<String, usize> = HashMap::new();
+        let mut untagged_count = 0;
+
+        for file in &self.discover.files {
+            if file.tags.is_empty() {
+                untagged_count += 1;
+            } else {
+                for tag in &file.tags {
+                    *tag_counts.entry(tag.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Build the tags list
+        let mut tags = Vec::new();
+
+        // "All files" is always first (special)
+        tags.push(TagInfo {
+            name: "All files".to_string(),
+            count: self.discover.files.len(),
+            is_special: true,
+        });
+
+        // Add actual tags sorted by count (descending)
+        let mut sorted_tags: Vec<_> = tag_counts.into_iter().collect();
+        sorted_tags.sort_by(|a, b| b.1.cmp(&a.1));
+
+        for (tag_name, count) in sorted_tags {
+            tags.push(TagInfo {
+                name: tag_name,
+                count,
+                is_special: false,
+            });
+        }
+
+        // "untagged" is last (special)
+        if untagged_count > 0 {
+            tags.push(TagInfo {
+                name: "untagged".to_string(),
+                count: untagged_count,
+                is_special: true,
+            });
+        }
+
+        self.discover.tags = tags;
+    }
+
+    /// Get files filtered by current tag and text filter
     ///
-    /// Supports gitignore-style patterns:
+    /// Tag filtering:
+    /// - Uses preview_tag when tags dropdown is open (live preview)
+    /// - Uses selected_tag when dropdown is closed
+    /// - "All files" (index 0) or None = no tag filter
+    /// - "untagged" = files with no tags
+    /// - Other tags = files with that specific tag
+    ///
+    /// Text filter supports gitignore-style patterns:
     /// - `foo` matches any path containing "foo"
     /// - `*foo*` matches paths with "foo" anywhere (wildcard)
     /// - `*.py` matches files ending in .py
     pub fn filtered_files(&self) -> Vec<&FileInfo> {
-        if self.discover.filter.is_empty() {
-            self.discover.files.iter().collect()
+        // Step 1: Get the active tag for filtering
+        let active_tag_idx = if self.discover.tags_dropdown_open {
+            self.discover.preview_tag
         } else {
-            // Check if filter contains wildcard characters
+            self.discover.selected_tag
+        };
+
+        // Step 2: Determine which tag to filter by
+        let tag_filter: Option<&str> = match active_tag_idx {
+            None => None, // No tag selected = show all
+            Some(idx) => {
+                match self.discover.tags.get(idx) {
+                    Some(tag_info) if tag_info.name == "All files" => None, // Show all
+                    Some(tag_info) if tag_info.name == "untagged" => Some(""), // Empty string = untagged
+                    Some(tag_info) => Some(&tag_info.name), // Specific tag
+                    None => None,
+                }
+            }
+        };
+
+        // Step 3: Apply tag filter first
+        let tag_filtered: Vec<&FileInfo> = match tag_filter {
+            None => self.discover.files.iter().collect(),
+            Some("") => {
+                // "untagged" - files with no tags
+                self.discover.files.iter().filter(|f| f.tags.is_empty()).collect()
+            }
+            Some(tag_name) => {
+                // Specific tag
+                self.discover.files.iter().filter(|f| f.tags.contains(&tag_name.to_string())).collect()
+            }
+        };
+
+        // Step 4: Apply text filter on top of tag filter
+        if self.discover.filter.is_empty() {
+            tag_filtered
+        } else {
             let has_wildcards = self.discover.filter.contains('*')
                 || self.discover.filter.contains('?');
 
             if has_wildcards {
-                // Use globset with case-insensitive matching
                 use globset::GlobBuilder;
 
-                // Wrap pattern to match anywhere in path if not already a path pattern
                 let pattern = if self.discover.filter.contains('/') {
                     self.discover.filter.clone()
                 } else {
@@ -1692,29 +2099,26 @@ impl App {
                     .map(|g| g.compile_matcher())
                 {
                     Ok(matcher) => {
-                        self.discover.files
-                            .iter()
+                        tag_filtered
+                            .into_iter()
                             .filter(|f| {
-                                // Strip leading / for glob matching (glob ** doesn't match leading /)
                                 let path = f.path.strip_prefix('/').unwrap_or(&f.path);
                                 matcher.is_match(path)
                             })
                             .collect()
                     }
                     Err(_) => {
-                        // Invalid pattern, fall back to substring match
                         let filter_lower = self.discover.filter.to_lowercase();
-                        self.discover.files
-                            .iter()
+                        tag_filtered
+                            .into_iter()
                             .filter(|f| f.path.to_lowercase().contains(&filter_lower))
                             .collect()
                     }
                 }
             } else {
-                // Simple substring match (case insensitive)
                 let filter_lower = self.discover.filter.to_lowercase();
-                self.discover.files
-                    .iter()
+                tag_filtered
+                    .into_iter()
                     .filter(|f| f.path.to_lowercase().contains(&filter_lower))
                     .collect()
             }
@@ -1887,6 +2291,9 @@ impl App {
                         self.discover.selected = 0;
                         self.discover.data_loaded = true;
                         self.discover.scan_error = None;
+
+                        // Show wizard if there are untagged files (first-time UX)
+                        self.maybe_show_wizard();
                     }
                     Err(e) => {
                         self.discover.scan_error = Some(format!("Query failed: {}", e));
@@ -2037,6 +2444,64 @@ impl App {
                     self.discover.selected_tag = None; // Reset to "All files"
                 }
             }
+        }
+    }
+
+    /// Persist pending tag and rule writes to the database
+    async fn persist_pending_writes(&mut self) {
+        use sqlx::SqlitePool;
+
+        // Skip if nothing to persist
+        if self.discover.pending_tag_writes.is_empty() && self.discover.pending_rule_writes.is_empty() {
+            return;
+        }
+
+        let db_path = dirs::home_dir()
+            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+
+        if !db_path.exists() {
+            return;
+        }
+
+        // Need write mode for updates
+        let db_url = format!("sqlite:{}", db_path.display());
+        let pool = match SqlitePool::connect(&db_url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Persist tag updates to scout_files
+        let tag_writes = std::mem::take(&mut self.discover.pending_tag_writes);
+        for (file_path, tag) in tag_writes {
+            let _ = sqlx::query("UPDATE scout_files SET tag = ? WHERE path = ?")
+                .bind(&tag)
+                .bind(&file_path)
+                .execute(&pool)
+                .await;
+        }
+
+        // Persist rules to scout_tagging_rules
+        let rule_writes = std::mem::take(&mut self.discover.pending_rule_writes);
+        for (pattern, tag, source_id) in rule_writes {
+            let rule_id = uuid::Uuid::new_v4().to_string();
+            let rule_name = format!("{} → {}", pattern, tag);
+            let now = chrono::Utc::now().timestamp();
+
+            let _ = sqlx::query(
+                r#"INSERT OR IGNORE INTO scout_tagging_rules
+                   (id, name, source_id, pattern, tag, priority, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 100, 1, ?, ?)"#
+            )
+                .bind(&rule_id)
+                .bind(&rule_name)
+                .bind(&source_id)
+                .bind(&pattern)
+                .bind(&tag)
+                .bind(now)
+                .bind(now)
+                .execute(&pool)
+                .await;
         }
     }
 
@@ -2596,6 +3061,9 @@ impl App {
     pub async fn tick(&mut self) {
         // Load Scout data if in Discover mode
         if self.mode == TuiMode::Discover {
+            // Process pending DB writes FIRST (before any reloads)
+            self.persist_pending_writes().await;
+
             // Load sources for sidebar
             if !self.discover.sources_loaded {
                 self.load_sources().await;
