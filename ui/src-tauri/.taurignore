@@ -1,7 +1,0 @@
-# Ignore SQLite database files from triggering hot-reload
-scout.db
-scout.db-wal
-scout.db-shm
-*.db
-*.db-wal
-*.db-shm

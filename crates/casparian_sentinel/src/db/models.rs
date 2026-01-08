@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use casparian_protocol::{SinkMode, WorkerStatus};
 
 // ============================================================================
 // Enums
@@ -99,8 +100,16 @@ pub struct TopicConfig {
     pub plugin_name: String,
     pub topic_name: String,
     pub uri: String,
+    /// Mode as string for database compatibility. Use `sink_mode()` for typed access.
     pub mode: String,
     pub schema_json: Option<String>,
+}
+
+impl TopicConfig {
+    /// Get mode as typed enum
+    pub fn sink_mode(&self) -> SinkMode {
+        self.mode.parse().unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -117,7 +126,7 @@ pub struct PluginSubscription {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ProcessingJob {
-    pub id: i32,
+    pub id: i64,
     pub file_version_id: i32,
     pub plugin_name: String,
     pub config_overrides: Option<String>, // JSON
@@ -207,8 +216,16 @@ pub struct WorkerNode {
     pub env_signature: Option<String>,
     pub started_at: DateTime<Utc>,
     pub last_heartbeat: DateTime<Utc>,
+    /// Status as string for database compatibility. Use `worker_status()` for typed access.
     pub status: String,
     pub current_job_id: Option<i32>,
+}
+
+impl WorkerNode {
+    /// Get status as typed enum
+    pub fn worker_status(&self) -> WorkerStatus {
+        self.status.parse().unwrap_or_default()
+    }
 }
 
 #[cfg(test)]

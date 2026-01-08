@@ -3,7 +3,7 @@
 //! Reads only 16KB of file head to detect format and shred strategy.
 //! Designed to handle 90% of cases deterministically without LLM.
 
-use cf_protocol::{AnalysisResult, DetectionConfidence, ShredStrategy};
+use casparian_protocol::{AnalysisResult, DetectionConfidence, ShredStrategy};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};

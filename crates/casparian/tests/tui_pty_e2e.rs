@@ -149,9 +149,38 @@ impl PtyReader {
     }
 }
 
+/// Find the casparian binary (prefer release, fallback to debug)
+fn find_casparian_binary() -> Option<std::path::PathBuf> {
+    let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();
+
+    // Try release first
+    let release_bin = workspace_dir.join("target/release/casparian");
+    if release_bin.exists() {
+        return Some(release_bin);
+    }
+
+    // Fall back to debug
+    let debug_bin = workspace_dir.join("target/debug/casparian");
+    if debug_bin.exists() {
+        return Some(debug_bin);
+    }
+
+    None
+}
+
 /// Test: TUI starts and shows welcome message
 #[test]
 fn test_tui_starts_in_pty() {
+    // Use pre-built binary for speed
+    let binary = match find_casparian_binary() {
+        Some(b) => b,
+        None => {
+            println!("Skipping: casparian binary not found. Run `cargo build` first.");
+            return;
+        }
+    };
+
     let pty_system = native_pty_system();
 
     let pair = match pty_system.openpty(PtySize {
@@ -167,9 +196,9 @@ fn test_tui_starts_in_pty() {
         }
     };
 
-    // Build command to run the TUI
-    let mut cmd = CommandBuilder::new("cargo");
-    cmd.args(["run", "-p", "casparian", "-q", "--", "tui"]);
+    // Build command to run the TUI using pre-built binary
+    let mut cmd = CommandBuilder::new(&binary);
+    cmd.arg("tui");
 
     // Set working directory
     let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -219,6 +248,14 @@ fn test_tui_starts_in_pty() {
 /// Test: Type a message and see it echoed (without Claude)
 #[test]
 fn test_tui_typing() {
+    let binary = match find_casparian_binary() {
+        Some(b) => b,
+        None => {
+            println!("Skipping: casparian binary not found");
+            return;
+        }
+    };
+
     let pty_system = native_pty_system();
 
     let pair = match pty_system.openpty(PtySize {
@@ -234,8 +271,8 @@ fn test_tui_typing() {
         }
     };
 
-    let mut cmd = CommandBuilder::new("cargo");
-    cmd.args(["run", "-p", "casparian", "-q", "--", "tui"]);
+    let mut cmd = CommandBuilder::new(&binary);
+    cmd.arg("tui");
 
     let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();
@@ -286,6 +323,14 @@ fn test_tui_typing() {
 /// Test: Full flow - type message, get Claude response (if available)
 #[test]
 fn test_tui_claude_chat() {
+    let binary = match find_casparian_binary() {
+        Some(b) => b,
+        None => {
+            println!("Skipping: casparian binary not found");
+            return;
+        }
+    };
+
     // First check if Claude Code is available
     let claude_available = std::process::Command::new("claude")
         .arg("--version")
@@ -313,8 +358,8 @@ fn test_tui_claude_chat() {
         }
     };
 
-    let mut cmd = CommandBuilder::new("cargo");
-    cmd.args(["run", "-p", "casparian", "-q", "--", "tui"]);
+    let mut cmd = CommandBuilder::new(&binary);
+    cmd.arg("tui");
 
     let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();
@@ -370,6 +415,14 @@ fn test_tui_claude_chat() {
 /// Test: View switching with F-keys
 #[test]
 fn test_tui_view_switching() {
+    let binary = match find_casparian_binary() {
+        Some(b) => b,
+        None => {
+            println!("Skipping: casparian binary not found");
+            return;
+        }
+    };
+
     let pty_system = native_pty_system();
 
     let pair = match pty_system.openpty(PtySize {
@@ -385,8 +438,8 @@ fn test_tui_view_switching() {
         }
     };
 
-    let mut cmd = CommandBuilder::new("cargo");
-    cmd.args(["run", "-p", "casparian", "-q", "--", "tui"]);
+    let mut cmd = CommandBuilder::new(&binary);
+    cmd.arg("tui");
 
     let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();

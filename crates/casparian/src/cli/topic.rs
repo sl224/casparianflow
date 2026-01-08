@@ -2,9 +2,10 @@
 //!
 //! Data-oriented design: structs for data, functions for behavior.
 
+use crate::cli::config::default_db_path;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table};
-use casparian_scout::{Database, FileStatus};
+use crate::scout::{Database, FileStatus};
 use clap::Subcommand;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,17 +42,6 @@ pub enum TopicAction {
         #[arg(long, default_value = "50")]
         limit: usize,
     },
-}
-
-/// Get the default database path
-fn get_default_db_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        let casparian_dir = home.join(".casparian_flow");
-        std::fs::create_dir_all(&casparian_dir).ok();
-        casparian_dir.join("scout.db")
-    } else {
-        PathBuf::from("scout.db")
-    }
 }
 
 /// Topic statistics
@@ -104,7 +94,7 @@ pub fn run(action: TopicAction) -> anyhow::Result<()> {
 }
 
 async fn run_async(action: TopicAction) -> anyhow::Result<()> {
-    let db_path = get_default_db_path();
+    let db_path = default_db_path();
     let db = Database::open(&db_path).await.map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
@@ -424,7 +414,7 @@ async fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<
     let files = db.list_files_by_tag(name, 100000).await.unwrap_or_default();
     for file in files {
         if let Some(id) = file.id {
-            db.clear_manual_overrides(id).await.ok();
+            db.untag_file(id).await.ok();
         }
     }
 
@@ -466,7 +456,7 @@ async fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian_scout::{Source, SourceType, TaggingRule};
+    use crate::scout::{ScannedFile, Source, SourceType, TaggingRule};
 
     #[tokio::test]
     async fn test_get_topic_stats() {
@@ -491,7 +481,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let file = casparian_scout::ScannedFile::new(
+            let file = ScannedFile::new(
                 "src-1",
                 &format!("/data/{}", name),
                 name,

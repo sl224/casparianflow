@@ -1,0 +1,955 @@
+//! SQLite state database for Scout
+//!
+//! Scout is the File Discovery + Tagging layer.
+//! All state flows through SQLite:
+//! - Sources: filesystem locations to watch
+//! - Tagging Rules: pattern → tag mappings
+//! - Files: discovered files with their tags and status
+
+use super::error::Result;
+use super::types::{DbStats, FileStatus, ScannedFile, Source, SourceType, TaggingRule, UpsertResult};
+use chrono::{DateTime, Utc};
+use sqlx::{Row, SqlitePool};
+use std::path::Path;
+
+/// SQLite database schema (v2 - tag-based)
+/// Note: All timestamps are stored as INTEGER (milliseconds since Unix epoch)
+const SCHEMA_SQL: &str = r#"
+-- Sources: filesystem locations to watch
+CREATE TABLE IF NOT EXISTS scout_sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    source_type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    poll_interval_secs INTEGER NOT NULL DEFAULT 30,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- Tagging Rules: pattern → tag mappings
+CREATE TABLE IF NOT EXISTS scout_tagging_rules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    source_id TEXT NOT NULL REFERENCES scout_sources(id),
+    pattern TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- Settings: key-value store for configuration
+CREATE TABLE IF NOT EXISTS scout_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Schema migrations: tracks which migrations have been applied
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    applied_at INTEGER NOT NULL
+);
+
+-- Files: discovered files and their status
+CREATE TABLE IF NOT EXISTS scout_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL REFERENCES scout_sources(id),
+    path TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    content_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    tag TEXT,
+    tag_source TEXT,
+    rule_id TEXT,
+    manual_plugin TEXT,
+    error TEXT,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    processed_at INTEGER,
+    sentinel_job_id INTEGER,
+    UNIQUE(source_id, path)
+);
+
+-- Parser Lab parsers (v6 - parser-centric)
+-- NOTE: These tables are here for backward compatibility.
+-- They should eventually be moved to a separate module.
+CREATE TABLE IF NOT EXISTS parser_lab_parsers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    file_pattern TEXT NOT NULL DEFAULT '',
+    pattern_type TEXT DEFAULT 'all',
+    source_code TEXT,
+    validation_status TEXT DEFAULT 'pending',
+    validation_error TEXT,
+    validation_output TEXT,
+    last_validated_at INTEGER,
+    messages_json TEXT,
+    schema_json TEXT,
+    sink_type TEXT DEFAULT 'parquet',
+    sink_config_json TEXT,
+    published_at INTEGER,
+    published_plugin_id INTEGER,
+    is_sample INTEGER DEFAULT 0,
+    output_mode TEXT DEFAULT 'single',
+    detected_topics_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- Parser Lab test files
+CREATE TABLE IF NOT EXISTS parser_lab_test_files (
+    id TEXT PRIMARY KEY,
+    parser_id TEXT NOT NULL REFERENCES parser_lab_parsers(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_size INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE(parser_id, file_path)
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_files_source ON scout_files(source_id);
+CREATE INDEX IF NOT EXISTS idx_files_status ON scout_files(status);
+CREATE INDEX IF NOT EXISTS idx_files_tag ON scout_files(tag);
+CREATE INDEX IF NOT EXISTS idx_files_mtime ON scout_files(mtime);
+CREATE INDEX IF NOT EXISTS idx_files_path ON scout_files(path);
+CREATE INDEX IF NOT EXISTS idx_files_last_seen ON scout_files(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_files_tag_source ON scout_files(tag_source);
+CREATE INDEX IF NOT EXISTS idx_files_manual_plugin ON scout_files(manual_plugin);
+CREATE INDEX IF NOT EXISTS idx_tagging_rules_source ON scout_tagging_rules(source_id);
+CREATE INDEX IF NOT EXISTS idx_tagging_rules_priority ON scout_tagging_rules(priority DESC);
+CREATE INDEX IF NOT EXISTS idx_parser_lab_parsers_updated ON parser_lab_parsers(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_parser_lab_parsers_status ON parser_lab_parsers(validation_status);
+CREATE INDEX IF NOT EXISTS idx_parser_lab_parsers_pattern ON parser_lab_parsers(file_pattern);
+CREATE INDEX IF NOT EXISTS idx_parser_lab_test_files_parser ON parser_lab_test_files(parser_id);
+"#;
+
+/// Convert milliseconds since epoch to DateTime
+fn millis_to_datetime(millis: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
+}
+
+/// Get current time as milliseconds since epoch
+fn now_millis() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// Database wrapper with connection pool
+#[derive(Clone)]
+pub struct Database {
+    pool: SqlitePool,
+}
+
+// Many methods are used in tests and will be used for processing integration
+#[allow(dead_code)]
+impl Database {
+    /// Open or create a database at the given path
+    pub async fn open(path: &Path) -> Result<Self> {
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let pool = SqlitePool::connect(&url).await?;
+
+        // Enable WAL mode for better concurrent access
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&pool)
+            .await?;
+
+        // Create schema
+        sqlx::query(SCHEMA_SQL).execute(&pool).await?;
+
+        Ok(Self { pool })
+    }
+
+    /// Create an in-memory database (for testing)
+    pub async fn open_in_memory() -> Result<Self> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+
+        // Create schema
+        sqlx::query(SCHEMA_SQL).execute(&pool).await?;
+
+        Ok(Self { pool })
+    }
+
+    /// Get the underlying pool (for sharing with other code)
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    // ========================================================================
+    // Source Operations
+    // ========================================================================
+
+    /// Insert or update a source
+    pub async fn upsert_source(&self, source: &Source) -> Result<()> {
+        let source_type_json = serde_json::to_string(&source.source_type)?;
+        let now = now_millis();
+
+        sqlx::query(
+            r#"
+            INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                source_type = excluded.source_type,
+                path = excluded.path,
+                poll_interval_secs = excluded.poll_interval_secs,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&source.id)
+        .bind(&source.name)
+        .bind(&source_type_json)
+        .bind(&source.path)
+        .bind(source.poll_interval_secs as i64)
+        .bind(source.enabled as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get a source by ID
+    pub async fn get_source(&self, id: &str) -> Result<Option<Source>> {
+        let row = sqlx::query(
+            "SELECT id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(Self::row_to_source(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get a source by name
+    pub async fn get_source_by_name(&self, name: &str) -> Result<Option<Source>> {
+        let row = sqlx::query(
+            "SELECT id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(Self::row_to_source(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all sources
+    pub async fn list_sources(&self) -> Result<Vec<Source>> {
+        let rows = sqlx::query(
+            "SELECT id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_source).collect()
+    }
+
+    /// List enabled sources
+    pub async fn list_enabled_sources(&self) -> Result<Vec<Source>> {
+        let rows = sqlx::query(
+            "SELECT id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE enabled = 1 ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_source).collect()
+    }
+
+    /// Delete a source and all associated data
+    pub async fn delete_source(&self, id: &str) -> Result<bool> {
+        // Delete associated files and tagging rules first
+        sqlx::query("DELETE FROM scout_files WHERE source_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM scout_tagging_rules WHERE source_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        let result = sqlx::query("DELETE FROM scout_sources WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    fn row_to_source(row: &sqlx::sqlite::SqliteRow) -> Result<Source> {
+        let source_type_json: String = row.get(2);
+        let source_type: SourceType = serde_json::from_str(&source_type_json)?;
+        let poll_interval: i64 = row.get(4);
+        let enabled: i32 = row.get(5);
+
+        Ok(Source {
+            id: row.get(0),
+            name: row.get(1),
+            source_type,
+            path: row.get(3),
+            poll_interval_secs: poll_interval as u64,
+            enabled: enabled != 0,
+        })
+    }
+
+    // ========================================================================
+    // Tagging Rule Operations
+    // ========================================================================
+
+    /// Insert or update a tagging rule
+    pub async fn upsert_tagging_rule(&self, rule: &TaggingRule) -> Result<()> {
+        let now = now_millis();
+
+        sqlx::query(
+            r#"
+            INSERT INTO scout_tagging_rules (id, name, source_id, pattern, tag, priority, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                source_id = excluded.source_id,
+                pattern = excluded.pattern,
+                tag = excluded.tag,
+                priority = excluded.priority,
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&rule.id)
+        .bind(&rule.name)
+        .bind(&rule.source_id)
+        .bind(&rule.pattern)
+        .bind(&rule.tag)
+        .bind(rule.priority)
+        .bind(rule.enabled as i32)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get a tagging rule by ID
+    pub async fn get_tagging_rule(&self, id: &str) -> Result<Option<TaggingRule>> {
+        let row = sqlx::query(
+            "SELECT id, name, source_id, pattern, tag, priority, enabled FROM scout_tagging_rules WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(Self::row_to_tagging_rule(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all tagging rules
+    pub async fn list_tagging_rules(&self) -> Result<Vec<TaggingRule>> {
+        let rows = sqlx::query(
+            "SELECT id, name, source_id, pattern, tag, priority, enabled FROM scout_tagging_rules ORDER BY priority DESC, name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_tagging_rule).collect()
+    }
+
+    /// List enabled tagging rules for a source (ordered by priority)
+    pub async fn list_tagging_rules_for_source(&self, source_id: &str) -> Result<Vec<TaggingRule>> {
+        let rows = sqlx::query(
+            "SELECT id, name, source_id, pattern, tag, priority, enabled FROM scout_tagging_rules WHERE source_id = ? AND enabled = 1 ORDER BY priority DESC, name",
+        )
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_tagging_rule).collect()
+    }
+
+    /// Delete a tagging rule
+    pub async fn delete_tagging_rule(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM scout_tagging_rules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    fn row_to_tagging_rule(row: &sqlx::sqlite::SqliteRow) -> Result<TaggingRule> {
+        let enabled: i32 = row.get(6);
+        Ok(TaggingRule {
+            id: row.get(0),
+            name: row.get(1),
+            source_id: row.get(2),
+            pattern: row.get(3),
+            tag: row.get(4),
+            priority: row.get(5),
+            enabled: enabled != 0,
+        })
+    }
+
+    // ========================================================================
+    // File Operations
+    // ========================================================================
+
+    /// Upsert a scanned file
+    ///
+    /// If the file exists and mtime/size changed, resets status to pending.
+    pub async fn upsert_file(&self, file: &ScannedFile) -> Result<UpsertResult> {
+        // Check if file exists
+        let existing: Option<(i64, i64, i64, String)> = sqlx::query_as(
+            "SELECT id, size, mtime, status FROM scout_files WHERE source_id = ? AND path = ?",
+        )
+        .bind(&file.source_id)
+        .bind(&file.path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let now = now_millis();
+        match existing {
+            None => {
+                // New file
+                let result = sqlx::query(
+                    r#"
+                    INSERT INTO scout_files (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    "#,
+                )
+                .bind(&file.source_id)
+                .bind(&file.path)
+                .bind(&file.rel_path)
+                .bind(file.size as i64)
+                .bind(file.mtime)
+                .bind(&file.content_hash)
+                .bind(&file.tag)
+                .bind(now)
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+
+                Ok(UpsertResult {
+                    id: result.last_insert_rowid(),
+                    is_new: true,
+                    is_changed: false,
+                })
+            }
+            Some((id, old_size, old_mtime, _status)) => {
+                let changed = file.size as i64 != old_size || file.mtime != old_mtime;
+
+                if changed {
+                    // File changed - reset to pending, clear tag
+                    sqlx::query(
+                        r#"
+                        UPDATE scout_files SET
+                            size = ?,
+                            mtime = ?,
+                            content_hash = ?,
+                            status = 'pending',
+                            tag = NULL,
+                            error = NULL,
+                            sentinel_job_id = NULL,
+                            last_seen_at = ?
+                        WHERE id = ?
+                        "#,
+                    )
+                    .bind(file.size as i64)
+                    .bind(file.mtime)
+                    .bind(&file.content_hash)
+                    .bind(now)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
+                } else {
+                    // Just update last_seen_at
+                    sqlx::query("UPDATE scout_files SET last_seen_at = ? WHERE id = ?")
+                        .bind(now)
+                        .bind(id)
+                        .execute(&self.pool)
+                        .await?;
+                }
+
+                Ok(UpsertResult {
+                    id,
+                    is_new: false,
+                    is_changed: changed,
+                })
+            }
+        }
+    }
+
+    /// Get a file by ID
+    pub async fn get_file(&self, id: i64) -> Result<Option<ScannedFile>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+            FROM scout_files WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(Self::row_to_file(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get a file by path
+    pub async fn get_file_by_path(&self, source_id: &str, path: &str) -> Result<Option<ScannedFile>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+            FROM scout_files WHERE source_id = ? AND path = ?
+            "#,
+        )
+        .bind(source_id)
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(Self::row_to_file(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all files for a source (regardless of status)
+    pub async fn list_files_by_source(&self, source_id: &str, limit: usize) -> Result<Vec<ScannedFile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+            FROM scout_files WHERE source_id = ?
+            ORDER BY mtime DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(source_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_file).collect()
+    }
+
+    /// List files with a specific status
+    pub async fn list_files_by_status(&self, status: FileStatus, limit: usize) -> Result<Vec<ScannedFile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+            FROM scout_files WHERE status = ?
+            ORDER BY mtime DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_file).collect()
+    }
+
+    /// List pending (untagged) files for a source
+    pub async fn list_pending_files(&self, source_id: &str, limit: usize) -> Result<Vec<ScannedFile>> {
+        self.list_files_by_source_and_status(source_id, FileStatus::Pending, limit).await
+    }
+
+    /// List tagged files ready for processing
+    pub async fn list_tagged_files(&self, source_id: &str, limit: usize) -> Result<Vec<ScannedFile>> {
+        self.list_files_by_source_and_status(source_id, FileStatus::Tagged, limit).await
+    }
+
+    /// List untagged files (files that have no tag assigned)
+    pub async fn list_untagged_files(&self, source_id: &str, limit: usize) -> Result<Vec<ScannedFile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+            FROM scout_files WHERE source_id = ? AND tag IS NULL AND status = 'pending'
+            ORDER BY mtime DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(source_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_file).collect()
+    }
+
+    /// List files by tag
+    pub async fn list_files_by_tag(&self, tag: &str, limit: usize) -> Result<Vec<ScannedFile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+            FROM scout_files WHERE tag = ?
+            ORDER BY mtime DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(tag)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_file).collect()
+    }
+
+    /// List files for a source with specific status
+    pub async fn list_files_by_source_and_status(
+        &self,
+        source_id: &str,
+        status: FileStatus,
+        limit: usize,
+    ) -> Result<Vec<ScannedFile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+            FROM scout_files WHERE source_id = ? AND status = ?
+            ORDER BY mtime DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(source_id)
+        .bind(status.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_file).collect()
+    }
+
+    /// Tag a file manually (sets tag_source = 'manual')
+    pub async fn tag_file(&self, id: i64, tag: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE scout_files SET tag = ?, tag_source = 'manual', rule_id = NULL, status = 'tagged' WHERE id = ?",
+        )
+        .bind(tag)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Tag multiple files manually (sets tag_source = 'manual')
+    pub async fn tag_files(&self, ids: &[i64], tag: &str) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0u64;
+        for id in ids {
+            let result = sqlx::query(
+                "UPDATE scout_files SET tag = ?, tag_source = 'manual', rule_id = NULL, status = 'tagged' WHERE id = ?",
+            )
+            .bind(tag)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            total += result.rows_affected();
+        }
+        Ok(total)
+    }
+
+    /// Tag a file via a tagging rule (sets tag_source = 'rule')
+    pub async fn tag_file_by_rule(&self, id: i64, tag: &str, rule_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE scout_files SET tag = ?, tag_source = 'rule', rule_id = ?, status = 'tagged' WHERE id = ?",
+        )
+        .bind(tag)
+        .bind(rule_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update file status
+    pub async fn update_file_status(&self, id: i64, status: FileStatus, error: Option<&str>) -> Result<()> {
+        if status == FileStatus::Processed {
+            sqlx::query("UPDATE scout_files SET status = ?, error = ?, processed_at = ? WHERE id = ?")
+                .bind(status.as_str())
+                .bind(error)
+                .bind(now_millis())
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            sqlx::query("UPDATE scout_files SET status = ?, error = ? WHERE id = ?")
+                .bind(status.as_str())
+                .bind(error)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Untag a file (clear tag, tag_source, rule_id, manual_plugin and reset to pending)
+    pub async fn untag_file(&self, id: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE scout_files SET tag = NULL, tag_source = NULL, rule_id = NULL, \
+             manual_plugin = NULL, status = 'pending', sentinel_job_id = NULL WHERE id = ?"
+        )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark file as queued for processing
+    pub async fn mark_file_queued(&self, id: i64, sentinel_job_id: i64) -> Result<()> {
+        sqlx::query("UPDATE scout_files SET status = 'queued', sentinel_job_id = ? WHERE id = ?")
+            .bind(sentinel_job_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark files as deleted if not seen recently
+    pub async fn mark_deleted_files(&self, source_id: &str, seen_before: DateTime<Utc>) -> Result<u64> {
+        let seen_before_millis = seen_before.timestamp_millis();
+        let result = sqlx::query(
+            r#"
+            UPDATE scout_files SET status = 'deleted'
+            WHERE source_id = ? AND last_seen_at < ? AND status != 'deleted'
+            "#,
+        )
+        .bind(source_id)
+        .bind(seen_before_millis)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    fn row_to_file(row: &sqlx::sqlite::SqliteRow) -> Result<ScannedFile> {
+        let status_str: String = row.get(7);
+        let status = FileStatus::parse(&status_str).unwrap_or(FileStatus::Pending);
+
+        let first_seen_millis: i64 = row.get(13);
+        let last_seen_millis: i64 = row.get(14);
+        let processed_at_millis: Option<i64> = row.get(15);
+
+        Ok(ScannedFile {
+            id: Some(row.get(0)),
+            source_id: row.get(1),
+            path: row.get(2),
+            rel_path: row.get(3),
+            size: row.get::<i64, _>(4) as u64,
+            mtime: row.get(5),
+            content_hash: row.get(6),
+            status,
+            tag: row.get(8),
+            tag_source: row.get(9),
+            rule_id: row.get(10),
+            manual_plugin: row.get(11),
+            error: row.get(12),
+            first_seen_at: millis_to_datetime(first_seen_millis),
+            last_seen_at: millis_to_datetime(last_seen_millis),
+            processed_at: processed_at_millis.map(millis_to_datetime),
+            sentinel_job_id: row.get(16),
+        })
+    }
+
+    // ========================================================================
+    // Statistics
+    // ========================================================================
+
+    /// Get database statistics
+    pub async fn get_stats(&self) -> Result<DbStats> {
+        let row: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) as total_files,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as files_pending,
+                SUM(CASE WHEN status = 'tagged' THEN 1 ELSE 0 END) as files_tagged,
+                SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) as files_queued,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as files_processing,
+                SUM(CASE WHEN status = 'processed' THEN 1 ELSE 0 END) as files_processed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as files_failed,
+                COALESCE(SUM(CASE WHEN status = 'pending' THEN size ELSE 0 END), 0) as bytes_pending,
+                COALESCE(SUM(CASE WHEN status = 'processed' THEN size ELSE 0 END), 0) as bytes_processed
+            FROM scout_files
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0, 0));
+
+        let total_sources: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scout_sources")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or((0,));
+
+        let total_tagging_rules: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM scout_tagging_rules")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or((0,));
+
+        Ok(DbStats {
+            total_sources: total_sources.0 as u64,
+            total_tagging_rules: total_tagging_rules.0 as u64,
+            total_files: row.0 as u64,
+            files_pending: row.1 as u64,
+            files_tagged: row.2 as u64,
+            files_queued: row.3 as u64,
+            files_processing: row.4 as u64,
+            files_processed: row.5 as u64,
+            files_failed: row.6 as u64,
+            bytes_pending: row.7 as u64,
+            bytes_processed: row.8 as u64,
+        })
+    }
+
+    // ========================================================================
+    // Settings Operations
+    // ========================================================================
+
+    /// Set a setting value
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO scout_settings (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Get a setting value
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let result: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM scout_settings WHERE key = ?")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(result.map(|(v,)| v))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn create_test_db() -> Database {
+        Database::open_in_memory().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_source_crud() {
+        let db = create_test_db().await;
+
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Test Source".to_string(),
+            source_type: SourceType::Local,
+            path: "/data".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+
+        db.upsert_source(&source).await.unwrap();
+        let fetched = db.get_source("src-1").await.unwrap().unwrap();
+        assert_eq!(fetched.name, "Test Source");
+        assert_eq!(fetched.path, "/data");
+
+        let sources = db.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+
+        assert!(db.delete_source("src-1").await.unwrap());
+        assert!(db.get_source("src-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tagging_rule_crud() {
+        let db = create_test_db().await;
+
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Test Source".to_string(),
+            source_type: SourceType::Local,
+            path: "/data".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        let rule = TaggingRule {
+            id: "rule-1".to_string(),
+            name: "CSV Files".to_string(),
+            source_id: "src-1".to_string(),
+            pattern: "*.csv".to_string(),
+            tag: "csv_data".to_string(),
+            priority: 10,
+            enabled: true,
+        };
+
+        db.upsert_tagging_rule(&rule).await.unwrap();
+        let fetched = db.get_tagging_rule("rule-1").await.unwrap().unwrap();
+        assert_eq!(fetched.tag, "csv_data");
+        assert_eq!(fetched.priority, 10);
+
+        let rules = db.list_tagging_rules_for_source("src-1").await.unwrap();
+        assert_eq!(rules.len(), 1);
+
+        assert!(db.delete_tagging_rule("rule-1").await.unwrap());
+        assert!(db.get_tagging_rule("rule-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_file_tagging() {
+        let db = create_test_db().await;
+
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Test".to_string(),
+            source_type: SourceType::Local,
+            path: "/data".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        let file = ScannedFile::new("src-1", "/data/test.csv", "test.csv", 1000, 12345);
+        let result = db.upsert_file(&file).await.unwrap();
+
+        // File starts untagged
+        let fetched = db.get_file(result.id).await.unwrap().unwrap();
+        assert!(fetched.tag.is_none());
+        assert_eq!(fetched.status, FileStatus::Pending);
+
+        // Tag the file
+        db.tag_file(result.id, "csv_data").await.unwrap();
+        let fetched = db.get_file(result.id).await.unwrap().unwrap();
+        assert_eq!(fetched.tag, Some("csv_data".to_string()));
+        assert_eq!(fetched.status, FileStatus::Tagged);
+
+        // List by tag
+        let tagged = db.list_files_by_tag("csv_data", 10).await.unwrap();
+        assert_eq!(tagged.len(), 1);
+    }
+}

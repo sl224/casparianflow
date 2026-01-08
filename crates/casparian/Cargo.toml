@@ -7,12 +7,12 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-casparian_scout = { path = "../casparian_scout" }
+# NOTE: casparian_scout has been inlined into crate::scout module
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
 casparian_mcp = { path = "../casparian_mcp" }
-cf_protocol = { path = "../cf_protocol" }
-cf_security = { path = "../cf_security" }
+casparian_protocol = { path = "../casparian_protocol" }
+casparian_security = { path = "../casparian_security" }
 
 # Async runtime
 tokio.workspace = true
@@ -33,9 +33,12 @@ zeromq.workspace = true
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
+blake3 = "1"
+base64 = "0.22"
 
 # Database
 sqlx.workspace = true
@@ -50,10 +53,11 @@ csv = "1"
 regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 glob = "0.3"
+globset = "0.4"
+ignore = "0.4"
 dirs = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
-blake3 = "1"
 zip = { version = "2", features = ["deflate"] }
 indicatif = { version = "0.17", features = ["rayon"] }
 
@@ -86,3 +90,4 @@ tempfile = "3.14"
 ureq = "2"
 futures = "0.3"
 portable-pty = "0.8"
+filetime = "0.2"

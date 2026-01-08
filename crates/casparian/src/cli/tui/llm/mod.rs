@@ -1,20 +1,16 @@
 //! LLM Provider Abstraction
 //!
-//! This module provides a trait-based abstraction for LLM providers,
-//! enabling support for multiple backends (Claude API, Claude Code, etc.).
-//!
-//! The design prioritizes:
-//! - **Streaming**: All responses stream token-by-token for responsive UI
-//! - **Tool Calling**: Full support for MCP tool definitions and execution
-//! - **Extensibility**: Easy to add new providers via the trait
+//! This module provides a trait-based abstraction for LLM providers.
 //!
 //! ## Available Providers
 //!
-//! - `claude`: Direct API calls (requires ANTHROPIC_API_KEY)
 //! - `claude_code`: Spawns `claude` CLI (uses claude-code's auth, no API key needed)
+//! - `mock`: Mock provider for deterministic testing (test only)
 
-pub mod claude;
 pub mod claude_code;
+
+#[cfg(test)]
+pub mod mock;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -29,6 +25,7 @@ use thiserror::Error;
 
 /// Errors that can occur during LLM operations
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum LlmError {
     /// API key not found or invalid
     #[error("API key error: {0}")]
@@ -124,43 +121,6 @@ impl ContentBlock {
         ContentBlock::Text { text: text.into() }
     }
 
-    /// Create a tool use content block
-    pub fn tool_use(id: impl Into<String>, name: impl Into<String>, input: Value) -> Self {
-        ContentBlock::ToolUse {
-            id: id.into(),
-            name: name.into(),
-            input,
-        }
-    }
-
-    /// Create a tool result content block
-    pub fn tool_result(tool_use_id: impl Into<String>, content: impl Into<String>) -> Self {
-        ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.into(),
-            content: content.into(),
-            is_error: false,
-        }
-    }
-
-    /// Create a tool error result content block
-    pub fn tool_error(tool_use_id: impl Into<String>, error: impl Into<String>) -> Self {
-        ContentBlock::ToolResult {
-            tool_use_id: tool_use_id.into(),
-            content: error.into(),
-            is_error: true,
-        }
-    }
-
-    /// Check if this is a text block
-    pub fn is_text(&self) -> bool {
-        matches!(self, ContentBlock::Text { .. })
-    }
-
-    /// Check if this is a tool use block
-    pub fn is_tool_use(&self) -> bool {
-        matches!(self, ContentBlock::ToolUse { .. })
-    }
-
     /// Get text content if this is a text block
     pub fn as_text(&self) -> Option<&str> {
         match self {
@@ -197,22 +157,6 @@ impl Message {
         }
     }
 
-    /// Create an assistant message with multiple content blocks
-    pub fn assistant_with_content(content: Vec<ContentBlock>) -> Self {
-        Self {
-            role: Role::Assistant,
-            content,
-        }
-    }
-
-    /// Create a user message with tool results
-    pub fn tool_results(results: Vec<ContentBlock>) -> Self {
-        Self {
-            role: Role::User,
-            content: results,
-        }
-    }
-
     /// Get all text from the message
     pub fn text(&self) -> String {
         self.content
@@ -220,16 +164,6 @@ impl Message {
             .filter_map(|c| c.as_text())
             .collect::<Vec<_>>()
             .join("")
-    }
-
-    /// Check if the message contains tool use requests
-    pub fn has_tool_use(&self) -> bool {
-        self.content.iter().any(|c| c.is_tool_use())
-    }
-
-    /// Get all tool use blocks from the message
-    pub fn tool_uses(&self) -> Vec<&ContentBlock> {
-        self.content.iter().filter(|c| c.is_tool_use()).collect()
     }
 }
 
@@ -277,20 +211,8 @@ pub struct ToolDefinition {
 }
 
 impl ToolDefinition {
-    /// Create a new tool definition
-    pub fn new(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        input_schema: ToolSchema,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            input_schema,
-        }
-    }
-
-    /// Create a tool definition with properties
+    /// Create a tool definition with properties (used for tests)
+    #[cfg(test)]
     pub fn with_properties(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -320,31 +242,12 @@ impl ToolDefinition {
 /// A chunk of streamed response from the LLM
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
-    /// Text delta (partial text)
+    /// Text content
     Text(String),
 
-    /// Tool call started
-    ToolCallStart {
-        /// Index of the tool call (for parallel calls)
-        index: usize,
-        /// Unique ID for this tool call
-        id: String,
-        /// Name of the tool being called
-        name: String,
-    },
-
-    /// Tool call arguments delta (partial JSON)
-    ToolCallDelta {
-        /// Index of the tool call
-        index: usize,
-        /// Partial arguments JSON
-        arguments_delta: String,
-    },
-
-    /// Tool call completed (full arguments available)
+    /// Tool call (full arguments available)
+    #[allow(dead_code)]
     ToolCall {
-        /// Unique ID for this tool call
-        id: String,
         /// Name of the tool
         name: String,
         /// Complete arguments as JSON
@@ -354,33 +257,12 @@ pub enum StreamChunk {
     /// Stream completed successfully
     Done {
         /// Stop reason (e.g., "end_turn", "tool_use")
+        #[allow(dead_code)]
         stop_reason: Option<String>,
     },
 
     /// Error occurred during streaming
     Error(String),
-}
-
-impl StreamChunk {
-    /// Check if this is a done chunk
-    pub fn is_done(&self) -> bool {
-        matches!(self, StreamChunk::Done { .. })
-    }
-
-    /// Check if this is an error chunk
-    pub fn is_error(&self) -> bool {
-        matches!(self, StreamChunk::Error(_))
-    }
-
-    /// Check if this indicates a tool use stop reason
-    pub fn is_tool_use_stop(&self) -> bool {
-        matches!(
-            self,
-            StreamChunk::Done {
-                stop_reason: Some(reason)
-            } if reason == "tool_use"
-        )
-    }
 }
 
 // =============================================================================
@@ -391,15 +273,19 @@ impl StreamChunk {
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     /// Model identifier (e.g., "claude-sonnet-4-20250514")
+    #[allow(dead_code)]
     pub model: String,
 
     /// Maximum tokens to generate
+    #[allow(dead_code)]
     pub max_tokens: u32,
 
     /// Temperature for sampling (0.0 - 1.0)
+    #[allow(dead_code)]
     pub temperature: Option<f32>,
 
     /// System prompt
+    #[allow(dead_code)]
     pub system: Option<String>,
 }
 
@@ -414,37 +300,11 @@ impl Default for LlmConfig {
     }
 }
 
-impl LlmConfig {
-    /// Create config with a specific model
-    pub fn with_model(model: impl Into<String>) -> Self {
-        Self {
-            model: model.into(),
-            ..Default::default()
-        }
-    }
-
-    /// Set the system prompt
-    pub fn system(mut self, system: impl Into<String>) -> Self {
-        self.system = Some(system.into());
-        self
-    }
-
-    /// Set max tokens
-    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
-        self
-    }
-
-    /// Set temperature
-    pub fn temperature(mut self, temperature: f32) -> Self {
-        self.temperature = Some(temperature);
-        self
-    }
-}
 
 /// Trait for LLM providers
 ///
 /// Implementations must be thread-safe and support async streaming.
+#[allow(dead_code)]
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Get the provider name (e.g., "Claude", "OpenAI")
@@ -485,25 +345,6 @@ pub trait LlmProvider: Send + Sync {
 // =============================================================================
 // Utility Functions
 // =============================================================================
-
-/// Convert MCP tool schemas to LLM tool definitions
-pub fn mcp_tools_to_definitions(tools: &[&dyn casparian_mcp::types::Tool]) -> Vec<ToolDefinition> {
-    tools
-        .iter()
-        .map(|tool| {
-            let schema = tool.input_schema();
-            ToolDefinition {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                input_schema: ToolSchema {
-                    schema_type: schema.schema_type.clone(),
-                    properties: schema.properties.clone(),
-                    required: schema.required.clone(),
-                },
-            }
-        })
-        .collect()
-}
 
 /// Convert ToolRegistry tools to definitions
 pub fn registry_to_definitions(
@@ -550,19 +391,6 @@ mod tests {
         let msg = Message::user("Hello");
         assert_eq!(msg.role, Role::User);
         assert_eq!(msg.text(), "Hello");
-        assert!(!msg.has_tool_use());
-    }
-
-    #[test]
-    fn test_message_with_tool_use() {
-        let content = vec![
-            ContentBlock::text("Let me help"),
-            ContentBlock::tool_use("123", "quick_scan", serde_json::json!({"path": "/tmp"})),
-        ];
-        let msg = Message::assistant_with_content(content);
-
-        assert!(msg.has_tool_use());
-        assert_eq!(msg.tool_uses().len(), 1);
     }
 
     #[test]
@@ -584,57 +412,21 @@ mod tests {
     #[test]
     fn test_content_block_text() {
         let block = ContentBlock::text("Hello");
-        assert!(block.is_text());
-        assert!(!block.is_tool_use());
+        assert!(matches!(block, ContentBlock::Text { .. }));
         assert_eq!(block.as_text(), Some("Hello"));
-    }
-
-    #[test]
-    fn test_tool_result_blocks() {
-        let success = ContentBlock::tool_result("123", "Success!");
-        let error = ContentBlock::tool_error("456", "Failed!");
-
-        match success {
-            ContentBlock::ToolResult { is_error, .. } => assert!(!is_error),
-            _ => panic!("Expected ToolResult"),
-        }
-
-        match error {
-            ContentBlock::ToolResult { is_error, .. } => assert!(is_error),
-            _ => panic!("Expected ToolResult"),
-        }
-    }
-
-    #[test]
-    fn test_llm_config_builder() {
-        let config = LlmConfig::with_model("claude-opus-4-20250514")
-            .system("You are helpful")
-            .max_tokens(8192)
-            .temperature(0.7);
-
-        assert_eq!(config.model, "claude-opus-4-20250514");
-        assert_eq!(config.system, Some("You are helpful".to_string()));
-        assert_eq!(config.max_tokens, 8192);
-        assert_eq!(config.temperature, Some(0.7));
     }
 
     #[test]
     fn test_stream_chunk_variants() {
         let text = StreamChunk::Text("Hello".to_string());
-        assert!(!text.is_done());
-        assert!(!text.is_error());
+        assert!(matches!(text, StreamChunk::Text(_)));
 
         let done = StreamChunk::Done {
             stop_reason: Some("end_turn".to_string()),
         };
-        assert!(done.is_done());
-
-        let tool_done = StreamChunk::Done {
-            stop_reason: Some("tool_use".to_string()),
-        };
-        assert!(tool_done.is_tool_use_stop());
+        assert!(matches!(done, StreamChunk::Done { .. }));
 
         let error = StreamChunk::Error("Oops".to_string());
-        assert!(error.is_error());
+        assert!(matches!(error, StreamChunk::Error(_)));
     }
 }

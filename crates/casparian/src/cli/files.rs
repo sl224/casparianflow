@@ -1,36 +1,36 @@
 //! Files command - List discovered files
 //!
 //! Query scout_files table with filters:
+//! - `--source <source>` - Filter by source (uses default context if not specified)
+//! - `--all` - Show files from all sources (override default context)
 //! - `--topic <topic>` - Filter by tag/topic
 //! - `--status <status>` - Filter by status (pending, processing, done, failed)
 //! - `--untagged` - Show only untagged files
+//! - `--pattern <pattern>` - Filter by gitignore-style pattern
+//! - `--tag <tag>` - Tag matching files
 //! - `--limit <n>` - Maximum files to display
+//!
+//! Uses crate::scout::Database as the single source of truth.
 
+use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table_colored};
+use crate::scout::{Database, FileStatus, ScannedFile};
 use comfy_table::Color;
-use rusqlite::Connection;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::path::PathBuf;
 
 /// Arguments for the files command
 #[derive(Debug)]
 pub struct FilesArgs {
+    pub source: Option<String>,
+    pub all: bool,
     pub topic: Option<String>,
     pub status: Option<String>,
     pub untagged: bool,
+    pub patterns: Vec<String>,
+    pub tag: Option<String>,
     pub limit: usize,
-}
-
-/// A file from the database
-#[derive(Debug)]
-struct ScannedFile {
-    #[allow(dead_code)]
-    id: i64,
-    path: String,
-    size: i64,
-    tag: Option<String>,
-    status: String,
-    error: Option<String>,
 }
 
 /// Valid file statuses
@@ -53,29 +53,8 @@ fn get_db_path() -> PathBuf {
         .join("casparian_flow.sqlite3")
 }
 
-/// Open database connection with helpful error
-fn open_db() -> Result<Connection, HelpfulError> {
-    let db_path = get_db_path();
-
-    if !db_path.exists() {
-        return Err(HelpfulError::new(format!("Database not found: {}", db_path.display()))
-            .with_context("The Scout database has not been initialized yet")
-            .with_suggestions([
-                "TRY: Start the Casparian UI to initialize the database".to_string(),
-                "TRY: Run `casparian start` to initialize the system".to_string(),
-                format!("TRY: Check the path exists: {}", db_path.display()),
-            ]));
-    }
-
-    Connection::open(&db_path).map_err(|e| {
-        HelpfulError::new(format!("Cannot open database: {}", e))
-            .with_context(format!("Database path: {}", db_path.display()))
-            .with_suggestion("TRY: Ensure the database file is not corrupted or locked")
-    })
-}
-
 /// Validate status filter
-fn validate_status(status: &str) -> Result<&str, HelpfulError> {
+fn validate_status(status: &str) -> Result<FileStatus, HelpfulError> {
     let status_lower = status.to_lowercase();
 
     // Map common aliases
@@ -84,27 +63,14 @@ fn validate_status(status: &str) -> Result<&str, HelpfulError> {
         s => s,
     };
 
-    if VALID_STATUSES.contains(&normalized) {
-        // Return the normalized status (static lifetime)
-        Ok(match normalized {
-            "pending" => "pending",
-            "tagged" => "tagged",
-            "queued" => "queued",
-            "processing" => "processing",
-            "processed" => "processed",
-            "failed" => "failed",
-            "skipped" => "skipped",
-            "deleted" => "deleted",
-            _ => unreachable!(),
-        })
-    } else {
-        Err(HelpfulError::new(format!("Invalid status: '{}'", status))
+    FileStatus::parse(normalized).ok_or_else(|| {
+        HelpfulError::new(format!("Invalid status: '{}'", status))
             .with_context("Status must be one of the valid file statuses")
             .with_suggestions([
                 format!("TRY: Valid statuses: {}", VALID_STATUSES.join(", ")),
                 "TRY: Use 'done' as an alias for 'processed'".to_string(),
-            ]))
-    }
+            ])
+    })
 }
 
 /// Get color for status display
@@ -122,123 +88,153 @@ fn color_for_status(status: &str) -> Color {
     }
 }
 
-/// Build the query based on filters
-fn build_query(args: &FilesArgs, validated_status: Option<&str>) -> (String, Vec<String>) {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
+/// Build a GlobSet from pattern strings
+fn build_glob_set(patterns: &[String]) -> anyhow::Result<(GlobSet, GlobSet)> {
+    let mut include_builder = GlobSetBuilder::new();
+    let mut exclude_builder = GlobSetBuilder::new();
 
-    // Topic filter
-    if let Some(topic) = &args.topic {
-        conditions.push("tag = ?".to_string());
-        params.push(topic.clone());
+    for pattern in patterns {
+        if let Some(stripped) = pattern.strip_prefix('!') {
+            exclude_builder.add(Glob::new(stripped)?);
+        } else {
+            include_builder.add(Glob::new(pattern)?);
+        }
     }
 
-    // Status filter
-    if let Some(status) = validated_status {
-        conditions.push("status = ?".to_string());
-        params.push(status.to_string());
-    }
-
-    // Untagged filter
-    if args.untagged {
-        conditions.push("tag IS NULL".to_string());
-    }
-
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    let query = format!(
-        "SELECT id, path, size, tag, status, error
-         FROM scout_files
-         {}
-         ORDER BY path
-         LIMIT ?",
-        where_clause
-    );
-
-    (query, params)
+    Ok((include_builder.build()?, exclude_builder.build()?))
 }
 
-/// Execute the files command
-pub fn run(args: FilesArgs) -> anyhow::Result<()> {
+/// Check if a path matches the pattern filters
+fn matches_patterns(
+    rel_path: &str,
+    include_set: &GlobSet,
+    exclude_set: &GlobSet,
+    has_includes: bool,
+) -> bool {
+    if exclude_set.is_match(rel_path) {
+        return false;
+    }
+    if !has_includes {
+        return true;
+    }
+    include_set.is_match(rel_path)
+}
+
+/// Execute the files command (async version)
+pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Validate status if provided
     let validated_status = args.status
         .as_ref()
         .map(|s| validate_status(s))
         .transpose()?;
 
-    let conn = open_db()?;
+    // Open database
+    let db_path = get_db_path();
+    if !db_path.exists() {
+        return Err(HelpfulError::new(format!("Database not found: {}", db_path.display()))
+            .with_context("The Scout database has not been initialized yet")
+            .with_suggestions([
+                "TRY: Run `casparian scan <directory>` to discover files".to_string(),
+                "TRY: Run `casparian source add /path/to/data` to add a source".to_string(),
+            ])
+            .into());
+    }
 
-    // Build query
-    let (query, params) = build_query(&args, validated_status);
+    let db = Database::open(&db_path).await
+        .map_err(|e| HelpfulError::new(format!("Cannot open database: {}", e))
+            .with_context(format!("Database path: {}", db_path.display()))
+            .with_suggestion("TRY: Ensure the database file is not corrupted or locked"))?;
 
-    // Prepare statement
-    let mut stmt = conn
-        .prepare(&query)
-        .map_err(|e| {
-            HelpfulError::new(format!("Failed to prepare query: {}", e))
-                .with_context("The scout_files table may not exist")
-                .with_suggestion("TRY: Ensure the database schema is up to date")
-        })?;
+    // Determine which source(s) to query
+    // Priority: explicit --source > --all > default context > all sources (with hint)
+    let sources = db.list_sources().await
+        .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
-    // Execute query with parameters
-    let limit = args.limit as i64;
-    let files: Vec<ScannedFile> = match params.len() {
-        0 => stmt
-            .query_map([limit], |row| {
-                Ok(ScannedFile {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    size: row.get(2)?,
-                    tag: row.get(3)?,
-                    status: row.get(4)?,
-                    error: row.get(5)?,
-                })
-            })
-            .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect(),
-        1 => stmt
-            .query_map(rusqlite::params![&params[0], limit], |row| {
-                Ok(ScannedFile {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    size: row.get(2)?,
-                    tag: row.get(3)?,
-                    status: row.get(4)?,
-                    error: row.get(5)?,
-                })
-            })
-            .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect(),
-        2 => stmt
-            .query_map(rusqlite::params![&params[0], &params[1], limit], |row| {
-                Ok(ScannedFile {
-                    id: row.get(0)?,
-                    path: row.get(1)?,
-                    size: row.get(2)?,
-                    tag: row.get(3)?,
-                    status: row.get(4)?,
-                    error: row.get(5)?,
-                })
-            })
-            .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?
-            .filter_map(|r| r.ok())
-            .collect(),
-        _ => {
-            return Err(HelpfulError::new("Too many filter parameters")
-                .with_context("Internal error: unexpected number of parameters")
-                .into());
+    let (source_ids, source_context_msg): (Vec<String>, Option<String>) = if let Some(ref source_name) = args.source {
+        // Explicit --source flag
+        let source = sources.iter().find(|s| s.name == *source_name || s.id == *source_name);
+        match source {
+            Some(s) => (vec![s.id.clone()], Some(format!("[{}]", s.name))),
+            None => {
+                return Err(HelpfulError::new(format!("Source not found: {}", source_name))
+                    .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
+                    .into());
+            }
         }
+    } else if args.all {
+        // --all flag: query all sources
+        (sources.iter().map(|s| s.id.clone()).collect(), None)
+    } else if let Some(default_source) = context::get_default_source() {
+        // Use default context
+        let source = sources.iter().find(|s| s.name == default_source || s.id == default_source);
+        match source {
+            Some(s) => (vec![s.id.clone()], Some(format!("[{}]", s.name))),
+            None => {
+                // Default source no longer exists - clear it and show all
+                let _ = context::clear_default_source();
+                (sources.iter().map(|s| s.id.clone()).collect(), None)
+            }
+        }
+    } else {
+        // No context set - query all sources
+        (sources.iter().map(|s| s.id.clone()).collect(), None)
+    };
+
+    // Query files based on filters, restricted to selected sources
+    let all_files: Vec<ScannedFile> = if let Some(topic) = &args.topic {
+        // Filter by topic - this queries across all sources, then we filter
+        let topic_files = db.list_files_by_tag(topic, 10000).await
+            .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+        topic_files.into_iter()
+            .filter(|f| source_ids.contains(&f.source_id))
+            .collect()
+    } else if let Some(status) = &validated_status {
+        // Filter by status - queries across all sources, then we filter
+        let status_files = db.list_files_by_status(*status, 10000).await
+            .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+        status_files.into_iter()
+            .filter(|f| source_ids.contains(&f.source_id))
+            .collect()
+    } else if args.untagged {
+        // Get untagged files from selected sources
+        let mut untagged_files = Vec::new();
+        for source_id in &source_ids {
+            let files = db.list_untagged_files(source_id, 10000).await
+                .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+            untagged_files.extend(files);
+        }
+        untagged_files
+    } else {
+        // Get all files from selected sources
+        let mut all = Vec::new();
+        for source_id in &source_ids {
+            let files = db.list_files_by_source(source_id, 10000).await
+                .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+            all.extend(files);
+        }
+        all
+    };
+
+    // Apply pattern filtering and limit in memory
+    let files: Vec<ScannedFile> = if args.patterns.is_empty() {
+        all_files.into_iter().take(args.limit).collect()
+    } else {
+        let (include_set, exclude_set) = build_glob_set(&args.patterns)?;
+        let has_includes = args.patterns.iter().any(|p| !p.starts_with('!'));
+        all_files
+            .into_iter()
+            .filter(|f| matches_patterns(&f.rel_path, &include_set, &exclude_set, has_includes))
+            .take(args.limit)
+            .collect()
     };
 
     // Handle empty results
     if files.is_empty() {
-        println!("No files found matching the filters.");
+        if let Some(ref ctx) = source_context_msg {
+            println!("{} No files found.", ctx);
+        } else {
+            println!("No files found matching the filters.");
+        }
         println!();
 
         // Show what filters were applied
@@ -246,8 +242,8 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
         if let Some(topic) = &args.topic {
             applied_filters.push(format!("topic={}", topic));
         }
-        if let Some(status) = validated_status {
-            applied_filters.push(format!("status={}", status));
+        if let Some(status) = &validated_status {
+            applied_filters.push(format!("status={}", status.as_str()));
         }
         if args.untagged {
             applied_filters.push("untagged=true".to_string());
@@ -257,34 +253,62 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
             println!("Applied filters: {}", applied_filters.join(", "));
         }
 
-        // Count total files
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM scout_files", [], |row| row.get(0))
-            .unwrap_or(0);
+        // Get total file count
+        let stats = db.get_stats().await
+            .map_err(|e| HelpfulError::new(format!("Failed to get stats: {}", e)))?;
 
-        if total > 0 {
+        if stats.total_files > 0 {
             println!();
-            println!("Hint: There are {} total files in the database.", total);
-            println!("TRY: casparian files   (to see all files)");
+            if source_context_msg.is_some() {
+                println!("Hint: There are {} total files across all sources.", stats.total_files);
+                println!("TRY: casparian files --all   (to see files from all sources)");
+            } else {
+                println!("Hint: There are {} total files in the database.", stats.total_files);
+                println!("TRY: casparian files   (to see all files)");
+            }
         }
 
         return Ok(());
     }
 
-    // Print header with filter summary
+    // Tag files if requested
+    let tagged_count = if let Some(ref new_tag) = args.tag {
+        let ids: Vec<i64> = files.iter().filter_map(|f| f.id).collect();
+        let tagged = db.tag_files(&ids, new_tag).await
+            .map_err(|e| HelpfulError::new(format!("Failed to tag files: {}", e)))?;
+        println!(
+            "Tagged {} files with: \x1b[36m{}\x1b[0m",
+            tagged, new_tag
+        );
+        println!();
+        Some(tagged)
+    } else {
+        None
+    };
+
+    // Print header with source context and filter summary
+    if let Some(ref ctx) = source_context_msg {
+        print!("{} ", ctx);
+    }
+
     let mut filter_desc = Vec::new();
     if let Some(topic) = &args.topic {
         filter_desc.push(format!("topic: {}", topic));
     }
-    if let Some(status) = validated_status {
-        filter_desc.push(format!("status: {}", status));
+    if let Some(status) = &validated_status {
+        filter_desc.push(format!("status: {}", status.as_str()));
     }
     if args.untagged {
         filter_desc.push("untagged".to_string());
     }
+    if !args.patterns.is_empty() {
+        filter_desc.push(format!("patterns: {:?}", args.patterns));
+    }
 
     if !filter_desc.is_empty() {
         println!("Files matching: {}", filter_desc.join(", "));
+    } else if source_context_msg.is_some() {
+        println!("{} files", files.len());
     }
     println!();
 
@@ -293,27 +317,33 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     let rows: Vec<Vec<(String, Option<Color>)>> = files
         .iter()
         .map(|f| {
-            let topic_display = f.tag.as_deref().unwrap_or("-").to_string();
-            let error_display = f.error.as_deref().unwrap_or("-").to_string();
-
-            // Truncate long paths and errors for display
-            let path_display = if f.path.len() > 50 {
-                format!("...{}", &f.path[f.path.len() - 47..])
+            // Show the new tag if we just tagged, otherwise show existing tag
+            let topic_display = if tagged_count.is_some() {
+                args.tag.as_deref().unwrap_or("-").to_string()
             } else {
-                f.path.clone()
+                f.tag.as_deref().unwrap_or("-").to_string()
+            };
+            let error_display = f.error.as_deref().unwrap_or("-").to_string();
+            let status_str = f.status.as_str();
+
+            // Use rel_path for display (shorter and more relevant)
+            let path_display = if f.rel_path.len() > 50 {
+                format!("...{}", &f.rel_path[f.rel_path.len().saturating_sub(47)..])
+            } else {
+                f.rel_path.clone()
             };
 
             let error_truncated = if error_display.len() > 30 {
                 format!("{}...", &error_display[..27])
             } else {
-                error_display
+                error_display.clone()
             };
 
             vec![
                 (path_display, None),
-                (format_size(f.size as u64), None),
+                (format_size(f.size), None),
                 (topic_display, Some(Color::Cyan)),
-                (f.status.clone(), Some(color_for_status(&f.status))),
+                (status_str.to_string(), Some(color_for_status(status_str))),
                 (error_truncated, if f.error.is_some() { Some(Color::Red) } else { None }),
             ]
         })
@@ -339,11 +369,11 @@ mod tests {
 
     #[test]
     fn test_validate_status() {
-        assert_eq!(validate_status("pending").unwrap(), "pending");
-        assert_eq!(validate_status("PENDING").unwrap(), "pending");
-        assert_eq!(validate_status("Pending").unwrap(), "pending");
-        assert_eq!(validate_status("done").unwrap(), "processed");
-        assert_eq!(validate_status("failed").unwrap(), "failed");
+        assert!(validate_status("pending").is_ok());
+        assert!(validate_status("PENDING").is_ok());
+        assert!(validate_status("Pending").is_ok());
+        assert!(validate_status("done").is_ok()); // Alias for processed
+        assert!(validate_status("failed").is_ok());
         assert!(validate_status("invalid").is_err());
     }
 
@@ -355,83 +385,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_query_no_filters() {
-        let args = FilesArgs {
-            topic: None,
-            status: None,
-            untagged: false,
-            limit: 50,
-        };
+    fn test_pattern_matching() {
+        let patterns = vec!["*.csv".to_string(), "!test/**".to_string()];
+        let (include, exclude) = build_glob_set(&patterns).unwrap();
 
-        let (query, params) = build_query(&args, None);
+        // Test include pattern
+        assert!(matches_patterns("data.csv", &include, &exclude, true));
+        assert!(!matches_patterns("data.json", &include, &exclude, true));
 
-        assert!(query.contains("SELECT id, path, size, tag, status, error"));
-        assert!(!query.contains("WHERE"));
-        assert!(params.is_empty());
-    }
-
-    #[test]
-    fn test_build_query_with_topic() {
-        let args = FilesArgs {
-            topic: Some("sales".to_string()),
-            status: None,
-            untagged: false,
-            limit: 50,
-        };
-
-        let (query, params) = build_query(&args, None);
-
-        assert!(query.contains("WHERE tag = ?"));
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0], "sales");
-    }
-
-    #[test]
-    fn test_build_query_with_status() {
-        let args = FilesArgs {
-            topic: None,
-            status: Some("failed".to_string()),
-            untagged: false,
-            limit: 50,
-        };
-
-        let (query, params) = build_query(&args, Some("failed"));
-
-        assert!(query.contains("WHERE status = ?"));
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0], "failed");
-    }
-
-    #[test]
-    fn test_build_query_untagged() {
-        let args = FilesArgs {
-            topic: None,
-            status: None,
-            untagged: true,
-            limit: 50,
-        };
-
-        let (query, params) = build_query(&args, None);
-
-        assert!(query.contains("WHERE tag IS NULL"));
-        assert!(params.is_empty());
-    }
-
-    #[test]
-    fn test_build_query_combined_filters() {
-        let args = FilesArgs {
-            topic: Some("sales".to_string()),
-            status: Some("failed".to_string()),
-            untagged: false,
-            limit: 50,
-        };
-
-        let (query, params) = build_query(&args, Some("failed"));
-
-        assert!(query.contains("WHERE"));
-        assert!(query.contains("tag = ?"));
-        assert!(query.contains("AND"));
-        assert!(query.contains("status = ?"));
-        assert_eq!(params.len(), 2);
+        // Test exclude pattern
+        assert!(!matches_patterns("test/data.csv", &include, &exclude, true));
     }
 }

@@ -10,6 +10,9 @@ pub mod output;
 // W1: Core commands (fully implemented)
 pub mod scan;
 pub mod preview;
+pub mod run;
+pub mod sink;
+pub mod backfill;
 
 // W2: Tagging commands (stubs)
 pub mod tag;
@@ -22,7 +25,6 @@ pub mod parser;
 pub mod jobs;
 pub mod job;
 pub mod worker;
-pub mod run;
 
 // W5: Resource commands (stubs)
 pub mod source;
@@ -35,11 +37,14 @@ pub mod mcp;
 // W8: TUI with LLM Integration
 pub mod tui;
 
-// Configuration
+// Configuration and context
 pub mod config;
+pub mod context;
 
-// Re-exports are used by the scan and preview modules
+// Re-exports are used by the scan, preview, and resource modules
 #[allow(unused_imports)]
 pub use error::HelpfulError;
 #[allow(unused_imports)]
 pub use output::{format_size, format_time, print_table};
+#[allow(unused_imports)]
+pub use config::default_db_path;

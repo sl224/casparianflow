@@ -2,9 +2,11 @@
 //!
 //! Data-oriented design: structs for data, functions for behavior.
 
+use crate::cli::config::default_db_path;
+use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table};
-use casparian_scout::{Database, Source, SourceType};
+use crate::scout::{Database, Scanner, Source, SourceType};
 use clap::Subcommand;
 use std::path::PathBuf;
 
@@ -12,6 +14,7 @@ use std::path::PathBuf;
 #[derive(Subcommand, Debug, Clone)]
 pub enum SourceAction {
     /// List all sources
+    #[command(visible_alias = "ls")]
     List {
         #[arg(long)]
         json: bool,
@@ -27,10 +30,17 @@ pub enum SourceAction {
     /// Show source details
     Show {
         name: String,
+        /// Show files in this source
+        #[arg(long)]
+        files: bool,
+        /// Maximum files to display (with --files)
+        #[arg(long, default_value = "50")]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
     /// Remove a source
+    #[command(visible_alias = "rm")]
     Remove {
         name: String,
         #[arg(long)]
@@ -42,17 +52,14 @@ pub enum SourceAction {
         #[arg(long)]
         all: bool,
     },
-}
-
-/// Get the default database path
-fn get_default_db_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        let casparian_dir = home.join(".casparian_flow");
-        std::fs::create_dir_all(&casparian_dir).ok();
-        casparian_dir.join("scout.db")
-    } else {
-        PathBuf::from("scout.db")
-    }
+    /// Set or show the default source context
+    Use {
+        /// Source name to set as default
+        name: Option<String>,
+        /// Clear the default source
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// Source statistics for display
@@ -81,7 +88,12 @@ pub fn run(action: SourceAction) -> anyhow::Result<()> {
 }
 
 async fn run_async(action: SourceAction) -> anyhow::Result<()> {
-    let db_path = get_default_db_path();
+    // Handle `use` command separately - it doesn't need DB for showing current context
+    if let SourceAction::Use { name, clear } = action {
+        return use_source(name, clear).await;
+    }
+
+    let db_path = default_db_path();
     let db = Database::open(&db_path).await.map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
@@ -91,9 +103,10 @@ async fn run_async(action: SourceAction) -> anyhow::Result<()> {
     match action {
         SourceAction::List { json } => list_sources(&db, json).await,
         SourceAction::Add { path, name, recursive: _ } => add_source(&db, path, name).await,
-        SourceAction::Show { name, json } => show_source(&db, &name, json).await,
+        SourceAction::Show { name, files, limit, json } => show_source(&db, &name, files, limit, json).await,
         SourceAction::Remove { name, force } => remove_source(&db, &name, force).await,
         SourceAction::Sync { name, all } => sync_sources(&db, name, all).await,
+        SourceAction::Use { .. } => unreachable!(), // Handled above
     }
 }
 
@@ -229,7 +242,7 @@ async fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyho
     Ok(())
 }
 
-async fn show_source(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
+async fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: bool) -> anyhow::Result<()> {
     let sources = db.list_sources().await?;
     let source = sources.iter().find(|s| s.name == name || s.id == name);
 
@@ -245,7 +258,7 @@ async fn show_source(db: &Database, name: &str, json: bool) -> anyhow::Result<()
     let stats = get_source_stats(db, &source.id).await;
 
     if json {
-        let output = serde_json::json!({
+        let mut output = serde_json::json!({
             "id": source.id,
             "name": source.name,
             "path": source.path,
@@ -255,6 +268,21 @@ async fn show_source(db: &Database, name: &str, json: bool) -> anyhow::Result<()
             "files": stats.file_count,
             "size": stats.total_size,
         });
+
+        // Include files in JSON output if requested
+        if show_files {
+            let files = db.list_files_by_source(&source.id, limit).await?;
+            let files_json: Vec<serde_json::Value> = files.iter().map(|f| {
+                serde_json::json!({
+                    "path": f.rel_path,
+                    "size": f.size,
+                    "status": f.status.as_str(),
+                    "tag": f.tag,
+                })
+            }).collect();
+            output["file_list"] = serde_json::Value::Array(files_json);
+        }
+
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
@@ -278,9 +306,40 @@ async fn show_source(db: &Database, name: &str, json: bool) -> anyhow::Result<()
         for rule in &rules {
             println!("  {} -> {}", rule.pattern, rule.tag);
         }
+        println!();
     } else {
         println!("No tagging rules configured for this source.");
         println!("  TRY: casparian rule add '*.csv' --topic csv_data");
+        println!();
+    }
+
+    // Show files if requested
+    if show_files {
+        let files = db.list_files_by_source(&source.id, limit).await?;
+        if files.is_empty() {
+            println!("No files discovered yet.");
+            println!("  TRY: casparian source sync {}", source.name);
+        } else {
+            println!("FILES");
+            let rows: Vec<Vec<String>> = files.iter().map(|f| {
+                vec![
+                    if f.rel_path.len() > 50 {
+                        format!("...{}", &f.rel_path[f.rel_path.len().saturating_sub(47)..])
+                    } else {
+                        f.rel_path.clone()
+                    },
+                    format_size(f.size),
+                    f.tag.as_deref().unwrap_or("-").to_string(),
+                    f.status.as_str().to_string(),
+                ]
+            }).collect();
+            print_table(&["PATH", "SIZE", "TAG", "STATUS"], rows);
+
+            if files.len() >= limit {
+                println!();
+                println!("Showing {} of {} files. Use --limit to see more.", limit, stats.file_count);
+            }
+        }
     }
 
     Ok(())
@@ -366,7 +425,7 @@ async fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow:
         println!("Syncing source '{}'...", source.name);
 
         // Use the scanner from casparian_scout
-        let scanner = casparian_scout::Scanner::new(db.clone());
+        let scanner = Scanner::new(db.clone());
         match scanner.scan_source(source).await {
             Ok(result) => {
                 println!(
@@ -385,9 +444,67 @@ async fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow:
     Ok(())
 }
 
+/// Set or show the default source context
+async fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
+    // Handle --clear flag
+    if clear {
+        context::clear_default_source()?;
+        println!("Default source cleared.");
+        return Ok(());
+    }
+
+    // If no name provided, show current context
+    if name.is_none() {
+        match context::get_default_source() {
+            Some(source_name) => {
+                println!("Current source: {}", source_name);
+            }
+            None => {
+                println!("No default source set.");
+                println!();
+                println!("Set a default with:");
+                println!("  casparian source use <name>");
+            }
+        }
+        return Ok(());
+    }
+
+    // Validate source exists before setting
+    let source_name = name.unwrap();
+    let db_path = default_db_path();
+    let db = Database::open(&db_path).await.map_err(|e| {
+        HelpfulError::new(format!("Failed to open database: {}", e))
+            .with_context(format!("Database path: {}", db_path.display()))
+            .with_suggestion("TRY: Ensure the directory exists and is writable")
+    })?;
+
+    let sources = db.list_sources().await?;
+    let source = sources.iter().find(|s| s.name == source_name || s.id == source_name);
+
+    let source = match source {
+        Some(s) => s,
+        None => {
+            return Err(HelpfulError::new(format!("Source not found: {}", source_name))
+                .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
+                .into());
+        }
+    };
+
+    // Set the context
+    context::set_default_source(&source.name)?;
+    println!("Default source set to: {}", source.name);
+    println!();
+    println!("Now you can run:");
+    println!("  casparian files              # Files from '{}'", source.name);
+    println!("  casparian files --all        # Files from all sources");
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scout::ScannedFile;
     use std::fs;
     use tempfile::TempDir;
 
@@ -430,7 +547,7 @@ mod tests {
         db.upsert_source(&source).await.unwrap();
 
         // Add some files
-        let file = casparian_scout::ScannedFile::new("src-1", "/data/test.csv", "test.csv", 1000, 12345);
+        let file = ScannedFile::new("src-1", "/data/test.csv", "test.csv", 1000, 12345);
         db.upsert_file(&file).await.unwrap();
 
         let stats = get_source_stats(&db, "src-1").await;
@@ -453,7 +570,7 @@ mod tests {
         db.upsert_source(&source).await.unwrap();
 
         // Add a file
-        let file = casparian_scout::ScannedFile::new("src-1", "/data/test.csv", "test.csv", 1000, 12345);
+        let file = ScannedFile::new("src-1", "/data/test.csv", "test.csv", 1000, 12345);
         db.upsert_file(&file).await.unwrap();
 
         // Delete source should remove files too

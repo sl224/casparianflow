@@ -20,7 +20,6 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::Deserialize;
-use serde_json::Value;
 use std::process::{Command, Stdio};
 use tokio::sync::mpsc;
 
@@ -33,57 +32,20 @@ use super::{
 pub struct ClaudeCodeResponse {
     /// Response type ("result" for success)
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     pub response_type: Option<String>,
     /// The text response
     #[serde(default)]
     pub result: String,
     /// Session ID for multi-turn
+    #[allow(dead_code)]
     pub session_id: Option<String>,
     /// Whether there was an error
     #[serde(default)]
     pub is_error: bool,
     /// Duration in milliseconds
+    #[allow(dead_code)]
     pub duration_ms: Option<u64>,
-}
-
-/// Streaming JSON event from `--output-format stream-json`
-/// Note: stream-json requires --verbose flag
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum StreamEvent {
-    /// System message (info about session)
-    System {
-        #[serde(default)]
-        message: String,
-    },
-    /// Assistant text content
-    Assistant {
-        #[serde(default)]
-        message: String,
-    },
-    /// Tool use request
-    ToolUse {
-        name: String,
-        #[serde(default)]
-        input: Value,
-    },
-    /// Tool result
-    ToolResult {
-        #[serde(default)]
-        content: String,
-    },
-    /// Final result
-    Result {
-        #[serde(default)]
-        result: String,
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-    /// Error
-    Error {
-        #[serde(default)]
-        message: String,
-    },
 }
 
 /// Claude Code provider configuration
@@ -134,6 +96,7 @@ impl ClaudeCodeProvider {
     }
 
     /// Create with custom config
+    #[allow(dead_code)]
     pub fn with_config(config: ClaudeCodeConfig) -> Self {
         Self {
             config,
@@ -238,6 +201,7 @@ impl ClaudeCodeProvider {
     }
 
     /// Execute and get full response (non-streaming)
+    #[allow(dead_code)]
     pub fn execute_sync(&self, prompt: &str) -> Result<ClaudeCodeResponse, LlmError> {
         let mut cmd = self.build_command(prompt);
 
@@ -345,7 +309,7 @@ impl LlmProvider for ClaudeCodeProvider {
                         let _ = tx.blocking_send(StreamChunk::Text(response.result));
                     }
                 }
-                Err(e) => {
+                Err(_e) => {
                     // Maybe raw text output
                     let _ = tx.blocking_send(StreamChunk::Text(stdout.to_string()));
                 }
@@ -448,14 +412,12 @@ mod tests {
 
         match result {
             Ok(mut stream) => {
-                let mut got_text = false;
                 let mut got_done = false;
 
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         StreamChunk::Text(t) => {
                             println!("Text: {}", t);
-                            got_text = true;
                         }
                         StreamChunk::Done { .. } => {
                             got_done = true;
@@ -465,7 +427,7 @@ mod tests {
                             println!("Error: {}", e);
                             break;
                         }
-                        _ => {}
+                        StreamChunk::ToolCall { .. } => {}
                     }
                 }
 

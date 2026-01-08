@@ -6,7 +6,7 @@ pub mod db;
 pub mod metrics;
 pub mod sentinel;
 
-pub use db::JobQueue;
+pub use db::{JobQueue, queue::{JobDetails, PluginDetails}};
 pub use metrics::METRICS;
 pub use sentinel::{Sentinel, SentinelConfig};
 

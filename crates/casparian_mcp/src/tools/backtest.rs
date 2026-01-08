@@ -10,10 +10,9 @@ use async_trait::async_trait;
 use casparian_backtest::{
     failfast::{FailFastConfig, FileTestResult, ParserRunner},
     high_failure::{FailureHistoryEntry, FileInfo, HighFailureTable},
-    loop_::IterationConfig,
+    iteration::IterationConfig,
     metrics::{FailureCategory, IterationMetrics},
 };
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -131,12 +130,6 @@ impl RunBacktestTool {
     pub fn new() -> Self {
         Self
     }
-
-    /// Create a simple parser runner that just validates file existence
-    /// In production, this would run the actual parser
-    fn create_mock_runner(&self, _parser_code: &str) -> Box<dyn ParserRunner + Send + Sync> {
-        Box::new(MockParserRunner::new())
-    }
 }
 
 impl Default for RunBacktestTool {
@@ -156,7 +149,7 @@ impl MockParserRunner {
 }
 
 impl ParserRunner for MockParserRunner {
-    fn run(&self, file_path: &str) -> FileTestResult {
+    async fn run(&self, file_path: &str) -> FileTestResult {
         use std::path::Path;
 
         let path = Path::new(file_path);
@@ -285,10 +278,7 @@ impl Tool for RunBacktestTool {
         };
 
         // Create in-memory high failure table
-        let conn = Connection::open_in_memory()
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create database: {}", e)))?;
-
-        let high_failure_table = HighFailureTable::new(conn)
+        let high_failure_table = HighFailureTable::in_memory().await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create high failure table: {}", e)))?;
 
         // Create file info list
@@ -298,29 +288,29 @@ impl Tool for RunBacktestTool {
             .collect();
 
         // Run parser on each file
-        let runner = self.create_mock_runner(parser_code);
+        let runner = MockParserRunner::new();
         let mut metrics = IterationMetrics::new(1, 1);
         let mut early_stopped = false;
         let mut high_failure_pass_rate = 1.0;
 
         // Get files in backtest order (would use high failure table in production)
         let ordered_files = high_failure_table
-            .get_backtest_order(&file_infos, &scope_id)
+            .get_backtest_order(&file_infos, &scope_id).await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to order files: {}", e)))?;
 
         for (idx, file) in ordered_files.iter().enumerate() {
-            let result = runner.run(&file.path);
+            let result = runner.run(&file.path).await;
 
             if result.passed {
                 metrics.record_pass();
-                let _ = high_failure_table.record_success(&file.path, &scope_id);
+                let _ = high_failure_table.record_success(&file.path, &scope_id).await;
             } else {
                 let category = result.category.unwrap_or(FailureCategory::Unknown);
                 let error_msg = result.error.as_deref().unwrap_or("Unknown error");
                 metrics.record_fail(&file.path, category, error_msg);
 
                 let entry = FailureHistoryEntry::new(1, 1, category, error_msg);
-                let _ = high_failure_table.record_failure(&file.path, &scope_id, entry);
+                let _ = high_failure_table.record_failure(&file.path, &scope_id, entry).await;
             }
 
             // Check for early stop
@@ -334,11 +324,13 @@ impl Tool for RunBacktestTool {
                     .count();
 
                 if hf_tested > 0 {
-                    high_failure_pass_rate = ordered_files[..=idx]
-                        .iter()
-                        .filter(|f| f.is_high_failure)
-                        .filter(|f| runner.run(&f.path).passed)
-                        .count() as f32 / hf_tested as f32;
+                    let mut hf_passed = 0;
+                    for f in ordered_files[..=idx].iter().filter(|f| f.is_high_failure) {
+                        if runner.run(&f.path).await.passed {
+                            hf_passed += 1;
+                        }
+                    }
+                    high_failure_pass_rate = hf_passed as f32 / hf_tested as f32;
 
                     if high_failure_pass_rate < failfast_config.high_failure_threshold {
                         early_stopped = true;

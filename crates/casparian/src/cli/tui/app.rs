@@ -6,13 +6,60 @@ use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use super::llm::claude_code::ClaudeCodeProvider;
 use super::llm::{registry_to_definitions, LlmProvider, StreamChunk};
 use super::TuiArgs;
 
+/// Result from a pending Claude response
+pub enum PendingResponse {
+    /// Response text received with tool calls info
+    Text {
+        content: String,
+        tools_used: Vec<String>,
+    },
+    /// Error occurred
+    Error(String),
+}
+
 /// Maximum number of messages to keep in input history
 const MAX_INPUT_HISTORY: usize = 50;
+
+/// Format tool call for display
+fn format_tool_call(name: &str, arguments: &Value) -> String {
+    let mut result = format!("\n[Tool: {}]\n", name);
+
+    // Format arguments in a readable way
+    if let Value::Object(obj) = arguments {
+        for (key, value) in obj {
+            let value_str = match value {
+                Value::String(s) => {
+                    // Truncate long strings
+                    if s.len() > 100 {
+                        format!("\"{}...\"", &s[..97])
+                    } else {
+                        format!("\"{}\"", s)
+                    }
+                }
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => "null".to_string(),
+                Value::Array(arr) => {
+                    if arr.len() <= 3 {
+                        format!("{:?}", arr)
+                    } else {
+                        format!("[{} items]", arr.len())
+                    }
+                }
+                Value::Object(_) => "{...}".to_string(),
+            };
+            result.push_str(&format!("  {}: {}\n", key, value_str));
+        }
+    }
+
+    result
+}
 
 /// Current view
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +92,7 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+    #[allow(dead_code)]
     Tool,
 }
 
@@ -142,6 +190,8 @@ pub struct ChatState {
     pub input_history: InputHistory,
     /// Whether in history browsing mode
     pub browsing_history: bool,
+    /// Recent tools used (for display in context pane)
+    pub recent_tools: Vec<String>,
 }
 
 impl Default for ChatState {
@@ -158,11 +208,23 @@ impl Default for ChatState {
             workflow: None,
             input_history: InputHistory::default(),
             browsing_history: false,
+            recent_tools: Vec::new(),
         }
     }
 }
 
 impl ChatState {
+    /// Estimate total line count for scroll bounds
+    /// This is a rough estimate used to prevent unbounded scroll growth
+    pub fn estimated_total_lines(&self) -> usize {
+        // Estimate ~5 lines per message on average (header + wrapped content)
+        // This is intentionally generous to allow scrolling
+        self.messages.iter().map(|m| {
+            // 2 lines for header + at least 1 for content, plus estimate based on content length
+            2 + (m.content.len() / 50).max(1)
+        }).sum()
+    }
+
     /// Get current line and column from cursor position
     pub fn cursor_line_col(&self) -> (usize, usize) {
         let before_cursor = &self.input[..self.cursor];
@@ -270,10 +332,17 @@ pub struct App {
     pub tools: ToolRegistry,
     /// LLM provider (Claude Code if available)
     pub llm: Option<ClaudeCodeProvider>,
+    /// Injected LLM provider (for testing with mock providers)
+    #[cfg(test)]
+    pub llm_provider: Option<std::sync::Arc<dyn super::llm::LlmProvider + Send + Sync>>,
     /// Configuration
+    #[allow(dead_code)]
     pub config: TuiArgs,
     /// Last error message
+    #[allow(dead_code)]
     pub error: Option<String>,
+    /// Pending response from Claude (non-blocking)
+    pending_response: Option<mpsc::Receiver<PendingResponse>>,
 }
 
 impl App {
@@ -307,12 +376,16 @@ impl App {
             monitor: MonitorState::default(),
             tools: create_default_registry(),
             llm,
+            #[cfg(test)]
+            llm_provider: None,
             config: args,
             error: None,
+            pending_response: None,
         }
     }
 
     /// Create app with custom tool registry (for testing)
+    #[cfg(test)]
     pub fn new_with_registry(registry: ToolRegistry, args: TuiArgs) -> Self {
         Self {
             running: true,
@@ -321,8 +394,30 @@ impl App {
             monitor: MonitorState::default(),
             tools: registry,
             llm: None,
+            llm_provider: None,
             config: args,
             error: None,
+            pending_response: None,
+        }
+    }
+
+    /// Create app with injected LLM provider (for testing with mock providers)
+    #[cfg(test)]
+    pub fn new_with_provider(
+        args: TuiArgs,
+        provider: std::sync::Arc<dyn super::llm::LlmProvider + Send + Sync>,
+    ) -> Self {
+        Self {
+            running: true,
+            view: View::Chat,
+            chat: ChatState::default(),
+            monitor: MonitorState::default(),
+            tools: create_default_registry(),
+            llm: None,
+            llm_provider: Some(provider),
+            config: args,
+            error: None,
+            pending_response: None,
         }
     }
 
@@ -458,8 +553,11 @@ impl App {
             }
             KeyCode::Down => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // Ctrl+Down: Scroll messages down
-                    self.chat.scroll += 1;
+                    // Ctrl+Down: Scroll messages down (with upper bound)
+                    let max_scroll = self.chat.estimated_total_lines();
+                    if self.chat.scroll < max_scroll {
+                        self.chat.scroll += 1;
+                    }
                 } else if self.chat.browsing_history {
                     // Down while browsing history: Move forward
                     if let Some(next) = self.chat.input_history.down() {
@@ -482,8 +580,9 @@ impl App {
                 self.chat.scroll = self.chat.scroll.saturating_sub(10);
             }
             KeyCode::PageDown => {
-                // Page down: Scroll messages down by multiple lines
-                self.chat.scroll += 10;
+                // Page down: Scroll messages down by multiple lines (with upper bound)
+                let max_scroll = self.chat.estimated_total_lines();
+                self.chat.scroll = (self.chat.scroll + 10).min(max_scroll);
             }
             _ => {}
         }
@@ -492,11 +591,6 @@ impl App {
     /// Get byte position for cursor (handles UTF-8)
     fn cursor_byte_pos(&self) -> usize {
         self.chat.cursor.min(self.chat.input.len())
-    }
-
-    /// Insert newline at cursor
-    fn insert_newline(&mut self) {
-        self.chat.insert_newline();
     }
 
     /// Handle monitor view keys
@@ -522,7 +616,7 @@ impl App {
         }
     }
 
-    /// Send user message
+    /// Send user message (non-blocking - spawns Claude in background)
     async fn send_message(&mut self) {
         let content = std::mem::take(&mut self.chat.input);
         self.chat.cursor = 0;
@@ -543,81 +637,110 @@ impl App {
         // Mark as awaiting response
         self.chat.awaiting_response = true;
 
+        // Build LLM messages from our chat messages
+        let llm_messages: Vec<super::llm::Message> = self
+            .chat
+            .messages
+            .iter()
+            .filter_map(|m| match m.role {
+                MessageRole::User => Some(super::llm::Message::user(&m.content)),
+                MessageRole::Assistant => Some(super::llm::Message::assistant(&m.content)),
+                _ => None,
+            })
+            .collect();
+
+        // Get tool definitions
+        let tool_defs = registry_to_definitions(&self.tools);
+
+        // Check for injected provider first (test mode)
+        #[cfg(test)]
+        if let Some(ref provider) = self.llm_provider {
+            let (tx, rx) = mpsc::channel::<PendingResponse>(1);
+            self.pending_response = Some(rx);
+
+            let provider = provider.clone();
+            tokio::spawn(async move {
+                Self::run_llm_request(provider, llm_messages, tool_defs, tx).await;
+            });
+
+            self.chat.messages.push(Message::new(
+                MessageRole::Assistant,
+                "Thinking...".to_string(),
+            ));
+            return;
+        }
+
         // Try to use Claude Code if available
-        if let Some(ref provider) = self.llm {
-            // Build LLM messages from our chat messages
-            let llm_messages: Vec<super::llm::Message> = self
-                .chat
-                .messages
-                .iter()
-                .filter_map(|m| match m.role {
-                    MessageRole::User => Some(super::llm::Message::user(&m.content)),
-                    MessageRole::Assistant => Some(super::llm::Message::assistant(&m.content)),
-                    _ => None,
-                })
-                .collect();
+        if self.llm.is_some() {
+            // Create channel for response
+            let (tx, rx) = mpsc::channel::<PendingResponse>(1);
+            self.pending_response = Some(rx);
 
-            // Get tool definitions
-            let tool_defs = registry_to_definitions(&self.tools);
+            // Spawn background task to get Claude response
+            // Note: We create a new provider instance since ClaudeCodeProvider is cheap
+            let provider = ClaudeCodeProvider::new()
+                .allowed_tools(vec![
+                    "Read".to_string(),
+                    "Grep".to_string(),
+                    "Glob".to_string(),
+                    "Bash".to_string(),
+                ])
+                .system_prompt(
+                    "You are helping the user with Casparian Flow, a data pipeline tool. \
+                     You have access to MCP tools for scanning files, discovering schemas, \
+                     and building data pipelines. Be concise and helpful.",
+                )
+                .max_turns(5);
 
-            // Stream response
-            match provider.chat_stream(&llm_messages, &tool_defs, None).await {
-                Ok(mut stream) => {
-                    let mut response_text = String::new();
+            tokio::spawn(async move {
+                match provider.chat_stream(&llm_messages, &tool_defs, None).await {
+                    Ok(mut stream) => {
+                        let mut response_text = String::new();
+                        let mut tools_used = Vec::new();
 
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            StreamChunk::Text(text) => {
-                                response_text.push_str(&text);
-                            }
-                            StreamChunk::ToolCall { name, arguments, .. } => {
-                                // Execute MCP tool
-                                response_text.push_str(&format!("\n[Calling {}...]\n", name));
-
-                                match self.execute_tool(&name, arguments.clone()).await {
-                                    Ok(result) => {
-                                        if let Some(content) = result.content.first() {
-                                            if let casparian_mcp::types::ToolContent::Text { text } = content {
-                                                response_text.push_str(&format!("[Result: {}]\n",
-                                                    if text.len() > 200 {
-                                                        format!("{}...", &text[..200])
-                                                    } else {
-                                                        text.clone()
-                                                    }
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        response_text.push_str(&format!("[Tool error: {}]\n", e));
-                                    }
+                        while let Some(chunk) = stream.next().await {
+                            match chunk {
+                                StreamChunk::Text(text) => {
+                                    response_text.push_str(&text);
+                                }
+                                StreamChunk::ToolCall { name, arguments } => {
+                                    // Track tool name for context pane
+                                    tools_used.push(name.clone());
+                                    // Show tool name and arguments
+                                    response_text.push_str(&format_tool_call(&name, &arguments));
+                                }
+                                StreamChunk::Done { .. } => {
+                                    break;
+                                }
+                                StreamChunk::Error(e) => {
+                                    response_text.push_str(&format!("\n[Error: {}]\n", e));
+                                    break;
                                 }
                             }
-                            StreamChunk::Done { .. } => break,
-                            StreamChunk::Error(e) => {
-                                response_text.push_str(&format!("\n[Error: {}]\n", e));
-                                break;
-                            }
-                            _ => {}
+                        }
+
+                        if response_text.is_empty() {
+                            let _ = tx.send(PendingResponse::Error(
+                                "(No response from Claude Code)".to_string()
+                            )).await;
+                        } else {
+                            let _ = tx.send(PendingResponse::Text {
+                                content: response_text,
+                                tools_used,
+                            }).await;
                         }
                     }
-
-                    if response_text.is_empty() {
-                        response_text = "(No response from Claude Code)".to_string();
+                    Err(e) => {
+                        let _ = tx.send(PendingResponse::Error(format!("LLM Error: {}", e))).await;
                     }
+                }
+            });
 
-                    self.chat.messages.push(Message::new(
-                        MessageRole::Assistant,
-                        response_text,
-                    ));
-                }
-                Err(e) => {
-                    self.chat.messages.push(Message::new(
-                        MessageRole::System,
-                        format!("LLM Error: {}", e),
-                    ));
-                }
-            }
+            // Add a "thinking" message that will be replaced
+            self.chat.messages.push(Message::new(
+                MessageRole::Assistant,
+                "Thinking...".to_string(),
+            ));
         } else {
             // No Claude Code available - show helpful message
             self.chat.messages.push(Message::new(
@@ -626,12 +749,65 @@ impl App {
                  to enable AI chat.\n\nFor now, you can use the MCP tools directly or try:\n  \
                  F2 - Monitor view\n  F3 - Help".to_string(),
             ));
+            self.chat.awaiting_response = false;
         }
+    }
 
-        self.chat.awaiting_response = false;
+    /// Helper to run LLM request in background (used by tests with injected provider)
+    #[cfg(test)]
+    async fn run_llm_request(
+        provider: std::sync::Arc<dyn super::llm::LlmProvider + Send + Sync>,
+        llm_messages: Vec<super::llm::Message>,
+        tool_defs: Vec<super::llm::ToolDefinition>,
+        tx: mpsc::Sender<PendingResponse>,
+    ) {
+        match provider.chat_stream(&llm_messages, &tool_defs, None).await {
+            Ok(mut stream) => {
+                let mut response_text = String::new();
+                let mut tools_used = Vec::new();
+
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        StreamChunk::Text(text) => {
+                            response_text.push_str(&text);
+                        }
+                        StreamChunk::ToolCall { name, arguments } => {
+                            tools_used.push(name.clone());
+                            response_text.push_str(&format_tool_call(&name, &arguments));
+                        }
+                        StreamChunk::Done { .. } => {
+                            break;
+                        }
+                        StreamChunk::Error(e) => {
+                            response_text.push_str(&format!("\n[Error: {}]\n", e));
+                            break;
+                        }
+                    }
+                }
+
+                if response_text.is_empty() {
+                    let _ = tx
+                        .send(PendingResponse::Error(
+                            "(No response from LLM)".to_string(),
+                        ))
+                        .await;
+                } else {
+                    let _ = tx.send(PendingResponse::Text {
+                        content: response_text,
+                        tools_used,
+                    }).await;
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(PendingResponse::Error(format!("LLM Error: {}", e)))
+                    .await;
+            }
+        }
     }
 
     /// Execute a tool directly
+    #[allow(dead_code)]
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<ToolResult, String> {
         let tool = self
             .tools
@@ -643,6 +819,61 @@ impl App {
 
     /// Periodic tick for updates
     pub async fn tick(&mut self) {
+        // Poll for pending Claude response
+        if let Some(ref mut rx) = self.pending_response {
+            // Try to receive without blocking
+            match rx.try_recv() {
+                Ok(response) => {
+                    // Replace the "Thinking..." message with actual response
+                    // Note: Use starts_with() because animation changes dots count
+                    if let Some(last_msg) = self.chat.messages.last_mut() {
+                        if last_msg.role == MessageRole::Assistant && last_msg.content.starts_with("Thinking") {
+                            match response {
+                                PendingResponse::Text { content, tools_used } => {
+                                    last_msg.content = content;
+                                    // Update recent tools for context pane
+                                    if !tools_used.is_empty() {
+                                        self.chat.recent_tools = tools_used;
+                                    }
+                                }
+                                PendingResponse::Error(err) => {
+                                    last_msg.content = err;
+                                    last_msg.role = MessageRole::System;
+                                }
+                            }
+                        }
+                    }
+                    self.chat.awaiting_response = false;
+                    self.pending_response = None;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Still waiting, update thinking animation
+                    if let Some(last_msg) = self.chat.messages.last_mut() {
+                        if last_msg.role == MessageRole::Assistant && last_msg.content.starts_with("Thinking") {
+                            // Cycle through animation: Thinking... -> Thinking.... -> Thinking.....
+                            let dots = last_msg.content.matches('.').count();
+                            if dots >= 5 {
+                                last_msg.content = "Thinking.".to_string();
+                            } else {
+                                last_msg.content.push('.');
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Channel closed without response
+                    if let Some(last_msg) = self.chat.messages.last_mut() {
+                        if last_msg.role == MessageRole::Assistant && last_msg.content.starts_with("Thinking") {
+                            last_msg.content = "(Claude process ended unexpectedly)".to_string();
+                            last_msg.role = MessageRole::System;
+                        }
+                    }
+                    self.chat.awaiting_response = false;
+                    self.pending_response = None;
+                }
+            }
+        }
+
         // TODO: Poll job status, refresh metrics
     }
 }
@@ -838,5 +1069,264 @@ mod tests {
 
         assert_eq!(app.chat.input, "");
         assert_eq!(app.chat.cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pending_response_polling() {
+        // Test the non-blocking response mechanism
+        let mut app = App::new(test_args());
+
+        // Simulate adding a "Thinking..." message and pending response
+        app.chat.messages.push(Message::new(
+            MessageRole::Assistant,
+            "Thinking...".to_string(),
+        ));
+        app.chat.awaiting_response = true;
+
+        // Create channel and send a response
+        let (tx, rx) = mpsc::channel::<PendingResponse>(1);
+        app.pending_response = Some(rx);
+
+        // Send response in background
+        tokio::spawn(async move {
+            tx.send(PendingResponse::Text {
+                content: "Hello from Claude!".to_string(),
+                tools_used: vec![],
+            })
+                .await
+                .unwrap();
+        });
+
+        // Give time for the message to be sent
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Call tick to poll the response
+        app.tick().await;
+
+        // Verify the message was updated
+        let last_msg = app.chat.messages.last().unwrap();
+        assert_eq!(last_msg.content, "Hello from Claude!");
+        assert!(!app.chat.awaiting_response);
+        assert!(app.pending_response.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pending_response_thinking_animation() {
+        // Test the thinking animation when no response yet
+        let mut app = App::new(test_args());
+
+        // Simulate adding a "Thinking..." message
+        app.chat.messages.push(Message::new(
+            MessageRole::Assistant,
+            "Thinking...".to_string(),
+        ));
+        app.chat.awaiting_response = true;
+
+        // Create channel but don't send anything
+        let (_tx, rx) = mpsc::channel::<PendingResponse>(1);
+        app.pending_response = Some(rx);
+
+        // Call tick - should animate the dots
+        app.tick().await;
+
+        // Verify the message got more dots
+        let last_msg = app.chat.messages.last().unwrap();
+        assert!(last_msg.content.starts_with("Thinking"));
+        assert!(last_msg.content.len() > "Thinking...".len());
+    }
+
+    /// CRITICAL TEST: Catches the animation bug where response wasn't applied
+    /// because the check used == "Thinking..." instead of starts_with()
+    #[tokio::test]
+    async fn test_response_replaces_animated_thinking() {
+        let mut app = App::new(test_args());
+
+        // Setup initial "Thinking..." message
+        app.chat.messages.push(Message::new(
+            MessageRole::Assistant,
+            "Thinking...".to_string(),
+        ));
+        app.chat.awaiting_response = true;
+
+        // Create channel but DON'T send response yet
+        let (tx, rx) = mpsc::channel::<PendingResponse>(1);
+        app.pending_response = Some(rx);
+
+        // Run multiple ticks to animate (no response yet)
+        for i in 0..4 {
+            app.tick().await;
+            let content = &app.chat.messages.last().unwrap().content;
+            println!("Tick {}: {}", i + 1, content);
+            assert!(content.starts_with("Thinking"), "Should still be thinking");
+        }
+
+        // Verify animation actually ran (not still exactly "Thinking...")
+        let animated_content = app.chat.messages.last().unwrap().content.clone();
+        assert_ne!(
+            animated_content, "Thinking...",
+            "Animation should have changed the dots"
+        );
+
+        // NOW send the response
+        tx.send(PendingResponse::Text {
+            content: "Response from Claude".to_string(),
+            tools_used: vec![],
+        })
+            .await
+            .unwrap();
+
+        // Run tick to process response
+        app.tick().await;
+
+        // CRITICAL: This is where the bug manifested
+        // With == "Thinking..." check, this would fail because animation changed dots
+        let final_msg = app.chat.messages.last().unwrap();
+        assert_eq!(
+            final_msg.content, "Response from Claude",
+            "Response should replace animated message - BUG if this fails!"
+        );
+        assert!(!app.chat.awaiting_response);
+        assert!(app.pending_response.is_none());
+    }
+
+    /// TRUE END-TO-END TEST: Full flow from user input to Claude response
+    ///
+    /// This test catches bugs that mocked tests miss by:
+    /// 1. Actually calling send_message() (not injecting mock channel)
+    /// 2. Using real ClaudeCodeProvider.chat_stream()
+    /// 3. Polling tick() like the real TUI event loop
+    /// 4. Verifying response replaces "Thinking..."
+    ///
+    /// This is the test that would have caught the "no response" bug.
+    #[tokio::test]
+    async fn test_full_chat_flow_with_real_claude() {
+        // Skip if Claude CLI not available
+        if !ClaudeCodeProvider::is_available() {
+            println!("Skipping test_full_chat_flow_with_real_claude: claude CLI not installed");
+            return;
+        }
+
+        let mut app = App::new(test_args());
+
+        // Verify Claude Code is available in the app
+        if app.llm.is_none() {
+            println!("Skipping: app.llm is None despite Claude being available");
+            return;
+        }
+
+        // Step 1: Type a simple message
+        app.chat.input = "say hello".to_string();
+        app.chat.cursor = app.chat.input.len();
+
+        // Step 2: Press Enter to send
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Verify "Thinking..." was added
+        assert!(app.chat.awaiting_response, "Should be awaiting response");
+        assert!(
+            app.chat
+                .messages
+                .last()
+                .map(|m| m.content.starts_with("Thinking"))
+                .unwrap_or(false),
+            "Should have Thinking... message"
+        );
+        assert!(
+            app.pending_response.is_some(),
+            "Should have pending_response channel"
+        );
+
+        // Step 3: Poll tick() until response arrives (max 60 seconds)
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(60);
+        let mut got_response = false;
+        let mut saw_animation = false;
+        let mut last_content = String::new();
+
+        while start.elapsed() < timeout {
+            app.tick().await;
+
+            let current_content = app
+                .chat
+                .messages
+                .last()
+                .map(|m| m.content.clone())
+                .unwrap_or_default();
+
+            // Track if animation ran
+            if current_content.starts_with("Thinking") && current_content != last_content {
+                println!("Animation frame: {}", current_content);
+                if current_content != "Thinking..." {
+                    saw_animation = true;
+                }
+            }
+
+            // Check if we got a real response
+            if !current_content.starts_with("Thinking")
+                && !current_content.is_empty()
+                && app.chat.messages.len() >= 2
+            {
+                // Not "Thinking..." anymore = got response!
+                got_response = true;
+                println!("Got response: {}", current_content.chars().take(100).collect::<String>());
+                break;
+            }
+
+            last_content = current_content;
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+
+        // Step 4: Assert the test results
+        let final_msg = app.chat.messages.last().unwrap();
+
+        // This is the critical check that would have caught the bug
+        assert!(
+            !final_msg.content.starts_with("Thinking"),
+            "FAILURE: Response never arrived! Content is still: '{}'.\n\
+             This means the spawned task didn't send a response through the channel.\n\
+             Check: 1) Is chat_stream() returning? 2) Is the channel send working?",
+            final_msg.content
+        );
+
+        assert!(got_response, "Should have received response from Claude");
+        assert!(!app.chat.awaiting_response, "Should no longer be awaiting");
+        assert!(app.pending_response.is_none(), "Channel should be consumed");
+
+        println!(
+            "TRUE E2E TEST PASSED: Animation ran: {}, Final content length: {}",
+            saw_animation,
+            final_msg.content.len()
+        );
+    }
+
+    /// Test that channel disconnection is handled gracefully
+    #[tokio::test]
+    async fn test_channel_disconnection_handling() {
+        let mut app = App::new(test_args());
+
+        // Setup "Thinking..." message
+        app.chat.messages.push(Message::new(
+            MessageRole::Assistant,
+            "Thinking...".to_string(),
+        ));
+        app.chat.awaiting_response = true;
+
+        // Create channel and immediately drop the sender
+        let (tx, rx) = mpsc::channel::<PendingResponse>(1);
+        app.pending_response = Some(rx);
+        drop(tx); // Simulate task ending without sending
+
+        // Call tick - should handle disconnection
+        app.tick().await;
+
+        // Should show error message
+        let last_msg = app.chat.messages.last().unwrap();
+        assert!(
+            last_msg.content.contains("unexpectedly") || last_msg.role == MessageRole::System,
+            "Should show disconnection error. Got: {}",
+            last_msg.content
+        );
+        assert!(!app.chat.awaiting_response);
     }
 }

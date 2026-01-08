@@ -2,12 +2,12 @@
 //!
 //! Data-oriented design: structs for data, functions for behavior.
 
+use crate::cli::config::default_db_path;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::print_table;
-use casparian_scout::{Database, TaggingRule};
+use crate::scout::{Database, TaggingRule};
 use clap::Subcommand;
 use glob::Pattern;
-use std::path::PathBuf;
 
 /// Subcommands for rule management
 #[derive(Subcommand, Debug, Clone)]
@@ -45,17 +45,6 @@ pub enum RuleAction {
         id: String,
         path: String,
     },
-}
-
-/// Get the default database path
-fn get_default_db_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        let casparian_dir = home.join(".casparian_flow");
-        std::fs::create_dir_all(&casparian_dir).ok();
-        casparian_dir.join("scout.db")
-    } else {
-        PathBuf::from("scout.db")
-    }
 }
 
 /// Validate a glob pattern
@@ -114,7 +103,7 @@ pub fn run(action: RuleAction) -> anyhow::Result<()> {
 }
 
 async fn run_async(action: RuleAction) -> anyhow::Result<()> {
-    let db_path = get_default_db_path();
+    let db_path = default_db_path();
     let db = Database::open(&db_path).await.map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
@@ -378,7 +367,7 @@ async fn test_rule(db: &Database, id: &str, path: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian_scout::{Source, SourceType};
+    use crate::scout::{ScannedFile, Source, SourceType};
 
     #[test]
     fn test_validate_pattern_valid() {
@@ -461,7 +450,7 @@ mod tests {
 
         // Add files
         for name in &["test.csv", "data.csv", "info.json"] {
-            let file = casparian_scout::ScannedFile::new(
+            let file = ScannedFile::new(
                 "src-1",
                 &format!("/data/{}", name),
                 name,

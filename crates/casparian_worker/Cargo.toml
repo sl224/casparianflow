@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Protocol
-cf_protocol = { path = "../cf_protocol" }
+casparian_protocol = { path = "../casparian_protocol" }
 
 # Async runtime
 tokio.workspace = true

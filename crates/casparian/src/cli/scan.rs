@@ -1,14 +1,28 @@
 //! Scan command - Discover files in a directory
 //!
-//! This is a standalone command that works without a database.
-//! It scans a directory for files matching specified criteria.
+//! Scans a directory for files matching specified criteria and stores
+//! file metadata in the database for later filtering and tagging.
+//!
+//! Uses crate::scout::Database as the single source of truth.
 
 use crate::cli::error::HelpfulError;
-use crate::cli::output::{color_for_extension, format_size, format_time, parse_size, print_table_colored};
+use crate::cli::output::{color_for_extension, format_size, format_time, print_table_colored};
+use crate::scout::{Database, ScannedFile, Source, SourceType};
 use comfy_table::Color;
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use walkdir::WalkDir;
@@ -18,6 +32,7 @@ use walkdir::WalkDir;
 pub struct ScanArgs {
     pub path: PathBuf,
     pub types: Vec<String>,
+    pub patterns: Vec<String>,
     pub recursive: bool,
     pub depth: Option<usize>,
     pub min_size: Option<String>,
@@ -25,6 +40,8 @@ pub struct ScanArgs {
     pub json: bool,
     pub stats: bool,
     pub quiet: bool,
+    pub interactive: bool,
+    pub tag: Option<String>,
 }
 
 /// Discovered file information
@@ -72,8 +89,55 @@ mod system_time_serde {
     }
 }
 
-/// Execute the scan command
-pub fn run(args: ScanArgs) -> anyhow::Result<()> {
+/// Get the default database path
+fn get_db_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".casparian_flow")
+        .join("casparian_flow.sqlite3")
+}
+
+/// Build a GlobSet from pattern strings
+fn build_glob_set(patterns: &[String]) -> anyhow::Result<(GlobSet, GlobSet)> {
+    let mut include_builder = GlobSetBuilder::new();
+    let mut exclude_builder = GlobSetBuilder::new();
+
+    for pattern in patterns {
+        if let Some(stripped) = pattern.strip_prefix('!') {
+            // Exclusion pattern
+            exclude_builder.add(Glob::new(stripped)?);
+        } else {
+            // Inclusion pattern
+            include_builder.add(Glob::new(pattern)?);
+        }
+    }
+
+    Ok((include_builder.build()?, exclude_builder.build()?))
+}
+
+/// Check if a path matches the pattern filters
+fn matches_patterns(
+    rel_path: &str,
+    include_set: &GlobSet,
+    exclude_set: &GlobSet,
+    has_includes: bool,
+) -> bool {
+    // If excluded, always reject
+    if exclude_set.is_match(rel_path) {
+        return false;
+    }
+
+    // If no include patterns, accept all (that aren't excluded)
+    if !has_includes {
+        return true;
+    }
+
+    // Must match at least one include pattern
+    include_set.is_match(rel_path)
+}
+
+/// Execute the scan command (async version)
+pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
     // Validate path exists
     if !args.path.exists() {
         return Err(HelpfulError::path_not_found(&args.path).into());
@@ -88,19 +152,23 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     let min_size = args
         .min_size
         .as_ref()
-        .map(|s| parse_size(s))
+        .map(|s| crate::cli::output::parse_size(s))
         .transpose()
         .map_err(|e| HelpfulError::invalid_size_format(&e))?;
 
     let max_size = args
         .max_size
         .as_ref()
-        .map(|s| parse_size(s))
+        .map(|s| crate::cli::output::parse_size(s))
         .transpose()
         .map_err(|e| HelpfulError::invalid_size_format(&e))?;
 
     // Normalize type filters to lowercase
     let type_filters: Vec<String> = args.types.iter().map(|t| t.to_lowercase()).collect();
+
+    // Build glob pattern matchers
+    let (include_set, exclude_set) = build_glob_set(&args.patterns)?;
+    let has_include_patterns = args.patterns.iter().any(|p| !p.starts_with('!'));
 
     // Build walker
     let mut walker = WalkDir::new(&args.path);
@@ -110,6 +178,9 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     } else if let Some(depth) = args.depth {
         walker = walker.max_depth(depth);
     }
+
+    // Canonicalize scan path for relative path calculation
+    let scan_path = args.path.canonicalize().unwrap_or_else(|_| args.path.clone());
 
     // Collect files
     let mut files: Vec<DiscoveredFile> = Vec::new();
@@ -121,6 +192,20 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
         if path.is_dir() {
             directories_scanned += 1;
             continue;
+        }
+
+        // Get relative path for pattern matching
+        let rel_path = path
+            .strip_prefix(&scan_path)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+
+        // Apply pattern filter
+        if !args.patterns.is_empty() {
+            if !matches_patterns(&rel_path, &include_set, &exclude_set, has_include_patterns) {
+                continue;
+            }
         }
 
         // Get file metadata
@@ -178,6 +263,18 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     // Build summary
     let summary = build_summary(&files, directories_scanned);
 
+    // Store files in database using casparian_scout::Database
+    let db_path = get_db_path();
+    let db_dir = db_path.parent().unwrap();
+    fs::create_dir_all(db_dir)?;
+
+    let db = Database::open(&db_path).await
+        .map_err(|e| HelpfulError::new(format!("Failed to open database: {}", e))
+            .with_context(format!("Database path: {}", db_path.display())))?;
+
+    let source_id = get_or_create_source(&db, &scan_path).await?;
+    let stored = store_files(&db, &source_id, &scan_path, &files, args.tag.as_deref()).await?;
+
     let result = ScanResult {
         files,
         summary,
@@ -185,17 +282,99 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     };
 
     // Output based on format
-    if args.json {
+    if args.interactive {
+        run_interactive(result, args.tag.clone())?;
+    } else if args.json {
         output_json(&result)?;
     } else if args.stats {
         output_stats(&result);
     } else if args.quiet {
         output_quiet(&result);
     } else {
-        output_table(&result);
+        output_table(&result, stored, args.tag.as_deref());
     }
 
     Ok(())
+}
+
+/// Get or create a source for the scan path
+async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<String> {
+    let path_str = path.display().to_string();
+
+    // Try to find existing source by path
+    let sources = db.list_sources().await
+        .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
+
+    for source in sources {
+        if source.path == path_str {
+            return Ok(source.id);
+        }
+    }
+
+    // Create new source
+    let id = uuid::Uuid::new_v4().to_string();
+    let name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("scan")
+        .to_string();
+
+    let source = Source {
+        id: id.clone(),
+        name,
+        source_type: SourceType::Local,
+        path: path_str,
+        poll_interval_secs: 0, // CLI scans are one-shot
+        enabled: true,
+    };
+
+    db.upsert_source(&source).await
+        .map_err(|e| HelpfulError::new(format!("Failed to create source: {}", e)))?;
+
+    Ok(id)
+}
+
+/// Store discovered files in the database
+async fn store_files(
+    db: &Database,
+    source_id: &str,
+    scan_path: &PathBuf,
+    files: &[DiscoveredFile],
+    tag: Option<&str>,
+) -> anyhow::Result<usize> {
+    let mut stored = 0;
+
+    for file in files {
+        let rel_path = file.path
+            .strip_prefix(scan_path)
+            .unwrap_or(&file.path)
+            .display()
+            .to_string();
+
+        let mtime = file.modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let scanned_file = ScannedFile::new(
+            source_id,
+            &file.path.display().to_string(),
+            &rel_path,
+            file.size,
+            mtime,
+        );
+
+        let result = db.upsert_file(&scanned_file).await;
+        if let Ok(upsert_result) = result {
+            stored += 1;
+
+            // Tag the file if requested
+            if let Some(t) = tag {
+                let _ = db.tag_file(upsert_result.id, t).await;
+            }
+        }
+    }
+
+    Ok(stored)
 }
 
 /// Build summary statistics from discovered files
@@ -266,7 +445,7 @@ fn output_quiet(result: &ScanResult) {
 }
 
 /// Output as formatted table
-fn output_table(result: &ScanResult) {
+fn output_table(result: &ScanResult, stored: usize, tag: Option<&str>) {
     if result.files.is_empty() {
         println!("No files found in: {}", result.scan_path.display());
         return;
@@ -278,6 +457,13 @@ fn output_table(result: &ScanResult) {
         result.scan_path.display(),
         format_size(result.summary.total_size)
     );
+
+    // Show storage info
+    if let Some(t) = tag {
+        println!("Stored {} files with tag: \x1b[36m{}\x1b[0m", stored, t);
+    } else {
+        println!("Stored {} files in database", stored);
+    }
     println!();
 
     let headers = &["Name", "Type", "Size", "Modified", "Path"];
@@ -312,6 +498,297 @@ fn output_table(result: &ScanResult) {
         .collect();
 
     print_table_colored(headers, rows);
+
+    // Show next steps
+    print_next_steps(result, tag);
+}
+
+/// Print helpful next steps after scan
+fn print_next_steps(result: &ScanResult, tag: Option<&str>) {
+    println!();
+    println!("\x1b[90m{}\x1b[0m", "─".repeat(60));
+    println!();
+
+    // Get a sample file for examples
+    let sample_file = result.files.first().map(|f| {
+        f.path
+            .strip_prefix(&result.scan_path)
+            .unwrap_or(&f.path)
+            .display()
+            .to_string()
+    });
+
+    let sample = sample_file.as_deref().unwrap_or("file.csv");
+
+    println!("\x1b[1mNext steps:\x1b[0m");
+    println!();
+
+    if tag.is_some() {
+        // Already tagged, show how to view and process
+        println!("  \x1b[36mView tagged files:\x1b[0m casparian files --topic {}", tag.unwrap());
+        println!("  \x1b[36mList all files:\x1b[0m    casparian files");
+    } else {
+        // Not tagged, show how to filter and tag
+        println!("  \x1b[36mList all files:\x1b[0m    casparian files");
+        println!("  \x1b[36mFilter by pattern:\x1b[0m casparian files -p \"*.csv\"");
+        println!("  \x1b[36mFilter and tag:\x1b[0m    casparian files -p \"*.csv\" --tag mydata");
+    }
+
+    println!();
+    println!(
+        "  \x1b[36mPreview a file:\x1b[0m    casparian preview {}",
+        sample
+    );
+    println!(
+        "  \x1b[36mInteractive mode:\x1b[0m  casparian scan {} -i",
+        result.scan_path.display()
+    );
+    println!();
+}
+
+/// Interactive file browser state
+struct InteractiveState {
+    files: Vec<DiscoveredFile>,
+    scan_path: PathBuf,
+    list_state: ListState,
+    preview_content: Option<String>,
+    running: bool,
+}
+
+impl InteractiveState {
+    fn new(result: ScanResult) -> Self {
+        let mut list_state = ListState::default();
+        if !result.files.is_empty() {
+            list_state.select(Some(0));
+        }
+        Self {
+            files: result.files,
+            scan_path: result.scan_path,
+            list_state,
+            preview_content: None,
+            running: true,
+        }
+    }
+
+    fn selected_file(&self) -> Option<&DiscoveredFile> {
+        self.list_state.selected().and_then(|i| self.files.get(i))
+    }
+
+    fn next(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) => (i + 1).min(self.files.len() - 1),
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+        self.update_preview();
+    }
+
+    fn previous(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let i = match self.list_state.selected() {
+            Some(i) => i.saturating_sub(1),
+            None => 0,
+        };
+        self.list_state.select(Some(i));
+        self.update_preview();
+    }
+
+    fn update_preview(&mut self) {
+        self.preview_content = self.selected_file().map(|file| {
+            // Read first 40 lines of the file
+            match std::fs::read_to_string(&file.path) {
+                Ok(content) => {
+                    let lines: Vec<&str> = content.lines().take(40).collect();
+                    lines.join("\n")
+                }
+                Err(_) => {
+                    // Try reading as binary
+                    match std::fs::read(&file.path) {
+                        Ok(bytes) => {
+                            let preview_bytes = bytes.iter().take(500);
+                            format!(
+                                "[Binary file: {} bytes]\n\nHex preview:\n{}",
+                                bytes.len(),
+                                preview_bytes
+                                    .take(256)
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<_>>()
+                                    .chunks(32)
+                                    .map(|chunk| chunk.join(" "))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            )
+                        }
+                        Err(e) => format!("Cannot read file: {}", e),
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Run interactive file browser
+fn run_interactive(result: ScanResult, _tag: Option<String>) -> anyhow::Result<()> {
+    if result.files.is_empty() {
+        println!("No files found in: {}", result.scan_path.display());
+        return Ok(());
+    }
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    let mut state = InteractiveState::new(result);
+    state.update_preview();
+
+    // Main loop
+    while state.running {
+        terminal.draw(|frame| draw_interactive(frame, &mut state))?;
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        state.running = false;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.previous();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.next();
+                    }
+                    KeyCode::Enter => {
+                        // Run preview command
+                        if let Some(file) = state.selected_file() {
+                            // Exit TUI, run preview, then re-enter
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+                            let _ = std::process::Command::new("casparian")
+                                .args(["preview", &file.path.display().to_string()])
+                                .status();
+
+                            println!("\nPress Enter to continue...");
+                            let _ = std::io::stdin().read_line(&mut String::new());
+
+                            enable_raw_mode()?;
+                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                        }
+                    }
+                    KeyCode::Char('s') => {
+                        // Show schema
+                        if let Some(file) = state.selected_file() {
+                            disable_raw_mode()?;
+                            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+                            let _ = std::process::Command::new("casparian")
+                                .args(["preview", &file.path.display().to_string(), "--schema"])
+                                .status();
+
+                            println!("\nPress Enter to continue...");
+                            let _ = std::io::stdin().read_line(&mut String::new());
+
+                            enable_raw_mode()?;
+                            execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(())
+}
+
+/// Draw the interactive UI
+fn draw_interactive(frame: &mut Frame, state: &mut InteractiveState) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(frame.area());
+
+    // File list
+    let items: Vec<ListItem> = state
+        .files
+        .iter()
+        .map(|file| {
+            let ext_style = match file.extension.as_str() {
+                "csv" | "tsv" => Style::default().fg(ratatui::style::Color::Green),
+                "json" | "jsonl" | "ndjson" => Style::default().fg(ratatui::style::Color::Yellow),
+                "parquet" | "pq" => Style::default().fg(ratatui::style::Color::Magenta),
+                _ => Style::default(),
+            };
+
+            let display_path = file
+                .path
+                .strip_prefix(&state.scan_path)
+                .unwrap_or(&file.path)
+                .display()
+                .to_string();
+
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<4} ", file.extension.to_uppercase()),
+                    ext_style,
+                ),
+                Span::raw(format!("{:>8}  ", format_size(file.size))),
+                Span::raw(display_path),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(format!(" Files ({}) ", state.files.len()))
+                .borders(Borders::ALL),
+        )
+        .highlight_style(Style::default().bg(ratatui::style::Color::DarkGray))
+        .highlight_symbol("> ");
+
+    frame.render_stateful_widget(list, chunks[0], &mut state.list_state);
+
+    // Preview pane
+    let preview_title = state
+        .selected_file()
+        .map(|f| format!(" {} ", f.name))
+        .unwrap_or_else(|| " Preview ".to_string());
+
+    let preview_content = state
+        .preview_content
+        .clone()
+        .unwrap_or_else(|| "Select a file to preview".to_string());
+
+    let preview = Paragraph::new(preview_content)
+        .block(Block::default().title(preview_title).borders(Borders::ALL))
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(preview, chunks[1]);
+
+    // Help bar at bottom
+    let help_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(frame.area())[1];
+
+    let help = Paragraph::new(" j/k or arrows: navigate | Enter: preview | s: schema | q: quit ")
+        .style(Style::default().fg(ratatui::style::Color::DarkGray));
+
+    frame.render_widget(help, help_area);
 }
 
 #[cfg(test)]
@@ -346,14 +823,15 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn test_scan_basic() {
+    #[tokio::test]
+    async fn test_scan_basic() {
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
 
         let args = ScanArgs {
             path: temp_dir.path().to_path_buf(),
             types: vec![],
+            patterns: vec![],
             recursive: true,
             depth: None,
             min_size: None,
@@ -361,19 +839,22 @@ mod tests {
             json: false,
             stats: false,
             quiet: true,
+            interactive: false,
+            tag: None,
         };
 
-        run(args).unwrap();
+        run(args).await.unwrap();
     }
 
-    #[test]
-    fn test_scan_type_filter() {
+    #[tokio::test]
+    async fn test_scan_type_filter() {
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
 
         let args = ScanArgs {
             path: temp_dir.path().to_path_buf(),
             types: vec!["csv".to_string()],
+            patterns: vec![],
             recursive: true,
             depth: None,
             min_size: None,
@@ -381,19 +862,22 @@ mod tests {
             json: false,
             stats: false,
             quiet: true,
+            interactive: false,
+            tag: None,
         };
 
-        run(args).unwrap();
+        run(args).await.unwrap();
     }
 
-    #[test]
-    fn test_scan_non_recursive() {
+    #[tokio::test]
+    async fn test_scan_non_recursive() {
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
 
         let args = ScanArgs {
             path: temp_dir.path().to_path_buf(),
             types: vec![],
+            patterns: vec![],
             recursive: false,
             depth: None,
             min_size: None,
@@ -401,16 +885,19 @@ mod tests {
             json: false,
             stats: false,
             quiet: true,
+            interactive: false,
+            tag: None,
         };
 
-        run(args).unwrap();
+        run(args).await.unwrap();
     }
 
-    #[test]
-    fn test_scan_nonexistent_path() {
+    #[tokio::test]
+    async fn test_scan_nonexistent_path() {
         let args = ScanArgs {
             path: PathBuf::from("/nonexistent/path/that/does/not/exist"),
             types: vec![],
+            patterns: vec![],
             recursive: false,
             depth: None,
             min_size: None,
@@ -418,14 +905,16 @@ mod tests {
             json: false,
             stats: false,
             quiet: true,
+            interactive: false,
+            tag: None,
         };
 
-        let result = run(args);
+        let result = run(args).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_scan_file_instead_of_dir() {
+    #[tokio::test]
+    async fn test_scan_file_instead_of_dir() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         File::create(&file_path)
@@ -436,6 +925,7 @@ mod tests {
         let args = ScanArgs {
             path: file_path,
             types: vec![],
+            patterns: vec![],
             recursive: false,
             depth: None,
             min_size: None,
@@ -443,9 +933,11 @@ mod tests {
             json: false,
             stats: false,
             quiet: true,
+            interactive: false,
+            tag: None,
         };
 
-        let result = run(args);
+        let result = run(args).await;
         assert!(result.is_err());
     }
 

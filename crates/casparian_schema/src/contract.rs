@@ -300,6 +300,42 @@ impl std::fmt::Display for DataType {
     }
 }
 
+// ============================================================================
+// Conversions to/from canonical casparian_protocol::DataType
+// ============================================================================
+
+impl From<DataType> for casparian_protocol::DataType {
+    fn from(dt: DataType) -> Self {
+        match dt {
+            DataType::String => casparian_protocol::DataType::String,
+            DataType::Int64 => casparian_protocol::DataType::Int64,
+            DataType::Float64 => casparian_protocol::DataType::Float64,
+            DataType::Boolean => casparian_protocol::DataType::Boolean,
+            DataType::Date => casparian_protocol::DataType::Date,
+            DataType::Timestamp => casparian_protocol::DataType::Timestamp,
+            DataType::Binary => casparian_protocol::DataType::Binary,
+        }
+    }
+}
+
+impl From<casparian_protocol::DataType> for DataType {
+    fn from(dt: casparian_protocol::DataType) -> Self {
+        match dt {
+            casparian_protocol::DataType::String => DataType::String,
+            casparian_protocol::DataType::Int64 => DataType::Int64,
+            casparian_protocol::DataType::Float64 => DataType::Float64,
+            casparian_protocol::DataType::Boolean => DataType::Boolean,
+            casparian_protocol::DataType::Date => DataType::Date,
+            casparian_protocol::DataType::Timestamp => DataType::Timestamp,
+            casparian_protocol::DataType::Binary => DataType::Binary,
+            // Map protocol-only types to String (fallback)
+            casparian_protocol::DataType::Null => DataType::String,
+            casparian_protocol::DataType::Time => DataType::String,
+            casparian_protocol::DataType::Duration => DataType::String,
+        }
+    }
+}
+
 /// A schema contract violation - parser output doesn't match contract.
 ///
 /// This represents a FAILURE, not a warning. The job should fail when

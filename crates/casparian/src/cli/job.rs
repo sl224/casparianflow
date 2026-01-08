@@ -3,7 +3,8 @@
 //! Commands for showing, retrying, and cancelling individual jobs.
 
 use crate::cli::error::HelpfulError;
-use crate::cli::jobs::{get_db_path, Job, JobStatus};
+use crate::cli::jobs::{get_db_path, Job};
+use casparian_protocol::ProcessingStatus;
 use clap::Subcommand;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -121,7 +122,7 @@ async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()>
     };
 
     // Get failure details if job failed
-    let failure = if job.status == JobStatus::Failed {
+    let failure = if job.status == ProcessingStatus::Failed {
         get_job_failure(&pool, job_id).await?
     } else {
         None
@@ -183,7 +184,7 @@ async fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             .into());
     };
 
-    if job.status != JobStatus::Failed {
+    if job.status != ProcessingStatus::Failed {
         return Err(HelpfulError::new(format!(
             "Job {} is {}, not FAILED",
             job_id,
@@ -292,21 +293,24 @@ async fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
     // Only cancel queued or running jobs
     match job.status {
-        JobStatus::Queued | JobStatus::Running | JobStatus::Pending => {
+        ProcessingStatus::Queued | ProcessingStatus::Running | ProcessingStatus::Pending => {
             // OK to cancel
         }
-        JobStatus::Completed => {
+        ProcessingStatus::Staged => {
+            // Staged jobs can also be cancelled
+        }
+        ProcessingStatus::Completed => {
             return Err(HelpfulError::new(format!("Job {} already completed", job_id))
                 .with_context("Cannot cancel a completed job")
                 .into());
         }
-        JobStatus::Failed => {
+        ProcessingStatus::Failed => {
             return Err(HelpfulError::new(format!("Job {} already failed", job_id))
                 .with_context("Cannot cancel a failed job")
                 .with_suggestion("TRY: casparian job retry {}   # Retry the job instead", )
                 .into());
         }
-        JobStatus::Skipped => {
+        ProcessingStatus::Skipped => {
             return Err(HelpfulError::new(format!("Job {} was skipped", job_id))
                 .with_context("Cannot cancel a skipped job")
                 .into());
@@ -332,7 +336,7 @@ async fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
     println!("Job {} cancelled", job_id);
 
     // If the job was running, warn about potential side effects
-    if job.status == JobStatus::Running {
+    if job.status == ProcessingStatus::Running {
         println!();
         println!("WARNING: Job was RUNNING when cancelled.");
         println!("The worker may have partially processed the file.");
@@ -397,7 +401,7 @@ async fn get_job_by_id(pool: &sqlx::SqlitePool, job_id: i64) -> anyhow::Result<O
         id: r.0,
         file_path: r.1,
         plugin_name: r.2,
-        status: JobStatus::from_str(&r.3),
+        status: r.3.parse().unwrap_or_default(),
         priority: r.4,
         claim_time: r.5,
         end_time: r.6,
@@ -550,13 +554,13 @@ fn print_job_details(job: &Job, failure: &Option<JobFailure>, timeline: &JobTime
     // Suggestions
     println!();
     println!("TRY:");
-    if job.status == JobStatus::Failed {
+    if job.status == ProcessingStatus::Failed {
         println!("  casparian job retry {}            # Retry this job", job.id);
         println!(
             "  casparian preview {}   # Inspect the file",
             job.file_path
         );
-    } else if job.status == JobStatus::Queued || job.status == JobStatus::Running {
+    } else if job.status == ProcessingStatus::Queued || job.status == ProcessingStatus::Running {
         println!("  casparian job cancel {}           # Cancel this job", job.id);
     }
     println!("  casparian jobs                    # View all jobs");
@@ -604,7 +608,7 @@ mod tests {
             id: 1,
             file_path: "/test/file.csv".to_string(),
             plugin_name: "test".to_string(),
-            status: JobStatus::Completed,
+            status: ProcessingStatus::Completed,
             priority: 0,
             claim_time: Some("2024-12-16T10:00:00Z".to_string()),
             end_time: Some("2024-12-16T10:00:05Z".to_string()),

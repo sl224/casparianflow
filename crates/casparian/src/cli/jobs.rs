@@ -5,6 +5,7 @@
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::print_table_colored;
+use casparian_protocol::ProcessingStatus;
 use comfy_table::Color;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -20,50 +21,16 @@ pub struct JobsArgs {
     pub limit: usize,
 }
 
-/// Job status (matches database enum)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum JobStatus {
-    Queued,
-    Running,
-    Completed,
-    Failed,
-    Pending,
-    Skipped,
-}
-
-impl JobStatus {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_uppercase().as_str() {
-            "QUEUED" => Self::Queued,
-            "RUNNING" => Self::Running,
-            "COMPLETED" => Self::Completed,
-            "FAILED" => Self::Failed,
-            "PENDING" => Self::Pending,
-            "SKIPPED" => Self::Skipped,
-            _ => Self::Pending,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Queued => "QUEUED",
-            Self::Running => "RUNNING",
-            Self::Completed => "COMPLETED",
-            Self::Failed => "FAILED",
-            Self::Pending => "PENDING",
-            Self::Skipped => "SKIPPED",
-        }
-    }
-
-    pub fn color(&self) -> Color {
-        match self {
-            Self::Queued => Color::Yellow,
-            Self::Running => Color::Cyan,
-            Self::Completed => Color::Green,
-            Self::Failed => Color::Red,
-            Self::Pending => Color::Grey,
-            Self::Skipped => Color::DarkGrey,
-        }
+/// Get display color for a processing status
+fn status_color(status: ProcessingStatus) -> Color {
+    match status {
+        ProcessingStatus::Queued => Color::Yellow,
+        ProcessingStatus::Running => Color::Cyan,
+        ProcessingStatus::Staged => Color::Blue,
+        ProcessingStatus::Completed => Color::Green,
+        ProcessingStatus::Failed => Color::Red,
+        ProcessingStatus::Pending => Color::Grey,
+        ProcessingStatus::Skipped => Color::DarkGrey,
     }
 }
 
@@ -73,7 +40,7 @@ pub struct Job {
     pub id: i64,
     pub file_path: String,
     pub plugin_name: String,
-    pub status: JobStatus,
+    pub status: ProcessingStatus,
     pub priority: i32,
     pub claim_time: Option<String>,
     pub end_time: Option<String>,
@@ -102,7 +69,6 @@ pub fn run(args: JobsArgs) -> anyhow::Result<()> {
         return Err(HelpfulError::new("Database not found")
             .with_context(format!("Expected database at: {}", db_path.display()))
             .with_suggestion("TRY: casparian start   # Start the server to create the database")
-            .with_suggestion("TRY: Check CASPARIAN_DB environment variable")
             .into());
     }
 
@@ -146,9 +112,9 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Get the database path from environment or default
+/// Get the database path
 pub fn get_db_path() -> anyhow::Result<PathBuf> {
-    Ok(config::resolve_db_path(None))
+    Ok(config::default_db_path())
 }
 
 /// Build status filter from command flags
@@ -307,7 +273,7 @@ async fn get_jobs(
             id: row.0,
             file_path: row.1,
             plugin_name: row.2,
-            status: JobStatus::from_str(&row.3),
+            status: row.3.parse().unwrap_or_default(),
             priority: row.4,
             claim_time: row.5,
             end_time: row.6,
@@ -359,7 +325,7 @@ fn print_jobs_table(jobs: &[Job], limit: usize) {
                 (job.id.to_string(), None),
                 (file_display, None),
                 (job.plugin_name.clone(), None),
-                (job.status.as_str().to_string(), Some(job.status.color())),
+                (job.status.as_str().to_string(), Some(status_color(job.status))),
                 (started, None),
                 (duration, None),
             ]
@@ -468,13 +434,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_job_status_from_str() {
-        assert_eq!(JobStatus::from_str("QUEUED"), JobStatus::Queued);
-        assert_eq!(JobStatus::from_str("RUNNING"), JobStatus::Running);
-        assert_eq!(JobStatus::from_str("COMPLETED"), JobStatus::Completed);
-        assert_eq!(JobStatus::from_str("FAILED"), JobStatus::Failed);
-        assert_eq!(JobStatus::from_str("queued"), JobStatus::Queued);
-        assert_eq!(JobStatus::from_str("unknown"), JobStatus::Pending);
+    fn test_processing_status_from_str() {
+        assert_eq!("QUEUED".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Queued);
+        assert_eq!("RUNNING".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Running);
+        assert_eq!("COMPLETED".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Completed);
+        assert_eq!("FAILED".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Failed);
+        assert_eq!("queued".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Queued);
+        assert!("unknown".parse::<ProcessingStatus>().is_err());
     }
 
     #[test]

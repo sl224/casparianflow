@@ -4,8 +4,8 @@
 //! Used by both CLI (`casparian publish`) and Tauri UI.
 
 use anyhow::{Context, Result};
-use cf_security::signing::sha256;
-use cf_security::Gatekeeper;
+use casparian_security::signing::sha256;
+use casparian_security::Gatekeeper;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

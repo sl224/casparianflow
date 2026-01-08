@@ -1,7 +1,7 @@
 use anyhow::Result;
 use casparian_worker::{Worker, WorkerConfig};
-use cf_protocol::types::{self};
-use cf_protocol::{Message, OpCode};
+use casparian_protocol::types::{self};
+use casparian_protocol::{Message, OpCode};
 use std::time::Duration;
 use tokio::time::timeout;
 use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
@@ -69,7 +69,7 @@ async fn test_worker_heartbeat_responsiveness() -> Result<()> {
     // 5. Send multiple heartbeats and verify prompt responses
     for i in 0..3 {
         let heartbeat_payload = types::HeartbeatPayload {
-            status: "CHECK".to_string(),
+            status: types::HeartbeatStatus::Alive,
             current_job_id: None,
             active_job_count: 0,
             active_job_ids: vec![],

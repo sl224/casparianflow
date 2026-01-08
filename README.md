@@ -23,6 +23,9 @@ cargo build --release
 # Start the system
 ./target/release/casparian start
 
+# Interactive TUI
+./target/release/casparian tui
+
 # Initialize Scout (file discovery)
 ./target/release/casparian scout init
 
@@ -101,11 +104,9 @@ Claude Code ──MCP──> Casparian MCP Server
 ```bash
 # Type check
 cargo check
-cd ui && bun run check
 
 # Build
-cargo build
-cd ui && bun run build
+cargo build --release
 
 # Test (E2E, no mocks)
 cargo test --package casparian_worker --test e2e_type_inference
@@ -113,8 +114,8 @@ cargo test --package casparian_schema --test e2e_contracts
 cargo test --package casparian_backtest --test e2e_backtest
 cargo test --package casparian_mcp --test e2e_tools
 
-# UI E2E
-cd ui && bun run test:e2e
+# E2E test script
+./tests/e2e/run_e2e_test.sh
 ```
 
 ## Documentation
@@ -127,7 +128,6 @@ cd ui && bun run test:e2e
 
 - Rust 1.75+
 - [uv](https://github.com/astral-sh/uv) for Python environment management
-- Node 20+ (for UI development)
 
 ## License
 

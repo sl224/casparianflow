@@ -1,16 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/cf_protocol",
+    "crates/casparian_protocol",
     "crates/casparian_worker",
     "crates/casparian_sentinel",
     "crates/casparian",
-    "crates/cf_security",
-    "crates/casparian_scout",
+    "crates/casparian_security",
+    # "crates/casparian_scout",  # Inlined into casparian::scout module
     "crates/casparian_schema",
     "crates/casparian_backtest",
     "crates/casparian_mcp",
-    "ui/src-tauri",
 ]
 
 [workspace.package]

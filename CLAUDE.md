@@ -63,8 +63,8 @@ The entire system should feel like "drag and drop your messy files, get clean da
 | `casparian_worker` | Parser execution + type inference | Constraint-based inference |
 | `casparian_scout` | File discovery + tagging | Sources, patterns, tags |
 | `casparian` | Unified CLI binary | start, publish, scout commands |
-| `cf_security` | Auth + signing | Ed25519, Azure AD |
-| `cf_protocol` | Binary protocol | OpCodes, serialization |
+| `casparian_security` | Auth + signing | Ed25519, Azure AD |
+| `casparian_protocol` | Binary protocol | OpCodes, serialization |
 
 ---
 
@@ -144,6 +144,71 @@ All Python environments use [uv](https://github.com/astral-sh/uv):
 - Fast, cross-platform environment creation
 - Content-addressable venv caching (`~/.casparian_flow/venvs/{env_hash}/`)
 
+### 7. Parser Execution (`casparian run`)
+
+The `run` command executes parsers with ZMQ-based IPC:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      casparian run                              │
+│                        (Rust CLI)                               │
+└─────────────────────────────────────────────────────────────────┘
+        │                                          ▲
+        │ 1. Spawn worker                          │ 4. ZMQ messages
+        │ 2. Pass: parser, input, endpoint         │    (Arrow IPC batches)
+        ▼                                          │
+┌─────────────────────────────────────────────────────────────────┐
+│                    Python Worker Shim                           │
+│  - Loads parser                                                 │
+│  - Extracts name, version, topics from parser class             │
+│  - Executes parse() method                                      │
+│  - Yields (sink_name, arrow_batch) tuples                       │
+│  - Serializes to Arrow IPC, sends via ZMQ                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Parser class requirements:**
+
+```python
+import pyarrow as pa
+
+class MyParser:
+    name = 'my_parser'           # Required: logical parser name
+    version = '1.0.0'            # Required: semver version
+    topics = ['sales_data']      # Required: topics to subscribe to
+    outputs = {
+        'orders': pa.schema([
+            ('id', pa.int64()),
+            ('amount', pa.float64()),
+        ])
+    }
+
+    def parse(self, ctx):
+        # ctx.input_path, ctx.source_hash, ctx.job_id available
+        yield ('orders', dataframe)  # Yield (sink_name, data) tuples
+```
+
+**Key features:**
+- **Parser versioning**: Parsers must declare `name`, `version`, `topics`
+- **Version conflict detection**: Same (name, version) with different source hash = ERROR
+- **Deduplication**: Skip if (input_hash, parser_name, parser_version) already processed
+- **Lineage columns**: `_cf_source_hash`, `_cf_job_id`, `_cf_processed_at`, `_cf_parser_version`
+- **Atomic writes**: Temp file → rename for parquet/csv
+- **Partitioned output**: `{output}_{job_id}.parquet` per run
+- **Topic subscriptions**: Files → Tags → Topics → Parsers
+
+**Version bump flow:**
+
+When you change parser code:
+1. Bump the `version` attribute (e.g., `1.0.0` → `1.0.1`)
+2. Run `casparian backfill my_parser` to see files needing re-processing
+3. Use `--execute` to actually re-process them
+
+**Supported sinks:**
+- `parquet://./output/` - Parquet files (default)
+- `sqlite:///data.db` - SQLite database
+- `csv://./output/` - CSV files
+
 ---
 
 ## Directory Structure
@@ -155,8 +220,11 @@ casparian-flow/
 ├── README.md                 # Quick start
 │
 ├── crates/                   # Rust core
-│   ├── casparian/            # Unified binary (CLI)
-│   │   └── src/main.rs       # CLI entry point
+│   ├── casparian/            # Unified binary (CLI + TUI)
+│   │   └── src/
+│   │       ├── main.rs       # CLI entry point
+│   │       └── cli/
+│   │           └── tui/      # Terminal UI (ratatui)
 │   ├── casparian_mcp/        # MCP server
 │   │   ├── CLAUDE.md         # MCP-specific docs
 │   │   └── src/
@@ -190,11 +258,6 @@ casparian-flow/
 │   │       └── scanner.rs    # Filesystem walking
 │   ├── cf_security/          # Auth + signing
 │   └── cf_protocol/          # Binary protocol
-│
-├── ui/                       # Tauri desktop app
-│   ├── CLAUDE.md             # UI-specific docs
-│   ├── src/                  # SvelteKit frontend
-│   └── src-tauri/            # Rust backend
 │
 └── demo/                     # Example files and plugins
 ```
@@ -237,45 +300,56 @@ The MCP server exposes 9 tools for Claude Code integration:
 ### After Any Code Change
 
 ```bash
-# 1. Type check everything
-cargo check                    # Rust
-cd ui && bun run check         # TypeScript/Svelte
+# 1. Type check
+cargo check
 
 # 2. Build
-cargo build                    # Rust
-cd ui && bun run build         # UI
+cargo build --release
 
 # 3. Test
 cargo test                     # All Rust tests
 cargo test -p casparian_mcp    # Specific crate
-cd ui && bun run test:e2e      # UI E2E tests
 ```
 
 ### Running E2E Tests
 
 ```bash
-# All E2E tests for new crates
+# All E2E tests for crates
 cargo test --package casparian_worker --test e2e_type_inference
 cargo test --package casparian_schema --test e2e_contracts
 cargo test --package casparian_backtest --test e2e_backtest
 cargo test --package casparian_mcp --test e2e_tools
 
-# UI E2E tests
-cd ui && bun run test:e2e
+# E2E test script
+./tests/e2e/run_e2e_test.sh
 ```
 
 ### Key Commands
 
 ```bash
-# Start the system
-./target/release/casparian start
+# Run a parser against an input file
+./target/release/casparian run parser.py input.csv
+./target/release/casparian run parser.py input.csv --sink parquet://./output/
+./target/release/casparian run parser.py input.csv --sink sqlite:///data.db
+./target/release/casparian run parser.py input.csv --force  # Skip dedup check
+./target/release/casparian run parser.py input.csv --whatif # Dry run
+
+# Backfill: re-process files when parser version changes
+./target/release/casparian backfill my_parser              # Preview what would be processed
+./target/release/casparian backfill my_parser --execute    # Actually process
+./target/release/casparian backfill my_parser --limit 10   # Limit to 10 files
+./target/release/casparian backfill my_parser --force      # Force re-process all
+
+# Interactive TUI
+./target/release/casparian tui
 
 # Publish a plugin
 ./target/release/casparian publish my_plugin.py --version 1.0.0
 
 # Scout operations
-./target/release/casparian scout init
-./target/release/casparian scout run --config scout.toml
+./target/release/casparian scan <directory> --tag my_topic
+./target/release/casparian files --tag my_topic
+./target/release/casparian jobs --status pending
 ```
 
 ---
@@ -299,9 +373,11 @@ cd ui && bun run test:e2e
 
 | Prefix | Tables | Purpose |
 |--------|--------|---------|
-| `parser_lab_*` | parsers, test_files | Parser development |
+| `cf_parsers` | Parser registry with name, version, source_hash | Parser versioning |
+| `cf_parser_topics` | Parser → topic subscriptions | Topic routing |
+| `cf_job_status` | Job lifecycle (running/staged/complete/failed) | Job tracking |
+| `cf_processing_history` | Dedup by (input_hash, parser_name, version) | Skip unchanged |
 | `scout_*` | sources, files, tagging_rules | File discovery |
-| `cf_*` | plugin_manifest, processing_queue | Sentinel/execution |
 | `schema_*` | contracts, amendments | Schema contracts |
 | `backtest_*` | high_failure_files | Backtest tracking |
 
@@ -342,14 +418,9 @@ for evidence in solver.elimination_evidence() {
 
 ### Rust
 - Use `rustfmt` defaults
-- Prefer `Result<T, String>` for Tauri commands
 - Add doc comments for public functions
 - Comprehensive error types with `thiserror`
-
-### TypeScript/Svelte
-- Svelte 5 runes: `$state`, `$derived`, `$props`
-- No emojis in code or UI unless requested
-- Semantic HTML for accessibility
+- Helpful CLI error messages with suggestions
 
 ### Testing
 - E2E tests for all new features
@@ -384,6 +455,41 @@ for evidence in solver.elimination_evidence() {
 **Decision:** Claude Code integration via MCP protocol.
 **Consequence:** AI-assisted data processing workflow.
 
+### ADR-007: CLI-First Architecture (Jan 2025)
+**Decision:** Remove Tauri desktop app, focus on CLI + TUI.
+**Consequence:** Simpler architecture, faster iteration, stability first.
+
+### ADR-008: Parser as Tuple Yielder (Jan 2025)
+**Decision:** Parsers yield `(sink_name, data)` tuples, not Record objects.
+**Consequence:** Simpler protocol, no wrapper classes, data is just data.
+
+### ADR-009: Content-Based Parser Identity (Jan 2025)
+**Decision:** Parser identity is blake3(parser_content), not file path.
+**Consequence:** Same parser = same ID regardless of location. Parser changes trigger reprocessing.
+
+### ADR-010: Partitioned Output by Job (Jan 2025)
+**Decision:** Each run creates `{output}_{job_id}.parquet`, no appending.
+**Consequence:** Atomic writes, no corruption risk, query with glob patterns.
+
+### ADR-011: CLI Sink Override (Jan 2025)
+**Decision:** CLI `--sink` overrides parser-defined sinks.
+**Consequence:** Flexibility for users, parser author defines defaults.
+
+### ADR-012: Parser Versioning (Jan 2025)
+**Decision:** Parsers must declare `name`, `version`, and `topics` attributes.
+**Consequence:**
+- Same (name, version) with different source hash = ERROR (must bump version)
+- Dedup key is (input_hash, parser_name, parser_version) not just parser_id
+- Backfill command enables re-processing when version changes
+- Lineage includes `_cf_parser_version` for traceability
+
+### ADR-013: Topic Subscriptions (Jan 2025)
+**Decision:** Parsers declare topics they subscribe to; files are routed by tag→topic match.
+**Consequence:**
+- Files → Tags → Topics → Parsers chain enables backfill queries
+- Parser can subscribe to multiple topics
+- Topic is decoupled from file pattern (one indirection layer)
+
 ---
 
 ## Glossary
@@ -399,6 +505,14 @@ for evidence in solver.elimination_evidence() {
 | **Bridge Mode** | Host/Guest execution model for isolation |
 | **Scope** | Group of files for processing (parser, pipeline, tag) |
 | **Amendment** | Controlled schema evolution after approval |
+| **parser_id** | UUID identifying a specific parser (name + version + source_hash) |
+| **parser_name** | Logical parser name (e.g., "sales_parser") |
+| **parser_version** | Semver version (e.g., "1.0.0") |
+| **job_id** | UUID identifying a single processing run |
+| **Lineage Columns** | `_cf_source_hash`, `_cf_job_id`, `_cf_processed_at`, `_cf_parser_version` |
+| **Deduplication** | Skip processing if (input_hash, parser_name, parser_version) seen before |
+| **Backfill** | Re-process files when parser version changes |
+| **Topic Subscription** | Parser declares topics it handles; files with matching tags are routed |
 
 ---
 
@@ -406,5 +520,5 @@ for evidence in solver.elimination_evidence() {
 
 - **Component docs**: Check crate-specific `CLAUDE.md` files
 - **Architecture**: See `ARCHITECTURE.md`
-- **UI development**: See `ui/CLAUDE.md`
 - **MCP tools**: See `crates/casparian_mcp/CLAUDE.md`
+- **CLI usage**: `./target/release/casparian --help`

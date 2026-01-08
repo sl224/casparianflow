@@ -8,8 +8,7 @@
 
 use anyhow::{Context, Result};
 use casparian_sentinel::{Sentinel, SentinelArgs, SentinelConfig};
-use casparian_worker::{bridge, analyzer, shredder, Worker, WorkerArgs, WorkerConfig};
-use cf_protocol::ShredStrategy;
+use casparian_worker::{bridge, Worker, WorkerArgs, WorkerConfig};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +21,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli;
 mod runner;
+mod scout;
 
 /// Shutdown timeout in seconds
 const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
@@ -45,6 +45,11 @@ enum Commands {
         /// Filter by file type (e.g., csv, json, parquet)
         #[arg(short = 't', long = "type")]
         types: Vec<String>,
+
+        /// Filter by gitignore-style pattern (e.g., "*.csv", "!node_modules/**")
+        /// Can be specified multiple times. Prefix with ! to exclude.
+        #[arg(short = 'p', long = "pattern")]
+        patterns: Vec<String>,
 
         /// Scan subdirectories recursively
         #[arg(short, long)]
@@ -73,6 +78,14 @@ enum Commands {
         /// Output file paths only (quiet mode)
         #[arg(short, long)]
         quiet: bool,
+
+        /// Interactive mode - browse and preview files
+        #[arg(short, long)]
+        interactive: bool,
+
+        /// Tag matched files with this topic (enables database mode)
+        #[arg(long)]
+        tag: Option<String>,
     },
 
     /// Preview file contents and infer schema
@@ -132,6 +145,14 @@ enum Commands {
 
     /// List discovered files
     Files {
+        /// Filter by source (uses default context if not specified)
+        #[arg(short = 's', long)]
+        source: Option<String>,
+
+        /// Show files from all sources (override default context)
+        #[arg(long)]
+        all: bool,
+
         /// Filter by topic
         #[arg(long)]
         topic: Option<String>,
@@ -143,6 +164,14 @@ enum Commands {
         /// Show only untagged files
         #[arg(long)]
         untagged: bool,
+
+        /// Filter by gitignore-style pattern (e.g., "*.csv", "!test/**")
+        #[arg(short = 'p', long = "pattern")]
+        patterns: Vec<String>,
+
+        /// Tag matching files with this topic
+        #[arg(long)]
+        tag: Option<String>,
 
         /// Maximum files to display
         #[arg(long, default_value = "50")]
@@ -220,6 +249,38 @@ enum Commands {
     Topic {
         #[command(subcommand)]
         action: cli::topic::TopicAction,
+    },
+
+    // === W6: Backfill Command ===
+
+    /// Re-process files when parser version changes
+    ///
+    /// When you update a parser to a new version, this command identifies
+    /// files that were processed with old versions and need re-processing.
+    ///
+    /// Examples:
+    ///   casparian backfill my_parser              # Preview files to backfill
+    ///   casparian backfill my_parser --execute    # Actually run backfill
+    ///   casparian backfill my_parser --limit 10   # Limit to 10 files
+    Backfill {
+        /// Parser name to backfill
+        parser: String,
+
+        /// Actually execute the backfill (default: preview mode)
+        #[arg(long)]
+        execute: bool,
+
+        /// Maximum files to process
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Force re-processing even if already processed with this version
+        #[arg(long)]
+        force: bool,
     },
 
     // === W7: MCP Server ===
@@ -303,11 +364,6 @@ enum Commands {
         #[arg(long, default_value = "output")]
         output: std::path::PathBuf,
     },
-    /// Shredder: Split multiplexed files into homogeneous shards
-    Shred {
-        #[command(subcommand)]
-        action: ShredAction,
-    },
 
     /// Show current configuration and paths
     Config {
@@ -320,48 +376,6 @@ enum Commands {
     Tui {
         #[command(flatten)]
         args: cli::tui::TuiArgs,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ShredAction {
-    /// Analyze a file to detect format and propose shred strategy
-    Analyze {
-        /// Path to the file to analyze
-        file: std::path::PathBuf,
-
-        /// Output format (text or json)
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Execute shredding with a given strategy
-    Run {
-        /// Path to the input file
-        file: std::path::PathBuf,
-
-        /// Output directory for shards
-        #[arg(long, default_value = "shards")]
-        output: std::path::PathBuf,
-
-        /// Strategy as JSON (e.g., '{"CsvColumn":{"delimiter":44,"col_index":1,"has_header":true}}')
-        #[arg(long)]
-        strategy: Option<String>,
-
-        /// Column index for CSV sharding (shorthand for CsvColumn strategy)
-        #[arg(long)]
-        column: Option<usize>,
-
-        /// Delimiter character (comma, tab, pipe, semicolon)
-        #[arg(long, default_value = ",")]
-        delimiter: String,
-
-        /// Whether file has a header row
-        #[arg(long, default_value = "true")]
-        has_header: bool,
-
-        /// Maximum number of dedicated shard files (rest go to _MISC)
-        #[arg(long, default_value = "5")]
-        top_n: usize,
     },
 }
 
@@ -469,6 +483,7 @@ fn main() -> Result<()> {
         Commands::Scan {
             path,
             types,
+            patterns,
             recursive,
             depth,
             min_size,
@@ -476,17 +491,27 @@ fn main() -> Result<()> {
             json,
             stats,
             quiet,
-        } => cli::scan::run(cli::scan::ScanArgs {
-            path,
-            types,
-            recursive,
-            depth,
-            min_size,
-            max_size,
-            json,
-            stats,
-            quiet,
-        }),
+            interactive,
+            tag,
+        } => {
+            let rt = Runtime::new().context("Failed to create runtime")?;
+            rt.block_on(async {
+                cli::scan::run(cli::scan::ScanArgs {
+                    path,
+                    types,
+                    patterns,
+                    recursive,
+                    depth,
+                    min_size,
+                    max_size,
+                    json,
+                    stats,
+                    quiet,
+                    interactive,
+                    tag,
+                }).await
+            })
+        }
 
         Commands::Preview {
             file,
@@ -522,16 +547,29 @@ fn main() -> Result<()> {
         Commands::Untag { path } => cli::tag::run_untag(cli::tag::UntagArgs { path }),
 
         Commands::Files {
+            source,
+            all,
             topic,
             status,
             untagged,
+            patterns,
+            tag,
             limit,
-        } => cli::files::run(cli::files::FilesArgs {
-            topic,
-            status,
-            untagged,
-            limit,
-        }),
+        } => {
+            let rt = Runtime::new().context("Failed to create runtime")?;
+            rt.block_on(async {
+                cli::files::run(cli::files::FilesArgs {
+                    source,
+                    all,
+                    topic,
+                    status,
+                    untagged,
+                    patterns,
+                    tag,
+                    limit,
+                }).await
+            })
+        }
 
         // === W3: Parser Commands (stubs) ===
         Commands::Parser { action } => cli::parser::run(action),
@@ -567,6 +605,27 @@ fn main() -> Result<()> {
         Commands::Rule { action } => cli::rule::run(action),
         Commands::Topic { action } => cli::topic::run(action),
 
+        // === W6: Backfill Command ===
+        Commands::Backfill {
+            parser,
+            execute,
+            limit,
+            json,
+            force,
+        } => {
+            let rt = Runtime::new().context("Failed to create runtime")?;
+            rt.block_on(async {
+                cli::backfill::run(cli::backfill::BackfillArgs {
+                    parser_name: parser,
+                    execute,
+                    limit,
+                    json,
+                    force,
+                })
+                .await
+            })
+        }
+
         // === W7: MCP Server ===
         Commands::McpServer { addr } => {
             let rt = Runtime::new().context("Failed to create runtime")?;
@@ -584,8 +643,8 @@ fn main() -> Result<()> {
             venvs_dir,
         } => {
             // Use config module for defaults
-            let db_path = cli::config::resolve_db_path(database);
-            let output_dir = cli::config::resolve_output_dir(output);
+            let db_path = database.unwrap_or_else(cli::config::default_db_path);
+            let output_dir = output.unwrap_or_else(cli::config::output_dir);
             run_unified(addr, db_path, output_dir, data_threads, venvs_dir)
         }
 
@@ -608,7 +667,6 @@ fn main() -> Result<()> {
         Commands::ProcessJob { job_id, db, output } => {
             process_single_job(job_id, &db, &output)
         }
-        Commands::Shred { action } => run_shred(action),
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
         Commands::Tui { args } => {
             let rt = Runtime::new().context("Failed to create runtime")?;
@@ -719,11 +777,7 @@ fn run_unified(
     let shim_path = bridge::materialize_bridge_shim()?;
     let worker_id = format!(
         "rust-{}",
-        uuid::Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap()
+        &uuid::Uuid::new_v4().to_string()[..8]  // First 8 hex chars of UUID
     );
     let worker_config = WorkerConfig {
         sentinel_addr: addr,
@@ -844,7 +898,7 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
     rt.block_on(async move {
         // Resolve database URL: if it's the default, use config module resolution
         let database_url = if args.database == "sqlite://casparian_flow.db" {
-            let db_path = cli::config::resolve_db_path(None);
+            let db_path = cli::config::default_db_path();
             format!("sqlite:{}?mode=rwc", db_path.display())
         } else {
             args.database
@@ -908,11 +962,7 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
         let worker_id = args.worker_id.unwrap_or_else(|| {
             format!(
                 "rust-{}",
-                uuid::Uuid::new_v4()
-                    .to_string()
-                    .split('-')
-                    .next()
-                    .unwrap()
+                &uuid::Uuid::new_v4().to_string()[..8]  // First 8 hex chars of UUID
             )
         });
 
@@ -948,10 +998,10 @@ async fn run_publish(
     publisher: Option<String>,
     email: Option<String>,
 ) -> Result<()> {
-    use cf_protocol::types::DeployCommand;
-    use cf_protocol::{Message, OpCode};
-    use cf_security::signing::sha256;
-    use cf_security::Gatekeeper;
+    use casparian_protocol::types::DeployCommand;
+    use casparian_protocol::{Message, OpCode};
+    use casparian_security::signing::sha256;
+    use casparian_security::Gatekeeper;
     use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
 
     info!("Publishing plugin: {:?} v{}", file, version);
@@ -1021,7 +1071,6 @@ async fn run_publish(
         lockfile_content,
         env_hash,
         artifact_hash,
-        signature: String::new(), // TODO: Add Ed25519 signing
         publisher_name,
         publisher_email: email,
         azure_oid: None,
@@ -1061,7 +1110,7 @@ async fn run_publish(
 
     match response_msg.header.opcode {
         OpCode::Ack => {
-            use cf_protocol::types::DeployResponse;
+            use casparian_protocol::types::DeployResponse;
             let deploy_response: DeployResponse = serde_json::from_slice(&response_msg.payload)?;
 
             if deploy_response.success {
@@ -1072,7 +1121,7 @@ async fn run_publish(
             }
         }
         OpCode::Err => {
-            use cf_protocol::types::ErrorPayload;
+            use casparian_protocol::types::ErrorPayload;
             let error_payload: ErrorPayload = serde_json::from_slice(&response_msg.payload)?;
             anyhow::bail!("Deployment error: {}", error_payload.message)
         }
@@ -1087,87 +1136,53 @@ async fn run_publish(
 ///
 /// This is used by the Tauri UI to spawn a worker process for each job.
 /// The job runs the plugin via the bridge (Python subprocess).
+///
+/// Uses casparian_sentinel::JobQueue (sqlx) for all database operations.
 fn process_single_job(
     job_id: i64,
     db_path: &std::path::Path,
     output_dir: &std::path::Path,
 ) -> Result<()> {
     use casparian_worker::bridge::{self, BridgeConfig};
-    use rusqlite::Connection;
     use std::time::Instant;
 
     info!(job_id, db = %db_path.display(), "Processing job");
 
-    // Open database
-    let conn = Connection::open(db_path)
+    // Create runtime for async operations
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Open database via JobQueue
+    let queue = rt.block_on(casparian_sentinel::JobQueue::open(db_path))
         .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
-    // Get job details - try two methods:
-    // 1. Production path: JOIN through file_version_id → file_location → source_root
-    // 2. Fallback: Direct input_file column (for tests/CLI jobs)
-    let (plugin_name, file_path): (String, String) = conn
-        .query_row(
-            r#"
-            SELECT
-                pq.plugin_name,
-                sr.path || '/' || fl.rel_path as full_path
-            FROM cf_processing_queue pq
-            JOIN cf_file_version fv ON pq.file_version_id = fv.id
-            JOIN cf_file_location fl ON fv.location_id = fl.id
-            JOIN cf_source_root sr ON fl.source_root_id = sr.id
-            WHERE pq.id = ?
-            "#,
-            [job_id],
-            |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .or_else(|_| {
-            // Fallback: use input_file directly (for test jobs or CLI-created jobs)
-            conn.query_row(
-                r#"
-                SELECT plugin_name, input_file
-                FROM cf_processing_queue
-                WHERE id = ? AND input_file IS NOT NULL
-                "#,
-                [job_id],
-                |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
-            )
-        })
-        .with_context(|| format!("Job {} not found (no file_version_id or input_file)", job_id))?;
+    // Get job details
+    let job_details = rt.block_on(queue.get_job_details(job_id))?
+        .ok_or_else(|| anyhow::anyhow!("Job {} not found (no file_version_id or input_file)", job_id))?;
+
+    let plugin_name = job_details.plugin_name;
+    let file_path = job_details.file_path;
 
     info!(plugin = %plugin_name, file = %file_path, "Starting job");
 
-    // Update status to RUNNING
-    conn.execute(
-        "UPDATE cf_processing_queue SET status = 'RUNNING', claim_time = datetime('now') WHERE id = ?",
-        [job_id],
-    )?;
+    // Claim the job (status = RUNNING)
+    rt.block_on(queue.claim_job(job_id))?;
 
-    // Get plugin source code AND env_hash from manifest (latest active/deployed version)
-    let (plugin_source, env_hash_opt): (String, Option<String>) = conn
-        .query_row(
-            r#"
-            SELECT pm.source_code, pm.env_hash
-            FROM cf_plugin_manifest pm
-            WHERE pm.plugin_name = ? AND pm.status IN ('ACTIVE', 'DEPLOYED')
-            ORDER BY pm.deployed_at DESC
-            LIMIT 1
-            "#,
-            [&plugin_name],
-            |row: &rusqlite::Row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .with_context(|| format!("Plugin '{}' not found or not deployed", plugin_name))?;
+    // Get plugin source code and env_hash
+    let plugin_details = rt.block_on(queue.get_plugin_details(&plugin_name))?
+        .ok_or_else(|| anyhow::anyhow!("Plugin '{}' not found or not deployed", plugin_name))?;
+
+    let plugin_source = plugin_details.source_code;
+    let env_hash_opt = plugin_details.env_hash;
 
     // Execute plugin via bridge
     let start = Instant::now();
 
     // Try to get lockfile from cf_plugin_environment (proper deployment path)
-    let lockfile_content: Option<String> = env_hash_opt.as_ref().and_then(|hash| {
-        conn.query_row(
-            "SELECT lockfile_content FROM cf_plugin_environment WHERE hash = ?",
-            [hash],
-            |row| row.get(0),
-        ).ok()
-    });
+    let lockfile_content: Option<String> = if let Some(ref hash) = env_hash_opt {
+        rt.block_on(queue.get_lockfile(hash))?
+    } else {
+        None
+    };
 
     // Determine venv setup strategy
     let (env_hash, interpreter) = if let (Some(hash), Some(lockfile)) = (&env_hash_opt, &lockfile_content) {
@@ -1183,7 +1198,7 @@ fn process_single_job(
         (hash.clone(), interp)
     } else {
         // ADHOC PATH: Generate minimal lockfile with plugin deps + bridge deps
-        use cf_security::signing::sha256;
+        use casparian_security::signing::sha256;
 
         let deps = parse_plugin_dependencies(&plugin_source);
         info!(deps = ?deps, "Detected plugin dependencies (adhoc mode)");
@@ -1254,7 +1269,6 @@ fn process_single_job(
     };
 
     // Execute via bridge
-    let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(bridge::execute_bridge(config));
     let elapsed = start.elapsed();
 
@@ -1276,9 +1290,6 @@ fn process_single_job(
                 output_paths.push(output_path.to_string_lossy().to_string());
             } else {
                 // Multi-output: route each output to its appropriate sink
-                // Note: Currently bridge sends all batches in order, one per output
-                // TODO: For multi-batch outputs, we'd need to track batch boundaries
-
                 // Group by sink type for efficiency
                 let mut sqlite_outputs: Vec<(String, &arrow::array::RecordBatch)> = vec![];
                 let mut parquet_batches: Vec<&arrow::array::RecordBatch> = vec![];
@@ -1300,7 +1311,6 @@ fn process_single_job(
                             parquet_batches.push(batch);
                         }
                         "csv" => {
-                            // Write CSV output
                             let csv_path = output_dir.join(format!("{}_{}.csv", table_name, job_id));
                             write_csv_output(&csv_path, batch)?;
                             info!(output = %csv_path.display(), table = %table_name, "Wrote CSV output");
@@ -1335,10 +1345,7 @@ fn process_single_job(
             let result_summary = output_paths.join(";");
             info!(job_id, elapsed_ms = elapsed.as_millis(), outputs = %result_summary, "Job completed");
 
-            conn.execute(
-                "UPDATE cf_processing_queue SET status = 'COMPLETED', end_time = datetime('now'), result_summary = ? WHERE id = ?",
-                rusqlite::params![result_summary, job_id],
-            )?;
+            rt.block_on(queue.complete_job(job_id, &result_summary))?;
 
             // Log plugin output
             if !bridge_result.logs.is_empty() {
@@ -1349,11 +1356,7 @@ fn process_single_job(
         }
         Err(e) => {
             error!(job_id, error = %e, elapsed_ms = elapsed.as_millis(), "Job failed");
-
-            conn.execute(
-                "UPDATE cf_processing_queue SET status = 'FAILED', end_time = datetime('now'), error_message = ? WHERE id = ?",
-                rusqlite::params![e.to_string(), job_id],
-            )?;
+            rt.block_on(queue.fail_job(job_id, &e.to_string()))?;
             Err(e)
         }
     }
@@ -1371,8 +1374,7 @@ fn parse_plugin_dependencies(source: &str) -> Vec<String> {
         let line = line.trim();
 
         // import X or import X as Y
-        if line.starts_with("import ") {
-            let rest = line.strip_prefix("import ").unwrap();
+        if let Some(rest) = line.strip_prefix("import ") {
             let module = rest.split_whitespace().next().unwrap_or("");
             let module = module.split('.').next().unwrap_or("");
             if !module.is_empty() && !is_stdlib_module(module) {
@@ -1380,13 +1382,11 @@ fn parse_plugin_dependencies(source: &str) -> Vec<String> {
             }
         }
         // from X import Y
-        else if line.starts_with("from ") {
-            if let Some(rest) = line.strip_prefix("from ") {
-                let module = rest.split_whitespace().next().unwrap_or("");
-                let module = module.split('.').next().unwrap_or("");
-                if !module.is_empty() && !is_stdlib_module(module) {
-                    deps.push(module.to_string());
-                }
+        else if let Some(rest) = line.strip_prefix("from ") {
+            let module = rest.split_whitespace().next().unwrap_or("");
+            let module = module.split('.').next().unwrap_or("");
+            if !module.is_empty() && !is_stdlib_module(module) {
+                deps.push(module.to_string());
             }
         }
     }
@@ -1533,208 +1533,6 @@ fn write_csv_output(path: &std::path::Path, batch: &arrow::array::RecordBatch) -
     let file = std::fs::File::create(path)?;
     let mut writer = WriterBuilder::new().with_header(true).build(file);
     writer.write(batch)?;
-
-    Ok(())
-}
-
-/// Run shredder commands (analyze or run)
-fn run_shred(action: ShredAction) -> Result<()> {
-    match action {
-        ShredAction::Analyze { file, format } => {
-            run_shred_analyze(&file, &format)
-        }
-        ShredAction::Run {
-            file,
-            output,
-            strategy,
-            column,
-            delimiter,
-            has_header,
-            top_n,
-        } => {
-            run_shred_execute(&file, &output, strategy, column, &delimiter, has_header, top_n)
-        }
-    }
-}
-
-/// Analyze a file and propose shred strategy
-fn run_shred_analyze(file: &std::path::Path, format: &str) -> Result<()> {
-    info!(file = %file.display(), "Analyzing file for shredding");
-
-    let result = analyzer::analyze_file_head(file)
-        .with_context(|| format!("Failed to analyze file: {}", file.display()))?;
-
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        // Text format for human readability
-        println!("═══════════════════════════════════════════════════════════");
-        println!("  SHRED ANALYSIS");
-        println!("═══════════════════════════════════════════════════════════");
-        println!();
-        println!("  File: {}", file.display());
-        println!("  Head bytes analyzed: {}", result.head_bytes);
-        println!();
-        println!("  Confidence: {:?}", result.confidence);
-        println!();
-        println!("  Strategy:");
-        match &result.strategy {
-            ShredStrategy::CsvColumn { delimiter, col_index, has_header } => {
-                let delim_char = *delimiter as char;
-                let delim_name = match delim_char {
-                    ',' => "comma",
-                    '\t' => "tab",
-                    '|' => "pipe",
-                    ';' => "semicolon",
-                    _ => "custom",
-                };
-                println!("    Type: CSV Column");
-                println!("    Delimiter: {} ('{}')", delim_name, delim_char);
-                println!("    Shard column: {}", col_index);
-                println!("    Has header: {}", has_header);
-            }
-            ShredStrategy::JsonKey { key_path } => {
-                println!("    Type: JSON Key");
-                println!("    Key path: {}", key_path);
-            }
-            ShredStrategy::Regex { pattern, key_group } => {
-                println!("    Type: Regex");
-                println!("    Pattern: {}", pattern);
-                println!("    Key group: {}", key_group);
-            }
-            ShredStrategy::Passthrough => {
-                println!("    Type: Passthrough (no shredding)");
-            }
-        }
-        println!();
-        println!("  Estimated shards: {}", result.estimated_shard_count);
-        println!("  Sample keys: {:?}", result.sample_keys);
-        println!();
-        println!("  Reasoning: {}", result.reasoning);
-
-        if let Some(warning) = &result.warning {
-            println!();
-            println!("  ⚠️  WARNING: {}", warning);
-        }
-
-        println!();
-        println!("═══════════════════════════════════════════════════════════");
-
-        // Print CLI command to execute
-        if let ShredStrategy::CsvColumn { delimiter, col_index, has_header } = &result.strategy {
-            let delim_char = *delimiter as char;
-            println!();
-            println!("  To shred with this strategy, run:");
-            println!();
-            println!("    casparian shred run {} --column {} --delimiter '{}' --has-header {} --output ./shards",
-                file.display(), col_index, delim_char, has_header);
-            println!();
-        }
-    }
-
-    Ok(())
-}
-
-/// Execute shredding with given strategy
-fn run_shred_execute(
-    file: &std::path::Path,
-    output: &std::path::Path,
-    strategy_json: Option<String>,
-    column: Option<usize>,
-    delimiter: &str,
-    has_header: bool,
-    top_n: usize,
-) -> Result<()> {
-    // Determine strategy
-    let strategy = if let Some(json) = strategy_json {
-        serde_json::from_str(&json)
-            .context("Failed to parse strategy JSON")?
-    } else if let Some(col_idx) = column {
-        let delim_byte = match delimiter {
-            "," => b',',
-            "\\t" | "tab" => b'\t',
-            "|" => b'|',
-            ";" => b';',
-            s if s.len() == 1 => s.as_bytes()[0],
-            _ => anyhow::bail!("Invalid delimiter: {}", delimiter),
-        };
-
-        ShredStrategy::CsvColumn {
-            delimiter: delim_byte,
-            col_index: col_idx,
-            has_header,
-        }
-    } else {
-        // Auto-detect
-        info!("No strategy specified, auto-detecting...");
-        let analysis = analyzer::analyze_file_head(file)
-            .context("Failed to analyze file")?;
-
-        if matches!(analysis.confidence, cf_protocol::DetectionConfidence::Unknown) {
-            anyhow::bail!(
-                "Could not detect file format. Please specify --column or --strategy.\n\
-                 Hint: Run `casparian shred analyze {}` to see detection results.",
-                file.display()
-            );
-        }
-
-        if let Some(warning) = &analysis.warning {
-            warn!("{}", warning);
-        }
-
-        info!("Detected strategy: {:?}", analysis.strategy);
-        analysis.strategy
-    };
-
-    info!(
-        file = %file.display(),
-        output = %output.display(),
-        strategy = ?strategy,
-        "Starting shred operation"
-    );
-
-    // Create shredder config
-    let config = cf_protocol::ShredConfig {
-        strategy,
-        output_dir: output.to_path_buf(),
-        max_handles: 200,
-        top_n_shards: top_n,
-        buffer_size: 65536,
-        promotion_threshold: 1000,
-    };
-
-    let shredder = shredder::Shredder::new(config);
-    let result = shredder.shred(file)?;
-
-    // Print results
-    println!();
-    println!("═══════════════════════════════════════════════════════════");
-    println!("  SHRED COMPLETE");
-    println!("═══════════════════════════════════════════════════════════");
-    println!();
-    println!("  Total rows: {}", result.total_rows);
-    println!("  Duration: {}ms", result.duration_ms);
-    println!("  Lineage index: {}", result.lineage_index_path.display());
-    println!();
-    println!("  Shards created ({}):", result.shards.len());
-    for shard in &result.shards {
-        println!("    - {} ({} rows, {} bytes)",
-            shard.path.file_name().unwrap_or_default().to_string_lossy(),
-            shard.row_count,
-            shard.byte_size
-        );
-    }
-
-    if let Some(freezer_path) = &result.freezer_path {
-        println!();
-        println!("  Freezer: {} ({} rare types)",
-            freezer_path.display(),
-            result.freezer_key_count
-        );
-    }
-
-    println!();
-    println!("═══════════════════════════════════════════════════════════");
 
     Ok(())
 }

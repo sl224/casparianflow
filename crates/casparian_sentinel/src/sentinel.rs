@@ -4,8 +4,8 @@
 //! Ported from Python sentinel.py with data-oriented design principles.
 
 use anyhow::{Context, Result};
-use cf_protocol::types::{self, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, SinkConfig};
-use cf_protocol::{Message, OpCode};
+use casparian_protocol::types::{self, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, SinkConfig, SinkMode};
+use casparian_protocol::{Message, OpCode};
 use std::collections::HashMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
@@ -41,7 +41,7 @@ pub struct ConnectedWorker {
     /// Plugin capabilities. Vec instead of HashSet - linear scan is faster
     /// for small N (< 50 plugins) due to cache locality.
     pub capabilities: Vec<String>,
-    pub current_job_id: Option<i32>,
+    pub current_job_id: Option<i64>,
     pub worker_id: String,
     /// Environments that are provisioned and ready on this worker.
     /// Vec instead of HashSet - linear scan is faster for small N (< 50 envs) due to cache locality.
@@ -105,7 +105,7 @@ pub struct Sentinel {
     running: bool,
     last_cleanup: f64, // Last time we ran stale worker cleanup
     /// Jobs orphaned by stale workers - need to be failed asynchronously
-    orphaned_jobs: Vec<i32>,
+    orphaned_jobs: Vec<i64>,
 }
 
 impl Sentinel {
@@ -127,8 +127,7 @@ impl Sentinel {
         // Destructive Initialization for IPC sockets (Unix only)
         // Unlink stale socket files to prevent "Address in use" errors
         #[cfg(unix)]
-        if config.bind_addr.starts_with("ipc://") {
-            let socket_path = config.bind_addr.strip_prefix("ipc://").unwrap();
+        if let Some(socket_path) = config.bind_addr.strip_prefix("ipc://") {
             let path = std::path::Path::new(socket_path);
             if path.exists() {
                 info!("Removing stale IPC socket: {}", socket_path);
@@ -170,10 +169,12 @@ impl Sentinel {
         let mut map: HashMap<String, Vec<SinkConfig>> = HashMap::new();
 
         for tc in configs {
+            // Get mode before moving other fields out of tc
+            let mode = tc.sink_mode();
             let sink = SinkConfig {
                 topic: tc.topic_name,
                 uri: tc.uri,
-                mode: tc.mode,
+                mode,
                 schema_def: tc.schema_json,
             };
 
@@ -209,7 +210,7 @@ impl Sentinel {
 
             // Fail any orphaned jobs from stale workers
             if !self.orphaned_jobs.is_empty() {
-                let jobs_to_fail: Vec<i32> = std::mem::take(&mut self.orphaned_jobs);
+                let jobs_to_fail: Vec<i64> = std::mem::take(&mut self.orphaned_jobs);
                 for job_id in jobs_to_fail {
                     if let Err(e) = self.queue.fail_job(
                         job_id,
@@ -248,7 +249,7 @@ impl Sentinel {
         let before_count = self.workers.len();
 
         // Collect stale workers and their current jobs before removing
-        let stale_workers: Vec<(Vec<u8>, String, Option<i32>)> = self.workers
+        let stale_workers: Vec<(Vec<u8>, String, Option<i64>)> = self.workers
             .iter()
             .filter(|(_, w)| w.last_seen < cutoff)
             .map(|(id, w)| (id.clone(), w.worker_id.clone(), w.current_job_id))
@@ -428,13 +429,13 @@ impl Sentinel {
             worker.last_seen = current_time();
         }
 
-        // Validate job_id fits in i32 (database uses i32 for job IDs)
-        let job_id: i32 = job_id.try_into().map_err(|_| {
+        // Validate job_id fits in i64 (database uses i64 for job IDs)
+        let job_id: i64 = job_id.try_into().map_err(|_| {
             anyhow::anyhow!(
                 "Job ID {} exceeds maximum supported value ({}). \
                 This indicates a protocol error or corrupted message.",
                 job_id,
-                i32::MAX
+                i64::MAX
             )
         })?;
 
@@ -492,12 +493,12 @@ impl Sentinel {
             worker.last_seen = current_time();
         }
 
-        // Validate job_id fits in i32
-        let job_id: i32 = job_id.try_into().map_err(|_| {
+        // Validate job_id fits in i64
+        let job_id: i64 = job_id.try_into().map_err(|_| {
             anyhow::anyhow!(
                 "Job ID {} exceeds maximum supported value ({})",
                 job_id,
-                i32::MAX
+                i64::MAX
             )
         })?;
 
@@ -583,7 +584,7 @@ impl Sentinel {
             sinks.push(SinkConfig {
                 topic: "output".to_string(),
                 uri: format!("parquet://{}_output.parquet", job.plugin_name),
-                mode: "append".to_string(),
+                mode: SinkMode::Append,
                 schema_def: None,
             });
         }
@@ -642,7 +643,7 @@ impl Sentinel {
         // Mark worker as busy
         if let Some(worker) = self.workers.get_mut(&identity) {
             worker.status = WorkerStatus::Busy;
-            worker.current_job_id = Some(job.id);
+            worker.current_job_id = Some(job.id as i64);
         }
 
         METRICS.inc_jobs_dispatched();
@@ -663,8 +664,7 @@ impl Sentinel {
             cmd.plugin_name, cmd.version, cmd.publisher_name
         );
 
-        // 1. Validate signature (TODO: implement Ed25519 verification)
-        // For now, just verify the artifact_hash matches the content
+        // Verify the artifact_hash matches the content
         let computed_hash = compute_artifact_hash(&cmd.source_code, &cmd.lockfile_content);
         if computed_hash != cmd.artifact_hash {
             anyhow::bail!(
@@ -673,7 +673,6 @@ impl Sentinel {
                 &computed_hash[..12]
             );
         }
-        // TODO: Verify cmd.signature against cmd.artifact_hash using publisher's public key
 
         // 2. Compute source_hash (SHA256, not MD5)
         let source_hash = compute_sha256(&cmd.source_code);
@@ -701,16 +700,15 @@ impl Sentinel {
         sqlx::query(
             r#"
             INSERT INTO cf_plugin_manifest
-            (plugin_name, version, source_code, source_hash, status, signature,
+            (plugin_name, version, source_code, source_hash, status,
              env_hash, artifact_hash, created_at)
-            VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, CURRENT_TIMESTAMP)
             "#,
         )
         .bind(&cmd.plugin_name)
         .bind(&cmd.version)
         .bind(&cmd.source_code)
         .bind(&source_hash)
-        .bind(&cmd.signature)
         .bind(&cmd.env_hash)
         .bind(&cmd.artifact_hash)
         .execute(&mut *tx)
@@ -819,7 +817,7 @@ impl Sentinel {
 fn current_time() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("SystemTime before UNIX_EPOCH - check system clock")
         .as_secs_f64()
 }
 

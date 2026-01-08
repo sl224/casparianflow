@@ -188,7 +188,7 @@ Casparian provides:
 
 | Decision | Rationale |
 |----------|-----------|
-| **Local-first (desktop app)** | Defense/healthcare can't use cloud; data never leaves machine |
+| **Local-first (CLI)** | Defense/healthcare can't use cloud; data never leaves machine |
 | **Schema contracts are immutable** | AI safety; prevents silent schema drift |
 | **Human approval for schema changes** | Governance requirement for regulated industries |
 | **Bridge Mode (isolated execution)** | AI-generated code runs in subprocess; security |
@@ -309,7 +309,7 @@ Casparian is creating a new category. Traditional comparisons don't apply.
 | Feature | MSP Need |
 |---------|----------|
 | Multi-tenant dashboard | Manage all clients in one view |
-| White-label UI | Remove Casparian branding |
+| White-label option | Remove Casparian branding from outputs |
 | Usage reporting | Bill clients accurately |
 | Bulk parser deployment | Same parser across 50 clients |
 
@@ -439,7 +439,7 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| MCP adoption is slow | High | Standalone UI/CLI value; hedge bet |
+| MCP adoption is slow | High | Standalone CLI/TUI value; hedge bet |
 | Anthropic builds this | Medium | First-mover advantage; deeper integration |
 | Enterprise sales is hard | High | MSP channel as alternative; shorter sales cycle |
 | Target market is smaller than expected | Medium | MSP channel expands reach to SMBs indirectly |
@@ -519,10 +519,10 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 - Arrow/Parquet (data format)
 - ZeroMQ (worker messaging)
 
-### Frontend (SvelteKit + Tauri)
-- Svelte 5 with runes
-- Tauri 2 (desktop app)
-- Monaco Editor (code editing)
+### CLI + TUI
+- Ratatui (terminal UI)
+- Clap (CLI framework)
+- Crossterm (terminal handling)
 
 ### Python Runtime
 - Polars/Pandas (dataframes)

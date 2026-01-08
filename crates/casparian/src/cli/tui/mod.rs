@@ -17,6 +17,9 @@ pub mod event;
 pub mod llm;
 pub mod ui;
 
+#[cfg(test)]
+pub mod test_harness;
+
 use anyhow::Result;
 use clap::Args;
 use crossterm::{
@@ -25,7 +28,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{prelude::*, backend::CrosstermBackend, Terminal};
-use std::io::{self, stdout};
+use std::io::stdout;
 use std::path::PathBuf;
 
 use crate::cli::tui::app::App;
@@ -34,8 +37,8 @@ use crate::cli::tui::event::{Event, EventHandler};
 /// TUI command arguments
 #[derive(Debug, Args)]
 pub struct TuiArgs {
-    /// Database path override
-    #[arg(long, env = "CASPARIAN_DB")]
+    /// Database path override (defaults to ~/.casparian_flow/casparian_flow.sqlite3)
+    #[arg(long)]
     pub database: Option<PathBuf>,
 
     /// API key for LLM provider (defaults to ANTHROPIC_API_KEY env var)

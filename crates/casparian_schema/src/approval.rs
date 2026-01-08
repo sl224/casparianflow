@@ -401,7 +401,7 @@ pub enum WarningType {
 /// 2. Applies user modifications
 /// 3. Creates the locked schema contract
 /// 4. Updates storage
-pub fn approve_schema(
+pub async fn approve_schema(
     storage: &SchemaStorage,
     request: SchemaApprovalRequest,
 ) -> Result<ApprovalResult, ApprovalError> {
@@ -434,7 +434,7 @@ pub fn approve_schema(
     );
 
     // Save to storage
-    storage.save_contract(&contract)?;
+    storage.save_contract(&contract).await?;
 
     Ok(ApprovalResult {
         contract,
@@ -536,13 +536,13 @@ fn generate_approval_warnings(request: &SchemaApprovalRequest) -> Vec<ApprovalWa
 /// 1. Retrieves the discovery result
 /// 2. Creates an approval request with the proposed schemas as-is
 /// 3. Approves and creates the contract
-pub fn approve_discovery_directly(
+pub async fn approve_discovery_directly(
     storage: &SchemaStorage,
     discovery_id: &str,
     approved_by: &str,
 ) -> Result<ApprovalResult, ApprovalError> {
     // Use storage's built-in approval
-    let contract = storage.approve_discovery(discovery_id, approved_by)?;
+    let contract = storage.approve_discovery(discovery_id, approved_by).await?;
 
     Ok(ApprovalResult {
         contract,
@@ -557,8 +557,8 @@ mod tests {
     use super::*;
     use crate::storage::SchemaStorage;
 
-    fn create_test_storage() -> SchemaStorage {
-        SchemaStorage::in_memory().unwrap()
+    async fn create_test_storage() -> SchemaStorage {
+        SchemaStorage::in_memory().await.unwrap()
     }
 
     #[test]
@@ -593,9 +593,9 @@ mod tests {
         assert_eq!(locked.description, Some("A date column".to_string()));
     }
 
-    #[test]
-    fn test_approve_schema_success() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_approve_schema_success() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "approver")
             .with_schema(
@@ -606,26 +606,26 @@ mod tests {
                     ])
             );
 
-        let result = approve_schema(&storage, request).unwrap();
+        let result = approve_schema(&storage, request).await.unwrap();
         assert_eq!(result.contract.approved_by, "approver");
         assert_eq!(result.contract.schemas.len(), 1);
         assert_eq!(result.contract.schemas[0].name, "test_output");
         assert_eq!(result.contract.schemas[0].columns.len(), 2);
     }
 
-    #[test]
-    fn test_approve_schema_no_schemas() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_approve_schema_no_schemas() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user");
 
-        let err = approve_schema(&storage, request).unwrap_err();
+        let err = approve_schema(&storage, request).await.unwrap_err();
         assert!(matches!(err, ApprovalError::NoSchemasApproved));
     }
 
-    #[test]
-    fn test_approve_schema_empty_name() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_approve_schema_empty_name() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
             .with_schema(
@@ -633,24 +633,24 @@ mod tests {
                     .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
             );
 
-        let err = approve_schema(&storage, request).unwrap_err();
+        let err = approve_schema(&storage, request).await.unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
     }
 
-    #[test]
-    fn test_approve_schema_no_columns() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_approve_schema_no_columns() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
             .with_schema(ApprovedSchemaVariant::new("test", "test_output"));
 
-        let err = approve_schema(&storage, request).unwrap_err();
+        let err = approve_schema(&storage, request).await.unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
     }
 
-    #[test]
-    fn test_approval_warnings_for_exclusions() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_approval_warnings_for_exclusions() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
             .with_schema(
@@ -659,13 +659,13 @@ mod tests {
             )
             .exclude_files(vec!["bad1.csv".into(), "bad2.csv".into()]);
 
-        let result = approve_schema(&storage, request).unwrap();
+        let result = approve_schema(&storage, request).await.unwrap();
         assert!(result.warnings.iter().any(|w| w.warning_type == WarningType::FilesExcluded));
     }
 
-    #[test]
-    fn test_approval_warnings_for_rename() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_approval_warnings_for_rename() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
             .with_schema(
@@ -675,7 +675,7 @@ mod tests {
                     ])
             );
 
-        let result = approve_schema(&storage, request).unwrap();
+        let result = approve_schema(&storage, request).await.unwrap();
         assert!(result.warnings.iter().any(|w| w.warning_type == WarningType::ColumnRenamed));
     }
 
@@ -694,9 +694,9 @@ mod tests {
         assert!(answer.explanation.is_some());
     }
 
-    #[test]
-    fn test_multiple_schemas_approval() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_multiple_schemas_approval() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
             .with_schemas(vec![
@@ -711,15 +711,15 @@ mod tests {
                     .with_source_pattern("*_b.csv"),
             ]);
 
-        let result = approve_schema(&storage, request).unwrap();
+        let result = approve_schema(&storage, request).await.unwrap();
         assert_eq!(result.contract.schemas.len(), 2);
         assert_eq!(result.contract.schemas[0].name, "output_a");
         assert_eq!(result.contract.schemas[1].name, "output_b");
     }
 
-    #[test]
-    fn test_duplicate_column_name_rejected() {
-        let storage = create_test_storage();
+    #[tokio::test]
+    async fn test_duplicate_column_name_rejected() {
+        let storage = create_test_storage().await;
 
         let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
             .with_schema(
@@ -730,7 +730,7 @@ mod tests {
                     ])
             );
 
-        let err = approve_schema(&storage, request).unwrap_err();
+        let err = approve_schema(&storage, request).await.unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
     }
 }

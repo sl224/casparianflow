@@ -30,10 +30,10 @@
 
 pub mod failfast;
 pub mod high_failure;
-pub mod loop_;
+pub mod iteration;
 pub mod metrics;
 
 pub use failfast::*;
 pub use high_failure::*;
-pub use loop_::*;
+pub use iteration::*;
 pub use metrics::*;

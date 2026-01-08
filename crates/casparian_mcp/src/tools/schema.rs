@@ -988,7 +988,7 @@ impl Tool for ApproveSchemasTool {
         }
 
         // Create storage (in-memory for now - would connect to actual DB in production)
-        let storage = SchemaStorage::in_memory()
+        let storage = SchemaStorage::in_memory().await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create storage: {}", e)))?;
 
         // Build approved schema variants
@@ -1033,7 +1033,7 @@ impl Tool for ApproveSchemasTool {
             .with_schemas(approved_variants);
 
         // Approve and create contract
-        let approval_result = casparian_schema::approval::approve_schema(&storage, request)
+        let approval_result = casparian_schema::approval::approve_schema(&storage, request).await
             .map_err(|e| ToolError::ExecutionFailed(format!("Approval failed: {}", e)))?;
 
         // Collect all warnings

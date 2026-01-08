@@ -113,6 +113,43 @@ impl std::fmt::Display for DataType {
     }
 }
 
+// ============================================================================
+// Conversions to/from canonical casparian_protocol::DataType
+// ============================================================================
+
+impl From<DataType> for casparian_protocol::DataType {
+    fn from(dt: DataType) -> Self {
+        match dt {
+            DataType::Null => casparian_protocol::DataType::Null,
+            DataType::Boolean => casparian_protocol::DataType::Boolean,
+            DataType::Integer => casparian_protocol::DataType::Int64,
+            DataType::Float => casparian_protocol::DataType::Float64,
+            DataType::Date => casparian_protocol::DataType::Date,
+            DataType::DateTime => casparian_protocol::DataType::Timestamp,
+            DataType::Time => casparian_protocol::DataType::Time,
+            DataType::Duration => casparian_protocol::DataType::Duration,
+            DataType::String => casparian_protocol::DataType::String,
+        }
+    }
+}
+
+impl From<casparian_protocol::DataType> for DataType {
+    fn from(dt: casparian_protocol::DataType) -> Self {
+        match dt {
+            casparian_protocol::DataType::Null => DataType::Null,
+            casparian_protocol::DataType::Boolean => DataType::Boolean,
+            casparian_protocol::DataType::Int64 => DataType::Integer,
+            casparian_protocol::DataType::Float64 => DataType::Float,
+            casparian_protocol::DataType::Date => DataType::Date,
+            casparian_protocol::DataType::Timestamp => DataType::DateTime,
+            casparian_protocol::DataType::Time => DataType::Time,
+            casparian_protocol::DataType::Duration => DataType::Duration,
+            casparian_protocol::DataType::String => DataType::String,
+            casparian_protocol::DataType::Binary => DataType::String, // Fallback
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

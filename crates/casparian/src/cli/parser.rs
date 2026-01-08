@@ -225,7 +225,7 @@ async fn run_async(action: ParserAction) -> anyhow::Result<()> {
 
 /// Get database path using config module
 fn get_db_path() -> PathBuf {
-    config::resolve_db_path(None)
+    config::default_db_path()
 }
 
 /// Connect to the database
@@ -237,7 +237,6 @@ async fn connect_db() -> anyhow::Result<SqlitePool> {
             .with_context(format!("Expected database at: {}", db_path.display()))
             .with_suggestions([
                 "TRY: Run 'casparian start' to initialize the database".to_string(),
-                "TRY: Set CASPARIAN_DB environment variable".to_string(),
                 format!("TRY: Check if {} exists", db_path.display()),
             ])
             .into());

@@ -147,20 +147,9 @@ casparian-flow/
 │       └── src/
 │           └── lib.rs        # OpCodes, serialization
 │
-├── ui/                       # Tauri Desktop App
-│   ├── CLAUDE.md
-│   ├── src/                  # SvelteKit frontend
-│   │   ├── routes/
-│   │   └── lib/
-│   │       ├── components/
-│   │       │   ├── parser-lab/
-│   │       │   ├── scout/
-│   │       │   └── shredder/  # deprecated
-│   │       └── stores/
-│   └── src-tauri/            # Rust backend
-│       └── src/
-│           ├── lib.rs
-│           └── scout.rs
+├── tests/                    # E2E Tests
+│   └── e2e/
+│       └── run_e2e_test.sh
 │
 └── demo/                     # Examples
     ├── plugins/
@@ -450,12 +439,9 @@ cargo test --package casparian_backtest --test e2e_backtest
 
 # MCP Tools (20 tests)
 cargo test --package casparian_mcp --test e2e_tools
-```
 
-### UI E2E Tests
-
-```bash
-cd ui && bun run test:e2e
+# E2E test script
+./tests/e2e/run_e2e_test.sh
 ```
 
 ---
@@ -485,6 +471,10 @@ Claude Code integration via standard protocol.
 ### ADR-006: UV for Environments
 UV instead of pip for venv management.
 *Why:* Speed and reproducibility.
+
+### ADR-007: CLI-First Architecture
+No desktop app (Tauri). CLI + TUI only.
+*Why:* Stability and simplicity over desktop features.
 
 ---
 

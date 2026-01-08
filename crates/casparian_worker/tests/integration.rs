@@ -3,7 +3,7 @@
 //! These tests verify the Rust worker can communicate correctly
 //! with the Python Sentinel over ZMQ.
 
-use cf_protocol::*;
+use casparian_protocol::*;
 use std::time::Duration;
 use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend};
 
@@ -17,7 +17,7 @@ fn test_protocol_message_roundtrip() {
         sinks: vec![types::SinkConfig {
             topic: "output".to_string(),
             uri: "parquet://output.parquet".to_string(),
-            mode: "append".to_string(),
+            mode: types::SinkMode::Append,
             schema_def: None,
         }],
         file_version_id: 1,

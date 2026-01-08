@@ -14,6 +14,22 @@ use super::models::ProcessingJob;
 /// This prevents infinite retry loops for jobs that consistently fail
 pub const MAX_RETRY_COUNT: i32 = 5;
 
+/// Job details needed for processing
+#[derive(Debug, Clone)]
+pub struct JobDetails {
+    pub job_id: i64,
+    pub plugin_name: String,
+    pub file_path: String,
+    pub input_file: Option<String>,
+}
+
+/// Plugin manifest details needed for execution
+#[derive(Debug, Clone)]
+pub struct PluginDetails {
+    pub source_code: String,
+    pub env_hash: Option<String>,
+}
+
 pub struct JobQueue {
     pool: Pool<Sqlite>,
 }
@@ -21,6 +37,116 @@ pub struct JobQueue {
 impl JobQueue {
     pub fn new(pool: Pool<Sqlite>) -> Self {
         Self { pool }
+    }
+
+    /// Open a JobQueue from a database path (convenience constructor for CLI)
+    pub async fn open(db_path: &std::path::Path) -> Result<Self> {
+        use sqlx::sqlite::SqlitePoolOptions;
+
+        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await?;
+
+        Ok(Self { pool })
+    }
+
+    /// Get job details for processing
+    ///
+    /// Tries production path (JOIN through file_version_id) first,
+    /// then falls back to input_file column for CLI/test jobs.
+    pub async fn get_job_details(&self, job_id: i64) -> Result<Option<JobDetails>> {
+        // Try production path first
+        let result: Option<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT
+                pq.plugin_name,
+                sr.path || '/' || fl.rel_path as full_path
+            FROM cf_processing_queue pq
+            JOIN cf_file_version fv ON pq.file_version_id = fv.id
+            JOIN cf_file_location fl ON fv.location_id = fl.id
+            JOIN cf_source_root sr ON fl.source_root_id = sr.id
+            WHERE pq.id = ?
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some((plugin_name, file_path)) = result {
+            return Ok(Some(JobDetails {
+                job_id,
+                plugin_name,
+                file_path,
+                input_file: None,
+            }));
+        }
+
+        // Fallback: use input_file directly (for test jobs or CLI-created jobs)
+        let result: Option<(String, String)> = sqlx::query_as(
+            r#"
+            SELECT plugin_name, input_file
+            FROM cf_processing_queue
+            WHERE id = ? AND input_file IS NOT NULL
+            "#,
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.map(|(plugin_name, input_file)| JobDetails {
+            job_id,
+            plugin_name,
+            file_path: input_file.clone(),
+            input_file: Some(input_file),
+        }))
+    }
+
+    /// Claim a job by setting status to RUNNING
+    pub async fn claim_job(&self, job_id: i64) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE cf_processing_queue SET status = 'RUNNING', claim_time = ? WHERE id = ?",
+        )
+        .bind(&now)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get plugin source code and env_hash from manifest
+    pub async fn get_plugin_details(&self, plugin_name: &str) -> Result<Option<PluginDetails>> {
+        let result: Option<(String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT source_code, env_hash
+            FROM cf_plugin_manifest
+            WHERE plugin_name = ? AND status IN ('ACTIVE', 'DEPLOYED')
+            ORDER BY deployed_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(plugin_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.map(|(source_code, env_hash)| PluginDetails {
+            source_code,
+            env_hash,
+        }))
+    }
+
+    /// Get lockfile content from plugin environment
+    pub async fn get_lockfile(&self, env_hash: &str) -> Result<Option<String>> {
+        let result: Option<(String,)> = sqlx::query_as(
+            "SELECT lockfile_content FROM cf_plugin_environment WHERE hash = ?",
+        )
+        .bind(env_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.map(|(s,)| s))
     }
 
     /// Peek at the next job without claiming it.
@@ -48,7 +174,7 @@ impl JobQueue {
         let mut tx = self.pool.begin().await?;
 
         // Find the next job to claim
-        let job_id: Option<i32> = sqlx::query_scalar(
+        let job_id: Option<i64> = sqlx::query_scalar(
             r#"
             SELECT id FROM cf_processing_queue
             WHERE status = 'QUEUED'
@@ -103,7 +229,7 @@ impl JobQueue {
     }
 
     /// Mark a job as completed
-    pub async fn complete_job(&self, job_id: i32, summary: &str) -> Result<()> {
+    pub async fn complete_job(&self, job_id: i64, summary: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
@@ -125,7 +251,7 @@ impl JobQueue {
     }
 
     /// Mark a job as failed
-    pub async fn fail_job(&self, job_id: i32, error: &str) -> Result<()> {
+    pub async fn fail_job(&self, job_id: i64, error: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             r#"
@@ -150,7 +276,7 @@ impl JobQueue {
     ///
     /// If the job has exceeded MAX_RETRY_COUNT, it is marked as FAILED instead.
     /// This prevents infinite retry loops for jobs that consistently fail.
-    pub async fn requeue_job(&self, job_id: i32) -> Result<()> {
+    pub async fn requeue_job(&self, job_id: i64) -> Result<()> {
         // First check the current retry count
         let current_retry: Option<i32> = sqlx::query_scalar(
             "SELECT retry_count FROM cf_processing_queue WHERE id = ?",

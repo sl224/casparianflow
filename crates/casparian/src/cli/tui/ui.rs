@@ -2,7 +2,7 @@
 
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs, Wrap},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs, Wrap},
 };
 
 use super::app::{App, MessageRole, View};
@@ -219,11 +219,14 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     result
 }
 
-/// Draw context pane with workflow metadata
+/// Draw context pane with workflow metadata and recent tools
 fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
-    let content = if let Some(ref workflow) = app.chat.workflow {
-        format!(
-            "Phase: {:?}\nNeeds Approval: {}\n\nNext Actions:\n{}",
+    let mut content = String::new();
+
+    // Show workflow info if available
+    if let Some(ref workflow) = app.chat.workflow {
+        content.push_str(&format!(
+            "Phase: {:?}\nNeeds Approval: {}\n\nNext Actions:\n{}\n\n",
             workflow.phase,
             workflow.needs_approval,
             workflow
@@ -232,10 +235,23 @@ fn draw_context(frame: &mut Frame, app: &App, area: Rect) {
                 .map(|a| format!("  > {}", a.tool_name))
                 .collect::<Vec<_>>()
                 .join("\n")
-        )
-    } else {
-        "No active workflow.\n\nStart by typing a message like:\n  'scan /path/to/data'\n  'help me process sensor files'".into()
-    };
+        ));
+    }
+
+    // Show recent tools used
+    if !app.chat.recent_tools.is_empty() {
+        content.push_str("Recent Tools:\n");
+        for tool in &app.chat.recent_tools {
+            content.push_str(&format!("  > {}\n", tool));
+        }
+    } else if content.is_empty() {
+        content.push_str("No active workflow.\n\nStart by typing a message like:\n  'scan /path/to/data'\n  'help me process sensor files'");
+    }
+
+    // Show status indicator
+    if app.chat.awaiting_response {
+        content.push_str("\n\n[Processing...]");
+    }
 
     let context = Paragraph::new(content)
         .block(
@@ -283,7 +299,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     // Calculate visible portion of input for scrolling
     let available_height = area.height.saturating_sub(2) as usize;
     let input_lines: Vec<&str> = app.chat.input.lines().collect();
-    let total_input_lines = input_lines.len().max(1);
+    let _total_input_lines = input_lines.len().max(1);
 
     let (cursor_line, cursor_col) = app.chat.cursor_line_col();
 

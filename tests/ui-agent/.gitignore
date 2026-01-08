@@ -1,6 +1,0 @@
-# Test artifacts
-test-results/
-playwright-report/
-
-# Dependencies
-node_modules/

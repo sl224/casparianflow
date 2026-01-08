@@ -9,8 +9,8 @@
 
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
-use cf_protocol::types::{self, DispatchCommand, JobStatus, PrepareEnvCommand};
-use cf_protocol::{Message, OpCode};
+use casparian_protocol::types::{self, DispatchCommand, HeartbeatStatus, JobStatus, PrepareEnvCommand};
+use casparian_protocol::{Message, OpCode};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
@@ -165,14 +165,14 @@ impl Worker {
                     let active_job_ids: Vec<i64> = self.active_jobs.keys()
                         .map(|&id| id as i64)
                         .collect();
-                    let status = if active_job_ids.is_empty() { "IDLE" } else { "BUSY" };
+                    let status = if active_job_ids.is_empty() { HeartbeatStatus::Idle } else { HeartbeatStatus::Busy };
                     let payload = types::HeartbeatPayload {
-                        status: status.to_string(),
+                        status,
                         current_job_id: active_job_ids.first().copied(),
                         active_job_count: active_job_ids.len(),
                         active_job_ids,
                     };
-                    debug!("Sending heartbeat: {} ({} active jobs)", status, payload.active_job_count);
+                    debug!("Sending heartbeat: {:?} ({} active jobs)", status, payload.active_job_count);
                     if let Err(e) = send_message(&mut self.socket, OpCode::Heartbeat, 0, &payload).await {
                         warn!("Failed to send heartbeat: {}", e);
                     }
@@ -357,15 +357,15 @@ impl Worker {
                 let current_job = active_job_ids.first().copied();
 
                 let status = if active_job_count == 0 {
-                    "IDLE"
+                    HeartbeatStatus::Idle
                 } else if active_job_count >= MAX_CONCURRENT_JOBS {
-                    "BUSY"  // At capacity
+                    HeartbeatStatus::Busy  // At capacity
                 } else {
-                    "ALIVE" // Working but can accept more
+                    HeartbeatStatus::Alive // Working but can accept more
                 };
 
                 let payload = types::HeartbeatPayload {
-                    status: status.to_string(),
+                    status,
                     current_job_id: current_job,
                     active_job_count,
                     active_job_ids,

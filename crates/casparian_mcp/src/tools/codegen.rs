@@ -145,6 +145,7 @@ impl GenerateParserTool {
     }
 
     /// Map schema data type to polars type
+    #[allow(dead_code)] // Used only in tests
     fn polars_type(data_type: &str) -> &'static str {
         match data_type.to_lowercase().as_str() {
             "int64" | "integer" | "int" => "pl.Int64",
@@ -728,9 +729,6 @@ struct ErrorAnalysis {
 /// A detected pattern in the errors
 #[derive(Debug, Clone)]
 struct ErrorPattern {
-    /// Type of pattern
-    #[allow(dead_code)]
-    pattern_type: String,
     /// Affected columns
     columns: Vec<String>,
     /// Suggested fix
@@ -760,10 +758,7 @@ enum FixType {
 #[derive(Debug, Clone)]
 struct Fix {
     /// Type of fix
-    fix_type: FixType,
-    /// Target column
-    #[allow(dead_code)]
-    column: Option<String>,
+    _fix_type: FixType,
     /// Description of what the fix does
     description: String,
     /// Code to add/modify
@@ -819,7 +814,6 @@ impl RefineParserTool {
 
             if null_errors.len() == col_errors.len() && !null_errors.is_empty() {
                 patterns.push(ErrorPattern {
-                    pattern_type: "all_nulls_single_column".to_string(),
                     columns: vec![col.clone()],
                     fix_type: FixType::NullHandling,
                     confidence: 0.95,
@@ -845,14 +839,12 @@ impl RefineParserTool {
 
                 if has_non_numeric {
                     patterns.push(ErrorPattern {
-                        pattern_type: "mixed_types_keep_string".to_string(),
                         columns: vec![col.clone()],
                         fix_type: FixType::KeepAsString,
                         confidence: 0.8,
                     });
                 } else {
                     patterns.push(ErrorPattern {
-                        pattern_type: "type_cast_issue".to_string(),
                         columns: vec![col.clone()],
                         fix_type: FixType::TypeCast,
                         confidence: 0.7,
@@ -878,7 +870,6 @@ impl RefineParserTool {
 
                 if looks_like_date {
                     patterns.push(ErrorPattern {
-                        pattern_type: "date_format_issue".to_string(),
                         columns: vec![col.clone()],
                         fix_type: FixType::DateFormat,
                         confidence: 0.75,
@@ -900,7 +891,6 @@ impl RefineParserTool {
                 .collect();
 
             patterns.push(ErrorPattern {
-                pattern_type: "value_cleaning_needed".to_string(),
                 columns: affected_cols,
                 fix_type: FixType::ValueCleaning,
                 confidence: 0.65,
@@ -930,8 +920,7 @@ impl RefineParserTool {
 
                 if is_required {
                     Fix {
-                        fix_type: FixType::NullHandling,
-                        column: Some(col_name.to_string()),
+                        _fix_type: FixType::NullHandling,
                         description: format!("Fill nulls in required column '{}' with default value", col_name),
                         code_change: format!(
                             r#"    # Fill nulls in required column
@@ -943,8 +932,7 @@ impl RefineParserTool {
                     }
                 } else if should_be_nullable {
                     Fix {
-                        fix_type: FixType::NullHandling,
-                        column: Some(col_name.to_string()),
+                        _fix_type: FixType::NullHandling,
                         description: format!("Column '{}' allows nulls - no fill needed", col_name),
                         code_change: format!(
                             r#"    # Column allows nulls - ensure proper null handling
@@ -954,8 +942,7 @@ impl RefineParserTool {
                     }
                 } else {
                     Fix {
-                        fix_type: FixType::NullHandling,
-                        column: Some(col_name.to_string()),
+                        _fix_type: FixType::NullHandling,
                         description: format!("Add null handling for column '{}'", col_name),
                         code_change: format!(
                             r#"    # Handle nulls in column
@@ -986,8 +973,7 @@ impl RefineParserTool {
                 };
 
                 Fix {
-                    fix_type: FixType::TypeCast,
-                    column: Some(col_name.to_string()),
+                    _fix_type: FixType::TypeCast,
                     description: format!("Cast column '{}' to {} with error handling", col_name, polars_type),
                     code_change: format!(
                         r#"    # Safe type cast with error handling
@@ -999,8 +985,7 @@ impl RefineParserTool {
                 }
             }
             FixType::ErrorHandling => Fix {
-                fix_type: FixType::ErrorHandling,
-                column: column.map(String::from),
+                _fix_type: FixType::ErrorHandling,
                 description: "Add try/except error handling around parsing".to_string(),
                 code_change: r#"    # Add error handling
     try:
@@ -1022,8 +1007,7 @@ impl RefineParserTool {
                     .unwrap_or("%Y-%m-%d");
 
                 Fix {
-                    fix_type: FixType::DateFormat,
-                    column: Some(col_name.to_string()),
+                    _fix_type: FixType::DateFormat,
                     description: format!("Try multiple date formats for column '{}'", col_name),
                     code_change: format!(
                         r#"    # Try multiple date formats
@@ -1045,8 +1029,7 @@ impl RefineParserTool {
                 }
             }
             FixType::ValueCleaning => Fix {
-                fix_type: FixType::ValueCleaning,
-                column: column.map(String::from),
+                _fix_type: FixType::ValueCleaning,
                 description: format!("Clean and validate values in column '{}'", col_name),
                 code_change: format!(
                     r#"    # Clean and validate values
@@ -1060,8 +1043,7 @@ impl RefineParserTool {
                 ),
             },
             FixType::KeepAsString => Fix {
-                fix_type: FixType::KeepAsString,
-                column: Some(col_name.to_string()),
+                _fix_type: FixType::KeepAsString,
                 description: format!("Keep column '{}' as string due to mixed types", col_name),
                 code_change: format!(
                     r#"    # Keep as string due to mixed types
@@ -1966,8 +1948,7 @@ def transform(file_path):
 
         let fix = tool.generate_fix(&FixType::NullHandling, Some("amount"), &constraints);
 
-        assert_eq!(fix.fix_type, FixType::NullHandling);
-        assert_eq!(fix.column, Some("amount".to_string()));
+        assert_eq!(fix._fix_type, FixType::NullHandling);
         assert!(fix.code_change.contains("fill_null"));
     }
 
@@ -1982,8 +1963,7 @@ def transform(file_path):
     return df"#;
 
         let fix = Fix {
-            fix_type: FixType::NullHandling,
-            column: Some("amount".to_string()),
+            _fix_type: FixType::NullHandling,
             description: "Fill nulls".to_string(),
             code_change: "    df = df.fill_null(0)".to_string(),
         };

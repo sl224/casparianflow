@@ -7,7 +7,7 @@
 //! 4. Atomic writes via .tmp/ → rename
 //! 5. Checkpointing every 100MB for resume capability
 
-use cf_protocol::{LineageBlock, ShardMeta, ShredConfig, ShredResult, ShredStrategy};
+use casparian_protocol::{LineageBlock, ShardMeta, ShredConfig, ShredResult, ShredStrategy};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
