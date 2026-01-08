@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # src/casparian_flow/engine/bridge_shim.py
 """
-v5.0 Bridge Mode: Guest Process Shim.
+v6.0 Bridge Mode: Guest Process Shim.
 
 This script runs inside the isolated venv and acts as the "Guest" side
 of the Host/Guest privilege separation model.
@@ -9,8 +9,8 @@ of the Host/Guest privilege separation model.
 Guest Side Role:
 - Pure Logic execution (no credentials, no heavy drivers)
 - Minimal dependencies: pandas, pyarrow
-- Receives plugin code and file path via environment
-- Streams Arrow IPC batches to the Host via AF_UNIX socket
+- Receives plugin code and file path via environment or CLI args
+- Streams Arrow IPC batches to the Host via TCP socket
 
 Security Model:
 - No access to AWS credentials, DB passwords, or heavy drivers
@@ -18,18 +18,39 @@ Security Model:
 - Sandboxed execution with minimal attack surface
 
 Communication Protocol:
-1. Read configuration from environment variables
-2. Execute plugin code with provided file path
-3. Stream Arrow IPC batches to socket
-4. Send completion signal and exit
+1. Read configuration from environment variables and CLI args
+2. Connect to Host via TCP on 127.0.0.1:BRIDGE_PORT
+3. Execute plugin code with provided file path
+4. Stream Arrow IPC batches to socket
+5. Send completion signal and exit
 
-Usage:
-    BRIDGE_SOCKET=/tmp/bridge.sock \
+Exit Code Convention:
+- 0: Success
+- 1: Permanent error (no retry) - parse errors, validation failures, bad data
+- 2: Transient error (retry eligible) - timeout, OOM, network issues
+
+Safety Features:
+- safe_to_arrow(): Handles mixed-type columns with string fallback
+- check_memory_for_batch(): OOM prevention (3x batch size rule)
+- PermanentError/TransientError: Explicit error classification
+
+Usage (Environment Variables):
+    BRIDGE_PORT=12345 \
     BRIDGE_PLUGIN_CODE=<base64> \
     BRIDGE_FILE_PATH=/path/to/file.csv \
     BRIDGE_JOB_ID=123 \
     BRIDGE_FILE_VERSION_ID=456 \
     python bridge_shim.py
+
+Usage (CLI Arguments - Dev Mode):
+    BRIDGE_PORT=12345 \
+    BRIDGE_FILE_PATH=/path/to/file.csv \
+    python bridge_shim.py --parser-path /path/to/parser.py
+
+Usage (CLI Arguments - Prod Mode):
+    BRIDGE_PORT=12345 \
+    BRIDGE_FILE_PATH=/path/to/file.csv \
+    python bridge_shim.py --parser-archive <base64-zip>
 """
 
 import os
@@ -40,6 +61,7 @@ import socket
 import struct
 import logging
 import traceback
+import argparse
 from typing import Iterator, Any, Optional
 from pathlib import Path
 from io import BytesIO
@@ -56,6 +78,72 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger(__name__)
+
+
+# --- Error Classes ---
+
+class PermanentError(Exception):
+    """Error that should not be retried (parse error, validation failure, bad data)."""
+    pass
+
+
+class TransientError(Exception):
+    """Error eligible for retry (timeout, connection reset, OOM, network issues)."""
+    pass
+
+
+# --- Safety Functions ---
+
+def safe_to_arrow(df: "pd.DataFrame") -> "pa.Table":
+    """
+    Convert DataFrame to Arrow with string fallback for mixed-type columns.
+
+    Ensures data always reaches Rust for quarantine processing,
+    rather than crashing in Python due to mixed types.
+    """
+    import pandas as pd
+    import pyarrow as pa
+
+    try:
+        return pa.Table.from_pandas(df)
+    except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
+        logger.warning(f"Arrow conversion failed, attempting column-by-column fallback: {e}")
+
+        # Identify and fix problematic columns
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                try:
+                    pa.array(df[col])
+                except (pa.ArrowInvalid, pa.ArrowTypeError):
+                    logger.warning(f"Column '{col}' has mixed types, converting to string")
+                    df[col] = df[col].astype(str)
+
+        # Retry with sanitized DataFrame
+        return pa.Table.from_pandas(df)
+
+
+def check_memory_for_batch(df: "pd.DataFrame") -> bool:
+    """
+    Check if enough RAM for Arrow conversion (3x batch size rule).
+
+    Returns True if safe to proceed, False if OOM risk.
+    """
+    try:
+        import psutil
+        available = psutil.virtual_memory().available
+        estimated = df.memory_usage(deep=True).sum() * 3
+
+        if estimated > available:
+            logger.error(
+                f"OOM risk: batch requires ~{estimated / 1e9:.1f}GB, "
+                f"only {available / 1e9:.1f}GB available"
+            )
+            return False
+        return True
+    except ImportError:
+        # psutil not available, skip check
+        logger.debug("psutil not available, skipping memory check")
+        return True
 
 
 # --- Arrow IPC Protocol ---
@@ -169,8 +257,8 @@ class BridgeContext:
     Provides a publish() method that streams Arrow IPC to the Host.
     """
 
-    def __init__(self, socket_path: str, job_id: int):
-        self.socket_path = socket_path
+    def __init__(self, port: int, job_id: int):
+        self.port = port
         self.job_id = job_id
         self._socket: Optional[socket.socket] = None
         self._topics: dict[int, str] = {}
@@ -178,10 +266,12 @@ class BridgeContext:
         self._row_count = 0
 
     def connect(self):
-        """Connect to the Host via AF_UNIX socket."""
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._socket.connect(self.socket_path)
-        logger.info(f"Connected to bridge socket: {self.socket_path}")
+        """Connect to the Host via TCP."""
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if self.port == 0:
+            raise RuntimeError("BRIDGE_PORT environment variable not set or is 0")
+        self._socket.connect(('127.0.0.1', self.port))
+        logger.info(f"Connected to host on port {self.port}")
 
     def close(self):
         """Send end-of-stream and close the socket."""
@@ -247,7 +337,7 @@ class BridgeContext:
         self._next_handle += 1
         return handle
 
-    def publish(self, handle: int, data: Any):
+    def publish(self, handle: int, data: Any, skip_memory_check: bool = False):
         """
         Publish data via Arrow IPC.
 
@@ -267,7 +357,10 @@ class BridgeContext:
                 # polars DataFrame
                 table = data.to_arrow()
             elif isinstance(data, pd.DataFrame):
-                table = pa.Table.from_pandas(data)
+                # Check memory before conversion
+                if not skip_memory_check and not check_memory_for_batch(data):
+                    raise TransientError("Insufficient memory for Arrow conversion")
+                table = safe_to_arrow(data)
             elif isinstance(data, pa.Table):
                 table = data
             elif isinstance(data, pa.RecordBatch):
@@ -431,38 +524,94 @@ def execute_plugin(
 
 def main():
     """Main entry point for Bridge Shim."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Bridge Shim for Casparian Flow")
+    parser.add_argument('--parser-path', help='Dev mode: path to parser.py file')
+    parser.add_argument('--parser-archive', help='Prod mode: base64-encoded ZIP archive')
+    args = parser.parse_args()
+
     # Read configuration from environment
-    socket_path = os.environ.get("BRIDGE_SOCKET")
+    port_str = os.environ.get("BRIDGE_PORT", "0")
     plugin_code_b64 = os.environ.get("BRIDGE_PLUGIN_CODE")
     file_path = os.environ.get("BRIDGE_FILE_PATH")
     job_id = int(os.environ.get("BRIDGE_JOB_ID", "0"))
     file_version_id = int(os.environ.get("BRIDGE_FILE_VERSION_ID", "0"))
 
-    if not all([socket_path, plugin_code_b64, file_path]):
+    # Handle different loader modes
+    source_code = None
+
+    if args.parser_path:
+        # Dev mode: load from file path
+        try:
+            with open(args.parser_path, 'r') as f:
+                source_code = f.read()
+        except Exception as e:
+            logger.error(f"Failed to read parser file: {e}")
+            sys.exit(1)
+    elif args.parser_archive:
+        # Prod mode: base64-encoded ZIP archive
+        try:
+            import zipfile
+            import tempfile
+            archive_bytes = base64.b64decode(args.parser_archive)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                with zipfile.ZipFile(BytesIO(archive_bytes)) as zf:
+                    zf.extractall(tmpdir)
+                    # Look for main parser file
+                    parser_file = Path(tmpdir) / "parser.py"
+                    if not parser_file.exists():
+                        # Try to find any .py file
+                        py_files = list(Path(tmpdir).glob("*.py"))
+                        if py_files:
+                            parser_file = py_files[0]
+                        else:
+                            raise FileNotFoundError("No parser.py found in archive")
+                    source_code = parser_file.read_text()
+        except Exception as e:
+            logger.error(f"Failed to extract parser archive: {e}")
+            sys.exit(1)
+    elif plugin_code_b64:
+        # Legacy mode: base64-encoded source code from env
+        try:
+            source_code = base64.b64decode(plugin_code_b64).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Failed to decode plugin code: {e}")
+            sys.exit(1)
+
+    # Validate required configuration
+    try:
+        port = int(port_str)
+    except ValueError:
+        logger.error(f"BRIDGE_PORT must be an integer, got: {port_str}")
+        sys.exit(1)
+
+    if port == 0:
+        logger.error("BRIDGE_PORT environment variable not set or is 0")
+        sys.exit(1)
+
+    if not file_path:
+        logger.error("BRIDGE_FILE_PATH environment variable not set")
+        sys.exit(1)
+
+    if source_code is None:
         logger.error(
-            "Missing required environment variables: "
-            "BRIDGE_SOCKET, BRIDGE_PLUGIN_CODE, BRIDGE_FILE_PATH"
+            "No parser source provided. Use --parser-path, --parser-archive, "
+            "or set BRIDGE_PLUGIN_CODE environment variable"
         )
         sys.exit(1)
 
-    # Decode plugin source code
-    try:
-        source_code = base64.b64decode(plugin_code_b64).decode("utf-8")
-    except Exception as e:
-        logger.error(f"Failed to decode plugin code: {e}")
-        sys.exit(1)
-
     # Create context and connect
-    context = BridgeContext(socket_path, job_id)
+    context = BridgeContext(port, job_id)
+
+    # Save original stdio for restoration
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
 
     try:
         context.connect()
 
         # === SIDEBAND LOGGING SETUP ===
         # Hijack stdout/stderr BEFORE executing user code to capture print() statements
-        # Save originals for fallback
-        original_stdout = sys.stdout
-        original_stderr = sys.stderr
 
         # Replace with socket writers
         sys.stdout = SocketWriter(context, LOG_LEVEL_STDOUT)
@@ -500,23 +649,86 @@ def main():
             sys.stdout = original_stdout
             sys.stderr = original_stderr
 
+    except PermanentError as e:
+        logger.error(f"Permanent error (no retry): {e}")
+        # Send error to host if possible
+        try:
+            context.send_error(str(e))
+        except Exception:
+            pass
+        try:
+            context.close()
+        except Exception:
+            pass
+        # Print error metrics
+        print(json.dumps({
+            "status": "FAILED",
+            "error": str(e),
+            "retryable": False,
+        }))
+        sys.exit(1)  # Permanent - no retry
+
+    except TransientError as e:
+        logger.error(f"Transient error (retry eligible): {e}")
+        try:
+            context.send_error(str(e))
+        except Exception:
+            pass
+        try:
+            context.close()
+        except Exception:
+            pass
+        print(json.dumps({
+            "status": "FAILED",
+            "error": str(e),
+            "retryable": True,
+        }))
+        sys.exit(2)  # Transient - retry eligible
+
+    except MemoryError as e:
+        logger.error(f"Memory error: {e}")
+        try:
+            context.send_error(f"Memory error: {e}")
+        except Exception:
+            pass
+        try:
+            context.close()
+        except Exception:
+            pass
+        print(json.dumps({
+            "status": "FAILED",
+            "error": str(e),
+            "retryable": True,
+        }))
+        sys.exit(2)  # Transient - retry eligible
+
     except Exception as e:
         error_msg = traceback.format_exc()
 
         # Try to send through sideband if socket still connected
         if context._socket:
-            context.send_log(LOG_LEVEL_ERROR, f"Plugin execution failed: {e}\n{error_msg}")
+            try:
+                context.send_log(LOG_LEVEL_ERROR, f"Plugin execution failed: {e}\n{error_msg}")
+            except Exception:
+                pass
 
         # Send error to Host via error signal
-        context.send_error(str(e))
-        context.close()
+        try:
+            context.send_error(str(e))
+        except Exception:
+            pass
+        try:
+            context.close()
+        except Exception:
+            pass
 
         # Print error metrics to original stdout
         print(json.dumps({
             "status": "FAILED",
             "error": str(e),
+            "retryable": False,
         }))
-        sys.exit(1)
+        sys.exit(1)  # Assume permanent for unknown errors
 
 
 if __name__ == "__main__":
