@@ -124,7 +124,7 @@ The system supports two execution modes sharing a single core executor.
     *   **IMPLEMENTATION NOTE**: Current codebase uses `Stdio::piped()` which breaks pdb. Dev mode MUST switch to `Stdio::inherit()`.
 *   **Serialization**:
     *   Shim MUST use `safe_to_arrow` with string fallback for mixed-type columns.
-    *   **IMPLEMENTATION NOTE**: Current `bridge_shim.py` does raw `pa.Table.from_pandas()`. Must add safety wrapper.
+    *   **IMPLEMENTED**: `bridge_shim.py` now has `safe_to_arrow()` that catches `ArrowInvalid`/`ArrowTypeError` and converts problematic columns to strings. Uses single-pass array building on fallback path for efficiency.
     *   Prevents worker crashes on data quality issues; ensures bad data reaches Rust for quarantine.
 *   **Memory Safety**: Before `safe_to_arrow` conversion, check available system RAM. If available memory < 3× batch size, abort job with `OOM_RISK` error. User must chunk their data.
 
@@ -167,6 +167,21 @@ The system supports two execution modes sharing a single core executor.
 *   **Location**: `~/.casparian_flow/logs/{date}/{job_id}.log`
 
 ### FS-8: Error Handling & Retry Semantics
+*   **Structured Error Codes** (Python → Rust):
+    *   Python shim classifies exceptions into structured `error_code` field in JSON output.
+    *   Rust parses `error_code` directly; falls back to string matching for legacy compatibility.
+    *   Error code mapping:
+
+    | Exception Type | Error Code | Retryable |
+    |----------------|------------|-----------|
+    | `KeyError` | `SCHEMA_MISMATCH` | No |
+    | `FileNotFoundError` | `FILE_NOT_FOUND` | No |
+    | `PermissionError` | `PERMISSION_ERROR` | No |
+    | `UnicodeDecodeError` | `ENCODING_ERROR` | No |
+    | `MemoryError` | `MEMORY_ERROR` | Yes |
+    | `ValueError` (convert) | `INVALID_DATA` | No |
+    | Other | `UNKNOWN_ERROR` | No |
+
 *   **Retry Policy**:
     *   Maximum 3 retries per job with exponential backoff (1s, 4s, 16s).
     *   Only **transient** errors trigger retry (timeout, OOM, connection reset).
@@ -235,56 +250,163 @@ The TUI (`casparian tui`) is a **user-driven** interface for iterative/explorato
 *   **Modal workflows**: Distinct modes for different tasks, accessed from a central hub.
 *   **IDE-agnostic**: Parsers are registered via CLI, run from TUI. No in-TUI code editing.
 
+#### Workflow Overview
+
+The TUI enforces a clear separation of concerns across four modes:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                           DATA PIPELINE FLOW                              │
+│                                                                          │
+│   DISCOVER       PARSER BENCH        JOBS            INSPECT            │
+│   ─────────      ────────────        ────            ───────            │
+│   Organize       Test & Dev          Monitor         Analyze            │
+│                                                                          │
+│   ┌─────────┐      ┌─────────┐      ┌─────────┐      ┌─────────┐        │
+│   │  Scan   │      │ Select  │      │  Track  │      │  Query  │        │
+│   │   ↓     │  ──► │   ↓     │  ──► │   ↓     │  ──► │   ↓     │        │
+│   │  Tag    │      │  Run    │      │  Retry  │      │ Export  │        │
+│   └─────────┘      └─────────┘      └─────────┘      └─────────┘        │
+│                                                                          │
+│   Files → Tags     Tags → Parsers   Jobs → Status   Tables → Insights   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
 #### Home Hub
 
 The landing view is a **card grid with stats** showing the four workflow modes:
 
 | Mode | Purpose | Quick Stats |
 |------|---------|-------------|
-| **Discover** | Scan files, tag, preview | "142 files, 3 sources" |
-| **Process** | Run parsers, view progress | "2 running, 5 pending" |
-| **Inspect** | Browse output tables, filter | "3 tables, 12K rows" |
-| **Jobs** | Queue status, retry, cancel | "1 failed, 8 complete" |
+| **Discover** | Organize: scan, tag, preview | "142 files, 3 sources" |
+| **Parser Bench** | Test & develop parsers | "3 parsers, 2 recent tests" |
+| **Inspect** | Analyze: query tables, view stats | "3 tables, 12K rows" |
+| **Jobs** | Monitor: track status, handle errors | "1 failed, 8 complete" |
 
 **Navigation**: Arrow keys to select card, Enter to launch mode. `q` to quit. `?` for help.
 
 #### Mode: Discover (Alt+d)
 
-*   **Layout**: File list (left) + Preview pane (right).
-*   **File List**: Shows path, tags, size, parent folder, depth.
-*   **Filtering**: Live filter with `.gitignore`-style patterns. Type to filter.
-*   **Actions**: `t` = tag selected, `p` = preview, `Enter` = full details.
-*   **AI**: Context-aware suggestions ("These look like invoice files. Tag as 'invoices'?").
+**Purpose**: File *organization* - scan, tag, preview. Prepares files for processing.
 
-#### Mode: Process (Alt+p)
+**Design**: Source-first workflow. Users must select a source before seeing files. This enforces clear data organization and prevents orphan files.
 
-*   **Layout**: Registered parsers list + run controls.
-*   **Parser List**: Shows name, version, matched file count, last run status.
-*   **Actions**: Select parser, see matched files, `r` = run, `s` = stop.
-*   **Progress**: Live progress bar per parser. Error count visible.
-*   **AI**: On error, "Explain this failure" available.
+*   **Layout**: Three-panel design with Tab navigation:
+    ```
+    ┌─────────────────┬────────────────────────────────────────┬─────────────┐
+    │  SOURCES        │           FILES                        │  PREVIEW    │
+    │  ─────────      │           ─────                        │  (toggle p) │
+    │  > sales_data   │  invoices/jan.csv          [sales] 2KB │             │
+    │    logs         │  invoices/feb.csv          [sales] 3KB │  [content]  │
+    │                 │  reports/q1.xlsx                   15KB│             │
+    │  ─────────      │                                        │             │
+    │  RULES          │                                        │             │
+    │  ─────────      │                                        │             │
+    │  *.csv → sales  │                                        │             │
+    │  *.log → logs   │                                        │             │
+    └─────────────────┴────────────────────────────────────────┴─────────────┘
+    ```
+*   **Panel Navigation**: Number keys for direct jump, Tab for flow-forward action.
+    *   `1` = jump to Sources panel
+    *   `2` = jump to Rules panel
+    *   `3` = jump to Files panel
+    *   `Tab` = context action (Sources: select→Files, Rules: filter→Files, Files: toggle preview)
+    *   `Esc` = return to Files panel (home base)
+*   **Source-First Loading**:
+    *   On mode entry, loads sources from `scout_sources` table.
+    *   Files only shown for the selected source (filtered by `source_id`).
+    *   No source selected = empty file list with guidance message.
+*   **Sources Panel** (`1` to focus):
+    *   `j/k` = navigate sources (scrollable)
+    *   `Tab` = select source AND jump to Files (flow forward)
+    *   `Enter` = select source (stay in Sources)
+    *   `n` = create new source (scan dialog)
+    *   `d` = delete source
+*   **Rules Panel** (`2` to focus):
+    *   Shows tagging rules for the selected source (scrollable)
+    *   `j/k` = navigate rules
+    *   `Tab` = apply rule pattern as filter AND jump to Files (flow forward)
+    *   `n` or `R` = create rule from current filter pattern
+    *   `d` = delete rule
+*   **Files Panel** (`3` to focus, default):
+    *   `j/k` or arrows = navigate file list
+    *   `Tab` = toggle preview pane
+    *   `p` = toggle preview pane (alternative)
+    *   `t` = tag selected file (opens tag dialog)
+    *   `T` = bulk tag filtered files
+    *   `/` = enter filter mode (live filter by path substring)
+    *   `s` = scan a new folder (creates source + scans)
+    *   `Enter` = drill into directory OR show file details
+*   **Empty States**:
+    *   No sources: "No sources found. Press 's' to scan a folder."
+    *   Source selected, no files: "No files in this source."
+*   **AI**: Context-aware suggestions via chat sidebar ("These look like invoice files. Tag as 'invoices'?").
+*   **NOT in Discover**: Running parsers (that's Parser Bench mode). Discover organizes; Parser Bench tests and executes.
+
+#### Mode: Parser Bench (Alt+p)
+
+**Purpose**: Parser *development and testing* - the workbench for iterating on parsers with immediate feedback.
+
+> **Full Specification**: See [specs/parser_bench.md](specs/parser_bench.md) for complete details.
+
+**Key Features**:
+*   **Quick Test Any Parser**: Test any `.py` file against any data file without registration
+*   **Recent Parsers**: Quick access to recently tested parser files
+*   **Registered Parsers**: View parsers published to the system with health badges
+*   **Smart Sampling**: Prioritize failed files first when selecting test data
+*   **Background Backtest**: Run full backtest while continuing to work
+
+**Layout**: Two-section list (Recent + Registered) with detail/results panel.
+
+**Core Workflow**:
+1.  Press `n` to start new test (or select from recent)
+2.  Pick parser `.py` file
+3.  Select data file (smart sampling suggests failed files first)
+4.  View results: schema, preview rows, errors with suggestions
+5.  Edit in IDE, press `r` to re-run
+
+**Connection to Discover**: Files tagged in Discover appear as test candidates for registered parsers.
 
 #### Mode: Inspect (Alt+i)
+
+**Purpose**: Output *analysis* - explore processed data, run queries, validate results.
 
 *   **Layout**: Output tables list → Stats summary → Drill-down view.
 *   **Stats Summary**: Column stats (nulls, uniques, min/max, type). Click to see distribution.
 *   **Drill-Down**: Select column to see value histogram, sample rows.
-*   **Actions**: `f` = filter, `e` = export to file (parquet/csv).
-*   **AI**: "What anomalies do you see in this data?"
+*   **Actions**:
+    *   `j/k` = navigate tables
+    *   `Enter` = expand table details
+    *   `q` = open SQL query input
+    *   `f` = filter rows
+    *   `e` = export to file (parquet/csv)
+*   **AI**: "What anomalies do you see in this data?" or "Write a query to find duplicates".
+*   **Connection to Jobs**: Links to job that produced each table.
 
 #### Mode: Jobs (Alt+j)
 
+**Purpose**: Queue *management* - monitor execution, handle failures, view logs.
+
 *   **Layout**: Job list (left) + Expandable detail pane (right).
 *   **Job List**: Status (running/pending/failed/complete), parser, file count, duration.
-*   **Actions**: `j/k` navigate, `r` = retry failed, `c` = cancel running, `Enter` = expand details.
-*   **Detail Pane**: Full logs, error traces, output paths.
+*   **Status Filters**: `1` = all, `2` = running, `3` = failed, `4` = pending.
+*   **Actions**:
+    *   `j/k` = navigate jobs
+    *   `Enter` = expand details (logs, error traces, output paths)
+    *   `r` = retry failed job
+    *   `c` = cancel running job
+    *   `d` = view dead-letter queue
+*   **Detail Pane**: Full logs, error traces, output paths, lineage info.
+*   **AI**: "Why did this job fail?" or "Show me similar failures".
 
 #### AI Assistant (Persistent Chat Sidebar)
 
-*   **Location**: Right sidebar, always visible (toggle with `Alt+a`).
+*   **Location**: Right sidebar (30% width), toggle visibility with `Alt+a`.
+*   **Focus**: `Tab` switches focus between main content and chat sidebar.
 *   **Context-Aware**: AI sees current mode, selected file/parser/job. Responses tailored.
 *   **Streaming**: Text streams in real-time. Tool calls shown inline.
-*   **Input**: Chat input at bottom. Enter to send.
+*   **Input**: Chat input at bottom. `Enter` to send, `Shift+Enter` for newline.
+*   **Scrolling**: `Ctrl+Up/Down` or `PageUp/PageDown` to scroll message history.
 
 #### Global Keybindings
 
@@ -294,9 +416,10 @@ The landing view is a **card grid with stats** showing the four workflow modes:
 | `Alt+p` | Go to Process mode |
 | `Alt+i` | Go to Inspect mode |
 | `Alt+j` | Go to Jobs mode |
+| `Alt+h` | Return to Home Hub |
 | `Alt+a` | Toggle AI chat sidebar |
-| `Alt+h` / `?` | Help |
-| `Esc` | Return to Home Hub |
+| `Tab` | Switch focus (Main ↔ Chat) when sidebar open |
+| `Esc` | Unfocus chat → Return to Home Hub (two-stage) |
 | `Ctrl+c` | Quit |
 
 #### Mouse Support (Basic)
@@ -315,13 +438,26 @@ The landing view is a **card grid with stats** showing the four workflow modes:
 ## 6. Data Strategy
 
 ### 6.1 Database Schema (SQLite)
-*   **`cf_files`**: Discovery inventory.
-*   **`cf_parsers`**: Registered parser bundles (ZIP BLOBs).
-*   **`cf_jobs`**: Execution queue and history.
-*   **`cf_quarantine`**: Row-level validation errors.
-*   **`cf_dead_letter`**: Jobs that exhausted retries. Columns: job_id, parser_name, input_path, error, retry_count, failed_at.
-*   **`cf_parser_health`**: Circuit breaker state. Columns: parser_name, consecutive_failures, paused_at, last_failure_reason.
+
+All tables use single database: `~/.casparian_flow/casparian_flow.sqlite3`
+
+**Scout Tables (File Discovery):**
+*   **`scout_sources`**: Data sources (directories to watch). Columns: id, name, source_type, path, poll_interval_secs, enabled.
+*   **`scout_files`**: Discovered files with tags. Columns: id, source_id (FK), path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id.
+*   **`scout_tagging_rules`**: Pattern → tag mappings. Columns: id, name, source_id (FK), pattern, tag, priority, enabled.
+
+**Parser Tables (CLI `run` command):**
+*   **`cf_parsers`**: Parser registry. Columns: id (UUID), name, version, source_hash, source_code, registered_at.
+*   **`cf_parser_topics`**: Parser → topic subscriptions. Columns: parser_id (FK), topic.
 *   **`cf_processing_history`**: Dedup tracking. Columns: input_hash, parser_name, parser_version, processed_at, job_id.
+
+**Sentinel Tables (Job Orchestration):**
+*   **`cf_processing_queue`**: Job queue. Columns: id, plugin_name, file_version_id, status (QUEUED/RUNNING/COMPLETED/FAILED), priority, retry_count.
+*   **`cf_dead_letter`**: Jobs that exhausted retries. Columns: original_job_id, plugin_name, error_message, retry_count, moved_at, reason.
+*   **`cf_parser_health`**: Circuit breaker state. Columns: parser_name, consecutive_failures, paused_at, last_failure_reason, total_executions.
+
+**Validation Tables:**
+*   **`cf_quarantine`**: Row-level validation errors for inspection.
 
 ### 6.2 File Formats
 *   **Output**: Apache Parquet (columnar, compressed) or Arrow IPC.

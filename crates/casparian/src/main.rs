@@ -51,8 +51,8 @@ enum Commands {
         #[arg(short = 'p', long = "pattern")]
         patterns: Vec<String>,
 
-        /// Scan subdirectories recursively
-        #[arg(short, long)]
+        /// Scan subdirectories recursively (default: true)
+        #[arg(short, long, default_value = "true", action = clap::ArgAction::Set)]
         recursive: bool,
 
         /// Maximum directory depth to scan

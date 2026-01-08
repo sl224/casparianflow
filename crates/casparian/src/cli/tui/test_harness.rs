@@ -11,7 +11,7 @@ use ratatui::{backend::TestBackend, Terminal};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::app::{App, Message, MessageRole, TuiMode, View};
+use super::app::{App, AppFocus, Message, MessageRole, TuiMode};
 use super::llm::mock::{CannedResponse, MockClaudeProvider};
 use super::ui;
 use super::TuiArgs;
@@ -22,9 +22,6 @@ pub struct ScreenSnapshot {
     pub raw: String,
     /// Content split by rows
     pub rows: Vec<String>,
-    /// Terminal dimensions
-    pub width: u16,
-    pub height: u16,
 }
 
 impl ScreenSnapshot {
@@ -51,40 +48,12 @@ impl ScreenSnapshot {
             .map(|chunk| chunk.iter().collect::<String>().trim_end().to_string())
             .collect();
 
-        Self {
-            raw,
-            rows,
-            width,
-            height,
-        }
+        Self { raw, rows }
     }
 
     /// Check if screen contains text anywhere
     pub fn contains(&self, text: &str) -> bool {
         self.raw.contains(text)
-    }
-
-    /// Check if specific row contains text
-    pub fn row_contains(&self, row: usize, text: &str) -> bool {
-        self.rows
-            .get(row)
-            .map(|r| r.contains(text))
-            .unwrap_or(false)
-    }
-
-    /// Get content of a specific row
-    pub fn row(&self, row: usize) -> Option<&str> {
-        self.rows.get(row).map(|s| s.as_str())
-    }
-
-    /// Find all rows containing text
-    pub fn rows_containing(&self, text: &str) -> Vec<(usize, &str)> {
-        self.rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| row.contains(text))
-            .map(|(i, row)| (i, row.as_str()))
-            .collect()
     }
 
     /// Assert screen contains text (with helpful error message)
@@ -144,26 +113,11 @@ impl TuiTestHarness {
         };
 
         let mut app = App::new(args);
-        // Start in Discover mode for chat functionality testing
+        // Start in Discover mode 
         app.mode = TuiMode::Discover;
-
-        Self { terminal, app }
-    }
-
-    /// Create a test harness with a mock LLM provider
-    pub fn with_mock_provider(provider: Arc<MockClaudeProvider>) -> Self {
-        let backend = TestBackend::new(80, 24);
-        let terminal = Terminal::new(backend).expect("Failed to create test terminal");
-
-        let args = TuiArgs {
-            database: None,
-            api_key: None,
-            model: "mock-test".into(),
-        };
-
-        let mut app = App::new_with_provider(args, provider);
-        // Start in Discover mode for chat functionality testing
-        app.mode = TuiMode::Discover;
+        // Open sidebar for chat testing
+        app.show_chat_sidebar = true;
+        app.focus = super::app::AppFocus::Chat;
 
         Self { terminal, app }
     }
@@ -214,34 +168,15 @@ impl TuiTestHarness {
             .await;
     }
 
-    /// Press F1 (Chat view)
-    pub async fn press_f1(&mut self) {
-        self.send_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
-            .await;
-    }
-
-    /// Press F2 (Monitor view)
-    pub async fn press_f2(&mut self) {
-        self.send_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
-            .await;
-    }
-
-    /// Press F3 (Help view)
-    pub async fn press_f3(&mut self) {
-        self.send_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+    /// Toggle Chat Sidebar (Alt+A)
+    pub async fn toggle_chat(&mut self) {
+        self.send_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT))
             .await;
     }
 
     /// Run tick (polls for pending responses)
     pub async fn tick(&mut self) {
         self.app.tick().await;
-    }
-
-    /// Run multiple ticks
-    pub async fn tick_n(&mut self, n: usize) {
-        for _ in 0..n {
-            self.tick().await;
-        }
     }
 
     /// Wait for response to arrive (polls tick until not awaiting)
@@ -278,19 +213,9 @@ impl TuiTestHarness {
         self.render()
     }
 
-    /// Get current view
-    pub fn current_view(&self) -> View {
-        self.app.view
-    }
-
     /// Get chat messages
     pub fn messages(&self) -> &[Message] {
         &self.app.chat.messages
-    }
-
-    /// Get last message content
-    pub fn last_message_content(&self) -> Option<&str> {
-        self.app.chat.messages.last().map(|m| m.content.as_str())
     }
 
     /// Check if awaiting response
@@ -325,7 +250,6 @@ pub struct TuiTestBuilder {
     height: u16,
     responses: Vec<CannedResponse>,
     initial_messages: Vec<Message>,
-    initial_view: View,
 }
 
 impl TuiTestBuilder {
@@ -335,34 +259,11 @@ impl TuiTestBuilder {
             height: 40, // Taller to show more messages
             responses: vec![],
             initial_messages: vec![],
-            initial_view: View::Chat,
         }
-    }
-
-    pub fn with_size(mut self, width: u16, height: u16) -> Self {
-        self.width = width;
-        self.height = height;
-        self
     }
 
     pub fn with_response(mut self, response: CannedResponse) -> Self {
         self.responses.push(response);
-        self
-    }
-
-    pub fn with_responses(mut self, responses: Vec<CannedResponse>) -> Self {
-        self.responses.extend(responses);
-        self
-    }
-
-    pub fn with_initial_message(mut self, role: MessageRole, content: &str) -> Self {
-        self.initial_messages
-            .push(Message::new(role, content.to_string()));
-        self
-    }
-
-    pub fn with_view(mut self, view: View) -> Self {
-        self.initial_view = view;
         self
     }
 
@@ -385,16 +286,16 @@ impl TuiTestBuilder {
         // Create app with mock provider
         let mut app = App::new_with_provider(args, mock_provider);
 
-        // Start in Discover mode for chat functionality testing
+        // Start in Discover mode
         app.mode = TuiMode::Discover;
+        // Open sidebar
+        app.show_chat_sidebar = true;
+        app.focus = super::app::AppFocus::Chat;
 
         // Add initial messages
         for msg in self.initial_messages {
             app.chat.messages.push(msg);
         }
-
-        // Set initial view
-        app.view = self.initial_view;
 
         TuiTestHarness { terminal, app }
     }
@@ -442,19 +343,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_harness_view_switching() {
+    async fn test_harness_chat_toggling() {
         let mut harness = TuiTestHarness::new();
 
-        assert!(matches!(harness.current_view(), View::Chat));
+        assert!(harness.app.show_chat_sidebar); // Default in test harness
 
-        harness.press_f2().await;
-        assert!(matches!(harness.current_view(), View::Monitor));
+        harness.toggle_chat().await;
+        assert!(!harness.app.show_chat_sidebar);
 
-        harness.press_f3().await;
-        assert!(matches!(harness.current_view(), View::Help));
-
-        harness.press_f1().await;
-        assert!(matches!(harness.current_view(), View::Chat));
+        harness.toggle_chat().await;
+        assert!(harness.app.show_chat_sidebar);
     }
 
     #[tokio::test]
@@ -481,13 +379,18 @@ mod tests {
     #[tokio::test]
     async fn test_escape_returns_to_home() {
         let mut harness = TuiTestHarness::new();
-        // Harness starts in Discover mode
+        // Harness starts in Discover mode with Chat focus
 
         harness.type_text("some text").await;
         assert_eq!(harness.input(), "some text");
 
         harness.press_escape().await;
-        // Esc now returns to Home mode instead of clearing input
+        // First Esc clears input/unfocuses chat
+        assert!(matches!(harness.app.focus, AppFocus::Main));
+        assert!(matches!(harness.app.mode, TuiMode::Discover));
+
+        harness.press_escape().await;
+        // Second Esc returns to Home mode
         assert!(matches!(harness.app.mode, TuiMode::Home));
     }
 
@@ -606,8 +509,9 @@ mod tests {
             .send_message_and_wait("Hi", Duration::from_secs(5))
             .await;
 
-        // Assistant response should be visible
-        screen.assert_contains("Hello! How can I help you today?");
+        // Assistant response should be visible (check parts due to wrapping)
+        screen.assert_contains("Hello!");
+        screen.assert_contains("today?");
     }
 
     #[tokio::test]
@@ -655,8 +559,9 @@ mod tests {
         screen.assert_contains("Second message");
 
         // Both assistant responses should be visible
-        screen.assert_contains("First response from Claude");
-        screen.assert_contains("Second response from Claude");
+        screen.assert_contains("First response");
+        screen.assert_contains("from Claude");
+        screen.assert_contains("Second response");
 
         // Verify internal state matches (includes system welcome message)
         assert_eq!(
@@ -727,30 +632,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_view_switching_preserves_messages() {
-        let mut harness = TuiTestBuilder::new()
-            .with_response(CannedResponse::text("Preserved response"))
-            .build();
-
-        // Send message in chat view
-        harness
-            .send_message_and_wait("test", Duration::from_secs(5))
-            .await;
-
-        // Switch to Monitor view
-        harness.press_f2().await;
-        assert!(matches!(harness.current_view(), View::Monitor));
-
-        // Switch back to Chat view
-        harness.press_f1().await;
-        assert!(matches!(harness.current_view(), View::Chat));
-
-        // Messages should still be there
-        let screen = harness.render();
-        screen.assert_contains("test");
-        screen.assert_contains("Preserved response");
-    }
 
     #[tokio::test]
     async fn test_multiline_input() {
@@ -773,7 +654,8 @@ mod tests {
         harness.wait_for_response(Duration::from_secs(5)).await;
 
         let screen = harness.render();
-        screen.assert_contains("Got your multiline message");
+        screen.assert_contains("Got your");
+        screen.assert_contains("multiline");
     }
 
     #[tokio::test]
@@ -835,6 +717,6 @@ mod tests {
         let screen = harness.render();
 
         // At minimum, the start of the message should be visible
-        screen.assert_contains("This is a very long response");
+        screen.assert_contains("This is a very");
     }
 }

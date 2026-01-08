@@ -257,10 +257,10 @@ impl Tool for RunBacktestTool {
             .and_then(|s| Uuid::parse_str(s).ok())
             .unwrap_or_else(Uuid::new_v4);
 
-        let parser_code = args
+        let _parser_code = args
             .get("parser_code")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or(""); // TODO: Use parser_code to execute actual backtest
 
         // Parse config
         let config: BacktestConfig = args

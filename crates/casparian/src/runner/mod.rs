@@ -12,8 +12,6 @@ use std::path::{Path, PathBuf};
 pub enum LogDestination {
     /// Dev mode: logs go to terminal (Stdio::inherit)
     Terminal,
-    /// Prod mode: logs go to file
-    File(PathBuf),
 }
 
 /// Result of parser execution
@@ -26,16 +24,10 @@ pub struct ExecutionResult {
     pub output_info: Vec<casparian_worker::bridge::OutputInfo>,
 }
 
-/// Reference to a parser - either path (dev) or bundle (prod)
+/// Reference to a parser by path
 pub enum ParserRef {
-    /// Development: path to parser.py
+    /// Path to parser.py
     Path(PathBuf),
-    /// Production: extracted bundle in temp dir
-    Bundle {
-        name: String,
-        version: String,
-        temp_dir: PathBuf,
-    },
 }
 
 /// Runner trait for parser execution
@@ -51,7 +43,5 @@ pub trait Runner: Send + Sync {
 }
 
 mod dev;
-mod queued;
 
 pub use dev::DevRunner;
-pub use queued::QueuedRunner;

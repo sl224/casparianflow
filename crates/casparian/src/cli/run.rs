@@ -23,37 +23,6 @@ use std::path::PathBuf;
 
 use crate::runner::{DevRunner, LogDestination, ParserRef, Runner};
 
-/// Parsed sink URI
-#[derive(Debug, Clone)]
-pub enum SinkUri {
-    /// Parquet files: parquet://./output/
-    Parquet { dir: PathBuf },
-    /// CSV files: csv://./output/
-    Csv { dir: PathBuf },
-    /// SQLite database: sqlite:///path/to/db.sqlite
-    Sqlite { path: PathBuf },
-}
-
-impl SinkUri {
-    /// Parse a sink URI string
-    pub fn parse(uri: &str) -> Result<Self> {
-        if let Some(path) = uri.strip_prefix("parquet://") {
-            Ok(SinkUri::Parquet { dir: PathBuf::from(path) })
-        } else if let Some(path) = uri.strip_prefix("csv://") {
-            Ok(SinkUri::Csv { dir: PathBuf::from(path) })
-        } else if let Some(path) = uri.strip_prefix("sqlite://") {
-            // sqlite:///path or sqlite://path
-            let path = path.strip_prefix('/').unwrap_or(path);
-            Ok(SinkUri::Sqlite { path: PathBuf::from(path) })
-        } else {
-            anyhow::bail!(
-                "Unknown sink URI scheme: {}\n\nSupported schemes:\n  parquet://./output/\n  csv://./output/\n  sqlite:///path/to/db.sqlite",
-                uri
-            )
-        }
-    }
-}
-
 /// Arguments for the `run` command
 #[derive(Debug, Args)]
 pub struct RunArgs {

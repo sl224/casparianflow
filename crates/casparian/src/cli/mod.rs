@@ -11,7 +11,6 @@ pub mod output;
 pub mod scan;
 pub mod preview;
 pub mod run;
-pub mod sink;
 pub mod backfill;
 
 // W2: Tagging commands (stubs)
@@ -45,6 +44,6 @@ pub mod context;
 #[allow(unused_imports)]
 pub use error::HelpfulError;
 #[allow(unused_imports)]
-pub use output::{format_size, format_time, print_table};
+pub use output::{format_number, format_number_signed, format_size, format_time, print_table};
 #[allow(unused_imports)]
 pub use config::default_db_path;

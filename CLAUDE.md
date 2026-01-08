@@ -421,11 +421,38 @@ for evidence in solver.elimination_evidence() {
 - Add doc comments for public functions
 - Comprehensive error types with `thiserror`
 - Helpful CLI error messages with suggestions
+- **Database access: Use `sqlx`, NOT `rusqlite`** - sqlx is async and the project standard
 
 ### Testing
 - E2E tests for all new features
 - No mocks for core functionality - use real databases
 - Test happy path AND error cases
+
+### CLI Design Principles
+
+**Core Principles:**
+1. **Verb-First Commands** - Action before noun: `casparian scan` not `casparian folder scan`
+2. **Fast Feedback** - <1s for typical operations, streaming output for long ops
+3. **Helpful Errors** - Every error includes what went wrong AND how to fix it
+4. **Type-Preserving Interchange** - Binary formats (Arrow IPC), not text streams
+5. **No Hidden State** - No project files, no server (unless explicitly started)
+6. **Discoverable** - Help system teaches the tool organically
+
+**Anti-Patterns to Avoid:**
+- No interactive wizards (use flags instead)
+- No "press enter to continue"
+- No spinners without information
+- No silent failures
+- No config files required for basic usage
+
+**Output Modes:**
+
+| Context | Format | Reason |
+|---------|--------|--------|
+| Terminal (human) | Pretty tables | Readable, truncated, colored |
+| `-o file.parquet` | Parquet | Compressed columnar storage |
+| `-o file.sqlite` | SQLite | Ad-hoc SQL queries |
+| `--sink` override | Per command | Flexible output destination |
 
 ---
 
@@ -489,6 +516,30 @@ for evidence in solver.elimination_evidence() {
 - Files → Tags → Topics → Parsers chain enables backfill queries
 - Parser can subscribe to multiple topics
 - Topic is decoupled from file pattern (one indirection layer)
+
+### ADR-014: Structured Error Codes (Jan 2025)
+**Decision:** Python bridge_shim emits structured `error_code` field based on exception type.
+**Consequence:**
+- Rust can parse error codes directly instead of string matching
+- Fallback string matching preserved for backwards compatibility
+- Error classification is deterministic and testable
+
+### ADR-015: Dual Parser Patterns (Jan 2025)
+**Decision:** Keep `transform(df)` and `parse(file_path)` as separate parser patterns.
+**Rationale:**
+- `transform(df)`: Test harness reads file, passes DataFrame - used by `casparian test`
+- `parse(file_path)`: Parser handles its own file reading - used by `casparian run`
+- Unifying would require changing parser interface (breaking change)
+**Consequence:** `run_parser_test` remains separate from `DevRunner` code path.
+
+### ADR-016: Split Runtime Architecture (Jan 2025)
+**Decision:** Keep separate Control Plane and Data Plane runtimes for now.
+**Rationale:**
+- Current pattern: Control (1 thread) + Data (N-1 threads) in separate `block_on` calls
+- Unifying to single runtime with `spawn_blocking` is significant refactor
+- Current architecture works and is tested
+**Future:** Consider unification when adding more complex async coordination.
+**Consequence:** Accept "uncanny valley" complexity until clear benefit emerges.
 
 ---
 

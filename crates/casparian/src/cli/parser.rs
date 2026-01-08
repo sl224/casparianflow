@@ -542,16 +542,17 @@ fn cmd_test(parser_path: &PathBuf, input_path: &PathBuf, rows: usize, json_outpu
 
     // Test the parser by running it
     let start = std::time::Instant::now();
-    let result = run_parser_test(parser_path, input_path, rows)?;
+    let (success, rows_processed, schema, preview_rows, headers, errors, _error_code) =
+        run_parser_test(parser_path, input_path, rows)?;
     let execution_time_ms = start.elapsed().as_millis() as u64;
 
     let test_result = ParserTestResult {
-        success: result.0,
-        rows_processed: result.1,
-        schema: result.2,
-        preview_rows: result.3,
-        headers: result.4,
-        errors: result.5,
+        success,
+        rows_processed,
+        schema,
+        preview_rows,
+        headers,
+        errors,
         execution_time_ms,
     };
 
@@ -861,7 +862,7 @@ async fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> an
         }
 
         match run_parser_test(&parser_path, &input_path, 1) {
-            Ok((true, _, schema, _, _, _)) => {
+            Ok((true, _, schema, _, _, _, _)) => {
                 passed += 1;
 
                 // Track schema variant
@@ -879,10 +880,11 @@ async fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> an
                     .or_default()
                     .push(file.path.clone());
             }
-            Ok((false, _, _, _, _, errors)) => {
+            Ok((false, _, _, _, _, errors, error_code)) => {
                 failed += 1;
 
-                let error_type = categorize_error(&errors);
+                // Prefer structured error_code, fall back to string matching
+                let error_type = categorize_error(error_code.as_deref(), &errors);
                 let error_msg = errors.first().cloned().unwrap_or_else(|| "Unknown error".to_string());
 
                 failures
@@ -1354,7 +1356,7 @@ fn run_parser_test(
     parser_path: &PathBuf,
     input_path: &PathBuf,
     preview_rows: usize,
-) -> anyhow::Result<(bool, usize, Option<Vec<SchemaColumn>>, Vec<Vec<String>>, Vec<String>, Vec<String>)> {
+) -> anyhow::Result<(bool, usize, Option<Vec<SchemaColumn>>, Vec<Vec<String>>, Vec<String>, Vec<String>, Option<String>)> {
     // Create a wrapper script that runs the parser
     let wrapper = format!(
         r#"
@@ -1442,12 +1444,33 @@ try:
 except Exception as e:
     error_msg = str(e)
     tb = traceback.format_exc()
+
+    # Structured error classification
+    error_code = "UNKNOWN_ERROR"
+    if isinstance(e, KeyError):
+        error_code = "SCHEMA_MISMATCH"
+    elif isinstance(e, FileNotFoundError):
+        error_code = "FILE_NOT_FOUND"
+    elif isinstance(e, PermissionError):
+        error_code = "PERMISSION_ERROR"
+    elif isinstance(e, UnicodeDecodeError):
+        error_code = "ENCODING_ERROR"
+    elif isinstance(e, MemoryError):
+        error_code = "MEMORY_ERROR"
+    elif isinstance(e, ValueError):
+        if "convert" in error_msg.lower() or "invalid" in error_msg.lower():
+            error_code = "INVALID_DATA"
+    elif isinstance(e, TypeError):
+        if "convert" in error_msg.lower():
+            error_code = "INVALID_DATA"
+
     output = {{
         "success": False,
         "total_rows": 0,
         "schema": None,
         "rows": [],
-        "errors": [error_msg, tb]
+        "errors": [error_msg, tb],
+        "error_code": error_code
     }}
     print(json.dumps(output))
 "#,
@@ -1473,6 +1496,7 @@ except Exception as e:
                 vec![],
                 vec![],
                 vec![format!("Failed to run Python: {}", e)],
+                Some("EXECUTION_ERROR".to_string()),
             ));
         }
     };
@@ -1536,7 +1560,12 @@ except Exception as e:
             })
             .unwrap_or_default();
 
-        Ok((success, total_rows, schema, rows, headers, errors))
+        // Extract structured error code from Python
+        let error_code: Option<String> = result["error_code"]
+            .as_str()
+            .map(|s| s.to_string());
+
+        Ok((success, total_rows, schema, rows, headers, errors, error_code))
     } else {
         // Failed to parse output
         let mut errors = vec![];
@@ -1550,12 +1579,19 @@ except Exception as e:
             errors.push("No output from parser".to_string());
         }
 
-        Ok((false, 0, None, vec![], vec![], errors))
+        Ok((false, 0, None, vec![], vec![], errors, None))
     }
 }
 
 /// Categorize an error by type
-fn categorize_error(errors: &[String]) -> String {
+/// Prefers structured error_code from Python if available, falls back to string matching
+fn categorize_error(error_code: Option<&str>, errors: &[String]) -> String {
+    // Prefer structured error code from Python (no string matching needed)
+    if let Some(code) = error_code {
+        return code.to_string();
+    }
+
+    // Fallback: string matching for legacy/external errors
     let error_text = errors.join(" ").to_lowercase();
 
     if error_text.contains("missing column") || error_text.contains("keyerror") {
@@ -1631,21 +1667,35 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_categorize_error() {
+    fn test_categorize_error_with_structured_code() {
+        // Structured error_code from Python takes precedence
         assert_eq!(
-            categorize_error(&["KeyError: 'missing_column'".to_string()]),
+            categorize_error(Some("SCHEMA_MISMATCH"), &["some error text".to_string()]),
             "SCHEMA_MISMATCH"
         );
         assert_eq!(
-            categorize_error(&["Could not convert 'abc' to float".to_string()]),
+            categorize_error(Some("INVALID_DATA"), &["KeyError: would match string".to_string()]),
+            "INVALID_DATA"
+        );
+    }
+
+    #[test]
+    fn test_categorize_error_fallback_string_matching() {
+        // When no structured error_code, fall back to string matching
+        assert_eq!(
+            categorize_error(None, &["KeyError: 'missing_column'".to_string()]),
+            "SCHEMA_MISMATCH"
+        );
+        assert_eq!(
+            categorize_error(None, &["Could not convert 'abc' to float".to_string()]),
             "INVALID_DATA"
         );
         assert_eq!(
-            categorize_error(&["FileNotFoundError: No such file".to_string()]),
+            categorize_error(None, &["FileNotFoundError: No such file".to_string()]),
             "FILE_NOT_FOUND"
         );
         assert_eq!(
-            categorize_error(&["Some random error".to_string()]),
+            categorize_error(None, &["Some random error".to_string()]),
             "UNKNOWN_ERROR"
         );
     }
@@ -1697,7 +1747,7 @@ def transform(df):
         let result = run_parser_test(&parser_path, &input_path, 10);
         assert!(result.is_ok());
 
-        let (success, rows, schema, _, _, errors) = result.unwrap();
+        let (success, rows, schema, _, _, errors, _error_code) = result.unwrap();
         // Success depends on whether polars/pandas is installed
         // In CI, we may not have these, so we just check the function runs
         if errors.is_empty() {

@@ -4,7 +4,7 @@
 
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
-use crate::cli::output::print_table_colored;
+use crate::cli::output::{format_number_signed, print_table_colored};
 use casparian_protocol::ProcessingStatus;
 use comfy_table::Color;
 use serde::Serialize;
@@ -393,13 +393,13 @@ async fn get_jobs(
 /// Print queue status summary
 fn print_queue_status(stats: &QueueStats) {
     println!("QUEUE STATUS");
-    println!("  Total:       {:>6} jobs", format_number(stats.total));
-    println!("  Pending:     {:>6}", format_number(stats.queued));
-    println!("  Running:     {:>6}", format_number(stats.running));
-    println!("  Done:        {:>6}", format_number(stats.completed));
-    println!("  Failed:      {:>6}", format_number(stats.failed));
+    println!("  Total:       {:>6} jobs", format_number_signed(stats.total));
+    println!("  Pending:     {:>6}", format_number_signed(stats.queued));
+    println!("  Running:     {:>6}", format_number_signed(stats.running));
+    println!("  Done:        {:>6}", format_number_signed(stats.completed));
+    println!("  Failed:      {:>6}", format_number_signed(stats.failed));
     if stats.dead_letter > 0 {
-        println!("  Dead Letter: {:>6}", format_number(stats.dead_letter));
+        println!("  Dead Letter: {:>6}", format_number_signed(stats.dead_letter));
     }
 }
 
@@ -571,22 +571,6 @@ fn format_datetime(dt_str: &str) -> String {
     }
 }
 
-/// Format a number with thousands separators
-fn format_number(n: i64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        format!("{},{:03}", n / 1000, n % 1000)
-    } else {
-        format!(
-            "{},{:03},{:03}",
-            n / 1_000_000,
-            (n % 1_000_000) / 1000,
-            n % 1000
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,14 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_number() {
-        assert_eq!(format_number(0), "0");
-        assert_eq!(format_number(999), "999");
-        assert_eq!(format_number(1000), "1,000");
-        assert_eq!(format_number(1234567), "1,234,567");
-    }
-
-    #[test]
     fn test_build_status_filter() {
         let args = JobsArgs {
             topic: None,
@@ -636,6 +612,7 @@ mod tests {
             failed: false,
             done: false,
             limit: 50,
+            dead_letter: false,
         };
         let filter = build_status_filter(&args);
         assert!(filter.contains(&"QUEUED"));
@@ -652,6 +629,7 @@ mod tests {
             failed: false,
             done: false,
             limit: 50,
+            dead_letter: false,
         };
         let filter = build_status_filter(&args);
         // Should include all statuses when none specified

@@ -41,7 +41,6 @@ impl Runner for DevRunner {
     ) -> Result<ExecutionResult> {
         let parser_path = match parser {
             ParserRef::Path(p) => p,
-            ParserRef::Bundle { temp_dir, .. } => temp_dir.join("parser.py"),
         };
 
         // Read parser source

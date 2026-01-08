@@ -40,6 +40,21 @@ Casparian provides:
 4. **Isolated execution (Bridge Mode)** - AI-generated code runs safely
 5. **Full traceability** - Parser versions, schema history, processing logs
 
+### Core Philosophy
+
+**What We Believe:**
+1. **AI generates, humans approve.** AI is a proposal engine, not an autonomous agent. Every AI-generated artifact (parser code) requires human approval of its *output*, not its implementation.
+2. **Show output, not code.** Users care about results. "Did my messy CSV become a clean table?" They don't need to read Python to answer that question.
+3. **Sandbox everything.** AI-generated code runs in isolation (Bridge Mode). It cannot escape, cannot corrupt, cannot cause damage outside its boundary.
+4. **Make the safe path easy.** Manual approval is the default. Auto-approve is opt-in, hard to enable, and fully logged.
+5. **Deterministic after approval.** Once a parser is approved, execution is deterministic. No AI in the hot path.
+
+**What We Don't Believe:**
+- "Agents all the way down" - Agents talking to agents is unpredictable. AI has ONE job: generate parser code.
+- "AI can figure it out" - AI is wrong 10-30% of the time. Always show the user what happened.
+- "Users will read the code" - They won't. Show them input vs output.
+- "More automation is better" - More automation without visibility destroys trust.
+
 ---
 
 ## Target Market

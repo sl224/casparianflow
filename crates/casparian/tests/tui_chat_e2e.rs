@@ -17,7 +17,6 @@
 //! Unit tests sent the response immediately (before animation ran),
 //! so the content was still exactly "Thinking..." and the check passed.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
 
 // We can't import from cli::tui directly in integration tests,

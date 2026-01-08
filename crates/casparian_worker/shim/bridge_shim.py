@@ -100,6 +100,9 @@ def safe_to_arrow(df: "pd.DataFrame") -> "pa.Table":
 
     Ensures data always reaches Rust for quarantine processing,
     rather than crashing in Python due to mixed types.
+
+    Optimization: On fallback, builds Arrow arrays directly instead of
+    retry-calling from_pandas() which would re-process all columns.
     """
     import pandas as pd
     import pyarrow as pa
@@ -109,17 +112,21 @@ def safe_to_arrow(df: "pd.DataFrame") -> "pa.Table":
     except (pa.ArrowInvalid, pa.ArrowTypeError) as e:
         logger.warning(f"Arrow conversion failed, attempting column-by-column fallback: {e}")
 
-        # Identify and fix problematic columns
+        # Build Arrow arrays directly (single pass, no retry)
+        arrays = []
+        names = []
         for col in df.columns:
-            if df[col].dtype == 'object':
-                try:
-                    pa.array(df[col])
-                except (pa.ArrowInvalid, pa.ArrowTypeError):
-                    logger.warning(f"Column '{col}' has mixed types, converting to string")
-                    df[col] = df[col].astype(str)
+            names.append(col)
+            try:
+                # Try to convert column directly
+                arr = pa.array(df[col], from_pandas=True)
+            except (pa.ArrowInvalid, pa.ArrowTypeError):
+                # Fallback: convert to string
+                logger.warning(f"Column '{col}' has mixed types, converting to string")
+                arr = pa.array(df[col].astype(str), type=pa.string())
+            arrays.append(arr)
 
-        # Retry with sanitized DataFrame
-        return pa.Table.from_pandas(df)
+        return pa.table(dict(zip(names, arrays)))
 
 
 def check_memory_for_batch(df: "pd.DataFrame") -> bool:
@@ -141,8 +148,11 @@ def check_memory_for_batch(df: "pd.DataFrame") -> bool:
             return False
         return True
     except ImportError:
-        # psutil not available, skip check
-        logger.debug("psutil not available, skipping memory check")
+        # psutil not available - OOM protection disabled! This is a bug.
+        logger.warning(
+            "psutil not installed - OOM protection DISABLED. "
+            "Install psutil to enable memory checks: pip install psutil"
+        )
         return True
 
 

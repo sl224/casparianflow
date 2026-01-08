@@ -276,7 +276,74 @@ Worker (Host)         Guest Process
 - Isolation: Plugin crashes don't affect host
 - Dependencies: Each plugin has its own venv
 
-### 6. Virtual Environment Management
+**Error Handling:**
+Guest process emits structured error codes based on exception type:
+
+| Exception Type | Error Code | Retryable |
+|----------------|------------|-----------|
+| `KeyError` | `SCHEMA_MISMATCH` | No |
+| `FileNotFoundError` | `FILE_NOT_FOUND` | No |
+| `PermissionError` | `PERMISSION_ERROR` | No |
+| `UnicodeDecodeError` | `ENCODING_ERROR` | No |
+| `MemoryError` | `MEMORY_ERROR` | Yes |
+| `ValueError` (convert) | `INVALID_DATA` | No |
+| Other | `UNKNOWN_ERROR` | No |
+
+Rust parses the `error_code` field directly; falls back to string matching for legacy compatibility.
+
+### 6. Runtime Architecture
+
+**Split Control/Data Planes:**
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      casparian start                            │
+└─────────────────────────────────────────────────────────────────┘
+                    │                           │
+                    ▼                           ▼
+        ┌─────────────────────┐     ┌─────────────────────────┐
+        │  Control Plane      │     │  Data Plane             │
+        │  (1 thread)         │     │  (N-1 threads)          │
+        │                     │     │                         │
+        │  - Sentinel         │     │  - Worker               │
+        │  - Job scheduling   │     │  - Parser execution     │
+        │  - ZMQ routing      │     │  - Arrow IPC handling   │
+        └─────────────────────┘     └─────────────────────────┘
+```
+
+**Why Split?**
+- Control plane needs low latency for job orchestration
+- Data plane needs high throughput for batch processing
+- Separate thread pools prevent starvation
+
+**Future:** May unify to single runtime with `spawn_blocking` when clear benefit emerges.
+
+### 7. Parser Patterns
+
+Two distinct parser patterns exist for different use cases:
+
+| Pattern | Function | Used By | File Reading |
+|---------|----------|---------|--------------|
+| **Transform** | `transform(df)` | `casparian test` | Harness reads file |
+| **Parse** | `parse(file_path)` | `casparian run` | Parser reads file |
+
+**Transform Pattern** (testing):
+```python
+def transform(df):
+    # df is already loaded by test harness
+    return df.with_columns(...)
+```
+
+**Parse Pattern** (production):
+```python
+def parse(file_path):
+    # Parser handles its own file reading
+    df = pl.read_csv(file_path)
+    return df.with_columns(...)
+```
+
+These patterns are kept separate because unifying would require changing the parser interface (breaking change).
+
+### 8. Virtual Environment Management
 
 All Python environments use [UV](https://github.com/astral-sh/uv):
 
@@ -476,6 +543,42 @@ UV instead of pip for venv management.
 No desktop app (Tauri). CLI + TUI only.
 *Why:* Stability and simplicity over desktop features.
 
+### ADR-008: Parser as Tuple Yielder
+Parsers yield `(sink_name, data)` tuples, not wrapper objects.
+*Why:* Simpler protocol, data is just data.
+
+### ADR-009: Content-Based Parser Identity
+Parser identity is `blake3(content)`, not file path.
+*Why:* Same parser = same ID regardless of location.
+
+### ADR-010: Partitioned Output by Job
+Each run creates `{output}_{job_id}.parquet`, no appending.
+*Why:* Atomic writes, no corruption risk.
+
+### ADR-011: CLI Sink Override
+CLI `--sink` overrides parser-defined sinks.
+*Why:* User flexibility while parser defines defaults.
+
+### ADR-012: Parser Versioning
+Parsers must declare `name`, `version`, `topics` attributes.
+*Why:* Version conflicts detected; backfill enabled.
+
+### ADR-013: Topic Subscriptions
+Files → Tags → Topics → Parsers routing chain.
+*Why:* Decoupled pattern matching from parser binding.
+
+### ADR-014: Structured Error Codes
+Python emits `error_code` field; Rust parses directly.
+*Why:* Deterministic classification without string matching.
+
+### ADR-015: Dual Parser Patterns
+Keep `transform(df)` and `parse(file_path)` separate.
+*Why:* Different use cases (test vs run); unifying is breaking change.
+
+### ADR-016: Split Runtime Architecture
+Separate Control Plane (1 thread) and Data Plane (N-1 threads).
+*Why:* Prevent starvation; may unify later with `spawn_blocking`.
+
 ---
 
 ## Glossary
@@ -492,3 +595,8 @@ No desktop app (Tauri). CLI + TUI only.
 | **Sentinel** | Job orchestration service |
 | **Guest** | Isolated subprocess running plugin |
 | **Host** | Worker process with credentials |
+| **Control Plane** | Single-thread runtime for job orchestration |
+| **Data Plane** | Multi-thread runtime for parser execution |
+| **Error Code** | Structured classification from Python exceptions |
+| **Transform Pattern** | Parser receives DataFrame from harness |
+| **Parse Pattern** | Parser handles its own file reading |

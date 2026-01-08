@@ -187,6 +187,45 @@ pub fn print_table_colored(headers: &[&str], rows: Vec<Vec<(String, Option<Color
     println!("{}", table);
 }
 
+/// Format a number with thousands separators
+///
+/// Examples:
+/// - 999 -> "999"
+/// - 1000 -> "1,000"
+/// - 1234567 -> "1,234,567"
+pub fn format_number(n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+
+    result
+}
+
+/// Format a signed number with thousands separators
+///
+/// Handles i64::MIN correctly (avoids overflow on negation)
+pub fn format_number_signed(n: i64) -> String {
+    if n == i64::MIN {
+        // Special case: -i64::MIN overflows, but i64::MIN as u64 gives correct magnitude
+        // i64::MIN = -9223372036854775808
+        format!("-{}", format_number(9223372036854775808u64))
+    } else if n < 0 {
+        format!("-{}", format_number((-n) as u64))
+    } else {
+        format_number(n as u64)
+    }
+}
+
 /// Color for file type indicators
 pub fn color_for_extension(ext: &str) -> Color {
     match ext.to_lowercase().as_str() {
@@ -244,5 +283,48 @@ mod tests {
         assert_eq!(split_number_unit("100"), ("100", ""));
         assert_eq!(split_number_unit("10KB"), ("10", "KB"));
         assert_eq!(split_number_unit("1.5MB"), ("1.5", "MB"));
+    }
+
+    #[test]
+    fn test_format_number() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(1), "1");
+        assert_eq!(format_number(12), "12");
+        assert_eq!(format_number(123), "123");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1000), "1,000");
+        assert_eq!(format_number(1234), "1,234");
+        assert_eq!(format_number(12345), "12,345");
+        assert_eq!(format_number(123456), "123,456");
+        assert_eq!(format_number(1234567), "1,234,567");
+        assert_eq!(format_number(1234567890), "1,234,567,890");
+    }
+
+    #[test]
+    fn test_format_number_signed() {
+        assert_eq!(format_number_signed(0), "0");
+        assert_eq!(format_number_signed(1000), "1,000");
+        assert_eq!(format_number_signed(-1000), "-1,000");
+        assert_eq!(format_number_signed(-1234567), "-1,234,567");
+    }
+
+    #[test]
+    fn test_format_number_signed_i64_min() {
+        // This test would panic before the fix due to overflow on -i64::MIN
+        let result = format_number_signed(i64::MIN);
+        assert_eq!(result, "-9,223,372,036,854,775,808");
+    }
+
+    #[test]
+    fn test_format_number_signed_i64_max() {
+        let result = format_number_signed(i64::MAX);
+        assert_eq!(result, "9,223,372,036,854,775,807");
+    }
+
+    #[test]
+    fn test_format_number_signed_edge_cases() {
+        assert_eq!(format_number_signed(-1), "-1");
+        assert_eq!(format_number_signed(1), "1");
+        assert_eq!(format_number_signed(i64::MIN + 1), "-9,223,372,036,854,775,807");
     }
 }

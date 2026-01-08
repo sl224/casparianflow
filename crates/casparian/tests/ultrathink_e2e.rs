@@ -93,7 +93,6 @@ mod binary_tui {
 
 mod tui_state {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     // We can't directly access cli::tui from integration tests,
     // but we CAN test via the public binary interface or
@@ -133,7 +132,7 @@ mod tui_state {
 
         // Spawn TUI without a TTY (will fail gracefully)
         // We're testing that it doesn't crash on startup
-        let mut child = Command::new(&binary)
+        let child = Command::new(&binary)
             .arg("tui")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

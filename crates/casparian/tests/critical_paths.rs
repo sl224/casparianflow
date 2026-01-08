@@ -24,7 +24,7 @@ use serde_json::json;
 mod mcp_tools {
     use super::*;
     use casparian_mcp::tools::create_default_registry;
-    use casparian_mcp::types::{Tool, ToolContent};
+    use casparian_mcp::types::ToolContent;
 
     fn extract_text(content: &ToolContent) -> Option<&str> {
         match content {

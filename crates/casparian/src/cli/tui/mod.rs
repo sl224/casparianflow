@@ -23,7 +23,6 @@ pub mod test_harness;
 use anyhow::Result;
 use clap::Args;
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -55,7 +54,7 @@ pub async fn run(args: TuiArgs) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -72,8 +71,7 @@ pub async fn run(args: TuiArgs) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
+        LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
 
@@ -115,7 +113,6 @@ mod tests {
         };
         let app = App::new(args);
         assert!(matches!(app.mode, app::TuiMode::Home));
-        assert!(matches!(app.view, app::View::Chat));
         assert!(app.running);
     }
 
