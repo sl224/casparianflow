@@ -229,7 +229,7 @@ impl WorkerNode {
 }
 
 // ============================================================================
-// Error Handling (W5)
+// Error Handling (W5) & Parser Health (W6)
 // ============================================================================
 
 /// A job that has been moved to the dead letter queue after exhausting retries
@@ -249,34 +249,44 @@ pub struct DeadLetterJob {
     pub reason: Option<String>,
 }
 
-/// Health tracking for parsers (circuit breaker state)
+/// Parser health tracking for circuit breaker pattern.
 ///
-/// This table tracks the health of each parser to implement a circuit breaker
-/// pattern. When a parser fails consecutively, it can be paused to prevent
-/// further failures from overwhelming the system.
+/// Tracks execution statistics and failure patterns to automatically
+/// pause parsers that are failing consistently.
 #[derive(Debug, Clone, FromRow)]
 pub struct ParserHealth {
+    /// Parser name (unique identifier)
     pub parser_name: String,
+    /// Total execution count (successes + failures)
+    pub total_executions: i64,
+    /// Successful execution count
+    pub successful_executions: i64,
+    /// Consecutive failure count (resets on success)
     pub consecutive_failures: i32,
-    pub paused_at: Option<String>,
+    /// Reason for last failure (for debugging)
     pub last_failure_reason: Option<String>,
-    pub total_executions: i32,
-    pub successful_executions: i32,
+    /// When the circuit breaker tripped (parser paused)
+    /// NULL means parser is active, non-NULL means paused
+    pub paused_at: Option<DateTime<Utc>>,
+    /// When health record was created
+    pub created_at: DateTime<Utc>,
+    /// When health record was last updated
+    pub updated_at: DateTime<Utc>,
 }
 
 impl ParserHealth {
-    /// Calculate success rate as a percentage
+    /// Check if this parser is currently paused (circuit open)
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+
+    /// Get success rate as percentage (0-100)
     pub fn success_rate(&self) -> f64 {
         if self.total_executions == 0 {
-            0.0
+            100.0 // No executions = healthy by default
         } else {
             (self.successful_executions as f64 / self.total_executions as f64) * 100.0
         }
-    }
-
-    /// Check if the parser is currently paused
-    pub fn is_paused(&self) -> bool {
-        self.paused_at.is_some()
     }
 }
 
@@ -317,5 +327,67 @@ mod tests {
             serde_json::to_string(&PluginStatusEnum::Active).unwrap(),
             "\"Active\""
         );
+    }
+
+    #[test]
+    fn test_parser_health_success_rate() {
+        let now = Utc::now();
+
+        // No executions = 100% (healthy by default)
+        let health = ParserHealth {
+            parser_name: "test".to_string(),
+            total_executions: 0,
+            successful_executions: 0,
+            consecutive_failures: 0,
+            last_failure_reason: None,
+            paused_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!((health.success_rate() - 100.0).abs() < 0.01);
+
+        // 8 out of 10 = 80%
+        let health = ParserHealth {
+            parser_name: "test".to_string(),
+            total_executions: 10,
+            successful_executions: 8,
+            consecutive_failures: 0,
+            last_failure_reason: None,
+            paused_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!((health.success_rate() - 80.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parser_health_is_paused() {
+        let now = Utc::now();
+
+        // Not paused
+        let health = ParserHealth {
+            parser_name: "test".to_string(),
+            total_executions: 10,
+            successful_executions: 5,
+            consecutive_failures: 5,
+            last_failure_reason: Some("timeout".to_string()),
+            paused_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(!health.is_paused());
+
+        // Paused
+        let health = ParserHealth {
+            parser_name: "test".to_string(),
+            total_executions: 10,
+            successful_executions: 5,
+            consecutive_failures: 5,
+            last_failure_reason: Some("timeout".to_string()),
+            paused_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(health.is_paused());
     }
 }
