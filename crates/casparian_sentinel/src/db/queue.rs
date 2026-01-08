@@ -8,7 +8,7 @@ use chrono::Utc;
 use sqlx::{Pool, Sqlite};
 use tracing::{info, warn};
 
-use super::models::ProcessingJob;
+use super::models::{DeadLetterJob, ParserHealth, ProcessingJob, QuarantinedRow};
 
 /// Maximum number of retries before a job is marked as permanently failed
 /// This prevents infinite retry loops for jobs that consistently fail
@@ -337,6 +337,416 @@ impl JobQueue {
         .await?;
 
         Ok(stats)
+    }
+
+    // ========================================================================
+    // Error Handling Tables (W5)
+    // ========================================================================
+
+    /// Initialize error handling tables (dead letter queue, parser health, quarantine)
+    ///
+    /// These tables support:
+    /// - Dead Letter Queue: Jobs that have exhausted retries
+    /// - Parser Health: Circuit breaker state for parsers
+    /// - Quarantine: Row-level failures during processing
+    pub async fn init_error_handling_schema(&self) -> Result<()> {
+        // Dead Letter Queue: Jobs that have exhausted retries
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_dead_letter (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_job_id INTEGER NOT NULL,
+                file_version_id INTEGER,
+                plugin_name TEXT NOT NULL,
+                error_message TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                moved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                reason TEXT
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Index for querying dead letter jobs by plugin
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS ix_dead_letter_plugin ON cf_dead_letter(plugin_name)"
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Index for querying dead letter jobs by time
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS ix_dead_letter_moved_at ON cf_dead_letter(moved_at)"
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Parser Health: Circuit breaker state for parsers
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_parser_health (
+                parser_name TEXT PRIMARY KEY,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                paused_at TEXT,
+                last_failure_reason TEXT,
+                total_executions INTEGER NOT NULL DEFAULT 0,
+                successful_executions INTEGER NOT NULL DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Quarantine: Row-level failures during processing
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_quarantine (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                row_index INTEGER NOT NULL,
+                error_reason TEXT NOT NULL,
+                raw_data BLOB,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Index for querying quarantined rows by job
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS ix_quarantine_job ON cf_quarantine(job_id)"
+        )
+        .execute(&self.pool)
+        .await?;
+
+        info!("Initialized error handling schema (dead_letter, parser_health, quarantine)");
+        Ok(())
+    }
+
+    // ========================================================================
+    // Dead Letter Queue Operations
+    // ========================================================================
+
+    /// Move a job to the dead letter queue
+    ///
+    /// This is called when a job has exhausted all retries and should be
+    /// permanently removed from the processing queue.
+    pub async fn move_to_dead_letter(&self, job_id: i64, error: &str, reason: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Get job details
+        let job: Option<(i32, String, i32)> = sqlx::query_as(
+            "SELECT file_version_id, plugin_name, retry_count FROM cf_processing_queue WHERE id = ?"
+        )
+        .bind(job_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((file_version_id, plugin_name, retry_count)) = job else {
+            warn!("Cannot move job {} to dead letter: not found", job_id);
+            return Ok(());
+        };
+
+        let now = Utc::now().to_rfc3339();
+
+        // 2. Insert into cf_dead_letter
+        sqlx::query(
+            r#"
+            INSERT INTO cf_dead_letter (original_job_id, file_version_id, plugin_name, error_message, retry_count, moved_at, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(job_id)
+        .bind(file_version_id)
+        .bind(&plugin_name)
+        .bind(error)
+        .bind(retry_count)
+        .bind(&now)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+
+        // 3. Delete from cf_processing_queue
+        sqlx::query("DELETE FROM cf_processing_queue WHERE id = ?")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        info!(
+            "Moved job {} ({}) to dead letter queue: {}",
+            job_id, plugin_name, reason
+        );
+        Ok(())
+    }
+
+    /// Get all dead letter jobs (limited)
+    pub async fn get_dead_letter_jobs(&self, limit: i64) -> Result<Vec<DeadLetterJob>> {
+        let jobs: Vec<DeadLetterJob> = sqlx::query_as(
+            "SELECT * FROM cf_dead_letter ORDER BY moved_at DESC LIMIT ?"
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(jobs)
+    }
+
+    /// Get dead letter jobs filtered by plugin
+    pub async fn get_dead_letter_jobs_by_plugin(
+        &self,
+        plugin_name: &str,
+        limit: i64,
+    ) -> Result<Vec<DeadLetterJob>> {
+        let jobs: Vec<DeadLetterJob> = sqlx::query_as(
+            "SELECT * FROM cf_dead_letter WHERE plugin_name = ? ORDER BY moved_at DESC LIMIT ?"
+        )
+        .bind(plugin_name)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(jobs)
+    }
+
+    /// Replay a dead letter job (move back to queue)
+    ///
+    /// Returns the new job_id if successful.
+    pub async fn replay_dead_letter(&self, dead_letter_id: i64) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Get dead letter job details
+        let dlj: Option<DeadLetterJob> = sqlx::query_as(
+            "SELECT * FROM cf_dead_letter WHERE id = ?"
+        )
+        .bind(dead_letter_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(dead_letter) = dlj else {
+            anyhow::bail!("Dead letter job {} not found", dead_letter_id);
+        };
+
+        // 2. Create new job in cf_processing_queue
+        let result = sqlx::query(
+            r#"
+            INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, retry_count)
+            VALUES (?, ?, 'QUEUED', 0, 0)
+            "#,
+        )
+        .bind(dead_letter.file_version_id.unwrap_or(0))
+        .bind(&dead_letter.plugin_name)
+        .execute(&mut *tx)
+        .await?;
+
+        let new_job_id = result.last_insert_rowid();
+
+        // 3. Delete from cf_dead_letter
+        sqlx::query("DELETE FROM cf_dead_letter WHERE id = ?")
+            .bind(dead_letter_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        info!(
+            "Replayed dead letter {} as new job {} ({})",
+            dead_letter_id, new_job_id, dead_letter.plugin_name
+        );
+        Ok(new_job_id)
+    }
+
+    /// Count dead letter jobs
+    pub async fn count_dead_letter_jobs(&self) -> Result<i64> {
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cf_dead_letter")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count.0)
+    }
+
+    // ========================================================================
+    // Parser Health Operations (Circuit Breaker)
+    // ========================================================================
+
+    /// Record a successful parser execution
+    pub async fn record_parser_success(&self, parser_name: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO cf_parser_health (parser_name, consecutive_failures, total_executions, successful_executions)
+            VALUES (?, 0, 1, 1)
+            ON CONFLICT(parser_name) DO UPDATE SET
+                consecutive_failures = 0,
+                paused_at = NULL,
+                total_executions = total_executions + 1,
+                successful_executions = successful_executions + 1
+            "#,
+        )
+        .bind(parser_name)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Record a parser failure
+    ///
+    /// Returns the new consecutive failure count.
+    pub async fn record_parser_failure(&self, parser_name: &str, reason: &str) -> Result<i32> {
+        sqlx::query(
+            r#"
+            INSERT INTO cf_parser_health (parser_name, consecutive_failures, last_failure_reason, total_executions)
+            VALUES (?, 1, ?, 1)
+            ON CONFLICT(parser_name) DO UPDATE SET
+                consecutive_failures = consecutive_failures + 1,
+                last_failure_reason = ?,
+                total_executions = total_executions + 1
+            "#,
+        )
+        .bind(parser_name)
+        .bind(reason)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+
+        // Get the updated count
+        let health: Option<ParserHealth> = sqlx::query_as(
+            "SELECT * FROM cf_parser_health WHERE parser_name = ?"
+        )
+        .bind(parser_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(health.map(|h| h.consecutive_failures).unwrap_or(1))
+    }
+
+    /// Pause a parser (circuit breaker open)
+    pub async fn pause_parser(&self, parser_name: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "UPDATE cf_parser_health SET paused_at = ? WHERE parser_name = ?"
+        )
+        .bind(&now)
+        .bind(parser_name)
+        .execute(&self.pool)
+        .await?;
+
+        warn!("Parser {} has been paused (circuit breaker open)", parser_name);
+        Ok(())
+    }
+
+    /// Resume a parser (circuit breaker closed)
+    pub async fn resume_parser(&self, parser_name: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0 WHERE parser_name = ?"
+        )
+        .bind(parser_name)
+        .execute(&self.pool)
+        .await?;
+
+        info!("Parser {} has been resumed (circuit breaker closed)", parser_name);
+        Ok(())
+    }
+
+    /// Check if a parser is paused
+    pub async fn is_parser_paused(&self, parser_name: &str) -> Result<bool> {
+        let health: Option<ParserHealth> = sqlx::query_as(
+            "SELECT * FROM cf_parser_health WHERE parser_name = ?"
+        )
+        .bind(parser_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(health.map(|h| h.paused_at.is_some()).unwrap_or(false))
+    }
+
+    /// Get parser health status
+    pub async fn get_parser_health(&self, parser_name: &str) -> Result<Option<ParserHealth>> {
+        let health: Option<ParserHealth> = sqlx::query_as(
+            "SELECT * FROM cf_parser_health WHERE parser_name = ?"
+        )
+        .bind(parser_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(health)
+    }
+
+    /// Get all parser health records
+    pub async fn get_all_parser_health(&self) -> Result<Vec<ParserHealth>> {
+        let health: Vec<ParserHealth> = sqlx::query_as(
+            "SELECT * FROM cf_parser_health ORDER BY parser_name"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(health)
+    }
+
+    // ========================================================================
+    // Quarantine Operations (Row-Level Failures)
+    // ========================================================================
+
+    /// Quarantine a row that failed processing
+    pub async fn quarantine_row(
+        &self,
+        job_id: i64,
+        row_index: i32,
+        error_reason: &str,
+        raw_data: Option<&[u8]>,
+    ) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"
+            INSERT INTO cf_quarantine (job_id, row_index, error_reason, raw_data, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(job_id)
+        .bind(row_index)
+        .bind(error_reason)
+        .bind(raw_data)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Get quarantined rows for a job
+    pub async fn get_quarantined_rows(&self, job_id: i64) -> Result<Vec<QuarantinedRow>> {
+        let rows: Vec<QuarantinedRow> = sqlx::query_as(
+            "SELECT * FROM cf_quarantine WHERE job_id = ? ORDER BY row_index"
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Count quarantined rows for a job
+    pub async fn count_quarantined_rows(&self, job_id: i64) -> Result<i64> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM cf_quarantine WHERE job_id = ?"
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count.0)
+    }
+
+    /// Delete quarantined rows for a job (e.g., after successful reprocessing)
+    pub async fn delete_quarantined_rows(&self, job_id: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM cf_quarantine WHERE job_id = ?")
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected())
     }
 }
 

@@ -228,6 +228,72 @@ impl WorkerNode {
     }
 }
 
+// ============================================================================
+// Error Handling (W5)
+// ============================================================================
+
+/// A job that has been moved to the dead letter queue after exhausting retries
+///
+/// Dead letter jobs are jobs that have failed too many times and have been
+/// removed from the main processing queue. They can be replayed manually
+/// after the underlying issue has been fixed.
+#[derive(Debug, Clone, FromRow)]
+pub struct DeadLetterJob {
+    pub id: i64,
+    pub original_job_id: i64,
+    pub file_version_id: Option<i64>,
+    pub plugin_name: String,
+    pub error_message: Option<String>,
+    pub retry_count: i32,
+    pub moved_at: String,
+    pub reason: Option<String>,
+}
+
+/// Health tracking for parsers (circuit breaker state)
+///
+/// This table tracks the health of each parser to implement a circuit breaker
+/// pattern. When a parser fails consecutively, it can be paused to prevent
+/// further failures from overwhelming the system.
+#[derive(Debug, Clone, FromRow)]
+pub struct ParserHealth {
+    pub parser_name: String,
+    pub consecutive_failures: i32,
+    pub paused_at: Option<String>,
+    pub last_failure_reason: Option<String>,
+    pub total_executions: i32,
+    pub successful_executions: i32,
+}
+
+impl ParserHealth {
+    /// Calculate success rate as a percentage
+    pub fn success_rate(&self) -> f64 {
+        if self.total_executions == 0 {
+            0.0
+        } else {
+            (self.successful_executions as f64 / self.total_executions as f64) * 100.0
+        }
+    }
+
+    /// Check if the parser is currently paused
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+}
+
+/// A row that failed processing and was quarantined
+///
+/// When individual rows fail during processing (e.g., schema validation errors),
+/// they are quarantined here so the rest of the file can be processed.
+#[derive(Debug, Clone, FromRow)]
+pub struct QuarantinedRow {
+    pub id: i64,
+    pub job_id: i64,
+    pub row_index: i32,
+    pub error_reason: String,
+    pub raw_data: Option<Vec<u8>>,
+    pub created_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

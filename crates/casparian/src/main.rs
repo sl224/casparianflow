@@ -213,6 +213,10 @@ enum Commands {
         #[arg(long)]
         done: bool,
 
+        /// Show dead letter jobs (jobs that exhausted retries)
+        #[arg(long)]
+        dead_letter: bool,
+
         /// Maximum jobs to display
         #[arg(long, default_value = "50")]
         limit: usize,
@@ -586,6 +590,7 @@ fn main() -> Result<()> {
             running,
             failed,
             done,
+            dead_letter,
             limit,
         } => cli::jobs::run(cli::jobs::JobsArgs {
             topic,
@@ -593,6 +598,7 @@ fn main() -> Result<()> {
             running,
             failed,
             done,
+            dead_letter,
             limit,
         }),
 

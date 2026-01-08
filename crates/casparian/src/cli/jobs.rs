@@ -18,6 +18,7 @@ pub struct JobsArgs {
     pub running: bool,
     pub failed: bool,
     pub done: bool,
+    pub dead_letter: bool,
     pub limit: usize,
 }
 
@@ -57,6 +58,19 @@ pub struct QueueStats {
     pub running: i64,
     pub completed: i64,
     pub failed: i64,
+    pub dead_letter: i64,
+}
+
+/// A dead letter job (from cf_dead_letter table)
+#[derive(Debug, Clone, Serialize)]
+pub struct DeadLetterJobDisplay {
+    pub id: i64,
+    pub original_job_id: i64,
+    pub plugin_name: String,
+    pub error_message: Option<String>,
+    pub retry_count: i32,
+    pub moved_at: String,
+    pub reason: Option<String>,
 }
 
 /// Execute the jobs command
@@ -98,6 +112,17 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
     // Get queue statistics
     let stats = get_queue_stats(&pool).await?;
 
+    // Print status header
+    print_queue_status(&stats);
+    println!();
+
+    // Handle dead letter mode separately
+    if args.dead_letter {
+        let dead_letter_jobs = get_dead_letter_jobs(&pool, &args.topic, args.limit).await?;
+        print_dead_letter_table(&dead_letter_jobs, args.limit);
+        return Ok(());
+    }
+
     // Build filter based on flags
     let status_filter = build_status_filter(&args);
 
@@ -105,8 +130,6 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
     let jobs = get_jobs(&pool, &args.topic, &status_filter, args.limit).await?;
 
     // Output
-    print_queue_status(&stats);
-    println!();
     print_jobs_table(&jobs, args.limit);
 
     Ok(())
@@ -171,13 +194,94 @@ async fn get_queue_stats(pool: &sqlx::SqlitePool) -> anyhow::Result<QueueStats> 
     .await
     .unwrap_or((0, 0, 0, 0, 0));
 
+    // Get dead letter count
+    let dead_letter_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cf_dead_letter"
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(0);
+
     Ok(QueueStats {
         total: row.0,
         queued: row.1,
         running: row.2,
         completed: row.3,
         failed: row.4,
+        dead_letter: dead_letter_count,
     })
+}
+
+/// Get dead letter jobs
+async fn get_dead_letter_jobs(
+    pool: &sqlx::SqlitePool,
+    topic: &Option<String>,
+    limit: usize,
+) -> anyhow::Result<Vec<DeadLetterJobDisplay>> {
+    // Check if table exists
+    let table_exists: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_dead_letter'"
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if table_exists.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let jobs: Vec<DeadLetterJobDisplay> = if let Some(plugin_name) = topic {
+        let rows: Vec<(i64, i64, String, Option<String>, i32, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, original_job_id, plugin_name, error_message, retry_count, moved_at, reason
+            FROM cf_dead_letter
+            WHERE plugin_name = ?
+            ORDER BY moved_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(plugin_name)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| DeadLetterJobDisplay {
+                id: row.0,
+                original_job_id: row.1,
+                plugin_name: row.2,
+                error_message: row.3,
+                retry_count: row.4,
+                moved_at: row.5,
+                reason: row.6,
+            })
+            .collect()
+    } else {
+        let rows: Vec<(i64, i64, String, Option<String>, i32, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, original_job_id, plugin_name, error_message, retry_count, moved_at, reason
+            FROM cf_dead_letter
+            ORDER BY moved_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| DeadLetterJobDisplay {
+                id: row.0,
+                original_job_id: row.1,
+                plugin_name: row.2,
+                error_message: row.3,
+                retry_count: row.4,
+                moved_at: row.5,
+                reason: row.6,
+            })
+            .collect()
+    };
+
+    Ok(jobs)
 }
 
 /// Get jobs matching filter criteria
@@ -289,11 +393,14 @@ async fn get_jobs(
 /// Print queue status summary
 fn print_queue_status(stats: &QueueStats) {
     println!("QUEUE STATUS");
-    println!("  Total:     {:>6} jobs", format_number(stats.total));
-    println!("  Pending:   {:>6}", format_number(stats.queued));
-    println!("  Running:   {:>6}", format_number(stats.running));
-    println!("  Done:      {:>6}", format_number(stats.completed));
-    println!("  Failed:    {:>6}", format_number(stats.failed));
+    println!("  Total:       {:>6} jobs", format_number(stats.total));
+    println!("  Pending:     {:>6}", format_number(stats.queued));
+    println!("  Running:     {:>6}", format_number(stats.running));
+    println!("  Done:        {:>6}", format_number(stats.completed));
+    println!("  Failed:      {:>6}", format_number(stats.failed));
+    if stats.dead_letter > 0 {
+        println!("  Dead Letter: {:>6}", format_number(stats.dead_letter));
+    }
 }
 
 /// Print jobs table
@@ -333,6 +440,57 @@ fn print_jobs_table(jobs: &[Job], limit: usize) {
         .collect();
 
     print_table_colored(headers, rows);
+}
+
+/// Print dead letter jobs table
+fn print_dead_letter_table(jobs: &[DeadLetterJobDisplay], limit: usize) {
+    if jobs.is_empty() {
+        println!("No dead letter jobs found.");
+        println!();
+        println!("Dead letter jobs are jobs that have exhausted all retries.");
+        println!("TRY: casparian jobs --failed    # Show failed jobs in the main queue");
+        return;
+    }
+
+    println!("DEAD LETTER QUEUE (last {})", limit.min(jobs.len()));
+
+    let headers = &["ID", "ORIG_JOB", "PARSER", "RETRIES", "MOVED_AT", "REASON"];
+
+    let rows: Vec<Vec<(String, Option<Color>)>> = jobs
+        .iter()
+        .map(|job| {
+            // Format moved_at time
+            let moved_at = format_datetime(&job.moved_at);
+
+            // Truncate reason for display
+            let reason = job.reason.as_ref()
+                .map(|r| truncate_string(r, 30))
+                .unwrap_or_else(|| "-".to_string());
+
+            vec![
+                (job.id.to_string(), None),
+                (job.original_job_id.to_string(), None),
+                (job.plugin_name.clone(), None),
+                (job.retry_count.to_string(), Some(Color::Red)),
+                (moved_at, None),
+                (reason, None),
+            ]
+        })
+        .collect();
+
+    print_table_colored(headers, rows);
+
+    println!();
+    println!("TIP: Use 'casparian job replay <ID>' to retry a dead letter job");
+}
+
+/// Truncate a string for display
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
 }
 
 /// Truncate a path for display
