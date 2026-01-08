@@ -22,6 +22,7 @@ pub mod parser;
 pub mod jobs;
 pub mod job;
 pub mod worker;
+pub mod run;
 
 // W5: Resource commands (stubs)
 pub mod source;

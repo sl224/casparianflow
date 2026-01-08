@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli;
+mod runner;
 
 /// Shutdown timeout in seconds
 const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
@@ -157,6 +158,9 @@ enum Commands {
     },
 
     // === W4: Job Commands (stubs) ===
+
+    /// Execute a parser against an input file (dev mode)
+    Run(cli::run::RunArgs),
 
     /// List processing jobs
     Jobs {
@@ -533,6 +537,11 @@ fn main() -> Result<()> {
         Commands::Parser { action } => cli::parser::run(action),
 
         // === W4: Job Commands (stubs) ===
+        Commands::Run(args) => {
+            let rt = Runtime::new().context("Failed to create runtime")?;
+            rt.block_on(cli::run::cmd_run(args))
+        }
+
         Commands::Jobs {
             topic,
             pending,

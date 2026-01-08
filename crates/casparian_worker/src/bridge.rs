@@ -1,11 +1,16 @@
 //! Bridge Executor: Spawns Python subprocess and streams Arrow IPC data
 //!
-//! Implements IPC via Unix socket for privilege separation.
+//! Implements IPC via TCP (127.0.0.1:port) for cross-platform compatibility.
 //! All I/O is synchronous and runs in a blocking thread pool.
 //!
 //! ## Single Binary Distribution
 //! The bridge shim Python code is embedded in the binary at compile time.
 //! At runtime, it's materialized to `~/.casparian_flow/shim/{version}/bridge_shim.py`.
+//!
+//! ## Transport
+//! Uses TCP on localhost (127.0.0.1) with automatic port allocation for
+//! Windows compatibility (Unix sockets not available on Windows).
+//! The Python guest connects to BRIDGE_PORT environment variable.
 //!
 //! ## Timeouts
 //! - Connection timeout: 30 seconds for Python to connect to the socket
@@ -17,7 +22,7 @@ use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
 use serde::Deserialize;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -201,22 +206,22 @@ pub async fn execute_bridge(config: BridgeConfig) -> Result<BridgeResult> {
 /// Synchronous bridge execution - no async lies here
 fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     let job_id = config.job_id;
-    let socket_path = format!("/tmp/bridge_{}.sock", job_id);
-
-    // Cleanup stale socket (TOCTOU is acceptable here - worst case we fail to bind)
-    let _ = std::fs::remove_file(&socket_path);
 
     // Create log writer for sideband logging (streams to disk, not RAM)
     let mut log_writer = JobLogWriter::new(job_id)
         .with_context(|| format!("[Job {}] Failed to create log writer", job_id))?;
 
-    // Create socket and spawn process
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("Failed to create Unix socket at {}", socket_path))?;
+    // Bind TCP listener on localhost with automatic port allocation
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .with_context(|| "[Job {}] Failed to bind TCP listener on 127.0.0.1:0")?;
 
-    debug!("[Job {}] Bridge socket created: {}", job_id, socket_path);
+    let port = listener.local_addr()
+        .with_context(|| format!("[Job {}] Failed to get local address", job_id))?
+        .port();
 
-    let mut process = spawn_guest(&config, &socket_path)?;
+    debug!("[Job {}] Bridge TCP listener bound to 127.0.0.1:{}", job_id, port);
+
+    let mut process = spawn_guest(&config, port)?;
     let process_pid = process.id();
 
     // Accept connection WITH TIMEOUT
@@ -225,7 +230,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
         Err(e) => {
             // Collect stderr for debugging before returning error
             let stderr_output = collect_stderr(&mut process);
-            cleanup_process(&mut process, &socket_path);
+            cleanup_process(&mut process);
 
             if !stderr_output.is_empty() {
                 error!("[Job {}] Guest stderr before connection failure:\n{}", job_id, stderr_output);
@@ -251,7 +256,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
         Ok(batches) => batches,
         Err(e) => {
             let stderr_output = collect_stderr(&mut process);
-            cleanup_process(&mut process, &socket_path);
+            cleanup_process(&mut process);
 
             if !stderr_output.is_empty() {
                 error!("[Job {}] Guest stderr during read failure:\n{}", job_id, stderr_output);
@@ -270,8 +275,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     let stderr_output = collect_stderr(&mut process);
 
     if !status.success() {
-        // Cleanup socket
-        let _ = std::fs::remove_file(&socket_path);
+        // TCP socket cleanup is automatic when listener is dropped
 
         if !stderr_output.is_empty() {
             error!("[Job {}] Guest stderr:\n{}", job_id, stderr_output);
@@ -320,8 +324,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
         vec![]
     };
 
-    // Cleanup
-    let _ = std::fs::remove_file(&socket_path);
+    // TCP socket cleanup is automatic when listener goes out of scope
 
     // Read and cleanup log file
     let logs = log_writer.read_and_cleanup()
@@ -333,16 +336,16 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     Ok(BridgeResult { batches, logs, output_info })
 }
 
-/// Accept a connection with timeout, checking if process is still alive
+/// Accept a TCP connection with timeout, checking if process is still alive
 fn accept_with_timeout(
-    listener: &UnixListener,
+    listener: &TcpListener,
     timeout: Duration,
     process: &mut Child,
     job_id: u64,
-) -> Result<std::os::unix::net::UnixStream> {
+) -> Result<TcpStream> {
     // Use non-blocking mode with polling
     listener.set_nonblocking(true)
-        .with_context(|| format!("[Job {}] Failed to set socket to non-blocking", job_id))?;
+        .with_context(|| format!("[Job {}] Failed to set TCP listener to non-blocking", job_id))?;
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
@@ -352,9 +355,9 @@ fn accept_with_timeout(
         let elapsed = start.elapsed();
         if elapsed >= timeout {
             anyhow::bail!(
-                "[Job {}] TIMEOUT: Guest process did not connect to socket within {:.1}s. \
+                "[Job {}] TIMEOUT: Guest process did not connect to TCP port within {:.1}s. \
                 The Python subprocess may have crashed during startup, failed to import dependencies, \
-                or the bridge_shim.py may not be connecting to BRIDGE_SOCKET. \
+                or the bridge_shim.py may not be connecting to BRIDGE_PORT. \
                 Check the guest stderr output above for details.",
                 job_id,
                 timeout.as_secs_f64()
@@ -373,7 +376,7 @@ fn accept_with_timeout(
 
                 // Switch back to blocking mode for the stream
                 stream.set_nonblocking(false)
-                    .with_context(|| format!("[Job {}] Failed to set stream to blocking mode", job_id))?;
+                    .with_context(|| format!("[Job {}] Failed to set TCP stream to blocking mode", job_id))?;
 
                 debug!(
                     "[Job {}] Guest connected after {:.2}s",
@@ -387,7 +390,7 @@ fn accept_with_timeout(
             }
             Err(e) => {
                 anyhow::bail!(
-                    "[Job {}] Failed to accept connection on socket: {}",
+                    "[Job {}] Failed to accept TCP connection: {}",
                     job_id,
                     e
                 );
@@ -403,7 +406,7 @@ fn accept_with_timeout(
                         // Try to set timeout, ignore if it fails on dead connection
                         let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
                         stream.set_nonblocking(false)
-                            .with_context(|| format!("[Job {}] Failed to set stream to blocking mode", job_id))?;
+                            .with_context(|| format!("[Job {}] Failed to set TCP stream to blocking mode", job_id))?;
                         debug!(
                             "[Job {}] Guest connected after {:.2}s (process already exited)",
                             job_id,
@@ -413,7 +416,7 @@ fn accept_with_timeout(
                     }
                     Err(_) => {
                         anyhow::bail!(
-                            "[Job {}] Guest process exited with {} before connecting to socket. \
+                            "[Job {}] Guest process exited with {} before connecting to TCP port. \
                             The Python subprocess crashed during startup. \
                             Check the guest stderr output above for details.",
                             job_id,
@@ -463,11 +466,10 @@ fn collect_stdout(process: &mut Child) -> String {
     }
 }
 
-/// Kill process and cleanup socket
-fn cleanup_process(process: &mut Child, socket_path: &str) {
+/// Kill process (TCP socket cleanup is automatic)
+fn cleanup_process(process: &mut Child) {
     let _ = process.kill();
     let _ = process.wait();
-    let _ = std::fs::remove_file(socket_path);
 }
 
 /// Spawn the guest Python process using `uv run`
@@ -475,7 +477,9 @@ fn cleanup_process(process: &mut Child, socket_path: &str) {
 /// Delegates to uv for correct Python environment setup on all platforms.
 /// uv reconstructs the macOS-specific env vars (like __PYVENV_LAUNCHER__)
 /// that Python's multiprocessing module needs to bootstrap correctly.
-fn spawn_guest(config: &BridgeConfig, socket_path: &str) -> Result<Child> {
+///
+/// The guest connects to localhost TCP port specified by BRIDGE_PORT env var.
+fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
     use base64::{Engine as _, engine::general_purpose};
     let source_b64 = general_purpose::STANDARD.encode(&config.source_code);
 
@@ -493,8 +497,8 @@ fn spawn_guest(config: &BridgeConfig, socket_path: &str) -> Result<Child> {
         .arg(&config.interpreter_path)
         .arg(&config.shim_path);
 
-    // Bridge context vars
-    cmd.env("BRIDGE_SOCKET", socket_path)
+    // Bridge context vars - use BRIDGE_PORT for TCP transport
+    cmd.env("BRIDGE_PORT", port.to_string())
         .env("BRIDGE_PLUGIN_CODE", source_b64)
         .env("BRIDGE_FILE_PATH", &config.file_path)
         .env("BRIDGE_JOB_ID", config.job_id.to_string())
@@ -514,18 +518,19 @@ fn spawn_guest(config: &BridgeConfig, socket_path: &str) -> Result<Child> {
         ))?;
 
     info!(
-        "[Job {}] Spawned guest via uv (pid={}) using interpreter {}",
+        "[Job {}] Spawned guest via uv (pid={}) using interpreter {}, port {}",
         config.job_id,
         child.id(),
-        config.interpreter_path.display()
+        config.interpreter_path.display(),
+        port
     );
 
     Ok(child)
 }
 
-/// Read Arrow IPC batches from socket stream, handling sideband log messages
+/// Read Arrow IPC batches from TCP stream, handling sideband log messages
 fn read_arrow_batches(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut TcpStream,
     job_id: u64,
     log_writer: &mut JobLogWriter,
 ) -> Result<Vec<RecordBatch>> {
@@ -648,10 +653,10 @@ fn read_arrow_batches(
     Ok(batches)
 }
 
-/// Read a log message from the socket and write to the log file.
+/// Read a log message from the TCP stream and write to the log file.
 /// Protocol: [LEVEL:1][LENGTH:4][MESSAGE]
 fn read_and_write_log(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut TcpStream,
     job_id: u64,
     log_writer: &mut JobLogWriter,
 ) -> Result<()> {
@@ -692,7 +697,7 @@ fn read_and_write_log(
 
 /// Read error message after ERROR_SIGNAL with size limit
 fn read_error_message(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut TcpStream,
     job_id: u64,
 ) -> Result<String> {
     let mut len_buf = [0u8; HEADER_SIZE];
@@ -935,11 +940,12 @@ mod tests {
     }
 
     #[test]
-    fn test_socket_path_format() {
-        // Verify socket path format is as expected
-        let job_id = 12345u64;
-        let socket_path = format!("/tmp/bridge_{}.sock", job_id);
-        assert_eq!(socket_path, "/tmp/bridge_12345.sock");
+    fn test_tcp_port_allocation() {
+        // Verify TCP port allocation works
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Should bind to ephemeral port");
+        let port = listener.local_addr().expect("Should get local addr").port();
+        assert!(port > 0, "Should allocate a valid port");
     }
 
     #[test]
