@@ -24,6 +24,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+// Import bundler for register command
+use casparian::bundler::bundle_parser;
+
 /// Subcommands for parser management
 #[derive(Subcommand, Debug, Clone)]
 pub enum ParserAction {
@@ -79,6 +82,17 @@ pub enum ParserAction {
         /// Maximum files to process
         #[arg(long, short = 'n')]
         limit: Option<usize>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a parser from a directory (bundles with deterministic hashing)
+    Register {
+        /// Path to parser directory (must contain uv.lock and parser.py)
+        path: PathBuf,
+        /// Output bundle as file instead of registering
+        #[arg(long)]
+        output: Option<PathBuf>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -198,6 +212,9 @@ async fn run_async(action: ParserAction) -> anyhow::Result<()> {
         ParserAction::Unpublish { name } => cmd_unpublish(&name).await,
         ParserAction::Backtest { name, limit, json } => {
             cmd_backtest(&name, limit, json).await
+        }
+        ParserAction::Register { path, output, json } => {
+            cmd_register(&path, output.as_deref(), json).await
         }
     }
 }
@@ -968,6 +985,183 @@ async fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> an
         println!("  1. Fix parser to handle the most common error type");
         println!("  2. Re-run backtest: casparian parser backtest {}", parser_name);
         println!("  3. If schema variants exist, consider splitting into multiple parsers");
+    }
+
+    Ok(())
+}
+
+/// Register a parser from a directory by bundling it
+async fn cmd_register(
+    path: &PathBuf,
+    output: Option<&std::path::Path>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    // Validate directory exists
+    if !path.exists() {
+        return Err(HelpfulError::new(format!("Parser directory not found: {}", path.display()))
+            .with_context("The specified directory does not exist")
+            .with_suggestions([
+                format!("TRY: ls -la {}", path.display()),
+                "TRY: Provide the full path to the parser directory".to_string(),
+            ])
+            .into());
+    }
+
+    if !path.is_dir() {
+        return Err(HelpfulError::new(format!("Path is not a directory: {}", path.display()))
+            .with_context("The register command expects a directory containing parser files")
+            .with_suggestions([
+                "TRY: casparian parser register ./my_parser_dir".to_string(),
+                "TRY: For single files, use 'casparian parser publish'".to_string(),
+            ])
+            .into());
+    }
+
+    // Bundle the parser
+    let bundle = bundle_parser(path).map_err(|e| {
+        HelpfulError::new("Failed to bundle parser")
+            .with_context(e.to_string())
+            .with_suggestions([
+                "TRY: Ensure uv.lock exists: run 'uv lock' in the parser directory".to_string(),
+                "TRY: Ensure parser has 'name' and 'version' attributes".to_string(),
+            ])
+    })?;
+
+    // If output path specified, write bundle to file
+    if let Some(output_path) = output {
+        std::fs::write(output_path, &bundle.archive).map_err(|e| {
+            HelpfulError::new("Failed to write bundle file")
+                .with_context(e.to_string())
+                .with_suggestion(format!("TRY: Check write permissions for {}", output_path.display()))
+        })?;
+
+        if json_output {
+            let result = serde_json::json!({
+                "name": bundle.name,
+                "version": bundle.version,
+                "source_hash": bundle.source_hash,
+                "lockfile_hash": bundle.lockfile_hash,
+                "archive_size": bundle.archive.len(),
+                "output_path": output_path.display().to_string(),
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("Bundled {} v{}", bundle.name, bundle.version);
+            println!("  Source hash:   {}", &bundle.source_hash[..12]);
+            println!("  Lockfile hash: {}", &bundle.lockfile_hash[..12]);
+            println!("  Archive size:  {:.1}KB", bundle.archive.len() as f64 / 1024.0);
+            println!("  Output:        {}", output_path.display());
+        }
+
+        return Ok(());
+    }
+
+    // Register in database
+    let pool = connect_db().await?;
+    let now = Utc::now().timestamp_millis();
+    let id = uuid::Uuid::new_v4().to_string();
+
+    // Check if parser with same name and version exists
+    let existing: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, source_hash FROM cf_parsers WHERE name = ? AND version = ?",
+    )
+    .bind(&bundle.name)
+    .bind(&bundle.version)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
+
+    if let Some((existing_id, existing_hash)) = existing {
+        // Same name + version exists - check if source hash matches
+        if existing_hash == bundle.source_hash {
+            if json_output {
+                let result = serde_json::json!({
+                    "status": "unchanged",
+                    "name": bundle.name,
+                    "version": bundle.version,
+                    "source_hash": bundle.source_hash,
+                    "parser_id": existing_id,
+                });
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Parser {} v{} already registered (unchanged)", bundle.name, bundle.version);
+                println!("  Parser ID: {}", existing_id);
+            }
+            return Ok(());
+        } else {
+            // Same name + version but different hash - ERROR (must bump version)
+            return Err(HelpfulError::new(format!(
+                "Parser {} v{} already exists with different source",
+                bundle.name, bundle.version
+            ))
+            .with_context("Same (name, version) with different source hash is not allowed")
+            .with_suggestions([
+                format!("TRY: Bump the version in your parser (currently {})", bundle.version),
+                "TRY: Use semantic versioning: 1.0.0 -> 1.0.1 for patches".to_string(),
+            ])
+            .into());
+        }
+    }
+
+    // Ensure cf_parsers table exists
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS cf_parsers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            lockfile_hash TEXT NOT NULL,
+            archive BLOB,
+            lockfile_content TEXT,
+            created_at INTEGER NOT NULL,
+            UNIQUE(name, version)
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // Insert new parser
+    sqlx::query(
+        r#"
+        INSERT INTO cf_parsers (id, name, version, source_hash, lockfile_hash, archive, lockfile_content, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&id)
+    .bind(&bundle.name)
+    .bind(&bundle.version)
+    .bind(&bundle.source_hash)
+    .bind(&bundle.lockfile_hash)
+    .bind(&bundle.archive)
+    .bind(&bundle.lockfile_content)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    if json_output {
+        let result = serde_json::json!({
+            "status": "registered",
+            "name": bundle.name,
+            "version": bundle.version,
+            "source_hash": bundle.source_hash,
+            "lockfile_hash": bundle.lockfile_hash,
+            "archive_size": bundle.archive.len(),
+            "parser_id": id,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("Registered {} v{}", bundle.name, bundle.version);
+        println!("  Parser ID:     {}", id);
+        println!("  Source hash:   {}", &bundle.source_hash[..12]);
+        println!("  Lockfile hash: {}", &bundle.lockfile_hash[..12]);
+        println!("  Archive size:  {:.1}KB", bundle.archive.len() as f64 / 1024.0);
+        println!();
+        println!("Next steps:");
+        println!("  1. Subscribe to topics: casparian parser subscribe {} --topic <topic>", bundle.name);
+        println!("  2. Backfill files: casparian backfill {}", bundle.name);
     }
 
     Ok(())
