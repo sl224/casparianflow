@@ -248,6 +248,21 @@ impl Database {
         }
     }
 
+    /// Get a source by path
+    pub async fn get_source_by_path(&self, path: &str) -> Result<Option<Source>> {
+        let row = sqlx::query(
+            "SELECT id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE path = ?",
+        )
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => Ok(Some(Self::row_to_source(&row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// List all sources
     pub async fn list_sources(&self) -> Result<Vec<Source>> {
         let rows = sqlx::query(
@@ -824,6 +839,198 @@ impl Database {
             bytes_pending: row.7 as u64,
             bytes_processed: row.8 as u64,
         })
+    }
+
+    // ========================================================================
+    // Glob Explorer Operations (Hierarchical Browsing)
+    // ========================================================================
+
+    /// Get folder counts at a specific depth for hierarchical browsing.
+    ///
+    /// Returns folders (subdirectories) with file counts, plus leaf files at current level.
+    /// This is designed for fast navigation of large sources (400k+ files).
+    ///
+    /// # Arguments
+    /// * `source_id` - The source to query
+    /// * `prefix` - Path prefix (empty for root, "folder/" for subfolder)
+    /// * `glob_pattern` - Optional glob pattern filter (e.g., "*.csv")
+    ///
+    /// # Returns
+    /// Vec of (folder_name, file_count, is_file) tuples
+    pub async fn get_folder_counts(
+        &self,
+        source_id: &str,
+        prefix: &str,
+        glob_pattern: Option<&str>,
+    ) -> Result<Vec<(String, i64, bool)>> {
+        // Query extracts the immediate child folder or filename from rel_path
+        // For paths like "a/b/c.csv" with prefix "a/":
+        //   - Extracts "b" (folder containing more files)
+        // For paths like "a/file.csv" with prefix "a/":
+        //   - Extracts "file.csv" (leaf file)
+        let prefix_len = prefix.len() as i32;
+
+        let query = if glob_pattern.is_some() {
+            r#"
+            SELECT
+                CASE
+                    WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
+                    THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
+                    ELSE SUBSTR(rel_path, ? + 1)
+                END AS item_name,
+                COUNT(*) as file_count,
+                MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
+            FROM scout_files
+            WHERE source_id = ?
+              AND rel_path LIKE ? || '%'
+              AND rel_path GLOB ?
+              AND LENGTH(rel_path) > ?
+            GROUP BY item_name
+            ORDER BY file_count DESC
+            LIMIT 100
+            "#
+        } else {
+            r#"
+            SELECT
+                CASE
+                    WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
+                    THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
+                    ELSE SUBSTR(rel_path, ? + 1)
+                END AS item_name,
+                COUNT(*) as file_count,
+                MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
+            FROM scout_files
+            WHERE source_id = ?
+              AND rel_path LIKE ? || '%'
+              AND LENGTH(rel_path) > ?
+            GROUP BY item_name
+            ORDER BY file_count DESC
+            LIMIT 100
+            "#
+        };
+
+        let rows: Vec<(String, i64, i32)> = if let Some(pattern) = glob_pattern {
+            sqlx::query_as(query)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(source_id)
+                .bind(prefix)
+                .bind(pattern)
+                .bind(prefix_len)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            sqlx::query_as(query)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(source_id)
+                .bind(prefix)
+                .bind(prefix_len)
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .filter(|(name, _, _)| !name.is_empty())
+            .map(|(name, count, is_file)| (name, count, is_file != 0))
+            .collect())
+    }
+
+    /// Get sampled preview files for a prefix and optional pattern.
+    ///
+    /// Returns up to `limit` files matching the criteria, for display in preview pane.
+    pub async fn get_preview_files(
+        &self,
+        source_id: &str,
+        prefix: &str,
+        glob_pattern: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        // Returns (rel_path, size, mtime)
+        let rows: Vec<(String, i64, i64)> = if let Some(pattern) = glob_pattern {
+            sqlx::query_as(
+                r#"
+                SELECT rel_path, size, mtime
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                  AND rel_path GLOB ?
+                ORDER BY mtime DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(source_id)
+            .bind(prefix)
+            .bind(pattern)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                r#"
+                SELECT rel_path, size, mtime
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                ORDER BY mtime DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(source_id)
+            .bind(prefix)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows)
+    }
+
+    /// Get total file count for a prefix and optional pattern.
+    pub async fn get_file_count_for_prefix(
+        &self,
+        source_id: &str,
+        prefix: &str,
+        glob_pattern: Option<&str>,
+    ) -> Result<i64> {
+        let count: (i64,) = if let Some(pattern) = glob_pattern {
+            sqlx::query_as(
+                r#"
+                SELECT COUNT(*)
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                  AND rel_path GLOB ?
+                "#,
+            )
+            .bind(source_id)
+            .bind(prefix)
+            .bind(pattern)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                r#"
+                SELECT COUNT(*)
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                "#,
+            )
+            .bind(source_id)
+            .bind(prefix)
+            .fetch_one(&self.pool)
+            .await?
+        };
+
+        Ok(count.0)
     }
 
     // ========================================================================

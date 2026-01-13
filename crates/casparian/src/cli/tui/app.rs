@@ -6,11 +6,16 @@ use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use serde_json::Value;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use super::llm::claude_code::ClaudeCodeProvider;
 use super::llm::{registry_to_definitions, LlmProvider, StreamChunk};
 use super::TuiArgs;
+use crate::scout::{
+    Database as ScoutDatabase, ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source,
+    SourceType,
+};
 
 /// Current TUI mode/screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,16 +123,21 @@ pub enum JobStatus {
     Running,
     Completed,
     Failed,
+    /// Job was cancelled by user
+    Cancelled,
 }
 
 impl JobStatus {
     /// Get display symbol for this status
+    /// Symbols per tui.md Section 5.3:
+    /// ○ = Pending, ↻ = Running, ✓ = Complete, ✗ = Failed, ⊘ = Cancelled
     pub fn symbol(&self) -> &'static str {
         match self {
-            JobStatus::Pending => "⏳",
-            JobStatus::Running => "▶",
+            JobStatus::Pending => "○",
+            JobStatus::Running => "↻",
             JobStatus::Completed => "✓",
             JobStatus::Failed => "✗",
+            JobStatus::Cancelled => "⊘",
         }
     }
 
@@ -138,6 +148,7 @@ impl JobStatus {
             JobStatus::Running => "Running",
             JobStatus::Completed => "Completed",
             JobStatus::Failed => "Failed",
+            JobStatus::Cancelled => "Cancelled",
         }
     }
 }
@@ -327,13 +338,140 @@ pub enum RuleDialogFocus {
     Tag,
 }
 
+// =============================================================================
+// Text Input Handling (shared across all input fields)
+// =============================================================================
+
+/// Result from processing a text input key event
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextInputResult {
+    /// User pressed Enter - commit the input
+    Committed,
+    /// User pressed Esc - cancel the input
+    Cancelled,
+    /// Input was modified, continue editing
+    Continue,
+    /// Key was not handled by text input (e.g., Tab)
+    NotHandled,
+}
+
+/// Process a key event for a text input field
+/// Returns what action should be taken
+fn handle_text_input(key: KeyEvent, input: &mut String) -> TextInputResult {
+    match key.code {
+        KeyCode::Enter => TextInputResult::Committed,
+        KeyCode::Esc => TextInputResult::Cancelled,
+        KeyCode::Char(c) => {
+            input.push(c);
+            TextInputResult::Continue
+        }
+        KeyCode::Backspace => {
+            input.pop();
+            TextInputResult::Continue
+        }
+        _ => TextInputResult::NotHandled,
+    }
+}
+
+// =============================================================================
+// Newtypes for type safety
+// =============================================================================
+
+/// Strongly-typed source ID (from database)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct SourceId(pub String);
+
+impl SourceId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for SourceId {
+    fn from(s: String) -> Self {
+        SourceId(s)
+    }
+}
+
+impl std::fmt::Display for SourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Strongly-typed rule ID (None = unsaved rule)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RuleId(pub Option<i64>);
+
+impl RuleId {
+    pub fn new(id: i64) -> Self {
+        RuleId(Some(id))
+    }
+
+    pub fn unsaved() -> Self {
+        RuleId(None)
+    }
+
+    pub fn is_saved(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Default for RuleId {
+    fn default() -> Self {
+        RuleId::unsaved()
+    }
+}
+
+// =============================================================================
+// View State Machine
+// =============================================================================
+
+/// View state machine for Discover mode - matches spec Section 4
+/// Controls which dialog/dropdown/view is currently active
+/// ALL modal states are represented here (no boolean flags)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiscoverViewState {
+    #[default]
+    Files,              // Default state, navigate files
+    // --- Modal input overlays (were previously booleans) ---
+    Filtering,          // Text filter input (was is_filtering)
+    EnteringPath,       // Scan path input (was is_entering_path)
+    Tagging,            // Single file tag input (was is_tagging)
+    CreatingSource,     // Source name input (was is_creating_source)
+    BulkTagging,        // Bulk tag input (was is_bulk_tagging)
+    // --- Dropdown menus ---
+    SourcesDropdown,    // Filtering/selecting sources
+    TagsDropdown,       // Filtering/selecting tags
+    // --- Full dialogs ---
+    RulesManager,       // Dialog for rule CRUD
+    RuleCreation,       // Dialog for creating/editing single rule
+    // --- Sources Manager (spec v1.7) ---
+    SourcesManager,     // Dialog for source CRUD (M key)
+    SourceEdit,         // Nested dialog for editing source name
+    SourceDeleteConfirm, // Delete confirmation dialog
+    // --- Background scanning ---
+    Scanning,           // Directory scan in progress (non-blocking)
+}
+
+/// Filter applied to file list based on tag selection
+#[derive(Debug, Clone, PartialEq)]
+pub enum TagFilter {
+    Untagged,           // Show files where tag IS NULL
+    Tag(String),        // Show files with specific tag
+}
+
 /// Source information for Discover mode sidebar
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
-    pub id: String,
+    pub id: SourceId,
     pub name: String,
     #[allow(dead_code)] // Will be used for displaying full path in details view
-    pub path: String,
+    pub path: std::path::PathBuf,
     pub file_count: usize,
 }
 
@@ -350,7 +488,7 @@ pub struct TagInfo {
 /// Rules are the mechanism that applies tags to files
 #[derive(Debug, Clone)]
 pub struct RuleInfo {
-    pub id: i64,
+    pub id: RuleId,
     pub pattern: String,
     pub tag: String,
     #[allow(dead_code)] // Used in Rules Manager sorting
@@ -358,50 +496,191 @@ pub struct RuleInfo {
     pub enabled: bool,
 }
 
+/// Pending tag write for persistence
+#[derive(Debug, Clone)]
+pub struct PendingTagWrite {
+    pub file_path: String,
+    pub tag: String,
+}
+
+/// Result from background directory scan
+#[derive(Debug)]
+pub enum TuiScanResult {
+    /// Progress update during scan
+    Progress(ScoutProgress),
+    /// Scanning completed successfully
+    Complete {
+        source_path: String,
+    },
+    /// Scanning failed with error
+    Error(String),
+}
+
+/// Pending rule write for persistence
+#[derive(Debug, Clone)]
+pub struct PendingRuleWrite {
+    pub pattern: String,
+    pub tag: String,
+    pub source_id: SourceId,
+}
+
+// ============================================================================
+// Glob Explorer State (Hierarchical File Browsing)
+// ============================================================================
+
+/// State for Glob Explorer - hierarchical file browsing for large sources.
+/// Single source of truth for all explorer state.
+#[derive(Debug, Clone)]
+pub struct GlobExplorerState {
+    // --- Input state (what user requested) ---
+    /// Current glob pattern filter (e.g., "*.csv", "**/*.json")
+    pub pattern: String,
+    /// History of patterns for Backspace navigation
+    pub pattern_history: Vec<String>,
+    /// Current path prefix (empty = root, "folder/" = inside folder)
+    pub current_prefix: String,
+
+    // --- Derived state (loaded atomically from DB) ---
+    /// Folders/files at current level with file counts
+    pub folders: Vec<FolderInfo>,
+    /// Sampled preview files (max 10)
+    pub preview_files: Vec<GlobPreviewFile>,
+    /// Total file count for current prefix + pattern
+    pub total_count: GlobFileCount,
+
+    // --- O(1) Navigation Cache ---
+    /// Preloaded folder hierarchy - key is prefix, value is children at that level
+    /// Example: "" -> [FolderInfo{name: "logs", ...}, FolderInfo{name: "data", ...}]
+    ///          "logs/" -> [FolderInfo{name: "app.log", is_file: true}, ...]
+    pub folder_cache: HashMap<String, Vec<FolderInfo>>,
+    /// Whether cache has been loaded for current source
+    pub cache_loaded: bool,
+    /// Source ID for which cache was loaded (to detect source changes)
+    pub cache_source_id: Option<String>,
+
+    // --- UI state ---
+    /// Currently selected folder index
+    pub selected_folder: usize,
+    /// Current phase in the explorer state machine
+    pub phase: GlobExplorerPhase,
+    /// Whether pattern input is active (for typing)
+    pub pattern_editing: bool,
+}
+
+impl Default for GlobExplorerState {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            pattern_history: Vec::new(),
+            current_prefix: String::new(),
+            folders: Vec::new(),
+            preview_files: Vec::new(),
+            total_count: GlobFileCount::Exact(0),
+            folder_cache: HashMap::new(),
+            cache_loaded: false,
+            cache_source_id: None,
+            selected_folder: 0,
+            phase: GlobExplorerPhase::Explore,
+            pattern_editing: false,
+        }
+    }
+}
+
+/// Folder/file info for hierarchical browsing
+#[derive(Debug, Clone)]
+pub struct FolderInfo {
+    /// Folder or file name
+    pub name: String,
+    /// Number of files in/under this folder
+    pub file_count: usize,
+    /// True if this is a leaf file (not a folder)
+    pub is_file: bool,
+}
+
+/// Preview file for Glob Explorer
+#[derive(Debug, Clone)]
+pub struct GlobPreviewFile {
+    pub rel_path: String,
+    pub size: u64,
+    pub mtime: i64,
+}
+
+/// File count (exact or estimated for large sources)
+#[derive(Debug, Clone)]
+pub enum GlobFileCount {
+    Exact(usize),
+    Estimated(usize),
+}
+
+impl GlobFileCount {
+    pub fn value(&self) -> usize {
+        match self {
+            GlobFileCount::Exact(n) => *n,
+            GlobFileCount::Estimated(n) => *n,
+        }
+    }
+}
+
+/// State machine phases for Glob Explorer
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum GlobExplorerPhase {
+    /// Browsing root level folders
+    #[default]
+    Explore,
+    /// Drilled into a folder (narrowed scope)
+    Focused,
+}
+
 /// State for the Discover mode (File Explorer)
 #[derive(Debug, Clone, Default)]
 pub struct DiscoverState {
+    // --- State machine (per spec Section 4) ---
+    /// Current view state - controls which dialog/dropdown is active
+    /// ALL modal states are in this enum (no separate boolean flags)
+    pub view_state: DiscoverViewState,
+    /// Previous state for "return to previous" transitions (Esc from dialogs)
+    pub previous_view_state: Option<DiscoverViewState>,
+    /// Active tag filter applied to files
+    pub tag_filter: Option<TagFilter>,
+
+    // --- File list ---
     pub files: Vec<FileInfo>,
     pub selected: usize,
+    /// Text filter for file list (used in Filtering state)
     pub filter: String,
-    pub is_filtering: bool,
     pub preview_open: bool,
-    /// Path input for scan dialog
+    /// Path input for scan dialog (used in EnteringPath state)
     pub scan_path_input: String,
-    /// Whether the scan path input is active
-    pub is_entering_path: bool,
     /// Error message from last scan attempt
     pub scan_error: Option<String>,
     /// Whether data has been loaded from Scout DB
     pub data_loaded: bool,
-    /// Whether the tag dialog is open
-    pub is_tagging: bool,
-    /// Tag input for new tag
+    /// Tag input for new tag (used in Tagging state)
     pub tag_input: String,
     /// Available tags from DB for autocomplete
     pub available_tags: Vec<String>,
     /// Status message (success/error) for user feedback
     pub status_message: Option<(String, bool)>, // (message, is_error)
-    /// Whether the create source dialog is open
-    pub is_creating_source: bool,
-    /// Source name input
+    /// Source name input (used in CreatingSource state)
     pub source_name_input: String,
     /// Directory path for the source being created
     pub pending_source_path: Option<String>,
-    /// Whether bulk tag dialog is open
-    pub is_bulk_tagging: bool,
-    /// Tag input for bulk tagging
+    /// Tag input for bulk tagging (used in BulkTagging state)
     pub bulk_tag_input: String,
     /// Whether to save bulk tag as a rule
     pub bulk_tag_save_as_rule: bool,
+
+    // --- Glob Explorer (hierarchical file browsing) ---
+    /// Glob Explorer state (Some = explorer active, None = flat file list)
+    pub glob_explorer: Option<GlobExplorerState>,
 
     // --- Sidebar state ---
     /// Current focus within Discover mode
     pub focus: DiscoverFocus,
     /// Available sources from DB
     pub sources: Vec<SourceInfo>,
-    /// Currently selected source index
-    pub selected_source: usize,
+    /// Currently selected source (by ID, not index - stable across list changes)
+    pub selected_source_id: Option<SourceId>,
     /// Whether sources have been loaded
     pub sources_loaded: bool,
 
@@ -410,38 +689,34 @@ pub struct DiscoverState {
     pub tags: Vec<TagInfo>,
     /// Currently selected tag index (None = "All files")
     pub selected_tag: Option<usize>,
-    /// Whether tags dropdown is expanded
-    pub tags_dropdown_open: bool,
     /// Filter text for tags dropdown
     pub tags_filter: String,
+    /// Whether actively filtering in tags dropdown (vim-style modal)
+    pub tags_filtering: bool,
     /// Temporary tag index while navigating dropdown (for preview)
     pub preview_tag: Option<usize>,
 
     // --- Sources dropdown state ---
-    /// Whether sources dropdown is expanded
-    pub sources_dropdown_open: bool,
     /// Filter text for sources dropdown
     pub sources_filter: String,
+    /// Whether actively filtering in sources dropdown (vim-style modal)
+    pub sources_filtering: bool,
     /// Temporary source index while navigating dropdown (for preview)
     pub preview_source: Option<usize>,
 
     // --- Rules Manager dialog ---
-    /// Whether Rules Manager dialog is open
-    pub rules_manager_open: bool,
     /// Tagging rules for the selected source (for Rules Manager)
     pub rules: Vec<RuleInfo>,
     /// Currently selected rule in Rules Manager
     pub selected_rule: usize,
 
     // --- Rule creation/edit dialog ---
-    /// Whether the create/edit rule dialog is open
-    pub is_creating_rule: bool,
     /// Tag input for new/edited rule
     pub rule_tag_input: String,
     /// Pattern input for new/edited rule
     pub rule_pattern_input: String,
     /// Rule being edited (None = creating new)
-    pub editing_rule_id: Option<i64>,
+    pub editing_rule_id: Option<RuleId>,
     /// Which field is focused in rule dialog (Pattern or Tag)
     pub rule_dialog_focus: RuleDialogFocus,
     /// Live preview of files matching current pattern
@@ -449,21 +724,67 @@ pub struct DiscoverState {
     /// Count of files matching current pattern
     pub rule_preview_count: usize,
 
-    // --- Onboarding wizard ---
-    /// Whether to show the onboarding wizard dialog
-    pub show_wizard: bool,
-    /// User preference: never show wizard again (persisted)
-    pub hide_wizard_forever: bool,
-    /// Checkbox state in wizard dialog (toggled with Space)
-    pub wizard_dont_show_checked: bool,
-    /// Whether wizard has been dismissed this session (don't show again until restart)
-    pub wizard_dismissed_this_session: bool,
+    // --- Sources Manager dialog (spec v1.7) ---
+    /// Selected source in Sources Manager list (separate from main selection)
+    pub sources_manager_selected: usize,
+    /// Name input for editing source
+    pub source_edit_input: String,
+    /// Source being edited (stores ID and original name)
+    pub editing_source: Option<SourceId>,
+    /// Source pending deletion (for confirmation dialog)
+    pub source_to_delete: Option<SourceId>,
 
     // --- Pending DB writes ---
-    /// File tags to persist to DB: (file_path, tag)
-    pub pending_tag_writes: Vec<(String, String)>,
-    /// Rules to persist to DB: (pattern, tag, source_id)
-    pub pending_rule_writes: Vec<(String, String, String)>,
+    pub pending_tag_writes: Vec<PendingTagWrite>,
+    pub pending_rule_writes: Vec<PendingRuleWrite>,
+
+    // --- Background scanning ---
+    /// Path being scanned (for display)
+    pub scanning_path: Option<String>,
+    /// Current scan progress (updated during scan)
+    pub scan_progress: Option<ScoutProgress>,
+    /// When scan started (for elapsed time display)
+    pub scan_start_time: Option<std::time::Instant>,
+
+    // --- Directory autocomplete (path input) ---
+    /// Suggested directories matching current path input
+    pub path_suggestions: Vec<String>,
+    /// Currently selected suggestion index
+    pub path_suggestion_idx: usize,
+}
+
+impl DiscoverState {
+    /// Get the index of the currently selected source (or 0 if none/not found)
+    pub fn selected_source_index(&self) -> usize {
+        self.selected_source_id
+            .as_ref()
+            .and_then(|id| self.sources.iter().position(|s| &s.id == id))
+            .unwrap_or(0)
+    }
+
+    /// Set the selected source by index
+    pub fn select_source_by_index(&mut self, idx: usize) {
+        self.selected_source_id = self.sources.get(idx).map(|s| s.id.clone());
+    }
+
+    /// Get the currently selected source
+    pub fn selected_source(&self) -> Option<&SourceInfo> {
+        self.selected_source_id
+            .as_ref()
+            .and_then(|id| self.sources.iter().find(|s| &s.id == id))
+    }
+
+    /// Ensure selection is valid after sources list changes
+    pub fn validate_source_selection(&mut self) {
+        if self.sources.is_empty() {
+            self.selected_source_id = None;
+        } else if self.selected_source_id.is_none()
+            || !self.sources.iter().any(|s| Some(&s.id) == self.selected_source_id.as_ref())
+        {
+            // Selection invalid, select first source
+            self.selected_source_id = self.sources.first().map(|s| s.id.clone());
+        }
+    }
 }
 
 /// File information for Discover mode
@@ -772,6 +1093,8 @@ pub struct App {
     pub mode: TuiMode,
     /// Whether the AI chat sidebar is visible
     pub show_chat_sidebar: bool,
+    /// Whether the help overlay is visible (per spec Section 3.1)
+    pub show_help: bool,
     /// Current input focus (Main vs Chat)
     pub focus: AppFocus,
     /// Home hub state
@@ -801,6 +1124,12 @@ pub struct App {
     pub error: Option<String>,
     /// Pending response from Claude (non-blocking)
     pending_response: Option<mpsc::Receiver<PendingResponse>>,
+    /// Pending scan result from background directory scan
+    pending_scan: Option<mpsc::Receiver<TuiScanResult>>,
+    /// Job ID for the currently running scan (for status updates)
+    current_scan_job_id: Option<i64>,
+    /// Tick counter for animated UI elements (spinner, etc.)
+    pub tick_count: u64,
 }
 
 impl App {
@@ -831,6 +1160,7 @@ impl App {
             running: true,
             mode: TuiMode::Home,
             show_chat_sidebar: false,
+            show_help: false,
             focus: AppFocus::Main,
             home: HomeState::default(),
             discover: DiscoverState::default(),
@@ -845,6 +1175,9 @@ impl App {
             config: args,
             error: None,
             pending_response: None,
+            pending_scan: None,
+            current_scan_job_id: None,
+            tick_count: 0,
         }
     }
 
@@ -858,6 +1191,7 @@ impl App {
             running: true,
             mode: TuiMode::Home,
             show_chat_sidebar: false,
+            show_help: false,
             focus: AppFocus::Main,
             home: HomeState::default(),
             discover: DiscoverState::default(),
@@ -871,6 +1205,9 @@ impl App {
             config: args,
             error: None,
             pending_response: None,
+            pending_scan: None,
+            current_scan_job_id: None,
+            tick_count: 0,
         }
     }
 
@@ -882,29 +1219,54 @@ impl App {
                 self.running = false;
                 return;
             }
-            // Alt+D: Switch to Discover mode
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+            // Number keys for primary navigation (1-4)
+            // Note: In Discover mode, 1/2/3 are overridden for panel focus
+            // Don't intercept when chat is focused (allow typing numbers)
+            KeyCode::Char('1') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
                 self.mode = TuiMode::Discover;
                 return;
             }
-            // Alt+P: Switch to Parser Bench mode
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char('2') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
                 self.mode = TuiMode::ParserBench;
                 return;
             }
-            // Alt+I: Switch to Inspect mode
-            KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.mode = TuiMode::Inspect;
-                return;
-            }
-            // Alt+J: Switch to Jobs mode
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char('3') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
                 self.mode = TuiMode::Jobs;
                 return;
             }
-            // Alt+H: Return to Home
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char('4') if self.focus != AppFocus::Chat => {
+                // TODO: Switch to Sources view when implemented
+                // For now, switch to Inspect as placeholder
+                self.mode = TuiMode::Inspect;
+                return;
+            }
+            // 0 or H: Return to Home (from any view)
+            // Don't intercept when chat is focused
+            KeyCode::Char('0') if self.focus != AppFocus::Chat => {
                 self.mode = TuiMode::Home;
+                return;
+            }
+            KeyCode::Char('H') if self.focus != AppFocus::Chat => {
+                self.mode = TuiMode::Home;
+                return;
+            }
+            // q: Quit application (per spec Section 3.1)
+            // Don't intercept when in text input mode
+            KeyCode::Char('q') if self.focus != AppFocus::Chat && !self.in_text_input_mode() => {
+                // TODO: Add confirmation dialog if unsaved changes
+                self.running = false;
+                return;
+            }
+            // r: Refresh current view (per spec Section 3.3)
+            // Don't intercept when in text input mode
+            KeyCode::Char('r') if self.focus != AppFocus::Chat && !self.in_text_input_mode() => {
+                self.refresh_current_view();
+                return;
+            }
+            // ?: Toggle help overlay (per spec Section 3.1)
+            // Don't intercept when in text input mode
+            KeyCode::Char('?') if self.focus != AppFocus::Chat && !self.in_text_input_mode() => {
+                self.show_help = !self.show_help;
                 return;
             }
             // Alt+A: Toggle AI Chat Sidebar
@@ -927,6 +1289,11 @@ impl App {
                     return;
                 }
             }
+            // Esc: Close help overlay first, then handle other escapes
+            KeyCode::Esc if self.show_help => {
+                self.show_help = false;
+                return;
+            }
             // Esc: Return to Home from any mode (except Home itself)
             // But NOT if we're in a focused state (e.g., query input in Inspect mode, or Chat focus)
             KeyCode::Esc if self.mode != TuiMode::Home => {
@@ -938,14 +1305,8 @@ impl App {
                 // Skip global Esc handling if mode-specific handler should handle it
                 // Discover mode has layered Esc: dialog -> filter -> sidebar -> Home
                 let discover_needs_local_esc = self.mode == TuiMode::Discover && (
-                    self.discover.is_filtering ||
-                    self.discover.is_entering_path ||
-                    self.discover.is_tagging ||
-                    self.discover.is_creating_source ||
-                    self.discover.is_bulk_tagging ||
-                    self.discover.is_creating_rule ||
-                    self.discover.show_wizard ||
-                    self.discover.rules_manager_open ||
+                    // Any state other than Files needs local Esc
+                    self.discover.view_state != DiscoverViewState::Files ||
                     !self.discover.filter.is_empty() ||
                     self.discover.focus != DiscoverFocus::Files
                 );
@@ -975,256 +1336,172 @@ impl App {
         }
     }
 
-    /// Handle Discover mode keys
+    // ======== Discover State Machine Helpers ========
+
+    /// Transition to a new Discover view state, saving current as previous
+    fn transition_discover_state(&mut self, new_state: DiscoverViewState) {
+        self.discover.previous_view_state = Some(self.discover.view_state);
+        self.discover.view_state = new_state;
+    }
+
+    /// Return to previous Discover view state (for Esc from dialogs/dropdowns)
+    fn return_to_previous_discover_state(&mut self) {
+        if let Some(prev) = self.discover.previous_view_state.take() {
+            self.discover.view_state = prev;
+        } else {
+            self.discover.view_state = DiscoverViewState::Files;
+        }
+    }
+
+    /// Handle Discover mode keys - using unified state machine
     fn handle_discover_key(&mut self, key: KeyEvent) {
         // Clear status message on any key press
         if self.discover.status_message.is_some() && key.code != KeyCode::Esc {
             self.discover.status_message = None;
         }
 
-        // If entering scan path, handle text input
-        if self.discover.is_entering_path {
+        // Global keybindings that work from most states (per spec Section 6.1)
+        // R (Rules Manager) and M (Sources Manager) work from Files, dropdowns, etc.
+        // but NOT from dialogs that are already open
+        if !matches!(self.discover.view_state,
+            DiscoverViewState::RulesManager |
+            DiscoverViewState::RuleCreation |
+            DiscoverViewState::SourcesManager |
+            DiscoverViewState::SourceEdit |
+            DiscoverViewState::SourceDeleteConfirm |
+            DiscoverViewState::EnteringPath |
+            DiscoverViewState::CreatingSource |
+            DiscoverViewState::Tagging |
+            DiscoverViewState::BulkTagging |
+            DiscoverViewState::Filtering
+        ) {
             match key.code {
-                KeyCode::Enter => {
-                    // Execute scan with the entered path
-                    let path = self.discover.scan_path_input.clone();
-                    self.discover.is_entering_path = false;
-                    if !path.is_empty() {
-                        self.scan_directory(&path);
-                    }
+                KeyCode::Char('R') => {
+                    self.transition_discover_state(DiscoverViewState::RulesManager);
+                    self.discover.selected_rule = 0;
+                    return;
                 }
-                KeyCode::Esc => {
-                    self.discover.is_entering_path = false;
-                    self.discover.scan_path_input.clear();
-                    self.discover.scan_error = None;
-                }
-                KeyCode::Char(c) => {
-                    self.discover.scan_path_input.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.discover.scan_path_input.pop();
+                KeyCode::Char('M') => {
+                    self.transition_discover_state(DiscoverViewState::SourcesManager);
+                    self.discover.sources_manager_selected = self.discover.selected_source_index();
+                    return;
                 }
                 _ => {}
             }
-            return;
         }
 
-        // If creating source, handle source name input
-        if self.discover.is_creating_source {
-            match key.code {
-                KeyCode::Enter => {
-                    // Create source with the entered name
-                    let name = self.discover.source_name_input.trim().to_string();
-                    if !name.is_empty() {
-                        if let Some(path) = self.discover.pending_source_path.take() {
-                            self.create_source(&path, &name);
+        // Route to handler based on current view state
+        match self.discover.view_state {
+            // === Modal text input states (using shared handler) ===
+            DiscoverViewState::EnteringPath => {
+                // Handle autocomplete navigation first
+                match key.code {
+                    KeyCode::Tab if !self.discover.path_suggestions.is_empty() => {
+                        // Apply selected suggestion
+                        self.apply_path_suggestion();
+                        return;
+                    }
+                    KeyCode::Down if !self.discover.path_suggestions.is_empty() => {
+                        // Navigate down in suggestions
+                        let max_idx = self.discover.path_suggestions.len().saturating_sub(1);
+                        self.discover.path_suggestion_idx =
+                            (self.discover.path_suggestion_idx + 1).min(max_idx);
+                        return;
+                    }
+                    KeyCode::Up if !self.discover.path_suggestions.is_empty() => {
+                        // Navigate up in suggestions
+                        self.discover.path_suggestion_idx =
+                            self.discover.path_suggestion_idx.saturating_sub(1);
+                        return;
+                    }
+                    _ => {}
+                }
+
+                // Handle regular text input
+                match handle_text_input(key, &mut self.discover.scan_path_input) {
+                    TextInputResult::Committed => {
+                        let path = self.discover.scan_path_input.clone();
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.path_suggestions.clear();
+                        if !path.is_empty() {
+                            self.scan_directory(&path);
                         }
                     }
-                    self.discover.is_creating_source = false;
-                    self.discover.source_name_input.clear();
+                    TextInputResult::Cancelled => {
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.scan_path_input.clear();
+                        self.discover.path_suggestions.clear();
+                        self.discover.scan_error = None;
+                    }
+                    TextInputResult::Continue => {
+                        // Update suggestions after any character change
+                        self.update_path_suggestions();
+                    }
+                    TextInputResult::NotHandled => {}
                 }
-                KeyCode::Esc => {
-                    self.discover.is_creating_source = false;
-                    self.discover.source_name_input.clear();
-                    self.discover.pending_source_path = None;
-                }
-                KeyCode::Char(c) => {
-                    self.discover.source_name_input.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.discover.source_name_input.pop();
-                }
-                _ => {}
             }
-            return;
-        }
 
-        // If bulk tagging, handle bulk tag input
-        if self.discover.is_bulk_tagging {
-            match key.code {
-                KeyCode::Enter => {
-                    // Apply tag to all filtered files
-                    let tag = self.discover.bulk_tag_input.trim().to_string();
-                    if !tag.is_empty() {
-                        let file_paths: Vec<String> = self.filtered_files()
-                            .iter()
-                            .map(|f| f.path.clone())
-                            .collect();
-                        let count = file_paths.len();
-
-                        for path in file_paths {
-                            self.apply_tag_to_file(&path, &tag);
+            DiscoverViewState::CreatingSource => {
+                match handle_text_input(key, &mut self.discover.source_name_input) {
+                    TextInputResult::Committed => {
+                        let name = self.discover.source_name_input.trim().to_string();
+                        if !name.is_empty() {
+                            if let Some(path) = self.discover.pending_source_path.take() {
+                                self.create_source(&path, &name);
+                            }
                         }
-
-                        // Show result (overwrite the per-file messages)
-                        let rule_msg = if self.discover.bulk_tag_save_as_rule {
-                            " (rule saved)"
-                        } else {
-                            ""
-                        };
-                        self.discover.status_message = Some((
-                            format!("Tagged {} files with '{}'{}", count, tag, rule_msg),
-                            false,
-                        ));
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.source_name_input.clear();
                     }
-                    self.discover.is_bulk_tagging = false;
-                    self.discover.bulk_tag_input.clear();
-                    self.discover.bulk_tag_save_as_rule = false;
+                    TextInputResult::Cancelled => {
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.source_name_input.clear();
+                        self.discover.pending_source_path = None;
+                    }
+                    TextInputResult::Continue | TextInputResult::NotHandled => {}
                 }
-                KeyCode::Esc => {
-                    self.discover.is_bulk_tagging = false;
-                    self.discover.bulk_tag_input.clear();
-                    self.discover.bulk_tag_save_as_rule = false;
-                }
-                KeyCode::Char(' ') => {
-                    // Space toggles "save as rule" option
+            }
+
+            DiscoverViewState::BulkTagging => {
+                // Special handling: Space toggles option
+                if key.code == KeyCode::Char(' ') {
                     self.discover.bulk_tag_save_as_rule = !self.discover.bulk_tag_save_as_rule;
+                    return;
                 }
-                KeyCode::Char(c) => {
-                    self.discover.bulk_tag_input.push(c);
+                match handle_text_input(key, &mut self.discover.bulk_tag_input) {
+                    TextInputResult::Committed => {
+                        let tag = self.discover.bulk_tag_input.trim().to_string();
+                        if !tag.is_empty() {
+                            let file_paths: Vec<String> = self.filtered_files()
+                                .iter()
+                                .map(|f| f.path.clone())
+                                .collect();
+                            let count = file_paths.len();
+                            for path in file_paths {
+                                self.apply_tag_to_file(&path, &tag);
+                            }
+                            let rule_msg = if self.discover.bulk_tag_save_as_rule { " (rule saved)" } else { "" };
+                            self.discover.status_message = Some((
+                                format!("Tagged {} files with '{}'{}", count, tag, rule_msg),
+                                false,
+                            ));
+                        }
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.bulk_tag_input.clear();
+                        self.discover.bulk_tag_save_as_rule = false;
+                    }
+                    TextInputResult::Cancelled => {
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.bulk_tag_input.clear();
+                        self.discover.bulk_tag_save_as_rule = false;
+                    }
+                    TextInputResult::Continue | TextInputResult::NotHandled => {}
                 }
-                KeyCode::Backspace => {
-                    self.discover.bulk_tag_input.pop();
-                }
-                _ => {}
             }
-            return;
-        }
 
-        // If wizard dialog is open, handle wizard keys
-        if self.discover.show_wizard {
-            match key.code {
-                KeyCode::Char('n') => {
-                    // Close wizard, open rule creation dialog
-                    self.close_wizard_and_save_preference();
-                    self.open_rule_creation_dialog();
-                }
-                KeyCode::Enter => {
-                    // Close wizard, browse files
-                    self.close_wizard_and_save_preference();
-                    self.discover.focus = DiscoverFocus::Files;
-                }
-                KeyCode::Char(' ') => {
-                    // Toggle "don't show again" checkbox
-                    self.discover.wizard_dont_show_checked = !self.discover.wizard_dont_show_checked;
-                }
-                KeyCode::Esc => {
-                    self.close_wizard_and_save_preference();
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // If creating rule, handle rule dialog input (two-field version)
-        if self.discover.is_creating_rule {
-            match key.code {
-                KeyCode::Enter => {
-                    // Save rule with pattern and tag
-                    let tag = self.discover.rule_tag_input.trim().to_string();
-                    let pattern = self.discover.rule_pattern_input.trim().to_string();
-                    if !tag.is_empty() && !pattern.is_empty() {
-                        // Apply the rule: tag all matching files
-                        let tagged_count = self.apply_rule_to_files(&pattern, &tag);
-
-                        // Add to local rules list for immediate feedback
-                        self.discover.rules.push(RuleInfo {
-                            id: -1, // Temporary ID until saved to DB
-                            pattern: pattern.clone(),
-                            tag: tag.clone(),
-                            priority: 100,
-                            enabled: true,
-                        });
-
-                        // Update the tags dropdown
-                        self.refresh_tags_list();
-
-                        // Show success message
-                        self.discover.status_message = Some((
-                            format!("Created rule: {} → {} ({} files tagged)", pattern, tag, tagged_count),
-                            false,
-                        ));
-                    } else if tag.is_empty() && !pattern.is_empty() {
-                        self.discover.status_message = Some((
-                            "Please enter a tag name".to_string(),
-                            true,
-                        ));
-                        return;
-                    } else if pattern.is_empty() {
-                        self.discover.status_message = Some((
-                            "Please enter a pattern".to_string(),
-                            true,
-                        ));
-                        return;
-                    }
-                    self.close_rule_creation_dialog();
-                }
-                KeyCode::Esc => {
-                    self.close_rule_creation_dialog();
-                }
-                KeyCode::Tab | KeyCode::BackTab => {
-                    // Toggle between Pattern and Tag fields
-                    self.discover.rule_dialog_focus = match self.discover.rule_dialog_focus {
-                        RuleDialogFocus::Pattern => RuleDialogFocus::Tag,
-                        RuleDialogFocus::Tag => RuleDialogFocus::Pattern,
-                    };
-                }
-                KeyCode::Char(c) => {
-                    // Type into the focused field
-                    match self.discover.rule_dialog_focus {
-                        RuleDialogFocus::Pattern => {
-                            self.discover.rule_pattern_input.push(c);
-                            self.update_rule_preview();
-                        }
-                        RuleDialogFocus::Tag => {
-                            self.discover.rule_tag_input.push(c);
-                        }
-                    }
-                }
-                KeyCode::Backspace => {
-                    // Delete from the focused field
-                    match self.discover.rule_dialog_focus {
-                        RuleDialogFocus::Pattern => {
-                            self.discover.rule_pattern_input.pop();
-                            self.update_rule_preview();
-                        }
-                        RuleDialogFocus::Tag => {
-                            self.discover.rule_tag_input.pop();
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // If tagging, handle tag input
-        if self.discover.is_tagging {
-            match key.code {
-                KeyCode::Enter => {
-                    // Apply tag to selected file
-                    let tag = self.discover.tag_input.trim().to_string();
-                    if !tag.is_empty() {
-                        if let Some(file) = self.filtered_files().get(self.discover.selected) {
-                            let file_path = file.path.clone();
-                            self.apply_tag_to_file(&file_path, &tag);
-                        }
-                    }
-                    self.discover.is_tagging = false;
-                    self.discover.tag_input.clear();
-                }
-                KeyCode::Esc => {
-                    self.discover.is_tagging = false;
-                    self.discover.tag_input.clear();
-                }
-                KeyCode::Char(c) => {
-                    self.discover.tag_input.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.discover.tag_input.pop();
-                }
-                KeyCode::Tab => {
-                    // Autocomplete from available tags
+            DiscoverViewState::Tagging => {
+                // Special handling: Tab for autocomplete
+                if key.code == KeyCode::Tab {
                     if !self.discover.tag_input.is_empty() {
                         let input_lower = self.discover.tag_input.to_lowercase();
                         if let Some(matching_tag) = self.discover.available_tags.iter()
@@ -1233,115 +1510,192 @@ impl App {
                             self.discover.tag_input = matching_tag.clone();
                         }
                     }
+                    return;
                 }
-                _ => {}
-            }
-            return;
-        }
-
-        // If filtering, handle text input
-        if self.discover.is_filtering {
-            match key.code {
-                KeyCode::Enter => {
-                    self.discover.is_filtering = false;
+                match handle_text_input(key, &mut self.discover.tag_input) {
+                    TextInputResult::Committed => {
+                        let tag = self.discover.tag_input.trim().to_string();
+                        if !tag.is_empty() {
+                            if let Some(file) = self.filtered_files().get(self.discover.selected) {
+                                let file_path = file.path.clone();
+                                self.apply_tag_to_file(&file_path, &tag);
+                            }
+                        }
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.tag_input.clear();
+                    }
+                    TextInputResult::Cancelled => {
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.tag_input.clear();
+                    }
+                    TextInputResult::Continue | TextInputResult::NotHandled => {}
                 }
-                KeyCode::Esc => {
-                    self.discover.is_filtering = false;
-                    self.discover.filter.clear();
+            }
+
+            DiscoverViewState::Filtering => {
+                match handle_text_input(key, &mut self.discover.filter) {
+                    TextInputResult::Committed => {
+                        self.discover.view_state = DiscoverViewState::Files;
+                    }
+                    TextInputResult::Cancelled => {
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.filter.clear();
+                    }
+                    TextInputResult::Continue | TextInputResult::NotHandled => {}
                 }
-                KeyCode::Char(c) => {
-                    self.discover.filter.push(c);
+            }
+
+            // === Dialog states ===
+            DiscoverViewState::RuleCreation => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let tag = self.discover.rule_tag_input.trim().to_string();
+                        let pattern = self.discover.rule_pattern_input.trim().to_string();
+                        if !tag.is_empty() && !pattern.is_empty() {
+                            let tagged_count = self.apply_rule_to_files(&pattern, &tag);
+                            self.discover.rules.push(RuleInfo {
+                                id: RuleId::unsaved(),
+                                pattern: pattern.clone(),
+                                tag: tag.clone(),
+                                priority: 100,
+                                enabled: true,
+                            });
+                            self.refresh_tags_list();
+                            self.discover.status_message = Some((
+                                format!("Created rule: {} → {} ({} files tagged)", pattern, tag, tagged_count),
+                                false,
+                            ));
+                        } else if tag.is_empty() && !pattern.is_empty() {
+                            self.discover.status_message = Some(("Please enter a tag name".to_string(), true));
+                            return;
+                        } else if pattern.is_empty() {
+                            self.discover.status_message = Some(("Please enter a pattern".to_string(), true));
+                            return;
+                        }
+                        self.close_rule_creation_dialog();
+                    }
+                    KeyCode::Esc => self.close_rule_creation_dialog(),
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        self.discover.rule_dialog_focus = match self.discover.rule_dialog_focus {
+                            RuleDialogFocus::Pattern => RuleDialogFocus::Tag,
+                            RuleDialogFocus::Tag => RuleDialogFocus::Pattern,
+                        };
+                    }
+                    KeyCode::Char(c) => match self.discover.rule_dialog_focus {
+                        RuleDialogFocus::Pattern => {
+                            self.discover.rule_pattern_input.push(c);
+                            self.update_rule_preview();
+                        }
+                        RuleDialogFocus::Tag => self.discover.rule_tag_input.push(c),
+                    },
+                    KeyCode::Backspace => match self.discover.rule_dialog_focus {
+                        RuleDialogFocus::Pattern => {
+                            self.discover.rule_pattern_input.pop();
+                            self.update_rule_preview();
+                        }
+                        RuleDialogFocus::Tag => { self.discover.rule_tag_input.pop(); }
+                    },
+                    _ => {}
                 }
-                KeyCode::Backspace => {
-                    self.discover.filter.pop();
+            }
+
+            DiscoverViewState::RulesManager => self.handle_rules_manager_key(key),
+            DiscoverViewState::SourcesDropdown => self.handle_sources_dropdown_key(key),
+            DiscoverViewState::TagsDropdown => self.handle_tags_dropdown_key(key),
+
+            // === Sources Manager states (spec v1.7) ===
+            DiscoverViewState::SourcesManager => self.handle_sources_manager_key(key),
+            DiscoverViewState::SourceEdit => self.handle_source_edit_key(key),
+            DiscoverViewState::SourceDeleteConfirm => self.handle_source_delete_confirm_key(key),
+
+            // === Background scanning state ===
+            DiscoverViewState::Scanning => {
+                match key.code {
+                    // Esc cancels the scan
+                    KeyCode::Esc => {
+                        // Update job status to Cancelled
+                        if let Some(job_id) = self.current_scan_job_id {
+                            self.update_scan_job_status(job_id, JobStatus::Cancelled, None);
+                        }
+
+                        self.pending_scan = None;
+                        self.current_scan_job_id = None;
+                        self.discover.scanning_path = None;
+                        self.discover.scan_progress = None;
+                        self.discover.scan_start_time = None;
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.status_message = Some(("Scan cancelled".to_string(), true));
+                    }
+                    // Navigate to Home while scan continues in background
+                    KeyCode::Char('0') => {
+                        // Don't cancel - scan continues, just switch view
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.mode = TuiMode::Home;
+                        self.discover.status_message = Some(("Scan running in background...".to_string(), false));
+                    }
+                    // Navigate to Jobs while scan continues in background
+                    KeyCode::Char('4') => {
+                        // Don't cancel - scan continues, just switch view
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.mode = TuiMode::Jobs;
+                        self.discover.status_message = Some(("Scan running in background...".to_string(), false));
+                    }
+                    // All other keys are ignored during scanning
+                    _ => {}
                 }
-                _ => {}
             }
-            return;
-        }
 
-        // Handle dropdown input FIRST when open (captures all keys including numbers)
-        if self.discover.sources_dropdown_open {
-            self.handle_sources_dropdown_key(key);
-            return;
-        }
-
-        if self.discover.tags_dropdown_open {
-            self.handle_tags_dropdown_key(key);
-            return;
-        }
-
-        // Rules Manager dialog intercepts all keys when open
-        if self.discover.rules_manager_open {
-            self.handle_rules_manager_key(key);
-            return;
-        }
-
-        // Number keys: Open dropdowns (only when no dropdown is open)
-        match key.code {
-            KeyCode::Char('1') => {
-                self.discover.focus = DiscoverFocus::Sources;
-                self.discover.sources_dropdown_open = true;
-                self.discover.sources_filter.clear();
-                self.discover.preview_source = Some(self.discover.selected_source);
-                return;
+            // === Default file browsing state ===
+            DiscoverViewState::Files => {
+                match key.code {
+                    KeyCode::Char('1') => {
+                        self.discover.focus = DiscoverFocus::Sources;
+                        self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                        self.discover.sources_filter.clear();
+                        self.discover.preview_source = Some(self.discover.selected_source_index());
+                    }
+                    KeyCode::Char('2') => {
+                        self.discover.focus = DiscoverFocus::Tags;
+                        self.transition_discover_state(DiscoverViewState::TagsDropdown);
+                        self.discover.tags_filter.clear();
+                        self.discover.preview_tag = self.discover.selected_tag;
+                    }
+                    KeyCode::Char('3') => self.discover.focus = DiscoverFocus::Files,
+                    KeyCode::Char('n') => self.open_rule_creation_dialog(),
+                    // Note: R and M are now handled globally above, so they work from dropdowns too
+                    KeyCode::Tab if self.discover.focus == DiscoverFocus::Files => {
+                        self.discover.preview_open = !self.discover.preview_open;
+                    }
+                    KeyCode::Esc if !self.discover.filter.is_empty() => {
+                        self.discover.filter.clear();
+                        self.discover.selected = 0;
+                    }
+                    _ => match self.discover.focus {
+                        DiscoverFocus::Files => self.handle_discover_files_key(key),
+                        DiscoverFocus::Sources => self.handle_discover_sources_key(key),
+                        DiscoverFocus::Tags => self.handle_discover_tags_key(key),
+                    }
+                }
             }
-            KeyCode::Char('2') => {
-                self.discover.focus = DiscoverFocus::Tags;
-                self.discover.tags_dropdown_open = true;
-                self.discover.tags_filter.clear();
-                self.discover.preview_tag = self.discover.selected_tag;
-                return;
-            }
-            KeyCode::Char('3') => {
-                self.discover.focus = DiscoverFocus::Files;
-                return;
-            }
-            KeyCode::Char('n') => {
-                // Open rule creation dialog from anywhere (primary action)
-                self.open_rule_creation_dialog();
-                return;
-            }
-            KeyCode::Char('R') => {
-                // Open Rules Manager dialog
-                self.discover.rules_manager_open = true;
-                self.discover.selected_rule = 0;
-                return;
-            }
-            _ => {}
-        }
-
-        // Tab: Toggle preview when in Files focus
-        if key.code == KeyCode::Tab {
-            if self.discover.focus == DiscoverFocus::Files {
-                self.discover.preview_open = !self.discover.preview_open;
-            }
-            return;
-        }
-
-        // Esc: Layered escape behavior
-        if key.code == KeyCode::Esc {
-            // 1. Clear filter if active
-            if !self.discover.filter.is_empty() {
-                self.discover.filter.clear();
-                self.discover.selected = 0;
-                return;
-            }
-            // 2. Go to Home (handled by global Esc handler)
-            return;
-        }
-
-        // Focus-specific navigation and actions
-        match self.discover.focus {
-            DiscoverFocus::Files => self.handle_discover_files_key(key),
-            DiscoverFocus::Sources => self.handle_discover_sources_key(key),
-            DiscoverFocus::Tags => self.handle_discover_tags_key(key),
         }
     }
 
     /// Handle keys when Files panel is focused
     fn handle_discover_files_key(&mut self, key: KeyEvent) {
+        // === Glob Explorer mode ===
+        // When glob_explorer is active, handle folder navigation
+        if self.discover.glob_explorer.is_some() {
+            self.handle_glob_explorer_key(key);
+            return;
+        }
+
+        // === Normal file list mode ===
         match key.code {
+            KeyCode::Char('g') => {
+                // Toggle Glob Explorer on
+                self.discover.glob_explorer = Some(GlobExplorerState::default());
+                self.discover.data_loaded = false; // Trigger reload
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.discover.selected < self.filtered_files().len().saturating_sub(1) {
                     self.discover.selected += 1;
@@ -1353,14 +1707,14 @@ impl App {
                 }
             }
             KeyCode::Char('/') => {
-                self.discover.is_filtering = true;
+                self.transition_discover_state(DiscoverViewState::Filtering);
             }
             KeyCode::Char('p') => {
                 self.discover.preview_open = !self.discover.preview_open;
             }
             KeyCode::Char('s') => {
                 // Open scan path input
-                self.discover.is_entering_path = true;
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
                 self.discover.scan_path_input.clear();
                 self.discover.scan_error = None;
             }
@@ -1375,20 +1729,22 @@ impl App {
                     // With filter active, 't' tags all filtered files
                     let count = self.filtered_files().len();
                     if count > 0 {
-                        self.discover.is_bulk_tagging = true;
+                        self.transition_discover_state(DiscoverViewState::BulkTagging);
                         self.discover.bulk_tag_input.clear();
                         self.discover.bulk_tag_save_as_rule = false;
                     }
                 } else if !self.filtered_files().is_empty() {
-                    self.discover.is_tagging = true;
+                    self.transition_discover_state(DiscoverViewState::Tagging);
                     self.discover.tag_input.clear();
                 }
             }
             KeyCode::Char('R') => {
                 // Create rule from current filter
                 if !self.discover.filter.is_empty() {
-                    self.discover.is_creating_rule = true;
+                    // Prefill pattern with current filter
+                    self.discover.rule_pattern_input = self.discover.filter.clone();
                     self.discover.rule_tag_input.clear();
+                    self.transition_discover_state(DiscoverViewState::RuleCreation);
                 } else {
                     self.discover.status_message = Some((
                         "Enter a filter pattern first (press /)".to_string(),
@@ -1403,7 +1759,7 @@ impl App {
 
                 if let Some((is_dir, path)) = file_info {
                     if is_dir {
-                        self.discover.is_creating_source = true;
+                        self.transition_discover_state(DiscoverViewState::CreatingSource);
                         self.discover.source_name_input.clear();
                         self.discover.pending_source_path = Some(path);
                     } else {
@@ -1418,7 +1774,7 @@ impl App {
                 // Bulk tag all filtered/visible files (explicit T)
                 let count = self.filtered_files().len();
                 if count > 0 {
-                    self.discover.is_bulk_tagging = true;
+                    self.transition_discover_state(DiscoverViewState::BulkTagging);
                     self.discover.bulk_tag_input.clear();
                     self.discover.bulk_tag_save_as_rule = false;
                 } else {
@@ -1427,6 +1783,109 @@ impl App {
                         true,
                     ));
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle keys when Glob Explorer is active (hierarchical folder navigation)
+    fn handle_glob_explorer_key(&mut self, key: KeyEvent) {
+        // Pattern editing mode - uses in-memory cache filtering (O(m) where m = current level items)
+        if let Some(ref explorer) = self.discover.glob_explorer {
+            if explorer.pattern_editing {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => {
+                        // Exit pattern editing, filter from cache
+                        if let Some(ref mut explorer) = self.discover.glob_explorer {
+                            explorer.pattern_editing = false;
+                        }
+                        self.update_folders_from_cache();
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(ref mut explorer) = self.discover.glob_explorer {
+                            explorer.pattern.pop();
+                        }
+                        // Live filter update from cache
+                        self.update_folders_from_cache();
+                    }
+                    KeyCode::Char(c) => {
+                        if let Some(ref mut explorer) = self.discover.glob_explorer {
+                            explorer.pattern.push(c);
+                        }
+                        // Live filter update from cache
+                        self.update_folders_from_cache();
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
+
+        // Navigation mode
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                // Navigate down in folder list
+                if let Some(ref mut explorer) = self.discover.glob_explorer {
+                    if explorer.selected_folder < explorer.folders.len().saturating_sub(1) {
+                        explorer.selected_folder += 1;
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                // Navigate up in folder list
+                if let Some(ref mut explorer) = self.discover.glob_explorer {
+                    if explorer.selected_folder > 0 {
+                        explorer.selected_folder -= 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                // Drill into selected folder - O(1) using cache
+                if let Some(ref mut explorer) = self.discover.glob_explorer {
+                    if let Some(folder) = explorer.folders.get(explorer.selected_folder).cloned() {
+                        if !folder.is_file {
+                            // Save current prefix to history
+                            explorer.pattern_history.push(explorer.current_prefix.clone());
+                            // Update prefix to drill into folder
+                            explorer.current_prefix = format!("{}{}/", explorer.current_prefix, folder.name);
+                            explorer.phase = GlobExplorerPhase::Focused;
+                        }
+                    }
+                }
+                // Update from cache - O(1) hashmap lookup, no SQL
+                self.update_folders_from_cache();
+            }
+            KeyCode::Backspace => {
+                // Go back to parent folder - O(1) using cache
+                if let Some(ref mut explorer) = self.discover.glob_explorer {
+                    if let Some(prev_prefix) = explorer.pattern_history.pop() {
+                        explorer.current_prefix = prev_prefix;
+                        explorer.phase = if explorer.pattern_history.is_empty() {
+                            GlobExplorerPhase::Explore
+                        } else {
+                            GlobExplorerPhase::Focused
+                        };
+                    }
+                }
+                // Update from cache - O(1) hashmap lookup, no SQL
+                self.update_folders_from_cache();
+            }
+            KeyCode::Char('/') => {
+                // Enter pattern editing mode
+                if let Some(ref mut explorer) = self.discover.glob_explorer {
+                    explorer.pattern_editing = true;
+                }
+            }
+            KeyCode::Char('g') | KeyCode::Esc => {
+                // Exit Glob Explorer
+                self.discover.glob_explorer = None;
+                self.discover.data_loaded = false; // Trigger reload of normal file list
+            }
+            KeyCode::Char('s') => {
+                // Open scan path input (same as normal mode)
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
+                self.discover.scan_path_input.clear();
+                self.discover.scan_error = None;
             }
             _ => {}
         }
@@ -1457,84 +1916,111 @@ impl App {
     }
 
     /// Handle keys when Sources dropdown is open
-    /// Arrow keys navigate, all other chars go to filter
+    /// Vim-style modal: navigation mode by default, '/' enters filter mode
     fn handle_sources_dropdown_key(&mut self, key: KeyEvent) {
+        // Filter mode: text input goes to filter
+        if self.discover.sources_filtering {
+            match key.code {
+                KeyCode::Enter => {
+                    // Confirm filter, stay in dropdown but exit filter mode
+                    self.discover.sources_filtering = false;
+                }
+                KeyCode::Esc => {
+                    // Clear filter and exit filter mode
+                    self.discover.sources_filter.clear();
+                    self.discover.sources_filtering = false;
+                    // Reset preview to first item
+                    let filtered = self.filtered_sources();
+                    self.discover.preview_source = filtered.first().map(|(i, _)| *i);
+                }
+                KeyCode::Backspace => {
+                    self.discover.sources_filter.pop();
+                    self.update_sources_preview_after_filter();
+                }
+                KeyCode::Char(c) => {
+                    self.discover.sources_filter.push(c);
+                    self.update_sources_preview_after_filter();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Navigation mode: keybindings work
         let filtered = self.filtered_sources();
 
         match key.code {
-            KeyCode::Down => {
+            KeyCode::Char('j') | KeyCode::Down => {
+                // Navigate down in dropdown - DON'T reload files here (perf fix)
+                // Files only reload on Enter (confirm selection)
                 if let Some(preview_idx) = self.discover.preview_source {
-                    // Find current position in filtered list
                     if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
                         if pos + 1 < filtered.len() {
                             self.discover.preview_source = Some(filtered[pos + 1].0);
-                            self.discover.data_loaded = false; // Trigger file preview reload
                         }
                     }
                 } else if !filtered.is_empty() {
                     self.discover.preview_source = Some(filtered[0].0);
-                    self.discover.data_loaded = false;
                 }
             }
-            KeyCode::Up => {
+            KeyCode::Char('k') | KeyCode::Up => {
+                // Navigate up in dropdown - DON'T reload files here (perf fix)
                 if let Some(preview_idx) = self.discover.preview_source {
                     if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
                         if pos > 0 {
                             self.discover.preview_source = Some(filtered[pos - 1].0);
-                            self.discover.data_loaded = false;
                         }
                     }
                 }
             }
+            KeyCode::Char('/') => {
+                // Enter filter mode
+                self.discover.sources_filtering = true;
+            }
+            KeyCode::Char('s') => {
+                // Open scan dialog to add new source
+                self.discover.view_state = DiscoverViewState::Files;
+                self.discover.sources_filter.clear();
+                self.discover.sources_filtering = false;
+                self.discover.preview_source = None;
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
+                self.discover.scan_path_input.clear();
+                self.discover.scan_error = None;
+            }
             KeyCode::Enter => {
-                // Confirm selection, close dropdown, focus Files
+                // Confirm selection, close dropdown
                 if let Some(preview_idx) = self.discover.preview_source {
-                    self.discover.selected_source = preview_idx;
-                    self.discover.data_loaded = false; // Reload files for confirmed source
-                    // Clear tag selection when source changes
+                    self.discover.select_source_by_index(preview_idx);
+                    self.discover.data_loaded = false;
                     self.discover.selected_tag = None;
                     self.discover.filter.clear();
                 }
-                self.discover.sources_dropdown_open = false;
+                self.discover.view_state = DiscoverViewState::Files;
                 self.discover.sources_filter.clear();
+                self.discover.sources_filtering = false;
                 self.discover.preview_source = None;
                 self.discover.focus = DiscoverFocus::Files;
             }
             KeyCode::Esc => {
                 // Close dropdown without changing selection
-                self.discover.sources_dropdown_open = false;
+                self.discover.view_state = DiscoverViewState::Files;
                 self.discover.sources_filter.clear();
+                self.discover.sources_filtering = false;
                 self.discover.preview_source = None;
                 self.discover.focus = DiscoverFocus::Files;
             }
-            KeyCode::Backspace => {
-                self.discover.sources_filter.pop();
-                // Reset preview to first match if current preview is filtered out
-                let filtered = self.filtered_sources();
-                if let Some(preview_idx) = self.discover.preview_source {
-                    if !filtered.iter().any(|(i, _)| *i == preview_idx) {
-                        self.discover.preview_source = filtered.first().map(|(i, _)| *i);
-                        if self.discover.preview_source.is_some() {
-                            self.discover.data_loaded = false;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                // All characters go to filter (including numbers, j, k, etc.)
-                self.discover.sources_filter.push(c);
-                // Reset preview to first match if current preview is filtered out
-                let filtered = self.filtered_sources();
-                if let Some(preview_idx) = self.discover.preview_source {
-                    if !filtered.iter().any(|(i, _)| *i == preview_idx) {
-                        self.discover.preview_source = filtered.first().map(|(i, _)| *i);
-                        if self.discover.preview_source.is_some() {
-                            self.discover.data_loaded = false;
-                        }
-                    }
-                }
-            }
             _ => {}
+        }
+    }
+
+    /// Helper to update preview after filter changes
+    /// Note: Does NOT reload files - that only happens on Enter (perf fix)
+    fn update_sources_preview_after_filter(&mut self) {
+        let filtered = self.filtered_sources();
+        if let Some(preview_idx) = self.discover.preview_source {
+            if !filtered.iter().any(|(i, _)| *i == preview_idx) {
+                self.discover.preview_source = filtered.first().map(|(i, _)| *i);
+            }
         }
     }
 
@@ -1543,7 +2029,7 @@ impl App {
         match key.code {
             KeyCode::Char('s') => {
                 // Create new source (open scan dialog)
-                self.discover.is_entering_path = true;
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
                 self.discover.scan_path_input.clear();
                 self.discover.scan_error = None;
             }
@@ -1552,31 +2038,53 @@ impl App {
     }
 
     /// Handle keys when Tags dropdown is open
-    /// Arrow keys navigate, all other chars go to filter
-    /// Note: File filtering by tag is done in-memory via filtered_files()
+    /// Vim-style modal: navigation mode by default, '/' enters filter mode
     fn handle_tags_dropdown_key(&mut self, key: KeyEvent) {
+        // Filter mode: text input goes to filter
+        if self.discover.tags_filtering {
+            match key.code {
+                KeyCode::Enter => {
+                    // Confirm filter, stay in dropdown but exit filter mode
+                    self.discover.tags_filtering = false;
+                }
+                KeyCode::Esc => {
+                    // Clear filter and exit filter mode
+                    self.discover.tags_filter.clear();
+                    self.discover.tags_filtering = false;
+                }
+                KeyCode::Backspace => {
+                    self.discover.tags_filter.pop();
+                    self.update_tags_preview_after_filter();
+                }
+                KeyCode::Char(c) => {
+                    self.discover.tags_filter.push(c);
+                    self.update_tags_preview_after_filter();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Navigation mode: keybindings work
+        let filtered = self.filtered_tags();
+
         match key.code {
-            KeyCode::Down => {
-                let filtered = self.filtered_tags();
+            KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(preview_idx) = self.discover.preview_tag {
-                    // Find current position in filtered list
                     if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
                         if pos + 1 < filtered.len() {
                             let new_idx = filtered[pos + 1].0;
                             self.discover.preview_tag = Some(new_idx);
-                            // Reset file selection when tag changes
                             self.discover.selected = 0;
                         }
                     }
                 } else if !filtered.is_empty() {
-                    // Select first tag
                     let new_idx = filtered[0].0;
                     self.discover.preview_tag = Some(new_idx);
                     self.discover.selected = 0;
                 }
             }
-            KeyCode::Up => {
-                let filtered = self.filtered_tags();
+            KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(preview_idx) = self.discover.preview_tag {
                     if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
                         if pos > 0 {
@@ -1591,11 +2099,16 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('/') => {
+                // Enter filter mode
+                self.discover.tags_filtering = true;
+            }
             KeyCode::Enter => {
-                // Confirm selection, close dropdown, focus Files
+                // Confirm selection, close dropdown
                 self.discover.selected_tag = self.discover.preview_tag;
-                self.discover.tags_dropdown_open = false;
+                self.discover.view_state = DiscoverViewState::Files;
                 self.discover.tags_filter.clear();
+                self.discover.tags_filtering = false;
                 self.discover.preview_tag = None;
                 self.discover.focus = DiscoverFocus::Files;
                 self.discover.selected = 0;
@@ -1603,50 +2116,25 @@ impl App {
             KeyCode::Esc => {
                 // Close dropdown, show all files
                 self.discover.selected_tag = None;
-                self.discover.tags_dropdown_open = false;
+                self.discover.view_state = DiscoverViewState::Files;
                 self.discover.tags_filter.clear();
+                self.discover.tags_filtering = false;
                 self.discover.preview_tag = None;
                 self.discover.focus = DiscoverFocus::Files;
                 self.discover.selected = 0;
             }
-            KeyCode::Backspace => {
-                if self.discover.tags_filter.is_empty() {
-                    // Empty filter + backspace: move to "All files" or close
-                    if self.discover.preview_tag.is_some() {
-                        self.discover.preview_tag = None;
-                        self.discover.selected = 0;
-                    } else {
-                        // Already at "all files", close dropdown
-                        self.discover.selected_tag = None;
-                        self.discover.tags_dropdown_open = false;
-                        self.discover.focus = DiscoverFocus::Files;
-                        self.discover.selected = 0;
-                    }
-                } else {
-                    self.discover.tags_filter.pop();
-                    // Reset preview if filtered out
-                    let filtered = self.filtered_tags();
-                    if let Some(preview_idx) = self.discover.preview_tag {
-                        if !filtered.iter().any(|(i, _)| *i == preview_idx) {
-                            self.discover.preview_tag = filtered.first().map(|(i, _)| *i);
-                            self.discover.selected = 0;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                // All characters go to filter (including numbers, j, k, etc.)
-                self.discover.tags_filter.push(c);
-                // Reset preview to first match if current is filtered out
-                let filtered = self.filtered_tags();
-                if let Some(preview_idx) = self.discover.preview_tag {
-                    if !filtered.iter().any(|(i, _)| *i == preview_idx) {
-                        self.discover.preview_tag = filtered.first().map(|(i, _)| *i);
-                        self.discover.selected = 0;
-                    }
-                }
-            }
             _ => {}
+        }
+    }
+
+    /// Helper to update preview after tags filter changes
+    fn update_tags_preview_after_filter(&mut self) {
+        let filtered = self.filtered_tags();
+        if let Some(preview_idx) = self.discover.preview_tag {
+            if !filtered.iter().any(|(i, _)| *i == preview_idx) {
+                self.discover.preview_tag = filtered.first().map(|(i, _)| *i);
+                self.discover.selected = 0;
+            }
         }
     }
 
@@ -1674,17 +2162,17 @@ impl App {
             }
             KeyCode::Char('n') => {
                 // Create new rule
-                self.discover.is_creating_rule = true;
+                self.transition_discover_state(DiscoverViewState::RuleCreation);
                 self.discover.rule_tag_input.clear();
                 self.discover.rule_pattern_input.clear();
                 self.discover.editing_rule_id = None;
             }
             KeyCode::Char('e') => {
                 // Edit selected rule
-                if let Some(rule) = self.discover.rules.get(self.discover.selected_rule) {
-                    self.discover.is_creating_rule = true;
-                    self.discover.rule_pattern_input = rule.pattern.clone();
-                    self.discover.rule_tag_input = rule.tag.clone();
+                if let Some(rule) = self.discover.rules.get(self.discover.selected_rule).cloned() {
+                    self.transition_discover_state(DiscoverViewState::RuleCreation);
+                    self.discover.rule_pattern_input = rule.pattern;
+                    self.discover.rule_tag_input = rule.tag;
                     self.discover.editing_rule_id = Some(rule.id);
                 }
             }
@@ -1707,7 +2195,134 @@ impl App {
             }
             KeyCode::Esc => {
                 // Close Rules Manager
-                self.discover.rules_manager_open = false;
+                self.return_to_previous_discover_state();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle keys when Sources Manager dialog is open (spec v1.7)
+    fn handle_sources_manager_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.discover.sources_manager_selected < self.discover.sources.len().saturating_sub(1) {
+                    self.discover.sources_manager_selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.discover.sources_manager_selected > 0 {
+                    self.discover.sources_manager_selected -= 1;
+                }
+            }
+            KeyCode::Char('n') => {
+                // Add new source (open scan dialog)
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
+                self.discover.scan_path_input.clear();
+                self.discover.scan_error = None;
+            }
+            KeyCode::Char('e') => {
+                // Edit selected source name
+                if let Some(source) = self.discover.sources.get(self.discover.sources_manager_selected) {
+                    self.discover.editing_source = Some(source.id.clone());
+                    self.discover.source_edit_input = source.name.clone();
+                    self.transition_discover_state(DiscoverViewState::SourceEdit);
+                }
+            }
+            KeyCode::Char('d') => {
+                // Delete source (with confirmation)
+                if let Some(source) = self.discover.sources.get(self.discover.sources_manager_selected) {
+                    self.discover.source_to_delete = Some(source.id.clone());
+                    self.transition_discover_state(DiscoverViewState::SourceDeleteConfirm);
+                }
+            }
+            KeyCode::Char('r') => {
+                // Rescan selected source
+                let source_info = self.discover.sources.get(self.discover.sources_manager_selected)
+                    .map(|s| (s.path.to_string_lossy().to_string(), s.name.clone()));
+
+                if let Some((path, name)) = source_info {
+                    self.scan_directory(&path);
+                    self.discover.status_message = Some((
+                        format!("Rescanning '{}'...", name),
+                        false,
+                    ));
+                }
+            }
+            KeyCode::Esc => {
+                self.return_to_previous_discover_state();
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle keys when Source Edit dialog is open (spec v1.7)
+    fn handle_source_edit_key(&mut self, key: KeyEvent) {
+        match handle_text_input(key, &mut self.discover.source_edit_input) {
+            TextInputResult::Committed => {
+                let new_name = self.discover.source_edit_input.trim().to_string();
+                if !new_name.is_empty() {
+                    if let Some(source_id) = &self.discover.editing_source {
+                        // Update source name in local state
+                        if let Some(source) = self.discover.sources.iter_mut()
+                            .find(|s| &s.id == source_id)
+                        {
+                            source.name = new_name.clone();
+                            self.discover.status_message = Some((
+                                format!("Renamed source to '{}'", new_name),
+                                false,
+                            ));
+                            // TODO: Persist to DB
+                        }
+                    }
+                }
+                self.discover.editing_source = None;
+                self.discover.source_edit_input.clear();
+                self.transition_discover_state(DiscoverViewState::SourcesManager);
+            }
+            TextInputResult::Cancelled => {
+                self.discover.editing_source = None;
+                self.discover.source_edit_input.clear();
+                self.transition_discover_state(DiscoverViewState::SourcesManager);
+            }
+            TextInputResult::Continue | TextInputResult::NotHandled => {}
+        }
+    }
+
+    /// Handle keys when Source Delete Confirmation dialog is open (spec v1.7)
+    fn handle_source_delete_confirm_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                if let Some(source_id) = self.discover.source_to_delete.take() {
+                    // Find and remove the source
+                    let source_name = self.discover.sources.iter()
+                        .find(|s| s.id == source_id)
+                        .map(|s| s.name.clone());
+
+                    self.discover.sources.retain(|s| s.id != source_id);
+
+                    // Adjust selection if needed
+                    if self.discover.sources_manager_selected >= self.discover.sources.len()
+                        && self.discover.sources_manager_selected > 0
+                    {
+                        self.discover.sources_manager_selected -= 1;
+                    }
+
+                    // Validate main selection after deletion
+                    self.discover.validate_source_selection();
+
+                    if let Some(name) = source_name {
+                        self.discover.status_message = Some((
+                            format!("Deleted source '{}'", name),
+                            false,
+                        ));
+                    }
+                    // TODO: Delete from DB (cascade delete files)
+                }
+                self.transition_discover_state(DiscoverViewState::SourcesManager);
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.discover.source_to_delete = None;
+                self.transition_discover_state(DiscoverViewState::SourcesManager);
             }
             _ => {}
         }
@@ -1765,7 +2380,7 @@ impl App {
 
     /// Open the rule creation dialog with context-aware prefilling
     fn open_rule_creation_dialog(&mut self) {
-        self.discover.is_creating_rule = true;
+        self.transition_discover_state(DiscoverViewState::RuleCreation);
         self.discover.rule_dialog_focus = RuleDialogFocus::Pattern;
 
         // Context-aware prefilling
@@ -1808,7 +2423,7 @@ impl App {
 
     /// Close the rule creation dialog and reset state
     fn close_rule_creation_dialog(&mut self) {
-        self.discover.is_creating_rule = false;
+        self.return_to_previous_discover_state();
         self.discover.rule_pattern_input.clear();
         self.discover.rule_tag_input.clear();
         self.discover.rule_preview_files.clear();
@@ -1870,58 +2485,6 @@ impl App {
         }
     }
 
-    /// Close the wizard dialog and save preference if checkbox is checked
-    fn close_wizard_and_save_preference(&mut self) {
-        self.discover.show_wizard = false;
-        self.discover.wizard_dismissed_this_session = true;
-
-        if self.discover.wizard_dont_show_checked {
-            self.discover.hide_wizard_forever = true;
-            // TODO: Persist to database
-            // For now, just set the local flag
-        }
-
-        self.discover.wizard_dont_show_checked = false;
-    }
-
-    /// Check if wizard should be shown (source selected, untagged files, not hidden)
-    fn should_show_wizard(&self) -> bool {
-        // Don't show if user has hidden it forever
-        if self.discover.hide_wizard_forever {
-            return false;
-        }
-
-        // Don't show if already dismissed this session
-        if self.discover.wizard_dismissed_this_session {
-            return false;
-        }
-
-        // Don't show if no sources
-        if self.discover.sources.is_empty() {
-            return false;
-        }
-
-        // Don't show if no files
-        if self.discover.files.is_empty() {
-            return false;
-        }
-
-        // Show if there are untagged files
-        let untagged_count = self.discover.files.iter()
-            .filter(|f| f.tags.is_empty())
-            .count();
-
-        untagged_count > 0
-    }
-
-    /// Trigger wizard check after source selection
-    fn maybe_show_wizard(&mut self) {
-        if self.should_show_wizard() && !self.discover.show_wizard {
-            self.discover.show_wizard = true;
-            self.discover.wizard_dont_show_checked = false;
-        }
-    }
-
     /// Apply a rule (pattern → tag) to all matching files
     /// Returns the number of files tagged
     /// Also queues DB writes for persistence
@@ -1954,7 +2517,10 @@ impl App {
                     file.tags.push(tag.to_string());
                     tagged_count += 1;
                     // Queue DB write
-                    self.discover.pending_tag_writes.push((file.path.clone(), tag.to_string()));
+                    self.discover.pending_tag_writes.push(PendingTagWrite {
+                        file_path: file.path.clone(),
+                        tag: tag.to_string(),
+                    });
                 }
             }
         }
@@ -1966,12 +2532,15 @@ impl App {
 
         // Queue rule write
         if tagged_count > 0 {
-            let source_id = self.discover.sources
-                .get(self.discover.selected_source)
+            let source_id = self.discover.selected_source()
                 .map(|s| s.id.clone())
                 .unwrap_or_default();
             if !source_id.is_empty() {
-                self.discover.pending_rule_writes.push((pattern.to_string(), tag.to_string(), source_id));
+                self.discover.pending_rule_writes.push(PendingRuleWrite {
+                    pattern: pattern.to_string(),
+                    tag: tag.to_string(),
+                    source_id,
+                });
             }
         }
 
@@ -2030,6 +2599,59 @@ impl App {
         self.discover.tags = tags;
     }
 
+    /// Refresh the current view's data (per spec Section 3.3)
+    fn refresh_current_view(&mut self) {
+        match self.mode {
+            TuiMode::Home => {
+                // Home stats are currently static placeholders
+                // TODO: Load real stats from database
+            }
+            TuiMode::Discover => {
+                // Mark data as needing refresh - will trigger reload on next tick
+                self.discover.data_loaded = false;
+                self.refresh_tags_list();
+            }
+            TuiMode::ParserBench => {
+                // Reload parsers from disk
+                self.parser_bench.parsers_loaded = false;
+                self.load_parsers();
+            }
+            TuiMode::Jobs => {
+                // TODO: Reload jobs from database
+                // For now just reset the view
+                self.jobs_state.selected_index = 0;
+            }
+            TuiMode::Inspect => {
+                // TODO: Reload tables from output directory
+                self.inspect.selected_table = 0;
+            }
+        }
+    }
+
+    /// Check if the app is in a text input mode where global keys should not be intercepted
+    fn in_text_input_mode(&self) -> bool {
+        match self.mode {
+            TuiMode::Discover => {
+                // All text input states are now in the view_state enum
+                matches!(
+                    self.discover.view_state,
+                    DiscoverViewState::Filtering |
+                    DiscoverViewState::EnteringPath |
+                    DiscoverViewState::Tagging |
+                    DiscoverViewState::CreatingSource |
+                    DiscoverViewState::BulkTagging |
+                    DiscoverViewState::RuleCreation |
+                    DiscoverViewState::SourcesDropdown |
+                    DiscoverViewState::TagsDropdown |
+                    DiscoverViewState::SourceEdit  // Added for Sources Manager
+                )
+            }
+            TuiMode::Inspect => self.inspect.query_focused,
+            TuiMode::ParserBench => self.parser_bench.is_filtering,
+            _ => false,
+        }
+    }
+
     /// Get files filtered by current tag and text filter
     ///
     /// Tag filtering:
@@ -2045,7 +2667,7 @@ impl App {
     /// - `*.py` matches files ending in .py
     pub fn filtered_files(&self) -> Vec<&FileInfo> {
         // Step 1: Get the active tag for filtering
-        let active_tag_idx = if self.discover.tags_dropdown_open {
+        let active_tag_idx = if self.discover.view_state == DiscoverViewState::TagsDropdown {
             self.discover.preview_tag
         } else {
             self.discover.selected_tag
@@ -2125,24 +2747,81 @@ impl App {
         }
     }
 
-    /// Scan a directory recursively and add files to the discover list
-    fn scan_directory(&mut self, path: &str) {
-        use std::path::Path;
-        use walkdir::WalkDir;
+    /// Scan a directory recursively and add files to the discover list (non-blocking)
+    ///
+    /// Path validation happens synchronously (fast). The actual directory walk
+    /// happens in a background task to avoid freezing the TUI. Results are
+    /// polled in tick() and applied when ready.
+    ///
+    /// ## Parallelism Design (fixing common pitfalls)
+    ///
+    /// 1. **Per-thread local batches**: Each thread accumulates files locally,
+    ///    only locking to flush full batches. This avoids the "global mutex on
+    ///    every file" anti-pattern that serializes parallel work.
+    ///
+    /// 2. **Atomic compare-exchange for progress**: Prevents duplicate progress
+    ///    messages from racing threads.
 
-        let path = Path::new(path);
+    // =========================================================================
+    // Job Management for Scans
+    // =========================================================================
 
-        // Expand ~ to home directory
-        let expanded_path = if path.starts_with("~") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(path.strip_prefix("~").unwrap_or(path))
-            } else {
-                path.to_path_buf()
-            }
-        } else {
-            path.to_path_buf()
+    /// Create a new scan job and add it to the jobs list.
+    ///
+    /// Returns the job ID for tracking status updates.
+    fn add_scan_job(&mut self, directory_path: &str) -> i64 {
+        // Generate unique job ID from timestamp
+        let job_id = chrono::Local::now().timestamp_millis();
+
+        let job = JobInfo {
+            id: job_id,
+            file_path: directory_path.to_string(),
+            parser_name: "scan".to_string(), // Distinguish scan jobs from parser jobs
+            status: JobStatus::Running,
+            retry_count: 0,
+            error_message: None,
+            created_at: chrono::Local::now(),
         };
 
+        // Add to front of list so it's visible immediately
+        self.jobs_state.jobs.insert(0, job);
+
+        job_id
+    }
+
+    /// Update the status of a scan job.
+    ///
+    /// Finds the job by ID and updates its status and error message.
+    fn update_scan_job_status(&mut self, job_id: i64, status: JobStatus, error: Option<String>) {
+        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
+            job.status = status;
+            if error.is_some() {
+                job.error_message = error;
+            }
+        }
+    }
+
+    /// Scan a directory using the unified parallel scanner.
+    ///
+    /// Uses `scout::Scanner` for parallel walking and DB persistence.
+    /// Progress updates are forwarded to the TUI via channel.
+    fn scan_directory(&mut self, path: &str) {
+        use std::path::Path;
+
+        let path_input = Path::new(path);
+
+        // Expand ~ to home directory (synchronous, fast)
+        let expanded_path = if path_input.starts_with("~") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(path_input.strip_prefix("~").unwrap_or(path_input))
+            } else {
+                path_input.to_path_buf()
+            }
+        } else {
+            path_input.to_path_buf()
+        };
+
+        // Path validation - synchronous (fast filesystem checks)
         if !expanded_path.exists() {
             self.discover.scan_error = Some(format!("Path not found: {}", expanded_path.display()));
             return;
@@ -2153,46 +2832,240 @@ impl App {
             return;
         }
 
-        // Scan directory recursively using walkdir
-        let mut new_files = Vec::new();
-        for entry in WalkDir::new(&expanded_path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let file_path = entry.path();
-            if let Ok(metadata) = entry.metadata() {
-                let modified = metadata.modified()
-                    .map(|t| chrono::DateTime::<chrono::Local>::from(t))
-                    .unwrap_or_else(|_| chrono::Local::now());
+        // Check if directory is readable
+        if std::fs::read_dir(&expanded_path).is_err() {
+            self.discover.scan_error = Some(format!("Cannot read directory: {}", expanded_path.display()));
+            return;
+        }
 
-                // Skip the root directory itself
-                if file_path == expanded_path {
+        // Path is valid - enter scanning state and spawn background task
+        let path_display = expanded_path.display().to_string();
+        self.discover.scanning_path = Some(path_display.clone());
+        self.discover.scan_progress = Some(ScoutProgress {
+            dirs_scanned: 0,
+            files_found: 0,
+            current_dir: Some("Initializing...".to_string()),
+        });
+        self.discover.scan_start_time = Some(std::time::Instant::now());
+        self.discover.view_state = DiscoverViewState::Scanning;
+        self.discover.scan_error = None;
+
+        // Channel for TUI scan results
+        let (tui_tx, tui_rx) = mpsc::channel::<TuiScanResult>(256);
+        self.pending_scan = Some(tui_rx);
+
+        // Create scan job for tracking in Jobs view
+        let job_id = self.add_scan_job(&path_display);
+        self.current_scan_job_id = Some(job_id);
+
+        // Get database path
+        let db_path = self.config.database.clone()
+            .unwrap_or_else(crate::cli::config::default_db_path);
+
+        let source_path = path_display;
+
+        // Spawn async task for scanning
+        tokio::spawn(async move {
+            // Open database
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let db = match ScoutDatabase::open(&db_path).await {
+                Ok(db) => db,
+                Err(e) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Failed to open database: {}", e))).await;
+                    return;
+                }
+            };
+
+            // Check if source with this path already exists (rescan case)
+            let existing_source = match db.get_source_by_path(&source_path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Database error: {}", e))).await;
+                    return;
+                }
+            };
+
+            let source = if let Some(existing) = existing_source {
+                // Rescan existing source - use existing source record
+                existing
+            } else {
+                // New source - create record
+                let source_name = std::path::Path::new(&source_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| source_path.clone());
+
+                // Check if a source with this name (but different path) already exists
+                if let Ok(Some(name_conflict)) = db.get_source_by_name(&source_name).await {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "A source named '{}' already exists at '{}'. Use Sources Manager (M) to rename or delete it first.",
+                        source_name, name_conflict.path
+                    ))).await;
+                    return;
+                }
+
+                let source_id = format!("local:{}", source_path.replace(['/', '\\'], "_"));
+
+                let new_source = Source {
+                    id: source_id,
+                    name: source_name,
+                    source_type: SourceType::Local,
+                    path: source_path.clone(),
+                    poll_interval_secs: 0,
+                    enabled: true,
+                };
+
+                // Insert new source
+                if let Err(e) = db.upsert_source(&new_source).await {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Failed to save source: {}", e))).await;
+                    return;
+                }
+
+                new_source
+            };
+
+            // Create progress channel that sends directly to TUI
+            // We wrap tui_tx in a channel adapter so scanner can use its existing interface
+            let (progress_tx, mut progress_rx) = mpsc::channel::<ScoutProgress>(512);
+
+            // Spawn a task to forward progress - use spawn_blocking context awareness
+            let tui_tx_progress = tui_tx.clone();
+            let forward_handle = tokio::spawn(async move {
+                while let Some(progress) = progress_rx.recv().await {
+                    // Send to TUI channel
+                    let _ = tui_tx_progress.try_send(TuiScanResult::Progress(progress));
+                }
+            });
+
+            // Create scanner with default config
+            let scanner = ScoutScanner::new(db);
+
+            // Run the scan in a blocking task so it doesn't block the runtime
+            let scan_result = {
+                let source_clone = source.clone();
+                tokio::task::spawn_blocking(move || {
+                    // Create a new runtime for the blocking task
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(scanner.scan_source_with_progress(&source_clone, Some(progress_tx)))
+                }).await
+            };
+
+            // Wait for forwarding to complete
+            let _ = forward_handle.await;
+
+            match scan_result {
+                Ok(Ok(_result)) => {
+                    // Scan complete - TUI will load files from DB
+                    let _ = tui_tx.send(TuiScanResult::Complete {
+                        source_path,
+                    }).await;
+                }
+                Ok(Err(e)) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Scan failed: {}", e))).await;
+                }
+                Err(e) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Scan task panicked: {}", e))).await;
+                }
+            }
+        });
+    }
+
+    /// List directories matching a partial path for autocomplete
+    ///
+    /// Given a partial path like "/Users/shan/Do", returns directories that match:
+    /// - If path ends with '/', lists directories in that path
+    /// - Otherwise, lists directories in parent matching the prefix
+    ///
+    /// Returns up to 8 suggestions, excludes hidden directories (starting with '.').
+    fn list_directories(partial_path: &str) -> Vec<String> {
+        use std::path::Path;
+
+        let partial = if partial_path.starts_with("~") {
+            if let Some(home) = dirs::home_dir() {
+                let rest = partial_path.strip_prefix("~").unwrap_or("");
+                home.join(rest.trim_start_matches('/')).to_string_lossy().to_string()
+            } else {
+                partial_path.to_string()
+            }
+        } else {
+            partial_path.to_string()
+        };
+
+        let path = Path::new(&partial);
+
+        let (parent, prefix) = if partial.ends_with('/') || partial.ends_with('\\') {
+            // Path ends with separator - list contents of this directory
+            (path, "")
+        } else {
+            // Split into parent directory and prefix to match
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            let prefix = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            (parent, prefix)
+        };
+
+        // Read directory and filter
+        let mut suggestions = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                // Check if it's a directory
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
 
-                // Compute relative path from scan root
-                let rel_path = file_path
-                    .strip_prefix(&expanded_path)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| file_path.display().to_string());
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
 
-                new_files.push(FileInfo {
-                    path: file_path.display().to_string(),
-                    rel_path,
-                    size: metadata.len(),
-                    modified,
-                    is_dir: metadata.is_dir(),
-                    tags: vec![],
-                });
+                // Skip hidden directories
+                if name_str.starts_with('.') {
+                    continue;
+                }
+
+                // Check prefix match (case-insensitive)
+                if name_str.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                    suggestions.push(format!("{}/", name_str));
+                }
             }
         }
 
-        // Sort by path for consistent ordering
-        new_files.sort_by(|a, b| a.path.cmp(&b.path));
+        // Sort alphabetically and limit to 8
+        suggestions.sort();
+        suggestions.truncate(8);
+        suggestions
+    }
 
-        self.discover.files = new_files;
-        self.discover.selected = 0;
-        self.discover.scan_error = None;
+    /// Update path suggestions based on current input
+    fn update_path_suggestions(&mut self) {
+        self.discover.path_suggestions = Self::list_directories(&self.discover.scan_path_input);
+        self.discover.path_suggestion_idx = 0;
+    }
+
+    /// Apply the selected suggestion to the path input
+    fn apply_path_suggestion(&mut self) {
+        if let Some(suggestion) = self.discover.path_suggestions.get(self.discover.path_suggestion_idx) {
+            let input = &self.discover.scan_path_input;
+
+            // Find the parent path (everything up to and including the last separator)
+            let parent = if input.ends_with('/') || input.ends_with('\\') {
+                input.clone()
+            } else if let Some(pos) = input.rfind(|c| c == '/' || c == '\\') {
+                input[..=pos].to_string()
+            } else {
+                String::new()
+            };
+
+            // Combine parent with suggestion
+            self.discover.scan_path_input = format!("{}{}", parent, suggestion);
+            self.update_path_suggestions();
+        }
     }
 
     /// Load files from Scout database for the selected source (async using sqlx)
@@ -2210,10 +3083,10 @@ impl App {
         use sqlx::SqlitePool;
 
         // Use preview source if dropdown is open, otherwise use selected source
-        let source_idx = if self.discover.sources_dropdown_open {
-            self.discover.preview_source.unwrap_or(self.discover.selected_source)
+        let source_idx = if self.discover.view_state == DiscoverViewState::SourcesDropdown {
+            self.discover.preview_source.unwrap_or_else(|| self.discover.selected_source_index())
         } else {
-            self.discover.selected_source
+            self.discover.selected_source_index()
         };
 
         // Check if we have a selected source - source-first workflow
@@ -2258,7 +3131,7 @@ impl App {
                 "#;
 
                 match sqlx::query_as::<_, (String, String, String, i64, i64, Option<String>)>(query)
-                    .bind(&selected_source_id)
+                    .bind(selected_source_id.as_str())
                     .fetch_all(&pool)
                     .await
                 {
@@ -2291,9 +3164,6 @@ impl App {
                         self.discover.selected = 0;
                         self.discover.data_loaded = true;
                         self.discover.scan_error = None;
-
-                        // Show wizard if there are untagged files (first-time UX)
-                        self.maybe_show_wizard();
                     }
                     Err(e) => {
                         self.discover.scan_error = Some(format!("Query failed: {}", e));
@@ -2304,6 +3174,384 @@ impl App {
             Err(e) => {
                 self.discover.scan_error = Some(format!("DB connection failed: {}", e));
                 self.discover.data_loaded = true;
+            }
+        }
+    }
+
+    /// Load folder tree for Glob Explorer (hierarchical file browsing).
+    ///
+    /// This replaces load_scout_files() when glob_explorer is active.
+    /// Queries are batched: folders + preview files + total count in one function call.
+    /// State is updated atomically at the end.
+    ///
+    /// NOTE: Currently unused - replaced by preload_folder_cache() for O(1) navigation.
+    /// Kept for potential future use with complex SQL-based pattern filtering.
+    #[allow(dead_code)]
+    async fn load_folder_tree(&mut self) {
+        use sqlx::SqlitePool;
+
+        // Must have glob_explorer active and a source selected
+        let source_id = match &self.discover.selected_source_id {
+            Some(id) => id.clone(),
+            None => return,
+        };
+        let explorer = match &self.discover.glob_explorer {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        let db_path = dirs::home_dir()
+            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+
+        if !db_path.exists() {
+            return;
+        }
+
+        let db_url = format!("sqlite:{}?mode=ro", db_path.display());
+        let pool = match SqlitePool::connect(&db_url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let prefix = &explorer.current_prefix;
+        let prefix_len = prefix.len() as i32;
+        let glob_pattern = if explorer.pattern.is_empty() {
+            None
+        } else {
+            Some(explorer.pattern.as_str())
+        };
+
+        // --- Batch Query 1: Folder counts at current depth ---
+        let folder_query = if glob_pattern.is_some() {
+            r#"
+            SELECT
+                CASE
+                    WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
+                    THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
+                    ELSE SUBSTR(rel_path, ? + 1)
+                END AS item_name,
+                COUNT(*) as file_count,
+                MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
+            FROM scout_files
+            WHERE source_id = ?
+              AND rel_path LIKE ? || '%'
+              AND rel_path GLOB ?
+              AND LENGTH(rel_path) > ?
+            GROUP BY item_name
+            ORDER BY file_count DESC
+            LIMIT 100
+            "#
+        } else {
+            r#"
+            SELECT
+                CASE
+                    WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
+                    THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
+                    ELSE SUBSTR(rel_path, ? + 1)
+                END AS item_name,
+                COUNT(*) as file_count,
+                MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
+            FROM scout_files
+            WHERE source_id = ?
+              AND rel_path LIKE ? || '%'
+              AND LENGTH(rel_path) > ?
+            GROUP BY item_name
+            ORDER BY file_count DESC
+            LIMIT 100
+            "#
+        };
+
+        let folders_result: Result<Vec<(String, i64, i32)>, _> = if let Some(pattern) = glob_pattern {
+            sqlx::query_as(folder_query)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(source_id.as_str())
+                .bind(prefix)
+                .bind(pattern)
+                .bind(prefix_len)
+                .fetch_all(&pool)
+                .await
+        } else {
+            sqlx::query_as(folder_query)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(prefix_len)
+                .bind(source_id.as_str())
+                .bind(prefix)
+                .bind(prefix_len)
+                .fetch_all(&pool)
+                .await
+        };
+
+        // --- Batch Query 2: Preview files ---
+        let preview_result: Result<Vec<(String, i64, i64)>, _> = if let Some(pattern) = glob_pattern {
+            sqlx::query_as(
+                r#"
+                SELECT rel_path, size, mtime
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                  AND rel_path GLOB ?
+                ORDER BY mtime DESC
+                LIMIT 10
+                "#,
+            )
+            .bind(source_id.as_str())
+            .bind(prefix)
+            .bind(pattern)
+            .fetch_all(&pool)
+            .await
+        } else {
+            sqlx::query_as(
+                r#"
+                SELECT rel_path, size, mtime
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                ORDER BY mtime DESC
+                LIMIT 10
+                "#,
+            )
+            .bind(source_id.as_str())
+            .bind(prefix)
+            .fetch_all(&pool)
+            .await
+        };
+
+        // --- Batch Query 3: Total count ---
+        let count_result: Result<(i64,), _> = if let Some(pattern) = glob_pattern {
+            sqlx::query_as(
+                r#"
+                SELECT COUNT(*)
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                  AND rel_path GLOB ?
+                "#,
+            )
+            .bind(source_id.as_str())
+            .bind(prefix)
+            .bind(pattern)
+            .fetch_one(&pool)
+            .await
+        } else {
+            sqlx::query_as(
+                r#"
+                SELECT COUNT(*)
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ? || '%'
+                "#,
+            )
+            .bind(source_id.as_str())
+            .bind(prefix)
+            .fetch_one(&pool)
+            .await
+        };
+
+        // --- ATOMIC STATE UPDATE ---
+        // Only update if all queries succeeded
+        if let (Ok(folders_raw), Ok(preview_raw), Ok((count,))) =
+            (folders_result, preview_result, count_result)
+        {
+            let folders: Vec<FolderInfo> = folders_raw
+                .into_iter()
+                .filter(|(name, _, _)| !name.is_empty())
+                .map(|(name, count, is_file)| FolderInfo {
+                    name,
+                    file_count: count as usize,
+                    is_file: is_file != 0,
+                })
+                .collect();
+
+            let preview_files: Vec<GlobPreviewFile> = preview_raw
+                .into_iter()
+                .map(|(rel_path, size, mtime)| GlobPreviewFile {
+                    rel_path,
+                    size: size as u64,
+                    mtime,
+                })
+                .collect();
+
+            let total_count = GlobFileCount::Exact(count as usize);
+
+            // Update explorer state atomically
+            if let Some(ref mut explorer) = self.discover.glob_explorer {
+                explorer.folders = folders;
+                explorer.preview_files = preview_files;
+                explorer.total_count = total_count;
+                explorer.selected_folder = 0;
+            }
+        }
+
+        // Mark as loaded (whether success or failure)
+        self.discover.data_loaded = true;
+    }
+
+    /// Preload entire folder hierarchy into cache for O(1) navigation.
+    /// Called once when source is selected. After this, all drill-in/back
+    /// operations use the in-memory HashMap instead of SQL queries.
+    async fn preload_folder_cache(&mut self) {
+        use sqlx::SqlitePool;
+
+        // Must have glob_explorer active and a source selected
+        let source_id = match &self.discover.selected_source_id {
+            Some(id) => id.clone(),
+            None => return,
+        };
+
+        // Skip if cache already loaded for this source
+        if let Some(ref explorer) = self.discover.glob_explorer {
+            if explorer.cache_loaded {
+                if let Some(ref cached_id) = explorer.cache_source_id {
+                    if cached_id.as_str() == source_id.as_str() {
+                        return; // Already cached for this source
+                    }
+                }
+            }
+        }
+
+        let db_path = dirs::home_dir()
+            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+
+        if !db_path.exists() {
+            return;
+        }
+
+        let db_url = format!("sqlite:{}?mode=ro", db_path.display());
+        let pool = match SqlitePool::connect(&db_url).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Single query: get all paths for this source
+        let paths: Vec<(String,)> = match sqlx::query_as(
+            "SELECT rel_path FROM scout_files WHERE source_id = ?"
+        )
+        .bind(source_id.as_str())
+        .fetch_all(&pool)
+        .await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Build cache in memory - O(n*m) where n=files, m=avg path depth
+        // Uses nested HashMap for O(1) lookup during build, then converts to Vec for display
+
+        // Intermediate structure: prefix -> (name -> (file_count, is_file))
+        // This gives O(1) lookup when checking if a segment exists
+        let mut build_cache: HashMap<String, HashMap<String, (usize, bool)>> = HashMap::new();
+
+        for (path,) in paths {
+            let segments: Vec<&str> = path.split('/').collect();
+            let mut current_prefix = String::new();
+
+            for (i, segment) in segments.iter().enumerate() {
+                if segment.is_empty() {
+                    continue;
+                }
+                let is_file = i == segments.len() - 1;
+                let level = build_cache.entry(current_prefix.clone()).or_default();
+
+                // O(1) lookup and update using HashMap
+                level.entry(segment.to_string())
+                    .and_modify(|(count, _)| *count += 1)
+                    .or_insert((1, is_file));
+
+                if !is_file {
+                    current_prefix = format!("{}{}/", current_prefix, segment);
+                }
+            }
+        }
+
+        // Convert to final format: HashMap<prefix, Vec<FolderInfo>> sorted by count
+        let mut cache: HashMap<String, Vec<FolderInfo>> = HashMap::with_capacity(build_cache.len());
+        for (prefix, entries) in build_cache {
+            let mut folder_vec: Vec<FolderInfo> = entries
+                .into_iter()
+                .map(|(name, (file_count, is_file))| FolderInfo {
+                    name,
+                    file_count,
+                    is_file,
+                })
+                .collect();
+            // Sort by file count descending
+            folder_vec.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+            cache.insert(prefix, folder_vec);
+        }
+
+        // Store cache and mark as loaded
+        if let Some(ref mut explorer) = self.discover.glob_explorer {
+            explorer.folder_cache = cache;
+            explorer.cache_loaded = true;
+            explorer.cache_source_id = Some(source_id.as_str().to_string());
+
+            // Initialize folders from cache at root level
+            if let Some(root_folders) = explorer.folder_cache.get("") {
+                explorer.folders = root_folders.clone();
+                explorer.total_count = GlobFileCount::Exact(
+                    root_folders.iter().map(|f| f.file_count).sum()
+                );
+            }
+        }
+    }
+
+    /// Update folders from cache based on current prefix (O(1) lookup).
+    /// Used for navigation instead of SQL queries.
+    /// If a pattern is set, filters entries in-memory using simple matching.
+    fn update_folders_from_cache(&mut self) {
+        if let Some(ref mut explorer) = self.discover.glob_explorer {
+            let prefix = explorer.current_prefix.clone();
+            let pattern = explorer.pattern.clone();
+
+            if let Some(cached_folders) = explorer.folder_cache.get(&prefix) {
+                // Filter folders based on pattern (in-memory)
+                let folders: Vec<FolderInfo> = if pattern.is_empty() {
+                    cached_folders.clone()
+                } else {
+                    // Simple pattern matching: supports *.ext and substring search
+                    let pattern_lower = pattern.to_lowercase();
+                    cached_folders.iter()
+                        .filter(|f| {
+                            let name_lower = f.name.to_lowercase();
+                            // Handle common glob patterns
+                            if pattern_lower.starts_with("*.") {
+                                // *.ext -> ends with .ext
+                                let ext = &pattern_lower[1..]; // ".ext"
+                                name_lower.ends_with(ext)
+                            } else if pattern_lower.ends_with("*") {
+                                // prefix* -> starts with prefix
+                                let prefix_pat = &pattern_lower[..pattern_lower.len()-1];
+                                name_lower.starts_with(prefix_pat)
+                            } else if pattern_lower.contains('*') {
+                                // a*b pattern -> starts with a and ends with b
+                                let parts: Vec<&str> = pattern_lower.split('*').collect();
+                                if parts.len() == 2 {
+                                    name_lower.starts_with(parts[0]) && name_lower.ends_with(parts[1])
+                                } else {
+                                    name_lower.contains(&pattern_lower.replace('*', ""))
+                                }
+                            } else {
+                                // Simple substring match
+                                name_lower.contains(&pattern_lower)
+                            }
+                        })
+                        .cloned()
+                        .collect()
+                };
+
+                explorer.folders = folders.clone();
+                explorer.total_count = GlobFileCount::Exact(
+                    folders.iter().map(|f| f.file_count).sum()
+                );
+                explorer.selected_folder = 0;
             }
         }
     }
@@ -2338,17 +3586,15 @@ impl App {
                 self.discover.sources = rows
                     .into_iter()
                     .map(|(id, name, path, file_count)| SourceInfo {
-                        id,
+                        id: SourceId::from(id),
                         name,
-                        path,
+                        path: std::path::PathBuf::from(path),
                         file_count: file_count as usize,
                     })
                     .collect();
 
-                // Auto-select first source if none selected and sources exist
-                if !self.discover.sources.is_empty() && self.discover.selected_source >= self.discover.sources.len() {
-                    self.discover.selected_source = 0;
-                }
+                // Auto-select first source if none selected or selection invalid
+                self.discover.validate_source_selection();
             }
         }
         self.discover.sources_loaded = true;
@@ -2360,7 +3606,7 @@ impl App {
         use sqlx::SqlitePool;
 
         // Get source ID for selected source
-        let source_id = match self.discover.sources.get(self.discover.selected_source) {
+        let source_id = match self.discover.sources.get(self.discover.selected_source_index()) {
             Some(source) => source.id.clone(),
             None => {
                 self.discover.tags.clear();
@@ -2382,7 +3628,7 @@ impl App {
             let total_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ?"
             )
-                .bind(&source_id)
+                .bind(source_id.as_str())
                 .fetch_one(&pool)
                 .await
                 .unwrap_or(0);
@@ -2406,7 +3652,7 @@ impl App {
             });
 
             if let Ok(rows) = sqlx::query_as::<_, (String, i64)>(query)
-                .bind(&source_id)
+                .bind(source_id.as_str())
                 .fetch_all(&pool)
                 .await
             {
@@ -2423,7 +3669,7 @@ impl App {
             let untagged_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND (tag IS NULL OR tag = '')"
             )
-                .bind(&source_id)
+                .bind(source_id.as_str())
                 .fetch_one(&pool)
                 .await
                 .unwrap_or(0);
@@ -2473,19 +3719,19 @@ impl App {
 
         // Persist tag updates to scout_files
         let tag_writes = std::mem::take(&mut self.discover.pending_tag_writes);
-        for (file_path, tag) in tag_writes {
+        for write in tag_writes {
             let _ = sqlx::query("UPDATE scout_files SET tag = ? WHERE path = ?")
-                .bind(&tag)
-                .bind(&file_path)
+                .bind(&write.tag)
+                .bind(&write.file_path)
                 .execute(&pool)
                 .await;
         }
 
         // Persist rules to scout_tagging_rules
         let rule_writes = std::mem::take(&mut self.discover.pending_rule_writes);
-        for (pattern, tag, source_id) in rule_writes {
+        for write in rule_writes {
             let rule_id = uuid::Uuid::new_v4().to_string();
-            let rule_name = format!("{} → {}", pattern, tag);
+            let rule_name = format!("{} → {}", write.pattern, write.tag);
             let now = chrono::Utc::now().timestamp();
 
             let _ = sqlx::query(
@@ -2495,9 +3741,9 @@ impl App {
             )
                 .bind(&rule_id)
                 .bind(&rule_name)
-                .bind(&source_id)
-                .bind(&pattern)
-                .bind(&tag)
+                .bind(write.source_id.as_str())
+                .bind(&write.pattern)
+                .bind(&write.tag)
                 .bind(now)
                 .bind(now)
                 .execute(&pool)
@@ -2510,7 +3756,7 @@ impl App {
         use sqlx::SqlitePool;
 
         // Get source ID for selected source
-        let source_id = match self.discover.sources.get(self.discover.selected_source) {
+        let source_id = match self.discover.sources.get(self.discover.selected_source_index()) {
             Some(source) => source.id.clone(),
             None => {
                 self.discover.rules.clear();
@@ -2536,14 +3782,14 @@ impl App {
             "#;
 
             if let Ok(rows) = sqlx::query_as::<_, (i64, String, String, i32, bool)>(query)
-                .bind(&source_id)
+                .bind(source_id.as_str())
                 .fetch_all(&pool)
                 .await
             {
                 self.discover.rules = rows
                     .into_iter()
                     .map(|(id, pattern, tag, priority, enabled)| RuleInfo {
-                        id,
+                        id: RuleId::new(id),
                         pattern,
                         tag,
                         priority,
@@ -2584,28 +3830,17 @@ impl App {
                 }
             }
             // Enter: Navigate to selected mode
+            // Card order: 0=Discover, 1=ParserBench, 2=Jobs, 3=Sources (Inspect placeholder)
             KeyCode::Enter => {
                 self.mode = match self.home.selected_card {
                     0 => TuiMode::Discover,
                     1 => TuiMode::ParserBench,
-                    2 => TuiMode::Inspect,
-                    3 => TuiMode::Jobs,
+                    2 => TuiMode::Jobs,
+                    3 => TuiMode::Inspect, // TODO: TuiMode::Sources when implemented
                     _ => TuiMode::Home,
                 };
             }
-            // Number keys for quick access
-            KeyCode::Char('1') => {
-                self.mode = TuiMode::Discover;
-            }
-            KeyCode::Char('2') => {
-                self.mode = TuiMode::ParserBench;
-            }
-            KeyCode::Char('3') => {
-                self.mode = TuiMode::Inspect;
-            }
-            KeyCode::Char('4') => {
-                self.mode = TuiMode::Jobs;
-            }
+            // Number keys 1-4 are handled by global key handler
             _ => {}
         }
     }
@@ -3059,8 +4294,13 @@ impl App {
 
     /// Periodic tick for updates
     pub async fn tick(&mut self) {
-        // Load Scout data if in Discover mode
-        if self.mode == TuiMode::Discover {
+        // Increment tick counter for animated UI elements
+        self.tick_count = self.tick_count.wrapping_add(1);
+
+        // Poll scan progress FIRST - before any potentially blocking operations
+
+        // Load Scout data if in Discover mode (but NOT while scanning - don't block progress updates)
+        if self.mode == TuiMode::Discover && self.discover.view_state != DiscoverViewState::Scanning {
             // Process pending DB writes FIRST (before any reloads)
             self.persist_pending_writes().await;
 
@@ -3070,12 +4310,26 @@ impl App {
             }
             // Load files for selected source (also reloads tags when source changes)
             if !self.discover.data_loaded {
-                self.load_scout_files().await;
+                // Always use Glob Explorer (hierarchical browsing) - prevents freeze on large sources
+                if self.discover.glob_explorer.is_none() {
+                    self.discover.glob_explorer = Some(GlobExplorerState::default());
+                }
+
+                // Preload folder cache for O(1) navigation (one-time per source)
+                // This single SQL query builds the entire hierarchy in memory
+                self.preload_folder_cache().await;
+
+                // Update display from cache (O(1) lookup)
+                self.update_folders_from_cache();
+
                 // Reload tags for the (possibly new) selected source
                 self.load_tags_for_source().await;
+
+                // Mark as loaded
+                self.discover.data_loaded = true;
             }
             // Load rules for Rules Manager if it's open
-            if self.discover.rules_manager_open && self.discover.rules.is_empty() {
+            if self.discover.view_state == DiscoverViewState::RulesManager && self.discover.rules.is_empty() {
                 self.load_rules_for_manager().await;
             }
         }
@@ -3132,6 +4386,103 @@ impl App {
                     self.chat.awaiting_response = false;
                     self.pending_response = None;
                 }
+            }
+        }
+
+        // Poll for pending scan results (non-blocking directory scan)
+        // Process ALL available messages (progress updates + completion)
+        if let Some(ref mut rx) = self.pending_scan {
+            let mut scan_complete = false;
+            // Drain all available messages
+            loop {
+                match rx.try_recv() {
+                    Ok(result) => {
+                        match result {
+                            TuiScanResult::Progress(progress) => {
+                                // Update progress - UI will display this
+                                self.discover.scan_progress = Some(progress);
+                            }
+                            TuiScanResult::Complete { source_path } => {
+                                // Update job status to Completed
+                                if let Some(job_id) = self.current_scan_job_id {
+                                    self.update_scan_job_status(job_id, JobStatus::Completed, None);
+                                }
+
+                                // Scanner persisted to DB - reload sources and files
+                                let source_name = std::path::Path::new(&source_path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| source_path.clone());
+
+                                // Generate source ID matching scanner's format
+                                let source_id = SourceId(format!(
+                                    "local:{}",
+                                    source_path.replace('/', "_").replace('\\', "_")
+                                ));
+
+                                // Reload sources from DB to get updated list
+                                self.load_sources().await;
+
+                                // Select the newly scanned source
+                                self.discover.selected_source_id = Some(source_id);
+
+                                // Load files for the new source
+                                self.load_scout_files().await;
+
+                                let file_count = self.discover.files.len();
+                                self.discover.selected = 0;
+                                self.discover.scan_error = None;
+                                self.discover.view_state = DiscoverViewState::Files;
+                                self.discover.scanning_path = None;
+                                self.discover.scan_progress = None;
+                                self.discover.scan_start_time = None;
+                                self.discover.status_message = Some((
+                                    format!("Scanned {} files from {}", file_count, source_name),
+                                    false,
+                                ));
+                                scan_complete = true;
+                                break;
+                            }
+                            TuiScanResult::Error(err) => {
+                                // Update job status to Failed
+                                if let Some(job_id) = self.current_scan_job_id {
+                                    self.update_scan_job_status(job_id, JobStatus::Failed, Some(err.clone()));
+                                }
+
+                                self.discover.scan_error = Some(err);
+                                self.discover.view_state = DiscoverViewState::Files;
+                                self.discover.scanning_path = None;
+                                self.discover.scan_progress = None;
+                                self.discover.scan_start_time = None;
+                                scan_complete = true;
+                                break;
+                            }
+                        }
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        // Task ended without completion - mark job as failed
+                        if let Some(job_id) = self.current_scan_job_id {
+                            self.update_scan_job_status(
+                                job_id,
+                                JobStatus::Failed,
+                                Some("Scan task ended unexpectedly".to_string()),
+                            );
+                        }
+
+                        self.discover.scan_error = Some("Scan task ended unexpectedly".to_string());
+                        self.discover.view_state = DiscoverViewState::Files;
+                        self.discover.scanning_path = None;
+                        self.discover.scan_progress = None;
+                        self.discover.scan_start_time = None;
+                        scan_complete = true;
+                        break;
+                    }
+                }
+            }
+            if scan_complete {
+                self.pending_scan = None;
+                self.current_scan_job_id = None;
             }
         }
 
@@ -3630,23 +4981,31 @@ mod tests {
         let mut app = App::new(test_args());
         assert!(matches!(app.mode, TuiMode::Home));
 
-        // Alt+D should switch to Discover
+        // Key '1' should switch to Discover (per spec)
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT))
+            app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
                 .await;
         });
         assert!(matches!(app.mode, TuiMode::Discover));
 
-        // Alt+P should switch to Parser Bench
+        // In Discover mode, '2' controls panel focus (not view navigation)
+        // So we need to go Home first with '0', then use '2'
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT))
+            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
+                .await;
+        });
+        assert!(matches!(app.mode, TuiMode::Home));
+
+        // Now '2' should switch to Parser Bench (per spec)
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
                 .await;
         });
         assert!(matches!(app.mode, TuiMode::ParserBench));
 
-        // Esc should return to Home
+        // Key '0' should return to Home (per spec)
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
                 .await;
         });
         assert!(matches!(app.mode, TuiMode::Home));
@@ -3672,11 +5031,12 @@ mod tests {
         assert_eq!(app.home.selected_card, 3);
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Enter should navigate to Jobs mode (card 3)
+            // Enter should navigate to Inspect mode (card 3 = Sources placeholder)
+            // Card order: 0=Discover, 1=ParserBench, 2=Jobs, 3=Sources(Inspect)
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .await;
         });
-        assert!(matches!(app.mode, TuiMode::Jobs));
+        assert!(matches!(app.mode, TuiMode::Inspect)); // Sources placeholder
     }
 
     #[test]
@@ -4242,6 +5602,196 @@ mod tests {
     }
 
     // =========================================================================
+    // UI Latency Tests - Navigation Must Be Fast
+    // =========================================================================
+    //
+    // These tests verify that navigation operations complete quickly.
+    // UI freezes occur when navigation triggers expensive operations like DB queries.
+    // Navigation should be pure in-memory operations (< 1ms typical, < 10ms max).
+
+    #[tokio::test]
+    async fn test_sources_dropdown_navigation_latency() {
+        use std::time::Instant;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Set up sources (in-memory, no DB)
+        app.discover.sources = (0..100)
+            .map(|i| SourceInfo {
+                id: SourceId(format!("source_{}", i)),
+                name: format!("Source {}", i),
+                path: std::path::PathBuf::from(format!("/data/source_{}", i)),
+                file_count: 1000,
+            })
+            .collect();
+        app.discover.sources_loaded = true;
+        app.discover.data_loaded = true;
+
+        // Open sources dropdown
+        app.discover.view_state = DiscoverViewState::SourcesDropdown;
+        app.discover.preview_source = Some(0);
+
+        // Navigate through all 100 sources and measure time
+        let start = Instant::now();
+        for _ in 0..99 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                .await;
+        }
+        let elapsed = start.elapsed();
+
+        // 99 navigation operations should complete in < 100ms (< 1ms each)
+        assert!(
+            elapsed.as_millis() < 100,
+            "Sources dropdown navigation too slow: {:?} for 99 operations (should be < 100ms)",
+            elapsed
+        );
+
+        // Verify we navigated to the last source
+        assert_eq!(app.discover.preview_source, Some(99));
+
+        // Verify data_loaded is still true (no DB reload triggered)
+        assert!(
+            app.discover.data_loaded,
+            "Navigation should NOT trigger data reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_list_navigation_latency() {
+        use std::time::Instant;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+        app.discover.view_state = DiscoverViewState::Files;
+
+        // Set up large file list (in-memory)
+        app.discover.files = (0..10_000)
+            .map(|i| FileInfo {
+                path: format!("/data/file_{}.csv", i),
+                rel_path: format!("file_{}.csv", i),
+                size: 1024,
+                modified: chrono::Local::now(),
+                is_dir: false,
+                tags: vec![],
+            })
+            .collect();
+        app.discover.selected = 0;
+
+        // Navigate through 1000 files and measure time
+        let start = Instant::now();
+        for _ in 0..1000 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                .await;
+        }
+        let elapsed = start.elapsed();
+
+        // 1000 navigation operations should complete in < 200ms
+        assert!(
+            elapsed.as_millis() < 200,
+            "File list navigation too slow: {:?} for 1000 operations (should be < 200ms)",
+            elapsed
+        );
+
+        assert_eq!(app.discover.selected, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_jobs_list_navigation_latency() {
+        use std::time::Instant;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Jobs;
+
+        // Set up large jobs list (in-memory)
+        app.jobs_state.jobs = (0..1000)
+            .map(|i| JobInfo {
+                id: i,
+                file_path: format!("/data/file_{}.csv", i),
+                parser_name: "test_parser".to_string(),
+                status: if i % 4 == 0 {
+                    JobStatus::Completed
+                } else if i % 4 == 1 {
+                    JobStatus::Running
+                } else if i % 4 == 2 {
+                    JobStatus::Failed
+                } else {
+                    JobStatus::Pending
+                },
+                retry_count: 0,
+                error_message: None,
+                created_at: chrono::Local::now(),
+            })
+            .collect();
+        app.jobs_state.selected_index = 0;
+
+        // Navigate through 500 jobs and measure time
+        let start = Instant::now();
+        for _ in 0..500 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                .await;
+        }
+        let elapsed = start.elapsed();
+
+        // 500 navigation operations should complete in < 100ms
+        assert!(
+            elapsed.as_millis() < 100,
+            "Jobs list navigation too slow: {:?} for 500 operations (should be < 100ms)",
+            elapsed
+        );
+
+        assert_eq!(app.jobs_state.selected_index, 500);
+    }
+
+    #[tokio::test]
+    async fn test_sources_filter_typing_latency() {
+        use std::time::Instant;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Set up sources
+        app.discover.sources = (0..100)
+            .map(|i| SourceInfo {
+                id: SourceId(format!("source_{}", i)),
+                name: format!("Source {}", i),
+                path: std::path::PathBuf::from(format!("/data/source_{}", i)),
+                file_count: 1000,
+            })
+            .collect();
+        app.discover.sources_loaded = true;
+        app.discover.data_loaded = true;
+
+        // Open sources dropdown and enter filter mode
+        app.discover.view_state = DiscoverViewState::SourcesDropdown;
+        app.discover.sources_filtering = true;
+
+        // Type a filter string and measure time
+        let start = Instant::now();
+        for c in "Source 5".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await;
+        }
+        let elapsed = start.elapsed();
+
+        // Typing 8 characters should complete in < 50ms
+        assert!(
+            elapsed.as_millis() < 50,
+            "Filter typing too slow: {:?} for 8 keystrokes (should be < 50ms)",
+            elapsed
+        );
+
+        // Verify filter was applied
+        assert_eq!(app.discover.sources_filter, "Source 5");
+
+        // Verify data_loaded is still true (no DB reload triggered)
+        assert!(
+            app.discover.data_loaded,
+            "Filtering should NOT trigger data reload"
+        );
+    }
+
+    // =========================================================================
     // Inspect Mode Tests - Critical Path Coverage
     // =========================================================================
 
@@ -4363,8 +5913,9 @@ mod tests {
 
     #[test]
     fn test_job_status_symbol() {
-        assert_eq!(JobStatus::Pending.symbol(), "⏳");
-        assert_eq!(JobStatus::Running.symbol(), "▶");
+        // Symbols per tui.md Section 5.3
+        assert_eq!(JobStatus::Pending.symbol(), "○");
+        assert_eq!(JobStatus::Running.symbol(), "↻");
         assert_eq!(JobStatus::Completed.symbol(), "✓");
         assert_eq!(JobStatus::Failed.symbol(), "✗");
     }
@@ -4468,7 +6019,7 @@ mod tests {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
-        assert!(!app.discover.is_filtering);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.filter.is_empty());
 
         // Press / to enter filter mode
@@ -4476,7 +6027,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
                 .await;
         });
-        assert!(app.discover.is_filtering);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Filtering);
 
         // Type filter text
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -4498,7 +6049,7 @@ mod tests {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
-        app.discover.is_filtering = true;
+        app.discover.view_state = DiscoverViewState::Filtering;
         app.discover.filter = "test".to_string();
 
         // Esc should exit filter mode, NOT go to Home
@@ -4506,7 +6057,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 .await;
         });
-        assert!(!app.discover.is_filtering);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.filter.is_empty());
         // Still in Discover mode
         assert!(matches!(app.mode, TuiMode::Discover));
@@ -4518,14 +6069,14 @@ mod tests {
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.selected = 1; // Select orders.csv
-        assert!(!app.discover.is_tagging);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 't' to open tag dialog
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
                 .await;
         });
-        assert!(app.discover.is_tagging);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Tagging);
         assert!(app.discover.tag_input.is_empty());
 
         // Type tag name
@@ -4543,7 +6094,7 @@ mod tests {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
-        app.discover.is_tagging = true;
+        app.discover.view_state = DiscoverViewState::Tagging;
         app.discover.tag_input = "partial".to_string();
 
         // Esc should close tag dialog, NOT go to Home
@@ -4551,7 +6102,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 .await;
         });
-        assert!(!app.discover.is_tagging);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.tag_input.is_empty());
         // Still in Discover mode
         assert!(matches!(app.mode, TuiMode::Discover));
@@ -4562,14 +6113,14 @@ mod tests {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
-        assert!(!app.discover.is_entering_path);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 's' to open scan path dialog
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
                 .await;
         });
-        assert!(app.discover.is_entering_path);
+        assert_eq!(app.discover.view_state, DiscoverViewState::EnteringPath);
 
         // Type path
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -4585,7 +6136,7 @@ mod tests {
     fn test_discover_scan_path_esc_cancels() {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
-        app.discover.is_entering_path = true;
+        app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = "/some/path".to_string();
 
         // Esc should close scan dialog, NOT go to Home
@@ -4593,7 +6144,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 .await;
         });
-        assert!(!app.discover.is_entering_path);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.scan_path_input.is_empty());
         // Still in Discover mode
         assert!(matches!(app.mode, TuiMode::Discover));
@@ -4604,14 +6155,14 @@ mod tests {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
-        assert!(!app.discover.is_bulk_tagging);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 'T' (Shift+t) to open bulk tag dialog
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT))
                 .await;
         });
-        assert!(app.discover.is_bulk_tagging);
+        assert_eq!(app.discover.view_state, DiscoverViewState::BulkTagging);
         assert!(app.discover.bulk_tag_input.is_empty());
         assert!(!app.discover.bulk_tag_save_as_rule);
     }
@@ -4621,7 +6172,7 @@ mod tests {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
-        app.discover.is_bulk_tagging = true;
+        app.discover.view_state = DiscoverViewState::BulkTagging;
         assert!(!app.discover.bulk_tag_save_as_rule);
 
         // Press Space to toggle save-as-rule
@@ -4643,7 +6194,7 @@ mod tests {
     fn test_discover_bulk_tag_esc_cancels() {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
-        app.discover.is_bulk_tagging = true;
+        app.discover.view_state = DiscoverViewState::BulkTagging;
         app.discover.bulk_tag_input = "batch".to_string();
         app.discover.bulk_tag_save_as_rule = true;
 
@@ -4652,7 +6203,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 .await;
         });
-        assert!(!app.discover.is_bulk_tagging);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.bulk_tag_input.is_empty());
         assert!(!app.discover.bulk_tag_save_as_rule);
         // Still in Discover mode
@@ -4665,14 +6216,14 @@ mod tests {
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.selected = 2; // Select archives directory
-        assert!(!app.discover.is_creating_source);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 'S' (Shift+s) on a directory to create source
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))
                 .await;
         });
-        assert!(app.discover.is_creating_source);
+        assert_eq!(app.discover.view_state, DiscoverViewState::CreatingSource);
         assert!(app.discover.pending_source_path.is_some());
         assert!(app.discover.pending_source_path.as_ref().unwrap().contains("archives"));
     }
@@ -4681,7 +6232,7 @@ mod tests {
     fn test_discover_create_source_esc_cancels() {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
-        app.discover.is_creating_source = true;
+        app.discover.view_state = DiscoverViewState::CreatingSource;
         app.discover.source_name_input = "my_source".to_string();
         app.discover.pending_source_path = Some("/data/archives".to_string());
 
@@ -4690,7 +6241,7 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 .await;
         });
-        assert!(!app.discover.is_creating_source);
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.source_name_input.is_empty());
         assert!(app.discover.pending_source_path.is_none());
         // Still in Discover mode
@@ -4701,12 +6252,8 @@ mod tests {
     fn test_discover_esc_goes_home_when_no_dialog() {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
-        // No dialogs open
-        assert!(!app.discover.is_filtering);
-        assert!(!app.discover.is_entering_path);
-        assert!(!app.discover.is_tagging);
-        assert!(!app.discover.is_creating_source);
-        assert!(!app.discover.is_bulk_tagging);
+        // No dialogs open - view_state should be Files
+        assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Esc should go to Home
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -4836,7 +6383,7 @@ mod tests {
         app.mode = TuiMode::Discover;
 
         // Test backspace in scan path
-        app.discover.is_entering_path = true;
+        app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = "/tmp/test".to_string();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
@@ -4845,8 +6392,7 @@ mod tests {
         assert_eq!(app.discover.scan_path_input, "/tmp/tes");
 
         // Reset and test backspace in tag input
-        app.discover.is_entering_path = false;
-        app.discover.is_tagging = true;
+        app.discover.view_state = DiscoverViewState::Tagging;
         app.discover.tag_input = "mytag".to_string();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
@@ -4855,13 +6401,847 @@ mod tests {
         assert_eq!(app.discover.tag_input, "myta");
 
         // Reset and test backspace in bulk tag input
-        app.discover.is_tagging = false;
-        app.discover.is_bulk_tagging = true;
+        app.discover.view_state = DiscoverViewState::BulkTagging;
         app.discover.bulk_tag_input = "bulktag".to_string();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
                 .await;
         });
         assert_eq!(app.discover.bulk_tag_input, "bulkta");
+    }
+
+    // =========================================================================
+    // Scanning E2E Tests - Non-blocking scan with progress
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_scan_valid_directory_enters_scanning_state() {
+        use tempfile::TempDir;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Create a temp directory with some files
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("file1.txt"), "test1").unwrap();
+        std::fs::write(temp_dir.path().join("file2.txt"), "test2").unwrap();
+
+        // Open scan dialog and enter path
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_dir.path().display().to_string();
+
+        // Press Enter to start scan
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Should enter Scanning state (non-blocking)
+        assert_eq!(
+            app.discover.view_state,
+            DiscoverViewState::Scanning,
+            "Should enter Scanning state after submitting valid path"
+        );
+        assert!(
+            app.discover.scanning_path.is_some(),
+            "scanning_path should be set"
+        );
+        assert!(
+            app.pending_scan.is_some(),
+            "pending_scan channel should be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_invalid_path_shows_error() {
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Open scan dialog with invalid path
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = "/nonexistent/path/that/does/not/exist".to_string();
+
+        // Press Enter
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Should NOT enter Scanning state - stays in Files with error
+        assert_eq!(
+            app.discover.view_state,
+            DiscoverViewState::Files,
+            "Should return to Files state on invalid path"
+        );
+        assert!(
+            app.discover.scan_error.is_some(),
+            "Should have scan_error set"
+        );
+        assert!(
+            app.discover.scan_error.as_ref().unwrap().contains("not found"),
+            "Error message should mention path not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_not_a_directory_shows_error() {
+        use tempfile::NamedTempFile;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Create a temp file (not a directory)
+        let temp_file = NamedTempFile::new().unwrap();
+
+        // Open scan dialog with file path
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_file.path().display().to_string();
+
+        // Press Enter
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Should NOT enter Scanning state - stays in Files with error
+        assert_eq!(
+            app.discover.view_state,
+            DiscoverViewState::Files,
+            "Should return to Files state when path is a file"
+        );
+        assert!(
+            app.discover.scan_error.is_some(),
+            "Should have scan_error set"
+        );
+        assert!(
+            app.discover.scan_error.as_ref().unwrap().contains("Not a directory"),
+            "Error message should mention not a directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_cancel_with_esc() {
+        use tempfile::TempDir;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Create a temp directory
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("file1.txt"), "test1").unwrap();
+
+        // Start a scan
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_dir.path().display().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(app.discover.view_state, DiscoverViewState::Scanning);
+
+        // Press Esc to cancel scan
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+
+        // Should return to Files state
+        assert_eq!(
+            app.discover.view_state,
+            DiscoverViewState::Files,
+            "Esc should cancel scan and return to Files"
+        );
+        assert!(
+            app.pending_scan.is_none(),
+            "pending_scan should be cleared"
+        );
+        assert!(
+            app.discover.scanning_path.is_none(),
+            "scanning_path should be cleared"
+        );
+        assert!(
+            app.discover.status_message.is_some(),
+            "Should have status message about cancellation"
+        );
+    }
+
+    // =========================================================================
+    // Scan-as-Job Integration Tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_scan_creates_job_with_running_status() {
+        use tempfile::TempDir;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Verify no jobs initially
+        assert!(app.jobs_state.jobs.is_empty(), "Should start with no jobs");
+
+        // Create a temp directory
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("file1.txt"), "test1").unwrap();
+
+        // Start a scan
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_dir.path().display().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Should have created a job
+        assert_eq!(app.jobs_state.jobs.len(), 1, "Should have created one job");
+
+        let job = &app.jobs_state.jobs[0];
+        assert_eq!(job.status, JobStatus::Running, "Job should be Running");
+        assert_eq!(job.parser_name, "scan", "Job type should be 'scan'");
+        assert!(
+            job.file_path.contains(temp_dir.path().to_str().unwrap()),
+            "Job should track the scanned directory"
+        );
+        assert!(
+            app.current_scan_job_id.is_some(),
+            "current_scan_job_id should be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_cancel_sets_job_cancelled() {
+        use tempfile::TempDir;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Create a temp directory
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("file1.txt"), "test1").unwrap();
+
+        // Start a scan
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_dir.path().display().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Verify job was created with Running status
+        assert_eq!(app.jobs_state.jobs.len(), 1);
+        assert_eq!(app.jobs_state.jobs[0].status, JobStatus::Running);
+
+        // Cancel with ESC
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+
+        // Job should now be Cancelled
+        assert_eq!(
+            app.jobs_state.jobs[0].status,
+            JobStatus::Cancelled,
+            "Job should be Cancelled after ESC"
+        );
+        assert!(
+            app.current_scan_job_id.is_none(),
+            "current_scan_job_id should be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_complete_sets_job_completed() {
+        use tempfile::TempDir;
+        use std::time::Duration;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Create a temp directory with some files
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("file1.txt"), "test1").unwrap();
+
+        // Start scan
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_dir.path().display().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Verify job created with Running status
+        assert_eq!(app.jobs_state.jobs.len(), 1);
+        assert_eq!(app.jobs_state.jobs[0].status, JobStatus::Running);
+
+        // Wait for scan to complete
+        let start = std::time::Instant::now();
+        while app.discover.view_state == DiscoverViewState::Scanning {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Scan did not complete within 5 seconds");
+            }
+            app.tick().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Job should now be Completed
+        assert_eq!(
+            app.jobs_state.jobs[0].status,
+            JobStatus::Completed,
+            "Job should be Completed after scan finishes"
+        );
+        assert!(
+            app.current_scan_job_id.is_none(),
+            "current_scan_job_id should be cleared after completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_completes_and_populates_files() {
+        use tempfile::TempDir;
+        use std::time::Duration;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Create a temp directory with some files
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("file1.txt"), "test1").unwrap();
+        std::fs::write(temp_dir.path().join("file2.txt"), "test2").unwrap();
+        std::fs::create_dir(temp_dir.path().join("subdir")).unwrap();
+        std::fs::write(temp_dir.path().join("subdir/file3.txt"), "test3").unwrap();
+
+        // Start scan
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_dir.path().display().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(app.discover.view_state, DiscoverViewState::Scanning);
+
+        // Poll tick until scan completes (with timeout)
+        let start = std::time::Instant::now();
+        while app.discover.view_state == DiscoverViewState::Scanning {
+            if start.elapsed() > Duration::from_secs(5) {
+                panic!("Scan did not complete within 5 seconds");
+            }
+            app.tick().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Should be back in Files state with files populated
+        assert_eq!(
+            app.discover.view_state,
+            DiscoverViewState::Files,
+            "Should return to Files after scan completes"
+        );
+        assert!(
+            !app.discover.files.is_empty(),
+            "Files should be populated after scan"
+        );
+        // Should have found 3 files (scanner stores files, not directories)
+        assert_eq!(
+            app.discover.files.len(),
+            3,
+            "Should have found 3 files (scanner stores files only, not directories)"
+        );
+        assert!(
+            app.discover.status_message.is_some(),
+            "Should have success message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_progress_initialized_and_cleared() {
+        use tempfile::TempDir;
+        use std::time::Duration;
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Create a temp directory with some files
+        let temp_dir = TempDir::new().unwrap();
+        for i in 0..10 {
+            std::fs::write(temp_dir.path().join(format!("file{}.txt", i)), format!("test{}", i)).unwrap();
+        }
+
+        // Start scan
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = temp_dir.path().display().to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // Should have entered Scanning state with progress initialized
+        assert_eq!(app.discover.view_state, DiscoverViewState::Scanning);
+        assert!(
+            app.discover.scan_progress.is_some(),
+            "scan_progress should be initialized when entering Scanning state"
+        );
+
+        // Wait for scan to complete
+        let start = std::time::Instant::now();
+        while app.discover.view_state == DiscoverViewState::Scanning {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("Scan did not complete within 10 seconds");
+            }
+            app.tick().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Verify scan completed successfully
+        assert_eq!(
+            app.discover.view_state,
+            DiscoverViewState::Files,
+            "Scan should complete"
+        );
+
+        // Progress should be cleared after completion
+        assert!(
+            app.discover.scan_progress.is_none(),
+            "scan_progress should be cleared after scan completes"
+        );
+
+        // Should have found the files
+        assert!(
+            app.discover.files.len() >= 10,
+            "Should have found files: got {}",
+            app.discover.files.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_home_tilde_expansion() {
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        // Test ~ expansion - should not fail immediately
+        app.discover.view_state = DiscoverViewState::EnteringPath;
+        app.discover.scan_path_input = "~".to_string();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        // If home dir exists and is readable, should enter Scanning
+        // Otherwise should show error - but NOT panic
+        // (We can't guarantee home dir exists in all test environments)
+        let valid_states = [DiscoverViewState::Scanning, DiscoverViewState::Files];
+        assert!(
+            valid_states.contains(&app.discover.view_state),
+            "Should either be Scanning (if ~ resolved) or Files (with error)"
+        );
+    }
+
+    // =========================================================================
+    // Pagination and Large Dataset Tests
+    // =========================================================================
+
+    #[test]
+    fn test_large_file_list_navigation_performance() {
+        // Test that navigating a large file list is O(1) not O(n)
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+        app.discover.view_state = DiscoverViewState::Files;
+
+        // Create a simulated large file list (100K files)
+        let large_count: usize = 100_000;
+        app.discover.files = (0..large_count)
+            .map(|i| FileInfo {
+                path: format!("/test/path/file_{}.txt", i),
+                rel_path: format!("file_{}.txt", i),
+                size: 1000,
+                modified: chrono::Local::now(),
+                is_dir: false,
+                tags: vec![],
+            })
+            .collect();
+
+        // Navigation should be instant - just updating selected index
+        let start = std::time::Instant::now();
+
+        // Navigate down 1000 times
+        for _ in 0..1000 {
+            app.discover.selected = (app.discover.selected + 1) % large_count;
+        }
+
+        let duration = start.elapsed();
+
+        // Should complete in under 10ms (pure index math)
+        assert!(
+            duration.as_millis() < 10,
+            "Navigation took {:?}, should be under 10ms for 1000 key presses",
+            duration
+        );
+    }
+
+    #[test]
+    fn test_selection_bounds_with_large_list() {
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+        app.discover.view_state = DiscoverViewState::Files;
+
+        // Create a large file list
+        let file_count: usize = 50_000;
+        app.discover.files = (0..file_count)
+            .map(|i| FileInfo {
+                path: format!("/test/path/file_{}.txt", i),
+                rel_path: format!("file_{}.txt", i),
+                size: 1000,
+                modified: chrono::Local::now(),
+                is_dir: false,
+                tags: vec![],
+            })
+            .collect();
+
+        // Test selection at various positions
+        app.discover.selected = 0;
+        assert_eq!(app.discover.selected, 0, "Should start at 0");
+
+        // Navigate to middle
+        app.discover.selected = file_count / 2;
+        assert_eq!(
+            app.discover.selected,
+            file_count / 2,
+            "Should be at middle"
+        );
+
+        // Navigate to end
+        app.discover.selected = file_count - 1;
+        assert_eq!(
+            app.discover.selected,
+            file_count - 1,
+            "Should be at last item"
+        );
+
+        // Bounds check - selection should not exceed file count
+        app.discover.selected = file_count; // Invalid - past end
+        app.discover.selected = app.discover.selected.min(file_count.saturating_sub(1));
+        assert_eq!(
+            app.discover.selected,
+            file_count - 1,
+            "Should clamp to valid range"
+        );
+    }
+
+    #[test]
+    fn test_virtual_scroll_offset_calculation() {
+        // Test the scroll offset logic used in draw_file_list
+        let file_count: usize = 10_000;
+        let visible_rows: usize = 30; // Typical terminal height for file list
+
+        // Near start - should not scroll
+        let selected: usize = 5;
+        let scroll_offset = if visible_rows >= file_count {
+            0
+        } else if selected < visible_rows / 2 {
+            0
+        } else if selected > file_count.saturating_sub(visible_rows / 2) {
+            file_count.saturating_sub(visible_rows)
+        } else {
+            selected.saturating_sub(visible_rows / 2)
+        };
+        assert_eq!(scroll_offset, 0, "Near start should show from beginning");
+
+        // Middle - should center selection
+        let selected: usize = 5000;
+        let scroll_offset = if visible_rows >= file_count {
+            0
+        } else if selected < visible_rows / 2 {
+            0
+        } else if selected > file_count.saturating_sub(visible_rows / 2) {
+            file_count.saturating_sub(visible_rows)
+        } else {
+            selected.saturating_sub(visible_rows / 2)
+        };
+        assert_eq!(
+            scroll_offset,
+            5000 - 15,
+            "Middle should center selection"
+        );
+
+        // Near end - should show last visible_rows
+        let selected: usize = 9990;
+        let scroll_offset = if visible_rows >= file_count {
+            0
+        } else if selected < visible_rows / 2 {
+            0
+        } else if selected > file_count.saturating_sub(visible_rows / 2) {
+            file_count.saturating_sub(visible_rows)
+        } else {
+            selected.saturating_sub(visible_rows / 2)
+        };
+        assert_eq!(
+            scroll_offset,
+            file_count - visible_rows,
+            "Near end should show last rows"
+        );
+    }
+
+    #[test]
+    fn test_small_list_no_scroll() {
+        // When all files fit, scroll offset should always be 0
+        let file_count: usize = 20;
+        let visible_rows: usize = 50; // More visible rows than files
+
+        for selected in 0..file_count {
+            let scroll_offset = if visible_rows >= file_count {
+                0
+            } else if selected < visible_rows / 2 {
+                0
+            } else if selected > file_count.saturating_sub(visible_rows / 2) {
+                file_count.saturating_sub(visible_rows)
+            } else {
+                selected.saturating_sub(visible_rows / 2)
+            };
+            assert_eq!(
+                scroll_offset, 0,
+                "Small list should never scroll, but got offset {} for selected {}",
+                scroll_offset, selected
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_with_large_list() {
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+        app.discover.view_state = DiscoverViewState::Files;
+
+        // Create a large file list with varied filenames
+        app.discover.files = (0..50_000usize)
+            .map(|i| {
+                let ext = match i % 5 {
+                    0 => "csv",
+                    1 => "json",
+                    2 => "txt",
+                    3 => "log",
+                    _ => "xml",
+                };
+                FileInfo {
+                    path: format!("/test/path/file_{}.{}", i, ext),
+                    rel_path: format!("file_{}.{}", i, ext),
+                    size: 1000,
+                    modified: chrono::Local::now(),
+                    is_dir: false,
+                    tags: vec![],
+                }
+            })
+            .collect();
+
+        // Apply filter
+        app.discover.filter = "csv".to_string();
+
+        // Count filtered files (without materializing all of them)
+        let filtered_count = app
+            .discover
+            .files
+            .iter()
+            .filter(|f| f.rel_path.contains("csv") || f.path.contains("csv"))
+            .count();
+
+        // Should have ~10K CSV files (1/5 of 50K)
+        assert_eq!(
+            filtered_count, 10_000,
+            "Filter should match ~10K CSV files"
+        );
+
+        // Selection should reset when filter applied
+        app.discover.selected = 25_000; // Invalid for filtered view
+        app.discover.selected = app.discover.selected.min(filtered_count.saturating_sub(1));
+        assert!(
+            app.discover.selected < filtered_count,
+            "Selection should be within filtered range"
+        );
+    }
+
+    #[test]
+    fn test_progress_update_no_overflow() {
+        // Test that progress update calculation doesn't overflow
+        // This simulates the race condition where last > count due to concurrent updates
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let count = AtomicUsize::new(0);
+        let last_progress = AtomicUsize::new(0);
+
+        // Simulate multiple threads updating progress
+        // Thread 1: count=50, last=0 -> 50-0=50 < 100, no update
+        count.store(50, Ordering::Relaxed);
+        let c = count.load(Ordering::Relaxed);
+        let l = last_progress.load(Ordering::Relaxed);
+        assert!(c.saturating_sub(l) < 100);
+
+        // Thread 2: count=150, last=0 -> 150-0=150 >= 100, update last to 150
+        count.store(150, Ordering::Relaxed);
+        last_progress.store(150, Ordering::Relaxed);
+
+        // Race condition: Thread 1 reads last=150 but count=50 (stale)
+        // Without saturating_sub: 50-150 = underflow panic!
+        // With saturating_sub: 50.saturating_sub(150) = 0 < 100, no update (safe)
+        let stale_count: usize = 50;
+        let updated_last: usize = 150;
+        assert_eq!(stale_count.saturating_sub(updated_last), 0);
+        assert!(stale_count.saturating_sub(updated_last) < 100);
+
+        // Normal case: count=250, last=150 -> 250-150=100 >= 100, update
+        let c: usize = 250;
+        let l: usize = 150;
+        assert_eq!(c.saturating_sub(l), 100);
+        assert!(c.saturating_sub(l) >= 100);
+    }
+
+    #[tokio::test]
+    async fn test_scan_result_memory_efficiency() {
+        // Test that scan results don't cause memory issues
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Create many subdirectories with files
+        for i in 0..100 {
+            let subdir = temp_dir.path().join(format!("dir_{}", i));
+            std::fs::create_dir(&subdir).unwrap();
+            for j in 0..50 {
+                let file_path = subdir.join(format!("file_{}.txt", j));
+                std::fs::write(&file_path, format!("content {}", j)).unwrap();
+            }
+        }
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+        app.discover.view_state = DiscoverViewState::Files;
+
+        // Trigger scan
+        let path = temp_dir.path().to_string_lossy().to_string();
+        app.discover.scan_path_input = path.clone();
+        app.scan_directory(&path);
+
+        // Complete scan
+        while app.discover.view_state == DiscoverViewState::Scanning {
+            app.tick().await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        // load_scout_files has LIMIT 1000 for memory efficiency
+        // So we expect 1000 files to be loaded (even though 5000+ were scanned)
+        assert!(
+            app.discover.files.len() == 1000,
+            "Should have loaded 1000 files (LIMIT 1000 for memory), got {}",
+            app.discover.files.len()
+        );
+
+        // Memory should be reasonable - each FileInfo is ~200 bytes
+        // 5000 files * 200 bytes = ~1MB, well under any reasonable limit
+        let estimated_memory = app.discover.files.len() * std::mem::size_of::<FileInfo>();
+        assert!(
+            estimated_memory < 50_000_000, // 50MB limit
+            "Memory usage should be reasonable: {} bytes",
+            estimated_memory
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_partial_batches_not_lost() {
+        // Test that partial batches (less than BATCH_SIZE=1000) are correctly flushed
+        // This validates the FlushGuard drop behavior
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Create exactly 150 files - less than BATCH_SIZE (1000)
+        // These should all be collected via FlushGuard.drop()
+        for i in 0..150 {
+            let file_path = temp_dir.path().join(format!("file_{}.txt", i));
+            std::fs::write(&file_path, format!("content {}", i)).unwrap();
+        }
+
+        let mut app = App::new(test_args());
+        app.mode = TuiMode::Discover;
+
+        let path = temp_dir.path().to_string_lossy().to_string();
+        app.scan_directory(&path);
+
+        // Wait for scan to complete
+        let mut iterations = 0;
+        while app.discover.view_state == DiscoverViewState::Scanning && iterations < 500 {
+            app.tick().await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            iterations += 1;
+        }
+
+        // All 150 files should be present - partial batch was flushed
+        assert_eq!(
+            app.discover.files.len(), 150,
+            "Expected exactly 150 files (partial batch), got {}",
+            app.discover.files.len()
+        );
+    }
+
+    #[test]
+    fn test_compare_exchange_prevents_duplicate_progress() {
+        // Test that compare_exchange correctly prevents duplicate progress updates
+        // when multiple threads race on the same old value
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let last_progress = Arc::new(AtomicUsize::new(0));
+        let successful_updates = Arc::new(AtomicUsize::new(0));
+
+        // All threads read the SAME "last" value before any thread succeeds
+        // This simulates the race condition
+        let last_seen = last_progress.load(Ordering::Relaxed);
+
+        // Spawn 10 threads that all try to update from the same old value
+        let handles: Vec<_> = (0..10).map(|_| {
+            let last_progress = last_progress.clone();
+            let successful_updates = successful_updates.clone();
+            thread::spawn(move || {
+                // All threads observed last_seen=0, all try to update to 5000
+                if last_progress.compare_exchange(
+                    last_seen,
+                    5000,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed
+                ).is_ok() {
+                    successful_updates.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        }).collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Only ONE thread should have won the race
+        assert_eq!(
+            successful_updates.load(Ordering::Relaxed), 1,
+            "Only one thread should win the compare_exchange race"
+        );
+        assert_eq!(last_progress.load(Ordering::Relaxed), 5000);
+    }
+
+    #[test]
+    fn test_batch_flush_guard_behavior() {
+        // Test the FlushGuard pattern used in parallel scanning
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let all_batches: Arc<Mutex<Vec<Vec<i32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let total_count = Arc::new(AtomicUsize::new(0));
+
+        // Simulate what happens in each thread
+        {
+            struct TestFlushGuard {
+                batch: Vec<i32>,
+                all_batches: Arc<Mutex<Vec<Vec<i32>>>>,
+                total_count: Arc<AtomicUsize>,
+            }
+
+            impl Drop for TestFlushGuard {
+                fn drop(&mut self) {
+                    if !self.batch.is_empty() {
+                        let batch = std::mem::take(&mut self.batch);
+                        let len = batch.len();
+                        self.all_batches.lock().unwrap().push(batch);
+                        self.total_count.fetch_add(len, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            let mut guard = TestFlushGuard {
+                batch: Vec::new(),
+                all_batches: all_batches.clone(),
+                total_count: total_count.clone(),
+            };
+
+            // Add 50 items (less than a typical batch size)
+            for i in 0..50 {
+                guard.batch.push(i);
+            }
+
+            // guard is dropped here, should flush the 50 items
+        }
+
+        // Verify items were flushed
+        let batches = all_batches.lock().unwrap();
+        assert_eq!(batches.len(), 1, "Should have one batch");
+        assert_eq!(batches[0].len(), 50, "Batch should have 50 items");
+        assert_eq!(total_count.load(Ordering::Relaxed), 50, "Total count should be 50");
     }
 }

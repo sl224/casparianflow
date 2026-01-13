@@ -20,6 +20,13 @@
 //! - Claude Code must be authenticated (run `claude` once to login)
 //!
 //! Tests are skipped gracefully if requirements aren't met.
+//!
+//! ## Feature Flag
+//!
+//! This test requires Claude Code CLI and is slow (~58s).
+//! Only runs with `cargo test --features=full`
+
+#![cfg(feature = "full")]
 
 use std::fs;
 use std::process::Command;

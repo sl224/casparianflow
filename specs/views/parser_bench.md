@@ -1,8 +1,12 @@
-# Parser Bench - TUI Subspec
+# Parser Bench - TUI View Spec
 
 **Status:** Approved for Implementation
-**Parent:** spec.md Section 5.3 (TUI Specification)
-**Replaces:** "Process" mode placeholder
+**Parent:** specs/tui.md (Master TUI Spec)
+**Version:** 1.2
+**Related:** specs/views/jobs.md
+
+> **Note:** For global keybindings, layout patterns, and common UI elements,
+> see the master TUI spec at `specs/tui.md`.
 
 ---
 
@@ -44,7 +48,7 @@ The **Parser Bench** (formerly "Process") is the TUI mode for parser development
 
 ```
 1. User copies/symlinks parser to ~/.casparian_flow/parsers/
-2. User enters Parser Bench (Alt+P)
+2. User enters Parser Bench (press 2 from any view)
 3. Parser appears in list automatically
 4. User selects parser, presses 't' to test
 5. System shows compatible files (smart sampling: failed first)
@@ -222,11 +226,134 @@ If metadata extraction fails or returns partial data:
 
 ---
 
-## 4. Preview Mode Safety
+## 4. State Machine
+
+### 4.1 State Diagram
+
+```
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                         PARSER BENCH STATE MACHINE                             │
+│                                                                                │
+│    ┌─────────────────────────────────────────────────────────────────────┐     │
+│    │                                                                     │     │
+│    │                        ┌─────────────────┐                          │     │
+│    │                 ┌──────│   PARSER_LIST   │──────┐                   │     │
+│    │                 │      │   (initial)     │      │                   │     │
+│    │                 │      └────────┬────────┘      │                   │     │
+│    │                 │               │               │                   │     │
+│    │         n       │          t    │   f           │  b                │     │
+│    │                 ▼               ▼               ▼                   │     │
+│    │    ┌────────────────┐  ┌─────────────┐  ┌─────────────┐            │     │
+│    │    │ QUICK_TEST_    │  │FILE_PICKER  │  │ FILES_VIEW  │            │     │
+│    │    │ PICKER         │  │             │  │             │            │     │
+│    │    └───────┬────────┘  └──────┬──────┘  └──────┬──────┘            │     │
+│    │            │                  │                │                    │     │
+│    │            │ select parser    │ select file    │ Enter              │     │
+│    │            │                  │                │ (test file)        │     │
+│    │            └──────────────────┼────────────────┘                    │     │
+│    │                               │                                     │     │
+│    │                               ▼                                     │     │
+│    │                       ┌─────────────┐                               │     │
+│    │                       │ RESULT_VIEW │◄──────────────────────────────┤     │
+│    │                       │             │      completion               │     │
+│    │                       └──────┬──────┘                               │     │
+│    │                              │                                      │     │
+│    │              ┌───────────────┼───────────────┐                      │     │
+│    │              │               │               │                      │     │
+│    │          r   │           f   │           Esc │                      │     │
+│    │       (rerun)│    (diff file)│        (back) │                      │     │
+│    │              ▼               ▼               │                      │     │
+│    │         [re-run test]   FILE_PICKER         ─┘                      │     │
+│    │                                                                     │     │
+│    └─────────────────────────────────────────────────────────────────────┘     │
+│                                                                                │
+│    ┌─────────────────────────────────────────────────────────────────────┐     │
+│    │                         BACKTEST (async)                            │     │
+│    │                                                                     │     │
+│    │     PARSER_LIST ──b──► BACKTEST ──Esc──► [backgrounds to Jobs]      │     │
+│    │                            │                                        │     │
+│    │                            └─completion─► RESULT_VIEW               │     │
+│    └─────────────────────────────────────────────────────────────────────┘     │
+│                                                                                │
+│    Esc from any picker state returns to PARSER_LIST                            │
+│    Alt+P from any state returns to PARSER_LIST (mode re-entry)                 │
+│    Alt+H from any state returns to HOME_HUB                                    │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 State Definitions
+
+| State | Entry | Exit | Behavior |
+|-------|-------|------|----------|
+| PARSER_LIST | Mode entry, Esc from child states | n/t/f/b keys, Alt+H | List parsers from `~/.casparian_flow/parsers/`, show health icons |
+| QUICK_TEST_PICKER | 'n' from PARSER_LIST | Select file, Esc | File picker for arbitrary .py files (not in parsers dir) |
+| FILE_PICKER | 't' from PARSER_LIST, 'f' from RESULT_VIEW | Select file, Esc | Show files bound to parser via topics; smart sampling |
+| FILES_VIEW | 'f' from PARSER_LIST | Enter (test), Esc | Browse all files bound to selected parser |
+| BACKTEST | 'b' from PARSER_LIST | Esc (backgrounds), completion | Run parser against all bound files; show progress |
+| RESULT_VIEW | Test completion, backtest completion | r/f/Esc | Display test results: schema, preview rows, errors |
+
+### 4.3 Transitions
+
+| From | To | Trigger | Guard |
+|------|----|---------|-------|
+| PARSER_LIST | QUICK_TEST_PICKER | 'n' | — |
+| PARSER_LIST | FILE_PICKER | 't' | Parser selected |
+| PARSER_LIST | FILES_VIEW | 'f' | Parser selected |
+| PARSER_LIST | BACKTEST | 'b' | Parser selected |
+| QUICK_TEST_PICKER | FILE_PICKER | Select parser | Valid .py file |
+| QUICK_TEST_PICKER | PARSER_LIST | Esc | — |
+| FILE_PICKER | RESULT_VIEW | Select file | Test completes |
+| FILE_PICKER | PARSER_LIST | Esc | — |
+| FILES_VIEW | RESULT_VIEW | Enter | File selected |
+| FILES_VIEW | PARSER_LIST | Esc | — |
+| BACKTEST | RESULT_VIEW | Completion | All files processed |
+| BACKTEST | PARSER_LIST | Esc | Backgrounds job |
+| RESULT_VIEW | RESULT_VIEW | 'r' | — (re-run) |
+| RESULT_VIEW | FILE_PICKER | 'f' | — |
+| RESULT_VIEW | PARSER_LIST | Esc | — |
+| any | HOME_HUB | Alt+H | — (global) |
+
+### 4.4 Focus Mode Overlay
+
+Focus mode (`z` key) is an **overlay**, not a separate state. It affects rendering only:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            FOCUS MODE                                    │
+│                                                                          │
+│   Can be toggled in: RESULT_VIEW, FILES_VIEW                             │
+│                                                                          │
+│   When active:                                                           │
+│   - Left panel hidden                                                    │
+│   - Right panel fullscreen                                               │
+│   - All keybindings preserved                                            │
+│   - 'z' toggles off                                                      │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.5 Watch Mode Overlay
+
+Watch mode (`w` key) is also an **overlay** that can be active in any state:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            WATCH MODE                                    │
+│                                                                          │
+│   When active:                                                           │
+│   - File watcher monitors selected parser                                │
+│   - On parser save: auto-trigger last test                               │
+│   - "Watching..." indicator in header                                    │
+│   - 'w' toggles off                                                      │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. Preview Mode Safety
 
 **CRITICAL**: Prevent OOM on large files by limiting rows read.
 
-### 4.1 Protocol Extension
+### 5.1 Protocol Extension
 
 ```rust
 // In casparian_protocol/src/types.rs
@@ -252,7 +379,7 @@ pub struct PreviewResult {
 }
 ```
 
-### 4.2 Python Implementation
+### 5.2 Python Implementation
 
 The wrapper script in `run_parser_test` MUST pass `nrows`:
 
@@ -273,7 +400,7 @@ else:
 truncated = len(df) >= ROW_LIMIT
 ```
 
-### 4.3 Default Limits
+### 5.3 Default Limits
 
 | Context | Row Limit | Rationale |
 |---------|-----------|-----------|
@@ -284,9 +411,9 @@ truncated = len(df) >= ROW_LIMIT
 
 ---
 
-## 5. Layout Specification
+## 6. Layout Specification
 
-### 5.1 Two-Panel Design with Focus Mode
+### 6.1 Two-Panel Design with Focus Mode
 
 Normal mode:
 ```
@@ -340,7 +467,7 @@ Focus mode (`z` pressed - right panel fullscreen):
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 Parser States
+### 6.2 Parser States
 
 | Icon | State | Description |
 |------|-------|-------------|
@@ -351,7 +478,7 @@ Focus mode (`z` pressed - right panel fullscreen):
 | `⏸` | Paused | Red, circuit breaker tripped |
 | `✗` | Broken | Red, broken symlink |
 
-### 5.3 Test Result Views
+### 6.3 Test Result Views
 
 **Success View**:
 ```
@@ -389,7 +516,7 @@ When `[a]` pressed, sends to Claude Code sidebar:
 
 ---
 
-## 6. Data Model
+## 7. Data Model
 
 ```rust
 pub struct ParserBenchState {
@@ -471,9 +598,9 @@ pub struct TestResult {
 
 ---
 
-## 7. Keybindings
+## 8. Keybindings
 
-### 7.1 Parser List View
+### 8.1 Parser List View
 
 | Key | Action |
 |-----|--------|
@@ -491,7 +618,7 @@ pub struct TestResult {
 | `Esc` | Return to Home |
 | `?` | Help overlay |
 
-### 7.2 Result View
+### 8.2 Result View
 
 | Key | Action |
 |-----|--------|
@@ -501,7 +628,7 @@ pub struct TestResult {
 | `z` | Toggle focus mode |
 | `Esc` | Back to list |
 
-### 7.3 Watch Mode Active
+### 8.3 Watch Mode Active
 
 | Key | Action |
 |-----|--------|
@@ -510,7 +637,7 @@ pub struct TestResult {
 
 ---
 
-## 8. File Watcher Implementation
+## 9. File Watcher Implementation
 
 Use `notify` crate with debouncing:
 
@@ -541,7 +668,7 @@ fn setup_watcher(parser_path: &Path, tx: Sender<()>) -> Result<RecommendedWatche
 
 ---
 
-## 9. Broken Symlink Detection
+## 10. Broken Symlink Detection
 
 ```rust
 fn detect_symlink_status(path: &Path) -> (bool, bool) {
@@ -561,7 +688,7 @@ fn detect_symlink_status(path: &Path) -> (bool, bool) {
 
 ---
 
-## 10. Smart Sampling
+## 11. Smart Sampling
 
 When selecting files for testing, prioritize:
 
@@ -597,7 +724,7 @@ fn smart_sample(files: &[FileInfo], limit: usize) -> Vec<&FileInfo> {
 
 ---
 
-## 11. Implementation Phases
+## 12. Implementation Phases
 
 ### Phase 1: Core Structure ✓
 - [x] Add `ParserBenchState` to `app.rs`
@@ -648,7 +775,7 @@ fn smart_sample(files: &[FileInfo], limit: usize) -> Vec<&FileInfo> {
 
 ---
 
-## 12. Decisions Made
+## 13. Decisions Made
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
@@ -664,7 +791,7 @@ fn smart_sample(files: &[FileInfo], limit: usize) -> Vec<&FileInfo> {
 
 ---
 
-## 13. Protocol Additions
+## 14. Protocol Additions
 
 Add to `crates/casparian_protocol/src/types.rs`:
 
@@ -704,10 +831,11 @@ pub struct SchemaColumn {
 
 ---
 
-## 14. Revision History
+## 15. Revision History
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2026-01-13 | 1.2 | Added formal state machine (Section 4) per spec refinement v2.3 |
 | 2026-01-07 | 0.1 | Initial draft |
 | 2026-01-07 | 0.2 | Quick test flow, smart sampling |
 | 2026-01-08 | 0.3 | Plugins directory approach |

@@ -16,6 +16,13 @@
 //!
 //! Unit tests sent the response immediately (before animation ran),
 //! so the content was still exactly "Thinking..." and the check passed.
+//!
+//! ## Feature Flag
+//!
+//! This test requires real Claude API access and is slow (~37s).
+//! Only runs with `cargo test --features=full`
+
+#![cfg(feature = "full")]
 
 use std::time::{Duration, Instant};
 

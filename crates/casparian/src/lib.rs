@@ -5,6 +5,7 @@
 pub mod bundler;
 pub mod publish;
 pub mod runner;
+pub mod scout;
 pub mod storage;
 
 pub use bundler::{bundle_parser, ParserBundle};

@@ -20,8 +20,10 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cli;
-mod runner;
-mod scout;
+
+// Use scout and runner from library (lib.rs) so they're testable
+use casparian::runner;
+use casparian::scout;
 
 /// Shutdown timeout in seconds
 const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
@@ -470,17 +472,32 @@ impl UnifiedWorkerHandle {
 }
 
 fn main() -> Result<()> {
-    // Initialize logging before anything else
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "casparian=info,casparian_sentinel=info,casparian_worker=info".into()
-            }),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
+    // Parse CLI first to check if we're in TUI mode
     let cli = Cli::parse();
+
+    // Initialize logging - suppress stdout logs in TUI mode to avoid corrupting display
+    let is_tui_mode = matches!(cli.command, Commands::Tui { .. });
+
+    if is_tui_mode {
+        // TUI mode: only log errors to stderr, suppress info/debug
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "error".into()),
+            )
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+    } else {
+        // Normal mode: full logging to stdout
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "casparian=info,casparian_sentinel=info,casparian_worker=info".into()
+                }),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
 
     match cli.command {
         // === W1: Core Standalone Commands ===

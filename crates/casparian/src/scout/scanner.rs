@@ -6,18 +6,60 @@
 //!
 //! # Design
 //!
-//! - Walk the filesystem using `walkdir` (or `jwalk` for parallel walking)
+//! - Walk the filesystem using `ignore::WalkParallel` for parallel walking
 //! - Compare against SQLite state to detect new/changed/deleted files
 //! - Queue pending files for processing
+//! - Support progress callbacks for UI updates
 
 use super::db::Database;
 use super::error::{Result, ScoutError};
-use super::types::{FileStatus, ProcessedEntry, ScanStats, ScannedFile, Source};
+use super::types::{FileStatus, ScanStats, ScannedFile, Source};
 use chrono::Utc;
+use ignore::WalkBuilder;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::mpsc;
 use tracing::info;
-use walkdir::WalkDir;
+
+/// Configuration for scanning operations
+#[derive(Debug, Clone)]
+pub struct ScanConfig {
+    /// Number of threads for parallel walking (0 = auto-detect CPU count)
+    pub threads: usize,
+    /// Batch size for accumulating files before DB operations
+    pub batch_size: usize,
+    /// Progress update interval (number of files between updates)
+    pub progress_interval: usize,
+    /// Whether to follow symlinks
+    pub follow_symlinks: bool,
+    /// Whether to include hidden files/directories
+    pub include_hidden: bool,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            threads: 0,             // Auto-detect CPU count
+            batch_size: 1000,       // Flush to DB every 1000 files
+            progress_interval: 100, // Progress update every 100 files for responsive TUI
+            follow_symlinks: false,
+            include_hidden: true,
+        }
+    }
+}
+
+/// Progress update during a scan
+#[derive(Debug, Clone)]
+pub struct ScanProgress {
+    /// Number of directories scanned
+    pub dirs_scanned: usize,
+    /// Number of files found
+    pub files_found: usize,
+    /// Current directory being scanned (hint)
+    pub current_dir: Option<String>,
+}
 
 /// Result of a scan operation
 #[derive(Debug)]
@@ -32,141 +74,364 @@ pub struct ScanResult {
 /// Filesystem scanner
 pub struct Scanner {
     db: Database,
+    config: ScanConfig,
 }
 
 impl Scanner {
-    /// Create a new scanner with the given database
+    /// Create a new scanner with the given database and default config
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            config: ScanConfig::default(),
+        }
     }
 
-    /// Scan a source and update the database
+    /// Create a new scanner with custom configuration
+    pub fn with_config(db: Database, config: ScanConfig) -> Self {
+        Self { db, config }
+    }
+
+    /// Scan a source and update the database using parallel walking
     ///
     /// This is the main entry point for scanning. It:
-    /// 1. Walks the source path
-    /// 2. Compares files against the database
-    /// 3. Upserts new/changed files
+    /// 1. Walks the source path in parallel using ignore::WalkParallel
+    /// 2. Collects files into batches per-thread (lock-free hot path)
+    /// 3. Persists files to database after walk completes
     /// 4. Marks deleted files
+    ///
+    /// For progress updates, use `scan_source_with_progress` instead.
     pub async fn scan_source(&self, source: &Source) -> Result<ScanResult> {
-        let start = Instant::now();
-        info!(source = %source.name, path = %source.path, "Starting scan");
+        self.scan_source_with_progress(source, None).await
+    }
 
-        let mut stats = ScanStats::default();
-        let mut errors = Vec::new();
+    /// Scan a source with optional progress updates
+    ///
+    /// If `progress_tx` is provided, progress updates will be sent during the scan.
+    /// This is useful for TUI or other interactive contexts.
+    pub async fn scan_source_with_progress(
+        &self,
+        source: &Source,
+        progress_tx: Option<mpsc::Sender<ScanProgress>>,
+    ) -> Result<ScanResult> {
+        let start = Instant::now();
+        info!(source = %source.name, path = %source.path, "Starting parallel scan");
 
         let source_path = Path::new(&source.path);
         if !source_path.exists() {
             return Err(ScoutError::FileNotFound(source.path.clone()));
         }
 
+        // Send initial progress so UI shows something immediately
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.try_send(ScanProgress {
+                dirs_scanned: 0,
+                files_found: 0,
+                current_dir: Some(source.path.clone()),
+            });
+        }
+
         // Record scan start time for deleted file detection
         let scan_start = Utc::now();
 
-        // Walk the filesystem
-        for entry in WalkDir::new(source_path)
-            .follow_links(false)
-            .into_iter()
-        {
-            match entry {
-                Ok(entry) => {
-                    if entry.file_type().is_dir() {
-                        stats.dirs_scanned += 1;
-                        continue;
+        // Collect files and stats from parallel walker
+        let (files, stats, errors) = self.parallel_walk(source_path, &source.id, progress_tx.clone())?;
+
+        // Send final progress with accurate counts
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.try_send(ScanProgress {
+                dirs_scanned: stats.dirs_scanned as usize,
+                files_found: stats.files_discovered as usize,
+                current_dir: None, // Scan complete
+            });
+        }
+
+        // Persist all files to database
+        let mut final_stats = self.persist_files(&source.id, files, stats).await?;
+
+        // Mark files not seen in this scan as deleted
+        let deleted = self.db.mark_deleted_files(&source.id, scan_start).await?;
+        final_stats.files_deleted = deleted;
+        final_stats.duration_ms = start.elapsed().as_millis() as u64;
+
+        info!(
+            source = %source.name,
+            discovered = final_stats.files_discovered,
+            new = final_stats.files_new,
+            changed = final_stats.files_changed,
+            deleted = final_stats.files_deleted,
+            errors = final_stats.errors,
+            duration_ms = final_stats.duration_ms,
+            "Scan complete"
+        );
+
+        Ok(ScanResult { stats: final_stats, errors })
+    }
+
+    /// Parallel filesystem walk - returns collected files and stats
+    ///
+    /// Uses ignore::WalkParallel for fast parallel traversal.
+    /// Each thread accumulates files locally, then flushes to shared state
+    /// only when batch is full - minimizing lock contention.
+    fn parallel_walk(
+        &self,
+        source_path: &Path,
+        source_id: &str,
+        progress_tx: Option<mpsc::Sender<ScanProgress>>,
+    ) -> Result<(Vec<ScannedFile>, ScanStats, Vec<(String, String)>)> {
+        let batch_size = self.config.batch_size;
+        let progress_interval = self.config.progress_interval;
+
+        // Shared state - threads only touch when flushing batches
+        let all_batches: Arc<Mutex<Vec<Vec<ScannedFile>>>> = Arc::new(Mutex::new(Vec::new()));
+        let all_errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Atomic counters - lock-free progress tracking
+        let total_files = Arc::new(AtomicUsize::new(0));
+        let total_dirs = Arc::new(AtomicUsize::new(0));
+        let total_bytes = Arc::new(AtomicUsize::new(0));
+        let last_progress_at = Arc::new(AtomicUsize::new(0));
+
+        // Current directory hint - updated infrequently
+        let current_dir_hint: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+
+        let walker = WalkBuilder::new(source_path)
+            .threads(self.config.threads)
+            .hidden(!self.config.include_hidden)
+            .follow_links(self.config.follow_symlinks)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .build_parallel();
+
+        let source_id_owned = source_id.to_string();
+        let source_path_owned = source_path.to_path_buf();
+
+        walker.run(|| {
+            // Thread-local state - no lock contention in hot path
+            let source_path = source_path_owned.clone();
+            let source_id = source_id_owned.clone();
+            let all_batches = all_batches.clone();
+            let all_errors = all_errors.clone();
+            let total_files = total_files.clone();
+            let total_dirs = total_dirs.clone();
+            let total_bytes = total_bytes.clone();
+            let last_progress_at = last_progress_at.clone();
+            let current_dir_hint = current_dir_hint.clone();
+            let progress_tx = progress_tx.clone();
+
+            // Thread-local batch with flush guard
+            struct FlushGuard {
+                batch: Vec<ScannedFile>,
+                dir_count: usize,
+                byte_count: usize,
+                all_batches: Arc<Mutex<Vec<Vec<ScannedFile>>>>,
+                total_files: Arc<AtomicUsize>,
+                total_dirs: Arc<AtomicUsize>,
+                total_bytes: Arc<AtomicUsize>,
+            }
+
+            impl Drop for FlushGuard {
+                fn drop(&mut self) {
+                    if !self.batch.is_empty() {
+                        let batch = std::mem::take(&mut self.batch);
+                        let batch_len = batch.len();
+                        if let Ok(mut batches) = self.all_batches.lock() {
+                            batches.push(batch);
+                        }
+                        self.total_files.fetch_add(batch_len, Ordering::Relaxed);
+                        self.total_dirs.fetch_add(self.dir_count, Ordering::Relaxed);
+                        self.total_bytes.fetch_add(self.byte_count, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            let mut guard = FlushGuard {
+                batch: Vec::with_capacity(batch_size),
+                dir_count: 0,
+                byte_count: 0,
+                all_batches: all_batches.clone(),
+                total_files: total_files.clone(),
+                total_dirs: total_dirs.clone(),
+                total_bytes: total_bytes.clone(),
+            };
+
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        if let Ok(mut errors) = all_errors.lock() {
+                            errors.push(("unknown".to_string(), e.to_string()));
+                        }
+                        return ignore::WalkState::Continue;
+                    }
+                };
+
+                let file_path = entry.path();
+
+                // Skip root
+                if file_path == source_path {
+                    return ignore::WalkState::Continue;
+                }
+
+                let metadata = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        if let Ok(mut errors) = all_errors.lock() {
+                            errors.push((file_path.display().to_string(), e.to_string()));
+                        }
+                        return ignore::WalkState::Continue;
+                    }
+                };
+
+                if metadata.is_dir() {
+                    guard.dir_count += 1;
+
+                    // Update current_dir hint infrequently
+                    if guard.dir_count % 100 == 0 {
+                        if let Ok(mut hint) = current_dir_hint.try_lock() {
+                            *hint = file_path
+                                .strip_prefix(&source_path)
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
+                        }
+                    }
+                    return ignore::WalkState::Continue;
+                }
+
+                // Skip symlinks unless configured to follow them
+                if metadata.is_symlink() {
+                    return ignore::WalkState::Continue;
+                }
+
+                // Build ScannedFile
+                let rel_path = file_path
+                    .strip_prefix(&source_path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| file_path.display().to_string());
+
+                let size = metadata.len();
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+
+                guard.batch.push(ScannedFile::new(
+                    &source_id,
+                    &file_path.to_string_lossy(),
+                    &rel_path,
+                    size,
+                    mtime,
+                ));
+                guard.byte_count += size as usize;
+
+                // Flush batch when full
+                if guard.batch.len() >= batch_size {
+                    let batch = std::mem::replace(
+                        &mut guard.batch,
+                        Vec::with_capacity(batch_size)
+                    );
+                    let batch_len = batch.len();
+
+                    if let Ok(mut batches) = all_batches.lock() {
+                        batches.push(batch);
                     }
 
-                    // Skip symlinks for now (could add as config option)
-                    if entry.file_type().is_symlink() {
-                        continue;
-                    }
+                    let new_total = total_files.fetch_add(batch_len, Ordering::Relaxed) + batch_len;
+                    total_dirs.fetch_add(guard.dir_count, Ordering::Relaxed);
+                    total_bytes.fetch_add(guard.byte_count, Ordering::Relaxed);
+                    guard.dir_count = 0;
+                    guard.byte_count = 0;
 
-                    match self.process_entry(&source.id, source_path, &entry).await {
-                        Ok(result) => {
-                            stats.files_discovered += 1;
-                            stats.bytes_scanned += result.size;
-                            if result.is_new {
-                                stats.files_new += 1;
-                            } else if result.is_changed {
-                                stats.files_changed += 1;
-                            } else {
-                                stats.files_unchanged += 1;
+                    // Send progress using compare_exchange to avoid duplicates
+                    let last = last_progress_at.load(Ordering::Relaxed);
+                    if new_total.saturating_sub(last) >= progress_interval {
+                        if last_progress_at.compare_exchange(
+                            last,
+                            new_total,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed
+                        ).is_ok() {
+                            if let Some(tx) = &progress_tx {
+                                let dir_hint = current_dir_hint.try_lock()
+                                    .ok()
+                                    .map(|h| h.clone());
+                                let _ = tx.try_send(ScanProgress {
+                                    dirs_scanned: total_dirs.load(Ordering::Relaxed),
+                                    files_found: new_total,
+                                    current_dir: dir_hint,
+                                });
                             }
                         }
-                        Err(e) => {
-                            stats.errors += 1;
-                            let path = entry.path().to_string_lossy().to_string();
-                            errors.push((path, e.to_string()));
-                        }
+                    }
+                }
+
+                ignore::WalkState::Continue
+            })
+        });
+
+        // Collect all files from batches
+        let batches = Arc::try_unwrap(all_batches)
+            .expect("BUG: Arc still has references after walker completed")
+            .into_inner()
+            .unwrap_or_default();
+
+        let total_capacity: usize = batches.iter().map(|b| b.len()).sum();
+        let mut files = Vec::with_capacity(total_capacity);
+        for batch in batches {
+            files.extend(batch);
+        }
+
+        // Collect errors
+        let errors = match Arc::try_unwrap(all_errors) {
+            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        };
+
+        let stats = ScanStats {
+            files_discovered: files.len() as u64,
+            dirs_scanned: total_dirs.load(Ordering::Relaxed) as u64,
+            bytes_scanned: total_bytes.load(Ordering::Relaxed) as u64,
+            errors: errors.len() as u64,
+            ..Default::default()
+        };
+
+        Ok((files, stats, errors))
+    }
+
+    /// Persist collected files to database
+    async fn persist_files(
+        &self,
+        source_id: &str,
+        files: Vec<ScannedFile>,
+        mut stats: ScanStats,
+    ) -> Result<ScanStats> {
+        for file in files {
+            match self.db.upsert_file(&file).await {
+                Ok(upsert) => {
+                    if upsert.is_new {
+                        stats.files_new += 1;
+                    } else if upsert.is_changed {
+                        stats.files_changed += 1;
+                    } else {
+                        stats.files_unchanged += 1;
                     }
                 }
                 Err(e) => {
                     stats.errors += 1;
-                    if let Some(path) = e.path() {
-                        errors.push((path.to_string_lossy().to_string(), e.to_string()));
-                    } else {
-                        errors.push(("unknown".to_string(), e.to_string()));
-                    }
+                    info!(
+                        file = %file.path,
+                        error = %e,
+                        "Failed to persist file"
+                    );
                 }
             }
         }
-
-        // Mark files not seen in this scan as deleted
-        // (Only if they haven't been seen since before the scan started)
-        let deleted = self.db.mark_deleted_files(&source.id, scan_start).await?;
-        stats.files_deleted = deleted;
-
-        stats.duration_ms = start.elapsed().as_millis() as u64;
-
-        info!(
-            source = %source.name,
-            discovered = stats.files_discovered,
-            new = stats.files_new,
-            changed = stats.files_changed,
-            deleted = stats.files_deleted,
-            errors = stats.errors,
-            duration_ms = stats.duration_ms,
-            "Scan complete"
-        );
-
-        Ok(ScanResult { stats, errors })
-    }
-
-    /// Process a single directory entry
-    async fn process_entry(
-        &self,
-        source_id: &str,
-        source_path: &Path,
-        entry: &walkdir::DirEntry,
-    ) -> Result<ProcessedEntry> {
-        let path = entry.path();
-        let rel_path = path
-            .strip_prefix(source_path)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
-
-        let meta = entry.metadata()?;
-        let size = meta.len();
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        let file = ScannedFile::new(
-            source_id,
-            &path.to_string_lossy(),
-            &rel_path,
-            size,
-            mtime,
-        );
-
-        let upsert = self.db.upsert_file(&file).await?;
-        Ok(ProcessedEntry {
-            is_new: upsert.is_new,
-            is_changed: upsert.is_changed,
-            size,
-        })
+        // Suppress unused variable warning
+        let _ = source_id;
+        Ok(stats)
     }
 
     // Methods below are used in tests and will be used for processing integration

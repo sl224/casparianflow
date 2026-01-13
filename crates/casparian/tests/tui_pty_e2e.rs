@@ -15,6 +15,13 @@
 //! 2. Keystrokes are received and processed
 //! 3. Chat messages appear on screen
 //! 4. Claude Code integration works end-to-end
+//!
+//! ## Feature Flag
+//!
+//! This test is slow (~180s) and requires PTY support.
+//! Only runs with `cargo test --features=full`
+
+#![cfg(feature = "full")]
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};

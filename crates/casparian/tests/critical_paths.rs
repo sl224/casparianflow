@@ -13,6 +13,7 @@
 //! 4. Test MCP tools through their public API
 
 use std::fs;
+#[cfg(feature = "full")]
 use std::process::Command;
 use tempfile::TempDir;
 use serde_json::json;
@@ -318,8 +319,10 @@ mod database {
 
 // =============================================================================
 // BINARY TESTS - Actual Executable
+// (Gated behind 'full' feature - runs cargo which triggers compilation)
 // =============================================================================
 
+#[cfg(feature = "full")]
 mod binary {
     use super::*;
 
@@ -642,5 +645,152 @@ mod workflow {
             }]
         })).await.unwrap();
         assert!(!approve_result.is_error, "Approval should succeed");
+    }
+}
+
+// =============================================================================
+// SCOUT SCANNER TESTS - File Discovery Critical Path
+// =============================================================================
+
+mod scout {
+    use super::*;
+    use casparian::scout::{Database, Scanner, ScanProgress, Source, SourceType};
+    use tokio::sync::mpsc;
+
+    /// Critical: Scanner must send progress updates during scan
+    #[tokio::test]
+    async fn test_scanner_sends_progress_updates() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create test files - enough to trigger progress updates
+        // (progress_interval is 500, batch_size is 1000)
+        for i in 0..100 {
+            fs::write(temp_dir.path().join(format!("file_{}.txt", i)), format!("content {}", i)).unwrap();
+        }
+
+        // Create in-memory database
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Create source
+        let source = Source {
+            id: "test-source".to_string(),
+            name: "test".to_string(),
+            source_type: SourceType::Local,
+            path: temp_dir.path().to_string_lossy().to_string(),
+            poll_interval_secs: 0,
+            enabled: true,
+        };
+
+        // Create progress channel
+        let (progress_tx, mut progress_rx) = mpsc::channel::<ScanProgress>(256);
+
+        // Create scanner
+        let scanner = Scanner::new(db);
+
+        // Run scan with progress
+        let scan_handle = tokio::spawn(async move {
+            scanner.scan_source_with_progress(&source, Some(progress_tx)).await
+        });
+
+        // Collect progress updates
+        let mut progress_updates = Vec::new();
+        while let Some(progress) = progress_rx.recv().await {
+            progress_updates.push(progress);
+        }
+
+        // Wait for scan to complete
+        let result = scan_handle.await.unwrap().unwrap();
+
+        // CRITICAL: Must receive at least initial and final progress
+        assert!(
+            progress_updates.len() >= 2,
+            "Must receive at least 2 progress updates (initial + final), got {}",
+            progress_updates.len()
+        );
+
+        // First progress should be initial (0 files)
+        let first = &progress_updates[0];
+        assert_eq!(first.files_found, 0, "Initial progress should show 0 files");
+
+        // Last progress should have final count
+        let last = progress_updates.last().unwrap();
+        assert_eq!(
+            last.files_found, 100,
+            "Final progress should show all 100 files, got {}",
+            last.files_found
+        );
+
+        // Scan result should match
+        assert_eq!(result.stats.files_discovered, 100);
+    }
+
+    /// Critical: Rescanning same path should work (use existing source)
+    #[tokio::test]
+    async fn test_rescan_existing_source_works() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create test files
+        for i in 0..10 {
+            fs::write(temp_dir.path().join(format!("file_{}.txt", i)), "content").unwrap();
+        }
+
+        let db = Database::open_in_memory().await.unwrap();
+
+        let source = Source {
+            id: "test-source".to_string(),
+            name: "test".to_string(),
+            source_type: SourceType::Local,
+            path: temp_dir.path().to_string_lossy().to_string(),
+            poll_interval_secs: 0,
+            enabled: true,
+        };
+
+        // Upsert source
+        db.upsert_source(&source).await.unwrap();
+
+        let scanner = Scanner::new(db.clone());
+
+        // First scan
+        let result1 = scanner.scan_source(&source).await.unwrap();
+        assert_eq!(result1.stats.files_discovered, 10);
+
+        // Rescan same source (should work without error)
+        let result2 = scanner.scan_source(&source).await.unwrap();
+        assert_eq!(result2.stats.files_discovered, 10);
+
+        // Source should still exist
+        let loaded = db.get_source_by_path(&source.path).await.unwrap();
+        assert!(loaded.is_some(), "Source should still exist after rescan");
+    }
+
+    /// Critical: Source names must be unique
+    #[tokio::test]
+    async fn test_unique_source_names() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        let source1 = Source {
+            id: "source-1".to_string(),
+            name: "data".to_string(),
+            source_type: SourceType::Local,
+            path: "/path/to/data".to_string(),
+            poll_interval_secs: 0,
+            enabled: true,
+        };
+
+        let source2 = Source {
+            id: "source-2".to_string(),
+            name: "data".to_string(), // Same name!
+            source_type: SourceType::Local,
+            path: "/other/path/to/data".to_string(),
+            poll_interval_secs: 0,
+            enabled: true,
+        };
+
+        // First insert should succeed
+        db.upsert_source(&source1).await.unwrap();
+
+        // Second insert with same name but different ID should fail
+        let result = db.upsert_source(&source2).await;
+        assert!(result.is_err(), "Should fail with duplicate name");
     }
 }

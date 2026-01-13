@@ -399,6 +399,129 @@ The landing view is a **card grid with stats** showing the four workflow modes:
 | `Esc` | Unfocus chat → Return to Home Hub (two-stage) |
 | `Ctrl+c` | Quit |
 
+#### Global Application State Machine
+
+The TUI operates as a hierarchical state machine with global navigation and mode-specific sub-states.
+
+```
+                                    ┌──────────────────────────────────────────────────────────────┐
+                                    │                     GLOBAL LAYER                             │
+                                    │                                                              │
+                                    │  ┌─────────────┐                                            │
+                                    │  │ AI SIDEBAR  │◄─── Alt+a (toggle from ANY state)         │
+                                    │  │  (overlay)  │                                            │
+                                    │  └─────────────┘                                            │
+                                    │                                                              │
+                                    │  ┌─────────────┐                                            │
+                                    │  │    HELP     │◄─── ? (toggle from ANY state)             │
+                                    │  │  (overlay)  │                                            │
+                                    │  └─────────────┘                                            │
+                                    │                                                              │
+                                    │  Ctrl+c ──────────────────────────────────► EXIT            │
+                                    └──────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      MODE LAYER                                                    │
+│                                                                                                    │
+│                                    ┌─────────────┐                                                │
+│          ┌─────────────────────────│  HOME HUB   │─────────────────────────┐                      │
+│          │                         │  (initial)  │                         │                      │
+│          │                         └──────┬──────┘                         │                      │
+│          │                                │                                 │                      │
+│          │ Alt+d / Enter[1]               │ Alt+p / Enter[2]               │ Alt+i / Enter[3]     │
+│          ▼                                ▼                                 ▼                      │
+│   ┌─────────────┐                  ┌─────────────┐                  ┌─────────────┐               │
+│   │  DISCOVER   │                  │PARSER BENCH │                  │   INSPECT   │               │
+│   │   (mode)    │                  │   (mode)    │                  │   (mode)    │               │
+│   └──────┬──────┘                  └──────┬──────┘                  └──────┬──────┘               │
+│          │                                │                                 │                      │
+│          │ Alt+j / [4]                    │                                 │                      │
+│          │          ┌─────────────────────┼─────────────────────────────────┘                      │
+│          │          │                     │                                                        │
+│          ▼          ▼                     ▼                                                        │
+│   ┌─────────────────────────────────────────────┐                                                 │
+│   │                  JOBS                        │                                                 │
+│   │                 (mode)                       │                                                 │
+│   └─────────────────────────────────────────────┘                                                 │
+│                                                                                                    │
+│   ◄─────────────────────────────────────────────────────────────────────────────────────────────► │
+│     Esc (from any mode) returns to HOME HUB                                                        │
+│     Alt+h returns to HOME HUB from any state                                                       │
+│     Alt+{d,p,i,j} navigates directly between modes                                                 │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                     MODE SUB-STATES                                                │
+│                                                                                                    │
+│   DISCOVER                         PARSER BENCH                    INSPECT                        │
+│   ────────                         ────────────                    ───────                        │
+│   ┌─────────────┐                  ┌─────────────┐                 ┌─────────────┐                │
+│   │ FILES_PANEL │◄── default       │ PARSER_LIST │◄── default      │ TABLE_LIST  │◄── default    │
+│   └──────┬──────┘                  └──────┬──────┘                 └──────┬──────┘                │
+│          │ 1                              │ Enter                         │ Enter                 │
+│          ▼                                ▼                               ▼                       │
+│   ┌─────────────┐                  ┌─────────────┐                 ┌─────────────┐                │
+│   │  SOURCES    │                  │ PARSER_EDIT │                 │TABLE_DETAIL │                │
+│   │  DROPDOWN   │                  │   (focus)   │                 │   (panel)   │                │
+│   └──────┬──────┘                  └──────┬──────┘                 └──────┬──────┘                │
+│          │ 2                              │ t (test)                      │ q (query)             │
+│          ▼                                ▼                               ▼                       │
+│   ┌─────────────┐                  ┌─────────────┐                 ┌─────────────┐                │
+│   │    TAGS     │                  │ TEST_RUNNER │                 │ SQL_EDITOR  │                │
+│   │  DROPDOWN   │                  │   (modal)   │                 │  (overlay)  │                │
+│   └──────┬──────┘                  └─────────────┘                 └─────────────┘                │
+│          │ g                                                                                       │
+│          ▼                                                                                         │
+│   ┌─────────────┐                  JOBS                                                           │
+│   │    GLOB     │                  ────                                                           │
+│   │  EXPLORER   │                  ┌─────────────┐                                                │
+│   │  (overlay)  │                  │  JOB_LIST   │◄── default                                     │
+│   │   ↓         │                  └──────┬──────┘                                                │
+│   │ EXPLORE     │                         │ Enter                                                 │
+│   │   ↓         │                         ▼                                                       │
+│   │ FOCUSED     │                  ┌─────────────┐                                                │
+│   │   ↓         │                  │ JOB_DETAIL  │                                                │
+│   │ EDIT_RULE   │                  │   (panel)   │                                                │
+│   │   ↓         │                  └──────┬──────┘                                                │
+│   │ TEST        │                         │ d                                                     │
+│   │   ↓         │                         ▼                                                       │
+│   │ PUBLISH     │                  ┌─────────────┐                                                │
+│   └─────────────┘                  │ DEAD_LETTER │                                                │
+│                                    │   (view)    │                                                │
+│                                    └─────────────┘                                                │
+└────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**State Machine Rules:**
+
+| Rule | Description |
+|------|-------------|
+| **GLOBAL_OVERLAY** | AI Sidebar and Help overlay on any mode without changing mode state |
+| **ESC_CASCADES** | Esc exits innermost state first: Overlay → Sub-state → Mode → Home |
+| **ALT_JUMPS** | Alt+{key} always jumps directly, saving current mode state |
+| **MODAL_EXCLUSIVE** | Only one overlay (Sidebar/Help) active at a time |
+| **STATE_PRESERVED** | Returning to a mode restores its last sub-state |
+
+**Mode Transition Table:**
+
+| From | To | Trigger | Notes |
+|------|----|---------|-------|
+| Home | Discover | `Alt+d` or `Enter` on card 1 | |
+| Home | Parser Bench | `Alt+p` or `Enter` on card 2 | |
+| Home | Inspect | `Alt+i` or `Enter` on card 3 | |
+| Home | Jobs | `Alt+j` or `Enter` on card 4 | |
+| Any Mode | Home | `Alt+h` or `Esc` (if no sub-state) | State preserved |
+| Any Mode | Any Mode | `Alt+{d,p,i,j}` | Direct navigation |
+| Any State | AI Sidebar | `Alt+a` | Toggle overlay |
+| Any State | Help | `?` | Toggle overlay |
+| Any State | Exit | `Ctrl+c` | Confirm if unsaved |
+
+> **Full Sub-State Machines:** See individual spec files for complete sub-state documentation:
+> - Discover: `specs/views/discover.md` Sections 4 and 13
+> - Parser Bench: `specs/parser_bench.md`
+> - Jobs: `specs/views/jobs.md` (planned)
+> - Inspect: `specs/views/inspect.md` (planned)
+
 #### Mouse Support (Basic)
 
 *   Scroll wheel for lists/content.

@@ -6,8 +6,9 @@
 
 **Start Here:**
 1. Read this file for high-level architecture
-2. See `ARCHITECTURE.md` for detailed system design
-3. Check crate-specific `CLAUDE.md` files for component details
+2. See `code_execution_workflow.md` for **coding standards and testing requirements**
+3. See `ARCHITECTURE.md` for detailed system design
+4. Check crate-specific `CLAUDE.md` files for component details
 
 ---
 
@@ -520,6 +521,36 @@ for evidence in solver.elimination_evidence() {
 
 ---
 
+## Code Quality Workflow
+
+> **Full documentation:** See [`code_execution_workflow.md`](./code_execution_workflow.md)
+
+**IMPORTANT:** Follow the workflow for all coding tasks. Key points:
+
+### Before You Code
+1. **Search for existing modules** - If similar exists, ask before creating new
+2. **Identify related components** - Reuse shared types
+3. **Plan concurrency** - Channels over locks, document strategy
+4. **Verify state machines** - Check spec matches code, understand hierarchy, reconcile if inconsistent
+
+### While You Code
+- **No stringly types** - Newtypes for IDs, enums for states, structs for config
+- **No race conditions** - Channels (`mpsc`) over `Arc<Mutex<T>>`, no locks across `.await`
+- **Propagate errors** - Use `?`, not `unwrap()` in library code
+- **No migrations** - Alpha app: change schema directly, users delete DB if needed
+
+### Testing
+- Test critical paths with real DBs (no mocks)
+- Test error cases and edge cases
+- Don't test implementation details
+
+### Before You Commit
+- `cargo check` + `cargo clippy` pass
+- Critical path has test coverage
+- Public APIs have doc comments
+
+---
+
 ## Code Style Guidelines
 
 ### Rust
@@ -533,6 +564,7 @@ for evidence in solver.elimination_evidence() {
 - E2E tests for all new features
 - No mocks for core functionality - use real databases
 - Test happy path AND error cases
+- See [`code_execution_workflow.md`](./code_execution_workflow.md) for detailed testing patterns and requirements
 
 ### CLI Design Principles
 

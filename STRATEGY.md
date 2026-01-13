@@ -565,6 +565,30 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 
 **Recommendation:** Target 5 MSP pilots in first 90 days to validate per-client pricing model.
 
+### Non-Dilutive Funding: Open Core Strategy
+
+> **Full Analysis:** See [strategies/non_dilutive_funding.md](strategies/non_dilutive_funding.md) for detailed grant opportunities.
+
+Casparian can pursue grants to fund core infrastructure while maintaining commercial freedom.
+
+**The Model:**
+- **Grants fund:** Open-source Rust crates, parsers, security audits
+- **Commercial revenue funds:** Pro/Enterprise features, support, connectors
+
+| Funding Source | Amount | Fit | Deadline |
+|----------------|--------|-----|----------|
+| **Sovereign Tech Fund** | €50K-€1M | Rust infrastructure | Rolling |
+| **NLNet Foundation** | €5K-€50K | Data sovereignty | Feb 1, 2026 |
+| **NIH SBIR** | $314K | HL7 interoperability | April 5, 2026 |
+| **Open Tech Fund** | $50K-$900K | Journalism/privacy | Rolling |
+
+**Why This Works:**
+- Grant committees see commercial path (Finance sales) as sustainability
+- Commercial customers see open-source core as trust signal
+- No equity dilution; no military entanglements
+
+**Estimated Year 1:** ~$165K in grant funding (in addition to commercial revenue)
+
 ---
 
 ## Key Metrics
@@ -719,6 +743,7 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 | 2026-01 | 2.0 | **Major revision:** Repositioned from "AI-native" to "local-first format parser"; Added vertical-specific competitor analysis; Restructured GTM to vertical-first (Finance → Legal → Defense → Healthcare); Clarified AI as Phase 2 enhancement, not core requirement; Added research-backed competitor tables |
 | 2026-01 | 2.1 | **Healthcare positioning fix:** Clarified Casparian is complementary to Mirth (archive analytics), not a replacement for real-time routing |
 | 2026-01 | 2.2 | **SBIR research:** Added program status note (expired Sept 2025, pending reauth); Identified best-fit topic A254-011; Created [dod_sbir_opportunities.md](strategies/dod_sbir_opportunities.md) |
+| 2026-01 | 2.3 | **Non-dilutive funding:** Added Open Core grant strategy; Created [non_dilutive_funding.md](strategies/non_dilutive_funding.md) with verified civilian funding sources (STF, NLNet, OTF, NIH) |
 
 ---
 

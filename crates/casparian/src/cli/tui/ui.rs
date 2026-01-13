@@ -6,7 +6,7 @@ use ratatui::{
 };
 
 use crate::cli::output::format_number;
-use super::app::{App, DiscoverFocus, JobStatus, MessageRole, ParserBenchView, ParserHealth, TuiMode};
+use super::app::{App, DiscoverFocus, DiscoverViewState, JobStatus, MessageRole, ParserBenchView, ParserHealth, TuiMode};
 
 // ============================================================================
 // Helper Functions for Truncation
@@ -102,6 +102,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(area) = sidebar_area {
         draw_sidebar(frame, app, area);
     }
+
+    // Draw Help Overlay (on top of everything)
+    if app.show_help {
+        draw_help_overlay(frame, area);
+    }
 }
 
 /// Draw the home hub screen with 4 cards
@@ -127,7 +132,7 @@ fn draw_home_screen(frame: &mut Frame, app: &App, area: Rect) {
     draw_home_cards(frame, app, chunks[1]);
 
     // Footer with shortcuts
-    let footer = Paragraph::new(" [Arrow keys/hjkl] Navigate  [Enter] Select  [1-4] Quick select  [Ctrl+C] Quit ")
+    let footer = Paragraph::new(" [↑↓←→/hjkl] Navigate  [Enter] Select  [1-4] Go to view  [0/H] Home  [q] Quit ")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::TOP));
@@ -154,8 +159,9 @@ fn draw_home_cards(frame: &mut Frame, app: &App, area: Rect) {
 
     let areas = [top_row[0], top_row[1], bottom_row[0], bottom_row[1]];
 
-    // Card definitions: (title, description, stats, shortcut, number)
-    let cards: [(&str, &str, String, &str, &str); 4] = [
+    // Card definitions: (title, description, stats, number)
+    // Order matches spec: 1=Discover, 2=Parser Bench, 3=Jobs, 4=Sources
+    let cards: [(&str, &str, String, &str); 4] = [
         (
             "Discover",
             "Find and tag files for processing",
@@ -163,45 +169,44 @@ fn draw_home_cards(frame: &mut Frame, app: &App, area: Rect) {
                 "{} files, {} sources",
                 app.home.stats.file_count, app.home.stats.source_count
             ),
-            "Alt+D",
             "1",
         ),
         (
-            "Process",
-            "Run parsers on discovered files",
+            "Parser Bench",
+            "Develop and test parsers",
             format!(
                 "{} parsers, {} paused",
                 app.home.stats.parser_count, app.home.stats.paused_parsers
             ),
-            "Alt+P",
             "2",
         ),
         (
-            "Inspect",
-            "View and query output data",
-            "Query tables and view results".to_string(),
-            "Alt+I",
-            "3",
-        ),
-        (
             "Jobs",
-            "Manage job queue and workers",
+            "Monitor job queue and workers",
             format!(
                 "{} running, {} pending, {} failed",
                 app.home.stats.running_jobs,
                 app.home.stats.pending_jobs,
                 app.home.stats.failed_jobs
             ),
-            "Alt+J",
+            "3",
+        ),
+        (
+            "Sources",
+            "Manage data sources",
+            format!(
+                "{} sources configured",
+                app.home.stats.source_count
+            ),
             "4",
         ),
     ];
 
     for (i, card_area) in areas.iter().enumerate() {
-        let (title, desc, stats, shortcut, number) = &cards[i];
+        let (title, desc, stats, number) = &cards[i];
         let is_selected = app.home.selected_card == i;
 
-        draw_card(frame, *card_area, title, desc, stats, shortcut, number, is_selected);
+        draw_card(frame, *card_area, title, desc, stats, number, is_selected);
     }
 }
 
@@ -212,7 +217,6 @@ fn draw_card(
     title: &str,
     description: &str,
     stats: &str,
-    shortcut: &str,
     number: &str,
     is_selected: bool,
 ) {
@@ -229,7 +233,7 @@ fn draw_card(
     };
 
     let block = Block::default()
-        .title(format!(" [{}] {} [{}] ", number, title, shortcut))
+        .title(format!(" [{}] {} ", number, title))
         .title_style(title_style)
         .borders(Borders::ALL)
         .border_style(border_style);
@@ -288,65 +292,69 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
     let filtered_count = filtered.len();
 
     // Title / Filter / Scan Input / Tag Input / Create Source / Bulk Tag / Rule Creation Bar
-    let (title_text, title_style) = if app.discover.is_creating_rule {
-        (
+    let (title_text, title_style) = match app.discover.view_state {
+        DiscoverViewState::RuleCreation => (
             format!(" Save filter '{}' as rule - Tag: {}_ ", app.discover.filter, app.discover.rule_tag_input),
             Style::default().fg(Color::Blue).bold(),
-        )
-    } else if app.discover.is_bulk_tagging {
-        let checkbox = if app.discover.bulk_tag_save_as_rule { "[x]" } else { "[ ]" };
-        (
-            format!(" Tag {} files: {}_ {} Save as rule ", filtered_count, app.discover.bulk_tag_input, checkbox),
-            Style::default().fg(Color::Yellow).bold(),
-        )
-    } else if app.discover.is_creating_source {
-        let dir_name = app.discover.pending_source_path.as_ref()
-            .map(|p| std::path::Path::new(p)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| p.clone()))
-            .unwrap_or_default();
-        (
-            format!(" Create source from '{}' - Name: {}_ ", dir_name, app.discover.source_name_input),
-            Style::default().fg(Color::Blue).bold(),
-        )
-    } else if app.discover.is_tagging {
-        let file_name = app.discover.files
-            .get(app.discover.selected)
-            .map(|f| std::path::Path::new(&f.path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| f.path.clone()))
-            .unwrap_or_default();
-        (
-            format!(" Tag '{}': {}_ ", file_name, app.discover.tag_input),
-            Style::default().fg(Color::Magenta).bold(),
-        )
-    } else if app.discover.is_entering_path {
-        (
-            format!(" Scan folder: {}_ ", app.discover.scan_path_input),
-            Style::default().fg(Color::Green).bold(),
-        )
-    } else if app.discover.is_filtering {
-        (
+        ),
+        DiscoverViewState::BulkTagging => {
+            let checkbox = if app.discover.bulk_tag_save_as_rule { "[x]" } else { "[ ]" };
+            (
+                format!(" Tag {} files: {}_ {} Save as rule ", filtered_count, app.discover.bulk_tag_input, checkbox),
+                Style::default().fg(Color::Yellow).bold(),
+            )
+        }
+        DiscoverViewState::CreatingSource => {
+            let dir_name = app.discover.pending_source_path.as_ref()
+                .map(|p| std::path::Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.clone()))
+                .unwrap_or_default();
+            (
+                format!(" Create source from '{}' - Name: {}_ ", dir_name, app.discover.source_name_input),
+                Style::default().fg(Color::Blue).bold(),
+            )
+        }
+        DiscoverViewState::Tagging => {
+            let file_name = app.discover.files
+                .get(app.discover.selected)
+                .map(|f| std::path::Path::new(&f.path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| f.path.clone()))
+                .unwrap_or_default();
+            (
+                format!(" Tag '{}': {}_ ", file_name, app.discover.tag_input),
+                Style::default().fg(Color::Magenta).bold(),
+            )
+        }
+        DiscoverViewState::EnteringPath => (
+            " Discover - Adding Source ".to_string(),
+            Style::default().fg(Color::Cyan).bold(),
+        ),
+        DiscoverViewState::Filtering => (
             format!(" Filter: {}_ ({} of {}) ", app.discover.filter, filtered_count, total_files),
             Style::default().fg(Color::Yellow).bold(),
-        )
-    } else if let Some(ref err) = app.discover.scan_error {
-        (
-            format!("  {}", err),
-            Style::default().fg(Color::Red),
-        )
-    } else if !app.discover.filter.is_empty() {
-        (
-            format!(" Discover - {} of {} files (filter: '{}') ", filtered_count, total_files, app.discover.filter),
-            Style::default().fg(Color::Cyan).bold(),
-        )
-    } else {
-        (
-            format!(" Discover - {} files ", total_files),
-            Style::default().fg(Color::Cyan).bold(),
-        )
+        ),
+        _ => {
+            if let Some(ref err) = app.discover.scan_error {
+                (
+                    format!("  {}", err),
+                    Style::default().fg(Color::Red),
+                )
+            } else if !app.discover.filter.is_empty() {
+                (
+                    format!(" Discover - {} of {} files (filter: '{}') ", filtered_count, total_files, app.discover.filter),
+                    Style::default().fg(Color::Cyan).bold(),
+                )
+            } else {
+                (
+                    format!(" Discover - {} files ", total_files),
+                    Style::default().fg(Color::Cyan).bold(),
+                )
+            }
+        }
     };
 
     let title = Paragraph::new(title_text)
@@ -380,11 +388,17 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
             .split(files_area)
     };
 
-    // File List - pass filtered files
-    draw_file_list(frame, app, &filtered, main_chunks[0]);
+    // File List or Glob Explorer
+    if app.discover.glob_explorer.is_some() {
+        // Glob Explorer is active - show hierarchical folder view
+        draw_glob_explorer(frame, app, main_chunks[0]);
+    } else {
+        // Normal file list
+        draw_file_list(frame, app, &filtered, main_chunks[0]);
+    }
 
-    // Preview Pane (if open)
-    if app.discover.preview_open {
+    // Preview Pane (if open, only for normal file list)
+    if app.discover.preview_open && app.discover.glob_explorer.is_none() {
         draw_file_preview(frame, app, &filtered, main_chunks[1]);
     }
 
@@ -396,13 +410,19 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, chunks[2]);
 
-    // Dialogs (overlays) - render in priority order
-    if app.discover.rules_manager_open {
-        draw_rules_manager_dialog(frame, app, area);
-    } else if app.discover.is_creating_rule {
-        draw_rule_creation_dialog(frame, app, area);
-    } else if app.discover.show_wizard {
-        draw_wizard_dialog(frame, app, area);
+    // Dialogs (overlays) - render based on view_state
+    match app.discover.view_state {
+        DiscoverViewState::RulesManager => draw_rules_manager_dialog(frame, app, area),
+        DiscoverViewState::RuleCreation => draw_rule_creation_dialog(frame, app, area),
+        // Sources Manager dialogs (spec v1.7)
+        DiscoverViewState::SourcesManager => draw_sources_manager_dialog(frame, app, area),
+        DiscoverViewState::SourceEdit => draw_source_edit_dialog(frame, app, area),
+        DiscoverViewState::SourceDeleteConfirm => draw_source_delete_confirm_dialog(frame, app, area),
+        // Scanning progress dialog
+        DiscoverViewState::Scanning => draw_scanning_dialog(frame, app, area),
+        // Add Source path input dialog
+        DiscoverViewState::EnteringPath => draw_add_source_dialog(frame, app, area),
+        _ => {}
     }
 }
 
@@ -420,55 +440,85 @@ fn get_discover_footer(app: &App, filtered_count: usize) -> (String, Style) {
         );
     }
 
-    // Dialog-specific footers
-    if app.discover.is_creating_rule {
-        return (" [Enter] Save rule  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-    }
-    if app.discover.is_bulk_tagging {
-        return (" [Enter] Apply tag  [Space] Toggle rule  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-    }
-    if app.discover.is_creating_source {
-        return (" [Enter] Create source  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-    }
-    if app.discover.is_tagging {
-        return (" [Enter] Apply tag  [Tab] Autocomplete  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-    }
-    if app.discover.is_entering_path {
-        return (" [Enter] Scan  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-    }
-    if app.discover.is_filtering {
-        return (
-            format!(" [Enter] Done  [t] Tag {} files  [R] Save as rule  [Esc] Clear ", filtered_count),
-            Style::default().fg(Color::DarkGray),
-        );
+    // Dialog/input-specific footers based on view state
+    match app.discover.view_state {
+        DiscoverViewState::RuleCreation => {
+            return (" [Enter] Save rule  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
+        }
+        DiscoverViewState::BulkTagging => {
+            return (" [Enter] Apply tag  [Space] Toggle rule  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
+        }
+        DiscoverViewState::CreatingSource => {
+            return (" [Enter] Create source  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
+        }
+        DiscoverViewState::Tagging => {
+            return (" [Enter] Apply tag  [Tab] Autocomplete  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
+        }
+        DiscoverViewState::EnteringPath => {
+            return (" [Enter] Scan  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
+        }
+        DiscoverViewState::Scanning => {
+            return (" Scanning... [0] Home  [4] Jobs (scan continues)  [Esc] Cancel ".to_string(), Style::default().fg(Color::Yellow));
+        }
+        DiscoverViewState::Filtering => {
+            return (
+                format!(" [Enter] Done  [t] Tag {} files  [R] Save as rule  [Esc] Clear ", filtered_count),
+                Style::default().fg(Color::DarkGray),
+            );
+        }
+        // Sources Manager dialogs (spec v1.7)
+        DiscoverViewState::SourcesManager => {
+            return (" [n] New  [e] Edit  [d] Delete  [r] Rescan  [Esc] Close ".to_string(), Style::default().fg(Color::DarkGray));
+        }
+        DiscoverViewState::SourceEdit => {
+            return (" [Enter] Save  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
+        }
+        DiscoverViewState::SourceDeleteConfirm => {
+            return (" [Enter/y] Confirm delete  [Esc/n] Cancel ".to_string(), Style::default().fg(Color::Red));
+        }
+        _ => {}
     }
 
     // Focus-based footers with new navigation model
     match app.discover.focus {
         DiscoverFocus::Files => {
+            // Glob Explorer mode has its own footer
+            if let Some(ref explorer) = app.discover.glob_explorer {
+                if explorer.pattern_editing {
+                    return (
+                        " [Enter] Done  [Esc] Cancel  │ Type glob pattern (e.g., *.csv) ".to_string(),
+                        Style::default().fg(Color::Yellow),
+                    );
+                }
+                return (
+                    " [j/k] Navigate  [Enter] Drill in  [Backspace] Back  [/] Filter  [g/Esc] Exit ".to_string(),
+                    Style::default().fg(Color::Cyan),
+                );
+            }
+            // Normal file list mode
             if !app.discover.filter.is_empty() {
                 (
-                    format!(" [n] New Rule  [t] Tag {} files  [Esc] Clear  │ 1:Source 2:Tags ", filtered_count),
+                    format!(" [t] Tag {} files  [Esc] Clear  │ [R] Rules [M] Sources │ 1:Source 2:Tags ", filtered_count),
                     Style::default().fg(Color::DarkGray),
                 )
             } else {
-                (" [n] New Rule  [/] Filter  [t] Tag  [s] Scan  [R] Rules  │ 1:Source 2:Tags ".to_string(), Style::default().fg(Color::DarkGray))
+                (" [g] Explorer  [/] Filter  [t] Tag  [s] Scan  │ [R] Rules [M] Sources │ 1:Source 2:Tags ".to_string(), Style::default().fg(Color::DarkGray))
             }
         }
         DiscoverFocus::Sources => {
-            (" [n] New Rule  [Enter] Select  [↑↓] Navigate  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray))
+            (" [Enter] Select  [↑↓] Navigate  │ [R] Rules [M] Sources │ [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray))
         }
         DiscoverFocus::Tags => {
-            (" [n] New Rule  [Enter] Select  [↑↓] Navigate  [Esc] All files ".to_string(), Style::default().fg(Color::DarkGray))
+            (" [Enter] Select  [↑↓] Navigate  │ [R] Rules [M] Sources │ [Esc] All files ".to_string(), Style::default().fg(Color::DarkGray))
         }
     }
 }
 
 /// Draw the Discover mode sidebar with Sources and Tags sections (scrollable)
 fn draw_discover_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    // Dynamic layout based on dropdown state
-    let sources_open = app.discover.sources_dropdown_open;
-    let tags_open = app.discover.tags_dropdown_open;
+    // Dynamic layout based on view state
+    let sources_open = app.discover.view_state == DiscoverViewState::SourcesDropdown;
+    let tags_open = app.discover.view_state == DiscoverViewState::TagsDropdown;
 
     // Calculate heights: collapsed = 3 lines (1 content + 2 border), expanded = remaining space
     let (sources_constraint, tags_constraint) = match (sources_open, tags_open) {
@@ -492,7 +542,7 @@ fn draw_discover_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Sources dropdown (collapsed or expanded)
 fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    let is_open = app.discover.sources_dropdown_open;
+    let is_open = app.discover.view_state == DiscoverViewState::SourcesDropdown;
     let is_focused = app.discover.focus == DiscoverFocus::Sources;
 
     let style = if is_focused {
@@ -502,18 +552,37 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     if is_open {
-        // Expanded: filter input + list
+        // Expanded dropdown with optional filter line
+        let is_filtering = app.discover.sources_filtering;
+
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .margin(1)
             .split(area);
 
-        // Filter input line
-        let filter_text = format!("Filter: {}█", app.discover.sources_filter);
-        let filter_line = Paragraph::new(filter_text)
-            .style(Style::default().fg(Color::Yellow));
-        frame.render_widget(filter_line, inner_chunks[0]);
+        // Top line: filter input OR hint
+        if is_filtering {
+            let filter_text = format!("/{}", app.discover.sources_filter);
+            let filter_line = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(filter_text, Style::default().fg(Color::Yellow)),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                ])
+            ]);
+            frame.render_widget(filter_line, inner_chunks[0]);
+        } else if !app.discover.sources_filter.is_empty() {
+            // Show active filter (but not in filter mode)
+            let hint = format!("/{} (Enter:clear)", app.discover.sources_filter);
+            let hint_line = Paragraph::new(hint)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(hint_line, inner_chunks[0]);
+        } else {
+            // Show keybinding hints
+            let hint_line = Paragraph::new("[/]filter [s]scan [j/k]nav")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(hint_line, inner_chunks[0]);
+        }
 
         // Filtered list
         let filtered: Vec<_> = app.discover.sources.iter()
@@ -534,7 +603,7 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             )));
         } else {
             // Find scroll offset based on preview position
-            let preview_idx = app.discover.preview_source.unwrap_or(app.discover.selected_source);
+            let preview_idx = app.discover.preview_source.unwrap_or_else(|| app.discover.selected_source_index());
             let preview_pos = filtered.iter().position(|(i, _)| *i == preview_idx).unwrap_or(0);
             let scroll_offset = if preview_pos >= visible_height {
                 preview_pos - visible_height + 1
@@ -544,7 +613,7 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
 
             for (i, source) in filtered.iter().skip(scroll_offset).take(visible_height) {
                 let is_preview = app.discover.preview_source == Some(*i);
-                let is_selected = *i == app.discover.selected_source;
+                let is_selected = *i == app.discover.selected_source_index();
                 let prefix = if is_preview { "► " } else { "  " };
 
                 let item_style = if is_preview {
@@ -573,7 +642,7 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         // Collapsed: show selected source
         let selected_text = if app.discover.sources.is_empty() {
             "No sources (press 's')".to_string()
-        } else if let Some(source) = app.discover.sources.get(app.discover.selected_source) {
+        } else if let Some(source) = app.discover.sources.get(app.discover.selected_source_index()) {
             format!("{} ({})", source.name, source.file_count)
         } else {
             "Select source...".to_string()
@@ -594,7 +663,7 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Tags dropdown (collapsed or expanded)
 fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    let is_open = app.discover.tags_dropdown_open;
+    let is_open = app.discover.view_state == DiscoverViewState::TagsDropdown;
     let is_focused = app.discover.focus == DiscoverFocus::Tags;
 
     let style = if is_focused {
@@ -604,18 +673,37 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     if is_open {
-        // Expanded: filter input + list
+        // Expanded dropdown with optional filter line
+        let is_filtering = app.discover.tags_filtering;
+
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .margin(1)
             .split(area);
 
-        // Filter input line
-        let filter_text = format!("Filter: {}█", app.discover.tags_filter);
-        let filter_line = Paragraph::new(filter_text)
-            .style(Style::default().fg(Color::Yellow));
-        frame.render_widget(filter_line, inner_chunks[0]);
+        // Top line: filter input OR hint
+        if is_filtering {
+            let filter_text = format!("/{}", app.discover.tags_filter);
+            let filter_line = Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled(filter_text, Style::default().fg(Color::Yellow)),
+                    Span::styled("█", Style::default().fg(Color::Yellow)),
+                ])
+            ]);
+            frame.render_widget(filter_line, inner_chunks[0]);
+        } else if !app.discover.tags_filter.is_empty() {
+            // Show active filter (but not in filter mode)
+            let hint = format!("/{} (Enter:clear)", app.discover.tags_filter);
+            let hint_line = Paragraph::new(hint)
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(hint_line, inner_chunks[0]);
+        } else {
+            // Show keybinding hints
+            let hint_line = Paragraph::new("[/]filter [j/k]nav")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(hint_line, inner_chunks[0]);
+        }
 
         // Filtered list
         let filtered: Vec<_> = app.discover.tags.iter()
@@ -826,6 +914,465 @@ fn draw_rules_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(footer, chunks[1]);
 }
 
+/// Draw the Sources Manager dialog as an overlay (spec v1.7)
+fn draw_sources_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the dialog
+    let dialog_width = area.width.min(65);
+    let dialog_height = area.height.min(20);
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    // Clear the area behind the dialog
+    frame.render_widget(Clear, dialog_area);
+
+    // Dialog block
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" Sources Manager ", Style::default().fg(Color::Cyan).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Split inner area: list + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner_area);
+
+    // Sources list
+    let mut lines: Vec<Line> = Vec::new();
+
+    if app.discover.sources.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  No sources yet",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Press [n] to scan a directory",
+            Style::default().fg(Color::Cyan),
+        )));
+    } else {
+        // Header
+        lines.push(Line::from(vec![
+            Span::styled("  Name", Style::default().fg(Color::DarkGray)),
+            Span::raw("                "),
+            Span::styled("Path", Style::default().fg(Color::DarkGray)),
+            Span::raw("                    "),
+            Span::styled("Files", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "  ─────────────────────────────────────────────────────────",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        for (i, source) in app.discover.sources.iter().enumerate() {
+            let is_selected = i == app.discover.sources_manager_selected;
+            let prefix = if is_selected { "► " } else { "  " };
+
+            let style = if is_selected {
+                Style::default().fg(Color::White).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            // Truncate name if too long
+            let name = if source.name.len() > 16 {
+                format!("{}...", &source.name[..13])
+            } else {
+                format!("{:<16}", source.name)
+            };
+
+            // Truncate path if too long
+            let path_str = source.path.to_string_lossy();
+            let path = if path_str.len() > 22 {
+                format!("...{}", &path_str[path_str.len()-19..])
+            } else {
+                format!("{:<22}", path_str)
+            };
+
+            lines.push(Line::from(Span::styled(
+                format!("{}{}  {}  {:>5}", prefix, name, path, source.file_count),
+                style,
+            )));
+        }
+    }
+
+    let sources_list = Paragraph::new(lines);
+    frame.render_widget(sources_list, chunks[0]);
+
+    // Footer with keybindings
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" [n]", Style::default().fg(Color::Cyan)),
+        Span::raw(" New  "),
+        Span::styled("[e]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Edit  "),
+        Span::styled("[d]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Del  "),
+        Span::styled("[r]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Rescan  "),
+        Span::styled("[Esc]", Style::default().fg(Color::Cyan)),
+        Span::raw(" Close"),
+    ]))
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[1]);
+}
+
+/// Draw the Source Edit dialog as an overlay (spec v1.7)
+fn draw_source_edit_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center a smaller dialog
+    let dialog_width = area.width.min(50);
+    let dialog_height = 8;
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(" Edit Source ", Style::default().fg(Color::Yellow).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Layout: name field + path (read-only) + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Name field
+            Constraint::Length(1),  // Path (read-only)
+            Constraint::Length(1),  // Footer
+        ])
+        .split(inner_area);
+
+    // Name input field
+    let name_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" Name ", Style::default().fg(Color::Cyan)));
+
+    let name_text = format!("{}█", app.discover.source_edit_input);
+    let name_para = Paragraph::new(name_text)
+        .style(Style::default().fg(Color::White))
+        .block(name_block);
+    frame.render_widget(name_para, chunks[0]);
+
+    // Path (read-only)
+    let path_text = if let Some(ref source_id) = app.discover.editing_source {
+        app.discover.sources.iter()
+            .find(|s| &s.id == source_id)
+            .map(|s| format!("  Path: {} (read-only)", s.path.to_string_lossy()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let path_para = Paragraph::new(path_text)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(path_para, chunks[1]);
+
+    // Footer
+    let footer = Paragraph::new(" [Enter] Save  [Esc] Cancel ")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Draw the Source Delete Confirmation dialog as an overlay (spec v1.7)
+fn draw_source_delete_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center a smaller dialog
+    let dialog_width = area.width.min(55);
+    let dialog_height = 10;
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(Span::styled(" Delete Source ", Style::default().fg(Color::Red).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Get source info for display
+    let (source_name, file_count) = app.discover.source_to_delete.as_ref()
+        .and_then(|id| app.discover.sources.iter().find(|s| &s.id == id))
+        .map(|s| (s.name.clone(), s.file_count))
+        .unwrap_or_else(|| ("Unknown".to_string(), 0));
+
+    // Content
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Delete source \"{}\"?", source_name),
+            Style::default().fg(Color::White).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  This will remove the source and all {} tracked", file_count),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "  files from the database. Files on disk will NOT",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "  be deleted.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [Enter/y]", Style::default().fg(Color::Red)),
+            Span::raw(" Confirm  "),
+            Span::styled("[Esc/n]", Style::default().fg(Color::Cyan)),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let para = Paragraph::new(content);
+    frame.render_widget(para, inner_area);
+}
+
+/// Draw the Add Source dialog as an overlay (improved UX for path input)
+fn draw_add_source_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Calculate height based on content
+    let suggestions_count = app.discover.path_suggestions.len().min(8);
+    let has_suggestions = suggestions_count > 0;
+    let has_error = app.discover.scan_error.is_some();
+
+    // Base height + suggestions + error
+    let dialog_height = 9
+        + if has_suggestions { suggestions_count as u16 + 2 } else { 0 }
+        + if has_error { 2 } else { 0 };
+
+    // Center a dialog
+    let dialog_width = area.width.min(70);
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" Add Source ", Style::default().fg(Color::Cyan).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Build content
+    let mut content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter the path to a folder to scan:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+    ];
+
+    // Path input field with cursor
+    let input = &app.discover.scan_path_input;
+    let input_display = if input.is_empty() {
+        "  Path: _".to_string()
+    } else {
+        format!("  Path: {}_", input)
+    };
+    content.push(Line::from(Span::styled(
+        input_display,
+        Style::default().fg(Color::Yellow).bold(),
+    )));
+
+    // Show suggestions if available
+    if has_suggestions {
+        content.push(Line::from(""));
+        for (idx, suggestion) in app.discover.path_suggestions.iter().enumerate() {
+            let is_selected = idx == app.discover.path_suggestion_idx;
+            let prefix = if is_selected { "  ► " } else { "    " };
+            let style = if is_selected {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            content.push(Line::from(Span::styled(
+                format!("{}{}", prefix, suggestion),
+                style,
+            )));
+        }
+    }
+
+    // Show error if present
+    if has_error {
+        if let Some(ref err) = app.discover.scan_error {
+            content.push(Line::from(""));
+            content.push(Line::from(Span::styled(
+                format!("  Error: {}", err),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
+
+    // Help text
+    content.push(Line::from(""));
+    let help_text = if has_suggestions {
+        "  [Tab] complete  [↑↓] select  [Enter] confirm  [Esc] cancel"
+    } else {
+        "  Tip: Use ~ for home directory (e.g., ~/Documents)"
+    };
+    content.push(Line::from(Span::styled(
+        help_text,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let para = Paragraph::new(content);
+    frame.render_widget(para, inner_area);
+}
+
+/// Draw the Scanning progress dialog as an overlay
+fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center a dialog
+    let dialog_width = area.width.min(60);
+    let dialog_height = 9;
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(
+        area.x + x,
+        area.y + y,
+        dialog_width,
+        dialog_height,
+    );
+
+    // Clear the entire dialog area first
+    frame.render_widget(Clear, dialog_area);
+
+    // Animated spinner for title
+    let spinner_chars = ["-", "\\", "|", "/"];
+    let spinner = spinner_chars[(app.tick_count / 2) as usize % 4];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            format!(" [{}] Scanning ", spinner),
+            Style::default().fg(Color::Yellow).bold()
+        ));
+
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Get progress - IMPORTANT: scan_progress contains the REAL values
+    let progress = app.discover.scan_progress.as_ref();
+    let files = progress.map(|p| p.files_found).unwrap_or(0);
+    let dirs = progress.map(|p| p.dirs_scanned).unwrap_or(0);
+    let current = progress.and_then(|p| p.current_dir.clone());
+
+    // Elapsed time from scan_start_time
+    let secs = app.discover.scan_start_time
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    let time_str = if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}s", secs)
+    };
+
+    // Path being scanned
+    let path = app.discover.scanning_path.as_deref().unwrap_or("...");
+    let w = inner.width as usize;
+    let path_display = if path.len() > w.saturating_sub(10) {
+        let take = w.saturating_sub(13);
+        format!("...{}", &path[path.len().saturating_sub(take)..])
+    } else {
+        path.to_string()
+    };
+
+    // Current directory hint
+    let hint = match &current {
+        Some(d) if d != "Initializing..." => {
+            if d.len() > w.saturating_sub(6) {
+                let take = w.saturating_sub(9);
+                format!("...{}", &d[d.len().saturating_sub(take)..])
+            } else {
+                d.clone()
+            }
+        }
+        _ => {
+            let dots = ["   ", ".  ", ".. ", "..."][(app.tick_count / 4) as usize % 4];
+            format!("scanning{}", dots)
+        }
+    };
+
+    // Render each line explicitly - using raw strings to fill width
+    let pad = |s: &str| format!("{:<width$}", s, width = w);
+
+    // Line 0: Path
+    let line0 = format!("  Path: {}", path_display);
+    // Line 1: empty
+    // Line 2: Stats (THE MAIN PROGRESS LINE)
+    let line2 = format!("  {} files | {} dirs | {}", files, dirs, time_str);
+    // Line 3: empty
+    // Line 4: Current directory hint
+    let line4 = format!("  {}", hint);
+    // Line 5: empty
+    // Line 6: Navigation
+    let line6 = "  [Esc] Cancel  [0] Home  [4] Jobs";
+
+    let text = vec![
+        Line::styled(pad(&line0), Style::default().fg(Color::White)),
+        Line::raw(pad("")),
+        Line::styled(pad(&line2), Style::default().fg(Color::Green).add_modifier(ratatui::style::Modifier::BOLD)),
+        Line::raw(pad("")),
+        Line::styled(pad(&line4), Style::default().fg(Color::DarkGray)),
+        Line::raw(pad("")),
+        Line::styled(pad(line6), Style::default().fg(Color::DarkGray)),
+    ];
+
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
 /// Draw the Rule Creation dialog as an overlay (two-field version with live preview)
 fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
     use ratatui::widgets::Clear;
@@ -969,123 +1516,6 @@ fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(footer, chunks[4]);
 }
 
-/// Draw the onboarding wizard dialog as an overlay
-fn draw_wizard_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
-
-    // Center the dialog
-    let dialog_width = area.width.min(60);
-    let dialog_height = area.height.min(16);
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    // Clear the area behind the dialog
-    frame.render_widget(Clear, dialog_area);
-
-    // Dialog block
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(" Quick Setup ", Style::default().fg(Color::Yellow).bold()));
-
-    let inner_area = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
-
-    // Get source and file counts
-    let source_name = app.discover.sources
-        .get(app.discover.selected_source)
-        .map(|s| s.name.as_str())
-        .unwrap_or("Unknown");
-
-    let total_files = app.discover.files.len();
-    let untagged_count = app.discover.files.iter()
-        .filter(|f| f.tags.is_empty())
-        .count();
-
-    // Split inner area
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),  // Header info
-            Constraint::Length(3),  // Explanation
-            Constraint::Length(4),  // Options
-            Constraint::Length(2),  // Checkbox
-            Constraint::Min(0),     // Footer
-        ])
-        .split(inner_area);
-
-    // Header info
-    let header_lines = vec![
-        Line::from(vec![
-            Span::styled("  📁 Source: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(source_name, Style::default().fg(Color::White).bold()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("  {} files discovered, {} untagged", total_files, untagged_count),
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-    ];
-    let header = Paragraph::new(header_lines);
-    frame.render_widget(header, chunks[0]);
-
-    // Explanation
-    let explanation = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Tagging rules automatically categorize files.",
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(Span::styled(
-            "  Example: *.csv → \"sales\"",
-            Style::default().fg(Color::DarkGray).italic(),
-        )),
-    ]);
-    frame.render_widget(explanation, chunks[1]);
-
-    // Options
-    let options = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("    [n]", Style::default().fg(Color::Cyan).bold()),
-            Span::styled(" Create a tagging rule", Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("    [Enter]", Style::default().fg(Color::Green).bold()),
-            Span::styled(" Browse files first", Style::default().fg(Color::White)),
-        ]),
-    ]);
-    frame.render_widget(options, chunks[2]);
-
-    // Checkbox
-    let checkbox = if app.discover.wizard_dont_show_checked { "[x]" } else { "[ ]" };
-    let checkbox_line = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("    {} ", checkbox), Style::default().fg(Color::DarkGray)),
-            Span::styled("Don't show this again", Style::default().fg(Color::DarkGray)),
-            Span::styled("  [Space] toggle", Style::default().fg(Color::DarkGray).italic()),
-        ]),
-    ]);
-    frame.render_widget(checkbox_line, chunks[3]);
-
-    // Footer
-    let footer = Paragraph::new(Line::from(Span::styled(
-        " [Esc] Close ",
-        Style::default().fg(Color::DarkGray),
-    )))
-        .alignment(Alignment::Center);
-    frame.render_widget(footer, chunks[4]);
-}
-
 fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::FileInfo], area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1121,6 +1551,26 @@ fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::F
             )));
         }
     } else {
+        // VIRTUAL SCROLLING: Only render visible rows for performance with large file lists
+        // Calculate visible height (area height minus 1 for title line)
+        let visible_rows = area.height.saturating_sub(1) as usize;
+        let total_files = filtered_files.len();
+        let selected = app.discover.selected;
+
+        // Calculate scroll offset to keep selected item visible
+        // Try to keep selected item roughly centered, but don't scroll past boundaries
+        let scroll_offset = if visible_rows >= total_files {
+            0 // All files fit, no scrolling needed
+        } else if selected < visible_rows / 2 {
+            0 // Near start, show from beginning
+        } else if selected > total_files.saturating_sub(visible_rows / 2) {
+            total_files.saturating_sub(visible_rows) // Near end, show last visible_rows
+        } else {
+            selected.saturating_sub(visible_rows / 2) // Center the selection
+        };
+
+        let end_idx = (scroll_offset + visible_rows).min(total_files);
+
         // Calculate column widths:
         // Icon: 2 chars (emoji + space)
         // Size: 8 chars (fixed)
@@ -1132,8 +1582,10 @@ fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::F
         let padding = 4; // some breathing room
         let path_width = area.width.saturating_sub((size_width + tag_width + icon_width + padding) as u16) as usize;
 
-        for (i, file) in filtered_files.iter().enumerate() {
-            let is_selected = i == app.discover.selected;
+        // Only iterate over visible files
+        for (visible_idx, file) in filtered_files[scroll_offset..end_idx].iter().enumerate() {
+            let actual_idx = scroll_offset + visible_idx;
+            let is_selected = actual_idx == selected;
             let style = if is_selected && is_focused {
                 Style::default().fg(Color::White).bold().bg(Color::DarkGray)
             } else if is_selected {
@@ -1175,7 +1627,14 @@ fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::F
     }
 
     let file_count = filtered_files.len();
-    let title = format!(" [3] FILES ({}) ", file_count);
+    let selected = app.discover.selected;
+
+    // Show position indicator for large lists
+    let title = if file_count > 100 {
+        format!(" [3] FILES ({}/{}) ", selected + 1, format_count(file_count))
+    } else {
+        format!(" [3] FILES ({}) ", file_count)
+    };
     let title_style = if is_focused {
         Style::default().fg(Color::Cyan)
     } else {
@@ -1188,6 +1647,176 @@ fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::F
 
     let list = Paragraph::new(lines).block(block);
     frame.render_widget(list, area);
+}
+
+/// Format large counts with K/M suffixes for readability
+fn format_count(count: usize) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
+/// Draw the Glob Explorer (hierarchical folder view)
+fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
+    use super::app::GlobFileCount;
+
+    let explorer = match &app.discover.glob_explorer {
+        Some(e) => e,
+        None => return,
+    };
+
+    let is_focused = app.discover.focus == DiscoverFocus::Files;
+
+    // Split into three sections: Pattern, Folders, Preview
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Pattern input
+            Constraint::Min(5),     // Folders list
+            Constraint::Length(6),  // Preview files
+        ])
+        .split(area);
+
+    // --- Pattern section ---
+    let pattern_display = if explorer.pattern.is_empty() {
+        "<no filter>".to_string()
+    } else {
+        explorer.pattern.clone()
+    };
+    let total_count = match &explorer.total_count {
+        GlobFileCount::Exact(n) => format!("{} files", format_count(*n)),
+        GlobFileCount::Estimated(n) => format!("~{} files", format_count(*n)),
+    };
+    let pattern_line = format!(
+        "Pattern: {}{}  [{}]",
+        pattern_display,
+        if !explorer.current_prefix.is_empty() {
+            format!("  (in {})", explorer.current_prefix)
+        } else {
+            String::new()
+        },
+        total_count
+    );
+    let pattern_style = if explorer.pattern_editing {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let pattern_widget = Paragraph::new(Line::from(Span::styled(pattern_line, pattern_style)))
+        .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(pattern_widget, chunks[0]);
+
+    // --- Folders section ---
+    let mut folder_lines: Vec<Line> = Vec::new();
+
+    if explorer.folders.is_empty() {
+        folder_lines.push(Line::from(""));
+        folder_lines.push(Line::from(Span::styled(
+            "  No folders found",
+            Style::default().fg(Color::DarkGray),
+        )));
+        if !explorer.current_prefix.is_empty() {
+            folder_lines.push(Line::from(Span::styled(
+                "  Press [Backspace] to go back",
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+    } else {
+        // Virtual scrolling for folders
+        let visible_rows = chunks[1].height.saturating_sub(1) as usize;
+        let total_folders = explorer.folders.len();
+        let selected = explorer.selected_folder;
+
+        let scroll_offset = if visible_rows >= total_folders {
+            0
+        } else if selected < visible_rows / 2 {
+            0
+        } else if selected > total_folders.saturating_sub(visible_rows / 2) {
+            total_folders.saturating_sub(visible_rows)
+        } else {
+            selected.saturating_sub(visible_rows / 2)
+        };
+
+        let end_idx = (scroll_offset + visible_rows).min(total_folders);
+
+        for (visible_idx, folder) in explorer.folders[scroll_offset..end_idx].iter().enumerate() {
+            let actual_idx = scroll_offset + visible_idx;
+            let is_selected = actual_idx == selected;
+
+            let style = if is_selected && is_focused {
+                Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+            } else if is_selected {
+                Style::default().fg(Color::Cyan).bg(Color::Black)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let icon = if folder.is_file { "📄" } else { "📁" };
+            let arrow = if folder.is_file { " " } else { ">" };
+            let count_str = format_count(folder.file_count);
+
+            let content = format!(
+                " {} {:<40} {:>8} files {}",
+                icon,
+                truncate_string(&folder.name, 40),
+                count_str,
+                arrow
+            );
+            folder_lines.push(Line::from(Span::styled(content, style)));
+        }
+    }
+
+    let folders_title = format!(" FOLDERS ({}) ", explorer.folders.len());
+    let folders_title_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let folders_block = Block::default()
+        .borders(Borders::NONE)
+        .title(Span::styled(folders_title, folders_title_style));
+    let folders_widget = Paragraph::new(folder_lines).block(folders_block);
+    frame.render_widget(folders_widget, chunks[1]);
+
+    // --- Preview section ---
+    let mut preview_lines: Vec<Line> = Vec::new();
+
+    if explorer.preview_files.is_empty() {
+        preview_lines.push(Line::from(Span::styled(
+            "  No preview files",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for file in explorer.preview_files.iter().take(5) {
+            let size_str = format_size(file.size);
+            let content = format!("  {} {:>8}", truncate_path_start(&file.rel_path, 50), size_str);
+            preview_lines.push(Line::from(Span::styled(
+                content,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let preview_block = Block::default()
+        .borders(Borders::TOP)
+        .title(Span::styled(" PREVIEW ", Style::default().fg(Color::DarkGray)));
+    let preview_widget = Paragraph::new(preview_lines).block(preview_block);
+    frame.render_widget(preview_widget, chunks[2]);
+}
+
+/// Truncate a string to max length (with ellipsis)
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len <= 3 {
+        "...".to_string()
+    } else {
+        format!("{}...", &s[..max_len - 3])
+    }
 }
 
 fn draw_file_preview(frame: &mut Frame, app: &App, filtered_files: &[&super::app::FileInfo], area: Rect) {
@@ -1782,6 +2411,7 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
         Some(JobStatus::Running) => " (Running only)",
         Some(JobStatus::Completed) => " (Completed only)",
         Some(JobStatus::Failed) => " (Failed only)",
+        Some(JobStatus::Cancelled) => " (Cancelled only)",
         None => "",
     };
 
@@ -1838,6 +2468,7 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
                 JobStatus::Running => Color::Blue,
                 JobStatus::Completed => Color::Green,
                 JobStatus::Failed => Color::Red,
+                JobStatus::Cancelled => Color::DarkGray,
             };
 
             let line_style = if is_selected {
@@ -2159,6 +2790,61 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Draw the help overlay (per spec Section 3.1)
+fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    // Center the help panel
+    let help_width = 60.min(area.width.saturating_sub(4));
+    let help_height = 20.min(area.height.saturating_sub(4));
+    let help_x = (area.width.saturating_sub(help_width)) / 2;
+    let help_y = (area.height.saturating_sub(help_height)) / 2;
+
+    let help_area = Rect {
+        x: area.x + help_x,
+        y: area.y + help_y,
+        width: help_width,
+        height: help_height,
+    };
+
+    // Clear the background
+    frame.render_widget(Clear, help_area);
+
+    // Help content
+    let help_text = vec![
+        "",
+        "  NAVIGATION",
+        "  ──────────",
+        "  1         Discover view",
+        "  2         Parser Bench view",
+        "  3         Jobs view",
+        "  4         Sources view",
+        "  0 / H     Home",
+        "  Esc       Back / Close dialog",
+        "",
+        "  GLOBAL ACTIONS",
+        "  ──────────────",
+        "  ?         Toggle this help",
+        "  r         Refresh current view",
+        "  q         Quit application",
+        "  Alt+A     Toggle AI sidebar",
+        "",
+        "  Press ? or Esc to close",
+    ];
+
+    let help_paragraph = Paragraph::new(help_text.join("\n"))
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .title(" Help ")
+                .title_style(Style::default().fg(Color::Cyan).bold())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+
+    frame.render_widget(help_paragraph, help_area);
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -2253,10 +2939,11 @@ mod tests {
             .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
             .collect();
 
+        // Card names per spec: Discover, Parser Bench, Jobs, Sources
         assert!(content.contains("Discover"));
-        assert!(content.contains("Process"));
-        assert!(content.contains("Inspect"));
+        assert!(content.contains("Parser"));  // "Parser Bench"
         assert!(content.contains("Jobs"));
+        assert!(content.contains("Sources"));
     }
 
     #[test]

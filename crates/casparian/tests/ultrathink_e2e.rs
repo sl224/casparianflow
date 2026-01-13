@@ -15,6 +15,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+#[cfg(feature = "full")]
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,8 +25,11 @@ use tempfile::TempDir;
 
 // =============================================================================
 // BINARY E2E TESTS
+// These spawn `cargo run` which triggers compilation - slow!
+// Only run with `cargo test --features=full`
 // =============================================================================
 
+#[cfg(feature = "full")]
 mod binary_tui {
     use super::*;
 
@@ -89,8 +93,11 @@ mod binary_tui {
 
 // =============================================================================
 // TUI STATE MACHINE TESTS - Using internal types directly
+// These spawn `cargo build` - slow!
+// Only run with `cargo test --features=full`
 // =============================================================================
 
+#[cfg(feature = "full")]
 mod tui_state {
     use super::*;
 
@@ -338,10 +345,13 @@ data: {"type":"message_stop"}
 
 mod full_pipeline {
     use super::*;
+    #[cfg(feature = "full")]
     use rusqlite::Connection;
 
     /// Complete pipeline test: Create database, deploy plugin, process job, verify output
+    /// (Gated - runs cargo run which triggers compilation)
     #[test]
+    #[cfg(feature = "full")]
     fn test_csv_to_parquet_pipeline() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -430,6 +440,7 @@ def process(input_path: str) -> pd.DataFrame:
     }
 
     /// Helper to setup test database with plugin and job
+    #[cfg(feature = "full")]
     fn setup_test_database(
         db_path: &std::path::Path,
         plugin_name: &str,
@@ -559,7 +570,9 @@ mod integration_boundaries {
     use super::*;
 
     /// Test: Environment without uv installed
+    /// (Gated - runs cargo run which triggers compilation)
     #[test]
+    #[cfg(feature = "full")]
     fn test_graceful_without_uv() {
         // This tests that we get a helpful error, not a crash
         let output = Command::new("cargo")
@@ -597,7 +610,9 @@ mod integration_boundaries {
     }
 
     /// Test: Invalid database path handling
+    /// (Gated - runs cargo run which triggers compilation)
     #[test]
+    #[cfg(feature = "full")]
     fn test_invalid_db_path() {
         let result = Command::new("cargo")
             .args([

@@ -11,5 +11,5 @@ pub mod types;
 
 // Re-exports for CLI usage
 pub use db::Database;
-pub use scanner::Scanner;
+pub use scanner::{ScanConfig, ScanProgress, Scanner};
 pub use types::{FileStatus, ScannedFile, Source, SourceType, TaggingRule};

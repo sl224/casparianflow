@@ -1,6 +1,6 @@
 # Product Specification: Casparian Discovery Intelligence (Phase 2)
 
-**Version:** 0.3 (Reviewed & Hardened)
+**Version:** 0.4 (Spec Refinement v2 - Gap Analysis Complete)
 **Status:** Conceptual / Research
 **Target Component:** Scout Subsystem (Discovery & Sampling)
 **Key Technology:** Structural Fingerprinting (Deterministic) + Vector Search (Semantic Layer)
@@ -206,6 +206,7 @@ Types are detected in **priority order** (first match wins):
 | 12 | **URL** | Starts with `http://` or `https://` | `https://example.com/path` |
 | 13 | **JSON** | Valid JSON object or array | `{"key": "value"}`, `[1,2,3]` |
 | 14 | **String** | Fallback for everything else | Any text |
+| 15 | **Unknown** | Column has only nulls in sample | (requires more data) |
 
 **Date Format Resolution (Constraint-Based):**
 
@@ -238,9 +239,9 @@ Result: Entire column is Date(SlashEU)
 ```
          String (top - everything can be string)
             │
-    ┌───────┼───────┐
-    │       │       │
-  Float64  Date*   JSON
+    ┌───────┼───────┬─────────┐
+    │       │       │         │
+  Float64  Date*   JSON    Unknown**
     │       │
   Int64  DateTime
     │
@@ -249,6 +250,7 @@ Result: Entire column is Date(SlashEU)
   Null (bottom)
 
 * Date types collapse: Date(SlashUS), Date(SlashEU), Date(SlashAmbiguous) → Date(Slash)
+** Unknown = column with only nulls in sample (flags for review, not a parsing type)
 ```
 
 **Type Mask Representation:**
@@ -334,6 +336,10 @@ LUB(Date(ISO), Date(Slash*)) = String  # Different formats → String
 LUB(Date(SlashUS), Date(SlashEU)) = String  # Conflict → String
 LUB(Date(SlashUS), Date(SlashAmbiguous)) = Date(SlashUS)  # Proof wins
 LUB(Date(SlashEU), Date(SlashAmbiguous)) = Date(SlashEU)  # Proof wins
+
+# Special case: All-null column
+If observed_types == {Null}:
+    result_type = Unknown  # Flag for review, not a parsing decision
 ```
 
 **Why LUB, Not Modal:**
@@ -464,6 +470,62 @@ Handling: Generate synthetic headers (col_0, col_1, ...)
 Flag: headerless=true in signature
 ```
 
+**Empty and Minimal Files:**
+```
+Handling: Empty and minimal file edge cases
+
+1. Empty file (0 bytes):
+   - Return error: FILE_EMPTY
+   - Signature: None (cannot compute)
+
+2. Header-only file (headers but no data rows):
+   - Signature: Computed from headers with empty type mask []
+   - Flag: data_rows=0 in signature metadata
+   - Warning: "No data rows found, type mask is empty"
+
+3. Single-row file (1 data row):
+   - Valid for fingerprinting
+   - Warning: "Single row sample - types may not be representative"
+   - Confidence reduced in metadata
+
+4. Truncated/incomplete file:
+   - Detect: Last row has fewer columns than header
+   - Return partial signature with warning
+   - Flag: truncated=true in signature metadata
+   - Include row count where truncation detected
+```
+
+**Large File Handling:**
+```
+Memory Limits:
+- Signature computation: Uses streaming, max 4KB buffer for header detection
+- Outlier detection: Streams entire file, constant memory O(1)
+- Max columns: 10,000 (returns error if exceeded)
+- Max header name length: 1,000 chars (truncates with warning)
+
+Files > 1GB:
+- Adaptive sampling uses head-only (no seek for middle/tail)
+- Progress reporting every 10% during outlier scan
+- CLI flag: --stream-only to force head-only sampling on any file
+```
+
+**Corrupted Data Handling:**
+```
+1. Invalid UTF-8 sequences:
+   - Replace with U+FFFD (replacement character)
+   - Track invalid_byte_count in signature metadata
+   - Warning if invalid_byte_count > 0.1% of file size
+
+2. Malformed CSV (unbalanced quotes):
+   - Max 10 continuation lines per logical row
+   - Beyond 10: treat as corrupt, skip row, log warning
+   - Flag: malformed_row_count in signature metadata
+
+3. Binary data in text columns:
+   - Detect: >10% non-printable characters in sample
+   - Type: String (but flag as potentially_binary=true)
+```
+
 **Encoding Detection (Simplified):**
 
 ```
@@ -524,6 +586,15 @@ Compute structural signature for a single file.
       "type": "integer",
       "default": 50,
       "description": "Maximum outliers to return"
+    },
+    "sample_rows": {
+      "type": "integer",
+      "default": 30,
+      "description": "Number of rows to sample for type detection (head + middle + tail)"
+    },
+    "encoding": {
+      "type": "string",
+      "description": "Force specific encoding (e.g., 'utf-8', 'latin-1'). Auto-detected if not specified."
     }
   },
   "returns": {
@@ -546,7 +617,15 @@ Compute structural signature for a single file.
       "deviation_class": "string"
     }],
     "outlier_count": "integer - Total outliers (may exceed returned)",
-    "row_count": "integer - Total rows scanned"
+    "row_count": "integer - Total rows scanned",
+    "warnings": "string[] - Any warnings generated during fingerprinting"
+  },
+  "errors": {
+    "FILE_NOT_FOUND": "File does not exist at specified path",
+    "FILE_EMPTY": "File is empty (0 bytes)",
+    "PERMISSION_DENIED": "Cannot read file due to permissions",
+    "TOO_MANY_COLUMNS": "File exceeds 10,000 column limit",
+    "ENCODING_ERROR": "Cannot decode file with detected/specified encoding"
   }
 }
 ```
@@ -578,10 +657,21 @@ Batch fingerprint files and group by signature.
       "type": "boolean",
       "default": false,
       "description": "Run outlier detection on each file (slower)"
+    },
+    "max_files": {
+      "type": "integer",
+      "default": 10000,
+      "description": "Maximum number of files to scan (prevents runaway on large directories)"
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "default": 300,
+      "description": "Maximum time to spend scanning (0 = no limit)"
     }
   },
   "returns": {
     "total_files": "integer",
+    "scanned_files": "integer - May be less than total_files if max_files or timeout reached",
     "groups": [{
       "signature_hash": "string",
       "signature": { /* same as fingerprint_file */ },
@@ -593,7 +683,13 @@ Batch fingerprint files and group by signature.
     "unrecognized": [{
       "path": "string",
       "reason": "string - Why it couldn't be fingerprinted"
-    }]
+    }],
+    "truncated": "boolean - True if max_files or timeout was reached",
+    "truncation_reason": "string|null - 'max_files' or 'timeout' if truncated"
+  },
+  "errors": {
+    "DIRECTORY_NOT_FOUND": "Directory does not exist",
+    "PERMISSION_DENIED": "Cannot read directory or files"
   }
 }
 ```
@@ -631,6 +727,11 @@ Get AI-suggested column mappings between file headers and target schema.
     }],
     "unmapped_sources": "string[] - Headers with no good match",
     "unmapped_targets": "string[] - Target columns with no source"
+  },
+  "errors": {
+    "SIDECAR_UNAVAILABLE": "Semantic sidecar is not running",
+    "SIDECAR_TIMEOUT": "Request to sidecar timed out (default 30s)",
+    "EMPTY_HEADERS": "source_headers or target_schema is empty"
   }
 }
 ```
@@ -663,6 +764,12 @@ Get AI-suggested semantic label for a file group.
     "confidence": "number",
     "alternatives": ["string - Other possible labels"],
     "reasoning": "string - Why this label was chosen"
+  },
+  "errors": {
+    "SIDECAR_UNAVAILABLE": "Semantic sidecar is not running",
+    "SIDECAR_TIMEOUT": "Request to sidecar timed out (default 30s)",
+    "SIGNATURE_NOT_FOUND": "No group with given signature_hash exists",
+    "EMPTY_HEADERS": "Headers array is empty"
   }
 }
 ```
@@ -816,6 +923,13 @@ CREATE TABLE cf_file_signatures (
     has_ambiguous_dates INTEGER DEFAULT 0,    -- 1 if Date(SlashAmbiguous) present
     outlier_count       INTEGER DEFAULT 0,    -- Count from last outlier scan
     outlier_scanned     INTEGER DEFAULT 0,    -- 1 if outlier detection was run
+    error_code          TEXT,                 -- Error code if fingerprinting failed
+    error_message       TEXT,                 -- Human-readable error message
+    warnings            TEXT,                 -- JSON array of warnings
+    data_rows           INTEGER,              -- Number of data rows (null = unknown)
+    truncated           INTEGER DEFAULT 0,    -- 1 if file was truncated during read
+    malformed_row_count INTEGER DEFAULT 0,    -- Count of malformed rows skipped
+    invalid_byte_count  INTEGER DEFAULT 0,    -- Count of invalid UTF-8 bytes replaced
     computed_at         TEXT NOT NULL,        -- ISO8601
 
     FOREIGN KEY (signature_hash) REFERENCES cf_signature_groups(signature_hash)
@@ -865,6 +979,7 @@ CREATE TABLE cf_structural_outliers (
 
 CREATE INDEX idx_outliers_file ON cf_structural_outliers(file_hash);
 CREATE INDEX idx_outliers_status ON cf_structural_outliers(status);
+CREATE INDEX idx_outliers_class ON cf_structural_outliers(deviation_class);
 
 -- Header mappings (confirmed by user)
 CREATE TABLE cf_header_mappings (
@@ -1074,7 +1189,45 @@ max_entries = 10000              # LRU cache for embeddings
 | `all-mpnet-base-v2` | 420MB | Better | Slower |
 | `bge-small-en-v1.5` | 130MB | Best for retrieval | Medium |
 
-### 10.6 Fallback Behavior
+### 10.6 Error Handling and Retry Logic
+
+**Timeout Configuration:**
+```toml
+[client]
+connect_timeout_ms = 5000      # Time to establish connection
+request_timeout_ms = 30000     # Time for individual request
+startup_timeout_ms = 60000     # Time to wait for sidecar to start
+```
+
+**Retry Strategy:**
+```
+1. Connection Failures:
+   - If sidecar not running: Attempt auto-start (once)
+   - Wait up to startup_timeout for model to load
+   - If still fails: Return SIDECAR_UNAVAILABLE error
+
+2. Request Timeouts:
+   - No automatic retry (embedding is deterministic, no point retrying)
+   - Return SIDECAR_TIMEOUT error
+   - Include elapsed time in error for debugging
+
+3. Model Load Failures:
+   - Log detailed error (out of memory, model not found, etc.)
+   - Return SIDECAR_MODEL_ERROR with details
+   - Do not attempt restart (requires user intervention)
+```
+
+**Health Check Protocol:**
+```
+Before each semantic operation:
+1. GET /health (timeout: 1s)
+2. If status != "ok" OR model_loaded != true:
+   - If first failure: Wait 5s, retry health check
+   - If second failure: Return error without attempting operation
+3. Proceed with operation
+```
+
+### 10.7 Fallback Behavior
 
 When the semantic sidecar is unavailable:
 
@@ -1349,10 +1502,12 @@ jq '.outliers[] | select(.row_index == 1001)' result.json | grep -q "TYPE_COERCI
 | **Signature Discrimination** | Files with different structure get different signatures | 100% | Unit tests with known-different files |
 | **Outlier Detection Rate** | Type mismatches found vs total in file | > 99% | Synthetic files with planted anomalies |
 | **Outlier False Positive Rate** | Non-anomalies flagged as outliers | < 1% | Clean files should have 0 outliers |
-| **Mapping Acceptance Rate** | User accepts AI header mappings | > 80% | User telemetry (opt-in) |
-| **Label Accuracy** | User accepts AI semantic labels | > 70% | User telemetry (opt-in) |
+| **Mapping Acceptance Rate** | User accepts AI header mappings | > 80% | Integration test suite with known-good mappings |
+| **Label Accuracy** | User accepts AI semantic labels | > 70% | Integration test suite with labeled examples |
 | **Fingerprint Throughput** | Files fingerprinted per second | > 100/s | Benchmark on 1KB-1MB files |
 | **Outlier Scan Throughput** | MB scanned per second | > 50MB/s | Benchmark on large files |
+| **Drift Detection Precision** | Correct drift alerts / total alerts | > 95% | Synthetic test with known schema changes |
+| **Drift Detection Recall** | Detected drifts / actual drifts | > 99% | Synthetic test with known schema changes |
 
 ### 12.4 Benchmark Suite
 
@@ -1394,7 +1549,7 @@ cargo bench --package casparian_worker -- fingerprint
 - Both stored in database (see §9.1)
 - Semantic Sidecar provides additional grouping via similarity
 
-### 13.3 Null Type Handling
+### 13.3 Null Type Handling - RESOLVED
 
 **Question:** How to handle columns that are entirely null in the sample?
 
@@ -1405,14 +1560,15 @@ id,maybe_amount
 3,
 ```
 
-**Options:**
-1. Type = Null (and fail if later rows have values)
-2. Type = Unknown (flag for review)
-3. Scan more rows to find non-null values
+**Resolution (v0.3):**
+- Type = Unknown (added to Type Lattice in Section 7.2)
+- Flagged in signature metadata for review
+- LUB computation handles this case explicitly (Section 7.3)
+- Column appears in signature with type "Unknown"
+- Outlier detection skips Unknown columns (cannot validate against unknown type)
+- Parser generation for Unknown columns: use String with nullable=true
 
-**Current Decision:** Option 2 (Unknown). Flag in signature as requiring attention.
-
-### 13.4 Multi-Table Files
+### 13.4 Multi-Table Files - DEFERRED
 
 **Question:** How to handle files with multiple embedded tables?
 
@@ -1426,7 +1582,17 @@ id,name
 1,Alice
 ```
 
-**Current Decision:** Out of scope for v0.2. Treat as single table with anomalies at section boundaries. Consider for v0.3.
+**Decision (v0.3):** Explicitly deferred to v0.4.
+
+**Current Behavior:**
+- Treat as single table with anomalies at section boundaries
+- Outlier detection will flag rows where column count changes
+- User must manually split file or use custom parser
+
+**Future v0.4 Consideration:**
+- Detect section markers (comment lines, blank lines with different headers)
+- Return multiple signatures per file
+- `fingerprint_file` returns `signatures: [...]` array instead of single signature
 
 ---
 
@@ -1501,6 +1667,7 @@ const URL_REGEX: &str = r"^https?://";
 | **Structural Outlier** | Row whose type mask differs from the expected |
 | **Deviation Class** | Category of type mismatch (coercion fail, nullable, widening) |
 | **Date(SlashAmbiguous)** | Slash-formatted date where MM/DD vs DD/MM cannot be determined |
+| **Unknown** | Column type when all sampled values are null (requires more data to determine) |
 | **Constraint-Based Resolution** | Using elimination (one proof) rather than voting (majority) |
 | **Semantic Sidecar** | Optional Python service for AI-powered features |
 | **Structural Drift** | Change in signature for files from a known source |
@@ -1511,6 +1678,5 @@ const URL_REGEX: &str = r"^https?://";
 
 **References:**
 - `spec.md` (Core Product Spec)
-- `UNIFIED_ARCHITECTURE_PLAN.md` (Execution Engine)
 - `CLAUDE.md` (Development Guide)
 - `crates/casparian_worker/CLAUDE.md` (Type Inference Details)
