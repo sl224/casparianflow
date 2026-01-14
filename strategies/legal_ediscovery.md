@@ -469,13 +469,63 @@ Raw Data → [CASPARIAN] → Structured Data → [Relativity/Everlaw] → Review
 | "Slack eDiscovery guide" | Thought leadership | Medium |
 | "Small firm eDiscovery toolkit" | Lead gen | High |
 
-### 8.3 Pricing (Legal Vertical)
+### 8.3 Pricing (Legal Vertical) - Value-Based
 
-| Tier | Price | Features | Target |
-|------|-------|----------|--------|
-| **Pro** | $75/user/month | PST + load file parsing | Solo/small firms |
-| **Team** | $300/month | Multi-custodian, export | Litigation support |
-| **Consultant** | $500/month | White-label, multi-client | Legal tech consultants |
+> **Pricing Philosophy:** Price by the value created, not by cost. See [STRATEGY.md](../STRATEGY.md#value-based-pricing-strategy) for framework.
+
+#### Value Analysis
+
+| Cost Item | Current Spend | Casparian Savings |
+|-----------|---------------|-------------------|
+| Vendor processing (per matter) | $5,000-15,000 | 80-90% reduction |
+| Annual vendor spend (20 matters) | $100,000-300,000 | **$80,000-270,000 saved** |
+| Relativity license | $150,000+/year | Not applicable (different use case) |
+| Litigation support salary | $75,000-100,000 | Time savings (20+ hrs/month) |
+
+**Additional value:** Faster turnaround (hours vs. days), better control (no data leaving premises), ability to take smaller matters profitably.
+
+#### Pricing Tiers (Capturing 5-15% of Value)
+
+| Tier | Price | Value Capture | Features | Target |
+|------|-------|---------------|----------|--------|
+| **Solo** | Free | N/A | 3 parsers, 1GB/month | Solo practitioners, evaluation |
+| **Firm** | $500/user/month | ~5% | PST + load file parsers, 100GB/month, email support | Small firms (2-10 attorneys) |
+| **Litigation Team** | $20,000/year | ~10% | Unlimited matter support, multi-custodian, priority support, export to any format | Active litigation teams |
+| **Enterprise** | $75,000+/year | Custom | Multi-office, SSO, SLA, white-label, dedicated success manager | Large firms, consulting firms |
+
+#### Pricing Justification
+
+**Litigation Team tier ($20,000/year):**
+- Average matter processing cost with vendors: $10,000
+- Matters per year: 20-50
+- Annual vendor spend: **$200,000-500,000**
+- $20K captures 4-10% of vendor cost savings
+- Plus faster turnaround, control, and ability to take smaller matters
+
+**Comparison to alternatives:**
+- Relativity: $150K+/year (overkill for small firms)
+- GoldFynch/Logikcull: $0.25-0.50/GB = $25K-50K for 100GB matter
+- Vendor processing: $5-15K per matter
+- **Casparian at $20K/year: Fixed cost, unlimited matters**
+
+#### Why Not Price Lower?
+
+Per Andreessen's framework:
+1. **$300/month ($3,600/year) doesn't prove the moat** - Firms won't trust critical litigation to "cheap" tool
+2. **$300/month can't fund sales** - Legal tech sales require conference presence, demos, consultants
+3. **$300/month signals "hobbyist tool"** - Litigation support managers need enterprise signals
+4. **$300/month doesn't fund customer success** - Legal matters require white-glove support
+
+#### Revenue Projection (Legal Vertical)
+
+| Metric | 6-Month | 12-Month | 24-Month |
+|--------|---------|----------|----------|
+| Firm customers | 20 | 50 | 150 |
+| Litigation Team customers | 5 | 20 | 60 |
+| Enterprise customers | 1 | 3 | 10 |
+| Avg contract value | $8,000 | $12,000 | $15,000 |
+| Legal MRR | $13,333 | $38,333 | $116,667 |
+| Legal ARR | $160,000 | $460,000 | $1,400,000 |
 
 ---
 

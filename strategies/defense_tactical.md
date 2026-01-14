@@ -477,14 +477,80 @@ This is almost a verbatim description of Casparian's capabilities.
 4. Monitor [defensesbirsttr.mil](https://www.defensesbirsttr.mil) weekly for reauthorization news
 5. Draft technical approach for interoperability-focused topic
 
-### 7.3 Pricing Strategy
+### 7.3 Pricing Strategy - Value-Based
 
-| Tier | Price | For |
-|------|-------|-----|
-| **Open Source** | Free | Core parsers, CLI, local use |
-| **Pro** | $100/user/month | Team features, support |
-| **Government** | Per-seat or site license | ATO support, priority fixes |
-| **OT/IDIQ** | Contract-based | Large-scale deployment |
+> **Pricing Philosophy:** Defense buyers expect enterprise pricing. Low prices signal "not serious." See [STRATEGY.md](../STRATEGY.md#value-based-pricing-strategy) for framework.
+
+#### Value Analysis
+
+**The reality:** No laptop-deployable, air-gapped data structuring tool exists. The alternatives are:
+- **Palantir:** $10B Army contract; requires server infrastructure
+- **ArcGIS Enterprise:** $100K+/year; requires server
+- **Custom Python:** "Free" but brittle, no governance, single point of failure
+- **Manual analysis:** Hours per file; analysts overwhelmed
+
+**Casparian's unique value:**
+1. **Runs on laptop** - No server, no cloud, no IT dependency
+2. **Works air-gapped** - Critical for DDIL environments
+3. **Memory-safe (Rust)** - Meets NSA/CISA guidance
+4. **Analyst-modifiable** - No contractor dependency for parser updates
+5. **SQL output** - Works with any downstream tool
+
+**Value created:** Mission-critical capability where no alternative exists. Value is effectively infinite for the right use case.
+
+#### Pricing Tiers
+
+| Tier | Price | Value Capture | Features | Target |
+|------|-------|---------------|----------|--------|
+| **Open Source** | Free | N/A | Core parsers, CLI, community support | Evaluation, ATAK-CIV users |
+| **Tactical** | $50,000/deployment/year | ~5% | Air-gapped bundle, 5 formats (CoT, PCAP, NITF, KML, KLV), 8x5 support | Single-site tactical |
+| **Mission** | $150,000/deployment/year | ~10% | All formats, 24x7 support, custom parser development, on-site training | Multi-format, high-criticality |
+| **Program** | $500,000+/year | Custom | Multi-site, program-level support, SBIR Phase III, dedicated team | Major programs, IDIQ |
+
+#### Pricing Justification
+
+**Tactical tier ($50,000/year):**
+- Palantir alternative: $1M+/year and can't run on laptop
+- ArcGIS Enterprise: $100K+/year and requires server
+- $50K is **5-10% of alternative cost** while providing unique capability
+- Defense budgets allocate millions for data tools; $50K is noise
+
+**Mission tier ($150,000/year):**
+- Includes 24x7 support (critical for deployed operations)
+- Custom parser development for unit-specific formats
+- On-site training for analysts
+- This is what enterprise defense contracts look like
+
+**Program tier ($500K+):**
+- Multi-site deployments (multiple TOCs, ships, aircraft)
+- Dedicated Casparian team for the program
+- Natural fit for SBIR Phase III or OT contract
+
+#### Why Not Price Lower?
+
+**$100/user/month signals "consumer tool":**
+1. DoD procurement officers won't take it seriously
+2. No budget for dedicated support at that price
+3. No budget for security reviews/ATO assistance
+4. Competitors will use low price against you ("they can't be serious")
+
+**$50K/year is still cheap for defense:**
+- 0.05% of a $100M program budget
+- 0.5% of typical annual IT spend for a unit
+- Rounding error compared to contractor costs
+
+#### Revenue Projection (Defense Vertical)
+
+| Metric | Year 1 | Year 2 | Year 3 |
+|--------|--------|--------|--------|
+| SBIR Phase I awards | 1 ($150K) | - | - |
+| SBIR Phase II awards | - | 1 ($1.5M) | - |
+| Tactical deployments | 2 | 8 | 20 |
+| Mission deployments | 0 | 2 | 5 |
+| Program contracts | 0 | 0 | 1 |
+| **Defense ARR** | **$250K** | **$1.0M** | **$3.5M** |
+
+Note: SBIR funding counted separately from commercial ARR.
 
 ### 7.4 Compliance Roadmap
 

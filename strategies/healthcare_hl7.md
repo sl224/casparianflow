@@ -352,14 +352,68 @@ async fn handle_mllp_connection(stream: TcpStream, output_dir: PathBuf) {
 | "Add analytics to your Mirth archives" | Complementary positioning | Medium |
 | Case study: Hospital X | Social proof | Medium |
 
-### 8.3 Pricing (Healthcare Vertical)
+### 8.3 Pricing (Healthcare Vertical) - Value-Based
 
-| Tier | Price | Features | Target |
-|------|-------|----------|--------|
-| **Free** | $0 | HL7 parsers, 3 custom parsers, local only | Analysts |
-| **Pro** | $50/user/month | Unlimited parsers, Scout, team sharing | Teams |
-| **Healthcare Team** | $300/month | HIPAA audit logs, schema governance | Departments |
-| **Enterprise** | Custom | SSO, on-prem, SLA, BAA | Health systems |
+> **Pricing Philosophy:** Price by the value created, not by cost. See [STRATEGY.md](../STRATEGY.md#value-based-pricing-strategy) for framework.
+
+#### Value Analysis
+
+| Pain Point | Current Cost | Casparian Value |
+|------------|--------------|-----------------|
+| Interface Team wait time | 6+ months opportunity cost | Days instead |
+| Custom integration project | $50,000-150,000 | Self-service |
+| Interface analyst salary | $80,000-120,000/year | Time savings |
+| Mirth Connect license (post-March 2025) | $20,000-50,000/year | Complementary analytics |
+| Compliance audit prep | $20,000-50,000 | Automated reports |
+| Research data extraction | $10,000-30,000/project | Self-service |
+
+**Additional value:** HIPAA compliance (data stays local), audit trails, researcher enablement, IT backlog reduction.
+
+#### Pricing Tiers (Capturing 10-15% of Value)
+
+| Tier | Price | Value Capture | Features | Target |
+|------|-------|---------------|----------|--------|
+| **Community** | Free | N/A | HL7 ADT parser, 1,000 messages/day | Individual analysts, evaluation |
+| **Clinic** | $250/month | ~3% | All HL7 parsers, 10K messages/day, email support | Small clinics, research groups |
+| **Hospital** | $25,000/year | ~10% | Unlimited volume, HIPAA BAA, audit logs, schema governance, priority support | Single facility |
+| **Health System** | $100,000+/year | Custom | Multi-facility, SSO, on-prem deployment, SLA, dedicated team, custom parser development | Health systems |
+
+#### Pricing Justification
+
+**Hospital tier ($25,000/year):**
+- Interface project cost: $50,000-150,000 and 6+ months
+- Casparian enables analysts to bypass Interface Team backlog
+- Compliance audit prep savings: $20,000-50,000
+- $25K captures 10-25% of first-year value
+- Plus ongoing savings on every subsequent project
+
+**Comparison to alternatives:**
+- Rhapsody: $100K+/year (overkill for analytics)
+- Mirth Connect (post-2025): $20K-50K/year (routing, not analytics)
+- Custom Python development: $100K+ one-time, fragile
+- **Casparian at $25K/year: Analytics layer that complements Mirth**
+
+#### Why Not Price Lower?
+
+Per Andreessen's framework:
+1. **$300/month ($3,600/year) signals "not HIPAA-ready"** - Healthcare buyers expect enterprise pricing
+2. **$300/month can't fund BAA support** - HIPAA compliance requires legal and operational investment
+3. **$300/month can't fund healthcare sales** - HIMSS presence, compliance certifications, long sales cycles
+4. **$300/month triggers "shadow IT" concerns** - IT leadership worried about unauthorized tools
+
+**Note:** Healthcare vertical has longer sales cycles. Budget for 12-18 months to close Hospital/Health System deals.
+
+#### Revenue Projection (Healthcare Vertical)
+
+| Metric | Year 1 | Year 2 | Year 3 |
+|--------|--------|--------|--------|
+| Community (free) users | 500 | 2,000 | 5,000 |
+| Clinic customers | 30 | 100 | 250 |
+| Hospital customers | 5 | 20 | 50 |
+| Health System customers | 0 | 2 | 8 |
+| **Healthcare ARR** | **$215,000** | **$830,000** | **$2,350,000** |
+
+Note: Year 1 assumes Phase 4 timing (starts Month 12+). Revenue projections begin when healthcare vertical is actively pursued.
 
 ---
 

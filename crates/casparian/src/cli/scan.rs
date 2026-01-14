@@ -7,7 +7,7 @@
 
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{color_for_extension, format_size, format_time, print_table_colored};
-use crate::scout::{Database, ScannedFile, Source, SourceType};
+use crate::scout::{Database, ScannedFile, Scanner, Source, SourceType};
 use comfy_table::Color;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -24,8 +24,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
-use std::time::SystemTime;
-use walkdir::WalkDir;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Arguments for the scan command
 #[derive(Debug)]
@@ -137,6 +136,9 @@ fn matches_patterns(
 }
 
 /// Execute the scan command (async version)
+///
+/// Uses the consolidated Scanner for file discovery, storage, and cache building.
+/// CLI-specific filters are applied post-scan for display and tagging.
 pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
     // Validate path exists
     if !args.path.exists() {
@@ -148,6 +150,101 @@ pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
         return Err(HelpfulError::not_a_directory(&args.path).into());
     }
 
+    // Canonicalize scan path
+    let scan_path = args.path.canonicalize().unwrap_or_else(|_| args.path.clone());
+
+    // Setup database
+    let db_path = get_db_path();
+    let db_dir = db_path.parent().unwrap();
+    fs::create_dir_all(db_dir)?;
+
+    let db = Database::open(&db_path).await
+        .map_err(|e| HelpfulError::new(format!("Failed to open database: {}", e))
+            .with_context(format!("Database path: {}", db_path.display())))?;
+
+    // Get or create source
+    let source = get_or_create_source(&db, &scan_path).await?;
+
+    // Use Scanner for discovery, storage, and cache building
+    // Note: Scanner scans ALL files; CLI filters are applied post-scan
+    let scanner = Scanner::new(db.clone());
+    let scan_result = scanner
+        .scan_source_with_progress(&source, None, None)
+        .await
+        .map_err(|e| HelpfulError::new(format!("Scan failed: {}", e)))?;
+
+    // Query all files from database
+    let db_files = db
+        .list_files_by_source(&source.id, 1_000_000)
+        .await
+        .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+
+    // Convert to DiscoveredFile and apply CLI filters
+    let files = apply_cli_filters(&db_files, &args, &scan_path)?;
+
+    // Tag filtered files if requested (only tags files matching filters)
+    let tagged_count = if let Some(ref tag) = args.tag {
+        tag_filtered_files(&db, &source.id, &files, tag).await?
+    } else {
+        0
+    };
+
+    // Build summary from filtered files
+    let summary = build_summary(&files, scan_result.stats.dirs_scanned as usize);
+
+    let result = ScanResult {
+        files,
+        summary,
+        scan_path: args.path.clone(),
+    };
+
+    // Output based on format
+    if args.interactive {
+        run_interactive(result, args.tag.clone())?;
+    } else if args.json {
+        output_json(&result)?;
+    } else if args.stats {
+        output_stats(&result);
+    } else if args.quiet {
+        output_quiet(&result);
+    } else {
+        let stored = (scan_result.stats.files_new + scan_result.stats.files_changed) as usize;
+        output_table(&result, stored, tagged_count, args.tag.as_deref());
+    }
+
+    Ok(())
+}
+
+/// Convert ScannedFile to DiscoveredFile
+fn scanned_to_discovered(file: &ScannedFile) -> DiscoveredFile {
+    let path = PathBuf::from(&file.path);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let modified = UNIX_EPOCH + Duration::from_millis(file.mtime as u64);
+
+    DiscoveredFile {
+        path,
+        name,
+        extension,
+        size: file.size,
+        modified,
+    }
+}
+
+/// Apply CLI filters (type, pattern, size, depth) to scanned files
+fn apply_cli_filters(
+    db_files: &[ScannedFile],
+    args: &ScanArgs,
+    scan_path: &PathBuf,
+) -> anyhow::Result<Vec<DiscoveredFile>> {
     // Parse size filters
     let min_size = args
         .min_size
@@ -170,135 +267,100 @@ pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
     let (include_set, exclude_set) = build_glob_set(&args.patterns)?;
     let has_include_patterns = args.patterns.iter().any(|p| !p.starts_with('!'));
 
-    // Build walker
-    let mut walker = WalkDir::new(&args.path);
+    let mut files = Vec::new();
 
-    if !args.recursive {
-        walker = walker.max_depth(1);
-    } else if let Some(depth) = args.depth {
-        walker = walker.max_depth(depth);
-    }
+    for db_file in db_files {
+        let discovered = scanned_to_discovered(db_file);
 
-    // Canonicalize scan path for relative path calculation
-    let scan_path = args.path.canonicalize().unwrap_or_else(|_| args.path.clone());
-
-    // Collect files
-    let mut files: Vec<DiscoveredFile> = Vec::new();
-    let mut directories_scanned = 0;
-
-    for entry in walker.into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-
-        if path.is_dir() {
-            directories_scanned += 1;
-            continue;
+        // Apply depth filter
+        if let Some(max_depth) = args.depth {
+            let rel_path = discovered
+                .path
+                .strip_prefix(scan_path)
+                .unwrap_or(&discovered.path);
+            let depth = rel_path.components().count();
+            if depth > max_depth {
+                continue;
+            }
         }
 
-        // Get relative path for pattern matching
-        let rel_path = path
-            .strip_prefix(&scan_path)
-            .unwrap_or(path)
-            .display()
-            .to_string();
+        // Non-recursive means depth 1 only
+        if !args.recursive {
+            let rel_path = discovered
+                .path
+                .strip_prefix(scan_path)
+                .unwrap_or(&discovered.path);
+            if rel_path.components().count() > 1 {
+                continue;
+            }
+        }
 
         // Apply pattern filter
         if !args.patterns.is_empty() {
+            let rel_path = discovered
+                .path
+                .strip_prefix(scan_path)
+                .unwrap_or(&discovered.path)
+                .display()
+                .to_string();
             if !matches_patterns(&rel_path, &include_set, &exclude_set, has_include_patterns) {
                 continue;
             }
         }
 
-        // Get file metadata
-        let metadata = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => continue, // Skip files we can't read
-        };
-
-        let size = metadata.len();
-
         // Apply size filters
         if let Some(min) = min_size {
-            if size < min {
+            if discovered.size < min {
                 continue;
             }
         }
         if let Some(max) = max_size {
-            if size > max {
+            if discovered.size > max {
                 continue;
             }
         }
 
-        // Get extension
-        let extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
         // Apply type filter
-        if !type_filters.is_empty() && !type_filters.contains(&extension) {
+        if !type_filters.is_empty() && !type_filters.contains(&discovered.extension) {
             continue;
         }
 
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-
-        files.push(DiscoveredFile {
-            path: path.to_path_buf(),
-            name,
-            extension,
-            size,
-            modified,
-        });
+        files.push(discovered);
     }
 
     // Sort by path for consistent output
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // Build summary
-    let summary = build_summary(&files, directories_scanned);
+    Ok(files)
+}
 
-    // Store files in database using casparian_scout::Database
-    let db_path = get_db_path();
-    let db_dir = db_path.parent().unwrap();
-    fs::create_dir_all(db_dir)?;
+/// Tag only the filtered files
+async fn tag_filtered_files(
+    db: &Database,
+    source_id: &str,
+    files: &[DiscoveredFile],
+    tag: &str,
+) -> anyhow::Result<usize> {
+    let mut tagged = 0;
 
-    let db = Database::open(&db_path).await
-        .map_err(|e| HelpfulError::new(format!("Failed to open database: {}", e))
-            .with_context(format!("Database path: {}", db_path.display())))?;
-
-    let source_id = get_or_create_source(&db, &scan_path).await?;
-    let stored = store_files(&db, &source_id, &scan_path, &files, args.tag.as_deref()).await?;
-
-    let result = ScanResult {
-        files,
-        summary,
-        scan_path: args.path.clone(),
-    };
-
-    // Output based on format
-    if args.interactive {
-        run_interactive(result, args.tag.clone())?;
-    } else if args.json {
-        output_json(&result)?;
-    } else if args.stats {
-        output_stats(&result);
-    } else if args.quiet {
-        output_quiet(&result);
-    } else {
-        output_table(&result, stored, args.tag.as_deref());
+    // We need file IDs to tag. Query DB for each file by path.
+    // This is not ideal but maintains the CLI behavior of only tagging filtered files.
+    for file in files {
+        let path_str = file.path.display().to_string();
+        if let Ok(Some(db_file)) = db.get_file_by_path(source_id, &path_str).await {
+            if let Some(id) = db_file.id {
+                if db.tag_file(id, tag).await.is_ok() {
+                    tagged += 1;
+                }
+            }
+        }
     }
 
-    Ok(())
+    Ok(tagged)
 }
 
 /// Get or create a source for the scan path
-async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<String> {
+async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<Source> {
     let path_str = path.display().to_string();
 
     // Try to find existing source by path
@@ -307,7 +369,7 @@ async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<S
 
     for source in sources {
         if source.path == path_str {
-            return Ok(source.id);
+            return Ok(source);
         }
     }
 
@@ -330,51 +392,7 @@ async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<S
     db.upsert_source(&source).await
         .map_err(|e| HelpfulError::new(format!("Failed to create source: {}", e)))?;
 
-    Ok(id)
-}
-
-/// Store discovered files in the database
-async fn store_files(
-    db: &Database,
-    source_id: &str,
-    scan_path: &PathBuf,
-    files: &[DiscoveredFile],
-    tag: Option<&str>,
-) -> anyhow::Result<usize> {
-    let mut stored = 0;
-
-    for file in files {
-        let rel_path = file.path
-            .strip_prefix(scan_path)
-            .unwrap_or(&file.path)
-            .display()
-            .to_string();
-
-        let mtime = file.modified
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        let scanned_file = ScannedFile::new(
-            source_id,
-            &file.path.display().to_string(),
-            &rel_path,
-            file.size,
-            mtime,
-        );
-
-        let result = db.upsert_file(&scanned_file).await;
-        if let Ok(upsert_result) = result {
-            stored += 1;
-
-            // Tag the file if requested
-            if let Some(t) = tag {
-                let _ = db.tag_file(upsert_result.id, t).await;
-            }
-        }
-    }
-
-    Ok(stored)
+    Ok(source)
 }
 
 /// Build summary statistics from discovered files
@@ -445,7 +463,7 @@ fn output_quiet(result: &ScanResult) {
 }
 
 /// Output as formatted table
-fn output_table(result: &ScanResult, stored: usize, tag: Option<&str>) {
+fn output_table(result: &ScanResult, stored: usize, tagged: usize, tag: Option<&str>) {
     if result.files.is_empty() {
         println!("No files found in: {}", result.scan_path.display());
         return;
@@ -459,10 +477,9 @@ fn output_table(result: &ScanResult, stored: usize, tag: Option<&str>) {
     );
 
     // Show storage info
+    println!("Stored {} files in database", stored);
     if let Some(t) = tag {
-        println!("Stored {} files with tag: \x1b[36m{}\x1b[0m", stored, t);
-    } else {
-        println!("Stored {} files in database", stored);
+        println!("Tagged {} files with: \x1b[36m{}\x1b[0m", tagged, t);
     }
     println!();
 

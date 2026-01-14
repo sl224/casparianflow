@@ -2,11 +2,75 @@
 
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 
 use crate::cli::output::format_number;
-use super::app::{App, DiscoverFocus, DiscoverViewState, JobStatus, MessageRole, ParserBenchView, ParserHealth, TuiMode};
+use ratatui::widgets::Clear;
+use chrono::{DateTime, Local};
+use super::app::{App, DiscoverFocus, DiscoverViewState, JobInfo, JobStatus, JobType, JobsViewState, MessageRole, ParserBenchView, ParserHealth, ThroughputSample, TuiMode};
+
+// ============================================================================
+// Shared UI Utilities
+// ============================================================================
+
+/// Spinner animation character based on tick count.
+/// Returns one of: ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+pub fn spinner_char(tick: u64) -> char {
+    const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    SPINNER[(tick / 2) as usize % SPINNER.len()]
+}
+
+/// ASCII spinner for contexts where unicode might not work.
+/// Returns one of: - \ | /
+pub fn spinner_ascii(tick: u64) -> char {
+    const SPINNER: [char; 4] = ['-', '\\', '|', '/'];
+    SPINNER[(tick / 2) as usize % SPINNER.len()]
+}
+
+/// Create a centered dialog area and clear it.
+/// Returns the dialog Rect. Caller should render_widget(Clear, area) before using.
+pub fn centered_dialog_area(area: Rect, max_width: u16, max_height: u16) -> Rect {
+    let width = area.width.min(max_width);
+    let height = area.height.min(max_height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+/// Render a centered dialog with Clear background.
+/// Returns the dialog Rect for content rendering.
+pub fn render_centered_dialog(frame: &mut Frame, area: Rect, max_width: u16, max_height: u16) -> Rect {
+    let dialog_area = centered_dialog_area(area, max_width, max_height);
+    frame.render_widget(Clear, dialog_area);
+    dialog_area
+}
+
+/// Calculate scroll offset to keep selected item centered in view.
+/// Works for any scrollable list (files, folders, dropdowns).
+pub fn centered_scroll_offset(selected: usize, visible: usize, total: usize) -> usize {
+    if visible >= total {
+        0 // All items fit, no scrolling needed
+    } else if selected < visible / 2 {
+        0 // Near start, show from beginning
+    } else if selected > total.saturating_sub(visible / 2) {
+        total.saturating_sub(visible) // Near end, show last items
+    } else {
+        selected.saturating_sub(visible / 2) // Center the selection
+    }
+}
+
+/// Format large counts with K/M suffixes for readability.
+/// Examples: 1500 -> "1.5K", 2500000 -> "2.5M"
+pub fn format_count(count: usize) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
 
 // ============================================================================
 // Helper Functions for Truncation
@@ -484,14 +548,14 @@ fn get_discover_footer(app: &App, filtered_count: usize) -> (String, Style) {
         DiscoverFocus::Files => {
             // Glob Explorer mode has its own footer
             if let Some(ref explorer) = app.discover.glob_explorer {
-                if explorer.pattern_editing {
+                if matches!(explorer.phase, crate::cli::tui::app::GlobExplorerPhase::Filtering) {
                     return (
                         " [Enter] Done  [Esc] Cancel  │ Type glob pattern (e.g., *.csv) ".to_string(),
                         Style::default().fg(Color::Yellow),
                     );
                 }
                 return (
-                    " [j/k] Navigate  [Enter] Drill in  [Backspace] Back  [/] Filter  [g/Esc] Exit ".to_string(),
+                    " [hjkl] Navigate  [l/Enter] In  [h/Bksp] Back  [/] Filter  [g/Esc] Exit ".to_string(),
                     Style::default().fg(Color::Cyan),
                 );
             }
@@ -514,29 +578,33 @@ fn get_discover_footer(app: &App, filtered_count: usize) -> (String, Style) {
     }
 }
 
-/// Draw the Discover mode sidebar with Sources and Tags sections (scrollable)
+/// Draw the Discover mode sidebar with Sources (single-line) and Tags sections
 fn draw_discover_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    // Dynamic layout based on view state
     let sources_open = app.discover.view_state == DiscoverViewState::SourcesDropdown;
     let tags_open = app.discover.view_state == DiscoverViewState::TagsDropdown;
 
-    // Calculate heights: collapsed = 3 lines (1 content + 2 border), expanded = remaining space
-    let (sources_constraint, tags_constraint) = match (sources_open, tags_open) {
-        (true, false) => (Constraint::Min(10), Constraint::Length(3)),
-        (false, true) => (Constraint::Length(3), Constraint::Min(10)),
-        (true, true) => (Constraint::Percentage(50), Constraint::Percentage(50)),
-        (false, false) => (Constraint::Length(3), Constraint::Length(3)),
+    // Option D layout: Sources is always 1 line when collapsed, Tags gets the rest
+    // When Sources is open, it expands as an overlay
+    let (sources_height, tags_constraint) = if sources_open {
+        // Sources dropdown expanded - takes more space
+        (Constraint::Min(8), Constraint::Length(3))
+    } else if tags_open {
+        // Tags expanded - Sources stays as single line header
+        (Constraint::Length(1), Constraint::Min(10))
+    } else {
+        // Both collapsed - Sources is 1 line, Tags gets remaining
+        (Constraint::Length(1), Constraint::Min(5))
     };
 
     let v_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([sources_constraint, tags_constraint])
+        .constraints([sources_height, tags_constraint])
         .split(area);
 
-    // === SOURCES DROPDOWN ===
+    // === SOURCES (single-line or dropdown) ===
     draw_sources_dropdown(frame, app, v_chunks[0]);
 
-    // === TAGS DROPDOWN ===
+    // === TAGS SECTION ===
     draw_tags_dropdown(frame, app, v_chunks[1]);
 }
 
@@ -602,14 +670,11 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray).italic(),
             )));
         } else {
-            // Find scroll offset based on preview position
+            // Find scroll offset based on preview position - keep selection visible with centering
             let preview_idx = app.discover.preview_source.unwrap_or_else(|| app.discover.selected_source_index());
             let preview_pos = filtered.iter().position(|(i, _)| *i == preview_idx).unwrap_or(0);
-            let scroll_offset = if preview_pos >= visible_height {
-                preview_pos - visible_height + 1
-            } else {
-                0
-            };
+            let total_items = filtered.len();
+            let scroll_offset = centered_scroll_offset(preview_pos, visible_height, total_items);
 
             for (i, source) in filtered.iter().skip(scroll_offset).take(visible_height) {
                 let is_preview = app.discover.preview_source == Some(*i);
@@ -632,31 +697,45 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         let list = Paragraph::new(lines);
         frame.render_widget(list, inner_chunks[1]);
 
-        // Border with title
+        // Border with title - use double borders when focused/open for visual prominence
+        let (border_style, border_type) = if is_focused {
+            (Style::default().fg(Color::Cyan), BorderType::Double)
+        } else {
+            (Style::default().fg(Color::DarkGray), BorderType::Rounded)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(style)
-            .title(Span::styled(" [1] Source ▲ ", style));
+            .border_style(border_style)
+            .border_type(border_type)
+            .title(Span::styled(" [1] Source ▲ ", style.bold()));
         frame.render_widget(block, area);
     } else {
-        // Collapsed: show selected source
-        let selected_text = if app.discover.sources.is_empty() {
-            "No sources (press 's')".to_string()
+        // Collapsed: single-line view without borders
+        // Format: "[1] name ▾ count" - compact to fit sidebar
+        let (name, count) = if app.discover.sources.is_empty() {
+            ("No sources".to_string(), "'s'".to_string())
         } else if let Some(source) = app.discover.sources.get(app.discover.selected_source_index()) {
-            format!("{} ({})", source.name, source.file_count)
+            (source.name.clone(), format_count(source.file_count))
         } else {
-            "Select source...".to_string()
+            ("Select...".to_string(), "".to_string())
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(style)
-            .title(Span::styled(" [1] Source ", style));
+        let label_style = Style::default().fg(Color::DarkGray);
+        let name_style = if is_focused {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let count_style = Style::default().fg(Color::DarkGray);
 
-        let content = Paragraph::new(selected_text)
-            .style(if is_focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::Gray) })
-            .block(block);
+        let line = Line::from(vec![
+            Span::styled("[1] ", label_style),
+            Span::styled(&name, name_style),
+            Span::styled(" ▾ ", if is_focused { Style::default().fg(Color::Cyan) } else { label_style }),
+            Span::styled(count, count_style),
+        ]);
 
+        let content = Paragraph::new(line);
         frame.render_widget(content, area);
     }
 }
@@ -728,14 +807,11 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::DarkGray).italic(),
             )));
         } else {
-            // Find scroll offset based on preview position
+            // Find scroll offset based on preview position - keep selection centered
+            let total_items = filtered.len();
             let scroll_offset = if let Some(preview_idx) = app.discover.preview_tag {
                 let preview_pos = filtered.iter().position(|(i, _)| *i == preview_idx).unwrap_or(0);
-                if preview_pos >= visible_height {
-                    preview_pos + 1 - visible_height
-                } else {
-                    0
-                }
+                centered_scroll_offset(preview_pos, visible_height, total_items)
             } else {
                 0
             };
@@ -763,11 +839,17 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         let list = Paragraph::new(lines);
         frame.render_widget(list, inner_chunks[1]);
 
-        // Border with title
+        // Border with title - use double borders when focused/open for visual prominence
+        let (border_style, border_type) = if is_focused {
+            (Style::default().fg(Color::Cyan), BorderType::Double)
+        } else {
+            (Style::default().fg(Color::DarkGray), BorderType::Rounded)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(style)
-            .title(Span::styled(" [2] Tags ▲ ", style));
+            .border_style(border_style)
+            .border_type(border_type)
+            .title(Span::styled(" [2] Tags ▲ ", style.bold()));
         frame.render_widget(block, area);
     } else {
         // Collapsed: show selected tag or "All files"
@@ -783,10 +865,17 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             format!("All files ({})", count)
         };
 
+        // Use double borders when focused for visual prominence
+        let (border_style, border_type) = if is_focused {
+            (Style::default().fg(Color::Cyan), BorderType::Double)
+        } else {
+            (Style::default().fg(Color::DarkGray), BorderType::Rounded)
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(style)
-            .title(Span::styled(" [2] Tags ", style));
+            .border_style(border_style)
+            .border_type(border_type)
+            .title(Span::styled(" [2] Tags ", style.bold()));
 
         let content = Paragraph::new(selected_text)
             .style(if is_focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::Gray) })
@@ -798,25 +887,8 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Rules Manager dialog as an overlay
 fn draw_rules_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
+    let dialog_area = render_centered_dialog(frame, area, 60, 20);
 
-    // Center the dialog
-    let dialog_width = area.width.min(60);
-    let dialog_height = area.height.min(20);
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    // Clear the area behind the dialog
-    frame.render_widget(Clear, dialog_area);
-
-    // Dialog block
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -916,25 +988,8 @@ fn draw_rules_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Sources Manager dialog as an overlay (spec v1.7)
 fn draw_sources_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
+    let dialog_area = render_centered_dialog(frame, area, 65, 20);
 
-    // Center the dialog
-    let dialog_width = area.width.min(65);
-    let dialog_height = area.height.min(20);
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    // Clear the area behind the dialog
-    frame.render_widget(Clear, dialog_area);
-
-    // Dialog block
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1032,22 +1087,7 @@ fn draw_sources_manager_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Source Edit dialog as an overlay (spec v1.7)
 fn draw_source_edit_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
-
-    // Center a smaller dialog
-    let dialog_width = area.width.min(50);
-    let dialog_height = 8;
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    frame.render_widget(Clear, dialog_area);
+    let dialog_area = render_centered_dialog(frame, area, 50, 8);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1101,22 +1141,7 @@ fn draw_source_edit_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Source Delete Confirmation dialog as an overlay (spec v1.7)
 fn draw_source_delete_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
-
-    // Center a smaller dialog
-    let dialog_width = area.width.min(55);
-    let dialog_height = 10;
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    frame.render_widget(Clear, dialog_area);
+    let dialog_area = render_centered_dialog(frame, area, 55, 10);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1167,8 +1192,6 @@ fn draw_source_delete_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Add Source dialog as an overlay (improved UX for path input)
 fn draw_add_source_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
-
     // Calculate height based on content
     let suggestions_count = app.discover.path_suggestions.len().min(8);
     let has_suggestions = suggestions_count > 0;
@@ -1179,19 +1202,7 @@ fn draw_add_source_dialog(frame: &mut Frame, app: &App, area: Rect) {
         + if has_suggestions { suggestions_count as u16 + 2 } else { 0 }
         + if has_error { 2 } else { 0 };
 
-    // Center a dialog
-    let dialog_width = area.width.min(70);
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    frame.render_widget(Clear, dialog_area);
+    let dialog_area = render_centered_dialog(frame, area, 70, dialog_height);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1270,27 +1281,10 @@ fn draw_add_source_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Scanning progress dialog as an overlay
 fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
-
-    // Center a dialog
-    let dialog_width = area.width.min(60);
-    let dialog_height = 9;
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
-
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    // Clear the entire dialog area first
-    frame.render_widget(Clear, dialog_area);
+    let dialog_area = render_centered_dialog(frame, area, 60, 9);
 
     // Animated spinner for title
-    let spinner_chars = ["-", "\\", "|", "/"];
-    let spinner = spinner_chars[(app.tick_count / 2) as usize % 4];
+    let spinner = spinner_ascii(app.tick_count);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1375,26 +1369,10 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Rule Creation dialog as an overlay (two-field version with live preview)
 fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    use ratatui::widgets::Clear;
     use super::app::RuleDialogFocus;
 
-    // Center the dialog
-    let dialog_width = area.width.min(70);
-    let dialog_height = area.height.min(18);
-    let x = (area.width.saturating_sub(dialog_width)) / 2;
-    let y = (area.height.saturating_sub(dialog_height)) / 2;
+    let dialog_area = render_centered_dialog(frame, area, 70, area.height.min(18));
 
-    let dialog_area = Rect::new(
-        area.x + x,
-        area.y + y,
-        dialog_width,
-        dialog_height,
-    );
-
-    // Clear the area behind the dialog
-    frame.render_widget(Clear, dialog_area);
-
-    // Dialog block
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1552,23 +1530,10 @@ fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::F
         }
     } else {
         // VIRTUAL SCROLLING: Only render visible rows for performance with large file lists
-        // Calculate visible height (area height minus 1 for title line)
         let visible_rows = area.height.saturating_sub(1) as usize;
         let total_files = filtered_files.len();
         let selected = app.discover.selected;
-
-        // Calculate scroll offset to keep selected item visible
-        // Try to keep selected item roughly centered, but don't scroll past boundaries
-        let scroll_offset = if visible_rows >= total_files {
-            0 // All files fit, no scrolling needed
-        } else if selected < visible_rows / 2 {
-            0 // Near start, show from beginning
-        } else if selected > total_files.saturating_sub(visible_rows / 2) {
-            total_files.saturating_sub(visible_rows) // Near end, show last visible_rows
-        } else {
-            selected.saturating_sub(visible_rows / 2) // Center the selection
-        };
-
+        let scroll_offset = centered_scroll_offset(selected, visible_rows, total_files);
         let end_idx = (scroll_offset + visible_rows).min(total_files);
 
         // Calculate column widths:
@@ -1649,25 +1614,37 @@ fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::F
     frame.render_widget(list, area);
 }
 
-/// Format large counts with K/M suffixes for readability
-fn format_count(count: usize) -> String {
-    if count >= 1_000_000 {
-        format!("{:.1}M", count as f64 / 1_000_000.0)
-    } else if count >= 1_000 {
-        format!("{:.1}K", count as f64 / 1_000.0)
-    } else {
-        count.to_string()
-    }
-}
-
 /// Draw the Glob Explorer (hierarchical folder view)
 fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
-    use super::app::GlobFileCount;
+    use super::app::{GlobFileCount, GlobExplorerPhase};
 
     let explorer = match &app.discover.glob_explorer {
         Some(e) => e,
         None => return,
     };
+
+    // Dispatch based on phase - EditRule, Testing, Publishing, Published have their own UIs
+    match &explorer.phase {
+        GlobExplorerPhase::EditRule { focus, selected_index, editing_field } => {
+            draw_rule_editor(frame, app, area, focus, *selected_index, editing_field);
+            return;
+        }
+        GlobExplorerPhase::Testing => {
+            draw_test_results(frame, app, area);
+            return;
+        }
+        GlobExplorerPhase::Publishing => {
+            draw_publishing(frame, app, area);
+            return;
+        }
+        GlobExplorerPhase::Published { job_id } => {
+            draw_published(frame, area, job_id);
+            return;
+        }
+        GlobExplorerPhase::Browse | GlobExplorerPhase::Filtering => {
+            // Continue with normal explorer UI below
+        }
+    }
 
     let is_focused = app.discover.focus == DiscoverFocus::Files;
 
@@ -1681,33 +1658,79 @@ fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    // --- Pattern section ---
-    let pattern_display = if explorer.pattern.is_empty() {
-        "<no filter>".to_string()
-    } else {
-        explorer.pattern.clone()
-    };
-    let total_count = match &explorer.total_count {
+    // --- Pattern section (prominent input box) ---
+    let is_filtering = matches!(explorer.phase, GlobExplorerPhase::Filtering);
+    let total_count_str = match &explorer.total_count {
         GlobFileCount::Exact(n) => format!("{} files", format_count(*n)),
         GlobFileCount::Estimated(n) => format!("~{} files", format_count(*n)),
     };
-    let pattern_line = format!(
-        "Pattern: {}{}  [{}]",
-        pattern_display,
-        if !explorer.current_prefix.is_empty() {
-            format!("  (in {})", explorer.current_prefix)
+
+    // Build the pattern display with prefix and cursor
+    let prefix = &explorer.current_prefix;
+    let pattern = &explorer.pattern;
+    let cursor_pos = explorer.pattern_cursor;
+
+    let mut pattern_spans: Vec<Span> = Vec::new();
+
+    // Add prefix (not editable, shown in dimmer color)
+    if !prefix.is_empty() {
+        pattern_spans.push(Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray)));
+    }
+
+    if is_filtering {
+        // Editing mode: show cursor
+        let before_cursor: String = pattern.chars().take(cursor_pos).collect();
+        let after_cursor: String = pattern.chars().skip(cursor_pos).collect();
+
+        pattern_spans.push(Span::styled(before_cursor, Style::default().fg(Color::Yellow).bold()));
+        pattern_spans.push(Span::styled("│", Style::default().fg(Color::White).bold())); // Cursor
+        pattern_spans.push(Span::styled(after_cursor, Style::default().fg(Color::Yellow).bold()));
+    } else {
+        // Browse mode: show pattern or placeholder
+        let display_pattern = if pattern.is_empty() && prefix.is_empty() {
+            "*".to_string()
+        } else if pattern.is_empty() {
+            "*".to_string()  // Inside folder, show * for "all files here"
         } else {
-            String::new()
-        },
-        total_count
-    );
-    let pattern_style = if explorer.pattern_editing {
+            pattern.clone()
+        };
+        pattern_spans.push(Span::styled(display_pattern, Style::default().fg(Color::Cyan).bold()));
+    }
+
+    // Add file count
+    pattern_spans.push(Span::raw("  "));
+    pattern_spans.push(Span::styled(format!("[{}]", total_count_str), Style::default().fg(Color::Green)));
+
+    // Hints based on mode
+    let hints = if is_filtering {
+        "  [Enter] Done  [Esc] Cancel"
+    } else if explorer.total_count.value() > 0 {
+        "  [/] Edit  [e] Create Rule"
+    } else {
+        "  [/] Edit pattern"
+    };
+    pattern_spans.push(Span::styled(hints, Style::default().fg(Color::DarkGray)));
+
+    let pattern_line = Line::from(pattern_spans);
+
+    // Create bordered box for pattern
+    let border_style = if is_filtering {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::Cyan)
     };
-    let pattern_widget = Paragraph::new(Line::from(Span::styled(pattern_line, pattern_style)))
-        .block(Block::default().borders(Borders::BOTTOM));
+    let border_type = if is_filtering { BorderType::Double } else { BorderType::Rounded };
+
+    let pattern_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .border_type(border_type)
+        .title(Span::styled(" GLOB PATTERN ", Style::default().fg(Color::Cyan).bold()));
+
+    let pattern_widget = Paragraph::new(pattern_line)
+        .block(pattern_block)
+        .style(Style::default());
+
     frame.render_widget(pattern_widget, chunks[0]);
 
     // --- Folders section ---
@@ -1730,17 +1753,7 @@ fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
         let visible_rows = chunks[1].height.saturating_sub(1) as usize;
         let total_folders = explorer.folders.len();
         let selected = explorer.selected_folder;
-
-        let scroll_offset = if visible_rows >= total_folders {
-            0
-        } else if selected < visible_rows / 2 {
-            0
-        } else if selected > total_folders.saturating_sub(visible_rows / 2) {
-            total_folders.saturating_sub(visible_rows)
-        } else {
-            selected.saturating_sub(visible_rows / 2)
-        };
-
+        let scroll_offset = centered_scroll_offset(selected, visible_rows, total_folders);
         let end_idx = (scroll_offset + visible_rows).min(total_folders);
 
         for (visible_idx, folder) in explorer.folders[scroll_offset..end_idx].iter().enumerate() {
@@ -1756,28 +1769,49 @@ fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let icon = if folder.is_file { "📄" } else { "📁" };
-            let arrow = if folder.is_file { " " } else { ">" };
-            let count_str = format_count(folder.file_count);
 
-            let content = format!(
-                " {} {:<40} {:>8} files {}",
-                icon,
-                truncate_string(&folder.name, 40),
-                count_str,
-                arrow
-            );
+            // Use truncate_path_start to show the end of the path (most relevant part)
+            let content = if folder.is_file {
+                // Files: just show icon and name (no redundant "1 files")
+                format!(
+                    " {} {}",
+                    icon,
+                    truncate_path_start(&folder.name, 50),
+                )
+            } else {
+                // Folders: show icon, name, count, and drill-down arrow
+                let count_str = format_count(folder.file_count);
+                format!(
+                    " {} {:<40} {:>8} files >",
+                    icon,
+                    truncate_path_start(&folder.name, 40),
+                    count_str,
+                )
+            };
             folder_lines.push(Line::from(Span::styled(content, style)));
         }
     }
 
     let folders_title = format!(" FOLDERS ({}) ", explorer.folders.len());
-    let folders_title_style = if is_focused {
-        Style::default().fg(Color::Cyan)
+    let (folders_title_style, folders_border_style, folders_border_type) = if is_focused && !is_filtering {
+        // Focused: bright cyan, double borders
+        (
+            Style::default().fg(Color::Cyan).bold(),
+            Style::default().fg(Color::Cyan),
+            BorderType::Double,
+        )
     } else {
-        Style::default().fg(Color::DarkGray)
+        // Unfocused: dim gray, rounded borders
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
+            BorderType::Rounded,
+        )
     };
     let folders_block = Block::default()
-        .borders(Borders::NONE)
+        .borders(Borders::ALL)
+        .border_style(folders_border_style)
+        .border_type(folders_border_type)
         .title(Span::styled(folders_title, folders_title_style));
     let folders_widget = Paragraph::new(folder_lines).block(folders_block);
     frame.render_widget(folders_widget, chunks[1]);
@@ -1807,18 +1841,6 @@ fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
     let preview_widget = Paragraph::new(preview_lines).block(preview_block);
     frame.render_widget(preview_widget, chunks[2]);
 }
-
-/// Truncate a string to max length (with ellipsis)
-fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else if max_len <= 3 {
-        "...".to_string()
-    } else {
-        format!("{}...", &s[..max_len - 3])
-    }
-}
-
 fn draw_file_preview(frame: &mut Frame, app: &App, filtered_files: &[&super::app::FileInfo], area: Rect) {
     let content = if let Some(file) = filtered_files.get(app.discover.selected) {
          format!(
@@ -1861,44 +1883,6 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
 
     draw_messages(frame, app, inner_chunks[0]);
     draw_input(frame, app, inner_chunks[1]);
-}
-
-/// Draw a placeholder screen for modes not yet implemented
-fn draw_placeholder_screen(frame: &mut Frame, area: Rect, title: &str, description: &str, shortcut: &str) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(0),     // Content
-            Constraint::Length(3),  // Footer
-        ])
-        .split(area);
-
-    // Title
-    let title_widget = Paragraph::new(format!(" {} Mode ", title))
-        .style(Style::default().fg(Color::Cyan).bold())
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title_widget, chunks[0]);
-
-    // Content
-    let content = format!(
-        "\n\n{}\n\n\n(Coming Soon)\n\nThis mode will allow you to {}.\n\nPress Esc or Alt+H to return to Home.",
-        description,
-        description.to_lowercase()
-    );
-    let content_widget = Paragraph::new(content)
-        .style(Style::default().fg(Color::Gray))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title(format!(" {} [{}] ", title, shortcut)));
-    frame.render_widget(content_widget, chunks[1]);
-
-    // Footer
-    let footer = Paragraph::new(" [Esc/Alt+H] Home  [Alt+D] Discover  [Alt+P] Parser Bench  [Alt+I] Inspect  [Alt+J] Jobs ")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
 }
 
 // =============================================================================
@@ -2394,54 +2378,136 @@ fn draw_table_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Draw the Jobs mode screen - view and manage job queue
+/// Draw the Jobs mode screen - per jobs_redesign.md spec
 fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
+    // Check view state for monitoring panel
+    if app.jobs_state.view_state == JobsViewState::MonitoringPanel {
+        draw_monitoring_panel(frame, app, area);
+        return;
+    }
+
+    // Calculate layout based on whether pipeline is shown
+    let (pipeline_height, content_height) = if app.jobs_state.show_pipeline {
+        (8, area.height.saturating_sub(14)) // Pipeline + status bar + footer
+    } else {
+        (0, area.height.saturating_sub(6)) // Just status bar + footer
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(0),     // Content
-            Constraint::Length(3),  // Footer
+            Constraint::Length(3),              // Status bar
+            Constraint::Length(pipeline_height), // Pipeline (if shown)
+            Constraint::Min(0),                 // Job list
+            Constraint::Length(3),              // Footer
         ])
         .split(area);
 
-    // Title with filter info
-    let filter_text = match app.jobs_state.status_filter {
-        Some(JobStatus::Pending) => " (Pending only)",
-        Some(JobStatus::Running) => " (Running only)",
-        Some(JobStatus::Completed) => " (Completed only)",
-        Some(JobStatus::Failed) => " (Failed only)",
-        Some(JobStatus::Cancelled) => " (Cancelled only)",
-        None => "",
+    // Status bar with aggregate stats (per spec Section 4.1)
+    let (running, done, failed, total_files, total_bytes) = app.jobs_state.aggregate_stats();
+    let status_parts: Vec<String> = vec![
+        if running > 0 { format!("↻ {} running", running) } else { String::new() },
+        if done > 0 { format!("✓ {} done", done) } else { String::new() },
+        if failed > 0 { format!("✗ {} failed", failed) } else { String::new() },
+    ].into_iter().filter(|s| !s.is_empty()).collect();
+
+    let status_text = format!(
+        "  {}     {}/{} files • {} output",
+        status_parts.join("   "),
+        total_files,
+        app.jobs_state.pipeline.source.count,
+        format_size(total_bytes)
+    );
+
+    let status_bar = Paragraph::new(status_text)
+        .style(Style::default().fg(Color::White))
+        .block(Block::default().borders(Borders::BOTTOM).title(" JOBS ").title_style(Style::default().fg(Color::Cyan).bold()));
+    frame.render_widget(status_bar, chunks[0]);
+
+    // Pipeline summary (if toggled)
+    let job_list_area = if app.jobs_state.show_pipeline && pipeline_height > 0 {
+        draw_pipeline_summary(frame, app, chunks[1]);
+        chunks[2]
+    } else {
+        // Combine pipeline slot with job list
+        Rect::new(chunks[1].x, chunks[1].y, chunks[1].width, chunks[1].height + chunks[2].height)
     };
 
-    let title = Paragraph::new(format!(" Jobs Mode - Queue Manager{} ", filter_text))
-        .style(Style::default().fg(Color::Cyan).bold())
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title, chunks[0]);
+    // Main content depends on view state
+    match app.jobs_state.view_state {
+        JobsViewState::JobList => {
+            draw_jobs_list(frame, app, job_list_area);
+        }
+        JobsViewState::DetailPanel => {
+            // Split into list and detail
+            let content_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(job_list_area);
+            draw_jobs_list(frame, app, content_chunks[0]);
+            draw_job_detail(frame, app, content_chunks[1]);
+        }
+        _ => {
+            draw_jobs_list(frame, app, job_list_area);
+        }
+    }
 
-    // Main content: job list (left) + detail pane (right)
-    let content_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+    // Footer with shortcuts (context-sensitive per spec Section 7)
+    let footer_text = match app.jobs_state.view_state {
+        JobsViewState::DetailPanel => " [Esc] Back  [R] Retry  [l] Logs  [y] Copy path ",
+        JobsViewState::MonitoringPanel => " [Esc] Back  [p] Pause  [r] Reset ",
+        _ => " [j/k] Navigate  [Enter] Details  [P] Pipeline  [m] Monitor  [f] Filter  [?] Help ",
+    };
 
-    // Jobs list
-    draw_jobs_list(frame, app, content_chunks[0]);
-
-    // Job detail pane
-    draw_job_detail(frame, app, content_chunks[1]);
-
-    // Footer with shortcuts
-    let footer = Paragraph::new(" [j/k] Navigate  [r] Retry  [c] Cancel  [0-4] Filter  [Esc] Home ")
+    let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, chunks[3]);
 }
 
-/// Draw the jobs list in Jobs mode
+/// Draw pipeline summary (per spec Section 3.2)
+fn draw_pipeline_summary(frame: &mut Frame, app: &App, area: Rect) {
+    let pipeline = &app.jobs_state.pipeline;
+
+    let source_in_progress = if pipeline.source.in_progress > 0 {
+        format!("@{}", pipeline.source.in_progress)
+    } else { String::new() };
+
+    let parsed_in_progress = if pipeline.parsed.in_progress > 0 {
+        format!("@{}", pipeline.parsed.in_progress)
+    } else { String::new() };
+
+    let output_in_progress = if pipeline.output.in_progress > 0 {
+        format!("{} run", pipeline.output.in_progress)
+    } else { String::new() };
+
+    let content = format!(
+        "   SOURCE              PARSED               OUTPUT\n\
+         \n\
+           {} files  ────▶  {} files  ────▶   {} ready\n\
+           {}              {}              {}\n\
+         \n\
+           {}",
+        pipeline.source.count,
+        pipeline.parsed.count,
+        pipeline.output.count,
+        source_in_progress,
+        parsed_in_progress,
+        output_in_progress,
+        pipeline.active_parser.as_deref().unwrap_or("")
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" PIPELINE ")
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let paragraph = Paragraph::new(content).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Draw the jobs list (per spec Section 4)
 fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let jobs = app.jobs_state.filtered_jobs();
@@ -2451,100 +2517,173 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
             "No jobs found.",
             Style::default().fg(Color::DarkGray),
         )));
-        if app.jobs_state.status_filter.is_some() {
+        if app.jobs_state.status_filter.is_some() || app.jobs_state.type_filter.is_some() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Press 0 to clear filter.",
+                "Press [f] to clear filters.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
     } else {
         for (i, job) in jobs.iter().enumerate() {
             let is_selected = i == app.jobs_state.selected_index;
-
-            let status_symbol = job.status.symbol();
-            let status_color = match job.status {
-                JobStatus::Pending => Color::Yellow,
-                JobStatus::Running => Color::Blue,
-                JobStatus::Completed => Color::Green,
-                JobStatus::Failed => Color::Red,
-                JobStatus::Cancelled => Color::DarkGray,
-            };
-
-            let line_style = if is_selected {
-                Style::default().bold()
-            } else {
-                Style::default()
-            };
-
-            let prefix = if is_selected { "> " } else { "  " };
-
-            // Job ID and status
-            lines.push(Line::from(vec![
-                Span::styled(prefix, line_style),
-                Span::styled(status_symbol, Style::default().fg(status_color)),
-                Span::styled(
-                    format!(" #{} - {}", job.id, job.parser_name),
-                    if is_selected {
-                        Style::default().fg(Color::Cyan).bold()
-                    } else {
-                        Style::default().fg(Color::White)
-                    },
-                ),
-            ]));
-
-            // File path (truncated) - use chars to handle UTF-8 safely
-            let path = {
-                let char_count = job.file_path.chars().count();
-                if char_count > 40 {
-                    let suffix: String = job.file_path.chars().skip(char_count - 37).collect();
-                    format!("...{}", suffix)
-                } else {
-                    job.file_path.clone()
-                }
-            };
-
-            lines.push(Line::from(Span::styled(
-                format!("    {}", path),
-                Style::default().fg(Color::DarkGray),
-            )));
-
-            lines.push(Line::from("")); // Spacing
+            render_job_line(&mut lines, job, is_selected, area.width as usize);
         }
     }
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Jobs ({}) ", jobs.len()))
         .border_style(Style::default().fg(Color::White));
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
 }
 
-/// Draw job detail pane in Jobs mode
+/// Render a single job (1-3 lines depending on type and status)
+/// Per spec Sections 4.1-4.9
+fn render_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, _width: usize) {
+    let status_symbol = job.status.symbol();
+    let status_color = match job.status {
+        JobStatus::Pending => Color::Yellow,
+        JobStatus::Running => Color::Blue,
+        JobStatus::Completed => Color::Green,
+        JobStatus::Failed => Color::Red,
+        JobStatus::Cancelled => Color::DarkGray,
+    };
+
+    let prefix = if is_selected { "▸ " } else { "  " };
+    let name_style = if is_selected {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    // Line 1: Status, Type, Name, Version, Timestamp/Progress
+    let version_str = job.version.as_deref().map(|v| format!(" v{}", v)).unwrap_or_default();
+    let time_str = format_relative_time(job.started_at);
+
+    let progress_or_time = if job.status == JobStatus::Running {
+        // Show progress bar for running jobs
+        let pct = if job.items_total > 0 {
+            (job.items_processed as f64 / job.items_total as f64 * 100.0) as u8
+        } else { 0 };
+        format!("{}  {}%", render_progress_bar(pct, 12), pct)
+    } else {
+        time_str
+    };
+
+    // Add backtest iteration if applicable
+    let backtest_iter = if job.job_type == JobType::Backtest {
+        if let Some(ref bt) = job.backtest {
+            format!(" (iter {})", bt.iteration)
+        } else { String::new() }
+    } else { String::new() };
+
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default()),
+        Span::styled(status_symbol, Style::default().fg(status_color)),
+        Span::styled(format!(" {} ", job.job_type.as_str()), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}{}{}", job.name, version_str, backtest_iter), name_style),
+        Span::styled(format!("  {}", progress_or_time), Style::default().fg(Color::DarkGray)),
+    ]));
+
+    // Line 2: Details (varies by job type and status)
+    let detail_line = match (job.job_type, job.status) {
+        (JobType::Scan, _) => {
+            format!("           {} files", job.items_processed)
+        }
+        (JobType::Parse, JobStatus::Failed) => {
+            format!("           {} files failed • {}", job.items_failed,
+                job.failures.first().map(|f| f.error.as_str()).unwrap_or("Unknown error"))
+        }
+        (JobType::Parse, JobStatus::Completed) => {
+            let path = job.output_path.as_deref().unwrap_or("");
+            let size = job.output_size_bytes.map(format_size).unwrap_or_default();
+            format!("           {} files → {} ({})", job.items_processed, truncate_path(path, 40), size)
+        }
+        (JobType::Parse, JobStatus::Running) => {
+            let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
+            format!("           {}/{} files • ETA {}", job.items_processed, job.items_total, eta)
+        }
+        (JobType::Export, JobStatus::Completed) => {
+            let path = job.output_path.as_deref().unwrap_or("");
+            let size = job.output_size_bytes.map(format_size).unwrap_or_default();
+            format!("           {} records → {} ({})", job.items_processed, truncate_path(path, 30), size)
+        }
+        (JobType::Export, JobStatus::Running) => {
+            let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
+            format!("           {}/{} records • ETA {}", job.items_processed, job.items_total, eta)
+        }
+        (JobType::Backtest, _) => {
+            if let Some(ref bt) = job.backtest {
+                let pct = (bt.pass_rate * 100.0) as u32;
+                let passed = (job.items_processed as f64 * bt.pass_rate) as u32;
+                format!("           Pass: {}/{} files ({})% • {} high-failure passed",
+                    passed, job.items_processed, pct, bt.high_failure_passed)
+            } else {
+                format!("           {} files tested", job.items_processed)
+            }
+        }
+        _ => {
+            format!("           {} items", job.items_processed)
+        }
+    };
+
+    lines.push(Line::from(Span::styled(detail_line, Style::default().fg(Color::DarkGray))));
+
+    // Line 3: First failure (for failed jobs only)
+    if job.status == JobStatus::Failed && !job.failures.is_empty() {
+        let first_failure = &job.failures[0];
+        lines.push(Line::from(Span::styled(
+            format!("           First failure: {}", truncate_path(&first_failure.file_path, 50)),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    lines.push(Line::from("")); // Spacing between jobs
+}
+
+/// Draw job detail panel (per spec Section 7)
 fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
     let jobs = app.jobs_state.filtered_jobs();
 
     let content = if let Some(job) = jobs.get(app.jobs_state.selected_index) {
         let mut detail = format!(
-            "Job ID: {}\nStatus: {}\nParser: {}\nRetries: {}\nCreated: {}\n\nFile:\n{}\n",
-            job.id,
+            "Type:       {}\n\
+             Name:       {}{}\n\
+             Status:     {}\n\
+             Started:    {}\n\
+             Duration:   {}\n",
+            job.job_type.as_str(),
+            job.name,
+            job.version.as_ref().map(|v| format!(" v{}", v)).unwrap_or_default(),
             job.status.as_str(),
-            job.parser_name,
-            job.retry_count,
-            job.created_at.format("%Y-%m-%d %H:%M:%S"),
-            job.file_path
+            job.started_at.format("%H:%M:%S"),
+            format_duration(job.started_at, job.completed_at)
         );
 
-        if let Some(ref error) = job.error_message {
-            detail.push_str(&format!("\nError:\n{}", error));
+        if let Some(ref path) = job.output_path {
+            detail.push_str(&format!("\nOUTPUT\n{}\n", path));
+            if let Some(bytes) = job.output_size_bytes {
+                detail.push_str(&format!("{} files • {}\n", job.items_processed, format_size(bytes)));
+            }
         }
 
+        if !job.failures.is_empty() {
+            detail.push_str(&format!("\nFAILURES ({})\n", job.failures.len()));
+            for failure in job.failures.iter().take(10) {
+                detail.push_str(&format!("{}\n  {}\n", truncate_path(&failure.file_path, 50), failure.error));
+            }
+            if job.failures.len() > 10 {
+                detail.push_str(&format!("... ({} more)\n", job.failures.len() - 10));
+            }
+        }
+
+        // Action hints
         if job.status == JobStatus::Failed {
-            detail.push_str("\n\nPress 'r' to retry this job.");
+            detail.push_str("\n[R] Retry all  [l] Logs");
         } else if job.status == JobStatus::Running {
-            detail.push_str("\n\nPress 'c' to cancel this job.");
+            detail.push_str("\n[c] Cancel  [l] Logs");
         }
 
         detail
@@ -2554,13 +2693,220 @@ fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Details ")
-        .border_style(Style::default().fg(Color::White));
+        .title(" JOB DETAILS ")
+        .border_style(Style::default().fg(Color::Cyan));
 
     let paragraph = Paragraph::new(content)
         .block(block)
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+/// Draw monitoring panel (per spec Section 5)
+fn draw_monitoring_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),   // Title
+            Constraint::Min(0),      // Content
+            Constraint::Length(3),   // Footer
+        ])
+        .split(area);
+
+    // Title
+    let title = Paragraph::new(" MONITORING ")
+        .style(Style::default().fg(Color::Cyan).bold())
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(title, chunks[0]);
+
+    // Content: Queue + Throughput on top, Sinks on bottom
+    let content_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    let top_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(content_chunks[0]);
+
+    // Queue panel
+    let queue = &app.jobs_state.monitoring.queue;
+    let queue_content = format!(
+        "  Pending:  {:>6}\n  Running:  {:>6}\n  Done:     {:>6}\n  Failed:   {:>6}\n\n  Depth: {}",
+        queue.pending, queue.running, queue.completed, queue.failed,
+        render_sparkline(&queue.depth_history)
+    );
+    let queue_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" QUEUE ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(Paragraph::new(queue_content).block(queue_block), top_row[0]);
+
+    // Throughput panel
+    let throughput_sparkline = render_throughput_sparkline(&app.jobs_state.monitoring.throughput_history);
+    let current_rps = app.jobs_state.monitoring.throughput_history.back()
+        .map(|s| s.rows_per_second).unwrap_or(0.0);
+    let avg_rps: f64 = if app.jobs_state.monitoring.throughput_history.is_empty() {
+        0.0
+    } else {
+        app.jobs_state.monitoring.throughput_history.iter().map(|s| s.rows_per_second).sum::<f64>()
+            / app.jobs_state.monitoring.throughput_history.len() as f64
+    };
+
+    let throughput_content = format!(
+        "\n{}\n\n  {:.1}k rows/s avg      {:.1}k now",
+        throughput_sparkline, avg_rps / 1000.0, current_rps / 1000.0
+    );
+    let throughput_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" THROUGHPUT (5m) ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(Paragraph::new(throughput_content).block(throughput_block), top_row[1]);
+
+    // Sinks panel
+    let mut sinks_content = String::new();
+    for sink in &app.jobs_state.monitoring.sinks {
+        sinks_content.push_str(&format!(
+            "  {}   {} total   {} errors\n",
+            sink.uri, format_size(sink.total_bytes), sink.error_count
+        ));
+        for output in &sink.outputs {
+            sinks_content.push_str(&format!(
+                "    └─ {}   {}   {} rows\n",
+                output.name, format_size(output.bytes), output.rows
+            ));
+        }
+        sinks_content.push('\n');
+    }
+    if sinks_content.is_empty() {
+        sinks_content = "  No sink data yet.".to_string();
+    }
+
+    let sinks_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" SINKS ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(Paragraph::new(sinks_content).block(sinks_block), content_chunks[1]);
+
+    // Footer
+    let paused_indicator = if app.jobs_state.monitoring.paused { " (PAUSED)" } else { "" };
+    let footer = Paragraph::new(format!(" [Esc] Back  [p] Pause updates  [r] Reset stats{} ", paused_indicator))
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Render a progress bar
+fn render_progress_bar(percent: u8, width: usize) -> String {
+    let filled = (percent as usize * width) / 100;
+    let empty = width.saturating_sub(filled);
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+/// Render sparkline from queue depth history
+fn render_sparkline(history: &std::collections::VecDeque<u32>) -> String {
+    const BLOCKS: [char; 8] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+
+    if history.is_empty() {
+        return " ".repeat(20);
+    }
+
+    let max = *history.iter().max().unwrap_or(&1) as f64;
+    let min = *history.iter().min().unwrap_or(&0) as f64;
+    let range = if max == min { 1.0 } else { max - min };
+
+    history.iter()
+        .take(20)
+        .map(|&v| {
+            let idx = ((v as f64 - min) / range * 7.0).round() as usize;
+            BLOCKS[idx.min(7)]
+        })
+        .collect()
+}
+
+/// Render throughput sparkline
+fn render_throughput_sparkline(history: &std::collections::VecDeque<ThroughputSample>) -> String {
+    const BLOCKS: [char; 8] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+
+    if history.is_empty() {
+        return "  ".to_string() + &" ".repeat(40);
+    }
+
+    let values: Vec<f64> = history.iter().map(|s| s.rows_per_second).collect();
+    let max = values.iter().cloned().fold(f64::MIN, f64::max);
+    let min = values.iter().cloned().fold(f64::MAX, f64::min);
+    let range = if max == min { 1.0 } else { max - min };
+
+    let sparkline: String = values.iter()
+        .take(40)
+        .map(|&v| {
+            let idx = ((v - min) / range * 7.0).round() as usize;
+            BLOCKS[idx.min(7)]
+        })
+        .collect();
+
+    format!("  {}", sparkline)
+}
+
+/// Format relative time (e.g., "2m ago", "1h ago")
+fn format_relative_time(dt: DateTime<Local>) -> String {
+    let now = Local::now();
+    let diff = now.signed_duration_since(dt);
+
+    if diff.num_seconds() < 60 {
+        format!("{}s ago", diff.num_seconds())
+    } else if diff.num_minutes() < 60 {
+        format!("{}m ago", diff.num_minutes())
+    } else if diff.num_hours() < 24 {
+        format!("{}h ago", diff.num_hours())
+    } else {
+        format!("{}d ago", diff.num_days())
+    }
+}
+
+/// Format duration between two times
+fn format_duration(start: DateTime<Local>, end: Option<DateTime<Local>>) -> String {
+    let end_time = end.unwrap_or_else(Local::now);
+    let diff = end_time.signed_duration_since(start);
+
+    if diff.num_seconds() < 60 {
+        format!("{}s", diff.num_seconds())
+    } else if diff.num_minutes() < 60 {
+        format!("{}m {}s", diff.num_minutes(), diff.num_seconds() % 60)
+    } else {
+        format!("{}h {}m", diff.num_hours(), diff.num_minutes() % 60)
+    }
+}
+
+/// Calculate ETA based on progress
+fn calculate_eta(processed: u32, total: u32, started: DateTime<Local>) -> String {
+    if processed == 0 || total == 0 {
+        return "calculating...".to_string();
+    }
+
+    let elapsed = Local::now().signed_duration_since(started).num_seconds() as f64;
+    let rate = processed as f64 / elapsed;
+    let remaining = (total - processed) as f64;
+    let eta_secs = (remaining / rate) as i64;
+
+    if eta_secs < 60 {
+        format!("{}s", eta_secs)
+    } else if eta_secs < 3600 {
+        format!("{}m", eta_secs / 60)
+    } else {
+        format!("{}h", eta_secs / 3600)
+    }
+}
+
+/// Truncate path from the left, keeping filename visible
+fn truncate_path(path: &str, max_len: usize) -> String {
+    if path.len() <= max_len {
+        return path.to_string();
+    }
+    format!("...{}", &path[path.len() - max_len + 3..])
 }
 
 
@@ -2845,11 +3191,371 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(help_paragraph, help_area);
 }
 
+// ============================================================================
+// Glob Explorer Phase UI: Rule Editing, Testing, Publishing
+// ============================================================================
+
+/// Draw the rule editor UI (EditRule phase)
+/// Layout: 4-section editor with focus indicators per spec v2.2
+fn draw_rule_editor(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    focus: &super::extraction::RuleEditorFocus,
+    selected_index: usize,
+    _editing_field: &Option<super::extraction::FieldEditFocus>,
+) {
+    use super::extraction::RuleEditorFocus;
+
+    let explorer = match &app.discover.glob_explorer {
+        Some(e) => e,
+        None => return,
+    };
+
+    let draft = match &explorer.rule_draft {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Main block with double border
+    let rule_name = if draft.name.is_empty() { "New Rule" } else { &draft.name };
+    let title = format!(" EDIT RULE: {} ", rule_name);
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(Span::styled(title, Style::default().fg(Color::Yellow).bold()));
+    frame.render_widget(main_block, area);
+
+    let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
+
+    // Split into 4 sections + footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Glob pattern
+            Constraint::Min(5),     // Fields
+            Constraint::Length(3),  // Base tag
+            Constraint::Min(4),     // Conditions
+            Constraint::Length(2),  // Footer
+        ])
+        .split(inner);
+
+    // Section 1: GLOB PATTERN
+    let glob_focused = matches!(focus, RuleEditorFocus::GlobPattern);
+    let glob_border = if glob_focused { BorderType::Double } else { BorderType::Plain };
+    let glob_style = if glob_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+    let file_count = explorer.total_count.value();
+    let glob_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(glob_border)
+        .title(Span::styled(format!(" GLOB PATTERN (1/4) [{}] ", file_count), glob_style));
+    let cursor = if glob_focused { ">> " } else { "   " };
+    let glob_content = format!("{}{}", cursor, draft.glob_pattern);
+    let glob_widget = Paragraph::new(glob_content).block(glob_block);
+    frame.render_widget(glob_widget, chunks[0]);
+
+    // Section 2: FIELDS
+    let fields_focused = matches!(focus, RuleEditorFocus::FieldList);
+    let fields_border = if fields_focused { BorderType::Double } else { BorderType::Plain };
+    let fields_style = if fields_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+    let fields_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(fields_border)
+        .title(Span::styled(" FIELDS (2/4) ", fields_style));
+    let mut fields_lines: Vec<Line> = Vec::new();
+    if draft.fields.is_empty() {
+        fields_lines.push(Line::from(Span::styled("  No fields. [a] Add  [i] Infer from pattern", Style::default().fg(Color::DarkGray))));
+    } else {
+        for (i, field) in draft.fields.iter().enumerate() {
+            let is_sel = fields_focused && i == selected_index;
+            let marker = if is_sel { ">>" } else { "  " };
+            let style = if is_sel { Style::default().fg(Color::White).bold() } else { Style::default().fg(Color::Gray) };
+            fields_lines.push(Line::from(Span::styled(format!("{} {}: {:?}", marker, field.name, field.source), style)));
+        }
+    }
+    if fields_focused {
+        fields_lines.push(Line::from(Span::styled("  [a] Add  [d] Delete  [i] Infer", Style::default().fg(Color::Cyan))));
+    }
+    let fields_widget = Paragraph::new(fields_lines).block(fields_block);
+    frame.render_widget(fields_widget, chunks[1]);
+
+    // Section 3: BASE TAG
+    let tag_focused = matches!(focus, RuleEditorFocus::BaseTag);
+    let tag_border = if tag_focused { BorderType::Double } else { BorderType::Plain };
+    let tag_style = if tag_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+    let tag_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(tag_border)
+        .title(Span::styled(" BASE TAG (3/4) ", tag_style));
+    let tag_cursor = if tag_focused { ">> " } else { "   " };
+    let tag_content = format!("{}{}", tag_cursor, draft.base_tag);
+    let tag_widget = Paragraph::new(tag_content).block(tag_block);
+    frame.render_widget(tag_widget, chunks[2]);
+
+    // Section 4: CONDITIONS
+    let cond_focused = matches!(focus, RuleEditorFocus::Conditions);
+    let cond_border = if cond_focused { BorderType::Double } else { BorderType::Plain };
+    let cond_style = if cond_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
+    let cond_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(cond_border)
+        .title(Span::styled(" CONDITIONS (4/4) ", cond_style));
+    let mut cond_lines: Vec<Line> = Vec::new();
+    if draft.tag_conditions.is_empty() {
+        cond_lines.push(Line::from(Span::styled("  No conditions. Base tag applies to all.", Style::default().fg(Color::DarkGray))));
+    } else {
+        for (i, cond) in draft.tag_conditions.iter().enumerate() {
+            let is_sel = cond_focused && i == selected_index;
+            let marker = if is_sel { ">>" } else { "  " };
+            let style = if is_sel { Style::default().fg(Color::White).bold() } else { Style::default().fg(Color::Gray) };
+            cond_lines.push(Line::from(Span::styled(
+                format!("{} IF {} {:?} {} THEN \"{}\"", marker, cond.field, cond.operator, cond.value, cond.tag),
+                style,
+            )));
+        }
+    }
+    let cond_widget = Paragraph::new(cond_lines).block(cond_block);
+    frame.render_widget(cond_widget, chunks[3]);
+
+    // Footer
+    let footer = Line::from(vec![
+        Span::styled(" [Tab] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Next  "),
+        Span::styled("[t] ", Style::default().fg(Color::Green)),
+        Span::raw("Test  "),
+        Span::styled("[Esc] ", Style::default().fg(Color::Red)),
+        Span::raw("Cancel"),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[4]);
+}
+
+/// Draw test results UI (Testing phase)
+fn draw_test_results(frame: &mut Frame, app: &App, area: Rect) {
+    use super::extraction::TestPhase;
+
+    let explorer = match &app.discover.glob_explorer {
+        Some(e) => e,
+        None => return,
+    };
+
+    let test_state = match &explorer.test_state {
+        Some(s) => s,
+        None => return,
+    };
+
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(Span::styled(" TEST RESULTS ", Style::default().fg(Color::Cyan).bold()));
+    frame.render_widget(main_block, area);
+
+    let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Header
+            Constraint::Min(8),     // Results
+            Constraint::Length(2),  // Footer
+        ])
+        .split(inner);
+
+    // Header with rule info and progress
+    let rule = &test_state.rule;
+    let mut header_lines = vec![
+        Line::from(vec![
+            Span::raw("  Rule: "),
+            Span::styled(if rule.name.is_empty() { "(unnamed)" } else { &rule.name }, Style::default().fg(Color::White).bold()),
+        ]),
+        Line::from(vec![
+            Span::raw("  Pattern: "),
+            Span::styled(&rule.glob_pattern, Style::default().fg(Color::Cyan)),
+        ]),
+    ];
+
+    // Progress line based on phase
+    match &test_state.phase {
+        TestPhase::Running { files_processed, files_total, current_file } => {
+            let pct = if *files_total > 0 { (*files_processed as f64 / *files_total as f64 * 100.0) as usize } else { 0 };
+            let bar_width: usize = 20;
+            let filled = (bar_width * pct / 100).min(bar_width);
+            let bar = format!("[{}{}] {}%", "=".repeat(filled), " ".repeat(bar_width - filled), pct);
+            header_lines.push(Line::from(vec![
+                Span::raw("  Progress: "),
+                Span::styled(bar, Style::default().fg(Color::Yellow)),
+                Span::raw(format!("  ({}/{})", files_processed, files_total)),
+            ]));
+            if let Some(f) = current_file {
+                header_lines.push(Line::from(Span::styled(format!("  Current: {}", f), Style::default().fg(Color::DarkGray))));
+            }
+        }
+        TestPhase::Complete => {
+            header_lines.push(Line::from(Span::styled("  Status: COMPLETE", Style::default().fg(Color::Green).bold())));
+        }
+        TestPhase::Cancelled { .. } => {
+            header_lines.push(Line::from(Span::styled("  Status: CANCELLED", Style::default().fg(Color::Red))));
+        }
+        TestPhase::Error(msg) => {
+            header_lines.push(Line::from(Span::styled(format!("  Error: {}", msg), Style::default().fg(Color::Red))));
+        }
+    }
+    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+
+    // Results section
+    let results_block = Block::default()
+        .borders(Borders::TOP)
+        .title(Span::styled(" EXTRACTION STATUS ", Style::default().fg(Color::DarkGray)));
+    let results_content = if let Some(ref results) = test_state.results {
+        vec![
+            Line::from(Span::styled(format!("  Complete: {} files", results.complete), Style::default().fg(Color::Green))),
+            Line::from(Span::styled(format!("  Partial:  {} files", results.partial), Style::default().fg(Color::Yellow))),
+            Line::from(Span::styled(format!("  Failed:   {} files", results.failed), Style::default().fg(Color::Red))),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled("  Waiting for test to complete...", Style::default().fg(Color::DarkGray))),
+        ]
+    };
+    let results_widget = Paragraph::new(results_content).block(results_block);
+    frame.render_widget(results_widget, chunks[1]);
+
+    // Footer
+    let footer = if matches!(test_state.phase, TestPhase::Complete) {
+        Line::from(vec![
+            Span::styled(" [p] ", Style::default().fg(Color::Green)),
+            Span::raw("Publish  "),
+            Span::styled("[e] ", Style::default().fg(Color::Yellow)),
+            Span::raw("Edit  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red)),
+            Span::raw("Cancel"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" [Esc] ", Style::default().fg(Color::Red)),
+            Span::raw("Cancel test"),
+        ])
+    };
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+/// Draw publishing confirmation UI (Publishing phase)
+fn draw_publishing(frame: &mut Frame, app: &App, area: Rect) {
+    use super::extraction::PublishPhase;
+
+    let explorer = match &app.discover.glob_explorer {
+        Some(e) => e,
+        None => return,
+    };
+
+    let publish_state = match &explorer.publish_state {
+        Some(s) => s,
+        None => return,
+    };
+
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(Span::styled(" PUBLISH RULE ", Style::default().fg(Color::Green).bold()));
+    frame.render_widget(main_block, area);
+
+    let inner = area.inner(Margin { horizontal: 2, vertical: 1 });
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Summary
+            Constraint::Min(6),     // Actions
+            Constraint::Length(2),  // Footer
+        ])
+        .split(inner);
+
+    // Rule summary
+    let rule = &publish_state.rule;
+    let summary_lines = vec![
+        Line::from(vec![
+            Span::raw("  Rule: "),
+            Span::styled(if rule.name.is_empty() { "(unnamed)" } else { &rule.name }, Style::default().fg(Color::White).bold()),
+        ]),
+        Line::from(vec![
+            Span::raw("  Pattern: "),
+            Span::styled(&rule.glob_pattern, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::raw("  Files: "),
+            Span::styled(format!("{}", publish_state.matching_files_count), Style::default().fg(Color::Yellow)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(summary_lines), chunks[0]);
+
+    // Actions
+    let action_block = Block::default()
+        .borders(Borders::TOP)
+        .title(Span::styled(" This will: ", Style::default().fg(Color::DarkGray)));
+    let action_lines = match publish_state.phase {
+        PublishPhase::Confirming => vec![
+            Line::from(Span::styled("    * Save rule to database", Style::default().fg(Color::Green))),
+            Line::from(Span::styled(format!("    * Extract metadata for {} files", publish_state.matching_files_count), Style::default().fg(Color::Green))),
+            Line::from(Span::styled(format!("    * Apply tag: {}", rule.base_tag), Style::default().fg(Color::Green))),
+            Line::from(Span::styled("    * Start background job", Style::default().fg(Color::Green))),
+        ],
+        PublishPhase::Saving => vec![
+            Line::from(Span::styled("    Saving rule to database...", Style::default().fg(Color::Yellow))),
+        ],
+        PublishPhase::StartingJob => vec![
+            Line::from(Span::styled("    Starting extraction job...", Style::default().fg(Color::Yellow))),
+        ],
+        _ => vec![],
+    };
+    let action_widget = Paragraph::new(action_lines).block(action_block);
+    frame.render_widget(action_widget, chunks[1]);
+
+    // Footer
+    let footer = Line::from(vec![
+        Span::styled(" [Enter] ", Style::default().fg(Color::Green)),
+        Span::raw("Confirm  "),
+        Span::styled("[Esc] ", Style::default().fg(Color::Red)),
+        Span::raw("Cancel"),
+    ]);
+    frame.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
+/// Draw published success screen (Published phase)
+fn draw_published(frame: &mut Frame, area: Rect, job_id: &str) {
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(Span::styled(" PUBLISH COMPLETE ", Style::default().fg(Color::Green).bold()));
+    frame.render_widget(main_block, area);
+
+    let inner = area.inner(Margin { horizontal: 2, vertical: 2 });
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("  Rule published successfully!", Style::default().fg(Color::Green).bold())),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Job ID: "),
+            Span::styled(job_id, Style::default().fg(Color::Cyan).bold()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Status: RUNNING", Style::default().fg(Color::Yellow))),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [Enter/Esc] ", Style::default().fg(Color::Cyan)),
+            Span::raw("Return  "),
+            Span::styled("[j] ", Style::default().fg(Color::Yellow)),
+            Span::raw("View jobs"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::tui::app::{JobInfo, JobsState};
+    use crate::cli::tui::app::{JobInfo, JobsState, JobType};
     use crate::cli::tui::TuiArgs;
     use chrono::Local;
     use ratatui::backend::TestBackend;
@@ -2862,7 +3568,27 @@ mod tests {
         }
     }
 
-    /// Test that UTF-8 paths are truncated safely without panicking
+    fn create_test_job(id: i64, name: &str, status: JobStatus) -> JobInfo {
+        JobInfo {
+            id,
+            file_version_id: Some(id * 100),
+            job_type: JobType::Parse,
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            status,
+            started_at: Local::now(),
+            completed_at: None,
+            items_total: 100,
+            items_processed: 50,
+            items_failed: 0,
+            output_path: Some(format!("/data/output/{}.parquet", name)),
+            output_size_bytes: None,
+            backtest: None,
+            failures: vec![],
+        }
+    }
+
+    /// Test that UTF-8 names are rendered safely without panicking
     #[test]
     fn test_utf8_path_truncation() {
         let backend = TestBackend::new(80, 24);
@@ -2871,29 +3597,17 @@ mod tests {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Jobs;
 
-        // Create a job with a long UTF-8 path containing multi-byte characters
-        // This would panic with byte-based truncation
-        let utf8_path = "/data/文件夹/数据/很长的路径名称/包含中文字符/测试文件.csv";
-        app.jobs_state = JobsState {
-            jobs: vec![JobInfo {
-                id: 1,
-                file_path: utf8_path.to_string(),
-                parser_name: "test_parser".into(),
-                status: JobStatus::Running,
-                retry_count: 0,
-                error_message: None,
-                created_at: Local::now(),
-            }],
-            selected_index: 0,
-            status_filter: None,
-        };
+        // Create a job with a UTF-8 name containing multi-byte characters
+        let mut jobs_state = JobsState::default();
+        jobs_state.jobs = vec![create_test_job(1, "文件夹_数据_测试解析器", JobStatus::Running)];
+        app.jobs_state = jobs_state;
 
         // This should not panic - the bug was byte-based truncation on UTF-8
         let result = terminal.draw(|f| draw(f, &app));
-        assert!(result.is_ok(), "Rendering UTF-8 path should not panic");
+        assert!(result.is_ok(), "Rendering UTF-8 name should not panic");
     }
 
-    /// Test with emoji in path (4-byte UTF-8 characters)
+    /// Test with emoji in name (4-byte UTF-8 characters)
     #[test]
     fn test_emoji_path_truncation() {
         let backend = TestBackend::new(80, 24);
@@ -2903,23 +3617,12 @@ mod tests {
         app.mode = TuiMode::Jobs;
 
         // Emoji are 4-byte UTF-8 sequences
-        let emoji_path = "/data/📁/documents/📊/reports/📈/analysis/🔬/results/data.csv";
-        app.jobs_state = JobsState {
-            jobs: vec![JobInfo {
-                id: 1,
-                file_path: emoji_path.to_string(),
-                parser_name: "test_parser".into(),
-                status: JobStatus::Pending,
-                retry_count: 0,
-                error_message: None,
-                created_at: Local::now(),
-            }],
-            selected_index: 0,
-            status_filter: None,
-        };
+        let mut jobs_state = JobsState::default();
+        jobs_state.jobs = vec![create_test_job(1, "📁_parser_📊_reports_📈", JobStatus::Pending)];
+        app.jobs_state = jobs_state;
 
         let result = terminal.draw(|f| draw(f, &app));
-        assert!(result.is_ok(), "Rendering emoji path should not panic");
+        assert!(result.is_ok(), "Rendering emoji name should not panic");
     }
 
     #[test]

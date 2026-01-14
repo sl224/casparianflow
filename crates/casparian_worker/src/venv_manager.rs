@@ -13,6 +13,15 @@ use std::process::Command;
 use std::sync::Mutex;
 use tracing::{info, warn};
 
+/// Default maximum number of venvs to keep cached
+const DEFAULT_MAX_VENVS: usize = 50;
+
+/// Default maximum age (days) for unused venvs before cleanup
+const DEFAULT_MAX_AGE_DAYS: u32 = 30;
+
+/// Threshold above which we trigger automatic cleanup
+const CLEANUP_THRESHOLD: usize = 60;
+
 /// Venv entry - plain data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VenvEntry {
@@ -141,7 +150,7 @@ impl VenvManager {
         // Record metadata (under lock)
         let size = dir_size(&venv_path);
         let now = chrono::Utc::now().to_rfc3339();
-        {
+        let should_cleanup = {
             let mut metadata = self.metadata.lock().unwrap();
             metadata.upsert(VenvEntry {
                 env_hash: env_hash.to_string(),
@@ -149,8 +158,16 @@ impl VenvManager {
                 last_used: now,
                 size_bytes: size,
             });
-        }
+            // Check if we should run cleanup after releasing lock
+            metadata.entries.len() > CLEANUP_THRESHOLD
+        };
         self.save_metadata();
+
+        // Proactive cleanup when cache grows large (prevents unbounded memory/disk growth)
+        if should_cleanup {
+            info!("VenvManager: cache exceeds threshold, running cleanup...");
+            self.cleanup(DEFAULT_MAX_VENVS, DEFAULT_MAX_AGE_DAYS);
+        }
 
         info!("VenvManager: created venv for {}", truncate_hash(env_hash));
         Ok(interpreter)
@@ -193,6 +210,88 @@ impl VenvManager {
         let count = metadata.entries.len();
         let total_bytes: u64 = metadata.entries.iter().map(|e| e.size_bytes).sum();
         (count, total_bytes)
+    }
+
+    /// Clean up old venvs using LRU eviction
+    ///
+    /// Removes venvs that:
+    /// 1. Haven't been used in `max_age_days` days, OR
+    /// 2. Exceed `max_venvs` count (oldest by last_used are removed first)
+    ///
+    /// Returns the number of venvs removed.
+    pub fn cleanup(&self, max_venvs: usize, max_age_days: u32) -> usize {
+        let now = chrono::Utc::now();
+        let max_age = chrono::Duration::days(max_age_days as i64);
+
+        let mut metadata = self.metadata.lock().unwrap();
+        let initial_count = metadata.entries.len();
+
+        // Collect hashes to remove (stale by age)
+        let mut to_remove: Vec<String> = metadata
+            .entries
+            .iter()
+            .filter(|e| {
+                if let Ok(last_used) = chrono::DateTime::parse_from_rfc3339(&e.last_used) {
+                    now.signed_duration_since(last_used.with_timezone(&chrono::Utc)) > max_age
+                } else {
+                    false // Keep entries with unparseable dates
+                }
+            })
+            .map(|e| e.env_hash.clone())
+            .collect();
+
+        // If still over limit after removing stale, remove oldest by last_used
+        let remaining_after_stale = initial_count - to_remove.len();
+        if remaining_after_stale > max_venvs {
+            // Sort remaining entries by last_used (oldest first)
+            let mut remaining: Vec<_> = metadata
+                .entries
+                .iter()
+                .filter(|e| !to_remove.contains(&e.env_hash))
+                .collect();
+
+            remaining.sort_by(|a, b| a.last_used.cmp(&b.last_used));
+
+            // Mark oldest for removal until we're under the limit
+            let excess = remaining_after_stale - max_venvs;
+            for entry in remaining.iter().take(excess) {
+                to_remove.push(entry.env_hash.clone());
+            }
+        }
+
+        // Remove from metadata
+        metadata.entries.retain(|e| !to_remove.contains(&e.env_hash));
+
+        // Release lock before I/O operations
+        drop(metadata);
+
+        // Delete venv directories from disk
+        let mut removed_count = 0;
+        for hash in &to_remove {
+            let venv_path = self.venvs_dir.join(hash);
+            if venv_path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&venv_path) {
+                    warn!("Failed to remove venv {}: {}", truncate_hash(hash), e);
+                } else {
+                    info!("Cleaned up stale venv: {}", truncate_hash(hash));
+                    removed_count += 1;
+                }
+            } else {
+                // Entry existed in metadata but not on disk - count as removed
+                removed_count += 1;
+            }
+        }
+
+        // Save updated metadata
+        self.save_metadata();
+
+        info!(
+            "VenvManager cleanup: removed {} venvs ({} remaining)",
+            removed_count,
+            initial_count - to_remove.len()
+        );
+
+        removed_count
     }
 }
 

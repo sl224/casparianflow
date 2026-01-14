@@ -13,6 +13,7 @@
 
 use super::db::Database;
 use super::error::{Result, ScoutError};
+use super::folder_cache::FolderCache;
 use super::types::{FileStatus, ScanStats, ScannedFile, Source};
 use chrono::Utc;
 use ignore::WalkBuilder;
@@ -101,17 +102,20 @@ impl Scanner {
     ///
     /// For progress updates, use `scan_source_with_progress` instead.
     pub async fn scan_source(&self, source: &Source) -> Result<ScanResult> {
-        self.scan_source_with_progress(source, None).await
+        self.scan_source_with_progress(source, None, None).await
     }
 
-    /// Scan a source with optional progress updates
+    /// Scan a source with optional progress updates and tagging
     ///
     /// If `progress_tx` is provided, progress updates will be sent during the scan.
     /// This is useful for TUI or other interactive contexts.
+    ///
+    /// If `tag` is provided, all discovered files will be tagged with it.
     pub async fn scan_source_with_progress(
         &self,
         source: &Source,
         progress_tx: Option<mpsc::Sender<ScanProgress>>,
+        tag: Option<&str>,
     ) -> Result<ScanResult> {
         let start = Instant::now();
         info!(source = %source.name, path = %source.path, "Starting parallel scan");
@@ -145,13 +149,23 @@ impl Scanner {
             });
         }
 
-        // Persist all files to database
-        let mut final_stats = self.persist_files(&source.id, files, stats).await?;
+        // Persist all files to database (with optional tagging)
+        let mut final_stats = self.persist_files(&source.id, files, stats, tag).await?;
 
         // Mark files not seen in this scan as deleted
         let deleted = self.db.mark_deleted_files(&source.id, scan_start).await?;
         final_stats.files_deleted = deleted;
         final_stats.duration_ms = start.elapsed().as_millis() as u64;
+
+        // Build and persist folder cache for O(1) TUI navigation
+        let cache_start = Instant::now();
+        if let Err(e) = self.build_folder_cache(&source.id).await {
+            // Log but don't fail the scan - cache is a nice-to-have
+            tracing::warn!(source_id = %source.id, error = %e, "Failed to build folder cache");
+        } else {
+            let cache_ms = cache_start.elapsed().as_millis();
+            info!(source_id = %source.id, cache_ms, "Folder cache built");
+        }
 
         info!(
             source = %source.name,
@@ -401,12 +415,13 @@ impl Scanner {
         Ok((files, stats, errors))
     }
 
-    /// Persist collected files to database
+    /// Persist collected files to database with optional tagging
     async fn persist_files(
         &self,
         source_id: &str,
         files: Vec<ScannedFile>,
         mut stats: ScanStats,
+        tag: Option<&str>,
     ) -> Result<ScanStats> {
         for file in files {
             match self.db.upsert_file(&file).await {
@@ -417,6 +432,13 @@ impl Scanner {
                         stats.files_changed += 1;
                     } else {
                         stats.files_unchanged += 1;
+                    }
+
+                    // Tag file if requested
+                    if let Some(t) = tag {
+                        if let Err(e) = self.db.tag_file(upsert.id, t).await {
+                            tracing::warn!(file_id = upsert.id, tag = t, error = %e, "Failed to tag file");
+                        }
                     }
                 }
                 Err(e) => {
@@ -470,6 +492,40 @@ impl Scanner {
     #[allow(dead_code)]
     pub async fn get_file(&self, file_id: i64) -> Result<Option<ScannedFile>> {
         self.db.get_file(file_id).await
+    }
+
+    /// Build and persist folder cache for O(1) TUI navigation
+    ///
+    /// This queries all file paths for the source and builds a trie-based
+    /// cache that's persisted to disk. The TUI loads this cache instead of
+    /// querying the database, enabling instant folder navigation.
+    async fn build_folder_cache(&self, source_id: &str) -> Result<()> {
+        // Query all file paths for this source
+        let paths: Vec<(String,)> = sqlx::query_as(
+            "SELECT rel_path FROM scout_files WHERE source_id = ? AND status != 'deleted'"
+        )
+        .bind(source_id)
+        .fetch_all(self.db.pool())
+        .await?;
+
+        if paths.is_empty() {
+            // Don't create empty cache
+            return Ok(());
+        }
+
+        // Build cache in blocking task (CPU-intensive)
+        let source_id_owned = source_id.to_string();
+        let cache = tokio::task::spawn_blocking(move || {
+            FolderCache::build(&source_id_owned, &paths)
+        })
+        .await
+        .map_err(|e| ScoutError::Config(format!("Failed to build cache: {}", e)))?;
+
+        // Save to disk
+        cache.save()
+            .map_err(|e| ScoutError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        Ok(())
     }
 }
 

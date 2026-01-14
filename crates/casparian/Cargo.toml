@@ -34,6 +34,8 @@ zeromq.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.8"
+bincode = "1.3"
+zstd = "0.13"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }

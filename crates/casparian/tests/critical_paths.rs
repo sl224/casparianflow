@@ -689,7 +689,7 @@ mod scout {
 
         // Run scan with progress
         let scan_handle = tokio::spawn(async move {
-            scanner.scan_source_with_progress(&source, Some(progress_tx)).await
+            scanner.scan_source_with_progress(&source, Some(progress_tx), None).await
         });
 
         // Collect progress updates

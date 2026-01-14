@@ -594,6 +594,123 @@ for evidence in solver.elimination_evidence() {
 
 ---
 
+## TUI Development & Debugging (REQUIRED)
+
+**Use TMux for ALL TUI work.** Never rely on PTY tests alone. Always verify TUI behavior in tmux first.
+
+### Why TMux > PTY
+
+| Aspect | PTY Tests | TMux |
+|--------|-----------|------|
+| Visibility | Pattern match on byte soup | Clean text, exactly what user sees |
+| Debugging | Test passes/fails, no context | Can inspect screen at each step |
+| Escape sequences | Must parse `\x1b[?25h` etc | `capture-pane -p` strips them |
+| State inspection | Implicit in assertions | Explicit screen capture |
+
+### Helper Scripts
+
+```bash
+# Start debug session
+./scripts/tui-debug.sh start
+
+# Send keystrokes
+./scripts/tui-send.sh "1"           # Characters
+./scripts/tui-send.sh Enter         # Special key
+./scripts/tui-send.sh -c Down       # Send and capture
+
+# Capture screen
+./scripts/tui-capture.sh            # Current screen
+./scripts/tui-capture.sh "after X"  # With label
+
+# Run test scenarios
+./scripts/tui-test.sh list          # List scenarios
+./scripts/tui-test.sh all           # Run all tests
+
+# Stop session
+./scripts/tui-debug.sh stop
+```
+
+### Raw TMux Commands
+
+```bash
+# Session lifecycle
+tmux kill-session -t tui 2>/dev/null
+tmux new-session -d -s tui -x 120 -y 40 "./target/release/casparian tui"
+tmux kill-session -t tui
+
+# Send keystrokes
+tmux send-keys -t tui "hello"       # Characters
+tmux send-keys -t tui Enter         # Enter key
+tmux send-keys -t tui Escape        # Escape
+tmux send-keys -t tui Down          # Arrow keys
+tmux send-keys -t tui C-c           # Ctrl+C
+tmux send-keys -t tui -l "1"        # Literal (not F1)
+
+# Capture screen
+tmux capture-pane -t tui -p         # Current visible
+tmux capture-pane -t tui -p -S -100 # With scrollback
+```
+
+### Debugging Workflow
+
+```
+1. REPRODUCE
+   └─ Start fresh: ./scripts/tui-debug.sh restart
+   └─ Send exact key sequence to reproduce issue
+   └─ Capture after EACH keystroke (not batched)
+
+2. IDENTIFY DIVERGENCE
+   └─ Compare screen to spec (specs/views/discover.md)
+   └─ Which step produces wrong output?
+
+3. TRACE CODE
+   └─ Find handler → state change → render
+   └─ Key handlers in app.rs handle_key_event()
+
+4. FIX AND VERIFY
+   └─ cargo build --release
+   └─ ./scripts/tui-debug.sh restart
+   └─ Repeat key sequence, confirm fix
+```
+
+### Debugging Checklist
+
+- [ ] Started fresh session? (`./scripts/tui-debug.sh restart`)
+- [ ] Captured after EACH keystroke? (not just at end)
+- [ ] Compared to spec? (`specs/views/discover.md` Section 3, 6)
+- [ ] Rebuilt binary? (`cargo build --release`)
+- [ ] Verified in fresh session after fix?
+
+### Common Pitfalls
+
+| Pitfall | Solution |
+|---------|----------|
+| Not waiting | Add `sleep 0.3` between send and capture |
+| Stale session | Always `./scripts/tui-debug.sh restart` |
+| Wrong terminal size | Scripts use consistent 120x40 |
+| Batch captures | Capture after EACH keystroke |
+| Forgot rebuild | `cargo build --release` after code change |
+
+### Key Reference (Discover Mode)
+
+Per `specs/views/discover.md` Section 6:
+
+| Key | State | Action |
+|-----|-------|--------|
+| `1` | Any | Open Sources dropdown |
+| `2` | Any | Open Tags dropdown |
+| `3` | Any | Focus Files panel |
+| `j`/`↓` | Files | Move down |
+| `k`/`↑` | Files | Move up |
+| `Enter` | Dropdown | Confirm selection |
+| `Escape` | Any | Close/back |
+| `n` | Any | Create tagging rule |
+| `R` | Any | Open Rules Manager |
+| `M` | Any | Open Sources Manager |
+| `s` | Any | Scan new directory |
+
+---
+
 ## Architecture Decision Records
 
 ### ADR-001: Parser Lab Redesign (Jan 2025)

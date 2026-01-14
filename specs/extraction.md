@@ -1,7 +1,7 @@
 # Extraction API - Unified Specification
 
 **Status:** READY FOR IMPLEMENTATION
-**Version:** 1.1
+**Version:** 1.2
 **Parent:** spec.md
 **Replaces:** extraction_rules.md, semantic_path_mapping.md
 **Related:** specs/views/discover.md Section 13 (Glob Explorer TUI)
@@ -359,6 +359,30 @@ def infer_from_samples(paths: List[Path]) -> InferredRule:
 | 50-79% | Accept with warning |
 | <50% | Prompt for more files or manual input |
 
+### 5.4 AI-Assisted Inference (Optional)
+
+> **Full Specification:** See `specs/ai_wizards.md` Section 3.5 (Path Intelligence Engine)
+
+When algorithmic inference has low confidence or files have inconsistent naming, the optional Path Intelligence Engine provides:
+
+| Capability | When It Helps |
+|------------|---------------|
+| **Path Clustering** | 500 files → 5 clusters for batch rule creation |
+| **Field Name Intelligence** | `segment2` → `client_name` (semantic naming) |
+| **Cross-Source Equivalence** | `mission_042` and `msn-42` recognized as same structure |
+| **Single-File Proposals** | Bootstrap extraction from 1 example (no 3+ requirement) |
+
+**Key Design Principle:** AI proposes, deterministic rules are the output. The Path Intelligence Engine is Layer 2 (build-time) - it generates extraction rules that become Layer 1 (runtime) configuration.
+
+```
+                   AI Layer (optional)              Deterministic Layer
+                   ─────────────────────            ──────────────────────
+User files ───► Path Intelligence Engine ───► Extraction Rules (YAML)
+                   • Embeddings                     • glob patterns
+                   • Clustering                     • segment extraction
+                   • LLM field naming               • type validation
+```
+
 ---
 
 ## 6. Database Schema
@@ -684,3 +708,4 @@ extract:
 | 2026-01-13 | 1.1 | **Tag conditions table**: Added `extraction_tag_conditions` table for persistent conditional tag rules |
 | 2026-01-13 | 1.1 | **JSON indexing**: Added guidance for SQLite JSON1 indexes on frequently-queried metadata fields |
 | 2026-01-13 | 1.1 | Cross-reference to Glob Explorer in discover.md for unified rule creation workflow |
+| 2026-01-13 | 1.2 | **AI-Assisted Inference (Section 5.4)**: Added cross-reference to Path Intelligence Engine in ai_wizards.md for embedding-based clustering, semantic field naming, cross-source equivalence, and single-file proposals |

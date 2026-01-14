@@ -112,6 +112,48 @@ CREATE TABLE IF NOT EXISTS parser_lab_test_files (
     UNIQUE(parser_id, file_path)
 );
 
+-- Extraction Rules: glob pattern → field extraction + tagging
+-- Created via the Glob Explorer's Rule Editing workflow
+CREATE TABLE IF NOT EXISTS extraction_rules (
+    id TEXT PRIMARY KEY,
+    source_id TEXT REFERENCES scout_sources(id),
+    name TEXT NOT NULL,
+    glob_pattern TEXT NOT NULL,
+    base_tag TEXT,
+    priority INTEGER NOT NULL DEFAULT 100,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL DEFAULT 'user',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(source_id, name)
+);
+
+-- Extraction Fields: field definitions for extraction rules
+CREATE TABLE IF NOT EXISTS extraction_fields (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL REFERENCES extraction_rules(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    source_value TEXT,
+    pattern TEXT,
+    type_hint TEXT NOT NULL DEFAULT 'string',
+    normalizer TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE(rule_id, field_name)
+);
+
+-- Extraction Tag Conditions: conditional tagging based on field values
+CREATE TABLE IF NOT EXISTS extraction_tag_conditions (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL REFERENCES extraction_rules(id) ON DELETE CASCADE,
+    field_name TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    value TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 100,
+    created_at INTEGER NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_files_source ON scout_files(source_id);
 CREATE INDEX IF NOT EXISTS idx_files_status ON scout_files(status);
@@ -127,6 +169,11 @@ CREATE INDEX IF NOT EXISTS idx_parser_lab_parsers_updated ON parser_lab_parsers(
 CREATE INDEX IF NOT EXISTS idx_parser_lab_parsers_status ON parser_lab_parsers(validation_status);
 CREATE INDEX IF NOT EXISTS idx_parser_lab_parsers_pattern ON parser_lab_parsers(file_pattern);
 CREATE INDEX IF NOT EXISTS idx_parser_lab_test_files_parser ON parser_lab_test_files(parser_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_rules_source ON extraction_rules(source_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_rules_pattern ON extraction_rules(glob_pattern);
+CREATE INDEX IF NOT EXISTS idx_extraction_rules_enabled ON extraction_rules(enabled);
+CREATE INDEX IF NOT EXISTS idx_extraction_fields_rule ON extraction_fields(rule_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_tag_conditions_rule ON extraction_tag_conditions(rule_id);
 "#;
 
 /// Convert milliseconds since epoch to DateTime

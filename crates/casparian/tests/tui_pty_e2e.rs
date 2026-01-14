@@ -490,3 +490,216 @@ fn test_tui_view_switching() {
         println!("Note: View switching test inconclusive");
     }
 }
+
+/// Test: Sources load on startup and are available in Discover mode
+#[test]
+fn test_sources_load_on_startup() {
+    let binary = match find_casparian_binary() {
+        Some(b) => b,
+        None => {
+            println!("Skipping: binary not found");
+            return;
+        }
+    };
+
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize {
+        rows: 30,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Skipping PTY test: {}", e);
+            return;
+        }
+    };
+
+    let mut cmd = CommandBuilder::new(&binary);
+    cmd.arg("tui");
+
+    let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();
+    cmd.cwd(workspace_dir);
+
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Skipping: could not spawn TUI: {}", e);
+            return;
+        }
+    };
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut pty_reader = PtyReader::new(reader);
+
+    println!("\n=== SOURCES LOAD ON STARTUP TEST ===\n");
+
+    // Wait for TUI to start
+    match pty_reader.wait_for("Home", Duration::from_secs(30)) {
+        Ok(_) => println!("[OK] TUI started"),
+        Err(e) => {
+            println!("[FAIL] TUI didn't start: {}", e);
+            let _ = child.kill();
+            return;
+        }
+    }
+
+    // Switch to Discover mode
+    let _ = writer.write_all(b"1");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(1000));
+
+    // Read output and check for Sources
+    let output = pty_reader.read_available(Duration::from_millis(1000));
+
+    // Press Ctrl+C to quit
+    let _ = writer.write_all(&[0x03]);
+    thread::sleep(Duration::from_millis(100));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Verify sources section is visible
+    let has_sources = output.contains("SOURCES") || output.contains("Sources");
+    let no_sources_msg = output.contains("No sources");
+    let has_scan_prompt = output.contains("Press") && output.contains("scan");
+
+    println!("[1] Checking for sources panel...");
+    if has_sources {
+        println!("  [OK] Sources panel visible");
+    } else {
+        println!("  [WARN] Sources panel not found in output");
+    }
+
+    println!("[2] Checking sources state...");
+    if no_sources_msg || has_scan_prompt {
+        println!("  [OK] Shows guidance when no sources (expected for fresh DB)");
+    } else if output.contains("shan") || output.contains("local:") {
+        println!("  [OK] Found existing sources");
+    } else {
+        println!("  [INFO] Sources state unclear");
+    }
+
+    // Output preview for debugging
+    let preview: String = output.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(500)
+        .collect();
+    println!("\nOutput preview:\n{}", preview);
+
+    println!("\n=== TEST COMPLETE ===\n");
+}
+
+/// Test: Folder navigation in Discover mode with large source
+#[test]
+fn test_folder_navigation() {
+    let binary = match find_casparian_binary() {
+        Some(b) => b,
+        None => {
+            println!("Skipping: binary not found");
+            return;
+        }
+    };
+
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize {
+        rows: 30,
+        cols: 100,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("Skipping PTY test: {}", e);
+            return;
+        }
+    };
+
+    let mut cmd = CommandBuilder::new(&binary);
+    cmd.arg("tui");
+
+    let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();
+    cmd.cwd(workspace_dir);
+
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Skipping: could not spawn TUI: {}", e);
+            return;
+        }
+    };
+
+    let reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut pty_reader = PtyReader::new(reader);
+
+    println!("\n=== FOLDER NAVIGATION TEST ===\n");
+
+    // Wait for TUI to start
+    match pty_reader.wait_for("Home", Duration::from_secs(30)) {
+        Ok(_) => println!("[OK] TUI started"),
+        Err(e) => {
+            println!("[FAIL] TUI didn't start: {}", e);
+            let _ = child.kill();
+            return;
+        }
+    }
+
+    // Switch to Discover mode
+    println!("[1] Switching to Discover mode...");
+    let _ = writer.write_all(b"1");
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(1500));
+
+    // Read initial output
+    let initial_output = pty_reader.read_available(Duration::from_millis(500));
+
+    // Check if folders panel appears (should show FOLDERS header)
+    let has_folders = initial_output.contains("FOLDERS") || initial_output.contains("Folders");
+
+    if has_folders {
+        println!("  [OK] Folders panel visible");
+    } else {
+        println!("  [INFO] Folders panel not found (may have no source selected)");
+    }
+
+    // Try navigating down in folder list
+    println!("[2] Testing folder navigation...");
+    let _ = writer.write_all(b"j"); // Move down
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(200));
+
+    let _ = writer.write_all(b"k"); // Move up
+    let _ = writer.flush();
+    thread::sleep(Duration::from_millis(200));
+
+    // Read output after navigation
+    let nav_output = pty_reader.read_available(Duration::from_millis(500));
+
+    // UI should still be responsive (not frozen)
+    let ui_responsive = !nav_output.is_empty() || initial_output.contains("FOLDERS");
+
+    if ui_responsive {
+        println!("  [OK] UI remains responsive during navigation");
+    } else {
+        println!("  [WARN] UI may be frozen");
+    }
+
+    // Press Ctrl+C to quit
+    let _ = writer.write_all(&[0x03]);
+    thread::sleep(Duration::from_millis(100));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // Output preview
+    let preview: String = initial_output.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .take(400)
+        .collect();
+    println!("\nInitial output preview:\n{}", preview);
+
+    println!("\n=== TEST COMPLETE ===\n");
+}

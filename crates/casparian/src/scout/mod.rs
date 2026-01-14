@@ -5,11 +5,13 @@
 
 pub mod db;
 pub mod error;
+pub mod folder_cache;
 pub mod scanner;
 pub mod tagger;
 pub mod types;
 
 // Re-exports for CLI usage
 pub use db::Database;
+pub use folder_cache::FolderCache;
 pub use scanner::{ScanConfig, ScanProgress, Scanner};
 pub use types::{FileStatus, ScannedFile, Source, SourceType, TaggingRule};

@@ -11,6 +11,9 @@ use tokio::sync::mpsc;
 
 use super::{LlmConfig, LlmError, LlmProvider, Message, StreamChunk, ToolDefinition};
 
+/// Maximum number of message histories to record (prevents unbounded memory growth in tests)
+const MAX_RECORDED_MESSAGES: usize = 100;
+
 /// Configuration for a single canned response
 #[derive(Debug, Clone)]
 pub struct CannedResponse {
@@ -45,8 +48,8 @@ impl CannedResponse {
 pub struct MockClaudeProvider {
     /// Queue of responses to return
     responses: Arc<Mutex<VecDeque<CannedResponse>>>,
-    /// Record of messages received (for assertions)
-    received_messages: Arc<Mutex<Vec<Vec<Message>>>>,
+    /// Record of messages received (for assertions) - bounded to prevent memory leaks
+    received_messages: Arc<Mutex<VecDeque<Vec<Message>>>>,
 }
 
 impl MockClaudeProvider {
@@ -54,7 +57,7 @@ impl MockClaudeProvider {
     pub fn new() -> Self {
         Self {
             responses: Arc::new(Mutex::new(VecDeque::new())),
-            received_messages: Arc::new(Mutex::new(vec![])),
+            received_messages: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -74,7 +77,7 @@ impl MockClaudeProvider {
     /// Get all messages received by this provider
     #[allow(dead_code)]
     pub fn received_messages(&self) -> Vec<Vec<Message>> {
-        self.received_messages.lock().unwrap().clone()
+        self.received_messages.lock().unwrap().iter().cloned().collect()
     }
 
     /// Check how many responses are still queued
@@ -110,11 +113,15 @@ impl LlmProvider for MockClaudeProvider {
         _tools: &[ToolDefinition],
         _config: Option<&LlmConfig>,
     ) -> Result<BoxStream<'static, StreamChunk>, LlmError> {
-        // Record received messages
-        self.received_messages
-            .lock()
-            .unwrap()
-            .push(messages.to_vec());
+        // Record received messages (bounded to prevent memory leaks in long test runs)
+        {
+            let mut recorded = self.received_messages.lock().unwrap();
+            recorded.push_back(messages.to_vec());
+            // Trim oldest entries if over limit
+            while recorded.len() > MAX_RECORDED_MESSAGES {
+                recorded.pop_front();
+            }
+        }
 
         // Get next queued response
         let response = self.responses.lock().unwrap().pop_front().ok_or_else(|| {

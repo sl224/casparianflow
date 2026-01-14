@@ -499,6 +499,135 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 | Not locked to single provider | Works with any MCP-compatible LLM |
 | Air-gapped compatible | Local models (Ollama, vLLM) work |
 
+---
+
+## Value-Based Pricing Strategy
+
+> **Full Specification:** See [specs/pricing.md](specs/pricing.md) for detailed pricing framework.
+
+### Pricing Philosophy: Value Capture, Not Cost-Plus
+
+**Core Principle (Andreessen Framework):** Price by the value created for the customer, not by our costs. Enterprise software should capture **10-20% of the value created**.
+
+**Current Problem:** Initial pricing ($50-100/user/month) captures **<2% of value**—leaving 90%+ on the table and signaling "not enterprise-grade."
+
+### Value Created by Vertical
+
+| Vertical | Value Created | Current Pricing | Gap |
+|----------|--------------|-----------------|-----|
+| **Finance (Trade Ops)** | $50-200K/desk/year (labor savings + risk reduction) | $900/user/year | **Capturing <2%** |
+| **Legal (eDiscovery)** | $50-750K/year (processing cost savings) | $900/user/year | **Capturing <1%** |
+| **Defense** | Mission-critical; no alternative exists | $1,200/user/year | **Capturing <1%** |
+| **Healthcare** | $100K+ (IT backlog bypass + compliance) | $600/user/year | **Capturing <1%** |
+| **Manufacturing** | $100K+ (historian license displacement) | $900/user/year | **Capturing <1%** |
+
+### Why Higher Prices Are Better
+
+Per Marc Andreessen's framework:
+
+1. **Proves the moat:** If customers pay $15K/year, it proves differentiation is real
+2. **Funds growth:** Higher margins enable enterprise sales investment
+3. **Signals quality:** Defense/healthcare buyers are suspicious of cheap software
+4. **Enables customer success:** Higher-paying customers get white-glove onboarding
+5. **Faster iteration:** Revenue funds R&D for better product
+
+### Revised Pricing Strategy (Value-Based)
+
+#### Finance Vertical
+
+| Tier | Price | Value Capture | Target |
+|------|-------|---------------|--------|
+| **Starter** | Free | N/A | Students, evaluation |
+| **Professional** | $500/user/month | ~3% of value | Individual analysts |
+| **Trading Desk** | $15,000/desk/year | ~10% of value | Operations teams |
+| **Enterprise** | $50,000+/year | Custom | Multi-desk, compliance |
+
+**Justification:** Trade Support Engineer fully loaded cost = $150K/year. Time savings = 6+ hours/day. Settlement risk reduction = incalculable. $15K/desk captures ~10% of quantifiable value.
+
+#### Legal Vertical
+
+| Tier | Price | Value Capture | Target |
+|------|-------|---------------|--------|
+| **Solo** | Free | N/A | Solo practitioners, evaluation |
+| **Firm** | $500/user/month | ~5% of value | Small firms |
+| **Litigation Team** | $20,000/year | ~10% of value | Active litigation teams |
+| **Enterprise** | $75,000+/year | Custom | Multi-office firms |
+
+**Justification:** Current vendor processing = $5-15K per matter × 20-50 matters/year = $100-750K/year. $20K captures 3-20% of savings.
+
+#### Defense Vertical
+
+| Tier | Price | Value Capture | Target |
+|------|-------|---------------|--------|
+| **Open Source** | Free | N/A | Evaluation, ATAK-CIV users |
+| **Tactical** | $50,000/deployment/year | ~5% of value | Single-site tactical |
+| **Mission** | $150,000/deployment/year | ~10% of value | Multi-format, 24x7 support |
+| **Program** | $500,000+/year | Custom | Multi-site, SBIR Phase III |
+
+**Justification:** No laptop-deployable alternative exists. Palantir contracts = $10B+. Air-gapped capability is rare. Defense budgets expect enterprise pricing.
+
+#### Healthcare Vertical
+
+| Tier | Price | Value Capture | Target |
+|------|-------|---------------|--------|
+| **Community** | Free | N/A | Small clinics, evaluation |
+| **Clinic** | $250/month | ~3% of value | Small practices |
+| **Hospital** | $25,000/year | ~10% of value | Single facility |
+| **Health System** | $100,000+/year | Custom | Multi-facility |
+
+**Justification:** HL7 interface projects = $100K+ and 6-month wait. Compliance audit prep = $20-50K. $25K captures 10-20% of avoided costs.
+
+#### MSP/SMB Channel
+
+| Tier | Price | MSP Markup | End Client Cost |
+|------|-------|------------|-----------------|
+| **Per-Client** | $25-50/client/month | 3-5x | $75-200/month |
+| **White-Label** | $2,500/month base | Full control | MSP sets price |
+
+**Note:** MSP channel uses lower per-unit pricing because volume and channel leverage justify different economics.
+
+### Pricing Implementation Roadmap
+
+**Phase 1: Finance Validation (Months 1-3)**
+- Approach 5 trading desks with $15K/desk/year offer
+- If accepted: moat validated, continue at this price
+- If rejected: gather feedback, adjust
+
+**Phase 2: Legal Testing (Months 3-6)**
+- Offer litigation teams $20K/year
+- Position: "$20K/year vs. $100K+/year in vendor costs"
+
+**Phase 3: Defense SBIR (Parallel)**
+- Price at $50K-150K from day one
+- Defense expects enterprise pricing; low prices signal "not serious"
+
+### Competitive Pricing Context
+
+| Competitor | Annual Price | Casparian Position |
+|------------|-------------|-------------------|
+| Bloomberg Terminal | $32,000/seat | 50% of price, more flexibility |
+| Relativity | $150,000+ | 15% of price, local-first |
+| OSIsoft PI | $100,000+ license | 25% of price, no lock-in |
+| Palantir | $1M+/year | Upstream enabler, different value |
+| Fivetran (at scale) | $500,000+/year | 10% of price, industry formats |
+
+Even at $50K/year, Casparian is **the cheap option** compared to enterprise alternatives.
+
+### Revenue Impact (Revised Projections)
+
+**Conservative scenario with value-based pricing:**
+
+| Vertical | Year 1 Customers | Avg Price | Revenue |
+|----------|------------------|-----------|---------|
+| Finance | 20 desks | $15,000 | $300,000 |
+| Legal | 30 firms | $10,000 | $300,000 |
+| Defense | 3 deployments | $50,000 | $150,000 |
+| Healthcare | 10 hospitals | $15,000 | $150,000 |
+| MSP/SMB | 50 accounts | $3,000 | $150,000 |
+| **Total Y1** | | | **$1,050,000** |
+
+This is **4x the previous $250K target** with similar sales effort—just higher prices.
+
 ### Revenue Projections: Scenario Analysis
 
 **Caveat:** These are modeled scenarios, not projections. Actual revenue depends on validated pricing and conversion rates.
