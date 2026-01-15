@@ -4930,22 +4930,36 @@ impl App {
             // ROBUST FIX: Populate scout_folders in background so next load is instant
             // This ensures the source has proper folder hierarchy data even for old databases
             if !all_paths.is_empty() {
+                let path_count = all_paths.len();
                 let source_id_for_cache = source_id_str.clone();
                 let source_id_for_db = source_id_str.clone();
+                eprintln!("[scout_folders rebuild] Starting for {} with {} paths", source_id_str, path_count);
+
                 tokio::spawn(async move {
+                    eprintln!("[scout_folders rebuild] Spawned task running");
+
                     // Compute folder deltas from collected paths (CPU-intensive)
                     let deltas = tokio::task::spawn_blocking(move || {
+                        eprintln!("[scout_folders rebuild] spawn_blocking started");
+
                         // Also save to disk cache while we have the data
                         let folder_cache = FolderCache::build(&source_id_for_cache, &all_paths);
                         let _ = folder_cache.save();
+                        eprintln!("[scout_folders rebuild] Disk cache saved");
 
                         // Compute deltas for scout_folders table
-                        compute_folder_deltas_from_paths(&all_paths)
+                        let deltas = compute_folder_deltas_from_paths(&all_paths);
+                        eprintln!("[scout_folders rebuild] Computed {} deltas", deltas.len());
+                        deltas
                     })
                     .await
-                    .unwrap_or_default();
+                    .unwrap_or_else(|e| {
+                        eprintln!("[scout_folders rebuild] spawn_blocking failed: {:?}", e);
+                        HashMap::new()
+                    });
 
                     if deltas.is_empty() {
+                        eprintln!("[scout_folders rebuild] Deltas empty, returning early");
                         return;
                     }
 
@@ -4954,28 +4968,32 @@ impl App {
                         .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
                         .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
 
+                    eprintln!("[scout_folders rebuild] Opening DB at {:?}", db_path);
                     let db = match ScoutDatabase::open(&db_path).await {
                         Ok(db) => db,
                         Err(e) => {
-                            tracing::warn!(error = %e, "Failed to open DB for scout_folders rebuild");
+                            eprintln!("[scout_folders rebuild] Failed to open DB: {}", e);
                             return;
                         }
                     };
 
                     // Clear and repopulate scout_folders for this source
+                    eprintln!("[scout_folders rebuild] Clearing folder cache for {}", source_id_for_db);
                     if let Err(e) = db.clear_folder_cache(&source_id_for_db).await {
-                        tracing::warn!(error = %e, "Failed to clear folder cache");
-                        return;
-                    }
-                    if let Err(e) = db.batch_upsert_folder_counts(&source_id_for_db, &deltas).await {
-                        tracing::warn!(error = %e, "Failed to populate scout_folders");
+                        eprintln!("[scout_folders rebuild] Failed to clear: {}", e);
                         return;
                     }
 
-                    tracing::info!(
-                        source_id = %source_id_for_db,
-                        folder_entries = deltas.len(),
-                        "Rebuilt scout_folders table - next load will be instant"
+                    eprintln!("[scout_folders rebuild] Upserting {} folder entries", deltas.len());
+                    if let Err(e) = db.batch_upsert_folder_counts(&source_id_for_db, &deltas).await {
+                        eprintln!("[scout_folders rebuild] Failed to upsert: {}", e);
+                        return;
+                    }
+
+                    eprintln!(
+                        "[scout_folders rebuild] SUCCESS: {} entries for {}",
+                        deltas.len(),
+                        source_id_for_db
                     );
                 });
             }
@@ -5272,7 +5290,7 @@ impl App {
                            (SELECT COUNT(*) FROM scout_files WHERE source_id = s.id) as file_count
                     FROM scout_sources s
                     WHERE s.enabled = 1
-                    ORDER BY s.name
+                    ORDER BY s.updated_at DESC
                 "#;
 
                 if let Ok(rows) = sqlx::query_as::<_, (String, String, String, i64)>(query)
