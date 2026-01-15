@@ -348,165 +348,20 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
     #[cfg(feature = "profiling")]
     let _zone = app.profiler.zone("tui.discover");
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title/Filter/Scan Input
-            Constraint::Min(0),    // Main content (Sidebar + Files)
-            Constraint::Length(3), // Footer/Status
-        ])
-        .split(area);
+    // Rule Builder is the ONLY view in Discover mode (replaces old GlobExplorer)
+    // Always render Rule Builder as the base, then overlay dropdowns/dialogs
+    draw_rule_builder_screen(frame, app, area);
 
-    // Get filtered files using proper glob matching from App
-    let total_files = app.discover.files.len();
-    let filtered = app.filtered_files();
-    let filtered_count = filtered.len();
-
-    // Title / Filter / Scan Input / Tag Input / Create Source / Bulk Tag / Rule Creation Bar
-    let (title_text, title_style) = match app.discover.view_state {
-        DiscoverViewState::RuleCreation => {
-            // When dialog is open, show simpler title (dialog has its own title)
-            let file_count = app.discover.rule_preview_count;
-            let title = if file_count > 0 {
-                format!(" Discover - Creating rule ({} files match) ", file_count)
-            } else {
-                " Discover - Creating rule ".to_string()
-            };
-            (title, Style::default().fg(Color::Cyan).bold())
-        }
-        DiscoverViewState::BulkTagging => {
-            let checkbox = if app.discover.bulk_tag_save_as_rule { "[x]" } else { "[ ]" };
-            (
-                format!(" Tag {} files: {}_ {} Save as rule ", filtered_count, app.discover.bulk_tag_input, checkbox),
-                Style::default().fg(Color::Yellow).bold(),
-            )
-        }
-        DiscoverViewState::CreatingSource => {
-            let dir_name = app.discover.pending_source_path.as_ref()
-                .map(|p| std::path::Path::new(p)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| p.clone()))
-                .unwrap_or_default();
-            (
-                format!(" Create source from '{}' - Name: {}_ ", dir_name, app.discover.source_name_input),
-                Style::default().fg(Color::Blue).bold(),
-            )
-        }
-        DiscoverViewState::Tagging => {
-            let file_name = app.discover.files
-                .get(app.discover.selected)
-                .map(|f| std::path::Path::new(&f.path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| f.path.clone()))
-                .unwrap_or_default();
-            (
-                format!(" Tag '{}': {}_ ", file_name, app.discover.tag_input),
-                Style::default().fg(Color::Magenta).bold(),
-            )
-        }
-        DiscoverViewState::EnteringPath => (
-            " Discover - Adding Source ".to_string(),
-            Style::default().fg(Color::Cyan).bold(),
-        ),
-        DiscoverViewState::Filtering => (
-            format!(" Filter: {}_ ({} of {}) ", app.discover.filter, filtered_count, total_files),
-            Style::default().fg(Color::Yellow).bold(),
-        ),
-        _ => {
-            if let Some(ref err) = app.discover.scan_error {
-                (
-                    format!("  {}", err),
-                    Style::default().fg(Color::Red),
-                )
-            } else if !app.discover.filter.is_empty() {
-                (
-                    format!(" Discover - {} of {} files (filter: '{}') ", filtered_count, total_files, app.discover.filter),
-                    Style::default().fg(Color::Cyan).bold(),
-                )
-            } else {
-                // Use glob explorer file count if active, otherwise use discover.files count
-                let display_count = if let Some(ref explorer) = app.discover.glob_explorer {
-                    explorer.total_count.value()
-                } else if total_files > 0 {
-                    total_files
-                } else {
-                    // Fall back to sum of all source file counts
-                    app.discover.sources.iter().map(|s| s.file_count).sum()
-                };
-                (
-                    format!(" Discover - {} files ", display_count),
-                    Style::default().fg(Color::Cyan).bold(),
-                )
-            }
-        }
-    };
-
-    let title = Paragraph::new(title_text)
-        .style(title_style)
-        .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title, chunks[0]);
-
-    // Main content: Sidebar (20%) | Files (80%)
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(18),        // Sidebar min width
-            Constraint::Percentage(80), // Files area
-        ])
-        .split(chunks[1]);
-
-    // Draw Sidebar (Sources + Rules)
-    draw_discover_sidebar(frame, app, h_chunks[0]);
-
-    // Files area: File List vs Preview split
-    let files_area = h_chunks[1];
-    let main_chunks = if app.discover.preview_open {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(files_area)
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(100)])
-            .split(files_area)
-    };
-
-    // File List or Glob Explorer
-    if app.discover.glob_explorer.is_some() {
-        // Glob Explorer is active - show hierarchical folder view
-        draw_glob_explorer(frame, app, main_chunks[0]);
-    } else {
-        // Normal file list
-        draw_file_list(frame, app, &filtered, main_chunks[0]);
-    }
-
-    // Preview Pane (if open, only for normal file list)
-    if app.discover.preview_open && app.discover.glob_explorer.is_none() {
-        draw_file_preview(frame, app, &filtered, main_chunks[1]);
-    }
-
-    // Footer - context-aware based on focus and state
-    let (footer_text, footer_style) = get_discover_footer(app, filtered_count);
-    let footer = Paragraph::new(footer_text)
-        .style(footer_style)
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
-
-    // Dialogs (overlays) - render based on view_state
+    // Render dropdown/dialog overlays on top of Rule Builder
     match app.discover.view_state {
+        DiscoverViewState::SourcesDropdown => draw_sources_dropdown(frame, app, area),
+        DiscoverViewState::TagsDropdown => draw_tags_dropdown(frame, app, area),
         DiscoverViewState::RulesManager => draw_rules_manager_dialog(frame, app, area),
         DiscoverViewState::RuleCreation => draw_rule_creation_dialog(frame, app, area),
-        // Sources Manager dialogs (spec v1.7)
         DiscoverViewState::SourcesManager => draw_sources_manager_dialog(frame, app, area),
         DiscoverViewState::SourceEdit => draw_source_edit_dialog(frame, app, area),
         DiscoverViewState::SourceDeleteConfirm => draw_source_delete_confirm_dialog(frame, app, area),
-        // Scanning progress dialog
         DiscoverViewState::Scanning => draw_scanning_dialog(frame, app, area),
-        // Add Source path input dialog
         DiscoverViewState::EnteringPath => draw_add_source_dialog(frame, app, area),
         _ => {}
     }
@@ -1442,6 +1297,739 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// Draw the Rule Builder as a full-screen view (replaces Discover, not overlay)
+/// Layout: Header | Split View (40% left / 60% right) | Footer
+fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
+    use super::extraction::RuleBuilderFocus;
+
+    let builder = match &app.discover.rule_builder {
+        Some(b) => b,
+        None => return,
+    };
+
+    // Main layout: Header (3) | Content (flex) | Footer (3)
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Content (split view)
+            Constraint::Length(3), // Footer
+        ])
+        .split(area);
+
+    // === HEADER ===
+    // Format: " Rule Builder - [1] Source: X ▾  [2] Tags: All ▾  | 247 files match "
+    let source_name = app.discover.selected_source()
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "All".to_string());
+    let match_count = builder.match_count;
+
+    let header_text = format!(
+        " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  │ {} files match ",
+        source_name, match_count
+    );
+    let header = Paragraph::new(header_text)
+        .style(Style::default().fg(Color::Green).bold())
+        .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(header, chunks[0]);
+
+    // === CONTENT: Split View ===
+    let content_area = chunks[1];
+
+    // Split into left (40%) and right (60%) panels
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(content_area);
+
+    // Left panel: Rule config sections
+    draw_rule_builder_left_panel(frame, builder, h_chunks[0]);
+
+    // Right panel: File results
+    draw_rule_builder_right_panel(frame, builder, h_chunks[1]);
+
+    // === FOOTER ===
+    let footer_text = " [Tab] Cycle focus  [Enter] Save  [Ctrl+Space] AI assist  [Esc] Close ";
+    let footer = Paragraph::new(footer_text)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, chunks[2]);
+}
+
+/// Draw the left panel of Rule Builder (PATTERN, EXCLUDES, TAG, EXTRACTIONS, OPTIONS)
+fn draw_rule_builder_left_panel(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect) {
+    use super::extraction::RuleBuilderFocus;
+
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Pattern
+            Constraint::Length(4),  // Excludes
+            Constraint::Length(3),  // Tag
+            Constraint::Length(5),  // Extractions
+            Constraint::Length(3),  // Options
+            Constraint::Min(0),     // Padding
+        ])
+        .split(area);
+
+    // --- PATTERN field ---
+    let pattern_focused = matches!(builder.focus, RuleBuilderFocus::Pattern);
+    let pattern_style = if pattern_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let pattern_title = if let Some(ref err) = builder.pattern_error {
+        format!(" PATTERN [!] {} ", err)
+    } else {
+        " PATTERN ".to_string()
+    };
+
+    let pattern_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if builder.pattern_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            pattern_style
+        })
+        .title(Span::styled(pattern_title, pattern_style));
+
+    let pattern_text = if pattern_focused {
+        format!("{}█", builder.pattern)
+    } else {
+        builder.pattern.clone()
+    };
+    let pattern_para = Paragraph::new(pattern_text)
+        .style(Style::default().fg(Color::White))
+        .block(pattern_block);
+    frame.render_widget(pattern_para, left_chunks[0]);
+
+    // --- EXCLUDES field ---
+    let excludes_focused = matches!(builder.focus, RuleBuilderFocus::Excludes | RuleBuilderFocus::ExcludeInput);
+    let excludes_style = if excludes_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let excludes_title = format!(" EXCLUDES ({}) ", builder.excludes.len());
+    let excludes_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(excludes_style)
+        .title(Span::styled(excludes_title, excludes_style));
+
+    let excludes_content = if matches!(builder.focus, RuleBuilderFocus::ExcludeInput) {
+        format!("{}█", builder.exclude_input)
+    } else if builder.excludes.is_empty() {
+        "[Enter] to add".to_string()
+    } else {
+        builder.excludes.iter().enumerate().map(|(i, e)| {
+            if i == builder.selected_exclude && excludes_focused {
+                format!("► {}", e)
+            } else {
+                format!("  {}", e)
+            }
+        }).collect::<Vec<_>>().join("\n")
+    };
+    let excludes_para = Paragraph::new(excludes_content)
+        .style(Style::default().fg(Color::Gray))
+        .block(excludes_block);
+    frame.render_widget(excludes_para, left_chunks[1]);
+
+    // --- TAG field ---
+    let tag_focused = matches!(builder.focus, RuleBuilderFocus::Tag);
+    let tag_style = if tag_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let tag_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(tag_style)
+        .title(Span::styled(" TAG ", tag_style));
+
+    let tag_text = if tag_focused {
+        format!("{}█", builder.tag)
+    } else if builder.tag.is_empty() {
+        "Enter tag name...".to_string()
+    } else {
+        builder.tag.clone()
+    };
+    let tag_para = Paragraph::new(tag_text)
+        .style(if builder.tag.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        })
+        .block(tag_block);
+    frame.render_widget(tag_para, left_chunks[2]);
+
+    // --- EXTRACTIONS field ---
+    let extractions_focused = matches!(builder.focus, RuleBuilderFocus::Extractions | RuleBuilderFocus::ExtractionEdit(_));
+    let extractions_style = if extractions_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let extractions_title = format!(" EXTRACTIONS ({}) ", builder.extractions.len());
+    let extractions_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(extractions_style)
+        .title(Span::styled(extractions_title, extractions_style));
+
+    let extractions_content = if builder.extractions.is_empty() {
+        "Use <field> in pattern to add".to_string()
+    } else {
+        builder.extractions.iter().enumerate().map(|(i, f)| {
+            let selected = i == builder.selected_extraction && extractions_focused;
+            let prefix = if selected { "► " } else { "  " };
+            let enabled = if f.enabled { "✓" } else { " " };
+            format!("{}{} {} {}", prefix, f.name, f.source.display_name(), enabled)
+        }).take(3).collect::<Vec<_>>().join("\n")
+    };
+    let extractions_para = Paragraph::new(extractions_content)
+        .style(Style::default().fg(Color::Gray))
+        .block(extractions_block);
+    frame.render_widget(extractions_para, left_chunks[3]);
+
+    // --- OPTIONS field ---
+    let options_focused = matches!(builder.focus, RuleBuilderFocus::Options);
+    let options_style = if options_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let options_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(options_style)
+        .title(Span::styled(" OPTIONS ", options_style));
+
+    let enabled_check = if builder.enabled { "[x]" } else { "[ ]" };
+    let job_check = if builder.run_job_on_save { "[x]" } else { "[ ]" };
+    let options_para = Paragraph::new(format!("{} Enable rule  {} Run job on save", enabled_check, job_check))
+        .style(Style::default().fg(Color::Gray))
+        .block(options_block);
+    frame.render_widget(options_para, left_chunks[4]);
+}
+
+/// Draw the right panel of Rule Builder (file results list)
+fn draw_rule_builder_right_panel(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect) {
+    use super::extraction::{RuleBuilderFocus, FileResultsPhase};
+
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),  // Header with filter
+            Constraint::Min(1),     // File list
+            Constraint::Length(2),  // Status bar
+        ])
+        .split(area);
+
+    let file_list_focused = matches!(builder.focus, RuleBuilderFocus::FileList);
+
+    // Phase-specific header
+    let header_text = match builder.file_results_phase {
+        FileResultsPhase::Exploration => {
+            let folder_count = builder.folder_matches.len();
+            let file_count: usize = builder.folder_matches.iter().map(|f| f.count).sum();
+            if builder.is_streaming {
+                format!(" FOLDERS  {} folders ({} files)  {}", folder_count, file_count, spinner_char(builder.stream_elapsed_ms / 100))
+            } else {
+                format!(" FOLDERS  {} folders ({} files)  ↵ expand/collapse", folder_count, file_count)
+            }
+        }
+        FileResultsPhase::ExtractionPreview => {
+            let file_count = builder.preview_files.len();
+            let warning_count: usize = builder.preview_files.iter().map(|f| f.warnings.len()).sum();
+            if warning_count > 0 {
+                format!(" PREVIEW  {} files  ⚠ {} warnings  t:test", file_count, warning_count)
+            } else {
+                format!(" PREVIEW  {} files  ✓ extractions OK  t:test", file_count)
+            }
+        }
+        FileResultsPhase::BacktestResults => {
+            let filter_label = builder.result_filter.label();
+            format!(" RESULTS [{}]  a/p/f to filter", filter_label)
+        }
+    };
+
+    let header = Paragraph::new(header_text)
+        .style(Style::default().fg(if file_list_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
+    frame.render_widget(header, right_chunks[0]);
+
+    // File list block
+    let file_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if file_list_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+
+    let file_list_inner = file_block.inner(right_chunks[1]);
+    frame.render_widget(file_block, right_chunks[1]);
+
+    // Phase-specific content rendering
+    match builder.file_results_phase {
+        FileResultsPhase::Exploration => {
+            draw_exploration_phase(frame, builder, file_list_inner, file_list_focused);
+        }
+        FileResultsPhase::ExtractionPreview => {
+            draw_extraction_preview_phase(frame, builder, file_list_inner, file_list_focused);
+        }
+        FileResultsPhase::BacktestResults => {
+            draw_backtest_results_phase(frame, builder, file_list_inner, file_list_focused);
+        }
+    }
+
+    // Phase-specific status bar
+    let status = match builder.file_results_phase {
+        FileResultsPhase::Exploration => {
+            if builder.folder_matches.is_empty() {
+                " Type a pattern to find files...".to_string()
+            } else {
+                let total_files: usize = builder.folder_matches.iter().map(|f| f.count).sum();
+                format!(" {} folders  {} files matched", builder.folder_matches.len(), total_files)
+            }
+        }
+        FileResultsPhase::ExtractionPreview => {
+            if builder.preview_files.is_empty() {
+                " No files match current pattern".to_string()
+            } else {
+                let ok_count = builder.preview_files.iter().filter(|f| f.warnings.is_empty()).count();
+                format!(" {} files  {} OK  {} warnings  Press 't' to run backtest",
+                    builder.preview_files.len(), ok_count,
+                    builder.preview_files.len() - ok_count)
+            }
+        }
+        FileResultsPhase::BacktestResults => {
+            format!(
+                " Pass: {}  Fail: {}  Skip: {}",
+                builder.backtest.pass_count,
+                builder.backtest.fail_count,
+                builder.backtest.excluded_count
+            )
+        }
+    };
+    let status_para = Paragraph::new(status)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(status_para, right_chunks[2]);
+}
+
+/// Phase 1: Exploration - folder counts + sample filenames
+fn draw_exploration_phase(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect, focused: bool) {
+    let lines: Vec<Line> = if builder.folder_matches.is_empty() {
+        vec![Line::from(Span::styled(
+            "  No matching folders",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let max_display = area.height.saturating_sub(1) as usize;
+        let start = centered_scroll_offset(builder.selected_file, max_display, builder.folder_matches.len());
+
+        builder.folder_matches.iter()
+            .enumerate()
+            .skip(start)
+            .take(max_display)
+            .map(|(i, folder)| {
+                let is_selected = i == builder.selected_file && focused;
+                let is_expanded = builder.expanded_folder_indices.contains(&i);
+
+                let prefix = if is_selected { "► " } else { "  " };
+                let expand_icon = if is_expanded { "▼" } else { "▸" };
+
+                let style = if is_selected {
+                    Style::default().fg(Color::White).bold()
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+
+                // Format: "▸ trades/2024/ (15)  trade_20240101.csv"
+                let display = format!(
+                    "{}{} {}/ ({})  {}",
+                    prefix,
+                    expand_icon,
+                    folder.path.trim_end_matches('/'),
+                    folder.count,
+                    folder.sample_filename
+                );
+
+                Line::from(Span::styled(display, style))
+            })
+            .collect()
+    };
+
+    let file_list = Paragraph::new(lines);
+    frame.render_widget(file_list, area);
+}
+
+/// Phase 2: Extraction Preview - per-file with extracted values
+fn draw_extraction_preview_phase(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect, focused: bool) {
+    let lines: Vec<Line> = if builder.preview_files.is_empty() {
+        vec![Line::from(Span::styled(
+            "  No files with extractions",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let max_display = area.height.saturating_sub(1) as usize;
+        let start = centered_scroll_offset(builder.selected_file, max_display, builder.preview_files.len());
+
+        builder.preview_files.iter()
+            .enumerate()
+            .skip(start)
+            .take(max_display)
+            .map(|(i, file)| {
+                let is_selected = i == builder.selected_file && focused;
+                let has_warnings = !file.warnings.is_empty();
+
+                let prefix = if is_selected { "► " } else { "  " };
+                let status_icon = if has_warnings { "⚠" } else { "✓" };
+
+                let style = if is_selected {
+                    Style::default().fg(Color::White).bold()
+                } else if has_warnings {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+
+                // Format extractions as "field=value, field=value"
+                let extractions_str: String = file.extractions.iter()
+                    .take(3)  // Limit to 3 extractions for display
+                    .map(|(k, v)| format!("{}={}", k, v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let display = format!(
+                    "{}{} {}  [{}]",
+                    prefix,
+                    status_icon,
+                    file.relative_path,
+                    extractions_str
+                );
+
+                Line::from(Span::styled(display, style))
+            })
+            .collect()
+    };
+
+    let file_list = Paragraph::new(lines);
+    frame.render_widget(file_list, area);
+}
+
+/// Phase 3: Backtest Results - per-file pass/fail with errors
+fn draw_backtest_results_phase(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect, focused: bool) {
+    let lines: Vec<Line> = if builder.visible_indices.is_empty() {
+        vec![Line::from(Span::styled(
+            "  No matching files",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let max_display = area.height.saturating_sub(1) as usize;
+        let start = centered_scroll_offset(builder.selected_file, max_display, builder.visible_indices.len());
+
+        builder.visible_indices.iter()
+            .skip(start)
+            .take(max_display)
+            .enumerate()
+            .map(|(i, &idx)| {
+                let file = &builder.matched_files[idx];
+                let is_selected = i + start == builder.selected_file && focused;
+                let prefix = if is_selected { "► " } else { "  " };
+                let indicator = file.test_result.indicator();
+
+                let style = if is_selected {
+                    Style::default().fg(Color::White).bold()
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+
+                Line::from(Span::styled(
+                    format!("{}{} {}", prefix, indicator, file.relative_path),
+                    style,
+                ))
+            })
+            .collect()
+    };
+
+    let file_list = Paragraph::new(lines);
+    frame.render_widget(file_list, area);
+}
+
+/// Draw the Rule Builder split-view (specs/rule_builder.md) - LEGACY OVERLAY VERSION
+/// Layout: Left panel (40%) = rule config, Right panel (60%) = file results
+#[allow(dead_code)]
+fn draw_rule_builder(frame: &mut Frame, app: &App, area: Rect) {
+    use super::extraction::RuleBuilderFocus;
+
+    let builder = match &app.discover.rule_builder {
+        Some(b) => b,
+        None => return,
+    };
+
+    // Full screen dialog - uses almost all available area
+    let dialog_area = render_centered_dialog(frame, area, area.width.saturating_sub(4), area.height.saturating_sub(4));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(Span::styled(" Rule Builder ", Style::default().fg(Color::Green).bold()));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Split into left (40%) and right (60%) panels
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(inner_area);
+
+    // === LEFT PANEL: Rule Config ===
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Pattern
+            Constraint::Length(4),  // Excludes
+            Constraint::Length(3),  // Tag
+            Constraint::Length(5),  // Extractions
+            Constraint::Length(3),  // Options
+            Constraint::Min(0),     // Footer/padding
+        ])
+        .split(h_chunks[0]);
+
+    // --- PATTERN field ---
+    let pattern_focused = matches!(builder.focus, RuleBuilderFocus::Pattern);
+    let pattern_style = if pattern_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let pattern_title = if let Some(ref err) = builder.pattern_error {
+        format!(" PATTERN [!] {} ", err)
+    } else {
+        " PATTERN ".to_string()
+    };
+
+    let pattern_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if builder.pattern_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else {
+            pattern_style
+        })
+        .title(Span::styled(pattern_title, pattern_style));
+
+    let pattern_text = if pattern_focused {
+        format!("{}█", builder.pattern)
+    } else {
+        builder.pattern.clone()
+    };
+    let pattern_para = Paragraph::new(pattern_text)
+        .style(Style::default().fg(Color::White))
+        .block(pattern_block);
+    frame.render_widget(pattern_para, left_chunks[0]);
+
+    // --- EXCLUDES field ---
+    let excludes_focused = matches!(builder.focus, RuleBuilderFocus::Excludes | RuleBuilderFocus::ExcludeInput);
+    let excludes_style = if excludes_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let excludes_title = format!(" EXCLUDES ({}) ", builder.excludes.len());
+    let excludes_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(excludes_style)
+        .title(Span::styled(excludes_title, excludes_style));
+
+    let excludes_content = if matches!(builder.focus, RuleBuilderFocus::ExcludeInput) {
+        format!("{}█", builder.exclude_input)
+    } else if builder.excludes.is_empty() {
+        "[Enter] to add".to_string()
+    } else {
+        builder.excludes.iter().enumerate().map(|(i, e)| {
+            if i == builder.selected_exclude && excludes_focused {
+                format!("► {}", e)
+            } else {
+                format!("  {}", e)
+            }
+        }).collect::<Vec<_>>().join("\n")
+    };
+    let excludes_para = Paragraph::new(excludes_content)
+        .style(Style::default().fg(Color::Gray))
+        .block(excludes_block);
+    frame.render_widget(excludes_para, left_chunks[1]);
+
+    // --- TAG field ---
+    let tag_focused = matches!(builder.focus, RuleBuilderFocus::Tag);
+    let tag_style = if tag_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let tag_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(tag_style)
+        .title(Span::styled(" TAG ", tag_style));
+
+    let tag_text = if tag_focused {
+        format!("{}█", builder.tag)
+    } else if builder.tag.is_empty() {
+        "Enter tag name...".to_string()
+    } else {
+        builder.tag.clone()
+    };
+    let tag_para = Paragraph::new(tag_text)
+        .style(if builder.tag.is_empty() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        })
+        .block(tag_block);
+    frame.render_widget(tag_para, left_chunks[2]);
+
+    // --- EXTRACTIONS field ---
+    let extractions_focused = matches!(builder.focus, RuleBuilderFocus::Extractions | RuleBuilderFocus::ExtractionEdit(_));
+    let extractions_style = if extractions_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let extractions_title = format!(" EXTRACTIONS ({}) ", builder.extractions.len());
+    let extractions_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(extractions_style)
+        .title(Span::styled(extractions_title, extractions_style));
+
+    let extractions_content = if builder.extractions.is_empty() {
+        "Use <field> in pattern to add".to_string()
+    } else {
+        builder.extractions.iter().enumerate().map(|(i, f)| {
+            let selected = i == builder.selected_extraction && extractions_focused;
+            let prefix = if selected { "► " } else { "  " };
+            let enabled = if f.enabled { "✓" } else { " " };
+            format!("{}{} {} {}", prefix, f.name, f.source.display_name(), enabled)
+        }).take(3).collect::<Vec<_>>().join("\n")
+    };
+    let extractions_para = Paragraph::new(extractions_content)
+        .style(Style::default().fg(Color::Gray))
+        .block(extractions_block);
+    frame.render_widget(extractions_para, left_chunks[3]);
+
+    // --- OPTIONS field ---
+    let options_focused = matches!(builder.focus, RuleBuilderFocus::Options);
+    let options_style = if options_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let options_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(options_style)
+        .title(Span::styled(" OPTIONS ", options_style));
+
+    let enabled_check = if builder.enabled { "[x]" } else { "[ ]" };
+    let job_check = if builder.run_job_on_save { "[x]" } else { "[ ]" };
+    let options_para = Paragraph::new(format!("{} Enable rule  {} Run job on save", enabled_check, job_check))
+        .style(Style::default().fg(Color::Gray))
+        .block(options_block);
+    frame.render_widget(options_para, left_chunks[4]);
+
+    // === RIGHT PANEL: File Results ===
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),  // Header with filter
+            Constraint::Min(1),     // File list
+            Constraint::Length(2),  // Status bar
+        ])
+        .split(h_chunks[1]);
+
+    // File list header
+    let filter_label = builder.result_filter.label();
+    let header = Paragraph::new(format!(" FILES [{}]  a/p/f to filter", filter_label))
+        .style(Style::default().fg(if matches!(builder.focus, RuleBuilderFocus::FileList) {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
+    frame.render_widget(header, right_chunks[0]);
+
+    // File list
+    let file_list_focused = matches!(builder.focus, RuleBuilderFocus::FileList);
+    let file_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if file_list_focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        });
+
+    let file_list_inner = file_block.inner(right_chunks[1]);
+
+    let files: Vec<Line> = if builder.visible_indices.is_empty() {
+        vec![Line::from(Span::styled(
+            "  No matching files",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let max_display = file_list_inner.height.saturating_sub(1) as usize;
+        let start = builder.selected_file.saturating_sub(max_display / 2);
+
+        builder.visible_indices.iter()
+            .skip(start)
+            .take(max_display)
+            .enumerate()
+            .map(|(i, &idx)| {
+                let file = &builder.matched_files[idx];
+                let is_selected = i + start == builder.selected_file && file_list_focused;
+                let prefix = if is_selected { "► " } else { "  " };
+                let indicator = file.test_result.indicator();
+
+                let style = if is_selected {
+                    Style::default().fg(Color::White).bold()
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+
+                Line::from(Span::styled(
+                    format!("{}{} {}", prefix, indicator, file.relative_path),
+                    style,
+                ))
+            })
+            .collect()
+    };
+
+    frame.render_widget(file_block, right_chunks[1]);
+    let file_list = Paragraph::new(files);
+    frame.render_widget(file_list, file_list_inner);
+
+    // Status bar
+    let status = format!(
+        " Pass: {}  Fail: {}  Skip: {} | Tab: cycle | Ctrl+S: save | Esc: close",
+        builder.backtest.pass_count,
+        builder.backtest.fail_count,
+        builder.backtest.excluded_count
+    );
+    let status_para = Paragraph::new(status)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(status_para, right_chunks[2]);
 }
 
 /// Draw the Rule Creation dialog as an overlay (simplified version)

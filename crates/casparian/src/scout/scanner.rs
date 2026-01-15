@@ -1071,10 +1071,13 @@ impl Scanner {
             return Ok(());
         }
 
+        // Query tag summaries for this source
+        let tags = self.query_tag_summaries(source_id).await?;
+
         // Build cache in blocking task (CPU-intensive)
         let source_id_owned = source_id.to_string();
         let cache = tokio::task::spawn_blocking(move || {
-            FolderCache::build(&source_id_owned, &paths)
+            FolderCache::build_with_tags(&source_id_owned, &paths, tags)
         })
         .await
         .map_err(|e| ScoutError::Config(format!("Failed to build cache: {}", e)))?;
@@ -1119,6 +1122,54 @@ impl Scanner {
         self.db.batch_upsert_folder_counts(source_id, &deltas).await?;
 
         Ok(())
+    }
+
+    /// Query tag summaries for a source (used when building folder cache)
+    async fn query_tag_summaries(&self, source_id: &str) -> Result<Vec<crate::scout::folder_cache::TagSummary>> {
+        use crate::scout::folder_cache::TagSummary;
+
+        let mut tags = Vec::new();
+
+        // Get total file count
+        let total_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND status != 'deleted'"
+        )
+        .bind(source_id)
+        .fetch_one(self.db.pool())
+        .await
+        .unwrap_or(0);
+
+        // Add "All files" as first option
+        tags.push(TagSummary {
+            name: "All files".to_string(),
+            count: total_count as usize,
+            is_special: true,
+        });
+
+        // Query distinct tags with counts
+        let tag_rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT tag, COUNT(*) as count
+            FROM scout_files
+            WHERE source_id = ? AND tag IS NOT NULL AND tag != '' AND status != 'deleted'
+            GROUP BY tag
+            ORDER BY count DESC, tag
+            "#
+        )
+        .bind(source_id)
+        .fetch_all(self.db.pool())
+        .await
+        .unwrap_or_default();
+
+        for (tag_name, count) in tag_rows {
+            tags.push(TagSummary {
+                name: tag_name,
+                count: count as usize,
+                is_special: false,
+            });
+        }
+
+        Ok(tags)
     }
 }
 

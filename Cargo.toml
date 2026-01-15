@@ -12,6 +12,7 @@ members = [
     "crates/casparian_mcp",
     "crates/casparian_test_utils",
     "crates/casparian_profiler",
+    "crates/casparian_db",
 ]
 
 [workspace.package]
@@ -42,7 +43,7 @@ arrow = "53.3"
 parquet = "53.3"
 
 # Database (for future use in sentinel)
-sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "postgres", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "postgres", "any", "chrono"] }
 
 # Tracing/Logging
 tracing = "0.1"

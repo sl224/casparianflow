@@ -50,8 +50,8 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 | Discover | `views/discover.md` | File scanning, tagging |
 | Parser Bench | `views/parser_bench.md` | Parser development, testing |
 | Jobs | `views/jobs.md` | Job monitoring, logs |
-| Sources | `views/sources.md` | Source management, equivalence |
-| Extraction | `views/extraction.md` | Rule creation, testing |
+| Settings | `views/settings.md` | Configuration |
+| Extraction Rules | `views/extraction_rules.md` | Rule creation, testing (Draft) |
 
 ---
 

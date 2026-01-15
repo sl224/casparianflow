@@ -25,7 +25,8 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
 
-# Database (async sqlx)
+# Database abstraction
+casparian_db = { path = "../casparian_db" }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 
 # Error handling

@@ -1,10 +1,14 @@
 # Extraction Rules - TUI View Spec
 
-**Status:** Draft
+**Status:** Draft (Future Design - ~15% Implemented)
 **Parent:** specs/tui.md (Master TUI Spec)
 **Version:** 1.1
 **Related:** specs/extraction.md (Extraction API), docs/decisions/ADR-017-tagging-vs-extraction-rules.md
 **Last Updated:** 2026-01-14
+
+> **Implementation Note:** This spec describes the target design for extraction rules management.
+> Current implementation is minimal - basic rule CRUD exists as a dialog within Discover mode,
+> but the dedicated view, YAML editor, test mode, coverage panel, and priority management are not yet built.
 
 > **Note:** For global keybindings, layout patterns, and common UI elements,
 > see the master TUI spec at `specs/tui.md`.

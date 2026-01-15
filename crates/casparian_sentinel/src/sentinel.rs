@@ -114,7 +114,7 @@ pub struct Sentinel {
     socket: RouterSocket,
     workers: HashMap<Vec<u8>, ConnectedWorker>,
     queue: JobQueue,
-    pool: sqlx::Pool<sqlx::Sqlite>,  // Database pool for queries
+    pool: casparian_db::DbPool,  // Database pool for queries
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     running: bool,
     last_cleanup: f64, // Last time we ran stale worker cleanup
@@ -125,9 +125,10 @@ pub struct Sentinel {
 impl Sentinel {
     /// Create and bind Sentinel
     pub async fn bind(config: SentinelConfig) -> Result<Self> {
-        // Connect to database
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect(&config.database_url)
+        // Connect to database using casparian_db
+        let db_config = casparian_db::DbConfig::from_url(&config.database_url, casparian_db::License::community())
+            .context("Invalid database URL")?;
+        let pool = casparian_db::create_pool(db_config)
             .await
             .context("Failed to connect to database")?;
 
@@ -164,7 +165,7 @@ impl Sentinel {
             socket,
             workers: HashMap::new(),
             queue,
-            pool, // Use the original pool, not a clone
+            pool,
             topic_map,
             running: false,
             last_cleanup: current_time(),
@@ -174,7 +175,7 @@ impl Sentinel {
 
     /// Load topic configurations from database into memory (non-blocking cache)
     async fn load_topic_configs(
-        pool: &sqlx::Pool<sqlx::Sqlite>,
+        pool: &casparian_db::DbPool,
     ) -> Result<HashMap<String, Vec<SinkConfig>>> {
         let configs: Vec<TopicConfig> = sqlx::query_as("SELECT * FROM cf_topic_config")
             .fetch_all(pool)

@@ -784,7 +784,8 @@ pub enum DiscoverViewState {
     TagsDropdown,       // Filtering/selecting tags
     // --- Full dialogs ---
     RulesManager,       // Dialog for rule CRUD
-    RuleCreation,       // Dialog for creating/editing single rule
+    RuleCreation,       // Dialog for creating/editing single rule (legacy)
+    RuleBuilder,        // Split-view Rule Builder (specs/rule_builder.md)
     // --- Sources Manager (spec v1.7) ---
     SourcesManager,     // Dialog for source CRUD (M key)
     SourceEdit,         // Nested dialog for editing source name
@@ -927,6 +928,19 @@ pub struct GlobExplorerState {
     pub excludes: Vec<String>,
     /// Backtest summary statistics
     pub backtest_summary: super::extraction::BacktestSummary,
+
+    // --- Staleness Detection (spec Section 4.5) ---
+    /// True if a scan is currently running for this source
+    pub scan_in_progress: bool,
+    /// Minutes since last completed scan (None if never scanned)
+    pub minutes_since_scan: Option<f64>,
+}
+
+impl GlobExplorerState {
+    /// Returns true if data may be stale (>60 min since scan or scan in progress)
+    pub fn is_stale(&self) -> bool {
+        self.scan_in_progress || self.minutes_since_scan.map(|m| m > 60.0).unwrap_or(true)
+    }
 }
 
 impl Default for GlobExplorerState {
@@ -954,6 +968,9 @@ impl Default for GlobExplorerState {
             result_filter: super::extraction::ResultFilter::default(),
             excludes: Vec::new(),
             backtest_summary: super::extraction::BacktestSummary::default(),
+            // Staleness detection
+            scan_in_progress: false,
+            minutes_since_scan: None,
         }
     }
 }
@@ -1087,8 +1104,19 @@ pub struct DiscoverState {
     /// Whether to save bulk tag as a rule
     pub bulk_tag_save_as_rule: bool,
 
-    // --- Glob Explorer (hierarchical file browsing) ---
-    /// Glob Explorer state (Some = explorer active, None = flat file list)
+    // --- Folder cache (hierarchical file browsing) ---
+    /// Folder cache for hierarchical browsing (moved from GlobExplorer)
+    /// Key = prefix path ("" for root, "logs/" for /logs folder)
+    /// Value = list of folders/files at that level
+    pub folder_cache: HashMap<String, Vec<FolderInfo>>,
+    /// Whether folder cache has been loaded
+    pub cache_loaded: bool,
+    /// Total file count across all folders
+    pub total_file_count: usize,
+
+    // --- Glob Explorer (DEPRECATED - use Rule Builder instead) ---
+    /// Glob Explorer state - DEPRECATED, kept for transition
+    /// TODO: Remove after Rule Builder fully replaces GlobExplorer
     pub glob_explorer: Option<GlobExplorerState>,
 
     // --- Sidebar state ---
@@ -1140,6 +1168,10 @@ pub struct DiscoverState {
     pub rule_preview_files: Vec<String>,
     /// Count of files matching current pattern
     pub rule_preview_count: usize,
+
+    // --- Rule Builder (v3.0 consolidation) ---
+    /// Rule Builder state (Some = builder active)
+    pub rule_builder: Option<super::extraction::RuleBuilderState>,
 
     // --- Sources Manager dialog (spec v1.7) ---
     /// Selected source in Sources Manager list (separate from main selection)
@@ -1578,6 +1610,8 @@ pub struct App {
     pending_cache_load: Option<mpsc::Receiver<CacheLoadMessage>>,
     /// Progress tracking for streaming cache load
     cache_load_progress: Option<CacheLoadProgress>,
+    /// Timing info from last completed cache load (for profiler display)
+    pub last_cache_load_timing: Option<CacheLoadTiming>,
     /// Pre-loaded folder caches (loaded at app start in background)
     /// Key is source_id, value is the folder cache HashMap
     preloaded_caches: HashMap<String, HashMap<String, Vec<FolderInfo>>>,
@@ -1591,6 +1625,10 @@ pub struct App {
     glob_search_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Pending sources load (non-blocking DB query)
     pending_sources_load: Option<mpsc::Receiver<Vec<SourceInfo>>>,
+    /// Pending jobs load (non-blocking DB query)
+    pending_jobs_load: Option<mpsc::Receiver<Vec<JobInfo>>>,
+    /// Last time jobs were polled (for incremental updates)
+    last_jobs_poll: Option<std::time::Instant>,
     /// Profiler for frame timing and zone breakdown (F12 toggle)
     #[cfg(feature = "profiling")]
     pub profiler: casparian_profiler::Profiler,
@@ -1603,10 +1641,11 @@ enum CacheLoadMessage {
         folders: HashMap<String, Vec<FolderInfo>>,
         files_processed: usize,
     },
-    /// Final message - loading complete
+    /// Final message - loading complete (includes tags from cache)
     Complete {
         source_id: String,
         total_files: usize,
+        tags: Vec<TagInfo>,
     },
     /// Error during loading
     Error(String),
@@ -1615,6 +1654,19 @@ enum CacheLoadMessage {
 /// Progress tracking for streaming cache load
 struct CacheLoadProgress {
     files_processed: usize,
+    /// When loading started (for measuring total load time)
+    started_at: std::time::Instant,
+}
+
+/// Timing info for the last completed cache load
+#[derive(Debug, Clone)]
+pub struct CacheLoadTiming {
+    /// Total time to load cache
+    pub duration_ms: f64,
+    /// Number of files loaded
+    pub files_loaded: usize,
+    /// Source ID that was loaded
+    pub source_id: String,
 }
 
 /// Result of background cache preloading (full cache, not chunked)
@@ -1688,12 +1740,15 @@ impl App {
             current_scan_job_id: None,
             pending_cache_load: None,
             cache_load_progress: None,
+            last_cache_load_timing: None,
             preloaded_caches: HashMap::new(),
             cache_preload_rx: None,
             tick_count: 0,
             pending_glob_search: None,
             glob_search_cancelled: None,
             pending_sources_load: None,
+            pending_jobs_load: None,
+            last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250), // 250ms frame budget
         }
@@ -1793,12 +1848,15 @@ impl App {
             current_scan_job_id: None,
             pending_cache_load: None,
             cache_load_progress: None,
+            last_cache_load_timing: None,
             preloaded_caches: HashMap::new(),
             cache_preload_rx: None,
             tick_count: 0,
             pending_glob_search: None,
             glob_search_cancelled: None,
             pending_sources_load: None,
+            pending_jobs_load: None,
+            last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250),
         }
@@ -1985,6 +2043,7 @@ impl App {
         if !self.in_text_input_mode() && !matches!(self.discover.view_state,
             DiscoverViewState::RulesManager |
             DiscoverViewState::RuleCreation |
+            DiscoverViewState::RuleBuilder |
             DiscoverViewState::SourcesManager |
             DiscoverViewState::SourceEdit |
             DiscoverViewState::SourceDeleteConfirm
@@ -2221,6 +2280,9 @@ impl App {
             DiscoverViewState::SourcesManager => self.handle_sources_manager_key(key),
             DiscoverViewState::SourceEdit => self.handle_source_edit_key(key),
             DiscoverViewState::SourceDeleteConfirm => self.handle_source_delete_confirm_key(key),
+
+            // === Rule Builder (specs/rule_builder.md) ===
+            DiscoverViewState::RuleBuilder => self.handle_rule_builder_key(key),
 
             // === Background scanning state ===
             DiscoverViewState::Scanning => {
@@ -3145,14 +3207,16 @@ impl App {
                     // Reset glob_explorer completely so it reloads for new source
                     // Setting to None triggers fresh creation in tick()
                     self.discover.glob_explorer = None;
+                    // Reset rule_builder so it reinitializes with new source
+                    self.discover.rule_builder = None;
                     // Cancel any pending cache load for old source
                     self.pending_cache_load = None;
                 }
-                self.discover.view_state = DiscoverViewState::Files;
+                // Return to RuleBuilder (the default Discover view)
+                self.discover.view_state = DiscoverViewState::RuleBuilder;
                 self.discover.sources_filter.clear();
                 self.discover.sources_filtering = false;
                 self.discover.preview_source = None;
-                self.discover.focus = DiscoverFocus::Files;
             }
             KeyCode::Esc => {
                 // Close dropdown without changing selection
@@ -3500,6 +3564,327 @@ impl App {
         }
     }
 
+    /// Handle keys in Rule Builder mode (specs/rule_builder.md)
+    ///
+    /// Focus cycles: Pattern → Excludes → Tag → Extractions → Options → FileList
+    fn handle_rule_builder_key(&mut self, key: KeyEvent) {
+        use super::extraction::RuleBuilderFocus;
+
+        // Capture the current pattern before handling the key
+        let pattern_before = self.discover.rule_builder.as_ref()
+            .map(|b| b.pattern.clone())
+            .unwrap_or_default();
+
+        let builder = match self.discover.rule_builder.as_mut() {
+            Some(b) => b,
+            None => {
+                // No builder state - should not happen, return to Files
+                self.transition_discover_state(DiscoverViewState::Files);
+                return;
+            }
+        };
+
+        match key.code {
+            // Tab cycles focus (per spec Section 8)
+            KeyCode::Tab => {
+                builder.focus = match builder.focus {
+                    RuleBuilderFocus::Pattern => RuleBuilderFocus::Excludes,
+                    RuleBuilderFocus::Excludes => RuleBuilderFocus::Tag,
+                    RuleBuilderFocus::ExcludeInput => RuleBuilderFocus::Tag,
+                    RuleBuilderFocus::Tag => RuleBuilderFocus::Extractions,
+                    RuleBuilderFocus::Extractions => RuleBuilderFocus::Options,
+                    RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Options,
+                    RuleBuilderFocus::Options => RuleBuilderFocus::FileList,
+                    RuleBuilderFocus::FileList => RuleBuilderFocus::Pattern,
+                    RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
+                };
+            }
+
+            // BackTab (Shift+Tab) cycles focus backwards
+            KeyCode::BackTab => {
+                builder.focus = match builder.focus {
+                    RuleBuilderFocus::Pattern => RuleBuilderFocus::FileList,
+                    RuleBuilderFocus::Excludes => RuleBuilderFocus::Pattern,
+                    RuleBuilderFocus::ExcludeInput => RuleBuilderFocus::Excludes,
+                    RuleBuilderFocus::Tag => RuleBuilderFocus::Excludes,
+                    RuleBuilderFocus::Extractions => RuleBuilderFocus::Tag,
+                    RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Extractions,
+                    RuleBuilderFocus::Options => RuleBuilderFocus::Extractions,
+                    RuleBuilderFocus::FileList => RuleBuilderFocus::Options,
+                    RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
+                };
+            }
+
+            // Escape cancels nested state (Rule Builder is persistent - no closing)
+            KeyCode::Esc => {
+                match builder.focus {
+                    RuleBuilderFocus::ExcludeInput => {
+                        builder.exclude_input.clear();
+                        builder.focus = RuleBuilderFocus::Excludes;
+                    }
+                    RuleBuilderFocus::ExtractionEdit(_) => {
+                        builder.focus = RuleBuilderFocus::Extractions;
+                    }
+                    RuleBuilderFocus::IgnorePicker => {
+                        builder.ignore_options.clear();
+                        builder.focus = RuleBuilderFocus::FileList;
+                    }
+                    _ => {
+                        // Rule Builder is the default Discover view - don't close
+                        // Reset focus to Pattern for a fresh start
+                        builder.focus = RuleBuilderFocus::Pattern;
+                    }
+                }
+            }
+
+            // Enter: confirm action based on focus (phase-aware for FileList)
+            KeyCode::Enter => {
+                use super::extraction::FileResultsPhase;
+                match builder.focus {
+                    RuleBuilderFocus::FileList => {
+                        // Phase-aware Enter behavior
+                        match builder.file_results_phase {
+                            FileResultsPhase::Exploration => {
+                                // Toggle folder expansion
+                                let idx = builder.selected_file;
+                                if builder.expanded_folder_indices.contains(&idx) {
+                                    builder.expanded_folder_indices.remove(&idx);
+                                } else {
+                                    builder.expanded_folder_indices.insert(idx);
+                                }
+                            }
+                            FileResultsPhase::ExtractionPreview => {
+                                // Could show file details or do nothing
+                            }
+                            FileResultsPhase::BacktestResults => {
+                                // Could show error details for failed files
+                            }
+                        }
+                    }
+                    RuleBuilderFocus::ExcludeInput => {
+                        // Add exclude pattern
+                        let pattern = builder.exclude_input.trim().to_string();
+                        if !pattern.is_empty() {
+                            builder.add_exclude(pattern);
+                        }
+                        builder.exclude_input.clear();
+                        builder.focus = RuleBuilderFocus::Excludes;
+                    }
+                    RuleBuilderFocus::Excludes => {
+                        // Start editing new exclude
+                        builder.focus = RuleBuilderFocus::ExcludeInput;
+                    }
+                    RuleBuilderFocus::IgnorePicker => {
+                        // Apply selected ignore option
+                        if let Some(option) = builder.ignore_options.get(builder.ignore_selected) {
+                            builder.add_exclude(option.pattern.clone());
+                        }
+                        builder.ignore_options.clear();
+                        builder.focus = RuleBuilderFocus::FileList;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Ctrl+S: Save rule
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if builder.can_save() {
+                    let _draft = builder.to_draft();
+                    // TODO: Save to database
+                    self.discover.status_message = Some((
+                        format!("Rule '{}' saved", builder.tag),
+                        false,
+                    ));
+                    // Stay in Rule Builder (it's the default view) - clear for next rule
+                    builder.pattern = "**/*".to_string();
+                    builder.tag.clear();
+                    builder.excludes.clear();
+                    builder.focus = RuleBuilderFocus::Pattern;
+                } else {
+                    self.discover.status_message = Some((
+                        "Cannot save: pattern and tag are required".to_string(),
+                        true,
+                    ));
+                }
+            }
+
+            // Navigation within sections (phase-aware for FileList)
+            KeyCode::Char('j') | KeyCode::Down => {
+                use super::extraction::FileResultsPhase;
+                match builder.focus {
+                    RuleBuilderFocus::FileList => {
+                        // Phase-aware navigation
+                        let max_index = match builder.file_results_phase {
+                            FileResultsPhase::Exploration => builder.folder_matches.len().saturating_sub(1),
+                            FileResultsPhase::ExtractionPreview => builder.preview_files.len().saturating_sub(1),
+                            FileResultsPhase::BacktestResults => builder.visible_indices.len().saturating_sub(1),
+                        };
+                        if max_index > 0 {
+                            builder.selected_file = (builder.selected_file + 1).min(max_index);
+                        }
+                    }
+                    RuleBuilderFocus::Excludes => {
+                        if !builder.excludes.is_empty() {
+                            builder.selected_exclude = (builder.selected_exclude + 1)
+                                .min(builder.excludes.len().saturating_sub(1));
+                        }
+                    }
+                    RuleBuilderFocus::Extractions => {
+                        if !builder.extractions.is_empty() {
+                            builder.selected_extraction = (builder.selected_extraction + 1)
+                                .min(builder.extractions.len().saturating_sub(1));
+                        }
+                    }
+                    RuleBuilderFocus::IgnorePicker => {
+                        if !builder.ignore_options.is_empty() {
+                            builder.ignore_selected = (builder.ignore_selected + 1)
+                                .min(builder.ignore_options.len().saturating_sub(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            KeyCode::Char('k') | KeyCode::Up => {
+                match builder.focus {
+                    RuleBuilderFocus::FileList => {
+                        builder.selected_file = builder.selected_file.saturating_sub(1);
+                    }
+                    RuleBuilderFocus::Excludes => {
+                        builder.selected_exclude = builder.selected_exclude.saturating_sub(1);
+                    }
+                    RuleBuilderFocus::Extractions => {
+                        builder.selected_extraction = builder.selected_extraction.saturating_sub(1);
+                    }
+                    RuleBuilderFocus::IgnorePicker => {
+                        builder.ignore_selected = builder.ignore_selected.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Delete exclude with 'd' or 'x'
+            KeyCode::Char('d') | KeyCode::Char('x') if builder.focus == RuleBuilderFocus::Excludes => {
+                builder.remove_exclude(builder.selected_exclude);
+            }
+
+            // Filter toggle in FileList (only in BacktestResults phase)
+            KeyCode::Char('a') if builder.focus == RuleBuilderFocus::FileList => {
+                use super::extraction::FileResultsPhase;
+                if matches!(builder.file_results_phase, FileResultsPhase::BacktestResults) {
+                    builder.result_filter = super::extraction::ResultFilter::All;
+                    builder.update_visible();
+                }
+            }
+            KeyCode::Char('p') if builder.focus == RuleBuilderFocus::FileList => {
+                use super::extraction::FileResultsPhase;
+                if matches!(builder.file_results_phase, FileResultsPhase::BacktestResults) {
+                    builder.result_filter = super::extraction::ResultFilter::PassOnly;
+                    builder.update_visible();
+                }
+            }
+            KeyCode::Char('f') if builder.focus == RuleBuilderFocus::FileList => {
+                use super::extraction::FileResultsPhase;
+                if matches!(builder.file_results_phase, FileResultsPhase::BacktestResults) {
+                    builder.result_filter = super::extraction::ResultFilter::FailOnly;
+                    builder.update_visible();
+                }
+            }
+
+            // 't' to run backtest (Phase 2 -> Phase 3) - only when not editing text
+            KeyCode::Char('t') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+                use super::extraction::FileResultsPhase;
+                if matches!(builder.file_results_phase, FileResultsPhase::ExtractionPreview) {
+                    // Transition to Backtest Results phase
+                    builder.file_results_phase = FileResultsPhase::BacktestResults;
+                    // Reset selection and populate matched_files from preview_files
+                    builder.selected_file = 0;
+                    builder.matched_files = builder.preview_files.iter().map(|pf| {
+                        super::extraction::RuleBuilderFile {
+                            path: pf.path.clone(),
+                            relative_path: pf.relative_path.clone(),
+                            extractions: pf.extractions.clone(),
+                            test_result: super::extraction::FileTestResult::NotTested,
+                        }
+                    }).collect();
+                    builder.visible_indices = (0..builder.matched_files.len()).collect();
+                    // TODO: Actually run backtest async and update test_result
+                }
+            }
+
+            // '1' opens Sources dropdown, '2' opens Tags dropdown (per spec Section 3)
+            KeyCode::Char('1') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+                self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                self.discover.sources_filter.clear();
+                return; // Exit early, don't continue to text input
+            }
+            KeyCode::Char('2') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+                self.transition_discover_state(DiscoverViewState::TagsDropdown);
+                self.discover.tags_filter.clear();
+                self.discover.preview_tag = self.discover.selected_tag;
+                return; // Exit early, don't continue to text input
+            }
+
+            // Text input for Pattern, Tag, and ExcludeInput
+            KeyCode::Char(c) => {
+                match builder.focus {
+                    RuleBuilderFocus::Pattern => {
+                        builder.pattern.push(c);
+                        builder.pattern_changed_at = Some(std::time::Instant::now());
+                        // Validate pattern
+                        match super::extraction::parse_custom_glob(&builder.pattern) {
+                            Ok(_) => builder.pattern_error = None,
+                            Err(e) => builder.pattern_error = Some(e.message),
+                        }
+                    }
+                    RuleBuilderFocus::Tag => {
+                        builder.tag.push(c);
+                    }
+                    RuleBuilderFocus::ExcludeInput => {
+                        builder.exclude_input.push(c);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Backspace for text input
+            KeyCode::Backspace => {
+                match builder.focus {
+                    RuleBuilderFocus::Pattern => {
+                        builder.pattern.pop();
+                        builder.pattern_changed_at = Some(std::time::Instant::now());
+                        // Re-validate pattern
+                        if builder.pattern.is_empty() {
+                            builder.pattern_error = None;
+                        } else {
+                            match super::extraction::parse_custom_glob(&builder.pattern) {
+                                Ok(_) => builder.pattern_error = None,
+                                Err(e) => builder.pattern_error = Some(e.message),
+                            }
+                        }
+                    }
+                    RuleBuilderFocus::Tag => {
+                        builder.tag.pop();
+                    }
+                    RuleBuilderFocus::ExcludeInput => {
+                        builder.exclude_input.pop();
+                    }
+                    _ => {}
+                }
+            }
+
+            _ => {}
+        }
+
+        // If pattern changed, update matched files
+        if let Some(builder) = &self.discover.rule_builder {
+            if builder.pattern != pattern_before {
+                let pattern = builder.pattern.clone();
+                self.update_rule_builder_files(&pattern);
+            }
+        }
+    }
+
     /// Create a source from a directory path
     fn create_source(&mut self, path: &str, name: &str) {
         // Note: Actual DB persistence would be done async via tick() or a separate task
@@ -3589,30 +3974,273 @@ impl App {
             String::new()
         };
 
-        // Get source_id for the rule
-        let source_id = self.discover.selected_source()
-            .and_then(|s| uuid::Uuid::parse_str(&s.id.to_string()).ok());
+        // Create RuleBuilderState (v3.0 consolidation)
+        let source_id_str = self.discover.selected_source()
+            .map(|s| s.id.to_string());
+        let mut builder_state = super::extraction::RuleBuilderState::new(source_id_str);
+        builder_state.pattern = initial_pattern.clone();
+        builder_state.tag = initial_tag;
 
-        // Create RuleDraft with prefilled values
-        let mut rule_draft = super::extraction::RuleDraft::from_pattern(&initial_pattern, source_id);
-        rule_draft.base_tag = initial_tag;
+        // Set the Rule Builder state and transition to RuleBuilder view
+        self.discover.rule_builder = Some(builder_state);
+        self.transition_discover_state(DiscoverViewState::RuleBuilder);
 
-        // Create GlobExplorer in EditRule phase (Rule Builder)
-        let mut explorer = GlobExplorerState::default();
-        explorer.pattern = initial_pattern;
-        explorer.rule_draft = Some(rule_draft);
-        explorer.phase = GlobExplorerPhase::EditRule {
-            focus: super::extraction::RuleEditorFocus::GlobPattern,
-            selected_index: 0,
-            editing_field: None,
-        };
-
-        // Set the explorer
-        self.discover.glob_explorer = Some(explorer);
-        self.discover.focus = DiscoverFocus::Files; // Focus on the explorer
+        // Populate files matching the initial pattern
+        self.update_rule_builder_files(&initial_pattern);
 
         // Trigger cache load for pattern matching
         self.load_folder_tree();
+    }
+
+    /// Update the Rule Builder's matched files based on the current pattern
+    /// Update the Rule Builder's file results based on the current pattern.
+    /// Detects phase based on whether pattern contains <field> placeholders.
+    fn update_rule_builder_files(&mut self, pattern: &str) {
+        use globset::GlobBuilder;
+        use super::extraction::{
+            RuleBuilderFile, FileTestResult, FileResultsPhase,
+            FolderMatch, ExtractionPreviewFile, parse_custom_glob, extract_field_values,
+        };
+
+        let builder = match self.discover.rule_builder.as_mut() {
+            Some(b) => b,
+            None => return,
+        };
+
+        if pattern.is_empty() {
+            builder.matched_files.clear();
+            builder.visible_indices.clear();
+            builder.folder_matches.clear();
+            builder.preview_files.clear();
+            builder.match_count = 0;
+            builder.file_results_phase = FileResultsPhase::Exploration;
+            return;
+        }
+
+        // Detect phase: Does pattern contain <field> placeholders?
+        let has_placeholders = pattern.contains('<') && pattern.contains('>');
+
+        if has_placeholders {
+            // Phase 2: Extraction Preview
+            builder.file_results_phase = FileResultsPhase::ExtractionPreview;
+            self.update_rule_builder_extraction_preview(pattern);
+        } else {
+            // Phase 1: Exploration (folder counts)
+            builder.file_results_phase = FileResultsPhase::Exploration;
+            self.update_rule_builder_exploration(pattern);
+        }
+    }
+
+    /// Phase 1: Exploration - Update folder matches with counts
+    fn update_rule_builder_exploration(&mut self, pattern: &str) {
+        use globset::GlobBuilder;
+        use super::extraction::FolderMatch;
+
+        // Get folder cache from GlobExplorer if available
+        let folder_cache = self.discover.glob_explorer.as_ref()
+            .map(|e| e.folder_cache.clone())
+            .unwrap_or_default();
+
+        let builder = match self.discover.rule_builder.as_mut() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Build glob matcher
+        let glob_pattern = if pattern.contains('/') {
+            pattern.to_string()
+        } else if pattern.is_empty() || pattern == "*" {
+            "**/*".to_string()
+        } else {
+            format!("**/{}", pattern)
+        };
+
+        let matcher = match GlobBuilder::new(&glob_pattern)
+            .case_insensitive(true)
+            .build()
+            .map(|g| g.compile_matcher())
+        {
+            Ok(m) => m,
+            Err(_) => {
+                builder.folder_matches.clear();
+                builder.match_count = 0;
+                builder.pattern_error = Some("Invalid pattern".to_string());
+                return;
+            }
+        };
+
+        builder.pattern_error = None;
+
+        // Collect all files from folder_cache and group by parent folder
+        let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
+            std::collections::HashMap::new();
+
+        // Recursive function to traverse folder cache
+        fn traverse_cache(
+            cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
+            prefix: &str,
+            matcher: &globset::GlobMatcher,
+            folder_counts: &mut std::collections::HashMap<String, (usize, String)>,
+        ) {
+            if let Some(items) = cache.get(prefix) {
+                for item in items {
+                    let full_path = if prefix.is_empty() {
+                        item.name.clone()
+                    } else {
+                        format!("{}{}", prefix, item.name)
+                    };
+
+                    if item.is_file {
+                        // It's a file - check if it matches
+                        if matcher.is_match(&full_path) {
+                            // Use the prefix as the folder path
+                            let folder = if prefix.is_empty() {
+                                ".".to_string()
+                            } else {
+                                prefix.trim_end_matches('/').to_string()
+                            };
+                            let entry = folder_counts.entry(folder).or_insert((0, item.name.clone()));
+                            entry.0 += 1;
+                        }
+                    } else {
+                        // It's a folder - recurse into it
+                        let sub_prefix = format!("{}/", full_path);
+                        traverse_cache(cache, &sub_prefix, matcher, folder_counts);
+                    }
+                }
+            }
+        }
+
+        // Start traversal from root
+        traverse_cache(&folder_cache, "", &matcher, &mut folder_counts);
+
+        // Convert to FolderMatch and sort by count descending
+        let mut folder_matches: Vec<FolderMatch> = folder_counts
+            .into_iter()
+            .filter(|(_, (count, _))| *count > 0)
+            .map(|(path, (count, sample))| FolderMatch {
+                path: if path == "." {
+                    "./".to_string()
+                } else {
+                    format!("{}/", path)
+                },
+                count,
+                sample_filename: sample,
+                files: Vec::new(), // Lazily populated on expand
+            })
+            .collect();
+
+        folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
+
+        builder.match_count = folder_matches.iter().map(|f| f.count).sum();
+        builder.folder_matches = folder_matches;
+        builder.selected_file = 0;
+    }
+
+    /// Phase 2: Extraction Preview - Show files with extracted values
+    fn update_rule_builder_extraction_preview(&mut self, pattern: &str) {
+        use globset::GlobBuilder;
+        use super::extraction::{ExtractionPreviewFile, parse_custom_glob, extract_field_values};
+
+        // Get folder cache from GlobExplorer if available
+        let folder_cache = self.discover.glob_explorer.as_ref()
+            .map(|e| e.folder_cache.clone())
+            .unwrap_or_default();
+
+        let builder = match self.discover.rule_builder.as_mut() {
+            Some(b) => b,
+            None => return,
+        };
+
+        // Parse the custom glob pattern with <field> placeholders
+        let parsed = match parse_custom_glob(pattern) {
+            Ok(p) => p,
+            Err(e) => {
+                builder.preview_files.clear();
+                builder.match_count = 0;
+                builder.pattern_error = Some(e.message);
+                return;
+            }
+        };
+
+        builder.pattern_error = None;
+
+        // Build glob matcher from the converted pattern
+        let glob_pattern = if parsed.glob_pattern.contains('/') {
+            parsed.glob_pattern.clone()
+        } else {
+            format!("**/{}", parsed.glob_pattern)
+        };
+
+        let matcher = match GlobBuilder::new(&glob_pattern)
+            .case_insensitive(true)
+            .build()
+            .map(|g| g.compile_matcher())
+        {
+            Ok(m) => m,
+            Err(_) => {
+                builder.preview_files.clear();
+                builder.match_count = 0;
+                builder.pattern_error = Some("Invalid glob pattern".to_string());
+                return;
+            }
+        };
+
+        // Collect all files from folder_cache
+        let mut all_files: Vec<String> = Vec::new();
+
+        fn collect_files(
+            cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
+            prefix: &str,
+            matcher: &globset::GlobMatcher,
+            files: &mut Vec<String>,
+            limit: usize,
+        ) {
+            if files.len() >= limit {
+                return;
+            }
+            if let Some(items) = cache.get(prefix) {
+                for item in items {
+                    if files.len() >= limit {
+                        return;
+                    }
+                    let full_path = if prefix.is_empty() {
+                        item.name.clone()
+                    } else {
+                        format!("{}{}", prefix, item.name)
+                    };
+
+                    if item.is_file {
+                        if matcher.is_match(&full_path) {
+                            files.push(full_path);
+                        }
+                    } else {
+                        let sub_prefix = format!("{}/", full_path);
+                        collect_files(cache, &sub_prefix, matcher, files, limit);
+                    }
+                }
+            }
+        }
+
+        collect_files(&folder_cache, "", &matcher, &mut all_files, 100);
+
+        // Convert to preview files with extractions
+        let preview_files: Vec<ExtractionPreviewFile> = all_files
+            .into_iter()
+            .map(|path| {
+                let extractions = extract_field_values(&path, &parsed);
+                ExtractionPreviewFile {
+                    path: path.clone(),
+                    relative_path: path,
+                    extractions,
+                    warnings: Vec::new(),
+                }
+            })
+            .collect();
+
+        builder.match_count = preview_files.len();
+        builder.preview_files = preview_files;
+        builder.selected_file = 0;
     }
 
     /// Close the rule creation dialog and reset state
@@ -4668,6 +5296,14 @@ impl App {
             self.update_folders_from_cache();
             // Load tags asynchronously since we can't await here
             self.discover.data_loaded = true;
+
+            // Update Rule Builder with preloaded cache data
+            if self.discover.view_state == DiscoverViewState::RuleBuilder {
+                if let Some(ref builder) = self.discover.rule_builder {
+                    let pattern = builder.pattern.clone();
+                    self.update_rule_builder_files(&pattern);
+                }
+            }
             return;
         }
 
@@ -4675,8 +5311,11 @@ impl App {
         let (tx, rx) = mpsc::channel::<CacheLoadMessage>(16);
         self.pending_cache_load = Some(rx);
 
-        // Initialize progress tracking
-        self.cache_load_progress = Some(CacheLoadProgress { files_processed: 0 });
+        // Initialize progress tracking with start time
+        self.cache_load_progress = Some(CacheLoadProgress {
+            files_processed: 0,
+            started_at: std::time::Instant::now(),
+        });
 
         // Initialize empty cache in explorer for streaming merge
         if let Some(ref mut explorer) = self.discover.glob_explorer {
@@ -4688,8 +5327,20 @@ impl App {
         tokio::spawn(async move {
             // First, try to load from disk cache (fast path - send as single Complete)
             let source_id_for_cache = source_id_str.clone();
+            let disk_cache_start = std::time::Instant::now();
             let cache_result = tokio::task::spawn_blocking(move || {
-                let folder_cache = FolderCache::load(&source_id_for_cache).ok()?;
+                let load_start = std::time::Instant::now();
+                let folder_cache = match FolderCache::load(&source_id_for_cache) {
+                    Ok(fc) => {
+                        tracing::info!(source_id = %source_id_for_cache, elapsed_ms = ?load_start.elapsed().as_millis(), "Disk cache loaded");
+                        fc
+                    }
+                    Err(e) => {
+                        tracing::debug!(source_id = %source_id_for_cache, error = %e, "Disk cache not found or failed");
+                        return None;
+                    }
+                };
+                let convert_start = std::time::Instant::now();
                 let cache: HashMap<String, Vec<FolderInfo>> = folder_cache.folders.iter()
                     .map(|(prefix, entries)| {
                         let folder_infos: Vec<FolderInfo> = entries.iter()
@@ -4702,10 +5353,20 @@ impl App {
                         (prefix.clone(), folder_infos)
                     })
                     .collect();
-                Some((cache, folder_cache.total_files))
+                // Convert TagSummary to TagInfo
+                let tags: Vec<TagInfo> = folder_cache.tags.iter()
+                    .map(|t| TagInfo {
+                        name: t.name.clone(),
+                        count: t.count,
+                        is_special: t.is_special,
+                    })
+                    .collect();
+                tracing::info!(elapsed_ms = ?convert_start.elapsed().as_millis(), entries = cache.len(), "Cache converted");
+                Some((cache, folder_cache.total_files, tags))
             }).await.ok().flatten();
 
-            if let Some((cache, total_files)) = cache_result {
+            if let Some((cache, total_files, tags)) = cache_result {
+                tracing::info!(source_id = %source_id_str, total_ms = ?disk_cache_start.elapsed().as_millis(), "Using disk cache (fast path)");
                 // Disk cache exists - send as single chunk then complete
                 let _ = tx.send(CacheLoadMessage::Chunk {
                     folders: cache,
@@ -4714,10 +5375,12 @@ impl App {
                 let _ = tx.send(CacheLoadMessage::Complete {
                     source_id: source_id_str,
                     total_files,
+                    tags,
                 }).await;
                 return;
             }
 
+            tracing::info!(source_id = %source_id_str, "Disk cache miss, using scout_folders fallback");
             // No disk cache - stream from DB using keyset pagination
             use sqlx::SqlitePool;
 
@@ -4812,10 +5475,14 @@ impl App {
                     }
                 }
 
+                // Query tags from scout_files (DB fallback path)
+                let tags = query_tags_from_db(&pool, &source_id_str, files_processed).await;
+
                 // Complete - no need for slow GROUP BY or streaming
                 let _ = tx.send(CacheLoadMessage::Complete {
                     source_id: source_id_str,
                     total_files: files_processed,
+                    tags,
                 }).await;
                 return;
             }
@@ -4921,10 +5588,14 @@ impl App {
                 }
             }
 
+            // Query tags from scout_files (streaming fallback path)
+            let tags = query_tags_from_db(&pool, &source_id_str, files_processed).await;
+
             // Send completion first so UI can proceed
             let _ = tx.send(CacheLoadMessage::Complete {
                 source_id: source_id_str.clone(),
                 total_files: files_processed,
+                tags,
             }).await;
 
             // ROBUST FIX: Populate scout_folders in background so next load is instant
@@ -4933,17 +5604,36 @@ impl App {
                 let path_count = all_paths.len();
                 let source_id_for_cache = source_id_str.clone();
                 let source_id_for_db = source_id_str.clone();
+                let source_id_for_tags = source_id_str.clone();
                 eprintln!("[scout_folders rebuild] Starting for {} with {} paths", source_id_str, path_count);
 
                 tokio::spawn(async move {
                     eprintln!("[scout_folders rebuild] Spawned task running");
 
+                    // Open DB first to query tags for disk cache
+                    let db_path = dirs::home_dir()
+                        .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+
+                    eprintln!("[scout_folders rebuild] Opening DB at {:?}", db_path);
+                    let db = match ScoutDatabase::open(&db_path).await {
+                        Ok(db) => db,
+                        Err(e) => {
+                            eprintln!("[scout_folders rebuild] Failed to open DB: {}", e);
+                            return;
+                        }
+                    };
+
+                    // Query tags for disk cache (before spawn_blocking)
+                    let tags = query_tags_for_cache(db.pool(), &source_id_for_tags, path_count).await;
+                    eprintln!("[scout_folders rebuild] Queried {} tags", tags.len());
+
                     // Compute folder deltas from collected paths (CPU-intensive)
                     let deltas = tokio::task::spawn_blocking(move || {
                         eprintln!("[scout_folders rebuild] spawn_blocking started");
 
-                        // Also save to disk cache while we have the data
-                        let folder_cache = FolderCache::build(&source_id_for_cache, &all_paths);
+                        // Also save to disk cache while we have the data (with tags!)
+                        let folder_cache = FolderCache::build_with_tags(&source_id_for_cache, &all_paths, tags);
                         let _ = folder_cache.save();
                         eprintln!("[scout_folders rebuild] Disk cache saved");
 
@@ -4962,20 +5652,6 @@ impl App {
                         eprintln!("[scout_folders rebuild] Deltas empty, returning early");
                         return;
                     }
-
-                    // Open writable DB connection to populate scout_folders
-                    let db_path = dirs::home_dir()
-                        .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-                        .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-                    eprintln!("[scout_folders rebuild] Opening DB at {:?}", db_path);
-                    let db = match ScoutDatabase::open(&db_path).await {
-                        Ok(db) => db,
-                        Err(e) => {
-                            eprintln!("[scout_folders rebuild] Failed to open DB: {}", e);
-                            return;
-                        }
-                    };
 
                     // Clear and repopulate scout_folders for this source
                     eprintln!("[scout_folders rebuild] Clearing folder cache for {}", source_id_for_db);
@@ -5075,6 +5751,82 @@ fn merge_folder_chunk(
     }
 }
 
+/// Query tag summaries from scout_files table (DB fallback when no disk cache)
+async fn query_tags_from_db(pool: &sqlx::SqlitePool, source_id: &str, total_files: usize) -> Vec<TagInfo> {
+    let mut tags = Vec::new();
+
+    // Add "All files" as first option
+    tags.push(TagInfo {
+        name: "All files".to_string(),
+        count: total_files,
+        is_special: true,
+    });
+
+    // Query distinct tags with counts
+    let tag_rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT tag, COUNT(*) as count
+        FROM scout_files
+        WHERE source_id = ? AND tag IS NOT NULL AND tag != ''
+        GROUP BY tag
+        ORDER BY count DESC, tag
+        "#
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (tag_name, count) in tag_rows {
+        tags.push(TagInfo {
+            name: tag_name,
+            count: count as usize,
+            is_special: false,
+        });
+    }
+
+    tags
+}
+
+/// Query tags for disk cache building (returns TagSummary for serialization)
+async fn query_tags_for_cache(pool: &sqlx::SqlitePool, source_id: &str, total_files: usize) -> Vec<crate::scout::TagSummary> {
+    use crate::scout::TagSummary;
+
+    let mut tags = Vec::new();
+
+    // Add "All files" as first option
+    tags.push(TagSummary {
+        name: "All files".to_string(),
+        count: total_files,
+        is_special: true,
+    });
+
+    // Query distinct tags with counts
+    let tag_rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT tag, COUNT(*) as count
+        FROM scout_files
+        WHERE source_id = ? AND tag IS NOT NULL AND tag != ''
+        GROUP BY tag
+        ORDER BY count DESC, tag
+        "#
+    )
+    .bind(source_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (tag_name, count) in tag_rows {
+        tags.push(TagSummary {
+            name: tag_name,
+            count: count as usize,
+            is_special: false,
+        });
+    }
+
+    tags
+}
+
 impl App {
     /// Check for profiler dump trigger file and export data.
     /// Used for testing integration - touch /tmp/casparian_profile_dump to trigger.
@@ -5089,10 +5841,24 @@ impl App {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+
+            // Format cache load timing if available
+            let cache_load_section = if let Some(ref timing) = self.last_cache_load_timing {
+                format!(
+                    "\n=== CACHE LOAD ===\nsource_id={}\nfiles_loaded={}\nload_duration_ms={:.1}\n",
+                    timing.source_id,
+                    timing.files_loaded,
+                    timing.duration_ms
+                )
+            } else {
+                String::new()
+            };
+
             let data = format!(
-                "=== PROFILER DUMP ===\ntimestamp={}\n{}\n=== ZONES ===\n{}\n=== FRAMES ===\n{}\n",
+                "=== PROFILER DUMP ===\ntimestamp={}\n{}{}\n=== ZONES ===\n{}\n=== FRAMES ===\n{}\n",
                 timestamp,
                 self.profiler.export_summary(),
+                cache_load_section,
                 self.profiler.export_zones(),
                 self.profiler.export_frames_tsv(30)
             );
@@ -5313,97 +6079,111 @@ impl App {
         });
     }
 
-    /// Load tags from files for the selected source
-    /// Tags are derived from actual file tags, not from rules
-    async fn load_tags_for_source(&mut self) {
-        use sqlx::SqlitePool;
-
-        // Get source ID for selected source
-        let source_id = match self.discover.sources.get(self.discover.selected_source_index()) {
-            Some(source) => source.id.clone(),
-            None => {
-                self.discover.tags.clear();
-                return;
-            }
-        };
+    /// Start non-blocking jobs load from processing queue database
+    fn start_jobs_load(&mut self) {
+        // Skip if already loading
+        if self.pending_jobs_load.is_some() {
+            return;
+        }
 
         let db_path = dirs::home_dir()
             .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
             .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
 
         if !db_path.exists() {
+            self.jobs_state.jobs_loaded = true;
             return;
         }
 
-        let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-        if let Ok(pool) = SqlitePool::connect(&db_url).await {
-            // Get total file count
-            let total_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ?"
-            )
-                .bind(source_id.as_str())
-                .fetch_one(&pool)
-                .await
-                .unwrap_or(0);
+        let (tx, rx) = mpsc::channel(1);
+        self.pending_jobs_load = Some(rx);
 
-            // Get distinct tags with counts
-            let query = r#"
-                SELECT tag, COUNT(*) as count
-                FROM scout_files
-                WHERE source_id = ? AND tag IS NOT NULL AND tag != ''
-                GROUP BY tag
-                ORDER BY count DESC, tag
-            "#;
+        // Spawn background task for DB query
+        tokio::spawn(async move {
+            use sqlx::SqlitePool;
 
-            let mut tags = Vec::new();
+            let db_url = format!("sqlite:{}?mode=ro", db_path.display());
+            if let Ok(pool) = SqlitePool::connect(&db_url).await {
+                let query = r#"
+                    SELECT
+                        q.id,
+                        q.file_version_id,
+                        q.plugin_name,
+                        q.status,
+                        q.claim_time,
+                        q.end_time,
+                        q.result_summary,
+                        q.error_message
+                    FROM cf_processing_queue q
+                    ORDER BY
+                        CASE q.status
+                            WHEN 'RUNNING' THEN 1
+                            WHEN 'QUEUED' THEN 2
+                            WHEN 'FAILED' THEN 3
+                            WHEN 'COMPLETED' THEN 4
+                        END,
+                        q.id DESC
+                    LIMIT 100
+                "#;
 
-            // Add "All files" as first option
-            tags.push(TagInfo {
-                name: "All files".to_string(),
-                count: total_count as usize,
-                is_special: true,
-            });
+                if let Ok(rows) = sqlx::query_as::<_, (i64, Option<i64>, String, String, Option<String>, Option<String>, Option<String>, Option<String>)>(query)
+                    .fetch_all(&pool)
+                    .await
+                {
+                    let jobs: Vec<JobInfo> = rows
+                        .into_iter()
+                        .map(|(id, file_version_id, plugin_name, status, claim_time, end_time, result_summary, error_message)| {
+                            let status = match status.as_str() {
+                                "RUNNING" => JobStatus::Running,
+                                "QUEUED" => JobStatus::Pending,
+                                "COMPLETED" => JobStatus::Completed,
+                                "FAILED" => JobStatus::Failed,
+                                _ => JobStatus::Pending,
+                            };
 
-            if let Ok(rows) = sqlx::query_as::<_, (String, i64)>(query)
-                .bind(source_id.as_str())
-                .fetch_all(&pool)
-                .await
-            {
-                for (tag_name, count) in rows {
-                    tags.push(TagInfo {
-                        name: tag_name,
-                        count: count as usize,
-                        is_special: false,
-                    });
+                            let started_at = claim_time
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                                .map(|dt| dt.with_timezone(&Local))
+                                .unwrap_or_else(Local::now);
+
+                            let completed_at = end_time
+                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                                .map(|dt| dt.with_timezone(&Local));
+
+                            let failures = if let Some(ref err) = error_message {
+                                vec![JobFailure {
+                                    file_path: String::new(),
+                                    error: err.clone(),
+                                    line: None,
+                                }]
+                            } else {
+                                vec![]
+                            };
+
+                            JobInfo {
+                                id,
+                                file_version_id,
+                                job_type: JobType::Parse,
+                                name: plugin_name,
+                                version: None,
+                                status,
+                                started_at,
+                                completed_at,
+                                items_total: 0,
+                                items_processed: if result_summary.is_some() { 1 } else { 0 },
+                                items_failed: if error_message.is_some() { 1 } else { 0 },
+                                output_path: None,
+                                output_size_bytes: None,
+                                backtest: None,
+                                failures,
+                            }
+                        })
+                        .collect();
+
+                    let _ = tx.send(jobs).await;
                 }
             }
-
-            // Get untagged count
-            let untagged_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND (tag IS NULL OR tag = '')"
-            )
-                .bind(source_id.as_str())
-                .fetch_one(&pool)
-                .await
-                .unwrap_or(0);
-
-            if untagged_count > 0 {
-                tags.push(TagInfo {
-                    name: "untagged".to_string(),
-                    count: untagged_count as usize,
-                    is_special: true,
-                });
-            }
-
-            self.discover.tags = tags;
-
-            // Clamp selected tag if it's out of bounds
-            if let Some(idx) = self.discover.selected_tag {
-                if idx >= self.discover.tags.len() {
-                    self.discover.selected_tag = None; // Reset to "All files"
-                }
-            }
-        }
+        });
     }
 
     /// Persist pending tag and rule writes to the database
@@ -5825,6 +6605,72 @@ impl App {
             }
             KeyCode::Char('0') => {
                 self.jobs_state.set_filter(None); // Show all
+            }
+            // Go to first job
+            KeyCode::Char('g') => {
+                self.jobs_state.selected_index = 0;
+            }
+            // Go to last job
+            KeyCode::Char('G') => {
+                self.jobs_state.selected_index = filtered_count.saturating_sub(1);
+            }
+            // Open filter dialog
+            KeyCode::Char('f') => {
+                self.jobs_state.transition_state(JobsViewState::FilterDialog);
+            }
+            // Stop running backtest (requires confirmation)
+            KeyCode::Char('S') => {
+                let jobs = self.jobs_state.filtered_jobs();
+                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
+                    if job.status == JobStatus::Running && job.job_type == JobType::Backtest {
+                        // TODO: Show confirmation dialog and stop backtest
+                    }
+                }
+            }
+            // Open output folder for completed jobs
+            KeyCode::Char('o') => {
+                let jobs = self.jobs_state.filtered_jobs();
+                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
+                    if job.status == JobStatus::Completed {
+                        if let Some(ref path) = job.output_path {
+                            // Try to open the folder in system file manager
+                            #[cfg(target_os = "macos")]
+                            let _ = std::process::Command::new("open").arg(path).spawn();
+                            #[cfg(target_os = "linux")]
+                            let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+                            #[cfg(target_os = "windows")]
+                            let _ = std::process::Command::new("explorer").arg(path).spawn();
+                        }
+                    }
+                }
+            }
+            // Clear completed jobs from the list
+            KeyCode::Char('x') => {
+                self.jobs_state.jobs.retain(|j| j.status != JobStatus::Completed);
+                // Clamp selection to valid range
+                if self.jobs_state.selected_index >= self.jobs_state.filtered_jobs().len() {
+                    self.jobs_state.selected_index = self.jobs_state.filtered_jobs().len().saturating_sub(1);
+                }
+            }
+            // Show help overlay
+            KeyCode::Char('?') => {
+                self.show_help = true;
+            }
+            // Open log viewer
+            KeyCode::Char('l') => {
+                if !self.jobs_state.filtered_jobs().is_empty() {
+                    self.jobs_state.transition_state(JobsViewState::LogViewer);
+                }
+            }
+            // Copy output path to clipboard
+            KeyCode::Char('y') => {
+                let jobs = self.jobs_state.filtered_jobs();
+                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
+                    if let Some(ref path) = job.output_path {
+                        // TODO: Copy to clipboard (requires clipboard crate or platform-specific impl)
+                        let _ = path; // Silence warning for now
+                    }
+                }
             }
             _ => {}
         }
@@ -6283,6 +7129,51 @@ impl App {
             }
         }
 
+        // Jobs mode: Trigger load on first visit or after poll interval
+        if self.mode == TuiMode::Jobs {
+            const JOBS_POLL_INTERVAL_MS: u64 = 2000; // Poll every 2 seconds when in Jobs view
+
+            let should_load = if !self.jobs_state.jobs_loaded {
+                // First load
+                true
+            } else if let Some(last_poll) = self.last_jobs_poll {
+                // Check if poll interval elapsed
+                last_poll.elapsed().as_millis() as u64 >= JOBS_POLL_INTERVAL_MS
+            } else {
+                false
+            };
+
+            if should_load && self.pending_jobs_load.is_none() {
+                self.start_jobs_load();
+            }
+        }
+
+        // Poll for pending jobs load results (non-blocking)
+        if let Some(ref mut rx) = self.pending_jobs_load {
+            let recv_result = {
+                #[cfg(feature = "profiling")]
+                let _zone = self.profiler.zone("jobs.poll");
+                rx.try_recv()
+            };
+
+            match recv_result {
+                Ok(jobs) => {
+                    self.jobs_state.jobs = jobs;
+                    self.jobs_state.jobs_loaded = true;
+                    self.last_jobs_poll = Some(std::time::Instant::now());
+                    self.pending_jobs_load = None;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Still loading - that's fine
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Channel closed, mark as loaded (empty jobs)
+                    self.jobs_state.jobs_loaded = true;
+                    self.pending_jobs_load = None;
+                }
+            }
+        }
+
         // Poll for background cache preload results (stores in memory for instant access later)
         if let Some(ref mut rx) = self.cache_preload_rx {
             #[cfg(feature = "profiling")]
@@ -6403,8 +7294,10 @@ impl App {
                         if let Some(ref mut explorer) = self.discover.glob_explorer {
                             merge_folder_chunk(&mut explorer.folder_cache, folders);
 
-                            // Update progress display
-                            self.cache_load_progress = Some(CacheLoadProgress { files_processed });
+                            // Update progress display (preserve started_at time)
+                            if let Some(ref mut progress) = self.cache_load_progress {
+                                progress.files_processed = files_processed;
+                            }
 
                             // Refresh visible folders if cache now has data for current prefix
                             if let Some(current_folders) = explorer.folder_cache.get(&explorer.current_prefix) {
@@ -6415,7 +7308,23 @@ impl App {
                             }
                         }
                     }
-                    Ok(CacheLoadMessage::Complete { source_id, total_files: _ }) => {
+                    Ok(CacheLoadMessage::Complete { source_id, total_files, tags }) => {
+                        // Record load timing before clearing progress
+                        if let Some(progress) = &self.cache_load_progress {
+                            let duration_ms = progress.started_at.elapsed().as_secs_f64() * 1000.0;
+                            self.last_cache_load_timing = Some(CacheLoadTiming {
+                                duration_ms,
+                                files_loaded: total_files,
+                                source_id: source_id.clone(),
+                            });
+                            tracing::info!(
+                                source_id = %source_id,
+                                files = total_files,
+                                duration_ms = format!("{:.1}", duration_ms),
+                                "Cache load complete"
+                            );
+                        }
+
                         // Cache fully loaded
                         if let Some(ref mut explorer) = self.discover.glob_explorer {
                             explorer.cache_loaded = true;
@@ -6430,13 +7339,21 @@ impl App {
                                 );
                             }
                         }
-                        self.pending_cache_load = None;
                         self.cache_load_progress = None;
-
-                        // Finish data loading
                         self.update_folders_from_cache();
-                        self.load_tags_for_source().await;
+
+                        // Tags came with the cache - no separate load needed
+                        self.discover.tags = tags;
                         self.discover.data_loaded = true;
+                        self.pending_cache_load = None;
+
+                        // Update Rule Builder with loaded cache data
+                        if self.discover.view_state == DiscoverViewState::RuleBuilder {
+                            if let Some(ref builder) = self.discover.rule_builder {
+                                let pattern = builder.pattern.clone();
+                                self.update_rule_builder_files(&pattern);
+                            }
+                        }
                         break;
                     }
                     Ok(CacheLoadMessage::Error(e)) => {
@@ -6465,9 +7382,25 @@ impl App {
             // Load files for selected source (also reloads tags when source changes)
             // Cache loading is non-blocking to avoid freezing UI on large sources
             if !self.discover.data_loaded {
-                // Always use Glob Explorer (hierarchical browsing)
+                // Initialize GlobExplorer for folder cache (data loading)
                 if self.discover.glob_explorer.is_none() {
                     self.discover.glob_explorer = Some(GlobExplorerState::default());
+                }
+
+                // Rule Builder is the default view (replaces old GlobExplorer UI per specs/rule_builder.md)
+                // Only initialize if we have a selected source and aren't in another modal state
+                if self.discover.rule_builder.is_none()
+                    && self.discover.selected_source_id.is_some()
+                    && matches!(self.discover.view_state, DiscoverViewState::Files)
+                {
+                    let source_id = self.discover.selected_source_id
+                        .as_ref()
+                        .map(|id| id.as_str().to_string())
+                        .unwrap_or_default();
+                    let mut builder = super::extraction::RuleBuilderState::new(Some(source_id));
+                    builder.pattern = "**/*".to_string();
+                    self.discover.rule_builder = Some(builder);
+                    self.discover.view_state = DiscoverViewState::RuleBuilder;
                 }
 
                 // Check if cache is still loading (not yet loaded)

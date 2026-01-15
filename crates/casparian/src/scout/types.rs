@@ -203,6 +203,13 @@ pub struct ScannedFile {
     pub processed_at: Option<DateTime<Utc>>,
     /// Sentinel job ID if submitted for processing
     pub sentinel_job_id: Option<i64>,
+    // --- Extractor metadata (Phase 6) ---
+    /// Raw extracted metadata as JSON blob
+    pub metadata_raw: Option<String>,
+    /// Extraction status
+    pub extraction_status: ExtractionStatus,
+    /// When metadata was last extracted
+    pub extracted_at: Option<DateTime<Utc>>,
 }
 
 impl ScannedFile {
@@ -227,6 +234,10 @@ impl ScannedFile {
             last_seen_at: now,
             processed_at: None,
             sentinel_job_id: None,
+            // Extractor metadata defaults (Phase 6)
+            metadata_raw: None,
+            extraction_status: ExtractionStatus::Pending,
+            extracted_at: None,
         }
     }
 
@@ -261,6 +272,10 @@ impl ScannedFile {
             last_seen_at: now,
             processed_at: None,
             sentinel_job_id: None,
+            // Extractor metadata defaults (Phase 6)
+            metadata_raw: None,
+            extraction_status: ExtractionStatus::Pending,
+            extracted_at: None,
         }
     }
 
@@ -268,6 +283,145 @@ impl ScannedFile {
     #[allow(dead_code)] // Will be used for processing integration
     pub fn is_manual(&self) -> bool {
         self.tag_source.as_deref() == Some("manual") || self.manual_plugin.is_some()
+    }
+}
+
+// ============================================================================
+// Extractor Types (Phase 6)
+// ============================================================================
+
+/// Status of metadata extraction for a file
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtractionStatus {
+    /// Not yet extracted
+    Pending,
+    /// Successfully extracted
+    Extracted,
+    /// Extraction timed out
+    Timeout,
+    /// Extractor crashed
+    Crash,
+    /// Metadata stale (extractor changed since extraction)
+    Stale,
+    /// Extraction failed with error
+    Error,
+}
+
+impl ExtractionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Extracted => "extracted",
+            Self::Timeout => "timeout",
+            Self::Crash => "crash",
+            Self::Stale => "stale",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "extracted" => Some(Self::Extracted),
+            "timeout" => Some(Self::Timeout),
+            "crash" => Some(Self::Crash),
+            "stale" => Some(Self::Stale),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ExtractionStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+/// A Python extractor that extracts metadata from file paths
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Extractor {
+    /// Unique identifier
+    pub id: String,
+    /// Human-readable name
+    pub name: String,
+    /// Path to the Python source file
+    pub source_path: String,
+    /// SHA-256 hash of the source code
+    pub source_hash: String,
+    /// Whether this extractor is enabled
+    pub enabled: bool,
+    /// Timeout per file in seconds
+    pub timeout_secs: u32,
+    /// Number of consecutive failures (for fail-fast)
+    pub consecutive_failures: u32,
+    /// When the extractor was auto-paused (None = not paused)
+    pub paused_at: Option<DateTime<Utc>>,
+    /// When the extractor was created
+    pub created_at: DateTime<Utc>,
+    /// When the extractor was last updated
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Extractor {
+    /// Check if extractor is paused due to failures
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
+}
+
+/// Log entry for extractor execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractionLogEntry {
+    /// Log entry ID
+    pub id: i64,
+    /// File ID that was processed
+    pub file_id: i64,
+    /// Extractor ID that ran
+    pub extractor_id: String,
+    /// Result status
+    pub status: ExtractionLogStatus,
+    /// Duration in milliseconds
+    pub duration_ms: Option<u64>,
+    /// Error message if failed
+    pub error_message: Option<String>,
+    /// Snapshot of extracted metadata
+    pub metadata_snapshot: Option<String>,
+    /// When the extraction ran
+    pub executed_at: DateTime<Utc>,
+}
+
+/// Status of an extraction log entry
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtractionLogStatus {
+    Success,
+    Timeout,
+    Crash,
+    Error,
+}
+
+impl ExtractionLogStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Timeout => "timeout",
+            Self::Crash => "crash",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "success" => Some(Self::Success),
+            "timeout" => Some(Self::Timeout),
+            "crash" => Some(Self::Crash),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
     }
 }
 

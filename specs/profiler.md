@@ -325,9 +325,10 @@ KeyCode::F12 => {
 
 ### 5.1 Toggle
 
-- **Key:** F12
+- **Key:** F12 (or backtick `` ` `` as fallback for Mac terminals)
 - **State:** `profiler.enabled: bool`
 - **Render order:** Last (overlays all other content)
+- **Note:** Some Mac terminal emulators intercept F12. Use backtick as alternative.
 
 ### 5.2 Data Timing
 

@@ -1,6 +1,6 @@
 # Casparian Flow: Product Strategy
 
-> Last updated: January 2026
+> Last updated: January 14, 2026
 
 ## Executive Summary
 
@@ -275,6 +275,7 @@ When AI features ship, 9 MCP tools will enable Claude Code integration:
 | **SQL/Parquet output** | Users query with familiar tools |
 | **SQLite default, Postgres for enterprise** | Simple start, enterprise scalability |
 | **AI in Phase 2** | Core value doesn't depend on AI; AI is productivity multiplier |
+| **Streaming deferred** | SQLite + ZMQ sufficient at current scale; Redpanda evaluated for future [→ Deep Dive](strategies/streaming_redpanda.md) |
 
 ---
 
@@ -873,6 +874,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 | 2026-01 | 2.1 | **Healthcare positioning fix:** Clarified Casparian is complementary to Mirth (archive analytics), not a replacement for real-time routing |
 | 2026-01 | 2.2 | **SBIR research:** Added program status note (expired Sept 2025, pending reauth); Identified best-fit topic A254-011; Created [dod_sbir_opportunities.md](strategies/dod_sbir_opportunities.md) |
 | 2026-01 | 2.3 | **Non-dilutive funding:** Added Open Core grant strategy; Created [non_dilutive_funding.md](strategies/non_dilutive_funding.md) with verified civilian funding sources (STF, NLNet, OTF, NIH) |
+| 2026-01 | 2.4 | **Streaming strategy:** Evaluated Redpanda/ADP for architecture; Documented phased approach (differentiate → complement → integrate); Created [streaming_redpanda.md](strategies/streaming_redpanda.md) |
 
 ---
 

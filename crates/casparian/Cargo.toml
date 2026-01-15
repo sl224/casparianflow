@@ -13,6 +13,7 @@ casparian_worker = { path = "../casparian_worker" }
 casparian_mcp = { path = "../casparian_mcp" }
 casparian_protocol = { path = "../casparian_protocol" }
 casparian_security = { path = "../casparian_security" }
+casparian_db = { path = "../casparian_db" }
 
 # Async runtime
 tokio.workspace = true

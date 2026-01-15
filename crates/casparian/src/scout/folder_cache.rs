@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Folder cache version - bump when format changes
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 /// Compressed folder cache stored on disk
 /// Uses segment interning for memory efficiency:
@@ -33,6 +33,10 @@ pub struct FolderCache {
     /// Key: prefix (e.g., "", "logs/", "logs/errors/")
     /// Value: list of (segment_idx, file_count, is_file)
     pub folders: HashMap<String, Vec<FolderEntry>>,
+    /// Tag summaries - computed at scan time
+    /// Includes "All files" (total), per-tag counts, sorted by count desc
+    #[serde(default)]
+    pub tags: Vec<TagSummary>,
 }
 
 /// Entry in a folder - references interned segment
@@ -46,10 +50,26 @@ pub struct FolderEntry {
     pub is_file: bool,
 }
 
+/// Tag summary for cache - computed at scan time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagSummary {
+    /// Tag name ("All files", "untagged", or actual tag)
+    pub name: String,
+    /// Number of files with this tag
+    pub count: usize,
+    /// True for "All files" and "untagged" special entries
+    pub is_special: bool,
+}
+
 impl FolderCache {
     /// Build cache from list of file paths
     /// This is O(n) where n = number of files
     pub fn build(source_id: &str, paths: &[(String,)]) -> Self {
+        Self::build_with_tags(source_id, paths, Vec::new())
+    }
+
+    /// Build cache from file paths with pre-computed tag summaries
+    pub fn build_with_tags(source_id: &str, paths: &[(String,)], tags: Vec<TagSummary>) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
 
         // F-008: Use IndexMap for segment interning - maintains insertion order,
@@ -133,6 +153,7 @@ impl FolderCache {
             built_at: now,
             segments,
             folders: final_folders,
+            tags,
         }
     }
 

@@ -5,6 +5,7 @@
 
 pub mod db;
 pub mod error;
+pub mod extractor;
 pub mod folder_cache;
 pub mod scanner;
 pub mod tagger;
@@ -12,9 +13,12 @@ pub mod types;
 
 // Re-exports for CLI usage
 pub use db::{Database, FolderEntry};
-pub use folder_cache::FolderCache;
+pub use extractor::{BatchExtractor, ExtractorConfig, ExtractorResult, ExtractorRunner};
+pub use folder_cache::{FolderCache, TagSummary};
 pub use scanner::{
     compute_folder_deltas_from_files, compute_folder_deltas_from_paths,
     merge_folder_deltas, FolderDelta, ScanConfig, ScanProgress, Scanner,
 };
-pub use types::{FileStatus, ScannedFile, Source, SourceType, TaggingRule};
+pub use types::{
+    ExtractionStatus, Extractor, FileStatus, ScannedFile, Source, SourceType, TaggingRule,
+};

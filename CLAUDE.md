@@ -66,6 +66,7 @@ The entire system should feel like "drag and drop your messy files, get clean da
 | `casparian` | Unified CLI binary | start, publish, scout commands |
 | `casparian_security` | Auth + signing | Ed25519, Azure AD |
 | `casparian_protocol` | Binary protocol | OpCodes, serialization |
+| `casparian_db` | Database abstraction | Feature flags, license gating |
 
 ---
 
@@ -463,6 +464,32 @@ cargo test --package casparian_mcp --test e2e_tools
 
 ## Database Architecture (CRITICAL)
 
+### Database Abstraction Layer (`casparian_db`)
+
+The `casparian_db` crate provides feature-gated, license-controlled database support:
+
+| Feature | License Tier | Status |
+|---------|--------------|--------|
+| `sqlite` | Community (free) | ✓ Default |
+| `postgres` | Professional | ✓ Available |
+| `mssql` | Enterprise | Planned |
+
+**License Gating:** Enterprise databases require a valid license file:
+- `CASPARIAN_LICENSE` environment variable
+- `~/.casparian_flow/license.json`
+- `./license.json`
+
+```rust
+use casparian_db::{DbConfig, create_pool, load_license};
+
+// SQLite (always works)
+let pool = create_pool(DbConfig::sqlite("./data.db")).await?;
+
+// PostgreSQL (requires Professional license)
+let license = load_license();
+let pool = create_pool(DbConfig::postgres("postgres://...", license)).await?;
+```
+
 ### Single Database Rule
 
 **Everything uses ONE database: `~/.casparian_flow/casparian_flow.sqlite3`**
@@ -470,6 +497,7 @@ cargo test --package casparian_mcp --test e2e_tools
 ```
 ~/.casparian_flow/
 ├── casparian_flow.sqlite3    # THE ONLY DATABASE
+├── license.json              # Enterprise license (optional)
 ├── venvs/                    # Content-addressable venv cache
 ├── parsers/                  # Deployed parser .py files
 ├── output/                   # Parser output (parquet, csv)

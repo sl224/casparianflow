@@ -40,6 +40,7 @@ pub mod config;
 pub mod draft;
 pub mod parser_lab;
 pub mod pathfinder;
+pub mod semantic_path;
 pub mod types;
 
 // Re-export commonly used types

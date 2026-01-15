@@ -1,11 +1,11 @@
 //! Job Queue implementation
 //!
-//! Provides atomic job claiming via SQL UPDATE ... WHERE for both SQLite and PostgreSQL.
+//! Provides atomic job claiming via SQL UPDATE ... WHERE.
 //! Ported from Python queue.py with improved type safety.
 
 use anyhow::Result;
+use casparian_db::{DbConfig, DbPool, create_pool};
 use chrono::Utc;
-use sqlx::{Pool, Sqlite};
 use tracing::{info, warn};
 
 use super::models::{DeadLetterJob, ParserHealth, ProcessingJob, QuarantinedRow};
@@ -30,25 +30,21 @@ pub struct PluginDetails {
     pub env_hash: Option<String>,
 }
 
+/// Job queue for managing processing jobs.
 pub struct JobQueue {
-    pool: Pool<Sqlite>,
+    pool: DbPool,
 }
 
 impl JobQueue {
-    pub fn new(pool: Pool<Sqlite>) -> Self {
+    /// Create a JobQueue from an existing pool.
+    pub fn new(pool: DbPool) -> Self {
         Self { pool }
     }
 
-    /// Open a JobQueue from a database path (convenience constructor for CLI)
+    /// Open a JobQueue from a database path (convenience constructor for CLI).
     pub async fn open(db_path: &std::path::Path) -> Result<Self> {
-        use sqlx::sqlite::SqlitePoolOptions;
-
-        let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await?;
-
+        let config = DbConfig::sqlite(&db_path.display().to_string());
+        let pool = create_pool(config).await?;
         Ok(Self { pool })
     }
 
@@ -763,7 +759,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    async fn setup_test_db() -> Pool<Sqlite> {
+    async fn setup_test_db() -> DbPool {
         let pool = SqlitePoolOptions::new()
             .connect(":memory:")
             .await
