@@ -73,7 +73,8 @@ impl IterationConfig {
 }
 
 /// A single backtest iteration result
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// F-015: All fields are Copy, so derive Copy for efficiency
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BacktestIteration {
     /// Which iteration this is
     pub iteration: usize,
@@ -227,9 +228,10 @@ pub trait MutableParser: ParserRunner {
 }
 
 /// Run the backtest loop with automatic parser refinement
+/// F-009: Take files by reference to avoid cloning
 pub async fn run_backtest_loop<P: MutableParser>(
     parser: &mut P,
-    files: Vec<FileInfo>,
+    files: &[FileInfo],
     high_failure_table: &HighFailureTable,
     scope_id: &Uuid,
     config: &IterationConfig,
@@ -243,9 +245,10 @@ pub async fn run_backtest_loop<P: MutableParser>(
         let parser_version = parser.version();
 
         // Run backtest
+        // F-009: Pass files by reference instead of cloning
         let result = backtest_with_failfast(
             parser,
-            files.clone(),
+            &files,
             high_failure_table,
             scope_id,
             parser_version,
@@ -320,9 +323,10 @@ pub async fn run_backtest_loop<P: MutableParser>(
 }
 
 /// Simple backtest runner (single iteration, no loop)
+/// F-009: Take files by reference
 pub async fn run_single_backtest<P: ParserRunner>(
     parser: &P,
-    files: Vec<FileInfo>,
+    files: &[FileInfo],
     high_failure_table: &HighFailureTable,
     scope_id: &Uuid,
     parser_version: usize,
@@ -481,7 +485,7 @@ mod tests {
             FileInfo::new("/path/c.csv", 100),
         ];
 
-        let result = run_backtest_loop(&mut parser, files, &table, &scope_id, &config).await.expect("run backtest loop");
+        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.expect("run backtest loop");
 
         // Should complete in 3 iterations (start with 2 failing, fix one each time)
         assert_eq!(result.termination_reason, TerminationReason::PassRateAchieved);
@@ -512,7 +516,7 @@ mod tests {
             FileInfo::new("/path/b.csv", 100),
         ];
 
-        let result = run_backtest_loop(&mut parser, files, &table, &scope_id, &config).await.expect("run backtest loop");
+        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.expect("run backtest loop");
 
         // Should stop after 1 iteration (no fixes possible)
         assert!(matches!(
@@ -540,7 +544,7 @@ mod tests {
 
         let result = run_single_backtest(
             &parser,
-            files,
+            &files,
             &table,
             &scope_id,
             1,

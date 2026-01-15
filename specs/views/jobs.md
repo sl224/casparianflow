@@ -1,607 +1,588 @@
-# Jobs - TUI View Spec
+# Jobs View - Specification
 
-**Status:** Draft
+**Status:** Ready for Implementation
 **Parent:** specs/tui.md (Master TUI Spec)
-**Version:** 1.0
-
-> **Note:** For global keybindings, layout patterns, and common UI elements,
-> see the master TUI spec at `specs/tui.md`.
-
-> **Schema Requirement:** This view requires `cf_job_logs` table and circuit breaker
-> columns in `cf_job_status`. See Section 7 for details.
+**Version:** 2.0
+**Related:** specs/views/discover.md, specs/views/parser_bench.md
+**Last Updated:** 2026-01-14
+**Refined via:** spec_refinement_workflow_v2 (2 rounds)
 
 ---
 
 ## 1. Overview
 
-The **Jobs** view monitors running and completed jobs, displays logs, and allows job management (cancel, retry, view details). It is the operational command center for tracking parser execution and pipeline health.
-
-### 1.1 Design Philosophy
-
-- **Real-time visibility**: Live progress updates for running jobs
-- **Quick triage**: Failed jobs surfaced prominently for immediate action
-- **Operational focus**: Cancel, retry, and clear actions one key away
-- **Log access**: Full log history without leaving the view
-- **Circuit breaker awareness**: Paused parsers visible and actionable
-
-### 1.2 Core Entities
-
-```
-~/.casparian_flow/casparian_flow.sqlite3
-
-Tables queried:
-├── cf_job_status        # Job lifecycle (queued/running/complete/failed/cancelled/paused)
-├── cf_parsers           # Parser name, version for display
-├── cf_job_logs          # Log entries per job (REQUIRES MIGRATION)
-└── cf_processing_history # File processing records for job details
-```
-
-### 1.3 User Goals
-
-| Goal | How Jobs Helps |
-|------|----------------|
-| "Is my job running?" | Active jobs show progress bars with ETA |
-| "Why did it fail?" | Error summary inline, full logs one key away |
-| "Fix and retry" | `R` re-queues failed job with same parameters |
-| "Stop runaway job" | `c` cancels with confirmation |
-| "Clean up clutter" | `x` clears completed jobs from view |
-| "What's paused?" | Circuit breaker status visible with resume option |
+The Jobs view shows processing activity with three purposes:
+1. **Find problems fast** - Failed jobs surface immediately
+2. **Know where output is** - Paths are always visible
+3. **Monitor throughput** - Live metrics via dedicated panel
 
 ---
 
-## 2. User Workflows
+## 2. User Questions This View Answers
 
-### 2.1 Monitor Active Job
+| Question | Answer Location |
+|----------|-----------------|
+| "What failed?" | Failed jobs pinned to top with error |
+| "Where's my output?" | Output path on every completed job |
+| "How far along?" | Progress bar on running jobs |
+| "How much is done?" | Status bar + Pipeline summary |
+| "How fast is it going?" | Monitoring panel (rows/sec, sink stats) |
+| "Is my parser ready?" | Backtest job shows pass rate |
 
-```
-1. User navigates to Jobs view (press '3' from any view)
-2. Jobs view displays list with running job at top:
-   ┌─ Job List ─────────────────┐
-   │ ● sales_parser    Running  │
-   │   ████████░░░░ 67%         │
-   │   847 / 1,247 files        │
-   └────────────────────────────┘
-3. Progress bar updates every 500ms
-4. User sees ETA in detail panel: "~2m 30s remaining"
-5. When complete, status changes to ✓ with green indicator
-6. Toast appears: "sales_parser completed (1,247 files)"
-```
+---
 
-### 2.2 Investigate Failed Job
+## 3. Layout
+
+### 3.1 Default View (Pipeline Collapsed)
 
 ```
-1. User sees "1 failed" in Home tile, presses '3' to open Jobs
-2. Failed jobs appear with ✗ indicator
-3. User selects failed job (already selected if most recent)
-4. Detail panel shows error summary
-5. User presses 'l' to view full log
-6. Log viewer opens with scrollable output
-7. User identifies issue, presses Esc to close log
-8. User presses 'R' to retry after fixing source data
+┌─ JOBS ─────────────────────────────────────────────────────────────────────────┐
+│                                                                                │
+│  ↻ 2 running   ✓ 3 done   ✗ 1 failed     1,235/1,247 files • 847 MB output    │
+│                                                                                │
+│  ══════════════════════════════════════════════════════════════════════════════ │
+│                                                                                │
+│▸ ✗ PARSE    fix_parser v1.2                                        2m ago     │
+│             12 files failed • SchemaViolation at row 42                       │
+│             First failure: venue_nyse_20240115.log                            │
+│                                                                                │
+│  ↻ BACKTEST fix_parser v1.3 (iter 3)                   ████████░░░░  87%     │
+│             Pass: 108/124 files • 5 high-failure passed                       │
+│                                                                                │
+│  ↻ EXPORT   concordance → ./production_001/          ████████░░░░  67%       │
+│             30,521/45,782 records • ETA 6m                                    │
+│                                                                                │
+│  ✓ PARSE    fix_parser v1.2                                        2m ago     │
+│             1,235 files → ~/.casparian_flow/output/fix_orders/ (847 MB)      │
+│                                                                                │
+│  ✓ SCAN     /data/fix_logs • 1,247 files                          15m ago     │
+│                                                                                │
+├────────────────────────────────────────────────────────────────────────────────┤
+│  [j/k] Navigate  [Enter] Details  [P] Pipeline  [m] Monitor  [?] Help         │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.3 Cancel Running Job
+### 3.2 With Pipeline Summary (Toggle `P`)
 
 ```
-1. User sees runaway job consuming resources
-2. Selects job in list, presses 'c'
-3. Confirmation dialog appears
-4. User presses Enter to confirm
-5. Job status changes to ⊘ Cancelled
-6. Toast: "sales_parser cancelled"
-```
-
-### 2.4 Retry Failed Job
-
-```
-1. User selects failed job in list
-2. Presses 'R' to retry
-3. If job failed due to fixable error:
-   - Job is re-queued with same parameters
-   - Status changes from ✗ to ○ (queued)
-   - Toast: "invoice_parse queued for retry"
-4. If job failed due to parser error:
-   - Dialog suggests: "Parser may need fixes. Open in Parser Bench?"
-```
-
-### 2.5 Filter Jobs by Status
-
-```
-1. User wants to see only failed jobs
-2. Presses 'f' to open filter dropdown
-3. User navigates with j/k, selects "Failed"
-4. List filters to show only failed jobs
-5. Filter indicator appears in header: "Filter: Failed (3)"
-```
-
-### 2.6 View Full Job Logs
-
-```
-1. User selects job and presses 'l'
-2. Log viewer opens (full-height panel)
-3. User scrolls with j/k, searches with '/'
-4. Search highlights matching lines, n/N navigates
-5. Press Esc to return to job list
-```
-
-### 2.7 Resume Paused Parser (Circuit Breaker)
-
-```
-1. User sees paused job with ⏸ indicator
-2. Detail panel shows circuit breaker info
-3. User presses 'u' to manually resume
-4. Confirmation: "Resume report_gen? Circuit breaker will reset."
-5. Job resumes, status changes to ↻ Running
-```
-
-### 2.8 Clear Completed Jobs
-
-```
-1. Job list cluttered with old completed jobs
-2. User presses 'x' to clear
-3. Confirmation dialog
-4. User confirms, completed jobs removed from list
+┌─ JOBS ─────────────────────────────────────────────────────────────────────────┐
+│                                                                                │
+│  ┌─ PIPELINE ────────────────────────────────────────────────────────────────┐ │
+│  │   SOURCE              PARSED               OUTPUT                         │ │
+│  │   ┌────────┐         ┌────────┐          ┌────────┐                       │ │
+│  │   │ 1,247  │  ────▶  │ 1,235  │  ────▶   │ 2 ready│                       │ │
+│  │   │ files  │   @12   │ files  │    @1    │ 1 run  │                       │ │
+│  │   └────────┘         └────────┘          └────────┘                       │ │
+│  │   fix_parser v1.2: 1,235 processed • 847 MB output                        │ │
+│  └───────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                │
+│  ↻ 2 running   ✓ 3 done   ✗ 1 failed                                          │
+│  ══════════════════════════════════════════════════════════════════════════════ │
+│                                                                                │
+│▸ ✗ PARSE    fix_parser v1.2                                        2m ago     │
+│             ...                                                                │
 ```
 
 ---
 
-## 3. Layout Specification
+## 4. Job Type Rendering
 
-### 3.1 Full Layout
+### 4.1 Scan Job
 
 ```
-┌─ Casparian Flow ───────────────────────────────────────────────────────┐
-│ Home > Jobs                                    Filter: All  [?] Help   │
-├─ Job List ─────────────────────┬─ Details ─────────────────────────────┤
-│                                │                                       │
-│ ↻ sales_parser      Running    │  Job: sales_parser                    │
-│   ████████████░░░░░░ 67%       │  Status: Running                      │
-│   847 / 1,247 files            │  Parser: sales_parser v1.0.0          │
-│                                │  Started: 10:32:15                    │
-│ ✓ log_analyzer     Complete    │  Duration: 2m 32s                     │
-│   1,247 files       2m ago     │  ETA: ~1m 15s                         │
-│                                │                                       │
-│ ✗ invoice_parse    Failed      │  ─────────────────────────────────    │
-│   SchemaViolation at row 42    │  Progress                             │
-│                                │  Files: 847 / 1,247                   │
-│ ○ report_gen       Queued      │  Errors: 0                            │
-│   Waiting...                   │  Warnings: 3                          │
-│                                │                                       │
-│ ⊘ daily_sync       Cancelled   │  ─────────────────────────────────    │
-│   User cancelled   5m ago      │  Recent Log:                          │
-│                                │  [10:34:45] Processing batch 17...    │
-│ ⏸ etl_job          Paused      │  [10:34:46] Warning: null value       │
-│   Circuit breaker tripped      │  [10:34:47] Batch 17 complete         │
-│                                │                                       │
-├────────────────────────────────┴───────────────────────────────────────┤
-│ [c] Cancel  [R] Retry  [l] Logs  [u] Resume  [f] Filter  [x] Clear     │
-└────────────────────────────────────────────────────────────────────────┘
+✓ SCAN     /data/fix_logs • 1,247 files                          15m ago
 ```
 
-### 3.2 Component Breakdown
+One line. Path scanned, file count, timestamp.
 
-| Component | Size | Purpose |
-|-----------|------|---------|
-| Header | 1 line | Breadcrumb, filter indicator, help hint |
-| Job List | 40% width | Scrollable job list with status indicators |
-| Details Panel | 60% width | Selected job details, progress, logs |
-| Footer | 1 line | Context-sensitive action hints |
+### 4.2 Parse Job (Complete)
 
-### 3.3 Job States (per tui.md Section 5.3)
+```
+✓ PARSE    fix_parser v1.2                                        2m ago
+           1,235 files → ~/.casparian_flow/output/fix_orders/ (847 MB)
+```
 
-| State | Indicator | Color |
-|-------|-----------|-------|
-| Queued | `○` | Gray |
-| Running | `↻` | Blue |
-| Complete | `✓` | Green |
-| Failed | `✗` | Red |
-| Cancelled | `⊘` | Gray |
-| Paused | `⏸` | Yellow |
+Two lines. Parser name/version, file count, **output path**, size.
+
+### 4.3 Parse Job (Failed)
+
+```
+✗ PARSE    fix_parser v1.2                                        2m ago
+           12 files failed • SchemaViolation at row 42
+           First failure: venue_nyse_20240115.log
+```
+
+Three lines. Error summary, **first failing file**.
+
+### 4.4 Parse Job (Running)
+
+```
+↻ PARSE    fix_parser v1.2                            ████████░░░░  67%
+           892/1,247 files • ETA 4m
+```
+
+### 4.5 Export Job (Complete)
+
+```
+✓ EXPORT   concordance → ./production_001/ (156 MB)               5m ago
+           45,782 records • Bates SMITH000001-045782
+```
+
+### 4.6 Export Job (Running)
+
+```
+↻ EXPORT   concordance → ./production_001/          ████████░░░░  67%
+           30,521/45,782 records • ETA 6m
+```
+
+### 4.7 Backtest Job (Running)
+
+```
+↻ BACKTEST fix_parser v1.3 (iter 3)                   ████████░░░░  87%
+           Pass: 108/124 files • 5 high-failure passed
+```
+
+Two lines. Iteration number, pass rate as progress, high-failure status.
+
+### 4.8 Backtest Job (Complete)
+
+```
+✓ BACKTEST fix_parser v1.3                                        1h ago
+           Pass rate: 99.2% (496/500) • All high-failure resolved
+```
+
+### 4.9 Backtest Job (Failed/Stopped)
+
+```
+✗ BACKTEST broken_parser v0.1                                    30m ago
+           Pass rate: 23% (12/52) • Early stop: high-failure failing
+           First failure: corrupt_file_001.csv
+```
 
 ---
 
-## 4. State Machine
+## 5. Monitoring Panel
 
-### 4.1 State Diagram
+Press `m` to open monitoring panel (sub-state of Jobs view).
 
 ```
-                            ┌─────────────┐
-                            │   LOADING   │
-                            └──────┬──────┘
-                                   │ Data loaded
-                                   ▼
-                ┌──────────────────────────────────────┐
-                │                                      │
-                │            JOB_LIST                  │◄────────────────┐
-                │       (default jobs state)          │                 │
-                │                                      │                 │
-                └───┬──────────┬──────────┬───────────┘                 │
-                    │          │          │                              │
-                'l' │      'c' │      'f' │                              │
-                    ▼          ▼          ▼                              │
-            ┌───────────┐ ┌───────────┐ ┌───────────┐                   │
-            │   LOG     │ │  CONFIRM  │ │  FILTER   │                   │
-            │  VIEWER   │ │  DIALOG   │ │  DIALOG   │                   │
-            └─────┬─────┘ └─────┬─────┘ └─────┬─────┘                   │
-                  │             │             │                          │
-            Esc   │       Esc/  │       Esc/  │                          │
-                  │       Enter │       Select│                          │
-                  └─────────────┴─────────────┴──────────────────────────┘
+┌─ MONITORING ───────────────────────────────────────────────────────────────────┐
+│                                                                                │
+│  QUEUE                              THROUGHPUT (5m)                            │
+│  ┌─────────────────────────────┐    ┌─────────────────────────────────────┐    │
+│  │  Pending:    45             │    │         ▄                           │    │
+│  │  Running:     3             │    │     ▃▅ ▆█    ▄                      │    │
+│  │  Done:    1,247             │    │    ▅███ ██  ███                     │    │
+│  │  Failed:     12             │    │   ████████ █████ ▃▄                 │    │
+│  │                             │    │  ███████████████████ ▅▆             │    │
+│  │  Depth: ▁▂▃▄█████▆▄▃▂       │    │ ███████████████████████▆▇           │    │
+│  └─────────────────────────────┘    │ 2.4k rows/s avg      3.1k now ▲     │    │
+│                                     └─────────────────────────────────────┘    │
+│                                                                                │
+│  SINKS                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │  parquet://output/                    847 MB total    45 errors         │   │
+│  │    └─ fix_orders                      623 MB   1,847,234 rows           │   │
+│  │    └─ venue_data                      224 MB     523,891 rows           │   │
+│  │                                                                          │   │
+│  │  sqlite:///data.db                    1.2 GB total     0 errors         │   │
+│  │    └─ transactions                    45,782 rows                       │   │
+│  │                                                                          │   │
+│  │  Write latency: 12ms (p50)  45ms (p99)                                  │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                │
+├────────────────────────────────────────────────────────────────────────────────┤
+│  [Esc] Back  [p] Pause updates  [r] Reset stats                               │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 State Definitions
+### 5.1 Monitoring Metrics
 
-| State | Description | Entry Condition |
-|-------|-------------|-----------------|
-| LOADING | Fetching jobs from database | View initialized |
-| JOB_LIST | Main state, browsing jobs | Data loaded |
-| LOG_VIEWER | Full-screen log viewer | Press 'l' |
-| CONFIRM_DIALOG | Confirmation for destructive action | Press 'c', 'x', 'u' |
-| FILTER_DIALOG | Status filter dropdown | Press 'f' |
-
-### 4.3 State Transitions
-
-| From | Event | To | Side Effects |
-|------|-------|-----|--------------|
-| LOADING | Data ready | JOB_LIST | Render job list |
-| LOADING | Error | JOB_LIST | Show error toast |
-| JOB_LIST | 'l' pressed | LOG_VIEWER | Load full logs |
-| JOB_LIST | 'c' pressed | CONFIRM_DIALOG | Show cancel confirmation |
-| JOB_LIST | 'x' pressed | CONFIRM_DIALOG | Show clear confirmation |
-| JOB_LIST | 'u' pressed | CONFIRM_DIALOG | Show resume confirmation |
-| JOB_LIST | 'R' pressed | JOB_LIST or CONFIRM | Retry job (may show suggestion) |
-| JOB_LIST | 'f' pressed | FILTER_DIALOG | Open filter dropdown |
-| LOG_VIEWER | Esc pressed | JOB_LIST | Close viewer |
-| LOG_VIEWER | '/' pressed | LOG_VIEWER | Enter search mode |
-| CONFIRM_DIALOG | Esc pressed | JOB_LIST | Cancel action |
-| CONFIRM_DIALOG | Enter pressed | JOB_LIST | Execute action, refresh |
-| CONFIRM_DIALOG | Action failed | JOB_LIST | Show error toast |
-| FILTER_DIALOG | Esc pressed | JOB_LIST | Cancel, keep current filter |
-| FILTER_DIALOG | Enter pressed | JOB_LIST | Apply selected filter |
+| Panel | Metrics Shown |
+|-------|---------------|
+| Queue | Pending/Running/Done/Failed counts, queue depth sparkline |
+| Throughput | Rows/sec over 5 minutes, current vs average |
+| Sinks | Per-sink totals (rows, bytes, errors), write latency |
 
 ---
 
-## 5. View-Specific Keybindings
+## 6. State Machine
 
-> **Note:** Global keybindings (1-4, 0, H, ?, q, Esc, r for refresh) are defined in `specs/tui.md`.
+```
+                         JOB_LIST
+                        (default)
+                            │
+         ┌──────────┬───────┼───────┬──────────┬──────────┐
+         │          │       │       │          │          │
+     Enter│       'l'│    'f'│    'm'│       'P'│          │
+         ▼          ▼       ▼       ▼          │          │
+    ┌─────────┐ ┌───────┐ ┌──────┐ ┌─────────┐ │          │
+    │ DETAIL  │ │ LOGS  │ │FILTER│ │MONITORING│ │          │
+    │ PANEL   │ │VIEWER │ │DIALOG│ │ PANEL   │ │          │
+    └────┬────┘ └───┬───┘ └──┬───┘ └────┬────┘ │          │
+         │          │        │          │      │          │
+       Esc│       Esc│   Esc/Enter    Esc│     │(toggle)  │
+         │          │        │          │      │          │
+         └──────────┴────────┴──────────┴──────┘          │
+                             │                             │
+                             ▼                             │
+                         JOB_LIST ◄────────────────────────┘
+                    (show_pipeline toggled)
+```
 
-### 5.1 Job List State
+**States:**
 
-| Key | Action | Description |
-|-----|--------|-------------|
-| `c` | Cancel job | Cancel selected running job |
-| `R` | Retry job | Retry selected failed job (capital R) |
-| `l` | View logs | Open full log viewer |
-| `u` | Resume | Resume paused job (circuit breaker) |
-| `f` | Filter | Open status filter dropdown |
-| `x` | Clear completed | Remove completed jobs from list |
-| `j` / `↓` | Next job | Move selection down |
-| `k` / `↑` | Previous job | Move selection up |
-| `g` | First job | Jump to first job |
-| `G` | Last job | Jump to last job |
-| `Enter` | Toggle details | Expand/collapse detail panel |
-| `Tab` | Switch panel | Move focus between list and details |
+| State | Entry | Exit | Behavior |
+|-------|-------|------|----------|
+| JOB_LIST | Default | - | Browse jobs, j/k navigate |
+| DETAIL_PANEL | Enter | Esc | Show full job details |
+| LOG_VIEWER | l | Esc | Full-screen logs |
+| FILTER_DIALOG | f | Esc/Enter | Filter by type/status |
+| MONITORING_PANEL | m | Esc | Live metrics dashboard |
 
-### 5.2 Log Viewer State
-
-> **Note:** `n/N` for search navigation follows vim convention, overriding global "New" pattern in this context.
-
-| Key | Action | Description |
-|-----|--------|-------------|
-| `j` / `↓` | Scroll down | Move down one line |
-| `k` / `↑` | Scroll up | Move up one line |
-| `Ctrl+d` | Page down | Scroll down half page |
-| `Ctrl+u` | Page up | Scroll up half page |
-| `g` | Go to top | Jump to first log line |
-| `G` | Go to bottom | Jump to last log line |
-| `/` | Search | Open search input |
-| `n` | Next match | Jump to next search match (vim standard) |
-| `N` | Previous match | Jump to previous search match |
-| `Esc` | Close | Return to job list |
-| `w` | Toggle wrap | Toggle line wrapping |
-
-### 5.3 Filter Dialog State
-
-| Key | Action | Description |
-|-----|--------|-------------|
-| `j` / `↓` | Next option | Move to next filter option |
-| `k` / `↑` | Previous option | Move to previous option |
-| `Enter` | Apply filter | Apply selected filter, close dialog |
-| `Esc` | Cancel | Close dialog, keep current filter |
-
-### 5.4 Confirm Dialog State
-
-| Key | Action | Description |
-|-----|--------|-------------|
-| `Enter` | Confirm | Execute the action |
-| `Esc` | Cancel | Close dialog, no action |
-| `Tab` | Switch button | Move between Confirm/Cancel buttons |
+`P` toggles `show_pipeline` flag without changing state.
 
 ---
 
-## 6. Data Model
+## 7. Keybindings
 
-### 6.1 View State
+### 7.1 Job List
 
-```rust
-pub struct JobsViewState {
-    pub state: JobsState,
-    pub jobs: Vec<JobInfo>,
-    pub selected_index: usize,
-    pub filter: JobFilter,
-    pub list_scroll: usize,
-    pub focused_panel: JobsPanel,
-    pub log_viewer: Option<LogViewerState>,
-    pub dialog: Option<JobsDialog>,
-    pub last_refresh: DateTime<Utc>,
-    pub auto_refresh: bool,
-}
+| Key | Action | When Available |
+|-----|--------|----------------|
+| `j` / `↓` | Next job | Always |
+| `k` / `↑` | Previous job | Always |
+| `g` | Go to first | Always |
+| `G` | Go to last | Always |
+| `Enter` | Detail panel | Always |
+| `l` | View logs | Always |
+| `R` | Retry failed | Failed jobs |
+| `c` | Cancel job | Running jobs |
+| `S` | Stop backtest | Running backtest (with confirm) |
+| `y` | Copy output path | Jobs with output |
+| `o` | Open folder | Completed exports |
+| `f` | Filter dialog | Always |
+| `P` | Toggle pipeline | Always |
+| `m` | Monitoring panel | Always |
+| `x` | Clear completed | When completed exist |
+| `?` | Help | Always |
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum JobsState {
-    Loading,
-    JobList,
-    LogViewer,
-    ConfirmDialog,
-    FilterDialog,
-}
+### 7.2 Monitoring Panel
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum JobsPanel {
-    List,
-    Details,
-}
+| Key | Action |
+|-----|--------|
+| `Esc` | Return to job list |
+| `p` | Pause/resume updates |
+| `r` | Reset statistics |
+| `Tab` | Cycle focus between panels |
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum JobFilter {
-    #[default]
-    All,
-    Running,
-    Failed,
-    Complete,
-    Queued,
-    Cancelled,
-    Paused,
-}
+---
 
-impl JobFilter {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Running => "Running",
-            Self::Failed => "Failed",
-            Self::Complete => "Completed",  // UI shows "Completed"
-            Self::Queued => "Queued",
-            Self::Cancelled => "Cancelled",
-            Self::Paused => "Paused",
-        }
-    }
-}
-```
+## 8. Data Model
 
-### 6.2 Job Information Model
+### 8.1 Core Types
 
 ```rust
 pub struct JobInfo {
-    pub id: Uuid,
-    pub parser_name: String,
-    pub parser_version: String,
+    pub id: i64,
+    pub file_version_id: Option<i64>,    // For parse jobs; None for scan/backtest
+    pub job_type: JobType,
+    pub name: String,                     // parser/exporter/source name
+    pub version: Option<String>,
     pub status: JobStatus,
-    pub created_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: DateTime<Utc>,        // Maps to claim_time in DB
     pub completed_at: Option<DateTime<Utc>>,
-    pub files_total: u32,
-    pub files_processed: u32,
-    pub error_count: u32,
-    pub warning_count: u32,
-    pub error_details: Option<JobError>,
-    pub circuit_breaker: Option<CircuitBreakerInfo>,
-    pub recent_logs: Vec<LogEntry>,
+
+    // Progress
+    pub items_total: u32,
+    pub items_processed: u32,
+    pub items_failed: u32,
+
+    // Output
+    pub output_path: Option<PathBuf>,
+    pub output_size_bytes: Option<u64>,
+
+    // Backtest-specific (None for other types)
+    pub backtest: Option<BacktestInfo>,
+
+    // Errors
+    pub failures: Vec<JobFailure>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum JobType {
+    Scan,
+    Parse,
+    Export,
+    Backtest,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JobStatus {
-    Queued,
     Running,
     Complete,
     Failed,
     Cancelled,
-    Paused,
 }
 
-impl JobStatus {
-    pub fn indicator(&self) -> char {
-        match self {
-            Self::Queued => '○',
-            Self::Running => '●',
-            Self::Complete => '✓',
-            Self::Failed => '✗',
-            Self::Cancelled => '⊘',
-            Self::Paused => '⏸',
-        }
-    }
+pub struct BacktestInfo {
+    pub pass_rate: f64,                   // 0.0 - 1.0
+    pub iteration: u32,
+    pub high_failure_tested: u32,
+    pub high_failure_passed: u32,
+    pub termination_reason: Option<TerminationReason>,
 }
 
-pub struct JobError {
-    pub error_type: String,
-    pub message: String,
-    pub location: Option<ErrorLocation>,
-    pub suggestion: Option<String>,
+#[derive(Clone, Copy)]
+pub enum TerminationReason {
+    PassRateAchieved,
+    MaxIterations,
+    PlateauDetected,
+    HighFailureEarlyStop,
+    UserStopped,
 }
 
-pub struct CircuitBreakerInfo {
-    pub failure_rate: f32,
-    pub threshold: f32,
-    pub consecutive_failures: u32,
-    pub auto_resume_at: DateTime<Utc>,
+pub struct JobFailure {
+    pub file_path: PathBuf,
+    pub error: String,
+    pub line: Option<u32>,
 }
 ```
 
-### 6.3 Log Viewer State
+### 8.2 Monitoring Types
 
 ```rust
-pub struct LogViewerState {
-    pub job_id: Uuid,
-    pub job_name: String,
-    pub entries: Vec<LogEntry>,
-    pub scroll_position: usize,
-    pub total_lines: usize,
-    pub search: Option<LogSearch>,
-    pub wrap_lines: bool,
-    pub is_loading: bool,
+pub struct MonitoringState {
+    pub queue: QueueStats,
+    pub throughput_history: VecDeque<ThroughputSample>,  // Last 5 min
+    pub sinks: Vec<SinkStats>,
+    pub paused: bool,
 }
 
-pub struct LogEntry {
+pub struct QueueStats {
+    pub pending: u32,
+    pub running: u32,
+    pub completed: u32,
+    pub failed: u32,
+    pub depth_history: VecDeque<u32>,  // For sparkline
+}
+
+pub struct ThroughputSample {
     pub timestamp: DateTime<Utc>,
-    pub level: LogLevel,
-    pub message: String,
+    pub rows_per_second: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum LogLevel {
-    Debug,
-    Info,
-    Warning,
-    Error,
+pub struct SinkStats {
+    pub uri: String,
+    pub total_rows: u64,
+    pub total_bytes: u64,
+    pub error_count: u32,
+    pub latency_p50_ms: u32,
+    pub latency_p99_ms: u32,
+    pub outputs: Vec<SinkOutput>,
+}
+
+pub struct SinkOutput {
+    pub name: String,
+    pub rows: u64,
+    pub bytes: u64,
+}
+```
+
+### 8.3 Pipeline Types
+
+```rust
+pub struct PipelineState {
+    pub source: PipelineStage,
+    pub parsed: PipelineStage,
+    pub output: PipelineStage,
+    pub active_parser: Option<String>,
+}
+
+pub struct PipelineStage {
+    pub count: u32,
+    pub in_progress: u32,
 }
 ```
 
 ---
 
-## 7. Data Sources
+## 9. Data Flow: Workers to TUI
 
-> **Schema Migration Required:** The queries below assume `cf_job_logs` table exists.
-> If not present, recent logs feature will be disabled until migration.
+### 9.1 Architecture
 
-| Widget | Query | Refresh |
-|--------|-------|---------|
-| Job list | See 7.2 | 500ms (running), 5s (else) |
-| Job details | Included in job query | On selection change |
-| Log entries | See 7.3 | On demand |
+TUI polls SQLite database. Workers write progress updates.
 
-### 7.2 Job List Query
-
-```sql
-SELECT
-    j.id,
-    j.parser_name,
-    j.parser_version,
-    j.status,
-    j.created_at,
-    j.started_at,
-    j.completed_at,
-    j.files_total,
-    j.files_processed,
-    j.error_count,
-    j.warning_count
-FROM cf_job_status j
-WHERE (:filter = 'all' OR j.status = :filter)
-ORDER BY
-    CASE j.status
-        WHEN 'running' THEN 1
-        WHEN 'failed' THEN 2
-        WHEN 'paused' THEN 3
-        WHEN 'queued' THEN 4
-        ELSE 5
-    END,
-    j.created_at DESC
-LIMIT 100;
+```
+Workers ──(write)──▶ SQLite ◀──(poll 500ms)── TUI
 ```
 
-### 7.3 Log Entries Query (Requires cf_job_logs)
+**Why polling over events?**
+- Matches existing architecture (Discover polls scout_files)
+- TUI survives restarts (state in DB, not memory)
+- No new IPC complexity
+
+### 9.2 Database Schema Extensions
 
 ```sql
-SELECT timestamp, level, message
-FROM cf_job_logs
-WHERE job_id = :job_id
-ORDER BY timestamp ASC
-LIMIT :limit OFFSET :offset;
+-- Extend cf_processing_queue
+ALTER TABLE cf_processing_queue ADD COLUMN job_type TEXT DEFAULT 'PARSE';
+ALTER TABLE cf_processing_queue ADD COLUMN progress_pct INTEGER DEFAULT 0;
+ALTER TABLE cf_processing_queue ADD COLUMN items_processed INTEGER DEFAULT 0;
+ALTER TABLE cf_processing_queue ADD COLUMN items_total INTEGER DEFAULT 0;
+ALTER TABLE cf_processing_queue ADD COLUMN backtest_data TEXT;  -- JSON
+ALTER TABLE cf_processing_queue ADD COLUMN updated_at TEXT;
+
+CREATE INDEX idx_jobs_updated ON cf_processing_queue(updated_at DESC);
+
+-- Monitoring metrics (time-series, auto-cleaned)
+CREATE TABLE cf_job_metrics (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL,
+    metric_time TEXT DEFAULT (datetime('now')),
+    rows_per_second REAL,
+    bytes_per_second INTEGER,
+    queue_depth INTEGER
+);
+
+-- Sink statistics
+CREATE TABLE cf_sink_stats (
+    id INTEGER PRIMARY KEY,
+    sink_uri TEXT NOT NULL,
+    recorded_at TEXT DEFAULT (datetime('now')),
+    total_rows INTEGER DEFAULT 0,
+    total_bytes INTEGER DEFAULT 0,
+    write_latency_ms INTEGER,
+    error_count INTEGER DEFAULT 0
+);
+```
+
+### 9.3 TUI Polling
+
+```rust
+/// Fetch jobs changed since last poll
+pub async fn fetch_job_updates(
+    pool: &SqlitePool,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<JobInfo>> {
+    sqlx::query_as!(
+        JobRow,
+        r#"
+        SELECT id, job_type, plugin_name, status, progress_pct,
+               items_processed, items_total, output_path, error_message,
+               claim_time as started_at, end_time as completed_at,
+               updated_at, backtest_data
+        FROM cf_processing_queue
+        WHERE updated_at > ?
+        ORDER BY
+            CASE status WHEN 'FAILED' THEN 0 WHEN 'RUNNING' THEN 1 ELSE 2 END,
+            claim_time DESC
+        LIMIT 100
+        "#,
+        since
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(JobInfo::from).collect())
+}
+
+/// Clean old metrics (run every poll cycle)
+pub async fn cleanup_old_metrics(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("DELETE FROM cf_job_metrics WHERE metric_time < datetime('now', '-5 minutes')")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+```
+
+### 9.4 DateTime Parsing
+
+SQLite stores `datetime()` as `YYYY-MM-DD HH:MM:SS`. Parse correctly:
+
+```rust
+fn parse_sqlite_datetime(s: &str) -> Option<DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+}
 ```
 
 ---
 
-## 8. Implementation Notes
+## 10. Implementation Notes
 
-### 8.1 Refresh Strategy
-
-- **Running jobs**: Refresh every 500ms for smooth progress
-- **Other states**: Refresh every 5 seconds
-- **Global `r`**: Manual refresh (per tui.md)
-- **Pause refresh**: When dialog/log viewer is active
-
-### 8.2 Progress Bar Rendering
+### 10.1 Sorting
 
 ```rust
-fn render_progress_bar(processed: u32, total: u32, width: usize) -> String {
-    let ratio = processed as f64 / total as f64;
-    let filled = (ratio * width as f64) as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
-}
-```
-
-### 8.3 Log Virtualization
-
-For large logs (>10,000 lines), load only visible range plus buffer.
-
-### 8.4 Action Validation
-
-```rust
-impl JobsViewState {
-    fn can_cancel(&self) -> bool {
-        self.selected_job()
-            .map(|j| matches!(j.status, JobStatus::Running | JobStatus::Queued))
-            .unwrap_or(false)
-    }
-
-    fn can_retry(&self) -> bool {
-        self.selected_job()
-            .map(|j| matches!(j.status, JobStatus::Failed | JobStatus::Cancelled))
-            .unwrap_or(false)
-    }
-
-    fn can_resume(&self) -> bool {
-        self.selected_job()
-            .map(|j| j.status == JobStatus::Paused)
-            .unwrap_or(false)
-    }
-}
-```
-
-### 8.5 View Trait Implementation
-
-```rust
-impl View for JobsView {
-    fn name(&self) -> &'static str { "Jobs" }
-
-    fn help_text(&self) -> Vec<(&'static str, &'static str)> {
-        match self.state.state {
-            JobsState::JobList => vec![
-                ("c", "Cancel"),
-                ("R", "Retry"),
-                ("l", "Logs"),
-                ("f", "Filter"),
-            ],
-            JobsState::LogViewer => vec![
-                ("j/k", "Scroll"),
-                ("/", "Search"),
-                ("Esc", "Close"),
-            ],
-            _ => vec![("Enter", "Confirm"), ("Esc", "Cancel")],
+fn sort_jobs(jobs: &mut Vec<JobInfo>) {
+    jobs.sort_by(|a, b| {
+        // Failed first
+        match (a.status == JobStatus::Failed, b.status == JobStatus::Failed) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
         }
-    }
+        // Then by recency
+        b.started_at.cmp(&a.started_at)
+    });
+}
+```
 
-    fn on_enter(&mut self) {
-        self.state.state = JobsState::Loading;
-        self.refresh_jobs();
-    }
+### 10.2 Sparkline Rendering
+
+Using Unicode block characters for visual consistency:
+
+```rust
+const BLOCKS: [char; 8] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
+
+fn render_sparkline(samples: &[f64], width: usize) -> String {
+    if samples.is_empty() { return " ".repeat(width); }
+
+    let max = samples.iter().cloned().fold(f64::MIN, f64::max);
+    let min = samples.iter().cloned().fold(f64::MAX, f64::min);
+    let range = if max == min { 1.0 } else { max - min };
+
+    samples.iter()
+        .map(|&v| {
+            let idx = ((v - min) / range * 7.0).round() as usize;
+            BLOCKS[idx.min(7)]
+        })
+        .collect()
+}
+```
+
+### 10.3 Backtest Pass Rate as Progress
+
+For backtest jobs, use pass rate as progress indicator:
+
+```rust
+fn render_backtest_progress(info: &BacktestInfo) -> String {
+    let percent = (info.pass_rate * 100.0).round() as u8;
+    let bar = render_progress_bar(percent);
+    format!("{}  {}%", bar, percent)
 }
 ```
 
 ---
 
-## 9. Revision History
+## 11. Success Criteria
+
+| Goal | Metric |
+|------|--------|
+| Find failures | Failed jobs visible without scrolling |
+| Copy output path | `y` copies in < 1 second |
+| Understand progress | Running jobs show %, ETA |
+| Monitor throughput | `m` shows live rows/sec, sink stats |
+| Track backtest | Pass rate visible, high-failure status clear |
+| See pipeline state | `P` toggles summary showing SOURCE→PARSED→OUTPUT |
+
+---
+
+## 12. Revision History
 
 | Date | Version | Changes |
 |------|---------|---------|
-| 2026-01-12 | 1.0 | Expanded from stub: full state machine, data models, workflows |
-| 2026-01-12 | 0.1 | Initial stub |
+| 2026-01 | 2.0 | Refinement v2: Added Backtest job type, full monitoring panel, pipeline visualization, data flow architecture |
+| 2026-01 | 1.0 | Crystallized spec (later deemed over-simplified) |
+| 2026-01 | 0.2 | Added monitoring view |
+| 2026-01 | 0.1 | Initial draft with 5 alternatives |

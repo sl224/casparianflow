@@ -2,6 +2,7 @@
 //!
 //! Shared functionality for the unified launcher.
 
+pub mod ai;
 pub mod bundler;
 pub mod publish;
 pub mod runner;

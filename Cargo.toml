@@ -10,6 +10,8 @@ members = [
     "crates/casparian_schema",
     "crates/casparian_backtest",
     "crates/casparian_mcp",
+    "crates/casparian_test_utils",
+    "crates/casparian_profiler",
 ]
 
 [workspace.package]

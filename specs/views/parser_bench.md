@@ -3,7 +3,8 @@
 **Status:** Approved for Implementation
 **Parent:** specs/tui.md (Master TUI Spec)
 **Version:** 1.2
-**Related:** specs/views/jobs.md
+**Related:** specs/views/jobs.md, specs/views/discover.md
+**Last Updated:** 2026-01-14
 
 > **Note:** For global keybindings, layout patterns, and common UI elements,
 > see the master TUI spec at `specs/tui.md`.

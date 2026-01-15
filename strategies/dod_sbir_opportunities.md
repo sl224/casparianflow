@@ -3,34 +3,38 @@
 **Status:** Research Complete
 **Parent:** [strategies/defense_tactical.md](defense_tactical.md) Section 7.2
 **Purpose:** Track relevant DoD funding opportunities for Casparian Flow
-**Version:** 1.0
+**Version:** 1.1
 **Date:** January 8, 2026
-**Last Updated:** January 8, 2026
+**Last Updated:** January 14, 2026
+**Next Review:** February 1, 2026 (post-funding deadline check)
 
 ---
 
 ## 1. Program Status (CRITICAL)
 
-### Current Situation
+### Current Situation (Updated January 14, 2026)
 
-**SBIR/STTR programs expired September 30, 2025** and are awaiting congressional reauthorization.
+**SBIR/STTR programs expired September 30, 2025** and remain in limbo. Congress has not passed reauthorization despite multiple attempts.
 
 | Status | Detail |
 |--------|--------|
 | **Program Authority** | Expired Sept 30, 2025 |
-| **New Solicitations** | Paused |
+| **New Solicitations** | Paused - no new applications accepted |
 | **Existing Awards** | Continue under current terms |
-| **Expected Resolution** | Late January / Early February 2026 |
+| **Congressional Status** | Impasse between clean extension vs. reform bills |
+| **Next Window** | January 30, 2026 funding deadline |
 
 ### Congressional Activity
 
 | Bill | Status | Description |
 |------|--------|-------------|
-| [H.R. 5100](https://www.congress.gov/bill/119th-congress/house-bill/5100) | Passed House | One-year clean extension |
-| [S.1573](https://www.congress.gov/bill/119th-congress/senate-bill/1573) | Senate | Full reauthorization with reforms |
+| [H.R. 5100](https://www.congress.gov/bill/119th-congress/house-bill/5100) | Passed House, **blocked in Senate** | One-year clean extension |
+| [S.1573](https://www.congress.gov/bill/119th-congress/senate-bill/1573) | Senate (Ernst) | Full reauthorization with reforms |
 | [H.R. 3169](https://www.congress.gov/bill/119th-congress/house-bill/3169) | House | SBIR/STTR Reauthorization Act of 2025 |
 
-**Key Date:** January 30, 2026 - Government funding deadline; SBIR reauthorization likely attached to appropriations.
+**The Impasse:** Sen. Ernst is blocking the clean 1-year extension (H.R. 5100) in favor of her reform bill (S.1573). The "six corners" (House/Senate Small Business + Science committees from both parties) have not aligned.
+
+**Key Date:** January 30, 2026 - Government funding deadline; SBIR reauthorization may be attached to continuing resolution or appropriations bill.
 
 ### What This Means for Casparian
 
@@ -398,4 +402,5 @@ Large primes (Palantir, Leidos, SAIC, Booz Allen) have SBIR mentorship programs 
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-01-08 | 1.0 | Initial research and analysis |
+| 2026-01-14 | 1.1 | Maintenance workflow: Updated congressional status (Ernst blocking H.R. 5100); added next review date; clarified impasse situation |
 

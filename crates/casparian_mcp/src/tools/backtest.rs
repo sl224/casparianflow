@@ -358,13 +358,13 @@ impl Tool for RunBacktestTool {
         };
 
         // Build failure categories
-        let failure_categories: Vec<FailureCategoryCount> = metrics
-            .failure_summary
-            .by_category
+        // F-013: Iterate over array using FailureCategory::ALL
+        let failure_categories: Vec<FailureCategoryCount> = FailureCategory::ALL
             .iter()
-            .map(|(cat, count)| FailureCategoryCount {
+            .filter(|cat| metrics.failure_summary.category_count(**cat) > 0)
+            .map(|cat| FailureCategoryCount {
                 category: cat.to_string(),
-                count: *count,
+                count: metrics.failure_summary.category_count(*cat),
             })
             .collect();
 

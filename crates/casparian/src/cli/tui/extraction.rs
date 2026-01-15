@@ -721,3 +721,181 @@ impl PublishState {
         }
     }
 }
+
+// =============================================================================
+// Rule Builder Types (v3.0 Consolidation)
+// =============================================================================
+// Types for the unified Rule Builder interface that consolidates:
+// - GlobExplorer (pattern exploration)
+// - RuleCreation (rule editing)
+// - Pathfinder/Labeling/SemanticPath (AI assistance via Tab key)
+//
+// See: specs/views/discover.md v3.0, specs/meta/sessions/ai_consolidation/design.md
+
+/// Filter for displaying test results in Rule Builder
+/// Cycles with a/p/f keys
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResultFilter {
+    /// Show all matched files
+    #[default]
+    All,
+    /// Show only files that pass extraction
+    PassOnly,
+    /// Show only files that fail extraction
+    FailOnly,
+}
+
+impl ResultFilter {
+    /// Cycle to next filter (a → p → f → a)
+    pub fn next(self) -> Self {
+        match self {
+            ResultFilter::All => ResultFilter::PassOnly,
+            ResultFilter::PassOnly => ResultFilter::FailOnly,
+            ResultFilter::FailOnly => ResultFilter::All,
+        }
+    }
+
+    /// Get display label
+    pub fn label(&self) -> &'static str {
+        match self {
+            ResultFilter::All => "All",
+            ResultFilter::PassOnly => "Pass",
+            ResultFilter::FailOnly => "Fail",
+        }
+    }
+
+    /// Get key hint
+    pub fn key_hint(&self) -> &'static str {
+        match self {
+            ResultFilter::All => "a",
+            ResultFilter::PassOnly => "p",
+            ResultFilter::FailOnly => "f",
+        }
+    }
+}
+
+/// Test result status for a single file
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileTestResult {
+    /// File has not been tested yet
+    NotTested,
+    /// File passed extraction (all fields extracted)
+    Pass,
+    /// File failed extraction
+    Fail {
+        /// Error message describing the failure
+        error: String,
+        /// Optional hint for fixing
+        hint: Option<String>,
+    },
+    /// File was explicitly excluded by user
+    Excluded {
+        /// The exclusion pattern that matched
+        pattern: String,
+    },
+}
+
+impl FileTestResult {
+    /// Is this a passing result?
+    pub fn is_pass(&self) -> bool {
+        matches!(self, FileTestResult::Pass)
+    }
+
+    /// Is this a failing result?
+    pub fn is_fail(&self) -> bool {
+        matches!(self, FileTestResult::Fail { .. })
+    }
+
+    /// Is this excluded?
+    pub fn is_excluded(&self) -> bool {
+        matches!(self, FileTestResult::Excluded { .. })
+    }
+
+    /// Get display indicator
+    pub fn indicator(&self) -> &'static str {
+        match self {
+            FileTestResult::NotTested => " ",
+            FileTestResult::Pass => "✓",
+            FileTestResult::Fail { .. } => "✗",
+            FileTestResult::Excluded { .. } => "○",
+        }
+    }
+}
+
+impl Default for FileTestResult {
+    fn default() -> Self {
+        FileTestResult::NotTested
+    }
+}
+
+/// Extended file info for Rule Builder with test status
+#[derive(Debug, Clone)]
+pub struct MatchedFileInfo {
+    /// Relative path from source root
+    pub rel_path: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Modification time (unix timestamp)
+    pub mtime: i64,
+    /// Test result status
+    pub test_result: FileTestResult,
+    /// Extracted field values (populated after test)
+    pub extracted_fields: Option<HashMap<String, String>>,
+}
+
+impl MatchedFileInfo {
+    /// Create from basic file info
+    pub fn new(rel_path: String, size: u64, mtime: i64) -> Self {
+        Self {
+            rel_path,
+            size,
+            mtime,
+            test_result: FileTestResult::NotTested,
+            extracted_fields: None,
+        }
+    }
+
+    /// Check if this file passes the current filter
+    pub fn passes_filter(&self, filter: ResultFilter) -> bool {
+        match filter {
+            ResultFilter::All => !self.test_result.is_excluded(),
+            ResultFilter::PassOnly => self.test_result.is_pass(),
+            ResultFilter::FailOnly => self.test_result.is_fail(),
+        }
+    }
+}
+
+/// Backtest summary statistics for Rule Builder
+#[derive(Debug, Clone, Default)]
+pub struct BacktestSummary {
+    /// Total files matched by pattern
+    pub total_matched: usize,
+    /// Files that pass extraction
+    pub pass_count: usize,
+    /// Files that fail extraction
+    pub fail_count: usize,
+    /// Files explicitly excluded
+    pub excluded_count: usize,
+    /// Whether backtest is currently running
+    pub is_running: bool,
+}
+
+impl BacktestSummary {
+    /// Get pass rate as percentage (excluding excluded files)
+    pub fn pass_rate(&self) -> f64 {
+        let testable = self.pass_count + self.fail_count;
+        if testable == 0 {
+            0.0
+        } else {
+            self.pass_count as f64 / testable as f64 * 100.0
+        }
+    }
+
+    /// Format as status line: "Pass: 847  Fail: 3  Skip: 12"
+    pub fn status_line(&self) -> String {
+        format!(
+            "Pass: {}  Fail: {}  Skip: {}",
+            self.pass_count, self.fail_count, self.excluded_count
+        )
+    }
+}

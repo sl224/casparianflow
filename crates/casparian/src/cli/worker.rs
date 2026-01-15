@@ -6,6 +6,7 @@
 use crate::cli::error::HelpfulError;
 use crate::cli::jobs::get_db_path;
 use crate::cli::output::print_table_colored;
+use casparian_protocol::WorkerStatus;
 use clap::Subcommand;
 use comfy_table::Color;
 use serde::Serialize;
@@ -45,43 +46,21 @@ pub enum WorkerAction {
     Status,
 }
 
-/// Worker status
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum WorkerStatus {
-    Idle,
-    Busy,
-    Draining,
-    Offline,
+/// Get display color for worker status (CLI display helper)
+fn worker_status_color(status: &WorkerStatus) -> Color {
+    match status {
+        WorkerStatus::Idle => Color::Green,
+        WorkerStatus::Busy => Color::Cyan,
+        WorkerStatus::Alive => Color::Blue,
+        WorkerStatus::Draining => Color::Yellow,
+        WorkerStatus::ShuttingDown => Color::Yellow,
+        WorkerStatus::Offline => Color::Red,
+    }
 }
 
-impl WorkerStatus {
-    fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "idle" => Self::Idle,
-            "busy" => Self::Busy,
-            "draining" => Self::Draining,
-            "offline" => Self::Offline,
-            _ => Self::Offline,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Idle => "IDLE",
-            Self::Busy => "BUSY",
-            Self::Draining => "DRAINING",
-            Self::Offline => "OFFLINE",
-        }
-    }
-
-    fn color(&self) -> Color {
-        match self {
-            Self::Idle => Color::Green,
-            Self::Busy => Color::Cyan,
-            Self::Draining => Color::Yellow,
-            Self::Offline => Color::Red,
-        }
-    }
+/// Parse worker status from string (handles case-insensitive matching)
+fn parse_worker_status(s: &str) -> WorkerStatus {
+    s.parse().unwrap_or(WorkerStatus::Offline)
 }
 
 /// Worker information
@@ -381,7 +360,7 @@ async fn get_all_workers(pool: &sqlx::SqlitePool) -> anyhow::Result<Vec<Worker>>
             env_signature: row.3,
             started_at: row.4,
             last_heartbeat: row.5,
-            status: WorkerStatus::from_str(&row.6),
+            status: parse_worker_status(&row.6),
             current_job_id: row.7,
         })
         .collect();
@@ -439,7 +418,7 @@ async fn get_worker_by_id(pool: &sqlx::SqlitePool, id: &str) -> anyhow::Result<O
         env_signature: r.3,
         started_at: r.4,
         last_heartbeat: r.5,
-        status: WorkerStatus::from_str(&r.6),
+        status: parse_worker_status(&r.6),
         current_job_id: r.7,
     }))
 }
@@ -485,7 +464,9 @@ fn calculate_stats(workers: &[Worker]) -> WorkerStats {
         match worker.status {
             WorkerStatus::Idle => stats.idle += 1,
             WorkerStatus::Busy => stats.busy += 1,
+            WorkerStatus::Alive => stats.idle += 1, // Count alive as available
             WorkerStatus::Draining => stats.draining += 1,
+            WorkerStatus::ShuttingDown => stats.draining += 1, // Count shutting down with draining
             WorkerStatus::Offline => stats.offline += 1,
         }
     }
@@ -520,7 +501,7 @@ fn print_workers_table(workers: &[Worker]) {
             vec![
                 (w.hostname.clone(), None),
                 (w.pid.to_string(), None),
-                (w.status.as_str().to_string(), Some(w.status.color())),
+                (w.status.as_str().to_string(), Some(worker_status_color(&w.status))),
                 (job_display, None),
                 (last_seen, None),
             ]
@@ -562,10 +543,10 @@ fn print_worker_details(worker: &Worker) {
     println!();
     println!("TRY:");
     match worker.status {
-        WorkerStatus::Idle | WorkerStatus::Busy => {
+        WorkerStatus::Idle | WorkerStatus::Busy | WorkerStatus::Alive => {
             println!("  casparian worker-cli drain {}   # Stop accepting new jobs", worker.hostname);
         }
-        WorkerStatus::Draining => {
+        WorkerStatus::Draining | WorkerStatus::ShuttingDown => {
             println!("  casparian worker-cli remove {}  # Remove after draining", worker.hostname);
         }
         WorkerStatus::Offline => {
@@ -611,13 +592,16 @@ fn format_relative_time(dt_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_worker_status_from_str() {
-        assert_eq!(WorkerStatus::from_str("idle"), WorkerStatus::Idle);
-        assert_eq!(WorkerStatus::from_str("BUSY"), WorkerStatus::Busy);
-        assert_eq!(WorkerStatus::from_str("draining"), WorkerStatus::Draining);
-        assert_eq!(WorkerStatus::from_str("unknown"), WorkerStatus::Offline);
+        // Protocol's from_str returns Result, unwrap for valid cases
+        assert_eq!(WorkerStatus::from_str("idle").unwrap(), WorkerStatus::Idle);
+        assert_eq!(WorkerStatus::from_str("BUSY").unwrap(), WorkerStatus::Busy);
+        assert_eq!(WorkerStatus::from_str("DRAINING").unwrap(), WorkerStatus::Draining);
+        // Unknown returns error, parse_worker_status falls back to Offline
+        assert_eq!(parse_worker_status("unknown"), WorkerStatus::Offline);
     }
 
     #[test]

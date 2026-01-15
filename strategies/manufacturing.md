@@ -2,8 +2,8 @@
 
 **Status:** Draft
 **Parent:** STRATEGY.md Section 2 (Target Market → Manufacturing)
-**Version:** 0.1
-**Date:** January 8, 2026
+**Version:** 0.2
+**Date:** January 14, 2026
 
 ---
 
@@ -497,7 +497,53 @@ Quality data:
 
 ---
 
-## 12. References
+## 12. Related Vertical: Energy & Utilities
+
+Energy and utilities share significant overlap with manufacturing (same historians, SCADA systems, OT/IT divide). Rather than a separate strategy, this section documents energy-specific considerations.
+
+### 12.1 Why Energy is Adjacent, Not Separate
+
+| Aspect | Manufacturing | Energy/Utilities | Overlap |
+|--------|---------------|------------------|---------|
+| Historians | OSIsoft PI, AVEVA | Same | 95% |
+| SCADA systems | Ignition, Wonderware | Same + specialized | 80% |
+| Regulatory | FDA, ISO | NERC CIP, FERC | Different |
+| Air-gapped | Common | Mandatory (NERC CIP) | Similar need |
+| Personas | Plant Engineer | Grid Engineer, Analyst | Similar |
+
+### 12.2 Energy-Specific Formats
+
+| Format | Domain | Notes |
+|--------|--------|-------|
+| **AMI/Smart Meter** | Distribution utilities | High volume, 15-min intervals |
+| **ICCP/TASE.2** | Grid control center data | Intercontrol Center Communications |
+| **CIM (IEC 61968/61970)** | Grid modeling | XML-based power system model |
+| **ISO market data** | Wholesale electricity | ERCOT, CAISO, PJM formats |
+| **SCADA point lists** | Substation data | Similar to manufacturing |
+
+### 12.3 Energy Attack Vector
+
+**"Grid Analyst Liberation"** - Same positioning as Plant Engineer Liberation:
+- Analysts have historian exports but no tooling
+- IT/OT divide prevents self-service analytics
+- NERC CIP compliance makes cloud tools difficult
+
+### 12.4 NERC CIP Advantage
+
+NERC CIP (Critical Infrastructure Protection) creates air-gapped environments:
+- Bulk Electric System (BES) data cannot touch internet
+- Casparian's local-first architecture is compliance-ready
+- Competitors requiring cloud are disqualified
+
+### 12.5 Recommendation
+
+**Phase 1:** Position manufacturing strategy to energy customers (same pitch)
+**Phase 2:** If energy traction exceeds manufacturing, create dedicated substrategy
+**Trigger:** 5+ energy customers or specific format requests (AMI, CIM)
+
+---
+
+## 13. References
 
 - [opcua-asyncio (Python OPC-UA)](https://github.com/FreeOpcUa/opcua-asyncio)
 - [MTConnect Standard](https://www.mtconnect.org/)
@@ -505,11 +551,13 @@ Quality data:
 - [Seeq](https://www.seeq.com/)
 - [AVEVA PI System](https://www.aveva.com/en/products/aveva-pi-system/)
 - [Ignition SCADA](https://inductiveautomation.com/)
+- [NERC CIP Standards](https://www.nerc.com/pa/Stand/Pages/CIPStandards.aspx)
 
 ---
 
-## 13. Revision History
+## 14. Revision History
 
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-01-08 | 0.1 | Initial draft |
+| 2026-01-14 | 0.2 | Maintenance workflow: Added Section 12 (Energy & Utilities as related vertical) with NERC CIP considerations |

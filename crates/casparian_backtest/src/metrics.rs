@@ -2,7 +2,7 @@
 //!
 //! Provides categorization and summarization of failures during backtest iterations.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
 /// Categories of failures that can occur during parsing
@@ -26,6 +26,49 @@ pub enum FailureCategory {
 }
 
 impl FailureCategory {
+    /// F-013: Number of variants for array-based storage
+    pub const COUNT: usize = 7;
+
+    /// F-013: All variants in index order
+    pub const ALL: [FailureCategory; Self::COUNT] = [
+        FailureCategory::TypeMismatch,
+        FailureCategory::NullNotAllowed,
+        FailureCategory::FormatMismatch,
+        FailureCategory::ParseError,
+        FailureCategory::SchemaViolation,
+        FailureCategory::FileNotFound,
+        FailureCategory::Unknown,
+    ];
+
+    /// F-013: Convert category to array index (0-6)
+    #[inline]
+    pub const fn as_index(self) -> usize {
+        match self {
+            FailureCategory::TypeMismatch => 0,
+            FailureCategory::NullNotAllowed => 1,
+            FailureCategory::FormatMismatch => 2,
+            FailureCategory::ParseError => 3,
+            FailureCategory::SchemaViolation => 4,
+            FailureCategory::FileNotFound => 5,
+            FailureCategory::Unknown => 6,
+        }
+    }
+
+    /// F-013: Convert array index to category
+    #[inline]
+    pub const fn from_index(idx: usize) -> Option<FailureCategory> {
+        match idx {
+            0 => Some(FailureCategory::TypeMismatch),
+            1 => Some(FailureCategory::NullNotAllowed),
+            2 => Some(FailureCategory::FormatMismatch),
+            3 => Some(FailureCategory::ParseError),
+            4 => Some(FailureCategory::SchemaViolation),
+            5 => Some(FailureCategory::FileNotFound),
+            6 => Some(FailureCategory::Unknown),
+            _ => None,
+        }
+    }
+
     /// Get a human-readable label for this category
     pub fn label(&self) -> &'static str {
         match self {
@@ -68,16 +111,19 @@ impl std::fmt::Display for FailureCategory {
 }
 
 /// Summary of failures in a backtest iteration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// F-013: Uses arrays instead of HashMaps for better cache locality.
+/// With only 7 categories, array indexing is faster than hash lookup.
+#[derive(Debug, Clone)]
 pub struct FailureSummary {
     /// Total number of failures
     pub total_failures: usize,
-    /// Failures by category
-    pub by_category: HashMap<FailureCategory, usize>,
+    /// F-013: Failures by category (indexed by FailureCategory::as_index())
+    pub by_category: [usize; FailureCategory::COUNT],
     /// Top failing files (path, failure count)
     pub top_failing_files: Vec<(String, usize)>,
-    /// Sample error messages by category
-    pub sample_errors: HashMap<FailureCategory, Vec<String>>,
+    /// F-013: Sample error messages by category (max 3 per category)
+    pub sample_errors: [Vec<String>; FailureCategory::COUNT],
 }
 
 impl FailureSummary {
@@ -85,9 +131,9 @@ impl FailureSummary {
     pub fn new() -> Self {
         Self {
             total_failures: 0,
-            by_category: HashMap::new(),
+            by_category: [0; FailureCategory::COUNT],
             top_failing_files: Vec::new(),
-            sample_errors: HashMap::new(),
+            sample_errors: Default::default(),
         }
     }
 
@@ -95,8 +141,9 @@ impl FailureSummary {
     pub fn record_failure(&mut self, file_path: &str, category: FailureCategory, error_msg: &str) {
         self.total_failures += 1;
 
-        // Count by category
-        *self.by_category.entry(category).or_insert(0) += 1;
+        // F-013: Direct array index instead of HashMap lookup
+        let idx = category.as_index();
+        self.by_category[idx] += 1;
 
         // Track failing files
         if let Some(pos) = self.top_failing_files.iter().position(|(p, _)| p == file_path) {
@@ -106,7 +153,7 @@ impl FailureSummary {
         }
 
         // Keep sample errors (max 3 per category)
-        let samples = self.sample_errors.entry(category).or_insert_with(Vec::new);
+        let samples = &mut self.sample_errors[idx];
         if samples.len() < 3 && !samples.contains(&error_msg.to_string()) {
             samples.push(error_msg.to_string());
         }
@@ -122,8 +169,10 @@ impl FailureSummary {
     pub fn most_common_category(&self) -> Option<FailureCategory> {
         self.by_category
             .iter()
+            .enumerate()
+            .filter(|(_, &count)| count > 0)
             .max_by_key(|(_, count)| *count)
-            .map(|(cat, _)| *cat)
+            .and_then(|(idx, _)| FailureCategory::from_index(idx))
     }
 
     /// Get failure rate for a category
@@ -131,14 +180,84 @@ impl FailureSummary {
         if self.total_failures == 0 {
             return 0.0;
         }
-        let count = self.by_category.get(&category).copied().unwrap_or(0);
+        let count = self.by_category[category.as_index()];
         count as f32 / self.total_failures as f32
+    }
+
+    /// F-013: Get count for a category (replaces HashMap::get)
+    pub fn category_count(&self, category: FailureCategory) -> usize {
+        self.by_category[category.as_index()]
     }
 }
 
 impl Default for FailureSummary {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// F-013: Custom serialization to maintain JSON compatibility with HashMap format
+impl Serialize for FailureSummary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        // Convert arrays to HashMaps for JSON output
+        let by_category: HashMap<FailureCategory, usize> = FailureCategory::ALL
+            .iter()
+            .filter(|cat| self.by_category[cat.as_index()] > 0)
+            .map(|&cat| (cat, self.by_category[cat.as_index()]))
+            .collect();
+
+        let sample_errors: HashMap<FailureCategory, Vec<String>> = FailureCategory::ALL
+            .iter()
+            .filter(|cat| !self.sample_errors[cat.as_index()].is_empty())
+            .map(|&cat| (cat, self.sample_errors[cat.as_index()].clone()))
+            .collect();
+
+        let mut state = serializer.serialize_struct("FailureSummary", 4)?;
+        state.serialize_field("total_failures", &self.total_failures)?;
+        state.serialize_field("by_category", &by_category)?;
+        state.serialize_field("top_failing_files", &self.top_failing_files)?;
+        state.serialize_field("sample_errors", &sample_errors)?;
+        state.end()
+    }
+}
+
+// F-013: Custom deserialization from HashMap format
+impl<'de> Deserialize<'de> for FailureSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct FailureSummaryHelper {
+            total_failures: usize,
+            by_category: HashMap<FailureCategory, usize>,
+            top_failing_files: Vec<(String, usize)>,
+            sample_errors: HashMap<FailureCategory, Vec<String>>,
+        }
+
+        let helper = FailureSummaryHelper::deserialize(deserializer)?;
+
+        let mut by_category = [0; FailureCategory::COUNT];
+        for (cat, count) in helper.by_category {
+            by_category[cat.as_index()] = count;
+        }
+
+        let mut sample_errors: [Vec<String>; FailureCategory::COUNT] = Default::default();
+        for (cat, errors) in helper.sample_errors {
+            sample_errors[cat.as_index()] = errors;
+        }
+
+        Ok(FailureSummary {
+            total_failures: helper.total_failures,
+            by_category,
+            top_failing_files: helper.top_failing_files,
+            sample_errors,
+        })
     }
 }
 
@@ -258,9 +377,9 @@ impl BacktestMetrics {
             self.best_iteration = metrics.iteration;
         }
 
-        // Merge failure summary
-        for (cat, count) in &metrics.failure_summary.by_category {
-            *self.aggregate_failures.by_category.entry(*cat).or_insert(0) += count;
+        // F-013: Merge failure summary using array indices
+        for (idx, &count) in metrics.failure_summary.by_category.iter().enumerate() {
+            self.aggregate_failures.by_category[idx] += count;
         }
         self.aggregate_failures.total_failures += metrics.failure_summary.total_failures;
     }
@@ -334,8 +453,9 @@ mod tests {
         summary.record_failure("/path/b.csv", FailureCategory::NullNotAllowed, "Error 3");
 
         assert_eq!(summary.total_failures, 3);
-        assert_eq!(summary.by_category[&FailureCategory::TypeMismatch], 2);
-        assert_eq!(summary.by_category[&FailureCategory::NullNotAllowed], 1);
+        // F-013: Use category_count() instead of HashMap indexing
+        assert_eq!(summary.category_count(FailureCategory::TypeMismatch), 2);
+        assert_eq!(summary.category_count(FailureCategory::NullNotAllowed), 1);
         assert_eq!(summary.most_common_category(), Some(FailureCategory::TypeMismatch));
 
         summary.finalize(10);

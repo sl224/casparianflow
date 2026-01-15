@@ -11,7 +11,10 @@ pub mod tagger;
 pub mod types;
 
 // Re-exports for CLI usage
-pub use db::Database;
+pub use db::{Database, FolderEntry};
 pub use folder_cache::FolderCache;
-pub use scanner::{ScanConfig, ScanProgress, Scanner};
+pub use scanner::{
+    compute_folder_deltas_from_files, compute_folder_deltas_from_paths,
+    merge_folder_deltas, FolderDelta, ScanConfig, ScanProgress, Scanner,
+};
 pub use types::{FileStatus, ScannedFile, Source, SourceType, TaggingRule};

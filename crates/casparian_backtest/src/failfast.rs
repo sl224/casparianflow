@@ -118,9 +118,10 @@ pub trait ParserRunner: Send + Sync {
 }
 
 /// Run a fail-fast backtest
+/// F-009: Take files by reference instead of by value to avoid cloning in iteration loop
 pub async fn backtest_with_failfast<P: ParserRunner>(
     parser: &P,
-    files: Vec<FileInfo>,
+    files: &[FileInfo],
     high_failure_table: &HighFailureTable,
     scope_id: &Uuid,
     parser_version: usize,
@@ -128,7 +129,7 @@ pub async fn backtest_with_failfast<P: ParserRunner>(
     config: &FailFastConfig,
 ) -> Result<BacktestResult, HighFailureError> {
     // Get files in optimal order
-    let ordered_files = high_failure_table.get_backtest_order(&files, scope_id).await?;
+    let ordered_files = high_failure_table.get_backtest_order(files, scope_id).await?;
 
     let total_files = ordered_files.len();
     if total_files == 0 {
@@ -286,7 +287,7 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
         assert!(result.is_complete());
         assert!((result.pass_rate() - 1.0).abs() < 0.001);
@@ -308,7 +309,7 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
         assert!(result.is_complete());
         assert!((result.pass_rate() - 0.666).abs() < 0.01);
@@ -358,7 +359,7 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
         // Should have stopped early because high-failure pass rate < 80%
         assert!(result.is_early_stopped());
@@ -399,7 +400,7 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
         // Should complete because high-failure files passed
         assert!(result.is_complete());
@@ -415,7 +416,7 @@ mod tests {
         let config = FailFastConfig::default();
 
         let result =
-            backtest_with_failfast(&parser, vec![], &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &[], &table, &scope_id, 1, 1, &config).await.unwrap();
 
         assert!(result.is_complete());
         assert!((result.pass_rate() - 0.0).abs() < 0.001); // 0/0 defaults to 0

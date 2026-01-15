@@ -3,6 +3,7 @@
 //! Built at scan time and persisted to disk. The TUI loads this cache
 //! instead of querying the database, enabling instant folder navigation.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -51,12 +52,15 @@ impl FolderCache {
     pub fn build(source_id: &str, paths: &[(String,)]) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
 
-        // Segment interning: map segment string -> index
-        let mut segment_to_idx: HashMap<String, u32> = HashMap::new();
-        let mut segments: Vec<String> = Vec::new();
+        // F-008: Use IndexMap for segment interning - maintains insertion order,
+        // eliminating the need for a separate Vec during building.
+        // PERF: Use get() first to avoid allocation when segment already exists.
+        let mut segment_to_idx: IndexMap<String, u32> = IndexMap::new();
 
-        // Build folder structure: prefix -> {segment -> (count, is_file)}
-        let mut folders: HashMap<String, HashMap<String, (u32, bool)>> = HashMap::new();
+        // Build folder structure: prefix -> {segment_idx -> (count, is_file)}
+        // PERF: Use u32 segment index as key instead of String to eliminate
+        // per-segment allocations in inner loop (was 10M allocs for 1M files).
+        let mut folders: HashMap<String, HashMap<u32, (u32, bool)>> = HashMap::new();
 
         // Reusable buffer for prefix building (O(1) amortized per segment)
         let mut prefix_buf = String::with_capacity(256);
@@ -69,16 +73,21 @@ impl FolderCache {
             for (i, segment) in path_segments.into_iter().enumerate() {
                 let is_file = i == segment_count - 1;
 
-                // Intern the segment (store for later use in final conversion)
-                if !segment_to_idx.contains_key(segment) {
-                    let idx = segments.len() as u32;
-                    segments.push(segment.to_string());
-                    segment_to_idx.insert(segment.to_string(), idx);
-                }
+                // PERF: Only allocate String when interning a NEW segment.
+                // Previously allocated on every segment (5M allocs for 1M files).
+                let segment_idx = match segment_to_idx.get(segment) {
+                    Some(&idx) => idx,
+                    None => {
+                        let idx = segment_to_idx.len() as u32;
+                        segment_to_idx.insert(segment.to_string(), idx);
+                        idx
+                    }
+                };
 
-                // Update folder entry
+                // PERF: Use segment_idx (u32) as key - no allocation.
+                // Previously used segment.to_string() (5M allocs for 1M files).
                 let level = folders.entry(prefix_buf.clone()).or_default();
-                level.entry(segment.to_string())
+                level.entry(segment_idx)
                     .and_modify(|(count, _)| *count += 1)
                     .or_insert((1, is_file));
 
@@ -90,14 +99,13 @@ impl FolderCache {
             }
         }
 
-        // Convert to final format with segment indices
+        // Convert to final format - already using segment indices
         let final_folders: HashMap<String, Vec<FolderEntry>> = folders
             .into_iter()
             .map(|(prefix, entries)| {
                 let mut folder_entries: Vec<FolderEntry> = entries
                     .into_iter()
-                    .map(|(segment, (count, is_file))| {
-                        let segment_idx = *segment_to_idx.get(&segment).unwrap();
+                    .map(|(segment_idx, (count, is_file))| {
                         FolderEntry {
                             segment_idx,
                             file_count: count,
@@ -107,11 +115,16 @@ impl FolderCache {
                     .collect();
                 // Sort by name for consistent ordering
                 folder_entries.sort_by(|a, b| {
-                    segments[a.segment_idx as usize].cmp(&segments[b.segment_idx as usize])
+                    let a_name = segment_to_idx.get_index(a.segment_idx as usize).unwrap().0;
+                    let b_name = segment_to_idx.get_index(b.segment_idx as usize).unwrap().0;
+                    a_name.cmp(b_name)
                 });
                 (prefix, folder_entries)
             })
             .collect();
+
+        // F-008: Extract keys from IndexMap to create final segments Vec
+        let segments: Vec<String> = segment_to_idx.into_keys().collect();
 
         Self {
             version: CACHE_VERSION,

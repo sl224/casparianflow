@@ -200,6 +200,30 @@ The system supports two execution modes sharing a single core executor.
     *   Resume manually: `casparian parser resume <name>`.
     *   Circuit breaker state stored in `cf_parser_health` table.
 
+*   **Error Fingerprinting** (for deduplication and catalog):
+    *   Errors are fingerprinted to group identical root causes across files/runs.
+    *   Fingerprint is a 16-character hex hash of 4 components:
+
+    | Component | Source | Purpose |
+    |-----------|--------|---------|
+    | Error Type | Exception class name | "SchemaValidationError" vs "ParseError" |
+    | Error Code | Structured code (e.g., `SCHEMA_MISMATCH`) | Programmatic classification |
+    | Normalized Trace | Stack trace with paths/line numbers stripped | WHERE in code error occurs |
+    | Context Structure | Hash of error context keys + types (not values) | Distinguishes error scenarios |
+
+    *   **Stack trace normalization**:
+        *   `File "/full/path/to/file.py", line 123, in func` → `File "file.py", in func`
+        *   Strips absolute paths (fingerprint stable across machines)
+        *   Keeps function names (identifies code location)
+        *   Truncates traces > 4KB (first frames are most relevant)
+    *   **Context structure hashing**:
+        *   Hashes keys and value types, NOT actual values
+        *   `{"column": "amount", "expected": "float"}` → hash of `["column:string", "expected:string"]`
+        *   Enables: same error type with different values = same fingerprint
+    *   **Result**: "47 occurrences of ERR-a1b2c3 across 12 files" instead of 47 separate errors.
+    *   **CLI**: `casparian errors list`, `casparian errors show <fingerprint>`, `casparian errors files <fingerprint>`
+    *   **Storage**: `cf_errors` table (fingerprint PK), `cf_error_occurrences` table (individual instances)
+
 ---
 
 ## 5. Interface Specifications

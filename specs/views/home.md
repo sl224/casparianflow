@@ -3,6 +3,8 @@
 **Status:** Draft
 **Parent:** specs/tui.md (Master TUI Spec)
 **Version:** 1.0
+**Related:** specs/views/discover.md, specs/views/jobs.md, specs/views/parser_bench.md
+**Last Updated:** 2026-01-14
 
 > **Note:** For global keybindings, layout patterns, and common UI elements,
 > see the master TUI spec at `specs/tui.md`.

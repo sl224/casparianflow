@@ -5,9 +5,12 @@
 //! ## Available Providers
 //!
 //! - `claude_code`: Spawns `claude` CLI (uses claude-code's auth, no API key needed)
+//! - `llama_cpp`: Direct llama.cpp integration (feature: `local-llm`)
 //! - `mock`: Mock provider for deterministic testing (test only)
 
 pub mod claude_code;
+#[cfg(feature = "local-llm")]
+pub mod llama_cpp;
 
 #[cfg(test)]
 pub mod mock;
@@ -25,17 +28,22 @@ use thiserror::Error;
 
 /// Errors that can occur during LLM operations
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub enum LlmError {
     /// API key not found or invalid
+    // Variant reserved for future API key validation
+    #[allow(dead_code)]
     #[error("API key error: {0}")]
     ApiKey(String),
 
     /// HTTP request failed
+    // Variant reserved for direct HTTP providers
+    #[allow(dead_code)]
     #[error("HTTP error: {0}")]
     Http(String),
 
     /// Rate limit exceeded
+    // Variant reserved for rate limiting implementation
+    #[allow(dead_code)]
     #[error("Rate limit exceeded: retry after {retry_after_ms}ms")]
     RateLimit { retry_after_ms: u64 },
 
@@ -304,7 +312,6 @@ impl Default for LlmConfig {
 /// Trait for LLM providers
 ///
 /// Implementations must be thread-safe and support async streaming.
-#[allow(dead_code)]
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     /// Get the provider name (e.g., "Claude", "OpenAI")

@@ -44,7 +44,7 @@ impl Tagger {
         self.rules
             .iter()
             .find(|cr| {
-                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
+                cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
             })
             .map(|cr| cr.rule.tag.as_str())
     }
@@ -55,7 +55,7 @@ impl Tagger {
         self.rules
             .iter()
             .find(|cr| {
-                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
+                cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
             })
             .map(|cr| (cr.rule.tag.as_str(), cr.rule.id.as_str()))
     }
@@ -65,7 +65,7 @@ impl Tagger {
         self.rules
             .iter()
             .filter(|cr| {
-                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
+                cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
             })
             .map(|cr| &cr.rule)
             .collect()
@@ -74,7 +74,7 @@ impl Tagger {
     /// Check if any rule matches a file
     pub fn has_match(&self, file: &ScannedFile) -> bool {
         self.rules.iter().any(|cr| {
-            cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
+            cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
         })
     }
 

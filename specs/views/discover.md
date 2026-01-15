@@ -2,8 +2,9 @@
 
 **Status:** Approved for Implementation
 **Parent:** specs/tui.md (Master TUI Spec)
-**Version:** 2.2
-**Related:** specs/extraction.md (Extraction API), specs/views/sources.md
+**Version:** 3.3
+**Related:** specs/extraction.md, docs/decisions/ADR-017-tagging-vs-extraction-rules.md
+**Last Updated:** 2026-01-14
 
 > **Note:** For global keybindings, layout patterns, and common UI elements,
 > see the master TUI spec at `specs/tui.md`.
@@ -256,63 +257,202 @@ Opened with `M` key, appears as overlay for full CRUD on sources:
 
 ## 4. State Machine
 
+> **Updated:** 2026-01-14 (aligned with codebase implementation)
+
+The Discover mode uses a state machine with 14 view states organized into 5 categories,
+plus a GlobExplorer overlay with 6 phases.
+
+### 4.1 High-Level State Architecture
+
 ```
-                    ┌─────────────────────────────────────┐
-                    │                                     │
-    ┌───────────────┴───────────────┐                     │
-    │                               │                     │
-    ▼                               │                     │
-┌─────────────┐     1          ┌─────────────┐            │
-│   FILES     │◄───────────────│  SOURCES    │            │
-│  (default)  │    Enter       │  DROPDOWN   │            │
-│             │                │   (open)    │            │
-└──────┬──────┘                └──────┬──────┘            │
-       │                              │                   │
-       │ 2                            │ Esc               │
-       ▼                              │                   │
-┌─────────────┐                       │                   │
-│    TAGS     │───────────────────────┘                   │
-│  DROPDOWN   │                                           │
-│   (open)    │────────────────────────────────────────────┘
-└─────────────┘     Enter
+DISCOVER VIEW STATE MACHINE
+===========================
 
-       │ R (from any state)           M (from any state)
-       ▼                               ▼
-┌─────────────┐                 ┌─────────────┐
-│   RULES     │                 │  SOURCES    │
-│  MANAGER    │──── Esc ───►    │  MANAGER    │──── Esc ────► (return to previous)
-│  (dialog)   │                 │  (dialog)   │
-└─────────────┘                 └──────┬──────┘
-                                       │ e (edit)
-                                       ▼
-                                ┌─────────────┐
-                                │   SOURCE    │
-                                │    EDIT     │──── Esc/Enter ────► SourcesManager
-                                │  (dialog)   │
-                                └─────────────┘
+LAYER 0: BASE
++------------------+
+|      FILES       |  <-- Default state, always return here
+|    (default)     |
++--------+---------+
+         |
+    +----+----+----+----+----+
+    |    |    |    |    |    |
+    v    v    v    v    v    v
 
-States:
-- FILES: Default state, arrows navigate files
-- SOURCES_DROPDOWN: Filter/navigate sources, files preview updates
-- TAGS_DROPDOWN: Filter/navigate tags, files filter by tag
-- RULES_MANAGER: Dialog overlay for managing tagging rules
-- SOURCES_MANAGER: Dialog overlay for managing sources (CRUD)
-- SOURCE_EDIT: Nested dialog for editing source name
+LAYER 1: Dropdowns & Inputs        LAYER 2: Dialogs
++----------+ +----------+          +----------+ +----------+
+| Sources  | | Tags     |          | Rules    | | Sources  |
+| Dropdown | | Dropdown |          | Manager  | | Manager  |
++----------+ +----------+          +----------+ +----------+
+
++----------+ +----------+          OVERLAY (independent of view state):
+| Filtering| | Entering |          +---------------------------+
+|          | | Path     |          | GlobExplorer (optional)   |
++----------+ +----------+          | Phases: Browse, Filtering,|
+                                   | EditRule, Testing,        |
++----------+ +----------+          | Publishing, Published     |
+| Tagging  | | Creating |          +---------------------------+
+|          | | Source   |
++----------+ +----------+
+
+LAYER KEY:
+  Layer 0: Base state (Files)
+  Layer 1: Overlays - Esc returns directly to Files
+  Layer 2: Dialogs - Esc uses previous_view_state
+  Overlay:  GlobExplorer can be active alongside any view state
 ```
 
-### 4.1 State Definitions
+### 4.2 State Categories
 
-| State | Entry | Exit | Behavior |
-|-------|-------|------|----------|
-| `Files` | Default, Enter from dropdown | Press 1, 2, R, or M | Navigate files, tag, preview |
-| `SourcesDropdown` | Press 1 | Enter/Esc | Filter sources, live file preview |
-| `TagsDropdown` | Press 2 | Enter/Esc | Filter tags, filter files by tag |
-| `RulesManager` | Press R | Esc | CRUD operations on tagging rules |
-| `SourcesManager` | Press M | Esc | CRUD operations on sources |
-| `SourceEdit` | Press e in SourcesManager | Enter/Esc | Edit source name |
-| `SourceDeleteConfirm` | Press d in SourcesManager | Enter/Esc | Confirm source deletion |
+**Category 1: DEFAULT**
+- `Files` - Default state, navigate files. Entry: Default, Esc from overlays.
 
-### 4.2 Preview vs Selection
+**Category 2: DROPDOWN MENUS (Layer 1)**
+- `SourcesDropdown` - Entry: Press 1. Exit: Enter/Esc -> Files
+- `TagsDropdown` - Entry: Press 2. Exit: Enter/Esc -> Files
+
+**Category 3: MODAL INPUT OVERLAYS (Layer 1)**
+- `Filtering` - Entry: Press /. Exit: Esc -> Files
+- `EnteringPath` - Entry: Press s. Exit: Esc/Enter -> Files/Scanning
+- `Tagging` - Entry: Press t. Exit: Esc/Enter -> Files
+- `CreatingSource` - Entry: After path entered. Exit: Esc/Enter -> Files
+- `BulkTagging` - Entry: Press T. Exit: Esc/Enter -> Files
+
+**Category 4: FULL DIALOGS (Layer 2)**
+- `RulesManager` - Entry: Press R. Exit: Esc -> previous_view_state
+- `RuleCreation` - Entry: Press n, or Enter in RulesManager. Exit: Esc/Enter -> RulesManager
+- `SourcesManager` - Entry: Press M. Exit: Esc -> previous_view_state
+- `SourceEdit` - Entry: Press e in SourcesManager. Exit: Esc/Enter -> SourcesManager
+- `SourceDeleteConfirm` - Entry: Press d in SourcesManager. Exit: Esc/Enter -> SourcesManager
+
+**Category 5: BACKGROUND STATES (Layer 1)**
+- `Scanning` - Entry: Auto after scan starts. Exit: Auto on complete -> Files
+
+### 4.3 GlobExplorer Overlay
+
+GlobExplorer is implemented as an **optional field** (`glob_explorer: Option<GlobExplorerState>`)
+rather than a view state variant. This allows it to overlay the Files state.
+
+The phase is tracked in `GlobExplorerState.phase` (see `GlobExplorerPhase` enum).
+
+```
+GLOB EXPLORER (Nested Sub-Machine)
+==================================
+Entry: Press 'g' from Files state
+Exit:  Press 'g' or 'Esc' from Browse phase
+
+NAVIGATION LAYER:
++----------------+     l/Enter      +----------------+
+|     BROWSE     |----------------->|     BROWSE     |
+|    (at root)   |                  |  (in subfolder)|
++-------+--------+<-----------------+-------+--------+
+        |           h/Backspace             |
+        | / (start typing)                  | /
+        v                                   v
++----------------+                  +----------------+
+|   FILTERING    |                  |   FILTERING    |
+|   (heat map)   |<---------------->|  (in subfolder)|
++-------+--------+     l/h          +-------+--------+
+        |
+        | e (when matches > 0)
+        v
+RULE EDITING LAYER:
++----------------+
+|   EDIT_RULE    |   4-section editor: Glob|Fields|Tag|Conditions
+| (Tab to cycle) |   j/k to navigate within sections
++-------+--------+
+        |
+        +-- t --> Testing
+        +-- Esc --> Browse (cancel)
+
++----------------+     +----------------+     +----------------+
+|    TESTING     | --> |   PUBLISHING   | --> |   PUBLISHED    |
+| (auto-progress)|     | (Enter/Esc)    |     | (job_id: xxx)  |
++----------------+     +----------------+     +----------------+
+```
+
+### 4.4 State Definitions Table
+
+| # | State | Category | Entry | Exit | Returns To |
+|---|-------|----------|-------|------|------------|
+| 1 | `Files` | Default | Default, Esc from overlays | 1,2,/,s,t,T,n,R,M,g | - |
+| 2 | `SourcesDropdown` | Dropdown | Press 1 | Enter, Esc | Files |
+| 3 | `TagsDropdown` | Dropdown | Press 2 | Enter, Esc | Files |
+| 4 | `Filtering` | Input | Press / | Esc | Files |
+| 5 | `EnteringPath` | Input | Press s | Esc, Enter | Files (or Scanning) |
+| 6 | `Tagging` | Input | Press t | Esc, Enter | Files |
+| 7 | `CreatingSource` | Input | After path entered | Esc, Enter | Files |
+| 8 | `BulkTagging` | Input | Press T | Esc, Enter | Files |
+| 9 | `RulesManager` | Dialog | Press R | Esc | previous_view_state |
+| 10 | `RuleCreation` | Dialog | Press n, Enter in RulesManager | Esc, Enter | previous_view_state |
+| 11 | `SourcesManager` | Dialog | Press M | Esc | previous_view_state |
+| 12 | `SourceEdit` | Dialog | Press e in SourcesManager | Esc, Enter | SourcesManager |
+| 13 | `SourceDeleteConfirm` | Dialog | Press d in SourcesManager | Esc, Enter | SourcesManager |
+| 14 | `Scanning` | Background | Auto (scan starts) | Auto (scan ends) | Files |
+
+**GlobExplorer Overlay** (not a DiscoverViewState variant - tracked via `glob_explorer: Option<GlobExplorerState>`):
+
+| Overlay | Entry | Exit | Returns To |
+|---------|-------|------|------------|
+| GlobExplorer | Press g from Files | g/Esc from Browse | Files (clears overlay) |
+
+### 4.5 GlobExplorer Phase Definitions
+
+| Phase | Entry | Exit | Preserves |
+|-------|-------|------|-----------|
+| `Browse` | Default, Esc from Filtering | `/` -> Filtering, `e` -> EditRule, `g`/Esc -> exit | prefix |
+| `Filtering` | `/` from Browse | Esc -> Browse, `e` -> EditRule | prefix, pattern |
+| `EditRule` | `e` (with matches) | `t` -> Testing, Esc -> Browse | prefix, pattern, draft |
+| `Testing` | `t` from EditRule | `p` -> Publishing, `e`/Esc -> EditRule | draft |
+| `Publishing` | `p` from Testing | Enter -> Published, Esc -> EditRule | draft |
+| `Published` | Auto from Publishing | Enter/Esc -> Browse, `j` -> Jobs | None |
+
+### 4.6 Transition Functions
+
+**Primary transition function** (saves previous_view_state):
+```rust
+fn transition_discover_state(&mut self, new_state: DiscoverViewState) {
+    self.discover.previous_view_state = Some(self.discover.view_state.clone());
+    self.discover.view_state = new_state;
+}
+```
+
+**Return to previous** (for Esc from dialogs):
+```rust
+fn return_to_previous_discover_state(&mut self) {
+    if let Some(prev) = self.discover.previous_view_state.take() {
+        self.discover.view_state = prev;
+    } else {
+        self.discover.view_state = DiscoverViewState::Files;
+    }
+}
+```
+
+**GlobExplorer phase transition** (modifies optional field, does NOT save previous_view_state):
+```rust
+fn transition_glob_explorer_phase(&mut self, new_phase: GlobExplorerPhase) {
+    if let Some(ref mut explorer) = self.discover.glob_explorer {
+        explorer.phase = new_phase;
+    }
+}
+```
+
+### 4.7 Esc Behavior Summary
+
+| Context | Esc Behavior |
+|---------|--------------|
+| Files (base state) | No effect |
+| Dropdowns | Close dropdown, return to Files |
+| Input overlays | Cancel input, return to Files |
+| Scanning | Cancel scan, return to Files |
+| Dialogs (RulesManager, SourcesManager) | Return to previous_view_state |
+| Nested dialogs (SourceEdit, RuleCreation) | Return to parent dialog |
+| GlobExplorer Browse | Exit GlobExplorer entirely (set to None) |
+| GlobExplorer Filtering | Clear pattern, return to Browse |
+| GlobExplorer EditRule | Cancel, return to Browse |
+| GlobExplorer Testing/Publishing | Cancel, return to EditRule |
+| GlobExplorer Published | Return to Browse (root) |
+
+### 4.8 Preview vs Selection
 
 Dropdowns have **two-stage selection**:
 1. **Preview** (during navigation): Files update as you move
@@ -322,60 +462,201 @@ Dropdowns have **two-stage selection**:
 
 ## 5. Data Model
 
-```rust
-pub struct DiscoverState {
-    // --- Focus tracking ---
-    pub focus: DiscoverFocus,
+> **Updated:** 2026-01-14 (aligned with codebase implementation)
 
-    // --- Sources ---
+### 5.1 State Machine
+
+The Discover mode uses an enum-based state machine. All modal states are represented
+in `DiscoverViewState` - there are **no boolean flags** for modal states.
+
+GlobExplorer is implemented as a separate optional field (`glob_explorer: Option<GlobExplorerState>`)
+that can overlay the Files state, rather than as an enum variant.
+
+```rust
+/// View state machine for Discover mode - matches Section 4
+/// Controls which dialog/dropdown/view is currently active
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DiscoverViewState {
+    #[default]
+    Files,              // Default state, navigate files
+
+    // --- Modal input overlays ---
+    Filtering,          // Text filter input (press '/')
+    EnteringPath,       // Scan path input (press 's')
+    Tagging,            // Single file tag input (press 't')
+    CreatingSource,     // Source name input (after path entered)
+    BulkTagging,        // Bulk tag input (press 'T')
+
+    // --- Dropdown menus ---
+    SourcesDropdown,    // Filtering/selecting sources (press '1')
+    TagsDropdown,       // Filtering/selecting tags (press '2')
+
+    // --- Full dialogs ---
+    RulesManager,       // Dialog for rule CRUD (press 'R')
+    RuleCreation,       // Dialog for creating/editing single rule
+
+    // --- Sources Manager (M key) ---
+    SourcesManager,     // Dialog for source CRUD
+    SourceEdit,         // Nested dialog for editing source name
+    SourceDeleteConfirm,// Delete confirmation dialog
+
+    // --- Background operations ---
+    Scanning,           // Directory scan in progress (non-blocking)
+}
+```
+
+### 5.2 Focus Areas
+
+Focus determines which sidebar panel is active (independent of modal state):
+
+```rust
+/// Focus areas within Discover mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiscoverFocus {
+    #[default]
+    Files,
+    Sources,
+    Tags,  // Users browse by tag category
+}
+```
+
+### 5.3 Tag Filtering
+
+```rust
+/// Filter applied to file list based on tag selection
+#[derive(Debug, Clone, PartialEq)]
+pub enum TagFilter {
+    Untagged,           // Show files where tag IS NULL
+    Tag(String),        // Show files with specific tag
+}
+```
+
+### 5.4 Main State Struct
+
+```rust
+/// State for the Discover mode (File Explorer)
+#[derive(Debug, Clone, Default)]
+pub struct DiscoverState {
+    // --- State machine (per Section 4) ---
+    /// Current view state - controls which dialog/dropdown is active
+    pub view_state: DiscoverViewState,
+    /// Previous state for "return to previous" transitions (Esc from dialogs)
+    pub previous_view_state: Option<DiscoverViewState>,
+    /// Active tag filter applied to files
+    pub tag_filter: Option<TagFilter>,
+
+    // --- File list ---
+    pub files: Vec<FileInfo>,
+    pub selected: usize,
+    /// Text filter for file list (used in Filtering state)
+    pub filter: String,
+    pub preview_open: bool,
+    /// Whether data has been loaded from Scout DB
+    pub data_loaded: bool,
+
+    // --- Scan dialog (EnteringPath state) ---
+    pub scan_path_input: String,
+    pub scan_error: Option<String>,
+
+    // --- Tagging (Tagging state) ---
+    pub tag_input: String,
+    pub available_tags: Vec<String>,
+
+    // --- Source creation (CreatingSource state) ---
+    pub source_name_input: String,
+    pub pending_source_path: Option<String>,
+
+    // --- Bulk tagging (BulkTagging state) ---
+    pub bulk_tag_input: String,
+    pub bulk_tag_save_as_rule: bool,
+
+    // --- Glob Explorer (hierarchical file browsing) ---
+    /// GlobExplorer state (Some = explorer active, None = flat file list)
+    /// Phase is tracked inside GlobExplorerState.phase
+    pub glob_explorer: Option<GlobExplorerState>,
+
+    // --- Sidebar state ---
+    pub focus: DiscoverFocus,
     pub sources: Vec<SourceInfo>,
-    pub selected_source: usize,
-    pub sources_dropdown_open: bool,
+    /// Selected source by ID (stable across list changes)
+    pub selected_source_id: Option<SourceId>,
+    pub sources_loaded: bool,
+
+    // --- Tags dropdown (TagsDropdown state) ---
+    pub tags: Vec<TagInfo>,
+    pub selected_tag: Option<usize>,  // None = "All files"
+    pub tags_filter: String,
+    pub tags_filtering: bool,         // Vim-style modal filtering
+    pub preview_tag: Option<usize>,   // Temporary preview while navigating
+
+    // --- Sources dropdown (SourcesDropdown state) ---
     pub sources_filter: String,
+    pub sources_filtering: bool,
     pub preview_source: Option<usize>,
 
-    // --- Tags (replaces Rules in sidebar) ---
-    pub tags: Vec<TagInfo>,
-    pub selected_tag: Option<usize>,     // None = "All files"
-    pub tags_dropdown_open: bool,
-    pub tags_filter: String,
-    pub preview_tag: Option<usize>,
-
-    // --- Files ---
-    pub files: Vec<FileInfo>,
-    pub selected_file: usize,
-    pub filter: String,                  // Manual filter (separate from tag)
-
-    // --- Preview pane ---
-    pub preview_content: Option<String>,
-    pub show_preview: bool,
-
-    // --- Rules Manager (dialog) ---
-    pub rules_manager_open: bool,
+    // --- Rules Manager (RulesManager state) ---
     pub rules: Vec<RuleInfo>,
     pub selected_rule: usize,
-    pub rule_edit_mode: Option<RuleEditMode>,
 
-    // --- Loading states ---
-    pub loading_files: bool,
-    pub loading_sources: bool,
+    // --- Rule dialog (RuleCreation state) ---
+    pub rule_tag_input: String,
+    pub rule_pattern_input: String,
+    pub editing_rule_id: Option<RuleId>,
+    pub rule_dialog_focus: RuleDialogFocus,
+    pub rule_preview_files: Vec<String>,
+    pub rule_preview_count: usize,
 
-    // --- Directory autocomplete (Add Source dialog) ---
-    pub path_suggestions: Vec<String>,    // Available directories matching input
-    pub path_suggestion_idx: usize,       // Currently highlighted suggestion
+    // --- Sources Manager (SourcesManager state) ---
+    pub sources_manager_selected: usize,
+    pub source_edit_input: String,
+    pub editing_source: Option<SourceId>,
+    pub source_to_delete: Option<SourceId>,
+
+    // --- Pending DB writes ---
+    pub pending_tag_writes: Vec<PendingTagWrite>,
+    pub pending_rule_writes: Vec<PendingRuleWrite>,
+
+    // --- Background scanning (Scanning state) ---
+    pub scanning_path: Option<String>,
+    pub scan_progress: Option<ScoutProgress>,
+    pub scan_start_time: Option<std::time::Instant>,
+
+    // --- Directory autocomplete ---
+    pub path_suggestions: Vec<String>,
+    pub path_suggestion_idx: usize,
+
+    // --- User feedback ---
+    pub status_message: Option<(String, bool)>,  // (message, is_error)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum DiscoverFocus {
-    Sources,
-    Tags,    // Renamed from Rules
-    Files,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuleDialogFocus {
+    #[default]
+    Pattern,
+    Tag,
+}
+```
+
+### 5.5 Supporting Types
+
+```rust
+/// Newtype wrappers for type safety
+pub struct SourceId(pub i64);
+pub struct RuleId(pub i64);
+
+/// Source information for sidebar
+#[derive(Debug, Clone)]
+pub struct SourceInfo {
+    pub id: SourceId,
+    pub name: String,
+    pub path: std::path::PathBuf,
+    pub file_count: usize,
 }
 
 /// Tag with file count (for Tags dropdown)
 #[derive(Debug, Clone)]
 pub struct TagInfo {
-    pub name: String,        // Tag name or "All files" or "untagged"
+    pub name: String,        // Tag name, "All files", or "untagged"
     pub count: usize,        // Number of files with this tag
     pub is_special: bool,    // True for "All files" and "untagged"
 }
@@ -383,49 +664,97 @@ pub struct TagInfo {
 /// Tagging rule (for Rules Manager)
 #[derive(Debug, Clone)]
 pub struct RuleInfo {
-    pub id: i64,
+    pub id: RuleId,
     pub pattern: String,
     pub tag: String,
     pub priority: i32,
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone)]
-pub enum RuleEditMode {
-    Creating,
-    Editing(i64),  // Rule ID being edited
-}
-
-#[derive(Debug, Clone)]
-pub struct SourceInfo {
-    pub id: i64,
-    pub name: String,
-    pub path: String,
-    pub file_count: usize,
-}
-
+/// File information for file list
 #[derive(Debug, Clone)]
 pub struct FileInfo {
-    pub id: i64,
     pub path: String,
-    pub rel_path: String,
+    pub rel_path: String,    // Relative path from source root
     pub size: u64,
-    pub tag: Option<String>,
-    pub status: FileStatus,
-
-    // --- Extractor fields (see Section 8) ---
-    pub metadata_raw: Option<serde_json::Value>,    // Raw JSON from DB
-    pub metadata_merged: Option<serde_json::Value>, // After inheritance merge
-    pub extraction_status: ExtractionStatus,        // OK, PENDING, TIMEOUT, CRASH, STALE
+    pub modified: chrono::DateTime<chrono::Local>,
+    pub is_dir: bool,
+    pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractionStatus {
-    Ok,
-    Pending,
-    Timeout,
-    Crash,
-    Stale,
+/// Pending tag write for persistence
+#[derive(Debug, Clone)]
+pub struct PendingTagWrite {
+    pub file_path: String,
+    pub tag: String,
+}
+
+/// Pending rule write for persistence
+#[derive(Debug, Clone)]
+pub struct PendingRuleWrite {
+    pub pattern: String,
+    pub tag: String,
+    pub source_id: SourceId,
+}
+```
+
+### 5.6 Glob Explorer State
+
+For hierarchical file browsing in large sources. GlobExplorer is stored as an optional
+field on DiscoverState (`glob_explorer: Option<GlobExplorerState>`). The phase is
+tracked inside the state struct, not as a separate enum variant.
+
+```rust
+/// State for Glob Explorer - hierarchical file browsing
+/// Stored as discover.glob_explorer: Option<GlobExplorerState>
+#[derive(Debug, Clone)]
+pub struct GlobExplorerState {
+    // --- Input state ---
+    pub pattern: String,
+    pub nav_history: Vec<(String, String)>,
+    pub current_prefix: String,
+
+    // --- Derived state (from DB) ---
+    pub folders: Vec<FolderInfo>,
+    pub preview_files: Vec<GlobPreviewFile>,
+    pub total_count: GlobFileCount,
+
+    // --- O(1) Navigation Cache ---
+    pub folder_cache: HashMap<String, Vec<FolderInfo>>,
+    pub cache_loaded: bool,
+    pub cache_source_id: Option<String>,
+
+    // --- UI state ---
+    pub selected_folder: usize,
+    pub pattern_cursor: usize,
+    pub phase: GlobExplorerPhase,  // Phase is a field, not enum variant
+
+    // --- Rule Editing ---
+    pub rule_draft: Option<RuleDraft>,
+    pub test_state: Option<TestState>,
+    pub publish_state: Option<PublishState>,
+
+    // --- Debouncing ---
+    pub pattern_changed_at: Option<std::time::Instant>,
+    pub last_searched_pattern: String,
+    pub last_searched_prefix: String,
+
+    // --- Rule Builder Enhancements ---
+    pub result_filter: ResultFilter,
+    pub excludes: Vec<String>,
+    pub backtest_summary: BacktestSummary,
+}
+
+/// GlobExplorer phase - stored in GlobExplorerState.phase
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum GlobExplorerPhase {
+    #[default]
+    Browse,     // Browsing folders without pattern
+    Filtering,  // Pattern active, showing heat map
+    EditRule { focus: RuleEditorFocus, selected_index: usize, editing_field: Option<FieldEditFocus> },
+    Testing,
+    Publishing,
+    Published { job_id: String },
 }
 ```
 
@@ -433,129 +762,185 @@ pub enum ExtractionStatus {
 
 ## 6. Keybindings
 
-### 6.1 Global (Discover Mode)
+> **Design Pattern:** Following [Lazygit](https://github.com/jesseduffield/lazygit) and
+> [K9s](https://k9scli.io) conventions, keys are organized by **function type** rather than
+> by keyboard layout. This makes it easy to learn: navigation keys always navigate,
+> action keys always perform actions, etc.
+
+### 6.1 Universal Keys (Work Everywhere)
+
+These keys work in **any** context—main view, dropdowns, or dialogs:
+
+| Category | Key | Action |
+|----------|-----|--------|
+| **Exit** | `Esc` | Close current dialog/dropdown, or return to Home |
+| **Confirm** | `Enter` | Confirm/select/save (context-dependent) |
+| **Help** | `?` | Show available keys for current context |
+
+### 6.2 Navigation Keys
+
+| Category | Key | Action |
+|----------|-----|--------|
+| **Vim-style** | `j` / `k` | Move down / up |
+| **Arrows** | `↑` / `↓` | Move up / down |
+| **Page** | `Ctrl+d` / `Ctrl+u` | Page down / up |
+| **Jump** | `g` `g` / `G` | Jump to top / bottom |
+| **Panel focus** | `1` / `2` / `3` | Focus Sources / Tags / Files panel |
+| **Tab** | `Tab` / `Shift+Tab` | Next / previous field or section |
+
+> **Note:** In Discover mode, `1`, `2`, `3` override global view navigation to control
+> panel focus. Use `0`/`H` (Home) or `Esc` to navigate to other views.
+
+### 6.3 Action Keys (Mnemonic)
+
+Single letters that perform actions. Same letter = same action across contexts:
+
+| Key | Action | Mnemonic |
+|-----|--------|----------|
+| `n` | Create **n**ew item (rule, source, field, condition) | **N**ew |
+| `e` | **E**dit selected item | **E**dit |
+| `d` | **D**elete selected item | **D**elete |
+| `r` | **R**escan / **R**efresh | **R**efresh |
+| `t` | **T**ag file(s) or **T**est rule | **T**ag/**T**est |
+| `s` | **S**can new directory | **S**can |
+| `p` | Toggle **P**review pane | **P**review |
+| `y` | Confirm (**Y**es) | **Y**es |
+
+### 6.4 Dialog/Overlay Keys (Shift = Window)
+
+Shift+Letter opens a dialog or overlay window:
+
+| Key | Opens | Mnemonic | Status |
+|-----|-------|----------|--------|
+| `R` | **R**ules Manager dialog | **R**ules | ✓ Implemented |
+| `M` | Sources **M**anager dialog | **M**anager | ✓ Implemented |
+| `T` | Bulk **T**ag dialog | **T**ag bulk | ✓ Implemented |
+| `S` | Create **S**ource from selected directory | **S**ource | ✓ Implemented |
+
+> **Note:** AI Wizards (Pathfinder, Semantic Path, Parser Lab) were consolidated into the
+> GlobExplorer EditRule phase. Rule creation with AI assistance is accessed via `g` -> `e`.
+
+### 6.5 Mode Switch Keys
+
+Keys that change the input mode or context:
+
+| Key | Mode | Description |
+|-----|------|-------------|
+| `/` | Filter mode | Type to filter current list |
+| `g` | Glob Explorer | Open interactive pattern exploration |
+| `Esc` | Exit mode | Return to normal navigation |
+
+---
+
+### 6.6 Context-Specific Keys
+
+> **Updated:** 2026-01-14 (spec refinement session - GAP-INT-001)
+
+The following tables show additional keys available in specific contexts.
+Universal, Navigation, and Action keys from above also apply.
+
+**Footer content** for each context is shown after the key table.
+
+#### Sources Dropdown
 
 | Key | Action |
 |-----|--------|
-| `1` | Open Sources dropdown |
-| `2` | Open Tags dropdown |
-| `3` | Focus Files panel |
-| `n` | **Create new tagging rule** (opens dialog) |
-| `s` | Scan new directory |
-| `p` | Toggle preview pane |
-| `R` | Open Rules Manager dialog |
-| `M` | **Open Sources Manager dialog** |
-| `W` | **Open AI Wizards menu** (see Section 8.7) |
-| `S` | **Launch Semantic Path Wizard** for current source |
-| `!` | **Open Pending Review panel** (files needing attention) |
-| `g` | **Open Glob Explorer** (interactive pattern exploration) |
-| `Esc` | Close dropdown/dialog or return to Home |
-
-> **Key Override Note:** In Discover mode, `1`, `2`, `3` control panel focus instead of
-> global view navigation. This is an intentional override documented in tui.md Section 3.3.
-> To navigate to other views from Discover, use `0`/`H` (Home), `4` (Sources), or `Esc` to
-> go back to Home first. The override exists because Discover's three-panel layout
-> (Sources/Tags/Files) is core to the workflow.
-
-### 6.2 Sources Dropdown (when open)
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Navigate sources (triggers file reload) |
-| `Char(c)` | Append to filter (including numbers) |
+| `Char(c)` | Append to filter (immediate, no `/` needed) |
 | `Backspace` | Remove from filter |
-| `Enter` | Confirm selection, close dropdown, focus Files |
-| `Esc` | Close dropdown, revert to previous selection |
+| `Enter` | Select highlighted source |
+| `up/down` | Navigate sources |
+| `Esc` | Cancel dropdown |
 
-### 6.3 Tags Dropdown (when open)
+**Footer:** `[Enter] Select  [up/down] Navigate  | [R] Rules [M] Sources | [Esc] Cancel`
+
+#### Tags Dropdown
 
 | Key | Action |
 |-----|--------|
-| `↑` / `↓` | Navigate tags (**live preview**: files filter instantly) |
 | `Char(c)` | Append to filter |
 | `Backspace` | Remove from filter / go to "All files" |
-| `Enter` | Confirm selection, close dropdown, focus Files |
-| `Esc` | Close dropdown, reset to "All files" |
+| `Enter` | Select highlighted tag |
+| `up/down` | Navigate tags |
+| `Esc` | Return to "All files" |
 
-**Live Preview Behavior:**
-- As you navigate through tags with `↑`/`↓`, the Files panel updates in real-time
-- "All files" shows all files (no tag filter)
-- "untagged" shows only files without tags
-- Specific tags show only files with that tag
-- Text filter (`/`) stacks on top of tag filter
+**Live Preview:** Files panel updates in real-time as you navigate tags.
 
-### 6.4 Files Panel
+**Footer:** `[Enter] Select  [up/down] Navigate  | [R] Rules [M] Sources | [Esc] All files`
+
+#### Files Panel
 
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `/` | Enter filter mode (type to filter by path) |
-| `t` | Tag selected file (or filtered files if filter active) |
-| `T` | Bulk tag filtered files |
-| `Enter` | Drill into directory OR show file details |
-| `w` | **Launch Pathfinder Wizard** for selected file's path |
-| `g` | **Launch Parser Lab** for current file group |
-| `l` | **Launch Labeling Wizard** for current group |
+| `g` | Open Glob Explorer |
+| `/` | Open filter mode |
+| `t` | Tag selected file |
+| `s` | Scan new directory |
+| `R` | Open Rules Manager |
+| `M` | Open Sources Manager |
+| `1` | Focus Sources dropdown |
+| `2` | Focus Tags dropdown |
 
-### 6.5 Rule Creation Dialog
+**Footer (no filter):** `[g] Explorer  [/] Filter  [t] Tag  [s] Scan  | [R] Rules [M] Sources | 1:Source 2:Tags`
 
-| Key | Action |
-|-----|--------|
-| `Tab` / `Shift+Tab` | Switch between Pattern and Tag fields |
-| `Char(c)` | Type into focused field |
-| `Backspace` | Delete from focused field |
-| `Enter` | Create rule |
-| `Esc` | Cancel and close |
+**Footer (with filter):** `[t] Tag {N} files  [Esc] Clear  | [R] Rules [M] Sources | 1:Source 2:Tags`
 
-### 6.6 Wizard Dialog (Onboarding)
+#### Files Panel (Glob Explorer)
 
 | Key | Action |
 |-----|--------|
-| `n` | Create a tagging rule (opens rule dialog) |
-| `Enter` | Browse files first (close wizard) |
-| `Space` | Toggle "Don't show again" checkbox |
-| `Esc` | Close wizard |
+| `l` / `Enter` | Drill into directory |
+| `h` / `Backspace` | Go back to parent |
+| `n` | Create new rule from current pattern |
+| `e` | Enter EditRule phase (when matches > 0) |
+| `/` | Enter pattern filter mode |
+| `g` / `Esc` | Exit Glob Explorer |
 
-### 6.7 Rules Manager Dialog
+**Footer (Browse):** `[hjkl] Navigate  [l/Enter] In  [h/Bksp] Back  [/] Filter  [n] New Rule  [e] Edit  [g/Esc] Exit`
+
+**Footer (Filtering):** `[Enter] Done  [Esc] Cancel  | Type glob pattern (e.g., *.csv)`
+
+#### Rule Creation Dialog
 
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `n` | Create new rule |
+| `Tab` | Switch between Pattern and Tag fields |
+| `Enter` | Create rule and close |
+| `Esc` | Cancel |
+
+**Footer:** `[Enter] Save rule  [Esc] Cancel`
+
+#### Rules Manager Dialog
+
+| Key | Action |
+|-----|--------|
+| `n` | New rule |
 | `e` | Edit selected rule |
 | `d` | Delete selected rule |
 | `Enter` | Toggle rule enabled/disabled |
 | `Esc` | Close dialog |
 
-### 6.8 Sources Manager Dialog
+**Footer:** `[n] New  [e] Edit  [d] Del  [Enter] Toggle  [Esc] Close`
+
+#### Sources Manager Dialog
 
 | Key | Action |
 |-----|--------|
-| `j` / `↓` | Move down |
-| `k` / `↑` | Move up |
-| `n` | Add new source (opens scan dialog) |
-| `e` | Edit selected source name |
-| `d` | Delete selected source (with confirmation) |
+| `n` | New source |
+| `e` | Edit source name |
+| `d` | Delete source |
 | `r` | Rescan selected source |
 | `Esc` | Close dialog |
 
-### 6.9 Source Edit Dialog
+**Footer:** `[n] New  [e] Edit  [d] Del  [r] Rescan  [Esc] Close`
 
-| Key | Action |
-|-----|--------|
-| `Char(c)` | Type into name field |
-| `Backspace` | Delete from name field |
-| `Enter` | Save changes |
-| `Esc` | Cancel and close |
-
-### 6.10 Source Delete Confirmation
+#### Source Delete Confirmation
 
 | Key | Action |
 |-----|--------|
 | `Enter` / `y` | Confirm deletion |
 | `Esc` / `n` | Cancel |
+
+**Footer:** `[Enter/y] Confirm delete  [Esc/n] Cancel`
 
 ---
 
@@ -1260,7 +1645,7 @@ SELECT s.id, s.name, s.path, COUNT(f.id) as file_count
 FROM scout_sources s
 LEFT JOIN scout_files f ON f.source_id = s.id
 GROUP BY s.id
-ORDER BY s.name
+ORDER BY s.updated_at DESC  -- Most recently used sources first
 ```
 
 ### 10.2 Load Tags for Source
@@ -1527,66 +1912,86 @@ The Glob Explorer provides interactive pattern-based file exploration with hiera
 
 ### 13.1 Design Philosophy
 
-- **Scan-time cache**: Folder hierarchy is built and cached when scan completes, not at TUI runtime
-- **O(1) navigation**: Folder drilling uses preloaded trie, no SQL queries during navigation
+- **Streaming scan**: Files are persisted in batches during scan, with bounded memory O(batch_size) not O(file_count)
+- **On-demand loading**: Folder hierarchy is queried from SQLite on drill-down, not preloaded (<5ms per query)
 - **Progressive reveal**: Heat map shows match density; flat results appear below threshold (~200 matches)
 - **Full glob syntax**: Supports `**/*.csv`, `logs/**/*.log`, etc. via `globset` crate
 - **Vim-style navigation**: `hjkl` for navigation, `l`/`Enter` to drill in, `h`/Backspace to go back
+- **Cancel support**: User can abort scan at any time via Esc
 
-### 13.2 Folder Cache Architecture
+> **Architecture:** See `specs/streaming_scanner.md` for full streaming architecture specification.
 
-The folder hierarchy is built as the final step of the scan job and persisted to disk.
+### 13.2 Folder Storage Architecture
 
-**Cache location:** `~/.casparian_flow/cache/folders_{source_id}.bin.zst`
+The folder hierarchy is stored in the main SQLite database and updated incrementally during scan.
 
-**Data structure (trie with interned segments):**
+**Storage:** `scout_folders` table in `~/.casparian_flow/casparian_flow.sqlite3`
+
+**Schema:**
+
+```sql
+CREATE TABLE scout_folders (
+    id INTEGER PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    prefix TEXT NOT NULL,      -- "" for root, "logs/" for /logs folder
+    name TEXT NOT NULL,        -- folder or file name
+    file_count INTEGER NOT NULL,
+    is_folder BOOLEAN NOT NULL,
+    UNIQUE(source_id, prefix, name)
+);
+
+CREATE INDEX idx_scout_folders_lookup
+    ON scout_folders(source_id, prefix);
+```
+
+**Query for drill-down:**
 
 ```rust
-/// Compressed folder cache - ~1MB for 1.2M files
-pub struct FolderCache {
-    /// Unique path segments (deduplicated)
-    /// e.g., ["logs", "errors", "2024", "app.log"]
-    pub segments: Vec<String>,
-
-    /// Trie nodes - each represents a folder or file
-    pub nodes: Vec<FolderNode>,
-
-    /// Root children indices
-    pub root_children: Vec<u16>,
-
-    /// Total file count
-    pub total_files: usize,
-}
-
-pub struct FolderNode {
-    pub segment_idx: u16,       // Index into segments array
-    pub children: Vec<u16>,     // Indices into nodes array
-    pub file_count: u32,        // Files in this subtree
-    pub is_file: bool,
+pub async fn get_folder_children(
+    db: &Database,
+    source_id: &str,
+    prefix: &str,
+) -> Vec<FolderEntry> {
+    sqlx::query_as(r#"
+        SELECT name, file_count, is_folder
+        FROM scout_folders
+        WHERE source_id = ? AND prefix = ?
+        ORDER BY is_folder DESC, name ASC
+    "#)
+    .bind(source_id)
+    .bind(prefix)
+    .fetch_all(db.pool()).await
+    .unwrap_or_default()
 }
 ```
 
-**Build-time flow:**
+**Streaming scan flow:**
 ```
-Scan Job Start
+Scan Job Start (ScanStream::start())
      │
      ▼
-Walk filesystem, insert files to DB
+Walker threads discover files in parallel
+     │
+     ├──▶ mpsc::channel(10) ──▶ Batch Writer Task
+     │    (bounded backpressure)     │
+     │                               ├──▶ INSERT batch into scout_files
+     │                               ├──▶ UPSERT ancestors into scout_folders
+     │                               └──▶ Emit progress event to TUI
      │
      ▼
-Build trie from all inserted paths (segment interning)
-     │
-     ▼
-Serialize with bincode + compress (zstd)
-     │
-     ▼
-Write to ~/.casparian_flow/cache/folders_{source_id}.bin.zst
+User sees live progress, can cancel with Esc
      │
      ▼
 Mark scan job complete
 ```
 
-**Load-time:** <50ms to decompress and deserialize
+**Performance:**
+
+| Operation | Latency |
+|-----------|---------|
+| Drill-down (indexed query) | 1-5ms |
+| Source switch | <5ms |
+| Memory per source | <1 MB |
 
 ### 13.3 State Machine
 
@@ -1797,9 +2202,11 @@ FOLDERS (5)                                                             MATCHES
 ```
 
 **Visual treatment:**
+- **Selection indicator (►)**: Shows which item is currently selected
 - **Bright/highlighted row**: Folders with matches > 0
 - **Dimmed row**: Folders with 0 matches (still navigable)
 - **MATCHES column**: Count of matching files in that subtree
+- **Background highlight**: Selected item has dark gray background when focused
 
 ### 13.6 FILTERING State - Heat Map + Flat Results (Few Matches)
 
@@ -1860,114 +2267,153 @@ When a source is still being scanned, folder navigation is disabled.
 
 ---
 
-### 13.8 EDIT RULE State Layout (Unified Rule Model)
+### 13.8 Extraction Pattern Syntax
 
-The rule combines Glob + Extraction + Tagging in a single definition.
-The layout uses four focus sections that cycle with Tab.
+Casparian uses an **extended glob syntax** with `<field>` placeholders for inline field extraction.
+This is a **superset of standard glob** - all valid globs work, plus extraction markers.
 
-**Visual Focus Indicators:**
-- `+== ... ==+` : Double-line border (focused section)
-- `+-- ... --+` : Single-line border (unfocused section)
-- `>>` : Cursor/selection indicator within focused section
-- `[847]` : Live match count (always visible in GLOB section)
+#### Syntax
+
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `*` | Match any characters (not `/`) | `*.csv` |
+| `**` | Match any path (including `/`) | `**/*.csv` |
+| `?` | Match single character | `file?.txt` |
+| `{a,b}` | Alternation (standard glob) | `{src,lib}/*.rs` |
+| `<field>` | **Capture as field** | `mission_<id>/*.csv` |
+| `<field:type>` | **Capture with type hint** | `<date:date>/*.csv` |
+
+#### Examples
 
 ```
-+====================[ EDIT RULE: Mission Telemetry ]====================+
-|                                                                         |
-|  +== GLOB PATTERN (1/4) ======== [Tab] next section ==================+|
-|  |>> **/mission_*/**/*.csv                                      [847] ||
-|  +====================================================================+|
-|                                                                         |
-|  +-- FIELDS (2/4) ------------------------------------------------+    |
-|  |  mission_id                                                    |    |
-|  |    source: segment(-3)                                         |    |
-|  |    pattern: mission_(\d+)                                      |    |
-|  |    type: integer                                               |    |
-|  |                                                                |    |
-|  |  date                                                          |    |
-|  |    source: segment(-2)                                         |    |
-|  |    type: date                                                  |    |
-|  |                                                                |    |
-|  |  [a] Add   [d] Delete   [j/k] Navigate   [Enter] Edit          |    |
-|  +----------------------------------------------------------------+    |
-|                                                                         |
-|  +-- BASE TAG (3/4) ----------------------------------------------+    |
-|  |  mission_data                                                  |    |
-|  +----------------------------------------------------------------+    |
-|                                                                         |
-|  +-- CONDITIONS (4/4) --------------------------------------------+    |
-|  |  IF mission_id < 100 THEN tag = "legacy_missions"              |    |
-|  |  IF date.year = 2024 THEN tag = "current_year"                 |    |
-|  |                                                                |    |
-|  |  [a] Add condition   [d] Delete   [j/k] Navigate               |    |
-|  +----------------------------------------------------------------+    |
-|                                                                         |
-+==========================================================================+
-| [Tab] Next section   [t] Test rule   [Esc] Cancel                       |
-+==========================================================================+
+# Simple: capture mission_id from folder name
+**/mission_<mission_id>/**/*.csv
+    └───────┬────────┘
+    captures "042" as mission_id
+
+# Multiple fields
+**/mission_<mission_id>/<date>/*.csv
+         └─────┬─────┘  └─┬─┘
+         captures 42    captures 2024-01-15
+
+# With type hints (for better inference)
+**/<client:string>/<year:int>/invoices/*.pdf
+
+# Standard glob still works (no extraction)
+**/*.csv
 ```
 
-**Section-Specific Keybindings:**
+#### How It Works
 
-| Focus Section | Key | Action |
-|---------------|-----|--------|
-| **GlobPattern** | Any char | Append to pattern |
-| | Backspace | Delete last char |
-| | Enter | Confirm pattern, move to Fields |
-| **FieldList** | j/k | Navigate field list |
-| | Enter | Edit selected field |
-| | a | Add new field |
-| | d | Delete selected field |
-| | i | Infer fields from pattern |
-| **BaseTag** | Any char | Edit tag name |
-| | Backspace | Delete last char |
-| | Enter | Confirm tag |
-| **Conditions** | j/k | Navigate condition list |
-| | Enter | Edit selected condition |
-| | a | Add new condition |
-| | d | Delete selected condition |
+1. Parser extracts `<field>` placeholders from pattern
+2. Placeholders replaced with `*` for glob matching
+3. After match, captured segments extracted by position
+4. Type inference runs on captured values
 
-**Global Keybindings (available in all focus sections):**
+```
+Input:  **/mission_<id>/<date>/*.csv
+        ↓
+Glob:   **/mission_*/*/*.csv
+        ↓
+Match:  /data/mission_042/2024-01-15/telemetry.csv
+        ↓
+Extract: id=042, date=2024-01-15
+```
+
+#### Type Inference
+
+When no type hint is provided, types are inferred from values:
+
+| Values | Inferred Type |
+|--------|---------------|
+| `042`, `043`, `100` | integer |
+| `2024-01-15`, `2024-02-01` | date |
+| `abc123`, `CLIENT-A` | string |
+| `550e8400-e29b-...` | uuid |
+
+---
+
+### 13.9 CREATE RULE Dialog (Unified)
+
+> **Design:** One dialog for everything. Live preview replaces the need for a separate
+> Test step in most cases. Full Test available via `[t]` for detailed field metrics.
+
+```
+┌─ CREATE RULE ──────────────────────────────────────────────────────────────────┐
+│                                                                                │
+│  PATTERN                                                                       │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │ **/mission_<mission_id>/<date>/*.csv                         [847 files] │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                │
+│  EXTRACTED FIELDS (auto-detected from pattern)                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │  mission_id : integer  (inferred: 042, 043, 044...)                      │ │
+│  │  date       : date     (inferred: 2024-01-15, 2024-02-01...)             │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                │
+│  TAG                                                                           │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │ mission_data                                                             │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+│                                                                                │
+│  OPTIONS                                                                       │
+│  ► [x] Enable rule                  ← selection indicator when focused         │
+│    [x] Run extraction job immediately                                          │
+│                                                                                │
+├─ LIVE PREVIEW ─────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  /data/mission_042/2024-01-15/telemetry.csv                                   │
+│    → mission_id: 42, date: 2024-01-15                                         │
+│                                                                                │
+│  /data/mission_043/2024-02-01/readings.csv                                    │
+│    → mission_id: 43, date: 2024-02-01                                         │
+│                                                                                │
+│  /data/mission_044/2024-02-10/sensor.csv                                      │
+│    → mission_id: 44, date: 2024-02-10                                         │
+│                                                                                │
+│  ... and 844 more files                                                        │
+│                                                                                │
+├────────────────────────────────────────────────────────────────────────────────┤
+│ [Enter] Save   [t] Full Test (metrics)   [Tab] Next field   [Esc] Cancel      │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Keybindings
 
 | Key | Action |
 |-----|--------|
-| Tab | Move to next section (Glob -> Fields -> Tag -> Conditions -> Glob) |
-| Shift+Tab | Move to previous section |
-| t | Test rule (transition to Testing state) |
-| Esc | Cancel and return to Browse (preserves prefix) |
+| `Tab` / `Shift+Tab` | Move between Pattern, Tag, Options |
+| `Enter` | **Save rule immediately** |
+| `t` | Open Full Test view (detailed metrics, histograms) |
+| `Esc` | Cancel and return to browse |
 
-**Status Bar Hints by Focus:**
-- GlobPattern: `[Tab] Fields | Type glob pattern | [t] Test | [Esc] Cancel`
-- FieldList: `[Tab] Tag | [a] Add | [d] Delete | [Enter] Edit | [i] Infer | [Esc] Cancel`
-- BaseTag: `[Tab] Conditions | Type tag name | [t] Test | [Esc] Cancel`
-- Conditions: `[Tab] Glob | [a] Add | [d] Delete | [Enter] Edit | [Esc] Cancel`
+#### Live Preview Behavior
 
-**Field Edit Sub-Focus (when editing a field):**
-```
-+== FIELDS (2/4) ===================================================+
-|  mission_id                                                        |
-|    source: segment(-3)                                             |
-|    pattern: mission_(\d+)                                          |
-|    type: integer                                                   |
-|                                                                    |
-|  date  [EDITING]                                                   |
-|    source: >> segment(-2)  <<   [1] segment [2] filename [3] path  |
-|    pattern: ____________________                                   |
-|    type:    date                [s]tring [i]nteger [d]ate [u]uid   |
-|                                                                    |
-|  [Enter] Save   [Esc] Cancel                                       |
-+====================================================================+
-```
+- Updates in real-time as you type the pattern (debounced 200ms)
+- Shows first 5 matching files with extracted values
+- Highlights extraction errors in red
+- Shows total match count in pattern field `[847 files]`
 
-### 13.6 TEST State Layout (with Field Metrics)
+#### Auto-Detection
 
-Test runs extraction + tagging on ALL matching files and shows results **without persisting**:
+When you type `<field>` placeholders:
+1. Fields appear automatically in EXTRACTED FIELDS section
+2. Type inference runs on sample values
+3. No manual field configuration needed for simple cases
+
+---
+
+### 13.10 FULL TEST View (Optional)
+
+For complex rules, `[t]` opens detailed test results with field metrics.
+This runs extraction on ALL matching files **without persisting**.
 
 ```
-┌─ TEST RESULTS ─────────────────────────────────────────────────────────────────┐
+┌─ FULL TEST RESULTS ────────────────────────────────────────────────────────────┐
 │                                                                                │
-│  Rule: "Mission Telemetry"                                                     │
-│  Pattern: **/mission_*/**/*.csv                                                │
+│  Rule: mission_data                                                            │
+│  Pattern: **/mission_<mission_id>/<date>/*.csv                                │
 │  Files tested: 847                                                             │
 │                                                                                │
 ├─ EXTRACTION STATUS ────────────────────────────────────────────────────────────┤
@@ -1987,27 +2433,16 @@ Test runs extraction + tagging on ALL matching files and shows results **without
 │  3 unique values                           4 unique months                     │
 │  Range: 042 - 044                          Range: 2023-11 → 2024-02            │
 │                                                                                │
-├─ TAGGING PREVIEW ──────────────────────────────────────────────────────────────┤
-│                                                                                │
-│  mission_data:      847 files (base tag)                                       │
-│  legacy_missions:    89 files (mission_id < 100)                               │
-│  current_year:      559 files (date.year = 2024)                               │
-│                                                                                │
-├─ SAMPLE FILES ─────────────────────────────────────────────────────────────────┤
-│                                                                                │
-│  /data/mission_042/2024-01-15/telemetry.csv                                   │
-│    → mission_id: 42, date: 2024-01-15                                         │
-│    → tags: [mission_data, current_year]                                       │
-│                                                                                │
-│  /data/mission_043/2024-02-01/readings.csv                                    │
-│    → mission_id: 43, date: 2024-02-01                                         │
-│    → tags: [mission_data, current_year]                                       │
-│                                                                                │
 ├────────────────────────────────────────────────────────────────────────────────┤
-│ [p] Publish rule   [e] Edit rule   [↑↓] Scroll   [Enter] Inspect file         │
-│ [f] Filter by status   [v] Value drill-down      [Esc] Cancel                 │
+│ [Enter] Save rule   [e] Edit   [↑↓] Scroll   [v] Value drill-down   [Esc] Back│
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**When to use Full Test:**
+- Complex patterns with multiple `<field>` captures
+- Want to see value distributions before committing
+- Debugging extraction failures
+- Verifying type inference is correct
 
 **Field Metrics Features:**
 
@@ -2018,29 +2453,9 @@ Test runs extraction + tagging on ALL matching files and shows results **without
 | Range | Min/Max for numeric and date fields |
 | Drill-down | Press `v` on a field to see all values |
 
-### 13.7 PUBLISH State
+---
 
-```
-┌─ PUBLISH RULE ─────────────────────────────────────────────────────────────────┐
-│                                                                                │
-│  Rule: "Mission Telemetry"                                                     │
-│  Pattern: **/mission_*/**/*.csv                                                │
-│  Files: 847                                                                    │
-│                                                                                │
-│  This will:                                                                    │
-│    ✓ Save rule to database                                                    │
-│    ✓ Extract metadata for 847 files                                           │
-│    ✓ Apply tags (mission_data, legacy_missions, current_year)                 │
-│    ✓ Start background job (ID will be shown)                                  │
-│                                                                                │
-│  ─────────────────────────────────────────────────────────────────────────     │
-│                                                                                │
-│  [Enter] Confirm and publish   [Esc] Cancel                                   │
-│                                                                                │
-└────────────────────────────────────────────────────────────────────────────────┘
-```
-
-After publish:
+### 13.8 After Save
 
 ```
 ┌─ PUBLISH COMPLETE ─────────────────────────────────────────────────────────────┐
@@ -2061,33 +2476,36 @@ After publish:
 
 ### 13.11 Glob Explorer Data Model
 
+> **DEPRECATED (v3.1):** The `FolderCache` struct and `.bin.zst` files are deprecated.
+> Folder hierarchy is now stored in `scout_folders` SQLite table with on-demand loading.
+> See specs/streaming_scanner.md for the new architecture.
+
 ```rust
-/// Folder cache - built at scan time, loaded at TUI time
-/// Stored at: ~/.casparian_flow/cache/folders_{source_id}.bin.zst
+/// [DEPRECATED] Folder cache - replaced by scout_folders table
+/// This struct exists only for migration from old .bin.zst files
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderCache {
-    /// Unique path segments (deduplicated via interning)
     pub segments: Vec<String>,
-
-    /// Trie nodes representing folder/file hierarchy
     pub nodes: Vec<FolderNode>,
-
-    /// Indices of root-level children
     pub root_children: Vec<u16>,
-
-    /// Total file count in this source
     pub total_files: usize,
-
-    /// When cache was built
     pub built_at: String,
 }
 
+/// [DEPRECATED] Node in old trie structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderNode {
-    pub segment_idx: u16,       // Index into segments array
-    pub children: Vec<u16>,     // Indices into nodes array
-    pub file_count: u32,        // Files in this subtree
+    pub segment_idx: u16,
+    pub children: Vec<u16>,
+    pub file_count: u32,
     pub is_file: bool,
+}
+
+/// Entry returned from scout_folders table query
+pub struct FolderEntry {
+    pub name: String,
+    pub file_count: i64,
+    pub is_folder: bool,
 }
 
 /// Glob Explorer state (extends DiscoverState)
@@ -2097,20 +2515,19 @@ pub struct GlobExplorerState {
     pub nav_history: Vec<(String, String)>,   // History of (prefix, pattern) for back navigation
     pub current_prefix: String,               // Current path prefix (empty = root)
 
-    // --- Derived state (loaded atomically from cache) ---
-    pub folders: Vec<FolderInfo>,             // Folders/files at current level
+    // --- Derived state (queried on-demand from scout_folders) ---
+    pub current_items: Vec<FolderEntry>,      // Children at current prefix (from SQLite)
     pub preview_files: Vec<GlobPreviewFile>,  // Sampled preview files (max 10)
     pub total_count: GlobFileCount,           // Total file count for current prefix + pattern
 
-    // --- O(1) Navigation Cache ---
-    pub folder_cache: HashMap<String, Vec<FolderInfo>>,  // Preloaded hierarchy
-    pub cache_loaded: bool,                   // Whether cache has been loaded
-    pub cache_source_id: Option<String>,      // Source ID for cache invalidation
+    // --- On-demand Loading State ---
+    pub loading: bool,                        // True while querying scout_folders
+    pub scan_in_progress: bool,               // True if source is being scanned
+    pub minutes_since_scan: Option<f64>,      // For staleness indicator
 
     // --- UI state ---
     pub selected_folder: usize,               // Currently selected folder index
     pub phase: GlobExplorerPhase,             // Current phase in state machine
-    pub pattern_editing: bool,                // Whether pattern input is active
 
     // --- Debouncing state (performance optimization) ---
     pub pattern_changed_at: Option<Instant>,  // When pattern was last modified
@@ -2359,25 +2776,32 @@ pub enum DateFormat {
 
 ### 13.13 Implementation Phases (Glob Explorer)
 
-#### Phase 12: Scan-Time Folder Cache
-- [ ] Create `FolderCache` struct with trie representation
-- [ ] Implement segment interning (deduplicate path components)
-- [ ] Build trie as final step of scan job in `casparian_scout`
-- [ ] Serialize with bincode + zstd compression
-- [ ] Write to `~/.casparian_flow/cache/folders_{source_id}.bin.zst`
-- [ ] Add cache invalidation on re-scan
+#### Phase 12: Streaming Scanner (P0)
+> **Spec:** See `specs/streaming_scanner.md` for full architecture.
 
-#### Phase 13: TUI Cache Loading
-- [ ] On source selection, check for cache file
-- [ ] Load and decompress cache (<50ms target)
-- [ ] If no cache, show "Scan required" or "Scan in progress" message
-- [ ] Populate folder list from trie root
+- [ ] Create `ScanStream` struct with progress channel
+- [ ] Modify `parallel_walk()` to send batches via channel
+- [ ] Add cancel flag to walker threads (`Arc<AtomicBool>`)
+- [ ] Implement `persist_task` that writes batches as they arrive
+- [ ] Memory: O(batch_size) not O(file_count)
 
-#### Phase 14: Folder Navigation (BROWSE State)
-- [ ] Implement O(1) folder drilling via trie traversal
+#### Phase 13: SQLite Folder Table (P1)
+- [ ] Add `scout_folders` table to schema
+- [ ] Implement `update_folder_counts()` during persist (UPSERT ancestors)
+- [ ] Implement `get_folder_children()` query function
+- [ ] Remove `FolderCache` file-based serialization
+- [ ] Clean up old `.bin.zst` cache files on startup
+
+#### Phase 14: TUI Integration
+- [ ] On source selection, query `scout_folders` for root entries
+- [ ] If scan in progress, show progress UI with cancel option
+- [ ] Populate folder list from query result (not preloaded cache)
+
+#### Phase 14b: Folder Navigation (BROWSE State)
+- [ ] Implement folder drilling via `get_folder_children()` query (<5ms)
 - [ ] vim-style keybindings: `hjkl`, `l`/Enter, `h`/Backspace
 - [ ] Track `current_prefix` for navigation state
-- [ ] Show folder/file counts from cache
+- [ ] Show folder/file counts from query result
 
 #### Phase 15: Glob Matching (FILTERING State)
 - [ ] Integrate `globset` crate for pattern parsing
@@ -3295,3 +3719,8 @@ fn list_directories(partial_path: &str) -> Vec<String> {
 | 2026-01-13 | 2.0 | **Pattern Input Performance (Phase 19)**: Debounced pattern input (150ms delay) - keystrokes instant, search triggers after pause. Cancellable background search via `Arc<AtomicBool>` - cancelled tasks exit early saving CPU. Updated `GlobExplorerState` with debouncing fields (`pattern_changed_at`, `last_searched_pattern`, `last_searched_prefix`). Added `FolderInfo` constructors (`::new()`, `::loading()`, `::with_path()`, `::from_cache_entry()`). Added `GlobPreviewFile` and `GlobFileCount` types. Consolidated utility functions (`spinner_char()`, `centered_scroll_offset()`, `render_centered_dialog()`). Deleted dead code (~200 lines). |
 | 2026-01-13 | 2.1 | **Extraction API Integration (Phase 18 Detailed)**: Expanded Phase 18 into 8 sub-phases (18a-18h) for complete Extraction API integration. Phase 18a: Extended `GlobExplorerPhase` enum with EditRule, Testing, Publishing, Published states. Phase 18b: EDIT RULE implementation with `RuleEditorState`, field inference, live match counts. Phase 18c: Field inference engine detecting dates, entity prefixes, categories from patterns. Phase 18d: TEST state with `TestState`, extraction runner, field metrics aggregation, histogram rendering. Phase 18e: PUBLISH state with `PublishState`, rule persistence, background job creation. Phase 18f: Database tables from extraction.md (extraction_rules, extraction_fields, extraction_tag_conditions). Phase 18g: Template matching for single-file workflow (Tier 1 Simple API). Phase 18h: Multi-file algorithmic inference (Tier 1 with confidence scoring). Cross-reference to specs/extraction.md Sections 5, 6, Appendix A/B. |
 | 2026-01-13 | 2.2 | **Spec Refinement Integration**: Applied 10 gap resolutions from spec refinement workflow (session: discover_extraction). **Section 13.3**: Unified 6-state machine (Browse, Filtering, EditRule, Testing, Publishing, Published) with Navigation Layer and Rule Editing Layer. `e` key requires Filtering state with matches > 0. Esc from Testing/Publishing returns to EditRule (preserves draft). Publishing requires explicit Enter confirmation. Return to Browse (root) after Published (clean slate). **Phase 18a**: Corrected state transitions with entry/exit conditions. **Phase 18b**: Added `RuleDraft`, `FieldDraft`, `FieldSource`, `FieldType`, `CompareOp`, `Normalizer`, `TagConditionDraft` types aligned with DB schema. **Phase 18c**: Added `FieldInferenceConfig` with stratified sampling (max 100 files), confidence thresholds (HIGH >= 0.85, MEDIUM 0.50-0.84, LOW < 0.50), multi-factor scoring algorithm. **Phase 18d**: Always-async test execution with cancellation via `Arc<AtomicBool>`, `HistogramConfig` (12-char bars, 5 max values, 15-char labels), proportional scaling with min 1 char for non-zero. **Phase 18e**: `PublishError` enum with `RecoveryOption` variants, conflict detection (name, pattern), partial success handling for job creation failures. **Section 13.8**: Definitive EDIT RULE ASCII layout with focus indicators (`+== ... ==+` for focused, `+-- ... --+` for unfocused), section numbers (1/4, 2/4...), section-specific keybindings, field edit sub-focus mode. Session artifacts at `specs/meta/sessions/discover_extraction/`. |
+| 2026-01-14 | 2.3 | **UI/UX Improvements**: Fixed Home Hub stats not updating after sources load. Fixed Discover title bar showing "0 files" when glob explorer is active (now shows glob explorer file count). Added selection indicator (►) to FOLDERS panel for clearer navigation feedback. Added selection indicator (►) to OPTIONS checkboxes in CREATE RULE dialog. Updated Section 13.5 Visual treatment with selection indicator documentation. Updated Section 13.9 CREATE RULE dialog ASCII art to show selection indicator. |
+| 2026-01-14 | 3.0 | **Rule Builder Consolidation**: Major redesign consolidating 5 concepts into unified Rule Builder. Merged: GlobExplorer, RuleCreation, Pathfinder Wizard, Semantic Path Wizard, Labeling Wizard. Rule Builder provides split-view interface (40% config / 60% live results) with: live pattern filtering, auto-analysis for extractions, inline backtest with pass/fail per file, exclusion system (ignore folders with `i`/`I` keys), result filtering (`a`/`p`/`f` for all/pass/fail). Parser Lab remains separate (generates Python code). Updated state categories: Category 5 now RuleBuilder, Category 6 now ParserLab. Keybinding changes: `n`/`r` opens Rule Builder, `W` opens Parser Lab directly, `g` removed (use Rule Builder). Deprecated: WizardMenu, all Pathfinder states, GlobExplorer phases. Full design: `specs/meta/sessions/ai_consolidation/design.md`. |
+| 2026-01-14 | 3.1 | **Streaming Scanner Architecture**: Replaced file-based `FolderCache` (.bin.zst) with SQLite `scout_folders` table. Section 13.1: Updated design philosophy - streaming scan with bounded memory O(batch_size), on-demand SQLite queries for folder drill-down (<5ms), cancel support. Section 13.2: New schema with `scout_folders` table, `get_folder_children()` query. Phases 12-14: Updated for streaming architecture (ScanStream, persist_task, incremental folder updates). Full spec: `specs/streaming_scanner.md`. Session: `specs/meta/sessions/streaming_scanner_2026-01-14/`. |
+| 2026-01-14 | 3.2 | **Corpus Alignment**: Updated Section 5.6 `GlobExplorerState` fields to use on-demand loading (`loading`, `scan_in_progress`, `minutes_since_scan`) instead of preloaded `folder_cache`. Updated Section 13.11 data model with deprecated `FolderCache` notice and new `FolderEntry` struct. Aligned with streaming_scanner.md v1.1 gap fixes (batch upserts, staleness detection). |
+| 2026-01-14 | 3.3 | **Codebase Alignment**: Removed archived `specs/views/sources.md` reference from Related header. Section 4: Updated state machine from 25 states to 14 view states + GlobExplorer overlay, removed non-existent wizard states (WizardMenu, Pathfinder*, ParserLab*). Section 5: Fixed GlobExplorer as `Option<GlobExplorerState>` field (not enum variant), removed wizard state types. Section 6: Updated `W` key status (removed AI Wizards), removed `w` Pathfinder key, noted AI assistance consolidated into GlobExplorer EditRule. |

@@ -186,14 +186,14 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
         let topic_files = db.list_files_by_tag(topic, 10000).await
             .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
         topic_files.into_iter()
-            .filter(|f| source_ids.contains(&f.source_id))
+            .filter(|f| source_ids.iter().any(|s| s.as_str() == &*f.source_id))
             .collect()
     } else if let Some(status) = &validated_status {
         // Filter by status - queries across all sources, then we filter
         let status_files = db.list_files_by_status(*status, 10000).await
             .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
         status_files.into_iter()
-            .filter(|f| source_ids.contains(&f.source_id))
+            .filter(|f| source_ids.iter().any(|s| s.as_str() == &*f.source_id))
             .collect()
     } else if args.untagged {
         // Get untagged files from selected sources

@@ -39,6 +39,8 @@ zstd = "0.13"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
+indexmap = "2"
+bumpalo = "3"
 blake3 = "1"
 base64 = "0.22"
 
@@ -78,6 +80,13 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 thiserror.workspace = true
 tokio-stream = "0.1"
 
+# Local LLM (llama.cpp)
+llama-cpp-2 = { version = "0.1", optional = true }
+hf-hub = { version = "0.3", optional = true }
+
+# Profiling (optional)
+casparian_profiler = { path = "../casparian_profiler", optional = true }
+
 # Signal handling (Unix)
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"
@@ -88,9 +97,11 @@ libc = "0.2"
 ctrlc = "3.4"
 
 [features]
-default = []
+default = ["profiling"]  # Profiling enabled by default for dev
 full = []  # Include slow tests (PTY, LLM, network)
 perf = []  # Performance regression tests
+local-llm = ["llama-cpp-2", "hf-hub"]  # Local LLM via llama.cpp
+profiling = ["dep:casparian_profiler"]  # TUI profiler overlay (` or F12 toggle)
 
 [dev-dependencies]
 tempfile = "3.14"

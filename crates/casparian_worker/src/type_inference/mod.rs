@@ -37,7 +37,22 @@ pub use date_formats::{ParsedDate, DATE_FORMATS};
 pub use solver::ConstraintSolver;
 pub use streaming::infer_types_streaming;
 
-/// Data types that can be inferred
+/// Type inference engine data types.
+///
+/// Uses inference-friendly names (Integer, Float, DateTime) rather than
+/// Arrow-compatible names (Int64, Float64, Timestamp) used in protocol.
+/// This makes the inference engine's output more readable.
+///
+/// The inference engine works with these types, then converts to
+/// `casparian_protocol::DataType` for output via `From` impl.
+///
+/// # Name Mapping
+///
+/// | Inference | Protocol | Arrow |
+/// |-----------|----------|-------|
+/// | Integer | Int64 | Int64 |
+/// | Float | Float64 | Float64 |
+/// | DateTime | Timestamp | Timestamp |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     /// Null/empty value

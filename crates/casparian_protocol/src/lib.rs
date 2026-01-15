@@ -28,9 +28,9 @@ pub use types::{
     HeartbeatPayload, HeartbeatStatus, IdentifyPayload, JobReceipt, JobStatus,
     PrepareEnvCommand, SinkConfig,
     // Shredder types
-    AnalysisResult, ApprovedParser, BacktestResult, DetectionConfidence, LineageBlock,
-    LineageChain, LineageFileType, LineageHop, LlmConfig, LlmProvider, ParseFailure, ParserDraft,
-    ShardMeta, ShredCheckpoint, ShredConfig, ShredResult, ShredStrategy,
+    AnalysisResult, DetectionConfidence, LineageBlock,
+    LineageChain, LineageFileType, LineageHop, LlmConfig, LlmProvider,
+    ShardMeta, ShredConfig, ShredResult, ShredStrategy,
 };
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};

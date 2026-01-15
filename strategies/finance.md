@@ -2,8 +2,8 @@
 
 **Status:** Draft
 **Parent:** STRATEGY.md Section 2 (Target Market → Financial Services)
-**Version:** 0.2
-**Date:** January 8, 2026
+**Version:** 0.3
+**Date:** January 14, 2026
 
 ---
 
@@ -42,9 +42,9 @@ This substrategy details how Casparian Flow captures the financial services data
 | RegTech (compliance) | $12B+ | 15%+ CAGR |
 | Bloomberg Terminal revenue | $12B/year | Stable |
 
-### 2.3 The T+1 Settlement Crunch (May 2024)
+### 2.3 T+1 Settlement Reality (Live Since May 2024)
 
-The SEC moved US markets to T+1 settlement (trade date + 1 day), creating operational pressure:
+The SEC moved US markets to T+1 settlement on May 28, 2024. The operational pressure is now permanent:
 - **Trade breaks must be resolved faster** - Less time to reconcile discrepancies
 - **Trade Support teams are overwhelmed** - Manual FIX log analysis is too slow
 - **Settlement risk is financial risk** - Failed settlements cost real money
@@ -57,19 +57,24 @@ The SEC moved US markets to T+1 settlement (trade date + 1 day), creating operat
 
 This "trade lifecycle reconstruction" takes 30-45 minutes per break. With T+1, there's no time.
 
-**Window of Opportunity:** Tools that accelerate trade break resolution have immediate, quantifiable ROI.
+**Global Expansion (2025-2027):**
+- **EU/UK:** Transitioning to T+1 by October 11, 2027
+- **Switzerland:** Aligned with EU/UK timeline
+- **Hong Kong:** Consultation underway for T+1 transition
 
-### 2.4 The November 2025 ISO 20022 Deadline
+**Ongoing Opportunity:** Tools that accelerate trade break resolution have immediate, quantifiable ROI - and the global market is expanding.
 
-SWIFT mandated ISO 20022 (MX format) for cross-border payments as of November 22, 2025:
-- Legacy MT messages auto-converted but degraded
-- Only ~72% of SWIFT banks migrated by deadline
-- ~5,000 international banks potentially non-compliant
-- Estimated **$5-10B spent industry-wide** on migration
+### 2.4 ISO 20022: Post-Migration Reality (November 2025 Complete)
 
-**The "Translation Trap":** Banks that use MT-to-MX translators check the compliance box but forfeit the strategic benefits of rich ISO 20022 data. They have MX messages but no tools to analyze them.
+SWIFT's ISO 20022 (MX format) mandate took effect November 22, 2025. The coexistence period has ended:
+- **Legacy MT messages no longer accepted** on SWIFT FIN network
+- **January 2026:** Additional charges for contingency/translation services
+- **November 2026:** Unstructured address formats retired; only structured/hybrid allowed
+- **2027-2028:** Full statement/reporting message adoption expected
 
-**Window of Opportunity:** Organizations now have ISO 20022 data but lack tooling to analyze it. Parsing MX messages requires specialized knowledge.
+**The "Translation Trap":** Banks that used MT-to-MX translators checked the compliance box but forfeited the strategic benefits of rich ISO 20022 data. They have MX messages but no tools to analyze them.
+
+**Current Opportunity:** Organizations now have mandatory ISO 20022 data but lack tooling to analyze it. The November 2026 structured address requirement creates another compliance wave - banks need to audit their data quality.
 
 ---
 
@@ -630,3 +635,4 @@ Per Andreessen's framework:
 |------|---------|---------|
 | 2026-01-08 | 0.1 | Initial draft |
 | 2026-01-08 | 0.2 | Gap analysis integration: Trade Break Workbench as primary attack; T+1 urgency section; Trade Support Engineer persona; fix_order_lifecycle table; updated positioning |
+| 2026-01-14 | 0.3 | Maintenance workflow: Updated T+1 to reflect live status (May 2024); added global T+1 expansion (EU/UK Oct 2027); updated ISO 20022 to post-migration reality with Nov 2026 structured address deadline |

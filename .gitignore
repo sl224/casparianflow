@@ -61,6 +61,13 @@ data/
 *.json.bak
 last_proposal.json
 
+# Spec session artifacts (working files, not part of codebase)
+specs/meta/sessions/
+specs/meta/maintenance/
+
+# Archive (historical documents)
+archive/
+
 # Rust artifacts
 target/
 Cargo.lock

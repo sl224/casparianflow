@@ -18,6 +18,9 @@ pub mod extraction;
 pub mod llm;
 pub mod ui;
 
+#[cfg(feature = "profiling")]
+mod profiler_overlay;
+
 #[cfg(test)]
 pub mod test_harness;
 
@@ -86,8 +89,20 @@ async fn run_app<B: Backend>(
     events: &mut EventHandler,
 ) -> Result<()> {
     while app.running {
+        // Begin profiling frame
+        #[cfg(feature = "profiling")]
+        app.profiler.begin_frame();
+
         // Draw UI
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        terminal.draw(|frame| {
+            ui::draw(frame, app);
+
+            // Render profiler overlay if enabled
+            #[cfg(feature = "profiling")]
+            if app.profiler.enabled {
+                profiler_overlay::render(frame, &app.profiler);
+            }
+        })?;
 
         // Handle events
         match events.next().await {
@@ -95,6 +110,14 @@ async fn run_app<B: Backend>(
             Event::Tick => app.tick().await,
             Event::Resize(_, _) => {} // Ratatui handles resize
         }
+
+        // End profiling frame
+        #[cfg(feature = "profiling")]
+        app.profiler.end_frame();
+
+        // Check for profiler dump trigger (testing integration)
+        #[cfg(feature = "profiling")]
+        app.check_profiler_dump();
     }
 
     Ok(())

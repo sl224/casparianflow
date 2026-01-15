@@ -215,9 +215,17 @@ impl LockedColumn {
     }
 }
 
-/// Data types supported by the schema system.
+/// User-facing data types for schema contracts.
 ///
-/// These map to Arrow/Parquet types for output.
+/// This is a SUBSET of `casparian_protocol::DataType`, exposing only
+/// types that users need to approve in schemas. Excludes internal types:
+/// - `Null` - Used internally during type inference
+/// - `Time` - Uncommon standalone time type
+/// - `Duration` - Interval type, rarely user-facing
+///
+/// Converts to canonical protocol type via `impl From<DataType> for casparian_protocol::DataType`.
+///
+/// Maps to Arrow/Parquet types for output storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DataType {

@@ -409,9 +409,10 @@ impl HighFailureTable {
     ) -> Result<Vec<FileInfo>, HighFailureError> {
         // Get all high-failure info
         let high_failure_files = self.get_all(scope_id).await?;
-        let high_failure_map: std::collections::HashMap<String, &HighFailureFile> = high_failure_files
+        // F-010: Use &str keys instead of String to avoid cloning
+        let high_failure_map: std::collections::HashMap<&str, &HighFailureFile> = high_failure_files
             .iter()
-            .map(|f| (f.file_path.clone(), f))
+            .map(|f| (f.file_path.as_str(), f))
             .collect();
 
         let mut result: Vec<FileInfo> = Vec::with_capacity(all_files.len());
@@ -423,7 +424,7 @@ impl HighFailureTable {
         let mut passing: Vec<FileInfo> = Vec::new();
 
         for file in all_files {
-            if let Some(hf) = high_failure_map.get(&file.path) {
+            if let Some(hf) = high_failure_map.get(file.path.as_str()) {
                 let mut file_with_info = file.clone();
                 file_with_info.is_high_failure = hf.consecutive_failures > 0;
                 file_with_info.consecutive_failures = hf.consecutive_failures;

@@ -1,0 +1,21 @@
+[package]
+name = "casparian_profiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Feature-gated profiler for TUI frame timing and zone breakdown"
+
+[lib]
+name = "casparian_profiler"
+path = "src/lib.rs"
+
+[features]
+default = []
+profiling = []  # Enable profiling. Zero overhead when disabled.
+
+[dependencies]
+# No dependencies - keep it simple
+
+[dev-dependencies]

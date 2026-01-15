@@ -6,6 +6,32 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+// ============================================================================
+// Serde helpers for Arc<str>
+// ============================================================================
+
+/// Custom serde for Arc<str> - serializes as String, deserializes efficiently
+mod arc_str_serde {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S>(value: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(value)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<str>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Arc::from(s))
+    }
+}
 
 // ============================================================================
 // Source Types
@@ -143,7 +169,10 @@ pub struct ScannedFile {
     /// Database ID (None if not yet persisted)
     pub id: Option<i64>,
     /// Source ID this file belongs to
-    pub source_id: String,
+    /// PERF: Uses Arc<str> to share source_id across all files in a scan,
+    /// eliminating 1M allocations when scanning 1M files.
+    #[serde(with = "arc_str_serde")]
+    pub source_id: Arc<str>,
     /// Full path to the file
     pub path: String,
     /// Relative path from source root
@@ -182,9 +211,43 @@ impl ScannedFile {
         let now = Utc::now();
         Self {
             id: None,
-            source_id: source_id.to_string(),
+            source_id: Arc::from(source_id),
             path: path.to_string(),
             rel_path: rel_path.to_string(),
+            size,
+            mtime,
+            content_hash: None,
+            status: FileStatus::Pending,
+            tag: None,
+            tag_source: None,
+            rule_id: None,
+            manual_plugin: None,
+            error: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            processed_at: None,
+            sentinel_job_id: None,
+        }
+    }
+
+    /// F-007: Create from pre-allocated strings to avoid redundant allocations
+    ///
+    /// Use this in hot paths where strings are already owned (e.g., scanner).
+    /// For source_id, use Arc<str> to share across all files in a scan.
+    /// PERF: No allocation - Arc is cloned (ref count bump only).
+    pub fn from_parts(
+        source_id: Arc<str>,
+        path: String,
+        rel_path: String,
+        size: u64,
+        mtime: i64,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: None,
+            source_id, // PERF: No allocation - just Arc clone (ref count bump)
+            path,
+            rel_path,
             size,
             mtime,
             content_hash: None,
@@ -248,18 +311,6 @@ pub struct UpsertResult {
     pub is_changed: bool,
 }
 
-/// Result of processing a single file entry during scanning
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Used in internal scan operations
-pub struct ProcessedEntry {
-    /// True if this is a new file
-    pub is_new: bool,
-    /// True if the file was modified
-    pub is_changed: bool,
-    /// File size in bytes
-    pub size: u64,
-}
-
 /// Statistics from the database
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // Will be used for status reporting
@@ -275,32 +326,6 @@ pub struct DbStats {
     pub files_failed: u64,
     pub bytes_pending: u64,
     pub bytes_processed: u64,
-}
-
-// ============================================================================
-// Submission Types (Scout → Sentinel handoff)
-// ============================================================================
-
-/// Result of submitting a file to Sentinel for processing
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Will be used for processing integration
-pub struct SubmissionResult {
-    /// The file that was submitted
-    pub file_id: i64,
-    /// The Sentinel job ID
-    pub job_id: i64,
-    /// The plugin that will process it
-    pub plugin_name: String,
-}
-
-/// Error when no plugin is configured for a tag
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Will be used for processing integration
-pub struct NoPluginError {
-    /// The tag that has no plugin
-    pub tag: String,
-    /// Suggestions for the user
-    pub suggestion: String,
 }
 
 #[cfg(test)]

@@ -111,11 +111,12 @@ impl ConstraintSolver {
             return;
         }
 
-        let lower = value.to_lowercase();
-        let is_boolean = matches!(
-            lower.as_str(),
-            "true" | "false" | "yes" | "no" | "y" | "n" | "1" | "0" | "t" | "f"
-        );
+        // F-002: Use eq_ignore_ascii_case() instead of to_lowercase() to avoid allocation
+        let is_boolean = value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("no")
+            || matches!(value, "y" | "Y" | "n" | "N" | "1" | "0" | "t" | "T" | "f" | "F");
 
         if !is_boolean {
             self.eliminate_type(
@@ -264,9 +265,11 @@ impl ConstraintSolver {
         }
 
         // Test each remaining date format candidate
+        // F-001: Iterate by reference instead of cloning the HashSet
+        let formats_to_check: Vec<&String> = self.date_format_candidates.iter().collect();
         let mut formats_to_eliminate = Vec::new();
 
-        for format_pattern in &self.date_format_candidates.clone() {
+        for format_pattern in formats_to_check {
             // Find the format spec
             let format = DATE_FORMATS
                 .iter()
@@ -500,32 +503,41 @@ impl ConstraintSolver {
         // - Human readable: 1h30m, 2 hours, 30 min, etc.
         // - Numeric durations: values like "10.50" are NOT durations
 
-        let lower = value.to_lowercase();
-
-        // Check for ISO 8601 duration (starts with P)
-        if lower.starts_with('p') && (lower.contains('t') || lower.contains('y') || lower.contains('m') || lower.contains('d')) {
-            return; // Looks like ISO 8601 duration
+        // Check for ISO 8601 duration (starts with P) - case insensitive without allocation
+        let first_char = value.chars().next();
+        if matches!(first_char, Some('p') | Some('P')) {
+            // Check for duration markers in rest of string
+            let has_duration_marker = value[1..].chars().any(|c| matches!(c, 't' | 'T' | 'y' | 'Y' | 'm' | 'M' | 'd' | 'D'));
+            if has_duration_marker {
+                return; // Looks like ISO 8601 duration
+            }
         }
 
-        // Check for human-readable duration markers
-        let has_duration_marker = lower.contains("hour")
-            || lower.contains("min")
-            || lower.contains("sec")
-            || lower.contains("day")
-            || lower.ends_with('h')
-            || lower.ends_with('m')
-            || lower.ends_with('s')
-            || lower.ends_with('d');
+        // Check for human-readable duration markers (case insensitive without allocation)
+        let value_bytes = value.as_bytes();
 
-        if has_duration_marker {
+        // Helper to check if slice contains substring case-insensitively
+        fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack.windows(needle.len()).any(|window| {
+                window.iter().zip(needle.iter()).all(|(h, n)| h.to_ascii_lowercase() == *n)
+            })
+        }
+
+        let has_hour = contains_ignore_case(value_bytes, b"hour");
+        let has_min = contains_ignore_case(value_bytes, b"min");
+        let has_sec = contains_ignore_case(value_bytes, b"sec");
+        let has_day = contains_ignore_case(value_bytes, b"day");
+        let ends_with_unit = matches!(value_bytes.last(), Some(b'h') | Some(b'H') | Some(b'm') | Some(b'M') | Some(b's') | Some(b'S') | Some(b'd') | Some(b'D'));
+
+        if has_hour || has_min || has_sec || has_day || ends_with_unit {
             return; // Looks like human-readable duration
         }
 
-        // Check for short form like "1h30m" or "2h"
-        let has_duration_unit = lower.chars().any(|c| c == 'h' || c == 'm' || c == 's')
-            && lower.chars().any(|c| c.is_ascii_digit());
+        // Check for short form like "1h30m" or "2h" - check for digits AND duration chars
+        let has_digit = value.chars().any(|c| c.is_ascii_digit());
+        let has_duration_char = value.chars().any(|c| matches!(c, 'h' | 'H' | 'm' | 'M' | 's' | 'S'));
 
-        if has_duration_unit {
+        if has_digit && has_duration_char {
             return; // Looks like short duration format
         }
 

@@ -3,8 +3,8 @@
 **Status:** Draft
 **Parent:** STRATEGY.md Section 2 (Target Market → Healthcare IT)
 **Related Spec:** [specs/hl7_parser.md](../specs/hl7_parser.md)
-**Version:** 0.1
-**Date:** January 8, 2026
+**Version:** 0.3
+**Date:** January 14, 2026
 
 ---
 
@@ -45,14 +45,20 @@ Live HL7 traffic → [MIRTH CONNECT] → Routes to destinations (EHR, Lab, etc.)
 | Interface engine market | $500M+ | Consolidating |
 | Healthcare analytics | $50B+ | 15%+ CAGR |
 
-### 2.3 The Mirth Connect Licensing Change (March 2025)
+### 2.3 The Mirth Connect Licensing Change (March 2025 - Complete)
 
-NextGen Healthcare transitioned Mirth Connect from open-source to **commercial-only**:
-- Version 4.6+ requires paid license
-- Version 4.5.2 (last free) receives no security patches
-- Healthcare IT budgets under pressure
+NextGen Healthcare transitioned Mirth Connect from open-source to **commercial-only** on March 19, 2025:
+- **Version 4.6+** requires paid license (source code no longer public)
+- **Version 4.5.2** is the last open-source release (no security patches)
+- **New Enterprise features:** SSL Manager, Channel History, Mirth Command Center (not available in EU/UK)
+- **Community response:** Forks emerged (Open Integration Engine, BridgeLink) offering open-source alternatives
 
-**Implication for Casparian:** Organizations now paying for Mirth will want to extract more value from their HL7 data. Casparian enables **analytics** on the archives Mirth creates - complementing their Mirth investment rather than replacing it.
+**Market Impact:**
+- Organizations face upgrade decision: pay for 4.6+ or stay on unsupported 4.5.2
+- Healthcare IT budgets now allocate Mirth licensing costs
+- Some orgs exploring fork migrations (creates integration uncertainty)
+
+**Implication for Casparian:** Organizations now paying for Mirth will want to extract more value from their HL7 data. Casparian enables **analytics** on the archives Mirth creates - complementing their Mirth investment rather than replacing it. For orgs on forks, Casparian remains compatible (same archive format).
 
 ---
 
@@ -482,4 +488,5 @@ Note: Year 1 assumes Phase 4 timing (starts Month 12+). Revenue projections begi
 |------|---------|---------|
 | 2026-01-08 | 0.1 | Initial draft |
 | 2026-01-08 | 0.2 | **Positioning fix:** Clarified Casparian is complementary to Mirth (archive analytics), not a replacement; Reframed competitive positioning as "Mirth + Casparian Stack"; Removed "Mirth alternative" language throughout |
+| 2026-01-14 | 0.3 | Maintenance workflow: Updated Mirth licensing section to reflect March 2025 change is complete; added community forks (OIE, BridgeLink); noted Mirth Command Center EU/UK unavailability |
 

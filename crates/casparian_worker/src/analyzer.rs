@@ -4,6 +4,7 @@
 //! Designed to handle 90% of cases deterministically without LLM.
 
 use casparian_protocol::{AnalysisResult, DetectionConfidence, ShredStrategy};
+use lasso::{Rodeo, Spur};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -82,6 +83,10 @@ pub struct FullAnalysisResult {
 /// to know exactly how many shards will be created.
 ///
 /// This is slower but gives complete information - no surprises at runtime.
+///
+/// F-004-v2: Uses lasso string interning to avoid allocating duplicate keys.
+/// For files with many rows but few unique keys, this significantly reduces
+/// allocations from O(rows) to O(unique_keys).
 pub fn analyze_file_full(
     path: &Path,
     strategy: &ShredStrategy,
@@ -92,7 +97,10 @@ pub fn analyze_file_full(
     let file_size = file.metadata()?.len();
     let reader = BufReader::with_capacity(65536, file);
 
-    let mut key_counts: HashMap<String, u64> = HashMap::new();
+    // F-004-v2: Use string interning to avoid per-row allocations
+    // Rodeo interns strings - duplicate keys reuse the same allocation
+    let mut interner = Rodeo::default();
+    let mut key_counts: HashMap<Spur, u64> = HashMap::new();
     let mut total_rows = 0u64;
 
     // Determine extraction method based on strategy
@@ -111,8 +119,9 @@ pub fn analyze_file_full(
 
                 total_rows += 1;
 
-                // Extract key from column
-                if let Some(key) = extract_csv_key(&line, delim, *col_index) {
+                // Extract key from column - F-004-v2: intern instead of allocate
+                if let Some(key_str) = extract_csv_key(&line, delim, *col_index) {
+                    let key = interner.get_or_intern(key_str);
                     *key_counts.entry(key).or_insert(0) += 1;
                 }
             }
@@ -122,7 +131,9 @@ pub fn analyze_file_full(
                 let line = line_result?;
                 total_rows += 1;
 
-                if let Some(key) = extract_json_key(&line, key_path) {
+                // F-004-v2: intern JSON keys too
+                if let Some(key_str) = extract_json_key(&line, key_path) {
+                    let key = interner.get_or_intern(&key_str);
                     *key_counts.entry(key).or_insert(0) += 1;
                 }
             }
@@ -132,7 +143,8 @@ pub fn analyze_file_full(
             for _ in reader.lines() {
                 total_rows += 1;
             }
-            key_counts.insert("_ALL".to_string(), total_rows);
+            let key = interner.get_or_intern("_ALL");
+            key_counts.insert(key, total_rows);
         }
         ShredStrategy::Regex { .. } => {
             // Regex not supported for full analysis yet
@@ -140,17 +152,23 @@ pub fn analyze_file_full(
         }
     }
 
+    // F-004-v2: Convert interned keys back to owned strings for the result
+    let all_keys: HashMap<String, u64> = key_counts
+        .into_iter()
+        .map(|(spur, count)| (interner.resolve(&spur).to_string(), count))
+        .collect();
+
     Ok(FullAnalysisResult {
-        all_keys: key_counts,
+        all_keys,
         total_rows,
         bytes_scanned: file_size,
         duration_ms: start.elapsed().as_millis() as u64,
     })
 }
 
-/// Extract key from CSV line
-fn extract_csv_key(line: &str, delim: char, col_index: usize) -> Option<String> {
-    line.split(delim).nth(col_index).map(|s| s.trim().to_string())
+/// F-004-v2: Extract key from CSV line (returns borrowed &str to avoid allocation)
+fn extract_csv_key(line: &str, delim: char, col_index: usize) -> Option<&str> {
+    line.split(delim).nth(col_index).map(|s| s.trim())
 }
 
 /// Extract key from JSON line

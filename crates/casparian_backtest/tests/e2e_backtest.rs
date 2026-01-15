@@ -365,7 +365,7 @@ async fn test_backtest_all_pass() {
 
     let result = backtest_with_failfast(
         &parser,
-        files,
+        &files,
         &table,
         &scope_id,
         1, // parser_version
@@ -420,7 +420,7 @@ async fn test_backtest_some_fail() {
         ..Default::default()
     };
 
-    let result = backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -496,7 +496,7 @@ async fn test_early_stop_on_high_failure() {
 
     let result = backtest_with_failfast(
         &tracking_parser,
-        ordered,
+        &ordered,
         &table,
         &scope_id,
         1,
@@ -621,7 +621,7 @@ async fn test_loop_achieves_pass_rate() {
 
     let result = run_backtest_loop(
         &mut parser,
-        files,
+        &files,
         &table,
         &scope_id,
         &config,
@@ -684,7 +684,7 @@ async fn test_loop_max_iterations() {
         failfast_config: FailFastConfig::default(),
     };
 
-    let result = run_backtest_loop(&mut parser, files, &table, &scope_id, &config).await.unwrap();
+    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.unwrap();
 
     assert!(matches!(result.termination_reason, TerminationReason::MaxIterations),
             "Should terminate due to max iterations");
@@ -758,7 +758,7 @@ async fn test_loop_plateau_detection() {
         failfast_config: FailFastConfig::default(),
     };
 
-    let result = run_backtest_loop(&mut parser, files, &table, &scope_id, &config).await.unwrap();
+    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.unwrap();
 
     match result.termination_reason {
         TerminationReason::Plateau { no_improvement_for } => {
@@ -792,9 +792,10 @@ fn test_failure_summary() {
     }
 
     assert_eq!(summary.total_failures, 5);
-    assert_eq!(summary.by_category.get(&FailureCategory::TypeMismatch), Some(&3));
-    assert_eq!(summary.by_category.get(&FailureCategory::ParseError), Some(&1));
-    assert_eq!(summary.by_category.get(&FailureCategory::NullNotAllowed), Some(&1));
+    // F-013: Use category_count() instead of HashMap get()
+    assert_eq!(summary.category_count(FailureCategory::TypeMismatch), 3);
+    assert_eq!(summary.category_count(FailureCategory::ParseError), 1);
+    assert_eq!(summary.category_count(FailureCategory::NullNotAllowed), 1);
 }
 
 /// Test iteration metrics tracking
@@ -923,7 +924,7 @@ async fn test_complete_backtest_workflow() {
 
     // First backtest run
     let config = FailFastConfig::default();
-    let result = backtest_with_failfast(&parser, files.clone(), &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -956,7 +957,7 @@ async fn test_complete_backtest_workflow() {
         min_high_failure_files: 1,
     };
 
-    let result2 = backtest_with_failfast(&parser, ordered, &table, &scope_id, 1, 2, &strict_config).await.unwrap();
+    let result2 = backtest_with_failfast(&parser, &ordered, &table, &scope_id, 1, 2, &strict_config).await.unwrap();
 
     // Should stop early because high-failure file still fails
     match result2 {
@@ -993,7 +994,7 @@ async fn test_handles_missing_files_gracefully() {
 
     let config = FailFastConfig::default();
 
-    let result = backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1019,7 +1020,7 @@ async fn test_handles_empty_file_list() {
 
     let config = FailFastConfig::default();
 
-    let result = backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1053,7 +1054,7 @@ async fn test_handles_unreadable_files() {
     let table = HighFailureTable::in_memory().await.unwrap();
     let scope_id = Uuid::new_v4();
 
-    let result = backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1092,7 +1093,7 @@ async fn test_handles_malformed_csv() {
     let table = HighFailureTable::in_memory().await.unwrap();
     let scope_id = Uuid::new_v4();
 
-    let result = backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1129,7 +1130,7 @@ async fn test_failure_categories_recorded_correctly() {
     let table = HighFailureTable::in_memory().await.unwrap();
     let scope_id = Uuid::new_v4();
 
-    let _ = backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let _ = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
     // Check that failures were recorded with correct categories
     let all_failures = table.get_all(&scope_id).await.unwrap();
@@ -1167,7 +1168,7 @@ async fn test_handles_large_file_count() {
     let table = HighFailureTable::in_memory().await.unwrap();
     let scope_id = Uuid::new_v4();
 
-    let result = backtest_with_failfast(&parser, files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1246,7 +1247,7 @@ async fn test_loop_handles_parser_errors() {
     };
 
     // Should complete without crashing
-    let result = run_backtest_loop(&mut parser, files, &table, &scope_id, &config).await.unwrap();
+    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.unwrap();
 
     // Should terminate due to max iterations or plateau
     assert!(matches!(

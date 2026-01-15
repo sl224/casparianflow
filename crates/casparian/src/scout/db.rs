@@ -75,6 +75,24 @@ CREATE TABLE IF NOT EXISTS scout_files (
     UNIQUE(source_id, path)
 );
 
+-- Folder hierarchy for O(1) TUI navigation (streaming scanner)
+-- Replaces file-based FolderCache (.bin.zst files)
+CREATE TABLE IF NOT EXISTS scout_folders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL REFERENCES scout_sources(id) ON DELETE CASCADE,
+    -- Prefix path, e.g., "" for root, "logs/" for /logs folder
+    prefix TEXT NOT NULL,
+    -- Folder or file name at this level
+    name TEXT NOT NULL,
+    -- Count of files in this subtree
+    file_count INTEGER NOT NULL DEFAULT 0,
+    -- True for folders, false for files (stored as 1/0)
+    is_folder INTEGER NOT NULL,
+    -- When this row was last updated
+    updated_at INTEGER NOT NULL,
+    UNIQUE(source_id, prefix, name)
+);
+
 -- Parser Lab parsers (v6 - parser-centric)
 -- NOTE: These tables are here for backward compatibility.
 -- They should eventually be moved to a separate module.
@@ -154,6 +172,68 @@ CREATE TABLE IF NOT EXISTS extraction_tag_conditions (
     created_at INTEGER NOT NULL
 );
 
+-- ============================================================================
+-- AI Wizards Tables (Layer 2)
+-- ============================================================================
+
+-- AI Drafts: temporary artifacts awaiting approval
+-- Types: 'extractor' (Pathfinder), 'parser' (Parser Lab), 'label' (Labeling), 'semantic_rule' (Semantic Path)
+CREATE TABLE IF NOT EXISTS cf_ai_drafts (
+    id TEXT PRIMARY KEY,
+    draft_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    source_context_json TEXT,
+    model_name TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    approved_at INTEGER,
+    approved_by TEXT
+);
+
+-- AI Audit Log: tracks all LLM interactions for debugging and compliance
+CREATE TABLE IF NOT EXISTS cf_ai_audit_log (
+    id TEXT PRIMARY KEY,
+    wizard_type TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    input_type TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    input_preview TEXT,
+    redactions_json TEXT,
+    output_type TEXT,
+    output_hash TEXT,
+    output_file TEXT,
+    duration_ms INTEGER,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    attempt_number INTEGER DEFAULT 1,
+    created_at INTEGER NOT NULL
+);
+
+-- Signature Groups: file groups with same structure (for Labeling Wizard)
+CREATE TABLE IF NOT EXISTS cf_signature_groups (
+    id TEXT PRIMARY KEY,
+    fingerprint_json TEXT NOT NULL,
+    file_count INTEGER DEFAULT 0,
+    label TEXT,
+    labeled_by TEXT,
+    labeled_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- AI Training Examples: approved rules for future model improvement
+CREATE TABLE IF NOT EXISTS cf_ai_training_examples (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    sample_paths_json TEXT NOT NULL,
+    extraction_config_json TEXT NOT NULL,
+    approved_by TEXT,
+    approved_at INTEGER NOT NULL,
+    quality_score REAL,
+    created_at INTEGER NOT NULL
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_files_source ON scout_files(source_id);
 CREATE INDEX IF NOT EXISTS idx_files_status ON scout_files(status);
@@ -174,6 +254,17 @@ CREATE INDEX IF NOT EXISTS idx_extraction_rules_pattern ON extraction_rules(glob
 CREATE INDEX IF NOT EXISTS idx_extraction_rules_enabled ON extraction_rules(enabled);
 CREATE INDEX IF NOT EXISTS idx_extraction_fields_rule ON extraction_fields(rule_id);
 CREATE INDEX IF NOT EXISTS idx_extraction_tag_conditions_rule ON extraction_tag_conditions(rule_id);
+CREATE INDEX IF NOT EXISTS idx_scout_folders_lookup ON scout_folders(source_id, prefix);
+
+-- AI Wizards indexes
+CREATE INDEX IF NOT EXISTS idx_ai_drafts_status ON cf_ai_drafts(status);
+CREATE INDEX IF NOT EXISTS idx_ai_drafts_type ON cf_ai_drafts(draft_type);
+CREATE INDEX IF NOT EXISTS idx_ai_drafts_expires ON cf_ai_drafts(expires_at);
+CREATE INDEX IF NOT EXISTS idx_ai_audit_wizard ON cf_ai_audit_log(wizard_type);
+CREATE INDEX IF NOT EXISTS idx_ai_audit_created ON cf_ai_audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_ai_audit_status ON cf_ai_audit_log(status);
+CREATE INDEX IF NOT EXISTS idx_sig_groups_label ON cf_signature_groups(label);
+CREATE INDEX IF NOT EXISTS idx_training_rule ON cf_ai_training_examples(rule_id);
 "#;
 
 /// Convert milliseconds since epoch to DateTime
@@ -477,7 +568,7 @@ impl Database {
         let existing: Option<(i64, i64, i64, String)> = sqlx::query_as(
             "SELECT id, size, mtime, status FROM scout_files WHERE source_id = ? AND path = ?",
         )
-        .bind(&file.source_id)
+        .bind(file.source_id.as_ref())  // Arc<str> -> &str for sqlx
         .bind(&file.path)
         .fetch_optional(&self.pool)
         .await?;
@@ -492,7 +583,7 @@ impl Database {
                     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     "#,
                 )
-                .bind(&file.source_id)
+                .bind(file.source_id.as_ref())  // Arc<str> -> &str for sqlx
                 .bind(&file.path)
                 .bind(&file.rel_path)
                 .bind(file.size as i64)
@@ -819,7 +910,7 @@ impl Database {
 
         Ok(ScannedFile {
             id: Some(row.get(0)),
-            source_id: row.get(1),
+            source_id: std::sync::Arc::from(row.get::<String, _>(1)),  // String -> Arc<str>
             path: row.get(2),
             rel_path: row.get(3),
             size: row.get::<i64, _>(4) as u64,
@@ -1103,6 +1194,141 @@ impl Database {
                 .await?;
         Ok(result.map(|(v,)| v))
     }
+
+    // ========================================================================
+    // Folder Operations (Streaming Scanner)
+    // ========================================================================
+
+    /// Get folder children at a given prefix for TUI drill-down
+    /// Returns folders first (sorted), then files (sorted)
+    pub async fn get_folder_children(
+        &self,
+        source_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<FolderEntry>> {
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT name, file_count, is_folder
+            FROM scout_folders
+            WHERE source_id = ? AND prefix = ?
+            ORDER BY is_folder DESC, name ASC
+            "#,
+        )
+        .bind(source_id)
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(name, file_count, is_folder)| FolderEntry {
+                name,
+                file_count,
+                is_folder: is_folder != 0,
+            })
+            .collect())
+    }
+
+    /// Batch upsert folder counts during scan
+    /// Called by persist_task with aggregated deltas
+    pub async fn batch_upsert_folder_counts(
+        &self,
+        source_id: &str,
+        deltas: &std::collections::HashMap<(String, String), (i64, bool)>,
+    ) -> Result<()> {
+        let now = now_millis();
+
+        for ((prefix, name), (count, is_folder)) in deltas {
+            sqlx::query(
+                r#"
+                INSERT INTO scout_folders (source_id, prefix, name, file_count, is_folder, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_id, prefix, name) DO UPDATE
+                SET file_count = file_count + excluded.file_count,
+                    updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(source_id)
+            .bind(prefix)
+            .bind(name)
+            .bind(*count)
+            .bind(*is_folder as i32)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Decrement folder counts when files are deleted
+    /// Called during rescan cleanup
+    pub async fn decrement_folder_counts(
+        &self,
+        source_id: &str,
+        deltas: &std::collections::HashMap<(String, String), (i64, bool)>,
+    ) -> Result<()> {
+        let now = now_millis();
+
+        for ((prefix, name), (delta, _)) in deltas {
+            sqlx::query(
+                r#"
+                UPDATE scout_folders
+                SET file_count = file_count + ?,
+                    updated_at = ?
+                WHERE source_id = ? AND prefix = ? AND name = ?
+                "#,
+            )
+            .bind(*delta) // negative for decrements
+            .bind(now)
+            .bind(source_id)
+            .bind(prefix)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        // Clean up zero-count folders
+        sqlx::query(
+            r#"
+            DELETE FROM scout_folders
+            WHERE source_id = ? AND file_count <= 0
+            "#,
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Clear all folder entries for a source (used before rescan)
+    pub async fn clear_folder_cache(&self, source_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM scout_folders WHERE source_id = ?")
+            .bind(source_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Check if folder data exists for a source
+    pub async fn has_folder_data(&self, source_id: &str) -> Result<bool> {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scout_folders WHERE source_id = ? LIMIT 1",
+        )
+        .bind(source_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.0 > 0)
+    }
+}
+
+/// Entry in folder hierarchy (from scout_folders table)
+#[derive(Debug, Clone)]
+pub struct FolderEntry {
+    pub name: String,
+    pub file_count: i64,
+    pub is_folder: bool,
 }
 
 #[cfg(test)]

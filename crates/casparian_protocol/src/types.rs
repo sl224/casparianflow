@@ -1,6 +1,5 @@
 //! Protocol payload types (Pydantic model equivalents)
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -199,6 +198,8 @@ pub enum WorkerStatus {
     Busy,
     /// Worker is alive but status unknown
     Alive,
+    /// Worker is draining (finishing current work, not accepting new jobs)
+    Draining,
     /// Worker is shutting down
     ShuttingDown,
     /// Worker is offline/dead
@@ -211,6 +212,7 @@ impl WorkerStatus {
             WorkerStatus::Idle => "IDLE",
             WorkerStatus::Busy => "BUSY",
             WorkerStatus::Alive => "ALIVE",
+            WorkerStatus::Draining => "DRAINING",
             WorkerStatus::ShuttingDown => "SHUTTING_DOWN",
             WorkerStatus::Offline => "OFFLINE",
         }
@@ -235,6 +237,7 @@ impl FromStr for WorkerStatus {
             "IDLE" => Ok(WorkerStatus::Idle),
             "BUSY" => Ok(WorkerStatus::Busy),
             "ALIVE" => Ok(WorkerStatus::Alive),
+            "DRAINING" => Ok(WorkerStatus::Draining),
             "SHUTTING_DOWN" => Ok(WorkerStatus::ShuttingDown),
             "OFFLINE" => Ok(WorkerStatus::Offline),
             _ => Err(format!("Invalid worker status: '{}'", s)),
@@ -246,11 +249,23 @@ impl FromStr for WorkerStatus {
 // Data Types (Canonical Definition)
 // ============================================================================
 
-/// Canonical data type enum used across all crates.
-/// This is the SINGLE SOURCE OF TRUTH for data types in Casparian.
+/// Canonical data type enum - the SINGLE SOURCE OF TRUTH for data types.
 ///
-/// Maps to Arrow/Parquet types for output. Different crates may use
-/// type aliases or conversion traits to map to/from this enum.
+/// # Layered Design
+///
+/// This crate defines the canonical data types. Other crates define
+/// domain-specific subsets that convert to this canonical type:
+///
+/// - `casparian_schema::DataType` - User-facing subset for schema approval
+///   (excludes Null, Time, Duration - internal/uncommon types)
+/// - `casparian_worker::type_inference::DataType` - Inference-friendly names
+///   (Integer vs Int64, Float vs Float64, DateTime vs Timestamp)
+///
+/// All domain-specific types convert to this canonical type via `From` impls.
+///
+/// # Arrow Mapping
+///
+/// Each variant maps to an Arrow/Parquet type for output storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DataType {
@@ -785,71 +800,6 @@ pub struct LineageBlock {
     pub shard_key: String,
     pub row_count_in_block: u32,
     pub first_row_number_in_shard: u64,
-}
-
-/// Checkpoint for resumable shredding
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShredCheckpoint {
-    pub job_id: i64,
-    pub last_source_offset: u64,
-    /// key -> bytes written so far
-    pub shards_written: HashMap<String, u64>,
-    pub checkpointed_at: DateTime<Utc>,
-}
-
-/// Parser draft for user review (LLM-generated)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParserDraft {
-    pub shard_key: String,
-    pub source_code: String,
-    /// First N rows of sample input
-    pub sample_input: Vec<String>,
-    /// Rendered table output (if validated)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_output: Option<String>,
-    /// Validation error (if any)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub validation_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// Parser that user has approved
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovedParser {
-    pub id: i64,
-    pub shard_key: String,
-    pub source_code: String,
-    pub source_hash: String,
-    pub approved_at: DateTime<Utc>,
-    /// "user" or future: username
-    pub approved_by: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backtest_results: Option<BacktestResult>,
-}
-
-/// Result of running parser against historical files
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BacktestResult {
-    pub files_tested: usize,
-    pub total_rows: u64,
-    pub success_count: u64,
-    pub failure_count: u64,
-    /// First 10 failures for inspection
-    pub failure_samples: Vec<ParseFailure>,
-    pub tested_at: DateTime<Utc>,
-}
-
-/// A single parse failure with full lineage
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParseFailure {
-    pub source_file: PathBuf,
-    pub source_offset: u64,
-    /// The actual line that failed
-    pub raw_line: String,
-    pub error_message: String,
-    /// Which column failed (if applicable)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub column_index: Option<usize>,
 }
 
 /// Hop in a lineage chain (for multi-hop tracing)

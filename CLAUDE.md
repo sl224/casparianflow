@@ -484,7 +484,7 @@ cargo test --package casparian_mcp --test e2e_tools
 | `cf_parser_topics` | Parser → topic subscriptions | Topic routing |
 | `cf_job_status` | Job lifecycle (running/staged/complete/failed) | Job tracking |
 | `cf_processing_history` | Dedup by (input_hash, parser_name, version) | Skip unchanged |
-| `scout_*` | sources, files, tagging_rules | File discovery |
+| `scout_*` | sources, files, tagging_rules, folders | File discovery + folder hierarchy |
 | `schema_*` | contracts, amendments | Schema contracts |
 | `backtest_*` | high_failure_files | Backtest tracking |
 
@@ -523,31 +523,145 @@ for evidence in solver.elimination_evidence() {
 
 ## Code Quality Workflow
 
-> **Full documentation:** See [`code_execution_workflow.md`](./code_execution_workflow.md)
+> **Full documentation:** See [`code_execution_workflow.md`](./code_execution_workflow.md) (v1.1)
 
-**IMPORTANT:** Follow the workflow for all coding tasks. Key points:
+**IMPORTANT:** Follow the workflow for all coding tasks.
 
-### Before You Code
-1. **Search for existing modules** - If similar exists, ask before creating new
-2. **Identify related components** - Reuse shared types
-3. **Plan concurrency** - Channels over locks, document strategy
-4. **Verify state machines** - Check spec matches code, understand hierarchy, reconcile if inconsistent
+### Critical Requirements (TLDR)
 
-### While You Code
-- **No stringly types** - Newtypes for IDs, enums for states, structs for config
-- **No race conditions** - Channels (`mpsc`) over `Arc<Mutex<T>>`, no locks across `.await`
-- **Propagate errors** - Use `?`, not `unwrap()` in library code
-- **No migrations** - Alpha app: change schema directly, users delete DB if needed
-
-### Testing
-- Test critical paths with real DBs (no mocks)
-- Test error cases and edge cases
-- Don't test implementation details
+| Requirement | Details |
+|-------------|---------|
+| **Zero warnings** | `cargo check` + `cargo clippy` must pass clean |
+| **Zero dead code** | No `#[allow(dead_code)]` without documented justification |
+| **Use sqlx** | Never `rusqlite` - sqlx is async and project standard |
+| **No unwrap in lib** | Use `?` or `expect()` with context; tests can use unwrap |
+| **Channels over locks** | Use `tokio::sync::mpsc` (async) or `std::sync::mpsc` (sync) |
+| **State machine sync** | Code enums must match spec diagrams |
 
 ### Before You Commit
-- `cargo check` + `cargo clippy` pass
+- `cargo check` + `cargo clippy` pass (zero warnings)
 - Critical path has test coverage
 - Public APIs have doc comments
+- State machine specs updated if changed
+
+---
+
+## Platform Abstraction Guidelines
+
+**CRITICAL:** This codebase must remain platform-agnostic. When writing code:
+
+### Database Abstraction
+- **NEVER** use `sqlx::Sqlite*` types directly in library code
+- **USE** generic `sqlx::Pool<DB>` or trait abstractions
+- **AVOID** SQLite-specific SQL syntax (AUTOINCREMENT, INTEGER PRIMARY KEY without explicit type)
+- **OK** to use concrete types in: CLI entry points, tests, benchmarks
+
+### LLM Provider Abstraction
+- **NEVER** hardcode `anthropic::*` or `openai::*` directly in library code
+- **USE** `LlmProvider` trait when it exists (or propose one)
+- **CONFIGURATION** should select provider, not code
+- **OK** to use concrete types in: CLI tools, tests
+
+### Storage Abstraction
+- **PREFER** trait-based storage backends over direct `std::fs::*` in library code
+- **OK** to use `std::fs` in: CLI tools, tests, one-time setup
+
+### Detection Patterns
+
+When reviewing code or implementing features, check for these anti-patterns:
+
+| Pattern | Severity | Fix |
+|---------|----------|-----|
+| `SqlitePool`, `SqliteRow` in public API | HIGH | Use generic `Pool<DB>` |
+| `anthropic::*`, `ClaudeClient` | HIGH | Use `LlmProvider` trait |
+| `std::env::var("SPECIFIC_VAR")` | LOW | Use typed config struct |
+| SQLite-specific SQL | MEDIUM | Use portable SQL or migration tool |
+
+### Audit & Prevention
+
+- **Full audit:** Run `abstraction_audit_workflow` to find existing violations
+- **Prevention:** `feature_workflow` Phase 3 checks new code automatically
+- **See:** `specs/meta/abstraction_audit_workflow.md` for detailed patterns
+
+---
+
+## Workflow Manager
+
+This project has meta-workflows for maintaining specs, code quality, and data models. When users request tasks that match these workflows, act as the **Workflow Manager**.
+
+> **Full documentation:** See [`specs/meta/workflow_manager.md`](./specs/meta/workflow_manager.md)
+> **Examples:** See [`specs/meta/workflow_manager_examples.md`](./specs/meta/workflow_manager_examples.md)
+
+### Available Workflows
+
+| Workflow | Trigger Keywords | Purpose |
+|----------|------------------|---------|
+| `feature_workflow` | "add", "implement", "fix", "build feature" | Optimized feature development (1-instance with escalation) |
+| `spec_refinement_workflow` | "refine spec", "gaps in spec", "incomplete spec" | Iterative spec improvement (3-instance: Engineer/Reviewer/Mediator) |
+| `spec_maintenance_workflow` | "audit specs", "check all specs", "spec alignment" | Corpus-level spec health check |
+| `memory_audit_workflow` | "memory audit", "allocation", "performance" | Find memory optimization opportunities |
+| `data_model_maintenance_workflow` | "dead types", "data model", "type cleanup" | Audit Rust structs/enums for health |
+| `abstraction_audit_workflow` | "abstraction", "platform", "sqlite coupling", "llm provider" | Find platform-specific coupling for remediation |
+| `tui_testing_workflow` | "test TUI", "TUI validation" | tmux-based TUI testing |
+
+### Routing Rules
+
+When you detect workflow-triggering keywords:
+
+1. **Identify the workflow(s)** from the table above
+2. **Check for sequences** - "refine spec then test" = refinement → tui_testing
+3. **Present execution plan** to user before starting
+4. **Load the workflow spec** - Read `specs/meta/{workflow_name}.md` for detailed instructions
+5. **Execute following the workflow's phases/rounds**
+6. **Emit actionable_findings.json** if the workflow produces code-change recommendations
+
+### Invocation Patterns
+
+**Natural Language (Primary):**
+```
+"Add a dark mode toggle"              → feature_workflow
+"Fix the export crash"                → feature_workflow
+"Run the spec maintenance workflow"   → spec_maintenance_workflow
+"Audit memory in the scanner"         → memory_audit_workflow
+"Check workflow compliance"           → spec_maintenance --mode contract_compliance
+```
+
+**Implicit (Claude Detects Intent):**
+```
+"I need to implement X"               → feature_workflow
+"The discover spec has gaps"          → spec_refinement_workflow
+"Clean up unused types"               → data_model_maintenance_workflow
+"Parser is using too much memory"     → memory_audit_workflow
+"Make the database layer portable"    → abstraction_audit_workflow
+```
+
+**With "workflow" Prefix (Explicit):**
+```
+"workflow: audit all specs"
+"workflow manager: run memory audit"
+```
+
+### Contract Compliance
+
+Workflows must emit `actionable_findings.json` per the contract in `workflow_manager.md` Section 13. To check compliance:
+
+```
+spec_maintenance_workflow
+  --mode contract_compliance
+  --corpus "specs/meta/*_workflow.md"
+  --contract "workflow_manager.md#section-13"
+```
+
+### Implementation Protocol
+
+When workflows produce actionable findings and user says "implement":
+
+1. Read `actionable_findings.json` from the workflow session
+2. Triage by severity and confidence
+3. Implement HIGH confidence findings automatically
+4. Verify with `cargo check && cargo test`
+5. Rollback on failure, continue to next
+6. Group into logical commits
 
 ---
 
