@@ -7,9 +7,13 @@
 //! - Files: discovered files with their tags and status
 
 use super::error::Result;
-use super::types::{DbStats, FileStatus, ScannedFile, Source, SourceType, TaggingRule, UpsertResult};
+use super::types::{
+    DbStats, ExtractionLogStatus, ExtractionStatus, Extractor, FileStatus, ScannedFile, Source,
+    SourceType, TaggingRule, UpsertResult,
+};
+use casparian_db::{DbConfig, DbPool, create_pool};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 use std::path::Path;
 
 /// SQLite database schema (v2 - tag-based)
@@ -72,7 +76,57 @@ CREATE TABLE IF NOT EXISTS scout_files (
     last_seen_at INTEGER NOT NULL,
     processed_at INTEGER,
     sentinel_job_id INTEGER,
+    -- Extractor metadata (Phase 6)
+    metadata_raw TEXT,                           -- JSON blob of extracted metadata
+    extraction_status TEXT DEFAULT 'pending',    -- pending, extracted, timeout, crash, stale
+    extracted_at INTEGER,                        -- timestamp of last extraction
     UNIQUE(source_id, path)
+);
+
+-- Extractors: Python extractor registry (Phase 6)
+-- Extractors are Python files that extract metadata from file paths
+CREATE TABLE IF NOT EXISTS scout_extractors (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    source_path TEXT NOT NULL,               -- Path to .py file
+    source_hash TEXT NOT NULL,               -- SHA-256 of source code
+    enabled INTEGER NOT NULL DEFAULT 1,
+    timeout_secs INTEGER NOT NULL DEFAULT 5, -- Per-file timeout
+    consecutive_failures INTEGER DEFAULT 0,  -- For fail-fast pausing
+    paused_at INTEGER,                       -- When auto-paused due to failures
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- Extraction Log: execution history for auditing (Phase 6)
+CREATE TABLE IF NOT EXISTS scout_extraction_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL REFERENCES scout_files(id),
+    extractor_id TEXT NOT NULL REFERENCES scout_extractors(id),
+    status TEXT NOT NULL,                    -- success, timeout, crash, error
+    duration_ms INTEGER,                     -- Execution time
+    error_message TEXT,                      -- Error details if failed
+    metadata_snapshot TEXT,                  -- Copy of extracted metadata
+    executed_at INTEGER NOT NULL
+);
+
+-- AI Audit Log: tracks all LLM invocations (Phase 1 AI Foundation)
+-- Used by AI Wizards (Pathfinder, Parser, Labeling, Semantic Path)
+CREATE TABLE IF NOT EXISTS cf_ai_audit_log (
+    id TEXT PRIMARY KEY,
+    wizard_type TEXT NOT NULL,               -- 'pathfinder', 'parser', 'labeling', 'semantic'
+    model_name TEXT NOT NULL,                -- 'claude-code', 'qwen2.5-coder:7b', etc.
+    input_type TEXT NOT NULL,                -- 'path', 'sample', 'headers', 'context'
+    input_hash TEXT NOT NULL,                -- blake3(input sent to LLM)
+    input_preview TEXT,                      -- First 500 chars (for debugging)
+    redactions TEXT,                         -- JSON array of redacted fields
+    output_type TEXT,                        -- 'extractor', 'parser', 'rule', 'label'
+    output_hash TEXT,                        -- blake3(LLM response)
+    output_file TEXT,                        -- Draft file path if code generated
+    duration_ms INTEGER,                     -- LLM call duration
+    status TEXT NOT NULL,                    -- 'success', 'timeout', 'error'
+    error_message TEXT,                      -- Error details if failed
+    created_at INTEGER NOT NULL
 );
 
 -- Parser Lab parsers (v6 - parser-centric)
@@ -174,6 +228,20 @@ CREATE INDEX IF NOT EXISTS idx_extraction_rules_pattern ON extraction_rules(glob
 CREATE INDEX IF NOT EXISTS idx_extraction_rules_enabled ON extraction_rules(enabled);
 CREATE INDEX IF NOT EXISTS idx_extraction_fields_rule ON extraction_fields(rule_id);
 CREATE INDEX IF NOT EXISTS idx_extraction_tag_conditions_rule ON extraction_tag_conditions(rule_id);
+
+-- Extractor indexes (Phase 6)
+CREATE INDEX IF NOT EXISTS idx_files_extraction_status ON scout_files(extraction_status);
+CREATE INDEX IF NOT EXISTS idx_files_extracted_at ON scout_files(extracted_at);
+CREATE INDEX IF NOT EXISTS idx_extractors_enabled ON scout_extractors(enabled);
+CREATE INDEX IF NOT EXISTS idx_extractors_paused ON scout_extractors(paused_at);
+CREATE INDEX IF NOT EXISTS idx_extraction_log_file ON scout_extraction_log(file_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_log_extractor ON scout_extraction_log(extractor_id);
+CREATE INDEX IF NOT EXISTS idx_extraction_log_executed ON scout_extraction_log(executed_at);
+
+-- AI Audit Log indexes (Phase 1 AI)
+CREATE INDEX IF NOT EXISTS idx_ai_audit_wizard ON cf_ai_audit_log(wizard_type);
+CREATE INDEX IF NOT EXISTS idx_ai_audit_status ON cf_ai_audit_log(status);
+CREATE INDEX IF NOT EXISTS idx_ai_audit_created ON cf_ai_audit_log(created_at);
 "#;
 
 /// Convert milliseconds since epoch to DateTime
@@ -186,27 +254,22 @@ fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// Database wrapper with connection pool
+/// Database wrapper with connection pool.
 #[derive(Clone)]
 pub struct Database {
-    pool: SqlitePool,
+    pool: DbPool,
 }
 
 // Many methods are used in tests and will be used for processing integration
 #[allow(dead_code)]
 impl Database {
-    /// Open or create a database at the given path
+    /// Open or create a database at the given path.
+    ///
+    /// Opens a SQLite database with optimizations (WAL mode, synchronous=NORMAL).
+    /// Optimizations are applied by casparian_db::create_pool.
     pub async fn open(path: &Path) -> Result<Self> {
-        let url = format!("sqlite:{}?mode=rwc", path.display());
-        let pool = SqlitePool::connect(&url).await?;
-
-        // Enable WAL mode for better concurrent access
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous=NORMAL")
-            .execute(&pool)
-            .await?;
+        let config = DbConfig::sqlite(&path.display().to_string());
+        let pool = create_pool(config).await?;
 
         // Create schema
         sqlx::query(SCHEMA_SQL).execute(&pool).await?;
@@ -214,9 +277,10 @@ impl Database {
         Ok(Self { pool })
     }
 
-    /// Create an in-memory database (for testing)
+    /// Create an in-memory database (for testing).
     pub async fn open_in_memory() -> Result<Self> {
-        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let config = DbConfig::sqlite_memory();
+        let pool = create_pool(config).await?;
 
         // Create schema
         sqlx::query(SCHEMA_SQL).execute(&pool).await?;
@@ -224,8 +288,8 @@ impl Database {
         Ok(Self { pool })
     }
 
-    /// Get the underlying pool (for sharing with other code)
-    pub fn pool(&self) -> &SqlitePool {
+    /// Get the underlying pool (for sharing with other code).
+    pub fn pool(&self) -> &DbPool {
         &self.pool
     }
 
@@ -559,7 +623,7 @@ impl Database {
         let row = sqlx::query(
             r#"
             SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
-                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE id = ?
             "#,
         )
@@ -578,7 +642,7 @@ impl Database {
         let row = sqlx::query(
             r#"
             SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
-                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ? AND path = ?
             "#,
         )
@@ -598,7 +662,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
-                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ?
             ORDER BY mtime DESC
             LIMIT ?
@@ -617,7 +681,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
-                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE status = ?
             ORDER BY mtime DESC
             LIMIT ?
@@ -646,7 +710,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
-                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ? AND tag IS NULL AND status = 'pending'
             ORDER BY mtime DESC
             LIMIT ?
@@ -665,7 +729,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
-                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE tag = ?
             ORDER BY mtime DESC
             LIMIT ?
@@ -689,7 +753,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
-                   first_seen_at, last_seen_at, processed_at, sentinel_job_id
+                   first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ? AND status = ?
             ORDER BY mtime DESC
             LIMIT ?
@@ -810,12 +874,22 @@ impl Database {
     }
 
     fn row_to_file(row: &sqlx::sqlite::SqliteRow) -> Result<ScannedFile> {
+        use super::types::ExtractionStatus;
+
         let status_str: String = row.get(7);
         let status = FileStatus::parse(&status_str).unwrap_or(FileStatus::Pending);
 
         let first_seen_millis: i64 = row.get(13);
         let last_seen_millis: i64 = row.get(14);
         let processed_at_millis: Option<i64> = row.get(15);
+
+        // Parse extraction status (Phase 6)
+        let extraction_status_str: Option<String> = row.get(18);
+        let extraction_status = extraction_status_str
+            .as_deref()
+            .and_then(ExtractionStatus::parse)
+            .unwrap_or(ExtractionStatus::Pending);
+        let extracted_at_millis: Option<i64> = row.get(19);
 
         Ok(ScannedFile {
             id: Some(row.get(0)),
@@ -835,6 +909,10 @@ impl Database {
             last_seen_at: millis_to_datetime(last_seen_millis),
             processed_at: processed_at_millis.map(millis_to_datetime),
             sentinel_job_id: row.get(16),
+            // Extractor metadata fields (Phase 6)
+            metadata_raw: row.get(17),
+            extraction_status,
+            extracted_at: extracted_at_millis.map(millis_to_datetime),
         })
     }
 
@@ -1102,6 +1180,263 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(result.map(|(v,)| v))
+    }
+
+    // ========================================================================
+    // Extractor Operations
+    // ========================================================================
+
+    /// Upsert an extractor
+    pub async fn upsert_extractor(&self, extractor: &Extractor) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let paused_at = extractor.paused_at.map(|dt| dt.timestamp_millis());
+
+        sqlx::query(
+            r#"
+            INSERT INTO scout_extractors (id, name, source_path, source_hash, enabled, timeout_secs, consecutive_failures, paused_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                source_path = excluded.source_path,
+                source_hash = excluded.source_hash,
+                enabled = excluded.enabled,
+                timeout_secs = excluded.timeout_secs,
+                consecutive_failures = excluded.consecutive_failures,
+                paused_at = excluded.paused_at,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&extractor.id)
+        .bind(&extractor.name)
+        .bind(&extractor.source_path)
+        .bind(&extractor.source_hash)
+        .bind(extractor.enabled)
+        .bind(extractor.timeout_secs as i64)
+        .bind(extractor.consecutive_failures as i64)
+        .bind(paused_at)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get an extractor by ID
+    pub async fn get_extractor(&self, id: &str) -> Result<Option<Extractor>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name, source_path, source_hash, enabled, timeout_secs, consecutive_failures, paused_at, created_at, updated_at
+            FROM scout_extractors WHERE id = ?
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| row_to_extractor(&r)))
+    }
+
+    /// Get all enabled, non-paused extractors
+    pub async fn get_enabled_extractors(&self) -> Result<Vec<Extractor>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, source_path, source_hash, enabled, timeout_secs, consecutive_failures, paused_at, created_at, updated_at
+            FROM scout_extractors
+            WHERE enabled = 1 AND paused_at IS NULL
+            ORDER BY name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(row_to_extractor).collect())
+    }
+
+    /// List all extractors
+    pub async fn list_extractors(&self) -> Result<Vec<Extractor>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name, source_path, source_hash, enabled, timeout_secs, consecutive_failures, paused_at, created_at, updated_at
+            FROM scout_extractors
+            ORDER BY name
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(row_to_extractor).collect())
+    }
+
+    /// Pause an extractor (set paused_at to now)
+    pub async fn pause_extractor(&self, id: &str) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+
+        sqlx::query("UPDATE scout_extractors SET paused_at = ?, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Resume a paused extractor (clear paused_at)
+    pub async fn resume_extractor(&self, id: &str) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+
+        sqlx::query("UPDATE scout_extractors SET paused_at = NULL, consecutive_failures = 0, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Update extractor consecutive failure count
+    pub async fn update_extractor_consecutive_failures(
+        &self,
+        id: &str,
+        failures: u32,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+
+        sqlx::query(
+            "UPDATE scout_extractors SET consecutive_failures = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(failures as i64)
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete an extractor
+    pub async fn delete_extractor(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM scout_extractors WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Get files pending extraction (extraction_status = 'pending')
+    pub async fn get_files_pending_extraction(&self) -> Result<Vec<ScannedFile>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error, first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
+            FROM scout_files
+            WHERE extraction_status = 'pending'
+            ORDER BY first_seen_at
+            LIMIT 1000
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.iter().map(Self::row_to_file).filter_map(|r| r.ok()).collect())
+    }
+
+    /// Log an extraction attempt
+    pub async fn log_extraction(
+        &self,
+        file_id: i64,
+        extractor_id: &str,
+        status: ExtractionLogStatus,
+        duration_ms: Option<u64>,
+        error_message: Option<&str>,
+        metadata_snapshot: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+
+        sqlx::query(
+            r#"
+            INSERT INTO scout_extraction_log (file_id, extractor_id, status, duration_ms, error_message, metadata_snapshot, executed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(file_id)
+        .bind(extractor_id)
+        .bind(status.as_str())
+        .bind(duration_ms.map(|d| d as i64))
+        .bind(error_message)
+        .bind(metadata_snapshot)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Update file extraction metadata and status
+    pub async fn update_file_extraction(
+        &self,
+        file_id: i64,
+        metadata_raw: &str,
+        status: ExtractionStatus,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+
+        sqlx::query(
+            r#"
+            UPDATE scout_files
+            SET metadata_raw = ?, extraction_status = ?, extracted_at = ?, last_seen_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(metadata_raw)
+        .bind(status.as_str())
+        .bind(now)
+        .bind(now)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Mark extraction as stale for files with a given extractor
+    pub async fn mark_extractions_stale(&self, extractor_id: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE scout_files
+            SET extraction_status = 'stale'
+            WHERE id IN (
+                SELECT DISTINCT file_id FROM scout_extraction_log WHERE extractor_id = ?
+            )
+            AND extraction_status = 'extracted'
+            "#,
+        )
+        .bind(extractor_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+}
+
+/// Helper function to convert a database row to an Extractor
+fn row_to_extractor(row: &sqlx::sqlite::SqliteRow) -> Extractor {
+    let paused_at_millis: Option<i64> = row.get(7);
+    let created_at_millis: i64 = row.get(8);
+    let updated_at_millis: i64 = row.get(9);
+
+    Extractor {
+        id: row.get(0),
+        name: row.get(1),
+        source_path: row.get(2),
+        source_hash: row.get(3),
+        enabled: row.get(4),
+        timeout_secs: row.get::<i64, _>(5) as u32,
+        consecutive_failures: row.get::<i64, _>(6) as u32,
+        paused_at: paused_at_millis.map(millis_to_datetime),
+        created_at: millis_to_datetime(created_at_millis),
+        updated_at: millis_to_datetime(updated_at_millis),
     }
 }
 

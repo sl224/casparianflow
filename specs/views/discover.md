@@ -2,7 +2,7 @@
 
 **Status:** Approved for Implementation
 **Parent:** specs/tui.md (Master TUI Spec)
-**Version:** 2.2
+**Version:** 2.3
 **Related:** specs/extraction.md (Extraction API), specs/views/sources.md
 
 > **Note:** For global keybindings, layout patterns, and common UI elements,
@@ -1447,21 +1447,28 @@ CREATE INDEX idx_ai_audit_status ON cf_ai_audit_log(status);
 - [ ] Tag dialog improvements
 - [ ] Bulk tag functionality
 - [ ] Preview pane content loading
-- [ ] Help overlay
+- [x] Help overlay (implemented 2026-01-14)
 
-### Phase 6: Extractors - Data Model
-- [ ] Add `metadata_raw`, `extraction_status`, `extracted_at` columns to `scout_files`
-- [ ] Create `scout_extractors` table
-- [ ] Create `scout_extraction_log` table
-- [ ] Add `ExtractionStatus` enum to Rust types
-- [ ] Update `FileInfo` struct with metadata fields
+### Phase 6: Extractors - Data Model (Complete)
+> **Status:** ✓ COMPLETE (2026-01-14)
 
-### Phase 7: Extractors - Execution Engine
-- [ ] Implement `ExtractorRunner` with subprocess isolation
-- [ ] Add timeout handling (default 5s)
-- [ ] Add crash isolation and error capture
-- [ ] Implement `BatchExtractor` with fail-fast semantics
-- [ ] Add consecutive failure pause logic
+- [x] Add `metadata_raw`, `extraction_status`, `extracted_at` columns to `scout_files`
+- [x] Create `scout_extractors` table
+- [x] Create `scout_extraction_log` table
+- [x] Add `ExtractionStatus` enum to Rust types (`crates/casparian/src/scout/types.rs`)
+- [x] Update `ScannedFile` struct with metadata fields
+- [x] Add `Extractor` and `ExtractionLogEntry` types
+- [x] Add `cf_ai_audit_log` table for AI wizards
+
+### Phase 7: Extractors - Execution Engine (Complete)
+> **Status:** ✓ COMPLETE (2026-01-14)
+
+- [x] Implement `ExtractorRunner` with subprocess isolation (`crates/casparian/src/scout/extractor.rs`)
+- [x] Add timeout handling (default 5s, configurable per extractor)
+- [x] Add crash isolation and error capture (`ExtractorResult` enum with Ok/Timeout/Crash/Error)
+- [x] Implement `BatchExtractor` with fail-fast semantics
+- [x] Add consecutive failure pause logic (MAX_CONSECUTIVE_FAILURES = 3)
+- [x] Add database methods for extractor CRUD and extraction logging
 
 ### Phase 8: Extractors - Metadata Inheritance
 - [ ] Implement `MetadataCache` for folder metadata
@@ -3290,6 +3297,8 @@ fn list_directories(partial_path: &str) -> Vec<String> {
 | 2026-01-12 | 1.4 | **Semantic Path Integration (Section 8.10)**: Added automatic recognition on scan, source sidebar indicator (📐), semantic info in file details, cross-source discovery. Updated Pending Review with Unrecognized Sources category. Added Phase 11 implementation tasks. Cross-reference to specs/semantic_path_mapping.md. |
 | 2026-01-12 | 1.5 | **Consolidation**: Added deprecation notice for Python extractors (path parsing) in favor of Extraction Rules. Added Coverage Gaps category to Pending Review with near-miss detection UI. Added keybindings for coverage gap actions (a, x, c). Cross-reference to extraction_rules.md Section 1.5 and 9.5. |
 | 2026-01-13 | 1.7 | **Sources Manager (Section 3.5)**: Added full CRUD dialog for sources (`M` key). States: SourcesManager, SourceEdit, SourceDeleteConfirm. Keybindings: n/e/d/r in manager, text input in edit, y/n/Enter/Esc in delete confirm. Added source management queries (10.5). |
+| 2026-01-14 | 2.2 | **Phase 6 Complete**: Implemented extractors data model - `scout_extractors`, `scout_extraction_log` tables, `ExtractionStatus` enum, `Extractor`/`ExtractionLogEntry` types, `cf_ai_audit_log` for AI wizards. |
+| 2026-01-14 | 2.3 | **Phase 7 Complete**: Implemented `ExtractorRunner` with subprocess isolation, timeout handling, crash isolation. Implemented `BatchExtractor` with fail-fast semantics and consecutive failure pause logic. Added database methods for extractor CRUD and extraction logging. |
 | 2026-01-13 | 1.8 | **Data Persistence & Scanning (Section 14)**: Added comprehensive documentation for persistence architecture, unified parallel scanner, and directory autocomplete. Sources/files now persist to SQLite and survive TUI restarts. Added `ScanConfig` with configurable threads, batch_size, progress_interval, follow_symlinks, include_hidden. Add Source dialog now includes live directory autocomplete with Tab completion, Up/Down navigation, ~ expansion, and case-insensitive matching. |
 | 2026-01-13 | 1.9 | **Glob Explorer Redesign (Section 13)**: Scan-time folder cache with trie structure and segment interning (~1MB for 1.2M files). O(1) folder navigation via HashMap lookup. Progressive reveal: heat map (≥200 matches) → heat map + flat results (<200 matches). Density bars with ▓/▒ proportional blocks (24 char width). vim-style navigation (hjkl). Full glob syntax via `globset` crate. Scan-in-progress state blocks navigation until cache is built. Updated data model with `FolderCache`, `FolderNode`, `GlobExplorerState`. New implementation phases 12-18. |
 | 2026-01-13 | 2.0 | **Pattern Input Performance (Phase 19)**: Debounced pattern input (150ms delay) - keystrokes instant, search triggers after pause. Cancellable background search via `Arc<AtomicBool>` - cancelled tasks exit early saving CPU. Updated `GlobExplorerState` with debouncing fields (`pattern_changed_at`, `last_searched_pattern`, `last_searched_prefix`). Added `FolderInfo` constructors (`::new()`, `::loading()`, `::with_path()`, `::from_cache_entry()`). Added `GlobPreviewFile` and `GlobFileCount` types. Consolidated utility functions (`spinner_char()`, `centered_scroll_offset()`, `render_centered_dialog()`). Deleted dead code (~200 lines). |

@@ -1,10 +1,10 @@
 //! Schema Contract Storage
 //!
-//! SQLite-backed persistence for schema contracts using sqlx.
+//! Database-backed persistence for schema contracts using casparian_db.
 
 use crate::{LockedSchema, SchemaContract};
+use casparian_db::{DbConfig, DbPool, create_pool};
 use chrono::{DateTime, Utc};
-use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -13,6 +13,9 @@ use uuid::Uuid;
 pub enum StorageError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
+
+    #[error("Database connection error: {0}")]
+    Connection(#[from] casparian_db::DbError),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -24,34 +27,30 @@ pub enum StorageError {
     Parse(String),
 }
 
-/// SQLite-backed storage for schema contracts.
+/// Database-backed storage for schema contracts.
 pub struct SchemaStorage {
-    pool: Pool<Sqlite>,
+    pool: DbPool,
 }
 
 impl SchemaStorage {
     /// Create a new SchemaStorage with the given pool.
-    pub async fn new(pool: Pool<Sqlite>) -> Result<Self, StorageError> {
+    pub async fn new(pool: DbPool) -> Result<Self, StorageError> {
         let storage = Self { pool };
         storage.init_tables().await?;
         Ok(storage)
     }
 
-    /// Open a SchemaStorage from a file path.
+    /// Open a SchemaStorage from a file path (SQLite).
     pub async fn open(path: &str) -> Result<Self, StorageError> {
-        let db_url = format!("sqlite:{}?mode=rwc", path);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await?;
+        let config = DbConfig::sqlite(path);
+        let pool = create_pool(config).await?;
         Self::new(pool).await
     }
 
     /// Create an in-memory SchemaStorage (for testing).
     pub async fn in_memory() -> Result<Self, StorageError> {
-        let pool = SqlitePoolOptions::new()
-            .connect(":memory:")
-            .await?;
+        let config = DbConfig::sqlite_memory();
+        let pool = create_pool(config).await?;
         Self::new(pool).await
     }
 
@@ -251,16 +250,18 @@ impl SchemaStorage {
     ) -> Result<String, StorageError> {
         let discovery_id = Uuid::new_v4().to_string();
         let schemas_json = serde_json::to_string(proposed_schemas)?;
+        let now = Utc::now().to_rfc3339();
 
         sqlx::query(
             r#"
             INSERT INTO schema_discovery_results
                 (discovery_id, scope_id, discovered_at, source_file, proposed_schemas_json, status)
-            VALUES (?1, ?2, datetime('now'), ?3, ?4, 'pending')
+            VALUES (?1, ?2, ?3, ?4, ?5, 'pending')
             "#,
         )
         .bind(&discovery_id)
         .bind(scope_id)
+        .bind(&now)
         .bind(source_file)
         .bind(&schemas_json)
         .execute(&self.pool)

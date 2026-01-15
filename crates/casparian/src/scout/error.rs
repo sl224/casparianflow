@@ -13,6 +13,9 @@ pub enum ScoutError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    #[error("Database pool error: {0}")]
+    DbPool(#[from] casparian_db::DbError),
+
     #[error("Walk error: {0}")]
     Walk(#[from] walkdir::Error),
 
@@ -54,6 +57,9 @@ pub enum ScoutError {
 
     #[error("Invalid state: {0}")]
     InvalidState(String),
+
+    #[error("Extractor error: {0}")]
+    Extractor(String),
 }
 
 /// Result type alias

@@ -15,6 +15,9 @@ path = "src/lib.rs"
 # Schema contracts
 casparian_schema = { path = "../casparian_schema" }
 
+# Database abstraction
+casparian_db = { path = "../casparian_db" }
+
 # Async runtime
 tokio = { workspace = true }
 

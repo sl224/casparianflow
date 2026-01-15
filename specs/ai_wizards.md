@@ -1,7 +1,7 @@
 # AI Wizards - Layer 2 Specification
 
 **Status:** Draft
-**Version:** 0.3
+**Version:** 0.5
 **Parent:** spec.md
 **Dependencies:** specs/discover.md (TUI), roadmap/spec_discovery_intelligence.md (Iron Core), specs/semantic_path_mapping.md (Semantic Layer)
 
@@ -2823,6 +2823,29 @@ assert!(response.code.contains("def parse("));
 
 ## 11. Implementation Phases
 
+### Phase 0: LLM Infrastructure (Complete)
+> **Status:** ✓ COMPLETE - Foundation for AI integration
+
+- [x] LLM provider abstraction trait (`crates/casparian/src/cli/tui/llm/mod.rs`)
+- [x] Claude Code provider implementation (`llm/claude_code.rs`)
+- [x] Mock provider for testing (`llm/mock.rs`)
+- [x] Chat sidebar UI (toggle with Alt+A)
+- [x] Multi-line input with history (Up/Down navigation)
+- [x] Streaming response display
+- [x] Message scrolling and navigation
+- [x] MCP tool registry integration (9 tools available to LLM)
+- [x] Focus cycling between Main/Chat (Tab key)
+
+**What's Working:**
+```
+Alt+A → Chat sidebar visible
+Tab → Focus cycles Main ↔ Chat
+Type message → Sent to Claude via MCP
+Claude can access: quick_scan, discover_schemas, approve_schemas,
+                   propose_amendment, run_backtest, fix_parser,
+                   execute_pipeline, query_output, apply_scope
+```
+
 ### Phase 1: Foundation
 - [ ] Create `drafts/` directory structure
 - [ ] Implement draft manifest (JSON)
@@ -2898,6 +2921,7 @@ assert!(response.code.contains("def parse("));
 | 2026-01-12 | 0.2 | **Added Semantic Path Wizard (Section 3.4).** Fourth wizard for recognizing folder semantics and generating extraction rules. TUI dialog (Section 5.5). MCP tools (Section 10.3). Implementation phase 5. Cross-reference to specs/semantic_path_mapping.md. |
 | 2026-01-12 | 0.3 | **Pathfinder YAML-first (Section 3.1).** Pathfinder now generates YAML Extraction Rules first, Python only as fallback for complex logic. Updated TUI dialog (Section 5.1) with dual-mode output. Consistent with Extraction Rules consolidation (extraction_rules.md §1.5). |
 | 2026-01-13 | 0.4 | **Added Path Intelligence Engine (Section 3.5).** Foundational AI layer for path clustering (embeddings + HDBSCAN), field name intelligence (LLM), cross-source semantic equivalence, and single-file proposals. Powers other wizards. Training data flywheel for self-improvement. Implementation phases 1-6. |
+| 2026-01-14 | 0.5 | **Implementation Status Audit.** Added Phase 0 (LLM Infrastructure) documenting completed work: Claude Code provider, chat sidebar, MCP tool integration. Clarified that chat system is working but specific wizards (Pathfinder, Parser, Labeling, Semantic) are not yet implemented. |
 
 ---
 

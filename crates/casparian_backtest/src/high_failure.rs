@@ -3,9 +3,9 @@
 //! Tracks files that have historically failed during backtest iterations.
 //! Files with high failure rates are tested first to enable early termination.
 
+use casparian_db::{DbConfig, DbPool, create_pool};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -16,6 +16,8 @@ use crate::metrics::FailureCategory;
 pub enum HighFailureError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("Database pool error: {0}")]
+    DbPool(#[from] casparian_db::DbError),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("File not found: {0}")]
@@ -131,34 +133,30 @@ impl FileInfo {
     }
 }
 
-/// Tracks high-failure files for a scope
+/// Tracks high-failure files for a scope.
 pub struct HighFailureTable {
-    pool: Pool<Sqlite>,
+    pool: DbPool,
 }
 
 impl HighFailureTable {
-    /// Create a new high-failure table with the given pool
-    pub async fn new(pool: Pool<Sqlite>) -> Result<Self, HighFailureError> {
+    /// Create a new high-failure table with the given pool.
+    pub async fn new(pool: DbPool) -> Result<Self, HighFailureError> {
         let table = Self { pool };
         table.init_schema().await?;
         Ok(table)
     }
 
-    /// Open from a file path
+    /// Open from a file path.
     pub async fn open(path: &str) -> Result<Self, HighFailureError> {
-        let db_url = format!("sqlite:{}?mode=rwc", path);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&db_url)
-            .await?;
+        let config = DbConfig::sqlite(path);
+        let pool = create_pool(config).await?;
         Self::new(pool).await
     }
 
-    /// Create an in-memory table (for testing)
+    /// Create an in-memory table (for testing).
     pub async fn in_memory() -> Result<Self, HighFailureError> {
-        let pool = SqlitePoolOptions::new()
-            .connect(":memory:")
-            .await?;
+        let config = DbConfig::sqlite_memory();
+        let pool = create_pool(config).await?;
         Self::new(pool).await
     }
 
