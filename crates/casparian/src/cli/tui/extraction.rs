@@ -943,6 +943,83 @@ impl BacktestSummary {
     }
 }
 
+/// Progress tracking for glob traversal (GrandPerspective-style)
+#[derive(Debug, Clone, Default)]
+pub struct GlobProgress {
+    /// Current folder being scanned (e.g., "dir_42/subfolder/")
+    pub current_folder: String,
+    /// Number of files matched so far
+    pub files_found: usize,
+    /// Number of folders discovered (denominator for progress)
+    pub folders_discovered: usize,
+    /// Number of folders scanned (numerator for progress)
+    pub folders_scanned: usize,
+    /// Whether the glob is in progress
+    pub is_active: bool,
+    /// When the glob started
+    pub started_at: Option<std::time::Instant>,
+}
+
+impl GlobProgress {
+    /// Start new progress tracking
+    pub fn start() -> Self {
+        Self {
+            current_folder: String::new(),
+            files_found: 0,
+            folders_discovered: 0,
+            folders_scanned: 0,
+            is_active: true,
+            started_at: Some(std::time::Instant::now()),
+        }
+    }
+
+    /// Get approximate progress percentage (0-100)
+    /// Denominator grows as we discover more folders, so this fluctuates but shows progress
+    pub fn percentage(&self) -> u8 {
+        if self.folders_discovered == 0 {
+            0
+        } else {
+            ((self.folders_scanned as f64 / self.folders_discovered as f64) * 100.0).min(99.0) as u8
+        }
+    }
+
+    /// Format status line: "Scanning logs/2024/... (2,450 files, 45%)"
+    pub fn status_line(&self) -> String {
+        let folder = if self.current_folder.len() > 30 {
+            format!("...{}", &self.current_folder[self.current_folder.len()-27..])
+        } else {
+            self.current_folder.clone()
+        };
+
+        let files_str = format_with_commas(self.files_found);
+        let pct = self.percentage();
+
+        if folder.is_empty() {
+            format!("Scanning... ({} files, {}%)", files_str, pct)
+        } else {
+            format!("Scanning {}/... ({} files, {}%)", folder.trim_end_matches('/'), files_str, pct)
+        }
+    }
+
+    /// Complete the progress
+    pub fn complete(&mut self) {
+        self.is_active = false;
+    }
+}
+
+/// Format number with comma separators
+fn format_with_commas(n: usize) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.insert(0, ',');
+        }
+        result.insert(0, c);
+    }
+    result
+}
+
 // =============================================================================
 // Rule Builder State (v3.0 Split-View)
 // =============================================================================
@@ -1125,6 +1202,10 @@ pub struct RuleBuilderState {
     /// Elapsed time in milliseconds for current search
     pub stream_elapsed_ms: u64,
 
+    // --- Glob progress ---
+    /// Progress tracking for folder traversal (shown in status bar)
+    pub glob_progress: GlobProgress,
+
     // --- Edit mode ---
     /// Rule ID if editing existing rule
     pub editing_rule_id: Option<String>,
@@ -1188,6 +1269,9 @@ impl Default for RuleBuilderState {
             // Streaming state
             is_streaming: false,
             stream_elapsed_ms: 0,
+
+            // Glob progress
+            glob_progress: GlobProgress::default(),
 
             // Edit mode
             editing_rule_id: None,

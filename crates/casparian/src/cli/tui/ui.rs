@@ -540,136 +540,146 @@ fn draw_discover_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     draw_tags_dropdown(frame, app, v_chunks[1]);
 }
 
-/// Draw the Sources dropdown (collapsed or expanded)
+/// Draw the Sources dropdown as a proper overlay dialog
 fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    let is_open = app.discover.view_state == DiscoverViewState::SourcesDropdown;
-    let is_focused = app.discover.focus == DiscoverFocus::Sources;
+    // Calculate dialog size - takes up left 40% of screen, respecting margins
+    let width = (area.width * 40 / 100).max(30).min(area.width - 4);
+    let height = area.height.saturating_sub(8).max(10);
 
-    let style = if is_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    // Position at left side of screen
+    let dialog_area = Rect {
+        x: area.x + 2,
+        y: area.y + 3,
+        width,
+        height,
     };
 
-    if is_open {
-        // Expanded dropdown with optional filter line
-        let is_filtering = app.discover.sources_filtering;
+    // Clear the area first (proper overlay)
+    frame.render_widget(Clear, dialog_area);
 
-        let inner_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .margin(1)
-            .split(area);
+    // Expanded dropdown with optional filter line
+    let is_filtering = app.discover.sources_filtering;
 
-        // Top line: filter input OR hint
-        if is_filtering {
-            let filter_text = format!("/{}", app.discover.sources_filter);
-            let filter_line = Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled(filter_text, Style::default().fg(Color::Yellow)),
-                    Span::styled("█", Style::default().fg(Color::Yellow)),
-                ])
-            ]);
-            frame.render_widget(filter_line, inner_chunks[0]);
-        } else if !app.discover.sources_filter.is_empty() {
-            // Show active filter (but not in filter mode)
-            let hint = format!("/{} (Enter:clear)", app.discover.sources_filter);
-            let hint_line = Paragraph::new(hint)
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(hint_line, inner_chunks[0]);
-        } else {
-            // Show keybinding hints
-            let hint_line = Paragraph::new("[/]filter [s]scan [j/k]nav")
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(hint_line, inner_chunks[0]);
-        }
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .margin(1)
+        .split(dialog_area);
 
-        // Filtered list
-        let filtered: Vec<_> = app.discover.sources.iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                app.discover.sources_filter.is_empty()
-                    || s.name.to_lowercase().contains(&app.discover.sources_filter.to_lowercase())
-            })
-            .collect();
-
-        let mut lines: Vec<Line> = Vec::new();
-        let visible_height = inner_chunks[1].height as usize;
-
-        if filtered.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "No matches",
-                Style::default().fg(Color::DarkGray).italic(),
-            )));
-        } else {
-            // Find scroll offset based on preview position - keep selection visible with centering
-            let preview_idx = app.discover.preview_source.unwrap_or_else(|| app.discover.selected_source_index());
-            let preview_pos = filtered.iter().position(|(i, _)| *i == preview_idx).unwrap_or(0);
-            let total_items = filtered.len();
-            let scroll_offset = centered_scroll_offset(preview_pos, visible_height, total_items);
-
-            for (i, source) in filtered.iter().skip(scroll_offset).take(visible_height) {
-                let is_preview = app.discover.preview_source == Some(*i);
-                let is_selected = *i == app.discover.selected_source_index();
-                let prefix = if is_preview { "► " } else { "  " };
-
-                let item_style = if is_preview {
-                    Style::default().fg(Color::White).bold()
-                } else if is_selected {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-
-                let text = format!("{}{} ({})", prefix, source.name, source.file_count);
-                lines.push(Line::from(Span::styled(text, item_style)));
-            }
-        }
-
-        let list = Paragraph::new(lines);
-        frame.render_widget(list, inner_chunks[1]);
-
-        // Border with title - use double borders when focused/open for visual prominence
-        let (border_style, border_type) = if is_focused {
-            (Style::default().fg(Color::Cyan), BorderType::Double)
-        } else {
-            (Style::default().fg(Color::DarkGray), BorderType::Rounded)
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .border_type(border_type)
-            .title(Span::styled(" [1] Source ▲ ", style.bold()));
-        frame.render_widget(block, area);
-    } else {
-        // Collapsed: single-line view without borders
-        // Format: "[1] name ▾ count" - compact to fit sidebar
-        let (name, count) = if app.discover.sources.is_empty() {
-            ("No sources".to_string(), "'s'".to_string())
-        } else if let Some(source) = app.discover.sources.get(app.discover.selected_source_index()) {
-            (source.name.clone(), format_count(source.file_count))
-        } else {
-            ("Select...".to_string(), "".to_string())
-        };
-
-        let label_style = Style::default().fg(Color::DarkGray);
-        let name_style = if is_focused {
-            Style::default().fg(Color::Cyan).bold()
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let count_style = Style::default().fg(Color::DarkGray);
-
-        let line = Line::from(vec![
-            Span::styled("[1] ", label_style),
-            Span::styled(&name, name_style),
-            Span::styled(" ▾ ", if is_focused { Style::default().fg(Color::Cyan) } else { label_style }),
-            Span::styled(count, count_style),
+    // Top line: filter input OR hint
+    if is_filtering {
+        let filter_text = format!("/{}", app.discover.sources_filter);
+        let filter_line = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(filter_text, Style::default().fg(Color::Yellow)),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+            ])
         ]);
-
-        let content = Paragraph::new(line);
-        frame.render_widget(content, area);
+        frame.render_widget(filter_line, inner_chunks[0]);
+    } else if !app.discover.sources_filter.is_empty() {
+        // Show active filter (but not in filter mode)
+        let hint = format!("/{} (Enter:clear)", app.discover.sources_filter);
+        let hint_line = Paragraph::new(hint)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(hint_line, inner_chunks[0]);
+    } else {
+        // Show keybinding hints
+        let hint_line = Paragraph::new("[/]filter [s]scan [j/k]nav [Enter]select [Esc]close")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(hint_line, inner_chunks[0]);
     }
+
+    // Filtered list
+    let filtered: Vec<_> = app.discover.sources.iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            app.discover.sources_filter.is_empty()
+                || s.name.to_lowercase().contains(&app.discover.sources_filter.to_lowercase())
+        })
+        .collect();
+
+    let mut lines: Vec<Line> = Vec::new();
+    let visible_height = inner_chunks[1].height.saturating_sub(2) as usize;
+
+    if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No sources found. Press 's' to scan a folder.",
+            Style::default().fg(Color::DarkGray).italic(),
+        )));
+    } else {
+        // Find scroll offset based on preview position - keep selection visible with centering
+        let preview_idx = app.discover.preview_source.unwrap_or_else(|| app.discover.selected_source_index());
+        let preview_pos = filtered.iter().position(|(i, _)| *i == preview_idx).unwrap_or(0);
+        let total_items = filtered.len();
+        let scroll_offset = centered_scroll_offset(preview_pos, visible_height, total_items);
+
+        for (i, source) in filtered.iter().skip(scroll_offset).take(visible_height) {
+            let is_preview = app.discover.preview_source == Some(*i);
+            let is_selected = *i == app.discover.selected_source_index();
+            let prefix = if is_preview { "► " } else { "  " };
+
+            let item_style = if is_preview {
+                Style::default().fg(Color::White).bold()
+            } else if is_selected {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let text = format!("{}{} ({})", prefix, source.name, source.file_count);
+            lines.push(Line::from(Span::styled(text, item_style)));
+        }
+    }
+
+    let list = Paragraph::new(lines);
+    frame.render_widget(list, inner_chunks[1]);
+
+    // Border with title
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" [1] Select Source ", Style::default().fg(Color::Cyan).bold()))
+        .title_alignment(Alignment::Left);
+    frame.render_widget(block, dialog_area);
+}
+
+/// Draw the Tags dropdown as a proper overlay dialog
+#[allow(dead_code)]
+fn draw_tags_dropdown_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    // Re-use same sizing as sources dropdown
+    let width = (area.width * 40 / 100).max(30).min(area.width - 4);
+    let height = area.height.saturating_sub(8).max(10);
+
+    let dialog_area = Rect {
+        x: area.x + 2,
+        y: area.y + 3,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" [2] Select Tag ", Style::default().fg(Color::Cyan).bold()));
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    // Tags list similar to sources
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled("  All files", Style::default().fg(Color::White))),
+    ];
+    for tag in &app.discover.tags {
+        lines.push(Line::from(Span::styled(
+            format!("  {} ({})", tag.name, tag.count),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    let list = Paragraph::new(lines);
+    frame.render_widget(list, inner);
 }
 
 /// Draw the Tags dropdown (collapsed or expanded)
@@ -1302,8 +1312,6 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
 /// Draw the Rule Builder as a full-screen view (replaces Discover, not overlay)
 /// Layout: Header | Split View (40% left / 60% right) | Footer
 fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
-    use super::extraction::RuleBuilderFocus;
-
     let builder = match &app.discover.rule_builder {
         Some(b) => b,
         None => return,
@@ -1348,12 +1356,20 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
     draw_rule_builder_left_panel(frame, builder, h_chunks[0]);
 
     // Right panel: File results
-    draw_rule_builder_right_panel(frame, builder, h_chunks[1]);
+    draw_rule_builder_right_panel(frame, builder, h_chunks[1], app.discover.scan_error.as_deref());
 
     // === FOOTER ===
-    let footer_text = " [Tab] Cycle focus  [Enter] Save  [Ctrl+Space] AI assist  [Esc] Close ";
+    // Show cache loading progress if active, otherwise show keybindings
+    let (footer_text, footer_style) = if let Some(ref progress) = app.cache_load_progress {
+        // Show spinner with source name and elapsed time
+        let spinner = spinner_char(app.tick_count);
+        let status = progress.status_line();
+        (format!(" {} {} ", spinner, status), Style::default().fg(Color::Yellow))
+    } else {
+        (" [Tab] Cycle focus  [Enter] Save  [Ctrl+Space] AI assist  [Esc] Close ".to_string(), Style::default().fg(Color::DarkGray))
+    };
     let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(footer_style)
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, chunks[2]);
@@ -1520,7 +1536,7 @@ fn draw_rule_builder_left_panel(frame: &mut Frame, builder: &super::extraction::
 }
 
 /// Draw the right panel of Rule Builder (file results list)
-fn draw_rule_builder_right_panel(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect) {
+fn draw_rule_builder_right_panel(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect, scan_error: Option<&str>) {
     use super::extraction::{RuleBuilderFocus, FileResultsPhase};
 
     let right_chunks = Layout::default()
@@ -1583,7 +1599,7 @@ fn draw_rule_builder_right_panel(frame: &mut Frame, builder: &super::extraction:
     // Phase-specific content rendering
     match builder.file_results_phase {
         FileResultsPhase::Exploration => {
-            draw_exploration_phase(frame, builder, file_list_inner, file_list_focused);
+            draw_exploration_phase(frame, builder, file_list_inner, file_list_focused, scan_error);
         }
         FileResultsPhase::ExtractionPreview => {
             draw_extraction_preview_phase(frame, builder, file_list_inner, file_list_focused);
@@ -1628,15 +1644,37 @@ fn draw_rule_builder_right_panel(frame: &mut Frame, builder: &super::extraction:
 }
 
 /// Phase 1: Exploration - folder counts + sample filenames
-fn draw_exploration_phase(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect, focused: bool) {
+fn draw_exploration_phase(frame: &mut Frame, builder: &super::extraction::RuleBuilderState, area: Rect, focused: bool, scan_error: Option<&str>) {
     let lines: Vec<Line> = if builder.folder_matches.is_empty() {
-        vec![Line::from(Span::styled(
-            "  No matching folders",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        // Show error if present, otherwise show "No matching folders"
+        if let Some(err) = scan_error {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("  ⚠ {}", err),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Press [s] to scan this folder",
+                    Style::default().fg(Color::Cyan),
+                )),
+            ]
+        } else {
+            vec![Line::from(Span::styled(
+                "  No matching folders",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        }
     } else {
         let max_display = area.height.saturating_sub(1) as usize;
         let start = centered_scroll_offset(builder.selected_file, max_display, builder.folder_matches.len());
+
+        // Calculate column widths for alignment
+        // Use width proportions: 60% folder path, 15% count, 25% sample filename
+        let available_width = area.width.saturating_sub(6) as usize; // Reserve space for prefix/icon
+        let path_width = (available_width * 50 / 100).min(35);
+        let count_width = 8;
 
         builder.folder_matches.iter()
             .enumerate()
@@ -1646,26 +1684,70 @@ fn draw_exploration_phase(frame: &mut Frame, builder: &super::extraction::RuleBu
                 let is_selected = i == builder.selected_file && focused;
                 let is_expanded = builder.expanded_folder_indices.contains(&i);
 
-                let prefix = if is_selected { "► " } else { "  " };
                 let expand_icon = if is_expanded { "▼" } else { "▸" };
 
-                let style = if is_selected {
-                    Style::default().fg(Color::White).bold()
+                // Truncate folder path if too long
+                let folder_path = folder.path.trim_end_matches('/');
+                let truncated_path = if folder_path.len() > path_width {
+                    format!("…{}", &folder_path[folder_path.len() - path_width + 1..])
                 } else {
-                    Style::default().fg(Color::Gray)
+                    folder_path.to_string()
                 };
 
-                // Format: "▸ trades/2024/ (15)  trade_20240101.csv"
-                let display = format!(
-                    "{}{} {}/ ({})  {}",
-                    prefix,
-                    expand_icon,
-                    folder.path.trim_end_matches('/'),
-                    folder.count,
-                    folder.sample_filename
-                );
+                // Format count with parentheses, right-aligned
+                let count_str = format!("({})", folder.count);
 
-                Line::from(Span::styled(display, style))
+                // Build styled spans for proper alignment
+                let mut spans = Vec::new();
+
+                // Selection indicator
+                if is_selected {
+                    spans.push(Span::styled("► ", Style::default().fg(Color::Cyan)));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+
+                // Expand icon
+                spans.push(Span::styled(
+                    format!("{} ", expand_icon),
+                    if is_selected {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    }
+                ));
+
+                // Folder path (left-aligned, padded)
+                spans.push(Span::styled(
+                    format!("{:<width$}", format!("{}/", truncated_path), width = path_width + 1),
+                    if is_selected {
+                        Style::default().fg(Color::White).bold()
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    }
+                ));
+
+                // Count (right-aligned)
+                spans.push(Span::styled(
+                    format!("{:>width$}", count_str, width = count_width),
+                    if is_selected {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    }
+                ));
+
+                // Sample filename
+                spans.push(Span::styled(
+                    format!("  {}", folder.sample_filename),
+                    if is_selected {
+                        Style::default().fg(Color::White).italic()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    }
+                ));
+
+                Line::from(spans)
             })
             .collect()
     };
@@ -2427,15 +2509,28 @@ fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
 
     if explorer.folders.is_empty() {
         folder_lines.push(Line::from(""));
-        folder_lines.push(Line::from(Span::styled(
-            "  No folders found",
-            Style::default().fg(Color::DarkGray),
-        )));
-        if !explorer.current_prefix.is_empty() {
+        // Show scan_error if present (e.g., "No cache found")
+        if let Some(ref err) = app.discover.scan_error {
             folder_lines.push(Line::from(Span::styled(
-                "  Press [Backspace] to go back",
+                format!("  ⚠ {}", err),
+                Style::default().fg(Color::Yellow),
+            )));
+            folder_lines.push(Line::from(""));
+            folder_lines.push(Line::from(Span::styled(
+                "  Press [s] to scan this folder",
                 Style::default().fg(Color::Cyan),
             )));
+        } else {
+            folder_lines.push(Line::from(Span::styled(
+                "  No folders found",
+                Style::default().fg(Color::DarkGray),
+            )));
+            if !explorer.current_prefix.is_empty() {
+                folder_lines.push(Line::from(Span::styled(
+                    "  Press [Backspace] to go back",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
         }
     } else {
         // Virtual scrolling for folders

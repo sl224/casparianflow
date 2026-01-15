@@ -13,7 +13,7 @@ use super::llm::claude_code::ClaudeCodeProvider;
 use super::llm::{registry_to_definitions, LlmProvider, StreamChunk};
 use super::TuiArgs;
 use crate::scout::{
-    compute_folder_deltas_from_paths, Database as ScoutDatabase, FolderCache,
+    Database as ScoutDatabase, FolderCache,
     ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source, SourceType,
 };
 
@@ -1104,17 +1104,7 @@ pub struct DiscoverState {
     /// Whether to save bulk tag as a rule
     pub bulk_tag_save_as_rule: bool,
 
-    // --- Folder cache (hierarchical file browsing) ---
-    /// Folder cache for hierarchical browsing (moved from GlobExplorer)
-    /// Key = prefix path ("" for root, "logs/" for /logs folder)
-    /// Value = list of folders/files at that level
-    pub folder_cache: HashMap<String, Vec<FolderInfo>>,
-    /// Whether folder cache has been loaded
-    pub cache_loaded: bool,
-    /// Total file count across all folders
-    pub total_file_count: usize,
-
-    // --- Glob Explorer (DEPRECATED - use Rule Builder instead) ---
+    // --- Glob Explorer ---
     /// Glob Explorer state - DEPRECATED, kept for transition
     /// TODO: Remove after Rule Builder fully replaces GlobExplorer
     pub glob_explorer: Option<GlobExplorerState>,
@@ -1186,6 +1176,8 @@ pub struct DiscoverState {
     // --- Pending DB writes ---
     pub pending_tag_writes: Vec<PendingTagWrite>,
     pub pending_rule_writes: Vec<PendingRuleWrite>,
+    /// Source ID to touch for MRU ordering (set on source selection)
+    pub pending_source_touch: Option<String>,
 
     // --- Background scanning ---
     /// Path being scanned (for display)
@@ -1267,9 +1259,6 @@ const MAX_CHAT_MESSAGES: usize = 500;
 
 /// Maximum number of jobs to keep in the jobs list (prevents unbounded memory growth)
 const MAX_JOBS: usize = 200;
-
-/// Maximum number of preloaded folder caches to keep (prevents unbounded memory growth)
-const MAX_PRELOADED_CACHES: usize = 50;
 
 /// Format tool call for display
 fn format_tool_call(name: &str, arguments: &Value) -> String {
@@ -1609,14 +1598,9 @@ pub struct App {
     /// Pending cache load for glob explorer (streaming chunks)
     pending_cache_load: Option<mpsc::Receiver<CacheLoadMessage>>,
     /// Progress tracking for streaming cache load
-    cache_load_progress: Option<CacheLoadProgress>,
+    pub cache_load_progress: Option<CacheLoadProgress>,
     /// Timing info from last completed cache load (for profiler display)
     pub last_cache_load_timing: Option<CacheLoadTiming>,
-    /// Pre-loaded folder caches (loaded at app start in background)
-    /// Key is source_id, value is the folder cache HashMap
-    preloaded_caches: HashMap<String, HashMap<String, Vec<FolderInfo>>>,
-    /// Receiver for background cache preloading (polls results from init tasks)
-    cache_preload_rx: Option<mpsc::Receiver<CachePreloadResult>>,
     /// Tick counter for animated UI elements (spinner, etc.)
     pub tick_count: u64,
     /// Pending glob search results (non-blocking recursive search)
@@ -1634,28 +1618,45 @@ pub struct App {
     pub profiler: casparian_profiler::Profiler,
 }
 
-/// Streaming cache load messages (chunked for progressive UI updates)
+/// Cache load messages (simplified - no chunking needed)
 enum CacheLoadMessage {
-    /// Partial folder hierarchy - merge into existing cache
-    Chunk {
-        folders: HashMap<String, Vec<FolderInfo>>,
-        files_processed: usize,
-    },
-    /// Final message - loading complete (includes tags from cache)
+    /// Loading complete (includes folder cache and tags)
     Complete {
         source_id: String,
         total_files: usize,
         tags: Vec<TagInfo>,
+        cache: HashMap<String, Vec<FolderInfo>>,
     },
     /// Error during loading
     Error(String),
 }
 
-/// Progress tracking for streaming cache load
-struct CacheLoadProgress {
-    files_processed: usize,
+/// Progress tracking for cache load (simplified - spinner only)
+pub struct CacheLoadProgress {
+    /// Source name being loaded
+    pub source_name: String,
     /// When loading started (for measuring total load time)
-    started_at: std::time::Instant,
+    pub started_at: std::time::Instant,
+}
+
+impl CacheLoadProgress {
+    fn new(source_name: String) -> Self {
+        Self {
+            source_name,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Format status line: "Loading sales_data... (1.2s)"
+    pub fn status_line(&self) -> String {
+        let elapsed = self.started_at.elapsed().as_secs_f32();
+        let name = if self.source_name.len() > 25 {
+            format!("...{}", &self.source_name[self.source_name.len()-22..])
+        } else {
+            self.source_name.clone()
+        };
+        format!("Loading {}... ({:.1}s)", name, elapsed)
+    }
 }
 
 /// Timing info for the last completed cache load
@@ -1667,14 +1668,6 @@ pub struct CacheLoadTiming {
     pub files_loaded: usize,
     /// Source ID that was loaded
     pub source_id: String,
-}
-
-/// Result of background cache preloading (full cache, not chunked)
-struct CachePreloadResult {
-    /// The folder cache HashMap
-    cache: HashMap<String, Vec<FolderInfo>>,
-    /// Source ID this cache was loaded for
-    source_id: String,
 }
 
 /// Result of background glob search
@@ -1741,8 +1734,6 @@ impl App {
             pending_cache_load: None,
             cache_load_progress: None,
             last_cache_load_timing: None,
-            preloaded_caches: HashMap::new(),
-            cache_preload_rx: None,
             tick_count: 0,
             pending_glob_search: None,
             glob_search_cancelled: None,
@@ -1754,69 +1745,30 @@ impl App {
         }
     }
 
-    /// Start background preloading of folder caches for all sources.
-    /// Called after sources are loaded in tick().
-    fn start_cache_preload(&mut self) {
-        // Skip if already preloading
-        if self.cache_preload_rx.is_some() {
-            return;
+    /// Enter Discover mode with Rule Builder initialized immediately.
+    /// This ensures the Rule Builder UI appears instantly (no loading delay).
+    /// Files will populate asynchronously as the cache loads.
+    pub fn enter_discover_mode(&mut self) {
+        self.mode = TuiMode::Discover;
+
+        // Initialize Rule Builder immediately if not already present
+        if self.discover.rule_builder.is_none() {
+            let source_id = self.discover.selected_source_id
+                .as_ref()
+                .map(|id| id.as_str().to_string());
+            let mut builder = super::extraction::RuleBuilderState::new(source_id);
+            builder.pattern = "**/*".to_string();
+            self.discover.rule_builder = Some(builder);
         }
 
-        // Get list of source IDs to preload
-        let source_ids: Vec<String> = self
-            .discover
-            .sources
-            .iter()
-            .map(|s| s.id.as_str().to_string())
-            .collect();
+        // Set view state to Rule Builder immediately
+        self.discover.view_state = DiscoverViewState::RuleBuilder;
 
-        if source_ids.is_empty() {
-            return;
-        }
-
-        // Create channel for receiving preloaded caches
-        let (tx, rx) = mpsc::channel(source_ids.len().max(1));
-        self.cache_preload_rx = Some(rx);
-
-        // Spawn background tasks to load each cache
-        // Load AND convert in spawn_blocking since both are CPU-bound
-        for source_id in source_ids {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let source_id_for_load = source_id.clone();
-                let cache_result = tokio::task::spawn_blocking(move || {
-                    let folder_cache = FolderCache::load(&source_id_for_load).ok()?;
-                    // Convert in blocking thread (CPU-bound for large caches)
-                    let cache: HashMap<String, Vec<FolderInfo>> = folder_cache.folders.iter()
-                        .map(|(prefix, entries)| {
-                            let folder_infos: Vec<FolderInfo> = entries.iter()
-                                .map(|e| {
-                                    let name = folder_cache.segments.get(e.segment_idx as usize)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    FolderInfo::new(name, e.file_count as usize, e.is_file)
-                                })
-                                .collect();
-                            (prefix.clone(), folder_infos)
-                        })
-                        .collect();
-                    Some(cache)
-                })
-                .await
-                .ok()
-                .flatten();
-
-                if let Some(cache) = cache_result {
-                    let _ = tx
-                        .send(CachePreloadResult {
-                            cache,
-                            source_id,
-                        })
-                        .await;
-                }
-                // If no disk cache, don't send anything - it will be built on demand
-            });
-        }
+        // Default focus to Sources dropdown on entry (per user feedback)
+        // This lets users quickly select a source when entering Discover
+        self.discover.view_state = DiscoverViewState::SourcesDropdown;
+        self.discover.sources_filter.clear();
+        self.discover.preview_source = Some(self.discover.selected_source_index());
     }
 
     /// Create app with injected LLM provider (for testing with mock providers)
@@ -1849,8 +1801,6 @@ impl App {
             pending_cache_load: None,
             cache_load_progress: None,
             last_cache_load_timing: None,
-            preloaded_caches: HashMap::new(),
-            cache_preload_rx: None,
             tick_count: 0,
             pending_glob_search: None,
             glob_search_cancelled: None,
@@ -1886,7 +1836,7 @@ impl App {
             // Note: In Discover mode, 1/2/3 are overridden for panel focus
             // Don't intercept when chat is focused (allow typing numbers)
             KeyCode::Char('1') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
-                self.mode = TuiMode::Discover;
+                self.enter_discover_mode();
                 return;
             }
             KeyCode::Char('2') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
@@ -2416,9 +2366,12 @@ impl App {
                 self.discover.preview_open = !self.discover.preview_open;
             }
             KeyCode::Char('s') => {
-                // Open scan path input
+                // Open scan path input - auto-populate with selected source path
                 self.transition_discover_state(DiscoverViewState::EnteringPath);
-                self.discover.scan_path_input.clear();
+                // Pre-fill with selected source path if available
+                self.discover.scan_path_input = self.discover.selected_source()
+                    .map(|s| s.path.display().to_string())
+                    .unwrap_or_default();
                 self.discover.scan_error = None;
             }
             KeyCode::Char('r') => {
@@ -2723,7 +2676,10 @@ impl App {
             KeyCode::Char('s') => {
                 // Open scan path input (same as normal mode)
                 self.transition_discover_state(DiscoverViewState::EnteringPath);
-                self.discover.scan_path_input.clear();
+                // Pre-fill with selected source path if available
+                self.discover.scan_path_input = self.discover.selected_source()
+                    .map(|s| s.path.display().to_string())
+                    .unwrap_or_default();
                 self.discover.scan_error = None;
             }
             // --- Rule Builder: Result Filtering (a/p/f keys) ---
@@ -3201,6 +3157,10 @@ impl App {
                 // Confirm selection, close dropdown
                 if let Some(preview_idx) = self.discover.preview_source {
                     self.discover.select_source_by_index(preview_idx);
+                    // Schedule source touch for MRU ordering (processed in tick)
+                    if let Some(source_id) = &self.discover.selected_source_id {
+                        self.discover.pending_source_touch = Some(source_id.as_str().to_string());
+                    }
                     self.discover.data_loaded = false;
                     self.discover.selected_tag = None;
                     self.discover.filter.clear();
@@ -3211,6 +3171,7 @@ impl App {
                     self.discover.rule_builder = None;
                     // Cancel any pending cache load for old source
                     self.pending_cache_load = None;
+                    self.cache_load_progress = None;
                 }
                 // Return to RuleBuilder (the default Discover view)
                 self.discover.view_state = DiscoverViewState::RuleBuilder;
@@ -3219,12 +3180,11 @@ impl App {
                 self.discover.preview_source = None;
             }
             KeyCode::Esc => {
-                // Close dropdown without changing selection
-                self.discover.view_state = DiscoverViewState::Files;
+                // Close dropdown without changing selection, return to Rule Builder
+                self.discover.view_state = DiscoverViewState::RuleBuilder;
                 self.discover.sources_filter.clear();
                 self.discover.sources_filtering = false;
                 self.discover.preview_source = None;
-                self.discover.focus = DiscoverFocus::Files;
             }
             _ => {}
         }
@@ -3329,23 +3289,20 @@ impl App {
                 self.discover.tags_filtering = true;
             }
             KeyCode::Enter => {
-                // Confirm selection, close dropdown
+                // Confirm selection, close dropdown, return to Rule Builder
                 self.discover.selected_tag = self.discover.preview_tag;
-                self.discover.view_state = DiscoverViewState::Files;
+                self.discover.view_state = DiscoverViewState::RuleBuilder;
                 self.discover.tags_filter.clear();
                 self.discover.tags_filtering = false;
                 self.discover.preview_tag = None;
-                self.discover.focus = DiscoverFocus::Files;
                 self.discover.selected = 0;
             }
             KeyCode::Esc => {
-                // Close dropdown, show all files
-                self.discover.selected_tag = None;
-                self.discover.view_state = DiscoverViewState::Files;
+                // Close dropdown without changing selection, return to Rule Builder
+                self.discover.view_state = DiscoverViewState::RuleBuilder;
                 self.discover.tags_filter.clear();
                 self.discover.tags_filtering = false;
                 self.discover.preview_tag = None;
-                self.discover.focus = DiscoverFocus::Files;
                 self.discover.selected = 0;
             }
             _ => {}
@@ -3531,9 +3488,6 @@ impl App {
                         .find(|s| s.id == source_id)
                         .map(|s| s.name.clone());
 
-                    // Remove preloaded cache for this source (prevents memory leak)
-                    self.preloaded_caches.remove(&source_id.0);
-
                     self.discover.sources.retain(|s| s.id != source_id);
 
                     // Adjust selection if needed
@@ -3629,10 +3583,15 @@ impl App {
                         builder.ignore_options.clear();
                         builder.focus = RuleBuilderFocus::FileList;
                     }
+                    RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag => {
+                        // Escape from text input fields moves focus to FileList
+                        // This provides a quick way to exit text entry mode
+                        builder.focus = RuleBuilderFocus::FileList;
+                    }
                     _ => {
                         // Rule Builder is the default Discover view - don't close
-                        // Reset focus to Pattern for a fresh start
-                        builder.focus = RuleBuilderFocus::Pattern;
+                        // Move focus to FileList for navigation
+                        builder.focus = RuleBuilderFocus::FileList;
                     }
                 }
             }
@@ -3812,10 +3771,26 @@ impl App {
                 }
             }
 
+            // Left/Right arrows for panel navigation (move between left panel and FileList)
+            // When not in text input mode, arrows provide quick panel switching
+            KeyCode::Left if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+                if matches!(builder.focus, RuleBuilderFocus::FileList) {
+                    // Move from FileList to Pattern (left panel)
+                    builder.focus = RuleBuilderFocus::Pattern;
+                }
+            }
+            KeyCode::Right if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+                if !matches!(builder.focus, RuleBuilderFocus::FileList | RuleBuilderFocus::IgnorePicker) {
+                    // Move from left panel to FileList (right panel)
+                    builder.focus = RuleBuilderFocus::FileList;
+                }
+            }
+
             // '1' opens Sources dropdown, '2' opens Tags dropdown (per spec Section 3)
             KeyCode::Char('1') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
                 self.transition_discover_state(DiscoverViewState::SourcesDropdown);
                 self.discover.sources_filter.clear();
+                self.discover.preview_source = Some(self.discover.selected_source_index());
                 return; // Exit early, don't continue to text input
             }
             KeyCode::Char('2') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
@@ -3823,6 +3798,17 @@ impl App {
                 self.discover.tags_filter.clear();
                 self.discover.preview_tag = self.discover.selected_tag;
                 return; // Exit early, don't continue to text input
+            }
+
+            // 's' opens scan dialog (when not in text input)
+            KeyCode::Char('s') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
+                // Pre-fill with selected source path if available
+                self.discover.scan_path_input = self.discover.selected_source()
+                    .map(|s| s.path.display().to_string())
+                    .unwrap_or_default();
+                self.discover.scan_error = None;
+                return; // Exit early
             }
 
             // Text input for Pattern, Tag, and ExcludeInput
@@ -3996,11 +3982,7 @@ impl App {
     /// Update the Rule Builder's file results based on the current pattern.
     /// Detects phase based on whether pattern contains <field> placeholders.
     fn update_rule_builder_files(&mut self, pattern: &str) {
-        use globset::GlobBuilder;
-        use super::extraction::{
-            RuleBuilderFile, FileTestResult, FileResultsPhase,
-            FolderMatch, ExtractionPreviewFile, parse_custom_glob, extract_field_values,
-        };
+        use super::extraction::FileResultsPhase;
 
         let builder = match self.discover.rule_builder.as_mut() {
             Some(b) => b,
@@ -4036,17 +4018,12 @@ impl App {
         use globset::GlobBuilder;
         use super::extraction::FolderMatch;
 
-        // Get folder cache from GlobExplorer if available
-        let folder_cache = self.discover.glob_explorer.as_ref()
-            .map(|e| e.folder_cache.clone())
-            .unwrap_or_default();
+        // Check rule_builder exists first (early return)
+        if self.discover.rule_builder.is_none() {
+            return;
+        }
 
-        let builder = match self.discover.rule_builder.as_mut() {
-            Some(b) => b,
-            None => return,
-        };
-
-        // Build glob matcher
+        // Build glob matcher (doesn't need folder_cache)
         let glob_pattern = if pattern.contains('/') {
             pattern.to_string()
         } else if pattern.is_empty() || pattern == "*" {
@@ -4062,79 +4039,84 @@ impl App {
         {
             Ok(m) => m,
             Err(_) => {
-                builder.folder_matches.clear();
-                builder.match_count = 0;
-                builder.pattern_error = Some("Invalid pattern".to_string());
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    builder.folder_matches.clear();
+                    builder.match_count = 0;
+                    builder.pattern_error = Some("Invalid pattern".to_string());
+                }
                 return;
             }
         };
 
-        builder.pattern_error = None;
+        // Traverse folder_cache with shared borrow - NO CLONE
+        let (folder_matches, match_count) = {
+            let folder_cache = match self.discover.glob_explorer.as_ref() {
+                Some(e) => &e.folder_cache,
+                None => return,
+            };
 
-        // Collect all files from folder_cache and group by parent folder
-        let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
-            std::collections::HashMap::new();
+            let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
+                std::collections::HashMap::new();
 
-        // Recursive function to traverse folder cache
-        fn traverse_cache(
-            cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
-            prefix: &str,
-            matcher: &globset::GlobMatcher,
-            folder_counts: &mut std::collections::HashMap<String, (usize, String)>,
-        ) {
-            if let Some(items) = cache.get(prefix) {
-                for item in items {
-                    let full_path = if prefix.is_empty() {
-                        item.name.clone()
-                    } else {
-                        format!("{}{}", prefix, item.name)
-                    };
+            // Recursive function to traverse folder cache
+            fn traverse_cache(
+                cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
+                prefix: &str,
+                matcher: &globset::GlobMatcher,
+                folder_counts: &mut std::collections::HashMap<String, (usize, String)>,
+            ) {
+                if let Some(items) = cache.get(prefix) {
+                    for item in items {
+                        let full_path = if prefix.is_empty() {
+                            item.name.clone()
+                        } else {
+                            format!("{}{}", prefix, item.name)
+                        };
 
-                    if item.is_file {
-                        // It's a file - check if it matches
-                        if matcher.is_match(&full_path) {
-                            // Use the prefix as the folder path
-                            let folder = if prefix.is_empty() {
-                                ".".to_string()
-                            } else {
-                                prefix.trim_end_matches('/').to_string()
-                            };
-                            let entry = folder_counts.entry(folder).or_insert((0, item.name.clone()));
-                            entry.0 += 1;
+                        if item.is_file {
+                            if matcher.is_match(&full_path) {
+                                let folder = if prefix.is_empty() {
+                                    ".".to_string()
+                                } else {
+                                    prefix.trim_end_matches('/').to_string()
+                                };
+                                let entry = folder_counts.entry(folder).or_insert((0, item.name.clone()));
+                                entry.0 += 1;
+                            }
+                        } else {
+                            let sub_prefix = format!("{}/", full_path);
+                            traverse_cache(cache, &sub_prefix, matcher, folder_counts);
                         }
-                    } else {
-                        // It's a folder - recurse into it
-                        let sub_prefix = format!("{}/", full_path);
-                        traverse_cache(cache, &sub_prefix, matcher, folder_counts);
                     }
                 }
             }
+
+            traverse_cache(folder_cache, "", &matcher, &mut folder_counts);
+
+            // Convert to FolderMatch and sort
+            let mut folder_matches: Vec<FolderMatch> = folder_counts
+                .into_iter()
+                .filter(|(_, (count, _))| *count > 0)
+                .map(|(path, (count, sample))| FolderMatch {
+                    path: if path == "." { "./".to_string() } else { format!("{}/", path) },
+                    count,
+                    sample_filename: sample,
+                    files: Vec::new(),
+                })
+                .collect();
+
+            folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
+            let match_count = folder_matches.iter().map(|f| f.count).sum();
+            (folder_matches, match_count)
+        }; // shared borrow ends here
+
+        // Update builder with mutable borrow
+        if let Some(builder) = self.discover.rule_builder.as_mut() {
+            builder.pattern_error = None;
+            builder.match_count = match_count;
+            builder.folder_matches = folder_matches;
+            builder.selected_file = 0;
         }
-
-        // Start traversal from root
-        traverse_cache(&folder_cache, "", &matcher, &mut folder_counts);
-
-        // Convert to FolderMatch and sort by count descending
-        let mut folder_matches: Vec<FolderMatch> = folder_counts
-            .into_iter()
-            .filter(|(_, (count, _))| *count > 0)
-            .map(|(path, (count, sample))| FolderMatch {
-                path: if path == "." {
-                    "./".to_string()
-                } else {
-                    format!("{}/", path)
-                },
-                count,
-                sample_filename: sample,
-                files: Vec::new(), // Lazily populated on expand
-            })
-            .collect();
-
-        folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
-
-        builder.match_count = folder_matches.iter().map(|f| f.count).sum();
-        builder.folder_matches = folder_matches;
-        builder.selected_file = 0;
     }
 
     /// Phase 2: Extraction Preview - Show files with extracted values
@@ -4142,30 +4124,25 @@ impl App {
         use globset::GlobBuilder;
         use super::extraction::{ExtractionPreviewFile, parse_custom_glob, extract_field_values};
 
-        // Get folder cache from GlobExplorer if available
-        let folder_cache = self.discover.glob_explorer.as_ref()
-            .map(|e| e.folder_cache.clone())
-            .unwrap_or_default();
+        // Check rule_builder exists first (early return)
+        if self.discover.rule_builder.is_none() {
+            return;
+        }
 
-        let builder = match self.discover.rule_builder.as_mut() {
-            Some(b) => b,
-            None => return,
-        };
-
-        // Parse the custom glob pattern with <field> placeholders
+        // Parse custom glob pattern (doesn't need folder_cache)
         let parsed = match parse_custom_glob(pattern) {
             Ok(p) => p,
             Err(e) => {
-                builder.preview_files.clear();
-                builder.match_count = 0;
-                builder.pattern_error = Some(e.message);
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    builder.preview_files.clear();
+                    builder.match_count = 0;
+                    builder.pattern_error = Some(e.message);
+                }
                 return;
             }
         };
 
-        builder.pattern_error = None;
-
-        // Build glob matcher from the converted pattern
+        // Build glob matcher
         let glob_pattern = if parsed.glob_pattern.contains('/') {
             parsed.glob_pattern.clone()
         } else {
@@ -4179,50 +4156,60 @@ impl App {
         {
             Ok(m) => m,
             Err(_) => {
-                builder.preview_files.clear();
-                builder.match_count = 0;
-                builder.pattern_error = Some("Invalid glob pattern".to_string());
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    builder.preview_files.clear();
+                    builder.match_count = 0;
+                    builder.pattern_error = Some("Invalid glob pattern".to_string());
+                }
                 return;
             }
         };
 
-        // Collect all files from folder_cache
-        let mut all_files: Vec<String> = Vec::new();
+        // Traverse folder_cache with shared borrow - NO CLONE
+        let all_files = {
+            let folder_cache = match self.discover.glob_explorer.as_ref() {
+                Some(e) => &e.folder_cache,
+                None => return,
+            };
 
-        fn collect_files(
-            cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
-            prefix: &str,
-            matcher: &globset::GlobMatcher,
-            files: &mut Vec<String>,
-            limit: usize,
-        ) {
-            if files.len() >= limit {
-                return;
-            }
-            if let Some(items) = cache.get(prefix) {
-                for item in items {
-                    if files.len() >= limit {
-                        return;
-                    }
-                    let full_path = if prefix.is_empty() {
-                        item.name.clone()
-                    } else {
-                        format!("{}{}", prefix, item.name)
-                    };
+            let mut files: Vec<String> = Vec::new();
 
-                    if item.is_file {
-                        if matcher.is_match(&full_path) {
-                            files.push(full_path);
+            fn collect_files(
+                cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
+                prefix: &str,
+                matcher: &globset::GlobMatcher,
+                files: &mut Vec<String>,
+                limit: usize,
+            ) {
+                if files.len() >= limit {
+                    return;
+                }
+                if let Some(items) = cache.get(prefix) {
+                    for item in items {
+                        if files.len() >= limit {
+                            return;
                         }
-                    } else {
-                        let sub_prefix = format!("{}/", full_path);
-                        collect_files(cache, &sub_prefix, matcher, files, limit);
+                        let full_path = if prefix.is_empty() {
+                            item.name.clone()
+                        } else {
+                            format!("{}{}", prefix, item.name)
+                        };
+
+                        if item.is_file {
+                            if matcher.is_match(&full_path) {
+                                files.push(full_path);
+                            }
+                        } else {
+                            let sub_prefix = format!("{}/", full_path);
+                            collect_files(cache, &sub_prefix, matcher, files, limit);
+                        }
                     }
                 }
             }
-        }
 
-        collect_files(&folder_cache, "", &matcher, &mut all_files, 100);
+            collect_files(folder_cache, "", &matcher, &mut files, 100);
+            files
+        }; // shared borrow ends here
 
         // Convert to preview files with extractions
         let preview_files: Vec<ExtractionPreviewFile> = all_files
@@ -4238,9 +4225,13 @@ impl App {
             })
             .collect();
 
-        builder.match_count = preview_files.len();
-        builder.preview_files = preview_files;
-        builder.selected_file = 0;
+        // Update builder with mutable borrow
+        if let Some(builder) = self.discover.rule_builder.as_mut() {
+            builder.pattern_error = None;
+            builder.match_count = preview_files.len();
+            builder.preview_files = preview_files;
+            builder.selected_file = 0;
+        }
     }
 
     /// Close the rule creation dialog and reset state
@@ -4707,6 +4698,12 @@ impl App {
         // Create scan job for tracking in Jobs view
         let job_id = self.add_scan_job(&path_display);
         self.current_scan_job_id = Some(job_id);
+
+        // Show confirmation with job ID
+        self.discover.status_message = Some((
+            format!("Scan started (Job #{}) - press [4] to view Jobs", job_id),
+            false,
+        ));
 
         // Get database path
         let db_path = self.config.database.clone()
@@ -5259,8 +5256,7 @@ impl App {
     }
 
     /// Start non-blocking cache load for glob explorer.
-    /// First checks preloaded caches (instant), then disk cache, falls back to building from DB.
-    /// Results are polled in tick() via pending_cache_load.
+    /// Checks preloaded caches first (instant), then loads from disk cache or scout_folders.
     fn start_cache_load(&mut self) {
         // Must have a source selected
         let source_id = match &self.discover.selected_source_id {
@@ -5273,51 +5269,45 @@ impl App {
             return;
         }
 
-        let source_id_str = source_id.as_str().to_string();
-
-        // Check if we have a preloaded cache for this source (instant!)
-        if let Some(cache) = self.preloaded_caches.remove(&source_id_str) {
-            // Cache was preloaded at app start - use it directly
-            if let Some(ref mut explorer) = self.discover.glob_explorer {
-                explorer.folder_cache = cache;
-                explorer.cache_loaded = true;
-                explorer.cache_source_id = Some(source_id_str);
-                explorer.current_prefix = String::new();
-                explorer.nav_history.clear();
-                explorer.selected_folder = 0;
-
-                if let Some(root_folders) = explorer.folder_cache.get("") {
-                    explorer.folders = root_folders.clone();
-                    explorer.total_count = GlobFileCount::Exact(
-                        root_folders.iter().map(|f| f.file_count).sum()
-                    );
+        // Skip if cache is already loaded for this source
+        if let Some(ref explorer) = self.discover.glob_explorer {
+            if explorer.cache_loaded {
+                if let Some(ref cache_source) = explorer.cache_source_id {
+                    if cache_source == source_id.as_str() {
+                        // Cache already loaded for this source, no reload needed
+                        self.discover.data_loaded = true;
+                        return;
+                    }
                 }
             }
-            self.update_folders_from_cache();
-            // Load tags asynchronously since we can't await here
-            self.discover.data_loaded = true;
+        }
 
-            // Update Rule Builder with preloaded cache data
-            if self.discover.view_state == DiscoverViewState::RuleBuilder {
-                if let Some(ref builder) = self.discover.rule_builder {
-                    let pattern = builder.pattern.clone();
-                    self.update_rule_builder_files(&pattern);
-                }
-            }
+        // Skip if we're already tracking progress for this load
+        // (prevents timer reset when tick() calls us multiple times)
+        if self.cache_load_progress.is_some() {
             return;
         }
 
-        // Use streaming channel for progressive UI updates
-        let (tx, rx) = mpsc::channel::<CacheLoadMessage>(16);
+        // Skip if cache load already failed (don't retry until user takes action)
+        if self.discover.scan_error.is_some() {
+            return;
+        }
+
+        let source_id_str = source_id.as_str().to_string();
+
+        // Get source name for progress display
+        let source_name = self.discover.sources
+            .iter()
+            .find(|s| s.id == source_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| source_id_str.clone());
+
+        // Set up channel and progress tracking
+        let (tx, rx) = mpsc::channel::<CacheLoadMessage>(1);
         self.pending_cache_load = Some(rx);
+        self.cache_load_progress = Some(CacheLoadProgress::new(source_name));
 
-        // Initialize progress tracking with start time
-        self.cache_load_progress = Some(CacheLoadProgress {
-            files_processed: 0,
-            started_at: std::time::Instant::now(),
-        });
-
-        // Initialize empty cache in explorer for streaming merge
+        // Initialize empty cache in explorer
         if let Some(ref mut explorer) = self.discover.glob_explorer {
             explorer.folder_cache = HashMap::new();
             explorer.cache_source_id = Some(source_id_str.clone());
@@ -5325,507 +5315,53 @@ impl App {
 
         // Spawn background task for cache loading
         tokio::spawn(async move {
-            // First, try to load from disk cache (fast path - send as single Complete)
+            // Try to load from disk cache (fast path)
             let source_id_for_cache = source_id_str.clone();
-            let disk_cache_start = std::time::Instant::now();
             let cache_result = tokio::task::spawn_blocking(move || {
-                let load_start = std::time::Instant::now();
-                let folder_cache = match FolderCache::load(&source_id_for_cache) {
-                    Ok(fc) => {
-                        tracing::info!(source_id = %source_id_for_cache, elapsed_ms = ?load_start.elapsed().as_millis(), "Disk cache loaded");
-                        fc
-                    }
-                    Err(e) => {
-                        tracing::debug!(source_id = %source_id_for_cache, error = %e, "Disk cache not found or failed");
-                        return None;
-                    }
-                };
-                let convert_start = std::time::Instant::now();
-                let cache: HashMap<String, Vec<FolderInfo>> = folder_cache.folders.iter()
+                let folder_cache = FolderCache::load(&source_id_for_cache).ok()?;
+                // Convert SoA FolderCache to HashMap<String, Vec<FolderInfo>> for TUI traversal
+                // Note: folder_cache::FolderInfo -> app::FolderInfo conversion
+                let cache: HashMap<String, Vec<FolderInfo>> = folder_cache
+                    .to_folder_map()
+                    .into_iter()
                     .map(|(prefix, entries)| {
-                        let folder_infos: Vec<FolderInfo> = entries.iter()
-                            .map(|e| FolderInfo::from_cache_entry(
-                                &folder_cache.segments[e.segment_idx as usize],
-                                e.file_count as usize,
-                                e.is_file,
-                            ))
+                        let folder_infos: Vec<FolderInfo> = entries
+                            .into_iter()
+                            .map(|e| FolderInfo::from_cache_entry(&e.name, e.file_count, e.is_file))
                             .collect();
-                        (prefix.clone(), folder_infos)
+                        (prefix, folder_infos)
                     })
                     .collect();
-                // Convert TagSummary to TagInfo
-                let tags: Vec<TagInfo> = folder_cache.tags.iter()
+                let tags: Vec<TagInfo> = folder_cache.get_tags().into_iter()
                     .map(|t| TagInfo {
-                        name: t.name.clone(),
+                        name: t.name,
                         count: t.count,
                         is_special: t.is_special,
                     })
                     .collect();
-                tracing::info!(elapsed_ms = ?convert_start.elapsed().as_millis(), entries = cache.len(), "Cache converted");
                 Some((cache, folder_cache.total_files, tags))
             }).await.ok().flatten();
 
-            if let Some((cache, total_files, tags)) = cache_result {
-                tracing::info!(source_id = %source_id_str, total_ms = ?disk_cache_start.elapsed().as_millis(), "Using disk cache (fast path)");
-                // Disk cache exists - send as single chunk then complete
-                let _ = tx.send(CacheLoadMessage::Chunk {
-                    folders: cache,
-                    files_processed: total_files,
-                }).await;
-                let _ = tx.send(CacheLoadMessage::Complete {
-                    source_id: source_id_str,
-                    total_files,
-                    tags,
-                }).await;
-                return;
-            }
-
-            tracing::info!(source_id = %source_id_str, "Disk cache miss, using scout_folders fallback");
-            // No disk cache - stream from DB using keyset pagination
-            use sqlx::SqlitePool;
-
-            let db_path = dirs::home_dir()
-                .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-                .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-            if !db_path.exists() {
-                let _ = tx.send(CacheLoadMessage::Error("Database not found".to_string())).await;
-                return;
-            }
-
-            let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-            let pool = match SqlitePool::connect(&db_url).await {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(CacheLoadMessage::Error(e.to_string())).await;
-                    return;
+            match cache_result {
+                Some((cache, total_files, tags)) => {
+                    let _ = tx.send(CacheLoadMessage::Complete {
+                        source_id: source_id_str,
+                        total_files,
+                        tags,
+                        cache,
+                    }).await;
                 }
-            };
-
-            const CHUNK_SIZE: i64 = 10_000;
-            let mut cursor: Option<String> = None;
-            let mut files_processed: usize = 0;
-            let mut all_paths: Vec<(String,)> = Vec::new(); // Collect for disk cache save
-
-            // FIRST: Try scout_folders table (instant! pre-computed during scan)
-            // This is the fast path when streaming scan has populated the table
-            let scout_folders: Vec<(String, i64, i32)> = sqlx::query_as(
-                r#"
-                SELECT name, file_count, is_folder
-                FROM scout_folders
-                WHERE source_id = ? AND prefix = ''
-                ORDER BY file_count DESC
-                "#
-            )
-            .bind(&source_id_str)
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
-
-            if !scout_folders.is_empty() {
-                // scout_folders table has data - use it directly (instant!)
-                let mut root_hierarchy: HashMap<String, Vec<FolderInfo>> = HashMap::new();
-                let root_entries: Vec<FolderInfo> = scout_folders.iter()
-                    .map(|(name, count, is_folder)| {
-                        FolderInfo::new(name.clone(), *count as usize, *is_folder == 0)
-                    })
-                    .collect();
-                let total_files: usize = root_entries.iter().map(|f| f.file_count).sum();
-                root_hierarchy.insert(String::new(), root_entries);
-
-                // Send root folders immediately - users see correct structure instantly
-                if tx.send(CacheLoadMessage::Chunk {
-                    folders: root_hierarchy,
-                    files_processed: total_files,
-                }).await.is_err() {
-                    return;
+                None => {
+                    // No disk cache - user needs to scan first
+                    let _ = tx.send(CacheLoadMessage::Error(
+                        "No cache found. Run a scan first.".to_string()
+                    )).await;
                 }
-                files_processed = total_files;
-
-                // For sources with scout_folders populated, we can skip the slow streaming
-                // The scout_folders table has the full hierarchy already
-                // Load the rest of the hierarchy from scout_folders
-                let all_folders: Vec<(String, String, i64, i32)> = sqlx::query_as(
-                    r#"
-                    SELECT prefix, name, file_count, is_folder
-                    FROM scout_folders
-                    WHERE source_id = ? AND prefix != ''
-                    ORDER BY prefix, file_count DESC
-                    "#
-                )
-                .bind(&source_id_str)
-                .fetch_all(&pool)
-                .await
-                .unwrap_or_default();
-
-                if !all_folders.is_empty() {
-                    // Build full hierarchy from scout_folders
-                    let mut full_hierarchy: HashMap<String, Vec<FolderInfo>> = HashMap::new();
-                    for (prefix, name, count, is_folder) in all_folders {
-                        let entry = FolderInfo::new(name, count as usize, is_folder == 0);
-                        full_hierarchy.entry(prefix).or_default().push(entry);
-                    }
-
-                    // Send as a single chunk
-                    if tx.send(CacheLoadMessage::Chunk {
-                        folders: full_hierarchy,
-                        files_processed,
-                    }).await.is_err() {
-                        return;
-                    }
-                }
-
-                // Query tags from scout_files (DB fallback path)
-                let tags = query_tags_from_db(&pool, &source_id_str, files_processed).await;
-
-                // Complete - no need for slow GROUP BY or streaming
-                let _ = tx.send(CacheLoadMessage::Complete {
-                    source_id: source_id_str,
-                    total_files: files_processed,
-                    tags,
-                }).await;
-                return;
-            }
-
-            // FALLBACK: scout_folders empty - stream from scout_files
-            // This happens on first load before scan runs, or for old databases
-            // After streaming, we'll populate scout_folders in the background
-
-            tracing::info!(source_id = %source_id_str, "scout_folders empty, streaming from scout_files");
-
-            // First, get root folders via GROUP BY (slow for large sources)
-            let root_folders: Vec<(String, i64)> = sqlx::query_as(
-                r#"
-                SELECT
-                    CASE
-                        WHEN INSTR(rel_path, '/') > 0 THEN SUBSTR(rel_path, 1, INSTR(rel_path, '/') - 1)
-                        ELSE rel_path
-                    END as root_name,
-                    COUNT(*) as file_count
-                FROM scout_files
-                WHERE source_id = ?
-                GROUP BY root_name
-                ORDER BY file_count DESC
-                "#
-            )
-            .bind(&source_id_str)
-            .fetch_all(&pool)
-            .await
-            .unwrap_or_default();
-
-            if !root_folders.is_empty() {
-                // Build root folder hierarchy
-                let mut root_hierarchy: HashMap<String, Vec<FolderInfo>> = HashMap::new();
-                let root_entries: Vec<FolderInfo> = root_folders.iter()
-                    .map(|(name, count)| {
-                        let is_file = *count == 1 && !name.is_empty() && !name.starts_with('.');
-                        FolderInfo::new(name.clone(), *count as usize, is_file)
-                    })
-                    .collect();
-                let total_files: usize = root_entries.iter().map(|f| f.file_count).sum();
-                root_hierarchy.insert(String::new(), root_entries);
-
-                if tx.send(CacheLoadMessage::Chunk {
-                    folders: root_hierarchy,
-                    files_processed: total_files,
-                }).await.is_err() {
-                    return;
-                }
-                files_processed = total_files;
-            }
-
-            // THEN: Stream full hierarchy for subfolders (detailed structure)
-            loop {
-                // Fetch chunk using keyset pagination (O(log n) per query via index)
-                let paths: Vec<(String,)> = match &cursor {
-                    None => {
-                        sqlx::query_as(
-                            "SELECT rel_path FROM scout_files WHERE source_id = ? ORDER BY rel_path LIMIT ?"
-                        )
-                        .bind(&source_id_str)
-                        .bind(CHUNK_SIZE)
-                        .fetch_all(&pool)
-                        .await
-                    }
-                    Some(last_path) => {
-                        sqlx::query_as(
-                            "SELECT rel_path FROM scout_files WHERE source_id = ? AND rel_path > ? ORDER BY rel_path LIMIT ?"
-                        )
-                        .bind(&source_id_str)
-                        .bind(last_path)
-                        .bind(CHUNK_SIZE)
-                        .fetch_all(&pool)
-                        .await
-                    }
-                }.unwrap_or_default();
-
-                if paths.is_empty() {
-                    break;
-                }
-
-                let chunk_size = paths.len();
-                files_processed += chunk_size;
-
-                // Update cursor to last path in this chunk
-                cursor = paths.last().map(|(p,)| p.clone());
-
-                // Build partial folder hierarchy from this chunk
-                let chunk_folders = build_folder_hierarchy_from_paths(&paths);
-
-                // Collect paths for disk cache save at end
-                all_paths.extend(paths);
-
-                // Send chunk to UI
-                if tx.send(CacheLoadMessage::Chunk {
-                    folders: chunk_folders,
-                    files_processed,
-                }).await.is_err() {
-                    return; // Receiver dropped (user changed source)
-                }
-
-                if chunk_size < CHUNK_SIZE as usize {
-                    break;
-                }
-            }
-
-            // Query tags from scout_files (streaming fallback path)
-            let tags = query_tags_from_db(&pool, &source_id_str, files_processed).await;
-
-            // Send completion first so UI can proceed
-            let _ = tx.send(CacheLoadMessage::Complete {
-                source_id: source_id_str.clone(),
-                total_files: files_processed,
-                tags,
-            }).await;
-
-            // ROBUST FIX: Populate scout_folders in background so next load is instant
-            // This ensures the source has proper folder hierarchy data even for old databases
-            if !all_paths.is_empty() {
-                let path_count = all_paths.len();
-                let source_id_for_cache = source_id_str.clone();
-                let source_id_for_db = source_id_str.clone();
-                let source_id_for_tags = source_id_str.clone();
-                eprintln!("[scout_folders rebuild] Starting for {} with {} paths", source_id_str, path_count);
-
-                tokio::spawn(async move {
-                    eprintln!("[scout_folders rebuild] Spawned task running");
-
-                    // Open DB first to query tags for disk cache
-                    let db_path = dirs::home_dir()
-                        .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-                        .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-                    eprintln!("[scout_folders rebuild] Opening DB at {:?}", db_path);
-                    let db = match ScoutDatabase::open(&db_path).await {
-                        Ok(db) => db,
-                        Err(e) => {
-                            eprintln!("[scout_folders rebuild] Failed to open DB: {}", e);
-                            return;
-                        }
-                    };
-
-                    // Query tags for disk cache (before spawn_blocking)
-                    let tags = query_tags_for_cache(db.pool(), &source_id_for_tags, path_count).await;
-                    eprintln!("[scout_folders rebuild] Queried {} tags", tags.len());
-
-                    // Compute folder deltas from collected paths (CPU-intensive)
-                    let deltas = tokio::task::spawn_blocking(move || {
-                        eprintln!("[scout_folders rebuild] spawn_blocking started");
-
-                        // Also save to disk cache while we have the data (with tags!)
-                        let folder_cache = FolderCache::build_with_tags(&source_id_for_cache, &all_paths, tags);
-                        let _ = folder_cache.save();
-                        eprintln!("[scout_folders rebuild] Disk cache saved");
-
-                        // Compute deltas for scout_folders table
-                        let deltas = compute_folder_deltas_from_paths(&all_paths);
-                        eprintln!("[scout_folders rebuild] Computed {} deltas", deltas.len());
-                        deltas
-                    })
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("[scout_folders rebuild] spawn_blocking failed: {:?}", e);
-                        HashMap::new()
-                    });
-
-                    if deltas.is_empty() {
-                        eprintln!("[scout_folders rebuild] Deltas empty, returning early");
-                        return;
-                    }
-
-                    // Clear and repopulate scout_folders for this source
-                    eprintln!("[scout_folders rebuild] Clearing folder cache for {}", source_id_for_db);
-                    if let Err(e) = db.clear_folder_cache(&source_id_for_db).await {
-                        eprintln!("[scout_folders rebuild] Failed to clear: {}", e);
-                        return;
-                    }
-
-                    eprintln!("[scout_folders rebuild] Upserting {} folder entries", deltas.len());
-                    if let Err(e) = db.batch_upsert_folder_counts(&source_id_for_db, &deltas).await {
-                        eprintln!("[scout_folders rebuild] Failed to upsert: {}", e);
-                        return;
-                    }
-
-                    eprintln!(
-                        "[scout_folders rebuild] SUCCESS: {} entries for {}",
-                        deltas.len(),
-                        source_id_for_db
-                    );
-                });
             }
         });
     }
 }
 
-/// Build folder hierarchy from a batch of paths (used for streaming chunks)
-fn build_folder_hierarchy_from_paths(paths: &[(String,)]) -> HashMap<String, Vec<FolderInfo>> {
-    let mut build_cache: HashMap<String, HashMap<String, (usize, bool)>> = HashMap::new();
-    let mut prefix_buf = String::with_capacity(256);
-
-    for (path,) in paths {
-        prefix_buf.clear();
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let segment_count = segments.len();
-
-        for (i, segment) in segments.into_iter().enumerate() {
-            let is_file = i == segment_count - 1;
-
-            let level = build_cache.entry(prefix_buf.clone()).or_default();
-            level.entry(segment.to_string())
-                .and_modify(|(count, _)| *count += 1)
-                .or_insert((1, is_file));
-
-            if !is_file {
-                prefix_buf.push_str(segment);
-                prefix_buf.push('/');
-            }
-        }
-    }
-
-    // Convert to FolderInfo format
-    build_cache.into_iter()
-        .map(|(prefix, entries)| {
-            let mut folder_vec: Vec<FolderInfo> = entries.into_iter()
-                .map(|(name, (count, is_file))| FolderInfo::new(name, count, is_file))
-                .collect();
-            // Sort by file count descending for consistent ordering
-            folder_vec.sort_unstable_by(|a, b| b.file_count.cmp(&a.file_count));
-            (prefix, folder_vec)
-        })
-        .collect()
-}
-
-/// Format a number with thousands separators (e.g., 1234567 -> "1,234,567")
-fn format_thousands(n: usize) -> String {
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
-}
-
-/// Merge a chunk's folders into the main cache
-fn merge_folder_chunk(
-    cache: &mut HashMap<String, Vec<FolderInfo>>,
-    chunk: HashMap<String, Vec<FolderInfo>>,
-) {
-    for (prefix, chunk_entries) in chunk {
-        let existing = cache.entry(prefix).or_default();
-
-        for chunk_entry in chunk_entries {
-            if let Some(existing_entry) = existing.iter_mut().find(|e| e.name == chunk_entry.name) {
-                // Merge: add counts
-                existing_entry.file_count += chunk_entry.file_count;
-            } else {
-                // New entry
-                existing.push(chunk_entry);
-            }
-        }
-
-        // Re-sort after merge to maintain ordering
-        existing.sort_unstable_by(|a, b| b.file_count.cmp(&a.file_count));
-    }
-}
-
-/// Query tag summaries from scout_files table (DB fallback when no disk cache)
-async fn query_tags_from_db(pool: &sqlx::SqlitePool, source_id: &str, total_files: usize) -> Vec<TagInfo> {
-    let mut tags = Vec::new();
-
-    // Add "All files" as first option
-    tags.push(TagInfo {
-        name: "All files".to_string(),
-        count: total_files,
-        is_special: true,
-    });
-
-    // Query distinct tags with counts
-    let tag_rows: Vec<(String, i64)> = sqlx::query_as(
-        r#"
-        SELECT tag, COUNT(*) as count
-        FROM scout_files
-        WHERE source_id = ? AND tag IS NOT NULL AND tag != ''
-        GROUP BY tag
-        ORDER BY count DESC, tag
-        "#
-    )
-    .bind(source_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    for (tag_name, count) in tag_rows {
-        tags.push(TagInfo {
-            name: tag_name,
-            count: count as usize,
-            is_special: false,
-        });
-    }
-
-    tags
-}
-
-/// Query tags for disk cache building (returns TagSummary for serialization)
-async fn query_tags_for_cache(pool: &sqlx::SqlitePool, source_id: &str, total_files: usize) -> Vec<crate::scout::TagSummary> {
-    use crate::scout::TagSummary;
-
-    let mut tags = Vec::new();
-
-    // Add "All files" as first option
-    tags.push(TagSummary {
-        name: "All files".to_string(),
-        count: total_files,
-        is_special: true,
-    });
-
-    // Query distinct tags with counts
-    let tag_rows: Vec<(String, i64)> = sqlx::query_as(
-        r#"
-        SELECT tag, COUNT(*) as count
-        FROM scout_files
-        WHERE source_id = ? AND tag IS NOT NULL AND tag != ''
-        GROUP BY tag
-        ORDER BY count DESC, tag
-        "#
-    )
-    .bind(source_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    for (tag_name, count) in tag_rows {
-        tags.push(TagSummary {
-            name: tag_name,
-            count: count as usize,
-            is_special: false,
-        });
-    }
-
-    tags
-}
 
 impl App {
     /// Check for profiler dump trigger file and export data.
@@ -6051,12 +5587,12 @@ impl App {
 
             let db_url = format!("sqlite:{}?mode=ro", db_path.display());
             if let Ok(pool) = SqlitePool::connect(&db_url).await {
+                // Use denormalized file_count column (O(n) instead of O(n×m))
                 let query = r#"
-                    SELECT s.id, s.name, s.path,
-                           (SELECT COUNT(*) FROM scout_files WHERE source_id = s.id) as file_count
-                    FROM scout_sources s
-                    WHERE s.enabled = 1
-                    ORDER BY s.updated_at DESC
+                    SELECT id, name, path, file_count
+                    FROM scout_sources
+                    WHERE enabled = 1
+                    ORDER BY updated_at DESC
                 "#;
 
                 if let Ok(rows) = sqlx::query_as::<_, (String, String, String, i64)>(query)
@@ -6191,7 +5727,9 @@ impl App {
         use sqlx::SqlitePool;
 
         // Skip if nothing to persist
-        if self.discover.pending_tag_writes.is_empty() && self.discover.pending_rule_writes.is_empty() {
+        if self.discover.pending_tag_writes.is_empty()
+            && self.discover.pending_rule_writes.is_empty()
+            && self.discover.pending_source_touch.is_none() {
             return;
         }
 
@@ -6241,6 +5779,20 @@ impl App {
                 .bind(now)
                 .execute(&pool)
                 .await;
+        }
+
+        // Touch source for MRU ordering (updates updated_at timestamp)
+        if let Some(source_id) = std::mem::take(&mut self.discover.pending_source_touch) {
+            let now = chrono::Utc::now().timestamp_millis();
+            let result = sqlx::query("UPDATE scout_sources SET updated_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(&source_id)
+                .execute(&pool)
+                .await;
+            // Trigger sources reload to reflect new MRU ordering
+            if result.is_ok() {
+                self.discover.sources_loaded = false;
+            }
         }
     }
 
@@ -6325,12 +5877,12 @@ impl App {
             // Enter: Navigate to selected mode
             // Card order: 0=Discover, 1=ParserBench, 2=Jobs, 3=Sources (Inspect placeholder)
             KeyCode::Enter => {
-                self.mode = match self.home.selected_card {
-                    0 => TuiMode::Discover,
-                    1 => TuiMode::ParserBench,
-                    2 => TuiMode::Jobs,
-                    3 => TuiMode::Inspect, // TODO: TuiMode::Sources when implemented
-                    _ => TuiMode::Home,
+                match self.home.selected_card {
+                    0 => self.enter_discover_mode(),
+                    1 => self.mode = TuiMode::ParserBench,
+                    2 => self.mode = TuiMode::Jobs,
+                    3 => self.mode = TuiMode::Inspect, // TODO: TuiMode::Sources when implemented
+                    _ => self.mode = TuiMode::Home,
                 };
             }
             // Number keys 1-4 are handled by global key handler
@@ -7115,8 +6667,6 @@ impl App {
                     self.discover.sources_loaded = true;
                     self.discover.validate_source_selection();
                     self.pending_sources_load = None;
-                    // Start background cache preloading for all sources
-                    self.start_cache_preload();
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     // Still loading - that's fine
@@ -7170,37 +6720,6 @@ impl App {
                     // Channel closed, mark as loaded (empty jobs)
                     self.jobs_state.jobs_loaded = true;
                     self.pending_jobs_load = None;
-                }
-            }
-        }
-
-        // Poll for background cache preload results (stores in memory for instant access later)
-        if let Some(ref mut rx) = self.cache_preload_rx {
-            #[cfg(feature = "profiling")]
-            let _zone = self.profiler.zone("discover.cache_preload_poll");
-
-            // Drain all available results
-            loop {
-                match rx.try_recv() {
-                    Ok(result) => {
-                        // Store preloaded cache for this source
-                        self.preloaded_caches.insert(result.source_id, result.cache);
-
-                        // Trim oldest entries if over limit (prevents unbounded memory growth)
-                        while self.preloaded_caches.len() > MAX_PRELOADED_CACHES {
-                            // HashMap doesn't track insertion order, so just remove arbitrary entry
-                            if let Some(key) = self.preloaded_caches.keys().next().cloned() {
-                                self.preloaded_caches.remove(&key);
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        self.cache_preload_rx = None;
-                        break;
-                    }
                 }
             }
         }
@@ -7275,101 +6794,72 @@ impl App {
             }
         }
 
-        // Poll for streaming cache load messages (non-blocking)
+        // Poll for cache load messages (non-blocking)
         if let Some(ref mut rx) = self.pending_cache_load {
-            // Process multiple chunks per tick for responsiveness
-            let mut chunks_this_tick = 0;
-            const MAX_CHUNKS_PER_TICK: usize = 3;
-
-            loop {
-                if chunks_this_tick >= MAX_CHUNKS_PER_TICK {
-                    break; // Yield to UI rendering
-                }
-
-                match rx.try_recv() {
-                    Ok(CacheLoadMessage::Chunk { folders, files_processed }) => {
-                        chunks_this_tick += 1;
-
-                        // Merge chunk into explorer's cache
-                        if let Some(ref mut explorer) = self.discover.glob_explorer {
-                            merge_folder_chunk(&mut explorer.folder_cache, folders);
-
-                            // Update progress display (preserve started_at time)
-                            if let Some(ref mut progress) = self.cache_load_progress {
-                                progress.files_processed = files_processed;
-                            }
-
-                            // Refresh visible folders if cache now has data for current prefix
-                            if let Some(current_folders) = explorer.folder_cache.get(&explorer.current_prefix) {
-                                explorer.folders = current_folders.clone();
-                                explorer.total_count = GlobFileCount::Exact(
-                                    current_folders.iter().map(|f| f.file_count).sum()
-                                );
-                            }
-                        }
+            match rx.try_recv() {
+                Ok(CacheLoadMessage::Complete { source_id, total_files, tags, cache }) => {
+                    // Record load timing before clearing progress
+                    if let Some(progress) = &self.cache_load_progress {
+                        let duration_ms = progress.started_at.elapsed().as_secs_f64() * 1000.0;
+                        self.last_cache_load_timing = Some(CacheLoadTiming {
+                            duration_ms,
+                            files_loaded: total_files,
+                            source_id: source_id.clone(),
+                        });
+                        tracing::info!(
+                            source_id = %source_id,
+                            files = total_files,
+                            duration_ms = format!("{:.1}", duration_ms),
+                            "Cache load complete"
+                        );
                     }
-                    Ok(CacheLoadMessage::Complete { source_id, total_files, tags }) => {
-                        // Record load timing before clearing progress
-                        if let Some(progress) = &self.cache_load_progress {
-                            let duration_ms = progress.started_at.elapsed().as_secs_f64() * 1000.0;
-                            self.last_cache_load_timing = Some(CacheLoadTiming {
-                                duration_ms,
-                                files_loaded: total_files,
-                                source_id: source_id.clone(),
-                            });
-                            tracing::info!(
-                                source_id = %source_id,
-                                files = total_files,
-                                duration_ms = format!("{:.1}", duration_ms),
-                                "Cache load complete"
+
+                    // Cache fully loaded
+                    if let Some(ref mut explorer) = self.discover.glob_explorer {
+                        explorer.folder_cache = cache;
+                        explorer.cache_loaded = true;
+                        explorer.cache_source_id = Some(source_id);
+                        explorer.selected_folder = 0;
+
+                        // Ensure root folders are displayed
+                        if let Some(root_folders) = explorer.folder_cache.get("") {
+                            explorer.folders = root_folders.clone();
+                            explorer.total_count = GlobFileCount::Exact(
+                                root_folders.iter().map(|f| f.file_count).sum()
                             );
                         }
+                    }
+                    self.cache_load_progress = None;
+                    self.update_folders_from_cache();
 
-                        // Cache fully loaded
-                        if let Some(ref mut explorer) = self.discover.glob_explorer {
-                            explorer.cache_loaded = true;
-                            explorer.cache_source_id = Some(source_id);
-                            explorer.selected_folder = 0;
+                    // Tags came with the cache - no separate load needed
+                    self.discover.tags = tags;
+                    self.discover.data_loaded = true;
+                    self.pending_cache_load = None;
 
-                            // Ensure root folders are displayed
-                            if let Some(root_folders) = explorer.folder_cache.get("") {
-                                explorer.folders = root_folders.clone();
-                                explorer.total_count = GlobFileCount::Exact(
-                                    root_folders.iter().map(|f| f.file_count).sum()
-                                );
-                            }
+                    // Update Rule Builder with loaded cache data
+                    if self.discover.view_state == DiscoverViewState::RuleBuilder {
+                        if let Some(ref builder) = self.discover.rule_builder {
+                            let pattern = builder.pattern.clone();
+                            self.update_rule_builder_files(&pattern);
                         }
-                        self.cache_load_progress = None;
-                        self.update_folders_from_cache();
-
-                        // Tags came with the cache - no separate load needed
-                        self.discover.tags = tags;
-                        self.discover.data_loaded = true;
-                        self.pending_cache_load = None;
-
-                        // Update Rule Builder with loaded cache data
-                        if self.discover.view_state == DiscoverViewState::RuleBuilder {
-                            if let Some(ref builder) = self.discover.rule_builder {
-                                let pattern = builder.pattern.clone();
-                                self.update_rule_builder_files(&pattern);
-                            }
-                        }
-                        break;
                     }
-                    Ok(CacheLoadMessage::Error(e)) => {
-                        self.discover.scan_error = Some(format!("Cache load failed: {}", e));
-                        self.pending_cache_load = None;
-                        self.cache_load_progress = None;
-                        break;
+                }
+                Ok(CacheLoadMessage::Error(e)) => {
+                    self.discover.scan_error = Some(format!("Cache load failed: {}", e));
+                    self.pending_cache_load = None;
+                    self.cache_load_progress = None;
+                    // Clear loading placeholder so error message can display
+                    if let Some(ref mut explorer) = self.discover.glob_explorer {
+                        explorer.folders.clear();
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        break; // No more messages this tick
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        self.pending_cache_load = None;
-                        self.cache_load_progress = None;
-                        break;
-                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // No message yet - still loading
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.pending_cache_load = None;
+                    self.cache_load_progress = None;
                 }
             }
         }
@@ -7388,19 +6878,15 @@ impl App {
                 }
 
                 // Rule Builder is the default view (replaces old GlobExplorer UI per specs/rule_builder.md)
-                // Only initialize if we have a selected source and aren't in another modal state
-                if self.discover.rule_builder.is_none()
-                    && self.discover.selected_source_id.is_some()
-                    && matches!(self.discover.view_state, DiscoverViewState::Files)
-                {
+                // Fallback initialization if not already done by enter_discover_mode()
+                // (e.g., tests that set mode directly)
+                if self.discover.rule_builder.is_none() {
                     let source_id = self.discover.selected_source_id
                         .as_ref()
-                        .map(|id| id.as_str().to_string())
-                        .unwrap_or_default();
-                    let mut builder = super::extraction::RuleBuilderState::new(Some(source_id));
+                        .map(|id| id.as_str().to_string());
+                    let mut builder = super::extraction::RuleBuilderState::new(source_id);
                     builder.pattern = "**/*".to_string();
                     self.discover.rule_builder = Some(builder);
-                    self.discover.view_state = DiscoverViewState::RuleBuilder;
                 }
 
                 // Check if cache is still loading (not yet loaded)
@@ -7411,25 +6897,23 @@ impl App {
 
                 // Show loading progress while cache is loading
                 // Only show loading placeholder if we have no folders yet (streaming will populate them)
-                if cache_not_loaded {
+                // But NOT if there's an error - let the error display instead
+                if cache_not_loaded && self.discover.scan_error.is_none() {
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
                         let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
 
-                        // Check if we have streaming progress
+                        // Check if we're still loading
                         if let Some(ref progress) = self.cache_load_progress {
-                            // Show progress count if we have folders streaming in
                             if explorer.folders.is_empty() || explorer.folders[0].name.contains("Loading") {
-                                // Format with thousands separator
-                                let count_str = format_thousands(progress.files_processed);
+                                let elapsed = progress.started_at.elapsed().as_secs_f32();
                                 explorer.folders = vec![FolderInfo::loading(&format!(
-                                    "{} Loading... {} files",
+                                    "{} Loading {}... ({:.1}s)",
                                     spinner_char,
-                                    count_str
+                                    progress.source_name,
+                                    elapsed
                                 ))];
                             }
-                            // Otherwise keep the folders that are streaming in - they're real data
                         } else if explorer.folders.is_empty() {
-                            // No progress yet, show initial loading message
                             explorer.folders = vec![FolderInfo::loading(&format!("{} Loading folder hierarchy...", spinner_char))];
                         }
                     }
@@ -10408,121 +9892,4 @@ mod tests {
         assert_eq!(total_count.load(Ordering::Relaxed), 50, "Total count should be 50");
     }
 
-    #[test]
-    fn test_build_folder_hierarchy_from_paths_correct_structure() {
-        // Test that folder hierarchy is built correctly from paths
-        // Simulates files in Library (large), workspace (medium), .config (small)
-        let paths: Vec<(String,)> = vec![
-            // Library folder - 5 files
-            ("Library/Preferences/file1.txt".to_string(),),
-            ("Library/Preferences/file2.txt".to_string(),),
-            ("Library/Caches/cache1.db".to_string(),),
-            ("Library/Caches/cache2.db".to_string(),),
-            ("Library/Application Support/app.plist".to_string(),),
-            // workspace folder - 3 files
-            ("workspace/project1/src/main.rs".to_string(),),
-            ("workspace/project1/Cargo.toml".to_string(),),
-            ("workspace/project2/README.md".to_string(),),
-            // .config folder - 2 files
-            (".config/nvim/init.lua".to_string(),),
-            (".config/git/config".to_string(),),
-            // Root file
-            (".bashrc".to_string(),),
-        ];
-
-        let hierarchy = super::build_folder_hierarchy_from_paths(&paths);
-
-        // Get root level folders
-        let root = hierarchy.get("").expect("Root level should exist");
-
-        // Folders should be sorted by file count (descending)
-        assert!(root.len() >= 4, "Should have at least 4 root entries");
-
-        // Library should be first (5 files)
-        assert_eq!(root[0].name, "Library", "Library should be first (most files)");
-        assert_eq!(root[0].file_count, 5, "Library should have 5 files");
-
-        // workspace should be second (3 files)
-        assert_eq!(root[1].name, "workspace", "workspace should be second");
-        assert_eq!(root[1].file_count, 3, "workspace should have 3 files");
-
-        // .config should be third (2 files)
-        assert_eq!(root[2].name, ".config", ".config should be third");
-        assert_eq!(root[2].file_count, 2, ".config should have 2 files");
-    }
-
-    #[test]
-    fn test_build_folder_hierarchy_sorting_by_count() {
-        // Test that folders are always sorted by file count descending
-        // This ensures users see the largest folders first
-        let paths: Vec<(String,)> = vec![
-            // Create folders in alphabetical order but with varying file counts
-            ("aaa/file1.txt".to_string(),),
-            ("bbb/file1.txt".to_string(),),
-            ("bbb/file2.txt".to_string(),),
-            ("ccc/file1.txt".to_string(),),
-            ("ccc/file2.txt".to_string(),),
-            ("ccc/file3.txt".to_string(),),
-        ];
-
-        let hierarchy = super::build_folder_hierarchy_from_paths(&paths);
-        let root = hierarchy.get("").expect("Root level should exist");
-
-        // Should be sorted: ccc (3), bbb (2), aaa (1) - NOT alphabetical
-        assert_eq!(root[0].name, "ccc", "ccc should be first (3 files)");
-        assert_eq!(root[0].file_count, 3);
-        assert_eq!(root[1].name, "bbb", "bbb should be second (2 files)");
-        assert_eq!(root[1].file_count, 2);
-        assert_eq!(root[2].name, "aaa", "aaa should be third (1 file)");
-        assert_eq!(root[2].file_count, 1);
-    }
-
-    #[test]
-    fn test_merge_folder_chunk_accumulates_counts() {
-        // Test that merging chunks correctly accumulates file counts
-        use std::collections::HashMap;
-
-        let mut cache: HashMap<String, Vec<FolderInfo>> = HashMap::new();
-
-        // First chunk: Library has 100 files
-        let chunk1: HashMap<String, Vec<FolderInfo>> = {
-            let mut h = HashMap::new();
-            h.insert(String::new(), vec![
-                FolderInfo::new("Library".to_string(), 100, false),
-                FolderInfo::new("workspace".to_string(), 50, false),
-            ]);
-            h
-        };
-        super::merge_folder_chunk(&mut cache, chunk1);
-
-        // Second chunk: Library has 50 more, workspace has 30 more
-        let chunk2: HashMap<String, Vec<FolderInfo>> = {
-            let mut h = HashMap::new();
-            h.insert(String::new(), vec![
-                FolderInfo::new("Library".to_string(), 50, false),
-                FolderInfo::new("workspace".to_string(), 30, false),
-            ]);
-            h
-        };
-        super::merge_folder_chunk(&mut cache, chunk2);
-
-        // Verify accumulated counts
-        let root = cache.get("").expect("Root should exist");
-
-        // Find Library and workspace entries (order may change due to sorting)
-        let library = root.iter().find(|f| f.name == "Library").expect("Library should exist");
-        let workspace = root.iter().find(|f| f.name == "workspace").expect("workspace should exist");
-
-        assert_eq!(library.file_count, 150, "Library should have 100 + 50 = 150 files");
-        assert_eq!(workspace.file_count, 80, "workspace should have 50 + 30 = 80 files");
-    }
-
-    #[test]
-    fn test_format_thousands() {
-        assert_eq!(super::format_thousands(0), "0");
-        assert_eq!(super::format_thousands(999), "999");
-        assert_eq!(super::format_thousands(1000), "1,000");
-        assert_eq!(super::format_thousands(1234567), "1,234,567");
-        assert_eq!(super::format_thousands(1191603), "1,191,603");
-    }
 }

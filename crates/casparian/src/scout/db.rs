@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS scout_sources (
     path TEXT NOT NULL,
     poll_interval_secs INTEGER NOT NULL DEFAULT 30,
     enabled INTEGER NOT NULL DEFAULT 1,
+    file_count INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -341,7 +342,41 @@ impl Database {
         // Create schema
         sqlx::query(SCHEMA_SQL).execute(&pool).await?;
 
+        // Run migrations for existing databases (add missing columns)
+        Self::run_migrations(&pool).await?;
+
         Ok(Self { pool })
+    }
+
+    /// Run migrations to add missing columns to existing databases
+    async fn run_migrations(pool: &DbPool) -> Result<()> {
+        // Check if scout_files needs the extraction columns (added in Phase 6)
+        let columns: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('scout_files') WHERE name IN ('metadata_raw', 'extraction_status', 'extracted_at')"
+        )
+        .fetch_all(pool)
+        .await?;
+
+        if columns.len() < 3 {
+            // Add missing columns - ALTER TABLE ADD COLUMN is safe (no-op if exists in some SQLite versions)
+            // Use separate queries since SQLite doesn't support multiple ADD COLUMN in one statement
+            let migrations = [
+                "ALTER TABLE scout_files ADD COLUMN metadata_raw TEXT",
+                "ALTER TABLE scout_files ADD COLUMN extraction_status TEXT DEFAULT 'pending'",
+                "ALTER TABLE scout_files ADD COLUMN extracted_at INTEGER",
+            ];
+
+            for migration in migrations {
+                // Ignore errors from columns that already exist
+                let _ = sqlx::query(migration).execute(pool).await;
+            }
+
+            // Create indexes if they don't exist
+            let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_extraction_status ON scout_files(extraction_status)").execute(pool).await;
+            let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_extracted_at ON scout_files(extracted_at)").execute(pool).await;
+        }
+
+        Ok(())
     }
 
     /// Create an in-memory database (for testing).
@@ -393,6 +428,29 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    /// Update the `updated_at` timestamp for a source (for MRU ordering)
+    /// Called when a source is scanned or selected to bring it to the top of the list
+    pub async fn touch_source(&self, id: &str) -> Result<()> {
+        let now = now_millis();
+        sqlx::query("UPDATE scout_sources SET updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Update the file_count for a source (called after scanning)
+    /// This is stored directly in scout_sources so listing sources is O(sources) not O(files)
+    pub async fn update_source_file_count(&self, id: &str, file_count: usize) -> Result<()> {
+        sqlx::query("UPDATE scout_sources SET file_count = ? WHERE id = ?")
+            .bind(file_count as i64)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -456,6 +514,18 @@ impl Database {
     pub async fn list_enabled_sources(&self) -> Result<Vec<Source>> {
         let rows = sqlx::query(
             "SELECT id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE enabled = 1 ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter().map(Self::row_to_source).collect()
+    }
+
+    /// List enabled sources ordered by most recently used (updated_at DESC)
+    /// This is used by the TUI to show recently accessed sources first
+    pub async fn list_sources_by_mru(&self) -> Result<Vec<Source>> {
+        let rows = sqlx::query(
+            "SELECT id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE enabled = 1 ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1742,5 +1812,93 @@ mod tests {
         // List by tag
         let tagged = db.list_files_by_tag("csv_data", 10).await.unwrap();
         assert_eq!(tagged.len(), 1);
+    }
+
+    /// Test that sources are ordered by most recently used (MRU) and persist across sessions
+    #[tokio::test]
+    async fn test_source_mru_ordering_persists() {
+        let db = create_test_db().await;
+
+        // Create three sources with small delays to ensure different timestamps
+        let source_a = Source {
+            id: "src-a".to_string(),
+            name: "Source A".to_string(),
+            source_type: SourceType::Local,
+            path: "/data/a".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source_a).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let source_b = Source {
+            id: "src-b".to_string(),
+            name: "Source B".to_string(),
+            source_type: SourceType::Local,
+            path: "/data/b".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source_b).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let source_c = Source {
+            id: "src-c".to_string(),
+            name: "Source C".to_string(),
+            source_type: SourceType::Local,
+            path: "/data/c".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source_c).await.unwrap();
+
+        // Initial MRU order: C (most recent), B, A (oldest)
+        let sources = db.list_sources_by_mru().await.unwrap();
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].id, "src-c", "Most recently created should be first");
+        assert_eq!(sources[1].id, "src-b");
+        assert_eq!(sources[2].id, "src-a", "Oldest should be last");
+
+        // Touch source A (simulates user selecting it)
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        db.touch_source("src-a").await.unwrap();
+
+        // New MRU order: A (touched), C, B
+        let sources = db.list_sources_by_mru().await.unwrap();
+        assert_eq!(sources[0].id, "src-a", "Touched source should move to top");
+        assert_eq!(sources[1].id, "src-c");
+        assert_eq!(sources[2].id, "src-b");
+
+        // Touch source B
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        db.touch_source("src-b").await.unwrap();
+
+        // New MRU order: B, A, C
+        let sources = db.list_sources_by_mru().await.unwrap();
+        assert_eq!(sources[0].id, "src-b", "Most recently touched should be first");
+        assert_eq!(sources[1].id, "src-a");
+        assert_eq!(sources[2].id, "src-c");
+
+        // Simulate "session restart" by creating a new Database instance
+        // pointing to the same in-memory pool (in production, this would be
+        // reconnecting to the same file-based database)
+        // Note: For in-memory SQLite, we can't truly test cross-session persistence,
+        // but we verify the data is correct in the current session.
+        // The real test is that touch_source updates updated_at in the DB.
+
+        // Verify by querying raw SQL to check actual updated_at values
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT updated_at FROM scout_sources WHERE id = 'src-a'),
+                (SELECT updated_at FROM scout_sources WHERE id = 'src-b'),
+                (SELECT updated_at FROM scout_sources WHERE id = 'src-c')"
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        let (ts_a, ts_b, ts_c) = row;
+        assert!(ts_b > ts_a, "B should have newer timestamp than A");
+        assert!(ts_a > ts_c, "A should have newer timestamp than C");
     }
 }

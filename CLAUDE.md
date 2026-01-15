@@ -222,7 +222,7 @@ casparian-flow/
 │
 ├── spec.md                   # MASTER: Product specification
 ├── specs/                    # SUBSPECS: Feature implementation details
-│   ├── discover.md           # Discover mode TUI spec
+│   ├── rule_builder.md       # Discover mode + Rule Builder TUI spec (canonical)
 │   ├── parser_bench.md       # Parser Bench mode TUI spec
 │   └── hl7_parser.md         # HL7 v2.x parser technical spec
 │
@@ -297,11 +297,11 @@ Complex components have detailed specifications in `specs/` subdirectory. This k
 
 **Bidirectional References:**
 ```
-spec.md                          specs/discover.md
-─────────                        ─────────────────
-#### Mode: Discover              # Discover Mode - TUI Subspec
+spec.md                          specs/rule_builder.md
+─────────                        ─────────────────────
+#### Mode: Discover              # Rule Builder - TUI Spec
 > Full Specification:
-> See specs/discover.md    ◄────► Parent: spec.md Section 5.3
+> See specs/rule_builder.md ◄────► (canonical Discover mode spec)
 ```
 
 **Subspec Structure:**
@@ -802,7 +802,7 @@ tmux capture-pane -t tui -p -S -100 # With scrollback
    └─ Capture after EACH keystroke (not batched)
 
 2. IDENTIFY DIVERGENCE
-   └─ Compare screen to spec (specs/views/discover.md)
+   └─ Compare screen to spec (specs/rule_builder.md)
    └─ Which step produces wrong output?
 
 3. TRACE CODE
@@ -819,7 +819,7 @@ tmux capture-pane -t tui -p -S -100 # With scrollback
 
 - [ ] Started fresh session? (`./scripts/tui-debug.sh restart`)
 - [ ] Captured after EACH keystroke? (not just at end)
-- [ ] Compared to spec? (`specs/views/discover.md` Section 3, 6)
+- [ ] Compared to spec? (`specs/rule_builder.md` Section 3, 9)
 - [ ] Rebuilt binary? (`cargo build --release`)
 - [ ] Verified in fresh session after fix?
 
@@ -835,7 +835,7 @@ tmux capture-pane -t tui -p -S -100 # With scrollback
 
 ### Key Reference (Discover Mode)
 
-Per `specs/views/discover.md` Section 6:
+Per `specs/rule_builder.md` Section 9:
 
 | Key | State | Action |
 |-----|-------|--------|

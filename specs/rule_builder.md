@@ -1,22 +1,47 @@
-# Rule Builder - TUI Subspec
+# Rule Builder - TUI Spec
 
 **Status:** Approved
-**Version:** 3.0
-**Date:** 2026-01-14
-**Parent:** [specs/views/discover.md](views/discover.md) Section 13
-**Session Origin:** specs/meta/sessions/ai_consolidation/
+**Version:** 4.0
+**Date:** 2026-01-15
+**Related:** specs/extraction.md, docs/decisions/ADR-017-tagging-vs-extraction-rules.md
+**Last Updated:** 2026-01-15
+
+> **Note:** This is the canonical spec for Discover mode and Rule Builder.
+> Previous: `specs/views/discover.md` (archived as `discover_v3_archived.md`)
 
 ---
 
 ## 1. Overview
 
-The **Rule Builder** is a unified split-view interface that consolidates pattern exploration, rule creation, and AI-assisted extraction into a single workflow.
+The **Discover** mode is the TUI mode for file organization - scanning directories, tagging files, and previewing contents. The **Rule Builder** is the unified split-view interface for creating tagging and extraction rules.
 
-### Key Insight
+### 1.1 Design Philosophy
 
-> **Pattern exploration IS rule creation.** They shouldn't be separate activities.
+- **Source-first workflow**: Users must select a source before seeing files
+- **Dropdown navigation**: Sources and Tags as filterable dropdowns (telescope.nvim style)
+- **Tags, not Rules**: Users browse by category (tag), not mechanism (rule)
+- **Live preview**: Navigating sources/tags updates file list in real-time
+- **Zero friction**: Immediate filter typing, no mode switches required
+- **Pattern exploration IS rule creation**: They shouldn't be separate activities
 
-### What Gets Consolidated
+### 1.2 Core Entities
+
+```
+~/.casparian_flow/casparian_flow.sqlite3
+
+Tables:
+├── scout_sources        # Directories being watched
+├── scout_files          # Discovered files with tags
+└── scout_tagging_rules  # Pattern → tag mappings (background mechanism)
+```
+
+**Key Distinction:**
+- **Tags** = Categories users browse (what files ARE)
+- **Rules** = Mechanisms that apply tags (HOW tags get assigned)
+
+Users interact with Tags in the sidebar. Rules are managed separately via Rules Manager (`R`) or Rule Builder (`n`).
+
+### 1.3 What Gets Consolidated
 
 | Before (5 concepts) | After (1 concept) |
 |---------------------|-------------------|
@@ -173,6 +198,8 @@ Negative:                -7    -6     -5     -4       -3           -2           
 
 ## 3. Layout
 
+### 3.1 Rule Builder Split View
+
 ```
 ┌ [1] Sources: sales_data ▾   [2] Tags: All ▾ ────────────────────────────────────┐
 ├─────────────────────────────────────────┬───────────────────────────────────────┤
@@ -206,30 +233,124 @@ Negative:                -7    -6     -5     -4       -3           -2           
 
 **Split ratio:** 40% left (Rule Builder) / 60% right (File Results)
 
-### Sections
+#### Sections
 
-#### PATTERN
+**PATTERN**
 - Custom glob pattern input with live filtering (see Section 2)
 - `[🔍]` triggers manual re-analysis
 - Errors shown inline: `⚠️ Invalid pattern: unclosed bracket`
 
-#### EXCLUDES
+**EXCLUDES**
 - Patterns to exclude from matching
 - Added via `[i]` ignore folder or `[x]` exclude file
 - Collapsed when empty
 
-#### TAG
+**TAG**
 - Tag to apply to matched files
 - `[💡]` shows suggestions dropdown
 
-#### EXTRACTIONS
+**EXTRACTIONS**
 - Auto-populated from pattern analysis (both `<field>` syntax and path heuristics)
 - Each field shows: name, source, type, sample values
 - Toggle with `[x]` checkbox, remove with `x` key
 
-#### OPTIONS
+**OPTIONS**
 - `[x] Enable rule` - Rule is active
 - `[x] Run job on save` - Execute extraction immediately
+
+### 3.2 Sidebar: Dropdown Navigation
+
+The sidebar contains two collapsible, filterable dropdowns:
+
+**Collapsed State (default):**
+```
+┌─ SOURCES [1] ─────────┐
+│ ▼ sales_data (142)    │  <- Selected source + file count
+└───────────────────────┘
+┌─ TAGS [2] ────────────┐
+│ ▼ All files (142)     │  <- Selected tag or "All files"
+└───────────────────────┘
+```
+
+**Tags Dropdown Expanded:**
+```
+┌─ TAGS [2] ────────────┐
+│ Filter: ___           │  <- Type to filter tags
+│ ► All files (142)     │  <- Always first option
+│   sales (89)          │  <- Tag with count
+│   logs (34)           │
+│   invoices (12)       │
+│   untagged (7)        │  <- Files without tags
+└───────────────────────┘
+```
+
+**Indicators:**
+- `▼` = Collapsed dropdown (press number key to expand)
+- `►` = Currently highlighted item
+- `(123)` = File count for source/tag
+
+### 3.3 Rules Manager Dialog
+
+Opened with `R` key, appears as overlay:
+
+```
+┌─ TAGGING RULES ─────────────────────────────────────────────┐
+│                                                             │
+│  Pattern              Tag          Priority   Enabled       │
+│  ─────────────────────────────────────────────────────────  │
+│  ► *.csv              sales        100        ✓             │
+│    *.log              logs         90         ✓             │
+│    invoice_*.*        invoices     80         ✓             │
+│                                                             │
+│  ─────────────────────────────────────────────────────────  │
+│  [n] New   [e] Edit   [d] Delete   [Enter] Toggle   [Esc]   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 3.4 Sources Manager Dialog
+
+Opened with `M` key, appears as overlay for full CRUD on sources:
+
+```
+┌─ SOURCES MANAGER ───────────────────────────────────────────┐
+│                                                             │
+│  Name                 Path                        Files     │
+│  ─────────────────────────────────────────────────────────  │
+│  ► sales_data         /data/sales                 142       │
+│    mission_logs       /mnt/missions               847       │
+│    sensor_archive     /data/sensors               312       │
+│                                                             │
+│  ─────────────────────────────────────────────────────────  │
+│  [n] New   [e] Edit name   [d] Delete   [r] Rescan   [Esc]  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Source Edit Dialog** (opened with `e` in Sources Manager):
+
+```
+┌─ EDIT SOURCE ───────────────────────────────────────────────┐
+│                                                             │
+│  Name: sales_data_______                                    │
+│  Path: /data/sales (read-only)                              │
+│                                                             │
+│  [Enter] Save   [Esc] Cancel                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Delete Confirmation** (opened with `d` in Sources Manager):
+
+```
+┌─ DELETE SOURCE ─────────────────────────────────────────────┐
+│                                                             │
+│  Delete source "sales_data"?                                │
+│                                                             │
+│  This will remove the source and all 142 tracked files      │
+│  from the database. The actual files on disk will NOT       │
+│  be deleted.                                                │
+│                                                             │
+│  [Enter] Confirm delete   [Esc] Cancel                      │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -279,12 +400,6 @@ The panel automatically transitions between phases based on pattern content and 
 │   │ orders_20240117_corrected.csv                                  │
 │   └ ... 86 more                                                    │
 │ ▸ trades/2024/Q2/           (72)  orders_20240401.csv              │
-```
-
-**Selected file footer (cursor on specific file):**
-```
-│ /data/trades/2024/Q1/orders_20240115.csv                           │
-│ Suggested: orders_<date:YYYYMMDD>.csv                              │
 ```
 
 ### 4.3 Phase 2: Extraction Preview
@@ -360,9 +475,9 @@ The panel automatically transitions between phases based on pattern content and 
 
 ---
 
-## 5. User Workflow
+## 5. User Workflows
 
-### Create New Rule
+### 5.1 Create New Rule
 
 ```
 1. User in Discover, browsing files
@@ -398,7 +513,44 @@ The panel automatically transitions between phases based on pattern content and 
    └── Returns to normal Discover view
 ```
 
-### AI-Assisted Creation
+### 5.2 Browse by Tag
+
+```
+1. User enters Discover mode (press 1 from any view)
+2. Sources dropdown shows scanned directories
+3. User presses 1 to open Sources dropdown
+4. User selects a source, files appear
+5. User presses 2 to open Tags dropdown
+6. Tags show: "All files", "sales (89)", "logs (34)", "untagged (19)"
+7. User navigates with ↑/↓ → files filter LIVE as they browse
+8. User presses Enter to confirm selection
+```
+
+**Live Preview:** While the Tags dropdown is open, the Files panel updates
+instantly as you navigate through tags. This lets you preview what files
+are in each category before committing to a selection.
+
+### 5.3 Manage Rules
+
+```
+1. User presses R to open Rules Manager
+2. Dialog shows all rules for current source:
+   *.csv → sales
+   *.log → logs
+   invoice_*.* → invoices
+3. User can: [n] New, [e] Edit, [d] Delete, [Esc] Close
+```
+
+### 5.4 Tag Files Manually
+
+```
+1. User focuses Files panel (press 3)
+2. User navigates to file
+3. User presses 't' to tag single file
+4. User presses 'T' to bulk tag filtered files
+```
+
+### 5.5 AI-Assisted Creation
 
 ```
 1. Press 'n' to open Rule Builder
@@ -595,7 +747,7 @@ pub enum DiscoverViewState {
 }
 ```
 
-### RuleBuilderState
+### 8.5 RuleBuilderState
 
 ```rust
 /// Focus within Rule Builder
@@ -725,19 +877,59 @@ pub struct RuleBuilderState {
 
 ## 9. Keybindings
 
-### Discover Mode (Normal)
+### 9.1 Universal Keys (Work Everywhere)
+
+These keys work in **any** context—main view, dropdowns, or dialogs:
+
+| Category | Key | Action |
+|----------|-----|--------|
+| **Exit** | `Esc` | Close current dialog/dropdown, or return to Home |
+| **Confirm** | `Enter` | Confirm/select/save (context-dependent) |
+| **Help** | `?` | Show available keys for current context |
+
+### 9.2 Navigation Keys
+
+| Category | Key | Action |
+|----------|-----|--------|
+| **Vim-style** | `j` / `k` | Move down / up |
+| **Arrows** | `↑` / `↓` | Move up / down |
+| **Page** | `Ctrl+d` / `Ctrl+u` | Page down / up |
+| **Jump** | `g` `g` / `G` | Jump to top / bottom |
+| **Panel focus** | `1` / `2` / `3` | Focus Sources / Tags / Files panel |
+| **Tab** | `Tab` / `Shift+Tab` | Next / previous field or section |
+
+> **Note:** In Discover mode, `1`, `2`, `3` override global view navigation to control
+> panel focus. Use `0`/`H` (Home) or `Esc` to navigate to other views.
+
+### 9.3 Action Keys (Mnemonic)
+
+Single letters that perform actions. Same letter = same action across contexts:
+
+| Key | Action | Mnemonic |
+|-----|--------|----------|
+| `n` | Create **n**ew item (rule, source, field, condition) | **N**ew |
+| `e` | **E**dit selected item | **E**dit |
+| `d` | **D**elete selected item | **D**elete |
+| `r` | **R**escan / **R**efresh | **R**efresh |
+| `t` | **T**ag file(s) or **T**est rule | **T**ag/**T**est |
+| `s` | **S**can new directory | **S**can |
+| `p` | Toggle **P**review pane | **P**review |
+| `y` | Confirm (**Y**es) | **Y**es |
+
+### 9.4 Discover Mode (Normal)
 
 | Key | Action |
 |-----|--------|
 | `n` | Open Rule Builder (new rule) |
 | `r` | Open Rule Builder (new rule) |
 | `R` | Open Rules Manager |
+| `M` | Open Sources Manager |
 | `W` | Open Parser Lab |
 | `1` | Sources dropdown |
 | `2` | Tags dropdown |
 | `3` | Focus files |
 
-### Rule Builder - Left Panel
+### 9.5 Rule Builder - Left Panel
 
 | Key | Context | Action |
 |-----|---------|--------|
@@ -754,7 +946,7 @@ pub struct RuleBuilderState {
 | `x` | Excludes | Remove exclude |
 | `n` / `+` | Extractions/Excludes | Add new item |
 
-### Rule Builder - Right Panel (Phase-Specific)
+### 9.6 Rule Builder - Right Panel (Phase-Specific)
 
 #### Phase 1: Exploration (Folder View)
 
@@ -786,7 +978,84 @@ pub struct RuleBuilderState {
 | `t` | Re-run backtest |
 | `Tab` | Focus left panel |
 
-### Ignore Picker
+### 9.7 Context-Specific Keys
+
+#### Sources Dropdown
+
+| Key | Action |
+|-----|--------|
+| `Char(c)` | Append to filter (immediate, no `/` needed) |
+| `Backspace` | Remove from filter |
+| `Enter` | Select highlighted source |
+| `up/down` | Navigate sources |
+| `Esc` | Cancel dropdown |
+
+**Footer:** `[Enter] Select  [up/down] Navigate  | [R] Rules [M] Sources | [Esc] Cancel`
+
+#### Tags Dropdown
+
+| Key | Action |
+|-----|--------|
+| `Char(c)` | Append to filter |
+| `Backspace` | Remove from filter / go to "All files" |
+| `Enter` | Select highlighted tag |
+| `up/down` | Navigate tags |
+| `Esc` | Return to "All files" |
+
+**Live Preview:** Files panel updates in real-time as you navigate tags.
+
+**Footer:** `[Enter] Select  [up/down] Navigate  | [R] Rules [M] Sources | [Esc] All files`
+
+#### Files Panel
+
+| Key | Action |
+|-----|--------|
+| `/` | Open filter mode |
+| `t` | Tag selected file |
+| `s` | Scan new directory |
+| `R` | Open Rules Manager |
+| `M` | Open Sources Manager |
+| `1` | Focus Sources dropdown |
+| `2` | Focus Tags dropdown |
+
+**Footer (no filter):** `[/] Filter  [t] Tag  [s] Scan  | [R] Rules [M] Sources | 1:Source 2:Tags`
+
+**Footer (with filter):** `[t] Tag {N} files  [Esc] Clear  | [R] Rules [M] Sources | 1:Source 2:Tags`
+
+#### Rules Manager Dialog
+
+| Key | Action |
+|-----|--------|
+| `n` | New rule |
+| `e` | Edit selected rule |
+| `d` | Delete selected rule |
+| `Enter` | Toggle rule enabled/disabled |
+| `Esc` | Close dialog |
+
+**Footer:** `[n] New  [e] Edit  [d] Del  [Enter] Toggle  [Esc] Close`
+
+#### Sources Manager Dialog
+
+| Key | Action |
+|-----|--------|
+| `n` | New source |
+| `e` | Edit source name |
+| `d` | Delete source |
+| `r` | Rescan selected source |
+| `Esc` | Close dialog |
+
+**Footer:** `[n] New  [e] Edit  [d] Del  [r] Rescan  [Esc] Close`
+
+#### Source Delete Confirmation
+
+| Key | Action |
+|-----|--------|
+| `Enter` / `y` | Confirm deletion |
+| `Esc` / `n` | Cancel |
+
+**Footer:** `[Enter/y] Confirm delete  [Esc/n] Cancel`
+
+#### Ignore Picker
 
 | Key | Action |
 |-----|--------|
@@ -932,7 +1201,7 @@ Total: ~40ms (NO LLM for 95% of cases)
 
 **Old:** "Open Pathfinder Wizard" -> separate modal -> AI does its thing -> user returns.
 
-**New:** Press `Tab` in Rule Builder -> AI fills in fields -> user reviews/edits.
+**New:** Press `Ctrl+Space` in Rule Builder -> AI fills in fields -> user reviews/edits.
 
 **Rationale:** AI should assist the current task, not be a separate destination.
 
@@ -946,39 +1215,26 @@ Total: ~40ms (NO LLM for 95% of cases)
 
 **LLM only invoked for:**
 - Ambiguous patterns
-- User explicitly requests AI assistance (Tab key)
+- User explicitly requests AI assistance (Ctrl+Space key)
 - Parser Lab (always needs LLM to generate Python)
 
 **Rationale:** Instant feedback is better than accurate-but-slow feedback.
 
----
+### Tags, Not Rules in Sidebar
 
-## 12. Migration Notes
-
-### Removed Concepts
-
-| Concept | Replacement |
-|---------|-------------|
-| Glob Explorer | Rule Builder |
-| Rule Creation Dialog | Rule Builder |
-| Wizard Menu | Parser Lab only (W key) |
-| Pathfinder Wizard | Auto-analysis + Tab in Rule Builder |
-| Semantic Path Wizard | Auto-analysis in Rule Builder |
-| Labeling Wizard | Tag suggestions in Rule Builder |
-
-### Keybinding Changes
-
-| Key | Before | After |
-|-----|--------|-------|
-| `g` | Glob Explorer | Removed (use `n`/`r` for Rule Builder) |
-| `W` | Wizard Menu | Parser Lab directly |
-| `n` | Rule Creation Dialog | Rule Builder |
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Sidebar shows Tags, not Rules | Tags are categories; Rules are mechanisms | Users think "show sales files" not "apply rule #3" |
+| Rules managed separately | `R` opens Rules Manager dialog | Keeps sidebar simple, gives rules proper CRUD UI |
+| Tags derived from files | Query `DISTINCT tag FROM scout_files` | Shows actual tags, not potential tags from rules |
+| "untagged" as special tag | Explicit option in Tags dropdown | Easy to find files needing tagging |
+| Rules apply in background | On scan and rule creation | Tags appear automatically, no manual "run rules" step |
 
 ---
 
-## 11. Error Handling
+## 12. Error Handling
 
-### 11.1 Error Categories
+### 12.1 Error Categories
 
 | Category | Severity | Blocks UI? | Example |
 |----------|----------|------------|---------|
@@ -987,7 +1243,7 @@ Total: ~40ms (NO LLM for 95% of cases)
 | Analysis Failure | Error | No | LLM timeout, rate limit |
 | Database Error | Error | Yes (modal) | Connection failed, constraint violation |
 
-### 11.2 Pattern Syntax Errors
+### 12.2 Pattern Syntax Errors
 
 Shown inline below pattern field with red border:
 ```
@@ -998,7 +1254,7 @@ Shown inline below pattern field with red border:
      Hint: Add matching `>` or escape with `\<`
 ```
 
-### 11.3 AI Analysis Failure
+### 12.3 AI Analysis Failure
 
 Status line shows error with retry option:
 ```
@@ -1006,7 +1262,7 @@ Status line shows error with retry option:
    [r] Retry  [Esc] Continue manually
 ```
 
-### 11.4 Database Save Failure
+### 12.4 Database Save Failure
 
 Modal dialog (blocks UI):
 ```
@@ -1019,16 +1275,16 @@ Modal dialog (blocks UI):
 
 ---
 
-## 12. Loading States
+## 13. Loading States
 
-### 12.1 Pattern Analysis
+### 13.1 Pattern Analysis
 
 Match count shows spinner while analyzing:
 ```
 [⠋] Analyzing...  (previous: 247 files match)
 ```
 
-### 12.2 AI Analysis (Ctrl+Space)
+### 13.2 AI Analysis (Ctrl+Space)
 
 Spinners appear in tag and extractions sections:
 ```
@@ -1039,7 +1295,7 @@ Spinners appear in tag and extractions sections:
 
 Press `Esc` to cancel.
 
-### 12.3 Backtest
+### 13.3 Backtest
 
 Progress bar with file count:
 ```
@@ -1048,7 +1304,7 @@ Testing: [████████░░░░░░] 45/247  (18%)
 
 Press `Esc` to cancel (keeps partial results).
 
-### 12.4 Rule Save
+### 13.4 Rule Save
 
 Three-phase progress:
 ```
@@ -1057,22 +1313,22 @@ Saving... [Validating] → [Saving] → [Starting job]
 
 ---
 
-## 13. Scroll Behavior
+## 14. Scroll Behavior
 
-### 13.1 File List (Right Panel)
+### 14.1 File List (Right Panel)
 
 - Viewport: 15-25 files depending on terminal height
 - Navigation: `j/k` single, `Ctrl+d/u` half-page, `g/G` top/bottom
 - Scroll indicators: `^` / `v` at edges when more content exists
 - Status: `Showing 1-20 of 247`
 
-### 13.2 Extractions List
+### 14.2 Extractions List
 
 - Viewport: 5 items
 - Navigation: `j/k`
 - Collapsed when empty
 
-### 13.3 Excludes List
+### 14.3 Excludes List
 
 - Viewport: 3 items
 - Navigation: `j/k`
@@ -1080,9 +1336,9 @@ Saving... [Validating] → [Saving] → [Starting job]
 
 ---
 
-## 14. Database Persistence
+## 15. Database
 
-### 14.1 Table Mapping
+### 15.1 Persistence (Rule Builder)
 
 | Spec Field | Table | Column |
 |------------|-------|--------|
@@ -1092,7 +1348,7 @@ Saving... [Validating] → [Saving] → [Starting job]
 | extractions | `extraction_fields` | (multiple rows) |
 | excludes | `scout_tagging_rules` | (separate rules, priority=-1) |
 
-### 14.2 Excludes Storage
+#### Excludes Storage
 
 Excludes are stored as separate tagging rules with:
 - `priority = -1` (negative = exclude)
@@ -1101,7 +1357,7 @@ Excludes are stored as separate tagging rules with:
 
 This allows excludes to be queried and managed independently.
 
-### 14.3 Save Transaction
+#### Save Transaction
 
 ```sql
 BEGIN TRANSACTION;
@@ -1117,9 +1373,246 @@ COMMIT;
 -- On any error: ROLLBACK
 ```
 
+### 15.2 Queries
+
+#### Load Sources
+
+```sql
+SELECT id, name, path, file_count
+FROM scout_sources
+WHERE enabled = 1
+ORDER BY updated_at DESC
+```
+
+#### Load Tags for Source
+
+```sql
+-- Distinct tags with counts
+SELECT tag, COUNT(*) as count
+FROM scout_files
+WHERE source_id = ? AND tag IS NOT NULL
+GROUP BY tag
+ORDER BY count DESC, tag
+
+-- Untagged count
+SELECT COUNT(*) as count
+FROM scout_files
+WHERE source_id = ? AND tag IS NULL
+```
+
+#### Load Files for Source (with tag filter)
+
+```sql
+-- All files
+SELECT id, path, rel_path, size, tag, status
+FROM scout_files
+WHERE source_id = ?
+ORDER BY rel_path
+
+-- Files with specific tag
+SELECT id, path, rel_path, size, tag, status
+FROM scout_files
+WHERE source_id = ? AND tag = ?
+ORDER BY rel_path
+
+-- Untagged files
+SELECT id, path, rel_path, size, tag, status
+FROM scout_files
+WHERE source_id = ? AND tag IS NULL
+ORDER BY rel_path
+```
+
+#### Load Rules for Source
+
+```sql
+SELECT id, pattern, tag, priority, enabled
+FROM scout_tagging_rules
+WHERE source_id = ?
+ORDER BY priority DESC, pattern
+```
+
+#### Source Management Queries
+
+```sql
+-- Update source name
+UPDATE scout_sources
+SET name = ?
+WHERE id = ?
+
+-- Delete source (cascades to files via FK)
+DELETE FROM scout_sources
+WHERE id = ?
+
+-- Get source by ID for confirmation dialog
+SELECT id, name, path, (SELECT COUNT(*) FROM scout_files WHERE source_id = s.id) as file_count
+FROM scout_sources s
+WHERE id = ?
+```
+
+### 15.3 Tag Loading Behavior
+
+Tags are derived from files, not from rules:
+
+```sql
+-- Get distinct tags with counts for current source
+SELECT
+    tag,
+    COUNT(*) as count
+FROM scout_files
+WHERE source_id = ? AND tag IS NOT NULL
+GROUP BY tag
+ORDER BY count DESC, tag
+
+-- Also count untagged files
+SELECT COUNT(*) FROM scout_files
+WHERE source_id = ? AND tag IS NULL
+```
+
+Result is rendered as:
+```
+All files (142)     <- sum of all files
+sales (89)          <- from query
+logs (34)
+invoices (12)
+untagged (7)        <- from second query
+```
+
+#### Tag Selection (Live Filter)
+
+```rust
+// User selects a tag
+match selected_tag {
+    None => {
+        // "All files" - show everything
+        self.discover.tag_filter = None;
+    }
+    Some(tag_info) if tag_info.name == "untagged" => {
+        // Show files where tag IS NULL
+        self.discover.tag_filter = Some(TagFilter::Untagged);
+    }
+    Some(tag_info) => {
+        // Show files with this specific tag
+        self.discover.tag_filter = Some(TagFilter::Tag(tag_info.name.clone()));
+    }
+}
+```
+
+#### Rules Apply in Background
+
+Tagging rules run:
+1. When files are first discovered (scan)
+2. When a new rule is created (applies to existing files)
+3. When user manually triggers re-tagging
+
+Tags dropdown shows the RESULT (what tags exist), not the mechanism (what rules exist).
+
 ---
 
-## 15. Revision History
+## 16. Directory Autocomplete
+
+The Add Source dialog provides directory autocomplete for better path input UX.
+
+### Layout
+
+```
+┌─ Add Source ─────────────────────────────────────┐
+│                                                  │
+│  Path: /Users/shan/Do█                           │
+│  ┌────────────────────────────────────────────┐  │
+│  │ ► Documents/                               │  │
+│  │   Downloads/                               │  │
+│  │   Desktop/                                 │  │
+│  └────────────────────────────────────────────┘  │
+│                                                  │
+│  [Tab] complete  [↑↓] select  [Enter] confirm    │
+└──────────────────────────────────────────────────┘
+```
+
+### Autocomplete Behavior
+
+| Feature | Behavior |
+|---------|----------|
+| Live suggestions | Updates as user types |
+| `~` expansion | Expands to home directory |
+| Hidden filtering | Excludes dotfiles/dotfolders |
+| Case-insensitive | Matches regardless of case |
+| Max suggestions | 8 directories shown |
+| Sorted | Alphabetical order |
+
+### Keybindings (EnteringPath state)
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Complete to selected suggestion |
+| `↑` / `↓` | Navigate through suggestions |
+| `Char(c)` | Append to path, refresh suggestions |
+| `Backspace` | Remove character, refresh suggestions |
+| `Enter` | Confirm path and start scan |
+| `Esc` | Cancel dialog |
+
+### State Fields
+
+```rust
+pub struct DiscoverState {
+    // ... existing fields ...
+
+    // --- Directory autocomplete (Add Source dialog) ---
+    pub path_suggestions: Vec<String>,    // Available directories
+    pub path_suggestion_idx: usize,       // Currently highlighted suggestion
+}
+```
+
+### Helper Function
+
+```rust
+fn list_directories(partial_path: &str) -> Vec<String> {
+    // 1. Expand ~ to home directory
+    // 2. Split into parent dir and prefix
+    // 3. Read parent directory
+    // 4. Filter: directories only, no hidden, case-insensitive prefix match
+    // 5. Sort alphabetically
+    // 6. Return up to 8 suggestions with trailing /
+}
+```
+
+---
+
+## 17. Empty States
+
+| Condition | Display |
+|-----------|---------|
+| No sources | "No sources found. Press 's' to scan a folder." |
+| Source selected, no files | "No files in this source." |
+| Filter matches nothing | "No files match filter." |
+| No tags (all untagged) | Tags dropdown shows only "All files" and "untagged" |
+| No rules | Rules Manager shows "No rules. Press 'n' to create one." |
+
+---
+
+## 18. Migration Notes
+
+### Removed Concepts
+
+| Concept | Replacement |
+|---------|-------------|
+| Glob Explorer | Rule Builder |
+| Rule Creation Dialog | Rule Builder |
+| Wizard Menu | Parser Lab only (W key) |
+| Pathfinder Wizard | Auto-analysis + Ctrl+Space in Rule Builder |
+| Semantic Path Wizard | Auto-analysis in Rule Builder |
+| Labeling Wizard | Tag suggestions in Rule Builder |
+
+### Keybinding Changes
+
+| Key | Before | After |
+|-----|--------|-------|
+| `g` | Glob Explorer | Removed (use `n`/`r` for Rule Builder) |
+| `W` | Wizard Menu | Parser Lab directly |
+| `n` | Rule Creation Dialog | Rule Builder |
+
+---
+
+## 19. Revision History
 
 | Date | Version | Changes |
 |------|---------|---------|
@@ -1132,10 +1625,10 @@ COMMIT;
 | | | - Added state machine diagram (Section 8.1-8.3) |
 | | | - Added parsing algorithm for `<field>` syntax (Section 2.1) |
 | | | - Changed AI invocation from Tab to Ctrl+Space |
-| | | - Added error handling (Section 11) |
-| | | - Added loading states (Section 12) |
-| | | - Added scroll behavior (Section 13) |
-| | | - Added database persistence (Section 14) |
+| | | - Added error handling (Section 12) |
+| | | - Added loading states (Section 13) |
+| | | - Added scroll behavior (Section 14) |
+| | | - Added database persistence (Section 15) |
 | 2026-01-14 | 3.0 | **Three-Phase File Results Panel:** |
 | | | - Section 4 redesigned with three phases: Exploration, Extraction Preview, Backtest Results |
 | | | - Phase 1 (Exploration): Folder counts + sample filenames, sorted by count |
@@ -1145,3 +1638,13 @@ COMMIT;
 | | | - Added streaming state fields to `RuleBuilderState` |
 | | | - Section 9 updated with phase-specific keybindings |
 | | | - Section 10 updated with phase-aware pattern change flow |
+| 2026-01-15 | 4.0 | **Spec Consolidation:** Merged discover.md into rule_builder.md |
+| | | - Added Section 1.1 Design Philosophy (from discover.md) |
+| | | - Added Section 1.2 Core Entities (from discover.md) |
+| | | - Added Section 3.2-3.4 Sidebar/Dialogs (from discover.md) |
+| | | - Added Section 5.2-5.4 User Workflows (from discover.md) |
+| | | - Added Section 9.1-9.3, 9.7 Keybindings (from discover.md) |
+| | | - Added Section 15.2-15.3 Database Queries (from discover.md) |
+| | | - Added Section 16 Directory Autocomplete (from discover.md) |
+| | | - Added Section 17 Empty States (from discover.md) |
+| | | - Archived specs/views/discover.md as discover_v3_archived.md |

@@ -276,6 +276,11 @@ impl Scanner {
             tracing::debug!(source_id = %source.id, error = %e, "Failed to build legacy folder cache");
         }
 
+        // Update denormalized file_count on source for fast TUI queries
+        if let Err(e) = self.db.update_source_file_count(&source.id, final_stats.files_discovered as usize).await {
+            tracing::warn!(source_id = %source.id, error = %e, "Failed to update source file_count");
+        }
+
         info!(
             source = %source.name,
             discovered = final_stats.files_discovered,
@@ -449,6 +454,11 @@ impl Scanner {
 
         // Skip legacy cache building - scout_folders is now authoritative
         // (GAP-005 cleanup: remove deprecated .bin.zst cache)
+
+        // Update denormalized file_count on source for fast TUI queries
+        if let Err(e) = self.db.update_source_file_count(&source.id, final_stats.files_discovered as usize).await {
+            tracing::warn!(source_id = %source.id, error = %e, "Failed to update source file_count");
+        }
 
         info!(
             source = %source.name,
