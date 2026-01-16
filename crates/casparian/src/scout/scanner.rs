@@ -42,7 +42,7 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             threads: 0,             // Auto-detect CPU count
-            batch_size: 1000,       // Flush to DB every 1000 files
+            batch_size: 10_000,     // Flush to DB every 10k files
             progress_interval: 100, // Progress update every 100 files for responsive TUI
             follow_symlinks: false,
             include_hidden: true,
@@ -65,7 +65,6 @@ pub struct ScanProgress {
 
 /// Result of a scan operation
 #[derive(Debug)]
-#[allow(dead_code)] // Used in tests and future scheduling
 pub struct ScanResult {
     /// Scan statistics
     pub stats: ScanStats,
@@ -235,6 +234,11 @@ impl Scanner {
         // Update denormalized file_count on source for fast TUI queries
         if let Err(e) = self.db.update_source_file_count(&source.id, final_stats.files_discovered as usize).await {
             tracing::warn!(source_id = %source.id, error = %e, "Failed to update source file_count");
+        }
+
+        // Populate folder cache for O(1) TUI navigation (avoids 20+ second root folder query)
+        if let Err(e) = self.db.populate_folder_cache(&source.id).await {
+            tracing::warn!(source_id = %source.id, error = %e, "Failed to populate folder cache");
         }
 
         info!(

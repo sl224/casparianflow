@@ -5,7 +5,6 @@ use thiserror::Error;
 
 /// Scout error type
 #[derive(Error, Debug)]
-#[allow(dead_code)] // Many variants for future use
 pub enum ScoutError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
@@ -60,6 +59,20 @@ pub enum ScoutError {
 
     #[error("Extractor error: {0}")]
     Extractor(String),
+
+    #[error("Source path '{new_path}' is inside existing source '{existing_name}' ({existing_path})")]
+    SourceIsChildOfExisting {
+        new_path: String,
+        existing_name: String,
+        existing_path: String,
+    },
+
+    #[error("Source path '{new_path}' encompasses existing source '{existing_name}' ({existing_path})")]
+    SourceIsParentOfExisting {
+        new_path: String,
+        existing_name: String,
+        existing_path: String,
+    },
 }
 
 /// Result type alias

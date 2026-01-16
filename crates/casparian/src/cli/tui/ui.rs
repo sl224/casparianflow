@@ -8,7 +8,7 @@ use ratatui::{
 use crate::cli::output::format_number;
 use ratatui::widgets::Clear;
 use chrono::{DateTime, Local};
-use super::app::{App, DiscoverFocus, DiscoverViewState, JobInfo, JobStatus, JobType, JobsViewState, MessageRole, ParserBenchView, ParserHealth, ThroughputSample, TuiMode};
+use super::app::{App, DiscoverFocus, DiscoverViewState, JobInfo, JobStatus, JobType, JobsViewState, MessageRole, ParserHealth, ThroughputSample, TuiMode};
 
 // ============================================================================
 // Shared UI Utilities
@@ -60,18 +60,6 @@ pub fn centered_scroll_offset(selected: usize, visible: usize, total: usize) -> 
     }
 }
 
-/// Format large counts with K/M suffixes for readability.
-/// Examples: 1500 -> "1.5K", 2500000 -> "2.5M"
-pub fn format_count(count: usize) -> String {
-    if count >= 1_000_000 {
-        format!("{:.1}M", count as f64 / 1_000_000.0)
-    } else if count >= 1_000 {
-        format!("{:.1}K", count as f64 / 1_000.0)
-    } else {
-        count.to_string()
-    }
-}
-
 // ============================================================================
 // Helper Functions for Truncation
 // ============================================================================
@@ -101,28 +89,6 @@ fn truncate_path_start(path: &str, max_width: usize) -> String {
         .collect();
 
     format!(".../{}", suffix)
-}
-
-/// Truncate tags to fit within max_width.
-/// Example: ["sales", "data", "archive"] -> "[sales, da...]"
-fn truncate_tags(tags: &[String], max_width: usize) -> String {
-    if tags.is_empty() {
-        return String::new();
-    }
-
-    let joined = tags.join(", ");
-    if joined.chars().count() + 2 <= max_width {
-        // +2 for []
-        format!("[{}]", joined)
-    } else if max_width <= 5 {
-        // Not enough room for anything meaningful
-        "[...]".to_string()
-    } else {
-        // Truncate and add ellipsis: [tag1, t...]
-        let content_width = max_width - 5; // Room for "[" and "...]"
-        let truncated: String = joined.chars().take(content_width).collect();
-        format!("[{}...]", truncated)
-    }
 }
 
 /// Format file size in human-readable form (fixed 8 char width)
@@ -173,7 +139,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Draw Help Overlay (on top of everything)
     if app.show_help {
-        draw_help_overlay(frame, area);
+        draw_help_overlay(frame, area, app);
     }
 }
 
@@ -367,179 +333,6 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Get contextual footer text and style for Discover mode
-fn get_discover_footer(app: &App, filtered_count: usize) -> (String, Style) {
-    // Status message takes priority
-    if let Some((ref msg, is_error)) = app.discover.status_message {
-        return (
-            format!(" {} ", msg),
-            if is_error {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::Green)
-            },
-        );
-    }
-
-    // Dialog/input-specific footers based on view state
-    match app.discover.view_state {
-        DiscoverViewState::RuleCreation => {
-            // Dialog has its own footer, hide main footer to avoid duplication
-            return (String::new(), Style::default());
-        }
-        DiscoverViewState::BulkTagging => {
-            return (" [Enter] Apply tag  [Space] Toggle rule  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-        }
-        DiscoverViewState::CreatingSource => {
-            return (" [Enter] Create source  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-        }
-        DiscoverViewState::Tagging => {
-            return (" [Enter] Apply tag  [Tab] Autocomplete  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-        }
-        DiscoverViewState::EnteringPath => {
-            return (" [Enter] Scan  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-        }
-        DiscoverViewState::Scanning => {
-            return (" Scanning... [0] Home  [4] Jobs (scan continues)  [Esc] Cancel ".to_string(), Style::default().fg(Color::Yellow));
-        }
-        DiscoverViewState::Filtering => {
-            return (
-                format!(" [Enter] Done  [t] Tag {} files  [R] Save as rule  [Esc] Clear ", filtered_count),
-                Style::default().fg(Color::DarkGray),
-            );
-        }
-        // Sources Manager dialogs (spec v1.7)
-        DiscoverViewState::SourcesManager => {
-            return (" [n] New  [e] Edit  [d] Delete  [r] Rescan  [Esc] Close ".to_string(), Style::default().fg(Color::DarkGray));
-        }
-        DiscoverViewState::SourceEdit => {
-            return (" [Enter] Save  [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray));
-        }
-        DiscoverViewState::SourceDeleteConfirm => {
-            return (" [Enter/y] Confirm delete  [Esc/n] Cancel ".to_string(), Style::default().fg(Color::Red));
-        }
-        _ => {}
-    }
-
-    // Focus-based footers with new navigation model
-    match app.discover.focus {
-        DiscoverFocus::Files => {
-            // Glob Explorer mode has its own footer
-            if let Some(ref explorer) = app.discover.glob_explorer {
-                use crate::cli::tui::app::GlobExplorerPhase;
-
-                match &explorer.phase {
-                    GlobExplorerPhase::Filtering => {
-                        return (
-                            " [Enter] Done  [Esc] Cancel  │ Type glob pattern (e.g., *.csv) ".to_string(),
-                            Style::default().fg(Color::Yellow),
-                        );
-                    }
-                    GlobExplorerPhase::EditRule { .. } => {
-                        // Rule Builder footer with stats
-                        let stats = &explorer.backtest_summary;
-                        let filter_label = explorer.result_filter.label();
-                        let exclude_info = if explorer.excludes.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  Excl:{}", explorer.excludes.len())
-                        };
-                        return (
-                            format!(
-                                " [Tab] Next  [Enter] Save  [Esc] Cancel  │ Filter:{} [a/p/f]  Pass:{}  Fail:{}{}  [x] Exclude ",
-                                filter_label, stats.pass_count, stats.fail_count, exclude_info
-                            ),
-                            Style::default().fg(Color::Yellow),
-                        );
-                    }
-                    GlobExplorerPhase::Testing => {
-                        return (
-                            " Testing extraction rule...  [Esc] Cancel ".to_string(),
-                            Style::default().fg(Color::Magenta),
-                        );
-                    }
-                    GlobExplorerPhase::Publishing => {
-                        return (
-                            " Publishing rule...  [Esc] Cancel ".to_string(),
-                            Style::default().fg(Color::Magenta),
-                        );
-                    }
-                    GlobExplorerPhase::Published { .. } => {
-                        return (
-                            " Rule published!  [Enter] Done  [Esc] Close ".to_string(),
-                            Style::default().fg(Color::Green),
-                        );
-                    }
-                    GlobExplorerPhase::Browse => {
-                        // Browse mode with result filter hints
-                        let filter_label = explorer.result_filter.label();
-                        let exclude_info = if explorer.excludes.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  Excl:{}", explorer.excludes.len())
-                        };
-                        return (
-                            format!(
-                                " [hjkl] Navigate  [/] Filter  [e] Edit Rule  [g/Esc] Exit  │ Filter:{} [a/p/f]{}  [x/i] Exclude ",
-                                filter_label, exclude_info
-                            ),
-                            Style::default().fg(Color::Cyan),
-                        );
-                    }
-                }
-            }
-            // Normal file list mode
-            if !app.discover.filter.is_empty() {
-                (
-                    format!(" [t] Tag {} files  [Esc] Clear  │ [R] Rules [M] Sources │ 1:Source 2:Tags ", filtered_count),
-                    Style::default().fg(Color::DarkGray),
-                )
-            } else {
-                (" [g] Explorer  [/] Filter  [t] Tag  [s] Scan  │ [R] Rules [M] Sources │ 1:Source 2:Tags ".to_string(), Style::default().fg(Color::DarkGray))
-            }
-        }
-        DiscoverFocus::Sources => {
-            (" [Enter] Select  [↑↓] Navigate  │ [R] Rules [M] Sources │ [Esc] Cancel ".to_string(), Style::default().fg(Color::DarkGray))
-        }
-        DiscoverFocus::Tags => {
-            (" [Enter] Select  [↑↓] Navigate  │ [R] Rules [M] Sources │ [Esc] All files ".to_string(), Style::default().fg(Color::DarkGray))
-        }
-    }
-}
-
-/// Draw the Discover mode sidebar with Sources (single-line) and Tags sections
-fn draw_discover_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    #[cfg(feature = "profiling")]
-    let _zone = app.profiler.zone("tui.discover.sidebar");
-
-    let sources_open = app.discover.view_state == DiscoverViewState::SourcesDropdown;
-    let tags_open = app.discover.view_state == DiscoverViewState::TagsDropdown;
-
-    // Option D layout: Sources is always 1 line when collapsed, Tags gets the rest
-    // When Sources is open, it expands as an overlay
-    let (sources_height, tags_constraint) = if sources_open {
-        // Sources dropdown expanded - takes more space
-        (Constraint::Min(8), Constraint::Length(3))
-    } else if tags_open {
-        // Tags expanded - Sources stays as single line header
-        (Constraint::Length(1), Constraint::Min(10))
-    } else {
-        // Both collapsed - Sources is 1 line, Tags gets remaining
-        (Constraint::Length(1), Constraint::Min(5))
-    };
-
-    let v_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([sources_height, tags_constraint])
-        .split(area);
-
-    // === SOURCES (single-line or dropdown) ===
-    draw_sources_dropdown(frame, app, v_chunks[0]);
-
-    // === TAGS SECTION ===
-    draw_tags_dropdown(frame, app, v_chunks[1]);
-}
-
 /// Draw the Sources dropdown as a proper overlay dialog
 fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     // Calculate dialog size - takes up left 40% of screen, respecting margins
@@ -644,44 +437,6 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, dialog_area);
 }
 
-/// Draw the Tags dropdown as a proper overlay dialog
-#[allow(dead_code)]
-fn draw_tags_dropdown_overlay(frame: &mut Frame, app: &App, area: Rect) {
-    // Re-use same sizing as sources dropdown
-    let width = (area.width * 40 / 100).max(30).min(area.width - 4);
-    let height = area.height.saturating_sub(8).max(10);
-
-    let dialog_area = Rect {
-        x: area.x + 2,
-        y: area.y + 3,
-        width,
-        height,
-    };
-
-    frame.render_widget(Clear, dialog_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" [2] Select Tag ", Style::default().fg(Color::Cyan).bold()));
-    let inner = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
-
-    // Tags list similar to sources
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled("  All files", Style::default().fg(Color::White))),
-    ];
-    for tag in &app.discover.tags {
-        lines.push(Line::from(Span::styled(
-            format!("  {} ({})", tag.name, tag.count),
-            Style::default().fg(Color::Gray),
-        )));
-    }
-    let list = Paragraph::new(lines);
-    frame.render_widget(list, inner);
-}
-
 /// Draw the Tags dropdown (collapsed or expanded)
 fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     let is_open = app.discover.view_state == DiscoverViewState::TagsDropdown;
@@ -720,8 +475,8 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(hint_line, inner_chunks[0]);
         } else {
-            // Show keybinding hints
-            let hint_line = Paragraph::new("[/]filter [j/k]nav")
+            // Show keybinding hints (same as Sources dropdown for consistency)
+            let hint_line = Paragraph::new("[/]filter [j/k]nav [Enter]select [Esc]close")
                 .style(Style::default().fg(Color::DarkGray));
             frame.render_widget(hint_line, inner_chunks[0]);
         }
@@ -781,17 +536,12 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
         let list = Paragraph::new(lines);
         frame.render_widget(list, inner_chunks[1]);
 
-        // Border with title - use double borders when focused/open for visual prominence
-        let (border_style, border_type) = if is_focused {
-            (Style::default().fg(Color::Cyan), BorderType::Double)
-        } else {
-            (Style::default().fg(Color::DarkGray), BorderType::Rounded)
-        };
+        // Border with title - always use double borders when open (like Sources dropdown)
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style)
-            .border_type(border_type)
-            .title(Span::styled(" [2] Tags ▲ ", style.bold()));
+            .border_style(Style::default().fg(Color::Cyan))
+            .border_type(BorderType::Double)
+            .title(Span::styled(" [2] Select Tag ", Style::default().fg(Color::Cyan).bold()));
         frame.render_widget(block, area);
     } else {
         // Collapsed: show selected tag or "All files"
@@ -1391,7 +1141,7 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         let status = progress.status_line();
         (format!(" {} {} ", spinner, status), Style::default().fg(Color::Yellow))
     } else {
-        (" [Tab] Cycle focus  [Enter] Save  [Ctrl+Space] AI assist  [Esc] Close ".to_string(), Style::default().fg(Color::DarkGray))
+        (" [s] Scan  [Tab] Navigate  [↑↓] Move  [Ctrl+S] Save  [?] Help  [Esc] Close ".to_string(), Style::default().fg(Color::DarkGray))
     };
     let footer = Paragraph::new(footer_text)
         .style(footer_style)
@@ -1426,18 +1176,23 @@ fn draw_rule_builder_left_panel(frame: &mut Frame, builder: &super::extraction::
 
     let pattern_title = if let Some(ref err) = builder.pattern_error {
         format!(" PATTERN [!] {} ", err)
+    } else if pattern_focused {
+        " PATTERN (editing) ".to_string()
     } else {
         " PATTERN ".to_string()
     };
 
     let pattern_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(if pattern_focused { BorderType::Double } else { BorderType::Plain })
         .border_style(if builder.pattern_error.is_some() {
             Style::default().fg(Color::Red)
+        } else if pattern_focused {
+            Style::default().fg(Color::Cyan).bold()
         } else {
             pattern_style
         })
-        .title(Span::styled(pattern_title, pattern_style));
+        .title(Span::styled(pattern_title, if pattern_focused { Style::default().fg(Color::Cyan).bold() } else { pattern_style }));
 
     let pattern_text = if pattern_focused {
         format!("{}█", builder.pattern)
@@ -1457,16 +1212,21 @@ fn draw_rule_builder_left_panel(frame: &mut Frame, builder: &super::extraction::
         Style::default().fg(Color::DarkGray)
     };
 
-    let excludes_title = format!(" EXCLUDES ({}) ", builder.excludes.len());
+    let excludes_title = if excludes_focused {
+        format!(" EXCLUDES ({}) [Enter: add, d: delete] ", builder.excludes.len())
+    } else {
+        format!(" EXCLUDES ({}) ", builder.excludes.len())
+    };
     let excludes_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(excludes_style)
-        .title(Span::styled(excludes_title, excludes_style));
+        .border_type(if excludes_focused { BorderType::Double } else { BorderType::Plain })
+        .border_style(if excludes_focused { Style::default().fg(Color::Cyan).bold() } else { excludes_style })
+        .title(Span::styled(excludes_title, if excludes_focused { Style::default().fg(Color::Cyan).bold() } else { excludes_style }));
 
     let excludes_content = if matches!(builder.focus, RuleBuilderFocus::ExcludeInput) {
         format!("{}█", builder.exclude_input)
     } else if builder.excludes.is_empty() {
-        "[Enter] to add".to_string()
+        "Press [Enter] to add exclude pattern".to_string()
     } else {
         builder.excludes.iter().enumerate().map(|(i, e)| {
             if i == builder.selected_exclude && excludes_focused {
@@ -1489,20 +1249,26 @@ fn draw_rule_builder_left_panel(frame: &mut Frame, builder: &super::extraction::
         Style::default().fg(Color::DarkGray)
     };
 
+    let tag_title = if tag_focused { " TAG (editing) " } else { " TAG " };
     let tag_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(tag_style)
-        .title(Span::styled(" TAG ", tag_style));
+        .border_type(if tag_focused { BorderType::Double } else { BorderType::Plain })
+        .border_style(if tag_focused { Style::default().fg(Color::Cyan).bold() } else { tag_style })
+        .title(Span::styled(tag_title, if tag_focused { Style::default().fg(Color::Cyan).bold() } else { tag_style }));
 
     let tag_text = if tag_focused {
-        format!("{}█", builder.tag)
+        if builder.tag.is_empty() {
+            "█".to_string()  // Show cursor in empty field
+        } else {
+            format!("{}█", builder.tag)
+        }
     } else if builder.tag.is_empty() {
-        "Enter tag name...".to_string()
+        "Type tag name to apply to matched files".to_string()
     } else {
         builder.tag.clone()
     };
     let tag_para = Paragraph::new(tag_text)
-        .style(if builder.tag.is_empty() {
+        .style(if builder.tag.is_empty() && !tag_focused {
             Style::default().fg(Color::DarkGray)
         } else {
             Style::default().fg(Color::White)
@@ -1518,14 +1284,19 @@ fn draw_rule_builder_left_panel(frame: &mut Frame, builder: &super::extraction::
         Style::default().fg(Color::DarkGray)
     };
 
-    let extractions_title = format!(" EXTRACTIONS ({}) ", builder.extractions.len());
+    let extractions_title = if extractions_focused {
+        format!(" EXTRACTIONS ({}) [Space: toggle] ", builder.extractions.len())
+    } else {
+        format!(" EXTRACTIONS ({}) ", builder.extractions.len())
+    };
     let extractions_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(extractions_style)
-        .title(Span::styled(extractions_title, extractions_style));
+        .border_type(if extractions_focused { BorderType::Double } else { BorderType::Plain })
+        .border_style(if extractions_focused { Style::default().fg(Color::Cyan).bold() } else { extractions_style })
+        .title(Span::styled(extractions_title, if extractions_focused { Style::default().fg(Color::Cyan).bold() } else { extractions_style }));
 
     let extractions_content = if builder.extractions.is_empty() {
-        "Use <field> in pattern to add".to_string()
+        "Add <name> to pattern, e.g. **/<year>/*.csv".to_string()
     } else {
         builder.extractions.iter().enumerate().map(|(i, f)| {
             let selected = i == builder.selected_extraction && extractions_focused;
@@ -1547,15 +1318,17 @@ fn draw_rule_builder_left_panel(frame: &mut Frame, builder: &super::extraction::
         Style::default().fg(Color::DarkGray)
     };
 
+    let options_title = if options_focused { " OPTIONS [Space: toggle] " } else { " OPTIONS " };
     let options_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(options_style)
-        .title(Span::styled(" OPTIONS ", options_style));
+        .border_type(if options_focused { BorderType::Double } else { BorderType::Plain })
+        .border_style(if options_focused { Style::default().fg(Color::Cyan).bold() } else { options_style })
+        .title(Span::styled(options_title, if options_focused { Style::default().fg(Color::Cyan).bold() } else { options_style }));
 
     let enabled_check = if builder.enabled { "[x]" } else { "[ ]" };
     let job_check = if builder.run_job_on_save { "[x]" } else { "[ ]" };
     let options_para = Paragraph::new(format!("{} Enable rule  {} Run job on save", enabled_check, job_check))
-        .style(Style::default().fg(Color::Gray))
+        .style(if options_focused { Style::default().fg(Color::White) } else { Style::default().fg(Color::Gray) })
         .block(options_block);
     frame.render_widget(options_para, left_chunks[4]);
 }
@@ -1583,7 +1356,7 @@ fn draw_rule_builder_right_panel(frame: &mut Frame, builder: &super::extraction:
             if builder.is_streaming {
                 format!(" FOLDERS  {} folders ({} files)  {}", folder_count, file_count, spinner_char(builder.stream_elapsed_ms / 100))
             } else {
-                format!(" FOLDERS  {} folders ({} files)  ↵ expand/collapse", folder_count, file_count)
+                format!(" FOLDERS  {} folders ({} files)  [Enter] drill down", folder_count, file_count)
             }
         }
         FileResultsPhase::ExtractionPreview => {
@@ -1874,271 +1647,6 @@ fn draw_backtest_results_phase(frame: &mut Frame, builder: &super::extraction::R
     frame.render_widget(file_list, area);
 }
 
-/// Draw the Rule Builder split-view (specs/rule_builder.md) - LEGACY OVERLAY VERSION
-/// Layout: Left panel (40%) = rule config, Right panel (60%) = file results
-#[allow(dead_code)]
-fn draw_rule_builder(frame: &mut Frame, app: &App, area: Rect) {
-    use super::extraction::RuleBuilderFocus;
-
-    let builder = match &app.discover.rule_builder {
-        Some(b) => b,
-        None => return,
-    };
-
-    // Full screen dialog - uses almost all available area
-    let dialog_area = render_centered_dialog(frame, area, area.width.saturating_sub(4), area.height.saturating_sub(4));
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
-        .title(Span::styled(" Rule Builder ", Style::default().fg(Color::Green).bold()));
-
-    let inner_area = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
-
-    // Split into left (40%) and right (60%) panels
-    let h_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(inner_area);
-
-    // === LEFT PANEL: Rule Config ===
-    let left_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Pattern
-            Constraint::Length(4),  // Excludes
-            Constraint::Length(3),  // Tag
-            Constraint::Length(5),  // Extractions
-            Constraint::Length(3),  // Options
-            Constraint::Min(0),     // Footer/padding
-        ])
-        .split(h_chunks[0]);
-
-    // --- PATTERN field ---
-    let pattern_focused = matches!(builder.focus, RuleBuilderFocus::Pattern);
-    let pattern_style = if pattern_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let pattern_title = if let Some(ref err) = builder.pattern_error {
-        format!(" PATTERN [!] {} ", err)
-    } else {
-        " PATTERN ".to_string()
-    };
-
-    let pattern_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(if builder.pattern_error.is_some() {
-            Style::default().fg(Color::Red)
-        } else {
-            pattern_style
-        })
-        .title(Span::styled(pattern_title, pattern_style));
-
-    let pattern_text = if pattern_focused {
-        format!("{}█", builder.pattern)
-    } else {
-        builder.pattern.clone()
-    };
-    let pattern_para = Paragraph::new(pattern_text)
-        .style(Style::default().fg(Color::White))
-        .block(pattern_block);
-    frame.render_widget(pattern_para, left_chunks[0]);
-
-    // --- EXCLUDES field ---
-    let excludes_focused = matches!(builder.focus, RuleBuilderFocus::Excludes | RuleBuilderFocus::ExcludeInput);
-    let excludes_style = if excludes_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let excludes_title = format!(" EXCLUDES ({}) ", builder.excludes.len());
-    let excludes_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(excludes_style)
-        .title(Span::styled(excludes_title, excludes_style));
-
-    let excludes_content = if matches!(builder.focus, RuleBuilderFocus::ExcludeInput) {
-        format!("{}█", builder.exclude_input)
-    } else if builder.excludes.is_empty() {
-        "[Enter] to add".to_string()
-    } else {
-        builder.excludes.iter().enumerate().map(|(i, e)| {
-            if i == builder.selected_exclude && excludes_focused {
-                format!("► {}", e)
-            } else {
-                format!("  {}", e)
-            }
-        }).collect::<Vec<_>>().join("\n")
-    };
-    let excludes_para = Paragraph::new(excludes_content)
-        .style(Style::default().fg(Color::Gray))
-        .block(excludes_block);
-    frame.render_widget(excludes_para, left_chunks[1]);
-
-    // --- TAG field ---
-    let tag_focused = matches!(builder.focus, RuleBuilderFocus::Tag);
-    let tag_style = if tag_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let tag_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(tag_style)
-        .title(Span::styled(" TAG ", tag_style));
-
-    let tag_text = if tag_focused {
-        format!("{}█", builder.tag)
-    } else if builder.tag.is_empty() {
-        "Enter tag name...".to_string()
-    } else {
-        builder.tag.clone()
-    };
-    let tag_para = Paragraph::new(tag_text)
-        .style(if builder.tag.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        })
-        .block(tag_block);
-    frame.render_widget(tag_para, left_chunks[2]);
-
-    // --- EXTRACTIONS field ---
-    let extractions_focused = matches!(builder.focus, RuleBuilderFocus::Extractions | RuleBuilderFocus::ExtractionEdit(_));
-    let extractions_style = if extractions_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let extractions_title = format!(" EXTRACTIONS ({}) ", builder.extractions.len());
-    let extractions_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(extractions_style)
-        .title(Span::styled(extractions_title, extractions_style));
-
-    let extractions_content = if builder.extractions.is_empty() {
-        "Use <field> in pattern to add".to_string()
-    } else {
-        builder.extractions.iter().enumerate().map(|(i, f)| {
-            let selected = i == builder.selected_extraction && extractions_focused;
-            let prefix = if selected { "► " } else { "  " };
-            let enabled = if f.enabled { "✓" } else { " " };
-            format!("{}{} {} {}", prefix, f.name, f.source.display_name(), enabled)
-        }).take(3).collect::<Vec<_>>().join("\n")
-    };
-    let extractions_para = Paragraph::new(extractions_content)
-        .style(Style::default().fg(Color::Gray))
-        .block(extractions_block);
-    frame.render_widget(extractions_para, left_chunks[3]);
-
-    // --- OPTIONS field ---
-    let options_focused = matches!(builder.focus, RuleBuilderFocus::Options);
-    let options_style = if options_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let options_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(options_style)
-        .title(Span::styled(" OPTIONS ", options_style));
-
-    let enabled_check = if builder.enabled { "[x]" } else { "[ ]" };
-    let job_check = if builder.run_job_on_save { "[x]" } else { "[ ]" };
-    let options_para = Paragraph::new(format!("{} Enable rule  {} Run job on save", enabled_check, job_check))
-        .style(Style::default().fg(Color::Gray))
-        .block(options_block);
-    frame.render_widget(options_para, left_chunks[4]);
-
-    // === RIGHT PANEL: File Results ===
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),  // Header with filter
-            Constraint::Min(1),     // File list
-            Constraint::Length(2),  // Status bar
-        ])
-        .split(h_chunks[1]);
-
-    // File list header
-    let filter_label = builder.result_filter.label();
-    let header = Paragraph::new(format!(" FILES [{}]  a/p/f to filter", filter_label))
-        .style(Style::default().fg(if matches!(builder.focus, RuleBuilderFocus::FileList) {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        }));
-    frame.render_widget(header, right_chunks[0]);
-
-    // File list
-    let file_list_focused = matches!(builder.focus, RuleBuilderFocus::FileList);
-    let file_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(if file_list_focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        });
-
-    let file_list_inner = file_block.inner(right_chunks[1]);
-
-    let files: Vec<Line> = if builder.visible_indices.is_empty() {
-        vec![Line::from(Span::styled(
-            "  No matching files",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        let max_display = file_list_inner.height.saturating_sub(1) as usize;
-        let start = builder.selected_file.saturating_sub(max_display / 2);
-
-        builder.visible_indices.iter()
-            .skip(start)
-            .take(max_display)
-            .enumerate()
-            .map(|(i, &idx)| {
-                let file = &builder.matched_files[idx];
-                let is_selected = i + start == builder.selected_file && file_list_focused;
-                let prefix = if is_selected { "► " } else { "  " };
-                let indicator = file.test_result.indicator();
-
-                let style = if is_selected {
-                    Style::default().fg(Color::White).bold()
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-
-                Line::from(Span::styled(
-                    format!("{}{} {}", prefix, indicator, file.relative_path),
-                    style,
-                ))
-            })
-            .collect()
-    };
-
-    frame.render_widget(file_block, right_chunks[1]);
-    let file_list = Paragraph::new(files);
-    frame.render_widget(file_list, file_list_inner);
-
-    // Status bar
-    let status = format!(
-        " Pass: {}  Fail: {}  Skip: {} | Tab: cycle | Ctrl+S: save | Esc: close",
-        builder.backtest.pass_count,
-        builder.backtest.fail_count,
-        builder.backtest.excluded_count
-    );
-    let status_para = Paragraph::new(status)
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(status_para, right_chunks[2]);
-}
-
 /// Draw the Rule Creation dialog as an overlay (simplified version)
 /// Layout: PATTERN → TAG → LIVE PREVIEW
 fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
@@ -2284,397 +1792,6 @@ fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(footer, chunks[4]);
 }
 
-fn draw_file_list(frame: &mut Frame, app: &App, filtered_files: &[&super::app::FileInfo], area: Rect) {
-    #[cfg(feature = "profiling")]
-    let _zone = app.profiler.zone("tui.discover.files");
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Check if file list is focused
-    let is_focused = app.discover.focus == DiscoverFocus::Files;
-
-    if filtered_files.is_empty() {
-        // Helpful empty state
-        lines.push(Line::from(""));
-        if app.discover.files.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  No files loaded",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  Press [s] to scan a folder",
-                Style::default().fg(Color::Cyan),
-            )));
-            lines.push(Line::from(Span::styled(
-                "  Press [r] to load from Scout DB",
-                Style::default().fg(Color::Cyan),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                "  No files match the current filter",
-                Style::default().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  Press [Esc] to clear filter",
-                Style::default().fg(Color::Cyan),
-            )));
-        }
-    } else {
-        // VIRTUAL SCROLLING: Only render visible rows for performance with large file lists
-        let visible_rows = area.height.saturating_sub(1) as usize;
-        let total_files = filtered_files.len();
-        let selected = app.discover.selected;
-        let scroll_offset = centered_scroll_offset(selected, visible_rows, total_files);
-        let end_idx = (scroll_offset + visible_rows).min(total_files);
-
-        // Calculate column widths:
-        // Icon: 2 chars (emoji + space)
-        // Size: 8 chars (fixed)
-        // Tags: 12 chars max
-        // Path: remaining space
-        let size_width = 8;
-        let tag_width = 12;
-        let icon_width = 3; // icon + space
-        let padding = 4; // some breathing room
-        let path_width = area.width.saturating_sub((size_width + tag_width + icon_width + padding) as u16) as usize;
-
-        // Only iterate over visible files
-        for (visible_idx, file) in filtered_files[scroll_offset..end_idx].iter().enumerate() {
-            let actual_idx = scroll_offset + visible_idx;
-            let is_selected = actual_idx == selected;
-            let style = if is_selected && is_focused {
-                Style::default().fg(Color::White).bold().bg(Color::DarkGray)
-            } else if is_selected {
-                Style::default().fg(Color::Cyan).bg(Color::Black)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            let icon = if file.is_dir { "📁" } else { "📄" };
-
-            // Use rel_path for display if available, otherwise use path
-            let display_path_source = if !file.rel_path.is_empty() {
-                &file.rel_path
-            } else {
-                &file.path
-            };
-
-            // Truncate path from START (show end of path - the most relevant part)
-            let display_path = truncate_path_start(display_path_source, path_width);
-
-            // Format size (fixed 8 chars)
-            let size_str = format_size(file.size);
-
-            // Truncate tags (max 12 chars)
-            let tags_str = truncate_tags(&file.tags, tag_width);
-
-            // Build line with fixed columns
-            let content = format!(
-                "{} {:<path_w$} {:>8} {:>tag_w$}",
-                icon,
-                display_path,
-                size_str,
-                tags_str,
-                path_w = path_width,
-                tag_w = tag_width
-            );
-            lines.push(Line::from(Span::styled(content, style)));
-        }
-    }
-
-    let file_count = filtered_files.len();
-    let selected = app.discover.selected;
-
-    // Show position indicator for large lists
-    let title = if file_count > 100 {
-        format!(" [3] FILES ({}/{}) ", selected + 1, format_count(file_count))
-    } else {
-        format!(" [3] FILES ({}) ", file_count)
-    };
-    let title_style = if is_focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let block = Block::default()
-        .borders(Borders::NONE)
-        .title(Span::styled(title, title_style));
-
-    let list = Paragraph::new(lines).block(block);
-    frame.render_widget(list, area);
-}
-
-/// Draw the Glob Explorer (hierarchical folder view)
-fn draw_glob_explorer(frame: &mut Frame, app: &App, area: Rect) {
-    #[cfg(feature = "profiling")]
-    let _zone = app.profiler.zone("tui.discover.glob");
-
-    use super::app::{GlobFileCount, GlobExplorerPhase};
-
-    let explorer = match &app.discover.glob_explorer {
-        Some(e) => e,
-        None => return,
-    };
-
-    // Dispatch based on phase - EditRule, Testing, Publishing, Published have their own UIs
-    match &explorer.phase {
-        GlobExplorerPhase::EditRule { focus, selected_index, editing_field } => {
-            draw_rule_editor(frame, app, area, focus, *selected_index, editing_field);
-            return;
-        }
-        GlobExplorerPhase::Testing => {
-            draw_test_results(frame, app, area);
-            return;
-        }
-        GlobExplorerPhase::Publishing => {
-            draw_publishing(frame, app, area);
-            return;
-        }
-        GlobExplorerPhase::Published { job_id } => {
-            draw_published(frame, area, job_id);
-            return;
-        }
-        GlobExplorerPhase::Browse | GlobExplorerPhase::Filtering => {
-            // Continue with normal explorer UI below
-        }
-    }
-
-    let is_focused = app.discover.focus == DiscoverFocus::Files;
-
-    // Split into three sections: Pattern, Folders, Preview
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Pattern input
-            Constraint::Min(5),     // Folders list
-            Constraint::Length(6),  // Preview files
-        ])
-        .split(area);
-
-    // --- Pattern section (prominent input box) ---
-    let is_filtering = matches!(explorer.phase, GlobExplorerPhase::Filtering);
-    let total_count_str = match &explorer.total_count {
-        GlobFileCount::Exact(n) => format!("{} files", format_count(*n)),
-        GlobFileCount::Estimated(n) => format!("~{} files", format_count(*n)),
-    };
-
-    // Build the pattern display with prefix and cursor
-    let prefix = &explorer.current_prefix;
-    let pattern = &explorer.pattern;
-    let cursor_pos = explorer.pattern_cursor;
-
-    let mut pattern_spans: Vec<Span> = Vec::new();
-
-    // Add prefix (not editable, shown in dimmer color)
-    if !prefix.is_empty() {
-        pattern_spans.push(Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray)));
-    }
-
-    if is_filtering {
-        // Editing mode: show cursor
-        let before_cursor: String = pattern.chars().take(cursor_pos).collect();
-        let after_cursor: String = pattern.chars().skip(cursor_pos).collect();
-
-        pattern_spans.push(Span::styled(before_cursor, Style::default().fg(Color::Yellow).bold()));
-        pattern_spans.push(Span::styled("│", Style::default().fg(Color::White).bold())); // Cursor
-        pattern_spans.push(Span::styled(after_cursor, Style::default().fg(Color::Yellow).bold()));
-    } else {
-        // Browse mode: show pattern or placeholder
-        let display_pattern = if pattern.is_empty() && prefix.is_empty() {
-            "*".to_string()
-        } else if pattern.is_empty() {
-            "*".to_string()  // Inside folder, show * for "all files here"
-        } else {
-            pattern.clone()
-        };
-        pattern_spans.push(Span::styled(display_pattern, Style::default().fg(Color::Cyan).bold()));
-    }
-
-    // Add file count
-    pattern_spans.push(Span::raw("  "));
-    pattern_spans.push(Span::styled(format!("[{}]", total_count_str), Style::default().fg(Color::Green)));
-
-    // Hints based on mode
-    let hints = if is_filtering {
-        "  [Enter] Done  [Esc] Cancel"
-    } else if explorer.total_count.value() > 0 {
-        "  [/] Edit  [e] Create Rule"
-    } else {
-        "  [/] Edit pattern"
-    };
-    pattern_spans.push(Span::styled(hints, Style::default().fg(Color::DarkGray)));
-
-    let pattern_line = Line::from(pattern_spans);
-
-    // Create bordered box for pattern
-    let border_style = if is_filtering {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::Cyan)
-    };
-    let border_type = if is_filtering { BorderType::Double } else { BorderType::Rounded };
-
-    let pattern_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .border_type(border_type)
-        .title(Span::styled(" GLOB PATTERN ", Style::default().fg(Color::Cyan).bold()));
-
-    let pattern_widget = Paragraph::new(pattern_line)
-        .block(pattern_block)
-        .style(Style::default());
-
-    frame.render_widget(pattern_widget, chunks[0]);
-
-    // --- Folders section ---
-    let mut folder_lines: Vec<Line> = Vec::new();
-
-    if explorer.folders.is_empty() {
-        folder_lines.push(Line::from(""));
-        // Show scan_error if present (e.g., "No cache found")
-        if let Some(ref err) = app.discover.scan_error {
-            folder_lines.push(Line::from(Span::styled(
-                format!("  ⚠ {}", err),
-                Style::default().fg(Color::Yellow),
-            )));
-            folder_lines.push(Line::from(""));
-            folder_lines.push(Line::from(Span::styled(
-                "  Press [s] to scan this folder",
-                Style::default().fg(Color::Cyan),
-            )));
-        } else {
-            folder_lines.push(Line::from(Span::styled(
-                "  No folders found",
-                Style::default().fg(Color::DarkGray),
-            )));
-            if !explorer.current_prefix.is_empty() {
-                folder_lines.push(Line::from(Span::styled(
-                    "  Press [Backspace] to go back",
-                    Style::default().fg(Color::Cyan),
-                )));
-            }
-        }
-    } else {
-        // Virtual scrolling for folders
-        let visible_rows = chunks[1].height.saturating_sub(1) as usize;
-        let total_folders = explorer.folders.len();
-        let selected = explorer.selected_folder;
-        let scroll_offset = centered_scroll_offset(selected, visible_rows, total_folders);
-        let end_idx = (scroll_offset + visible_rows).min(total_folders);
-
-        for (visible_idx, folder) in explorer.folders[scroll_offset..end_idx].iter().enumerate() {
-            let actual_idx = scroll_offset + visible_idx;
-            let is_selected = actual_idx == selected;
-
-            let style = if is_selected && is_focused {
-                Style::default().fg(Color::White).bold().bg(Color::DarkGray)
-            } else if is_selected {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            let icon = if folder.is_file { "📄" } else { "📁" };
-            // Selection indicator prefix
-            let prefix = if is_selected { "►" } else { " " };
-
-            // Use truncate_path_start to show the end of the path (most relevant part)
-            let content = if folder.is_file {
-                // Files: just show icon and name (no redundant "1 files")
-                format!(
-                    "{} {} {}",
-                    prefix,
-                    icon,
-                    truncate_path_start(&folder.name, 50),
-                )
-            } else {
-                // Folders: show icon, name, count, and drill-down arrow
-                let count_str = format_count(folder.file_count);
-                format!(
-                    "{} {} {:<40} {:>8} files >",
-                    prefix,
-                    icon,
-                    truncate_path_start(&folder.name, 40),
-                    count_str,
-                )
-            };
-            folder_lines.push(Line::from(Span::styled(content, style)));
-        }
-    }
-
-    let folders_title = format!(" FOLDERS ({}) ", explorer.folders.len());
-    let (folders_title_style, folders_border_style, folders_border_type) = if is_focused && !is_filtering {
-        // Focused: bright cyan, double borders
-        (
-            Style::default().fg(Color::Cyan).bold(),
-            Style::default().fg(Color::Cyan),
-            BorderType::Double,
-        )
-    } else {
-        // Unfocused: dim gray, rounded borders
-        (
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::DarkGray),
-            BorderType::Rounded,
-        )
-    };
-    let folders_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(folders_border_style)
-        .border_type(folders_border_type)
-        .title(Span::styled(folders_title, folders_title_style));
-    let folders_widget = Paragraph::new(folder_lines).block(folders_block);
-    frame.render_widget(folders_widget, chunks[1]);
-
-    // --- Preview section ---
-    let mut preview_lines: Vec<Line> = Vec::new();
-
-    if explorer.preview_files.is_empty() {
-        preview_lines.push(Line::from(Span::styled(
-            "  No preview files",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        for file in explorer.preview_files.iter().take(5) {
-            let size_str = format_size(file.size);
-            let content = format!("  {} {:>8}", truncate_path_start(&file.rel_path, 50), size_str);
-            preview_lines.push(Line::from(Span::styled(
-                content,
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-    }
-
-    let preview_block = Block::default()
-        .borders(Borders::TOP)
-        .title(Span::styled(" PREVIEW ", Style::default().fg(Color::DarkGray)));
-    let preview_widget = Paragraph::new(preview_lines).block(preview_block);
-    frame.render_widget(preview_widget, chunks[2]);
-}
-fn draw_file_preview(frame: &mut Frame, app: &App, filtered_files: &[&super::app::FileInfo], area: Rect) {
-    let content = if let Some(file) = filtered_files.get(app.discover.selected) {
-         format!(
-            "Path: {}\nSize: {}\nModified: {}\n\n[Preview functionality coming soon]",
-            file.path,
-            file.size,
-            file.modified.format("%Y-%m-%d %H:%M:%S")
-        )
-    } else {
-        "Select a file to preview".to_string()
-    };
-
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .title(" Preview ");
-    
-    let preview = Paragraph::new(content).block(block);
-    frame.render_widget(preview, area);
-}
-
-
 /// Draw the AI Sidebar (Chat)
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     let main_block = Block::default()
@@ -2736,15 +1853,7 @@ fn draw_parser_bench_screen(frame: &mut Frame, app: &App, area: Rect) {
     draw_parser_details(frame, app, content_chunks[1]);
 
     // Footer with keybindings
-    let footer_text = match app.parser_bench.view {
-        ParserBenchView::ParserList => {
-            " [j/k] Navigate  [t] Test  [n] Quick test  [/] Filter  [?] Help  [Esc] Home "
-        }
-        ParserBenchView::ResultView => {
-            " [r] Re-run  [f] Different file  [Esc] Back "
-        }
-        _ => " [Esc] Back ",
-    };
+    let footer_text = " [j/k] Navigate  [t] Test  [n] Quick test  [/] Filter  [?] Help  [Esc] Home ";
     let footer = Paragraph::new(footer_text)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center)
@@ -3200,7 +2309,7 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Calculate layout based on whether pipeline is shown
-    let (pipeline_height, content_height) = if app.jobs_state.show_pipeline {
+    let (pipeline_height, _content_height) = if app.jobs_state.show_pipeline {
         (8, area.height.saturating_sub(14)) // Pipeline + status bar + footer
     } else {
         (0, area.height.saturating_sub(6)) // Just status bar + footer
@@ -3417,15 +2526,6 @@ fn render_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, _wid
         (JobType::Parse, JobStatus::Running) => {
             let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
             format!("           {}/{} files • ETA {}", job.items_processed, job.items_total, eta)
-        }
-        (JobType::Export, JobStatus::Completed) => {
-            let path = job.output_path.as_deref().unwrap_or("");
-            let size = job.output_size_bytes.map(format_size).unwrap_or_default();
-            format!("           {} records → {} ({})", job.items_processed, truncate_path(path, 30), size)
-        }
-        (JobType::Export, JobStatus::Running) => {
-            let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
-            format!("           {}/{} records • ETA {}", job.items_processed, job.items_total, eta)
         }
         (JobType::Backtest, _) => {
             if let Some(ref bt) = job.backtest {
@@ -3950,12 +3050,12 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Draw the help overlay (per spec Section 3.1)
-fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::Clear;
 
-    // Center the help panel
-    let help_width = 60.min(area.width.saturating_sub(4));
-    let help_height = 20.min(area.height.saturating_sub(4));
+    // Center the help panel - larger to fit all content
+    let help_width = 76.min(area.width.saturating_sub(4));
+    let help_height = 36.min(area.height.saturating_sub(2));
     let help_x = (area.width.saturating_sub(help_width)) / 2;
     let help_y = (area.height.saturating_sub(help_height)) / 2;
 
@@ -3969,27 +3069,109 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     // Clear the background
     frame.render_widget(Clear, help_area);
 
-    // Help content
-    let help_text = vec![
-        "",
-        "  NAVIGATION",
-        "  ──────────",
-        "  1         Discover view",
-        "  2         Parser Bench view",
-        "  3         Jobs view",
-        "  4         Sources view",
-        "  0 / H     Home",
-        "  Esc       Back / Close dialog",
-        "",
-        "  GLOBAL ACTIONS",
-        "  ──────────────",
-        "  ?         Toggle this help",
-        "  r         Refresh current view",
-        "  q         Quit application",
-        "  Alt+A     Toggle AI sidebar",
-        "",
-        "  Press ? or Esc to close",
-    ];
+    // Context-aware help content based on current mode
+    let help_text = match app.mode {
+        TuiMode::Discover => {
+            if app.discover.view_state == super::app::DiscoverViewState::RuleBuilder {
+                vec![
+                    "",
+                    "  RULE BUILDER KEYS                      NAVIGATION",
+                    "  ─────────────────                      ──────────",
+                    "  Tab/Shift+Tab  Cycle between fields    1-4       Go to view",
+                    "  ↑/↓ arrows     Move between fields     0 / H     Home",
+                    "  ←/→ arrows     Switch panels           Esc       Back / Close",
+                    "  j/k            Navigate lists (vim)",
+                    "  Enter          Expand folder / Save    PATTERN SYNTAX",
+                    "                                         ──────────────",
+                    "  ACTIONS                                **/*      All files",
+                    "  ───────                                *.rs      Rust files",
+                    "  1              Open Source dropdown    **/*.csv  CSV files (recursive)",
+                    "  2              Open Tags dropdown      <name>    Extract field",
+                    "  s              Scan new directory",
+                    "  Ctrl+S         Save rule               FOCUS INDICATOR",
+                    "  t              Run backtest            ──────────────",
+                    "  Ctrl+Space     AI assist               █ cursor   = text input active",
+                    "                                         ► pointer  = list navigation",
+                    "  IN DROPDOWNS",
+                    "  ────────────                           GLOBAL",
+                    "  /              Filter list             ──────",
+                    "  j/k or ↑/↓    Navigate                 ?         This help",
+                    "  Enter          Select item             r         Refresh view",
+                    "  Esc            Close dropdown          q         Quit",
+                    "",
+                    "  Press ? or Esc to close",
+                ]
+            } else {
+                vec![
+                    "",
+                    "  DISCOVER MODE                          NAVIGATION",
+                    "  ─────────────                          ──────────",
+                    "  s              Scan new directory      1-4       Go to view",
+                    "  n              Create new rule         0 / H     Home",
+                    "  Enter          Open Rule Builder       Esc       Back / Close",
+                    "  j/k or ↑/↓    Navigate files",
+                    "  /              Filter files            GLOBAL",
+                    "                                         ──────",
+                    "  IN SOURCES/TAGS DROPDOWN               ?         This help",
+                    "  ────────────────────────               r         Refresh view",
+                    "  /              Filter list             q         Quit",
+                    "  s              Scan (in Sources)",
+                    "  j/k or ↑/↓    Navigate",
+                    "  Enter          Select",
+                    "  Esc            Close",
+                    "",
+                    "  Press ? or Esc to close",
+                ]
+            }
+        }
+        TuiMode::ParserBench => vec![
+            "",
+            "  PARSER BENCH                           NAVIGATION",
+            "  ────────────                           ──────────",
+            "  n              Quick test any .py      1-4       Go to view",
+            "  t              Test selected parser    0 / H     Home",
+            "  j/k or ↑/↓    Navigate parsers        Esc       Back / Close",
+            "  /              Filter parsers",
+            "  Enter          View details            GLOBAL",
+            "                                         ──────",
+            "                                         ?         This help",
+            "                                         r         Refresh view",
+            "                                         q         Quit",
+            "",
+            "  Press ? or Esc to close",
+        ],
+        TuiMode::Jobs => vec![
+            "",
+            "  JOBS VIEW                              NAVIGATION",
+            "  ─────────                              ──────────",
+            "  j/k or ↑/↓    Navigate jobs           1-4       Go to view",
+            "  Enter          View job details        0 / H     Home",
+            "  P              View pipeline           Esc       Back / Close",
+            "  m              Toggle monitor mode",
+            "  f              Filter jobs             GLOBAL",
+            "                                         ──────",
+            "                                         ?         This help",
+            "                                         r         Refresh view",
+            "                                         q         Quit",
+            "",
+            "  Press ? or Esc to close",
+        ],
+        _ => vec![
+            "",
+            "  NAVIGATION                             GLOBAL ACTIONS",
+            "  ──────────                             ──────────────",
+            "  1              Discover view           ?         This help",
+            "  2              Parser Bench view       r         Refresh view",
+            "  3              Jobs view               q         Quit",
+            "  4              Sources view            Alt+A     AI sidebar",
+            "  0 / H          Home",
+            "  Esc            Back / Close",
+            "  ↑/↓/←/→       Navigate",
+            "  Enter          Select",
+            "",
+            "  Press ? or Esc to close",
+        ],
+    };
 
     let help_paragraph = Paragraph::new(help_text.join("\n"))
         .style(Style::default().fg(Color::White))
@@ -4007,364 +3189,6 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 // ============================================================================
 // Glob Explorer Phase UI: Rule Editing, Testing, Publishing
 // ============================================================================
-
-/// Draw the rule editor UI (EditRule phase)
-/// Layout: 4-section editor with focus indicators per spec v2.2
-fn draw_rule_editor(
-    frame: &mut Frame,
-    app: &App,
-    area: Rect,
-    focus: &super::extraction::RuleEditorFocus,
-    selected_index: usize,
-    _editing_field: &Option<super::extraction::FieldEditFocus>,
-) {
-    use super::extraction::RuleEditorFocus;
-
-    let explorer = match &app.discover.glob_explorer {
-        Some(e) => e,
-        None => return,
-    };
-
-    let draft = match &explorer.rule_draft {
-        Some(d) => d,
-        None => return,
-    };
-
-    // Main block with double border
-    let rule_name = if draft.name.is_empty() { "New Rule" } else { &draft.name };
-    let title = format!(" EDIT RULE: {} ", rule_name);
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .title(Span::styled(title, Style::default().fg(Color::Yellow).bold()));
-    frame.render_widget(main_block, area);
-
-    let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
-
-    // Split into 4 sections + footer
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Glob pattern
-            Constraint::Min(5),     // Fields
-            Constraint::Length(3),  // Base tag
-            Constraint::Min(4),     // Conditions
-            Constraint::Length(2),  // Footer
-        ])
-        .split(inner);
-
-    // Section 1: GLOB PATTERN
-    let glob_focused = matches!(focus, RuleEditorFocus::GlobPattern);
-    let glob_border = if glob_focused { BorderType::Double } else { BorderType::Plain };
-    let glob_style = if glob_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-    let file_count = explorer.total_count.value();
-    let glob_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(glob_border)
-        .title(Span::styled(format!(" GLOB PATTERN (1/4) [{}] ", file_count), glob_style));
-    let cursor = if glob_focused { ">> " } else { "   " };
-    let glob_content = format!("{}{}", cursor, draft.glob_pattern);
-    let glob_widget = Paragraph::new(glob_content).block(glob_block);
-    frame.render_widget(glob_widget, chunks[0]);
-
-    // Section 2: FIELDS
-    let fields_focused = matches!(focus, RuleEditorFocus::FieldList);
-    let fields_border = if fields_focused { BorderType::Double } else { BorderType::Plain };
-    let fields_style = if fields_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-    let fields_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(fields_border)
-        .title(Span::styled(" FIELDS (2/4) ", fields_style));
-    let mut fields_lines: Vec<Line> = Vec::new();
-    if draft.fields.is_empty() {
-        fields_lines.push(Line::from(Span::styled("  No fields. [a] Add  [i] Infer from pattern", Style::default().fg(Color::DarkGray))));
-    } else {
-        for (i, field) in draft.fields.iter().enumerate() {
-            let is_sel = fields_focused && i == selected_index;
-            let marker = if is_sel { ">>" } else { "  " };
-            let style = if is_sel { Style::default().fg(Color::White).bold() } else { Style::default().fg(Color::Gray) };
-            fields_lines.push(Line::from(Span::styled(format!("{} {}: {:?}", marker, field.name, field.source), style)));
-        }
-    }
-    if fields_focused {
-        fields_lines.push(Line::from(Span::styled("  [a] Add  [d] Delete  [i] Infer", Style::default().fg(Color::Cyan))));
-    }
-    let fields_widget = Paragraph::new(fields_lines).block(fields_block);
-    frame.render_widget(fields_widget, chunks[1]);
-
-    // Section 3: BASE TAG
-    let tag_focused = matches!(focus, RuleEditorFocus::BaseTag);
-    let tag_border = if tag_focused { BorderType::Double } else { BorderType::Plain };
-    let tag_style = if tag_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-    let tag_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(tag_border)
-        .title(Span::styled(" BASE TAG (3/4) ", tag_style));
-    let tag_cursor = if tag_focused { ">> " } else { "   " };
-    let tag_content = format!("{}{}", tag_cursor, draft.base_tag);
-    let tag_widget = Paragraph::new(tag_content).block(tag_block);
-    frame.render_widget(tag_widget, chunks[2]);
-
-    // Section 4: CONDITIONS
-    let cond_focused = matches!(focus, RuleEditorFocus::Conditions);
-    let cond_border = if cond_focused { BorderType::Double } else { BorderType::Plain };
-    let cond_style = if cond_focused { Style::default().fg(Color::Yellow) } else { Style::default().fg(Color::DarkGray) };
-    let cond_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(cond_border)
-        .title(Span::styled(" CONDITIONS (4/4) ", cond_style));
-    let mut cond_lines: Vec<Line> = Vec::new();
-    if draft.tag_conditions.is_empty() {
-        cond_lines.push(Line::from(Span::styled("  No conditions. Base tag applies to all.", Style::default().fg(Color::DarkGray))));
-    } else {
-        for (i, cond) in draft.tag_conditions.iter().enumerate() {
-            let is_sel = cond_focused && i == selected_index;
-            let marker = if is_sel { ">>" } else { "  " };
-            let style = if is_sel { Style::default().fg(Color::White).bold() } else { Style::default().fg(Color::Gray) };
-            cond_lines.push(Line::from(Span::styled(
-                format!("{} IF {} {:?} {} THEN \"{}\"", marker, cond.field, cond.operator, cond.value, cond.tag),
-                style,
-            )));
-        }
-    }
-    let cond_widget = Paragraph::new(cond_lines).block(cond_block);
-    frame.render_widget(cond_widget, chunks[3]);
-
-    // Footer
-    let footer = Line::from(vec![
-        Span::styled(" [Tab] ", Style::default().fg(Color::Cyan)),
-        Span::raw("Next  "),
-        Span::styled("[Enter] ", Style::default().fg(Color::Green)),
-        Span::raw("Save  "),
-        Span::styled("[t] ", Style::default().fg(Color::Yellow)),
-        Span::raw("Test  "),
-        Span::styled("[Esc] ", Style::default().fg(Color::Red)),
-        Span::raw("Cancel"),
-    ]);
-    frame.render_widget(Paragraph::new(footer), chunks[4]);
-}
-
-/// Draw test results UI (Testing phase)
-fn draw_test_results(frame: &mut Frame, app: &App, area: Rect) {
-    use super::extraction::TestPhase;
-
-    let explorer = match &app.discover.glob_explorer {
-        Some(e) => e,
-        None => return,
-    };
-
-    let test_state = match &explorer.test_state {
-        Some(s) => s,
-        None => return,
-    };
-
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .title(Span::styled(" TEST RESULTS ", Style::default().fg(Color::Cyan).bold()));
-    frame.render_widget(main_block, area);
-
-    let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),  // Header
-            Constraint::Min(8),     // Results
-            Constraint::Length(2),  // Footer
-        ])
-        .split(inner);
-
-    // Header with rule info and progress
-    let rule = &test_state.rule;
-    let mut header_lines = vec![
-        Line::from(vec![
-            Span::raw("  Rule: "),
-            Span::styled(if rule.name.is_empty() { "(unnamed)" } else { &rule.name }, Style::default().fg(Color::White).bold()),
-        ]),
-        Line::from(vec![
-            Span::raw("  Pattern: "),
-            Span::styled(&rule.glob_pattern, Style::default().fg(Color::Cyan)),
-        ]),
-    ];
-
-    // Progress line based on phase
-    match &test_state.phase {
-        TestPhase::Running { files_processed, files_total, current_file } => {
-            let pct = if *files_total > 0 { (*files_processed as f64 / *files_total as f64 * 100.0) as usize } else { 0 };
-            let bar_width: usize = 20;
-            let filled = (bar_width * pct / 100).min(bar_width);
-            let bar = format!("[{}{}] {}%", "=".repeat(filled), " ".repeat(bar_width - filled), pct);
-            header_lines.push(Line::from(vec![
-                Span::raw("  Progress: "),
-                Span::styled(bar, Style::default().fg(Color::Yellow)),
-                Span::raw(format!("  ({}/{})", files_processed, files_total)),
-            ]));
-            if let Some(f) = current_file {
-                header_lines.push(Line::from(Span::styled(format!("  Current: {}", f), Style::default().fg(Color::DarkGray))));
-            }
-        }
-        TestPhase::Complete => {
-            header_lines.push(Line::from(Span::styled("  Status: COMPLETE", Style::default().fg(Color::Green).bold())));
-        }
-        TestPhase::Cancelled { .. } => {
-            header_lines.push(Line::from(Span::styled("  Status: CANCELLED", Style::default().fg(Color::Red))));
-        }
-        TestPhase::Error(msg) => {
-            header_lines.push(Line::from(Span::styled(format!("  Error: {}", msg), Style::default().fg(Color::Red))));
-        }
-    }
-    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
-
-    // Results section
-    let results_block = Block::default()
-        .borders(Borders::TOP)
-        .title(Span::styled(" EXTRACTION STATUS ", Style::default().fg(Color::DarkGray)));
-    let results_content = if let Some(ref results) = test_state.results {
-        vec![
-            Line::from(Span::styled(format!("  Complete: {} files", results.complete), Style::default().fg(Color::Green))),
-            Line::from(Span::styled(format!("  Partial:  {} files", results.partial), Style::default().fg(Color::Yellow))),
-            Line::from(Span::styled(format!("  Failed:   {} files", results.failed), Style::default().fg(Color::Red))),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled("  Waiting for test to complete...", Style::default().fg(Color::DarkGray))),
-        ]
-    };
-    let results_widget = Paragraph::new(results_content).block(results_block);
-    frame.render_widget(results_widget, chunks[1]);
-
-    // Footer
-    let footer = if matches!(test_state.phase, TestPhase::Complete) {
-        Line::from(vec![
-            Span::styled(" [p] ", Style::default().fg(Color::Green)),
-            Span::raw("Publish  "),
-            Span::styled("[e] ", Style::default().fg(Color::Yellow)),
-            Span::raw("Edit  "),
-            Span::styled("[Esc] ", Style::default().fg(Color::Red)),
-            Span::raw("Cancel"),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(" [Esc] ", Style::default().fg(Color::Red)),
-            Span::raw("Cancel test"),
-        ])
-    };
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
-}
-
-/// Draw publishing confirmation UI (Publishing phase)
-fn draw_publishing(frame: &mut Frame, app: &App, area: Rect) {
-    use super::extraction::PublishPhase;
-
-    let explorer = match &app.discover.glob_explorer {
-        Some(e) => e,
-        None => return,
-    };
-
-    let publish_state = match &explorer.publish_state {
-        Some(s) => s,
-        None => return,
-    };
-
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .title(Span::styled(" PUBLISH RULE ", Style::default().fg(Color::Green).bold()));
-    frame.render_widget(main_block, area);
-
-    let inner = area.inner(Margin { horizontal: 2, vertical: 1 });
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),  // Summary
-            Constraint::Min(6),     // Actions
-            Constraint::Length(2),  // Footer
-        ])
-        .split(inner);
-
-    // Rule summary
-    let rule = &publish_state.rule;
-    let summary_lines = vec![
-        Line::from(vec![
-            Span::raw("  Rule: "),
-            Span::styled(if rule.name.is_empty() { "(unnamed)" } else { &rule.name }, Style::default().fg(Color::White).bold()),
-        ]),
-        Line::from(vec![
-            Span::raw("  Pattern: "),
-            Span::styled(&rule.glob_pattern, Style::default().fg(Color::Cyan)),
-        ]),
-        Line::from(vec![
-            Span::raw("  Files: "),
-            Span::styled(format!("{}", publish_state.matching_files_count), Style::default().fg(Color::Yellow)),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(summary_lines), chunks[0]);
-
-    // Actions
-    let action_block = Block::default()
-        .borders(Borders::TOP)
-        .title(Span::styled(" This will: ", Style::default().fg(Color::DarkGray)));
-    let action_lines = match publish_state.phase {
-        PublishPhase::Confirming => vec![
-            Line::from(Span::styled("    * Save rule to database", Style::default().fg(Color::Green))),
-            Line::from(Span::styled(format!("    * Extract metadata for {} files", publish_state.matching_files_count), Style::default().fg(Color::Green))),
-            Line::from(Span::styled(format!("    * Apply tag: {}", rule.base_tag), Style::default().fg(Color::Green))),
-            Line::from(Span::styled("    * Start background job", Style::default().fg(Color::Green))),
-        ],
-        PublishPhase::Saving => vec![
-            Line::from(Span::styled("    Saving rule to database...", Style::default().fg(Color::Yellow))),
-        ],
-        PublishPhase::StartingJob => vec![
-            Line::from(Span::styled("    Starting extraction job...", Style::default().fg(Color::Yellow))),
-        ],
-        _ => vec![],
-    };
-    let action_widget = Paragraph::new(action_lines).block(action_block);
-    frame.render_widget(action_widget, chunks[1]);
-
-    // Footer
-    let footer = Line::from(vec![
-        Span::styled(" [Enter] ", Style::default().fg(Color::Green)),
-        Span::raw("Confirm  "),
-        Span::styled("[Esc] ", Style::default().fg(Color::Red)),
-        Span::raw("Cancel"),
-    ]);
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
-}
-
-/// Draw published success screen (Published phase)
-fn draw_published(frame: &mut Frame, area: Rect, job_id: &str) {
-    let main_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .title(Span::styled(" PUBLISH COMPLETE ", Style::default().fg(Color::Green).bold()));
-    frame.render_widget(main_block, area);
-
-    let inner = area.inner(Margin { horizontal: 2, vertical: 2 });
-
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled("  Rule published successfully!", Style::default().fg(Color::Green).bold())),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("  Job ID: "),
-            Span::styled(job_id, Style::default().fg(Color::Cyan).bold()),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("  Status: RUNNING", Style::default().fg(Color::Yellow))),
-        Line::from(""),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" [Enter/Esc] ", Style::default().fg(Color::Cyan)),
-            Span::raw("Return  "),
-            Span::styled("[j] ", Style::default().fg(Color::Yellow)),
-            Span::raw("View jobs"),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(lines), inner);
-}
 
 // ======== Settings Screen ========
 

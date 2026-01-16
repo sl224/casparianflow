@@ -279,7 +279,6 @@ pub enum JobType {
     Scan,
     #[default]
     Parse,
-    Export,
     Backtest,
 }
 
@@ -289,7 +288,6 @@ impl JobType {
         match self {
             JobType::Scan => "SCAN",
             JobType::Parse => "PARSE",
-            JobType::Export => "EXPORT",
             JobType::Backtest => "BACKTEST",
         }
     }
@@ -350,19 +348,7 @@ impl Default for JobInfo {
 pub struct BacktestInfo {
     pub pass_rate: f64,                   // 0.0 - 1.0
     pub iteration: u32,
-    pub high_failure_tested: u32,
     pub high_failure_passed: u32,
-    pub termination_reason: Option<TerminationReason>,
-}
-
-/// Backtest termination reasons
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminationReason {
-    PassRateAchieved,
-    MaxIterations,
-    PlateauDetected,
-    HighFailureEarlyStop,
-    UserStopped,
 }
 
 /// Job failure details
@@ -495,6 +481,8 @@ pub struct HomeState {
     pub selected_card: usize,
     /// Statistics displayed on cards
     pub stats: HomeStats,
+    /// Whether stats have been loaded from database
+    pub stats_loaded: bool,
 }
 
 // =============================================================================
@@ -537,9 +525,6 @@ pub struct ParserBenchState {
 pub enum ParserBenchView {
     #[default]
     ParserList,
-    FilePicker,
-    FilesView,
-    ResultView,
 }
 
 /// Parser information discovered from parsers directory
@@ -797,13 +782,6 @@ pub enum DiscoverViewState {
     // - ParserLab will be standalone mode (not yet implemented)
 }
 
-/// Filter applied to file list based on tag selection
-#[derive(Debug, Clone, PartialEq)]
-pub enum TagFilter {
-    Untagged,           // Show files where tag IS NULL
-    Tag(String),        // Show files with specific tag
-}
-
 /// Source information for Discover mode sidebar
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
@@ -845,11 +823,15 @@ pub struct PendingTagWrite {
 /// Result from background directory scan
 #[derive(Debug)]
 pub enum TuiScanResult {
+    /// Validation passed, scan is starting
+    Started { job_id: i64 },
     /// Progress update during scan
     Progress(ScoutProgress),
     /// Scanning completed successfully
     Complete {
         source_path: String,
+        /// Final count of files persisted (accurate, unlike last progress update)
+        files_persisted: usize,
     },
     /// Scanning failed with error
     Error(String),
@@ -1069,8 +1051,6 @@ pub struct DiscoverState {
     pub view_state: DiscoverViewState,
     /// Previous state for "return to previous" transitions (Esc from dialogs)
     pub previous_view_state: Option<DiscoverViewState>,
-    /// Active tag filter applied to files
-    pub tag_filter: Option<TagFilter>,
 
     // --- File list ---
     pub files: Vec<FileInfo>,
@@ -1600,6 +1580,8 @@ pub struct App {
     pub tick_count: u64,
     /// Pending glob search results (non-blocking recursive search)
     pending_glob_search: Option<mpsc::Receiver<GlobSearchResult>>,
+    /// Pending Rule Builder pattern search (async database query for **/*.ext patterns)
+    pending_rule_builder_search: Option<mpsc::Receiver<RuleBuilderSearchResult>>,
     /// Cancellation token for pending glob search (set to true to cancel)
     glob_search_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Pending folder query (on-demand database query for navigation)
@@ -1608,6 +1590,8 @@ pub struct App {
     pending_sources_load: Option<mpsc::Receiver<Vec<SourceInfo>>>,
     /// Pending jobs load (non-blocking DB query)
     pending_jobs_load: Option<mpsc::Receiver<Vec<JobInfo>>>,
+    /// Pending home stats load (non-blocking DB query)
+    pending_stats_load: Option<mpsc::Receiver<HomeStats>>,
     /// Last time jobs were polled (for incremental updates)
     last_jobs_poll: Option<std::time::Instant>,
     /// Profiler for frame timing and zone breakdown (F12 toggle)
@@ -1686,6 +1670,13 @@ struct GlobSearchResult {
     pattern: String,
 }
 
+/// Result of background Rule Builder pattern search
+struct RuleBuilderSearchResult {
+    folder_matches: Vec<super::extraction::FolderMatch>,
+    total_count: usize,
+    pattern: String,
+}
+
 impl App {
     /// Create new app with given args
     pub fn new(args: TuiArgs) -> Self {
@@ -1745,10 +1736,12 @@ impl App {
             last_cache_load_timing: None,
             tick_count: 0,
             pending_glob_search: None,
+            pending_rule_builder_search: None,
             glob_search_cancelled: None,
             pending_folder_query: None,
             pending_sources_load: None,
             pending_jobs_load: None,
+            pending_stats_load: None,
             last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250), // 250ms frame budget
@@ -1774,11 +1767,13 @@ impl App {
         // Set view state to Rule Builder immediately
         self.discover.view_state = DiscoverViewState::RuleBuilder;
 
-        // Default focus to Sources dropdown on entry (per user feedback)
-        // This lets users quickly select a source when entering Discover
-        self.discover.view_state = DiscoverViewState::SourcesDropdown;
-        self.discover.sources_filter.clear();
-        self.discover.preview_source = Some(self.discover.selected_source_index());
+        // Only auto-open Sources dropdown if no source is selected (first-time use)
+        // Otherwise stay in RuleBuilder view for returning users
+        if self.discover.selected_source_id.is_none() && self.discover.sources.is_empty() {
+            self.discover.view_state = DiscoverViewState::SourcesDropdown;
+            self.discover.sources_filter.clear();
+            self.discover.preview_source = Some(self.discover.selected_source_index());
+        }
     }
 
     /// Create app with injected LLM provider (for testing with mock providers)
@@ -1813,10 +1808,12 @@ impl App {
             last_cache_load_timing: None,
             tick_count: 0,
             pending_glob_search: None,
+            pending_rule_builder_search: None,
             glob_search_cancelled: None,
             pending_folder_query: None,
             pending_sources_load: None,
             pending_jobs_load: None,
+            pending_stats_load: None,
             last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250),
@@ -1881,6 +1878,11 @@ impl App {
                 if self.mode == TuiMode::Discover && self.discover.view_state == DiscoverViewState::Scanning {
                     self.mode = TuiMode::Jobs;
                     self.discover.status_message = Some(("Scan running in background...".to_string(), false));
+                } else if self.mode == TuiMode::Home {
+                    // From Home: [4] Sources card goes to Sources Manager within Discover
+                    self.enter_discover_mode();
+                    self.discover.view_state = DiscoverViewState::SourcesManager;
+                    self.discover.sources_manager_selected = self.discover.selected_source_index();
                 } else {
                     self.mode = TuiMode::Inspect;
                 }
@@ -3706,11 +3708,11 @@ impl App {
             }
 
             // Navigation within sections (phase-aware for FileList)
-            KeyCode::Char('j') | KeyCode::Down => {
+            // 'j' only for vim-style nav when NOT in text input mode
+            KeyCode::Char('j') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
                 use super::extraction::FileResultsPhase;
                 match builder.focus {
                     RuleBuilderFocus::FileList => {
-                        // Phase-aware navigation
                         let max_index = match builder.file_results_phase {
                             FileResultsPhase::Exploration => builder.folder_matches.len().saturating_sub(1),
                             FileResultsPhase::ExtractionPreview => builder.preview_files.len().saturating_sub(1),
@@ -3742,7 +3744,55 @@ impl App {
                 }
             }
 
-            KeyCode::Char('k') | KeyCode::Up => {
+            // Down arrow: navigate lists OR move to next field from text input
+            KeyCode::Down => {
+                use super::extraction::FileResultsPhase;
+                match builder.focus {
+                    // In text input fields, Down moves to next field
+                    RuleBuilderFocus::Pattern => {
+                        builder.focus = RuleBuilderFocus::Excludes;
+                    }
+                    RuleBuilderFocus::Tag => {
+                        builder.focus = RuleBuilderFocus::Extractions;
+                    }
+                    RuleBuilderFocus::ExcludeInput => {
+                        builder.focus = RuleBuilderFocus::Tag;
+                    }
+                    // In lists, navigate within the list
+                    RuleBuilderFocus::FileList => {
+                        let max_index = match builder.file_results_phase {
+                            FileResultsPhase::Exploration => builder.folder_matches.len().saturating_sub(1),
+                            FileResultsPhase::ExtractionPreview => builder.preview_files.len().saturating_sub(1),
+                            FileResultsPhase::BacktestResults => builder.visible_indices.len().saturating_sub(1),
+                        };
+                        if max_index > 0 {
+                            builder.selected_file = (builder.selected_file + 1).min(max_index);
+                        }
+                    }
+                    RuleBuilderFocus::Excludes => {
+                        if !builder.excludes.is_empty() {
+                            builder.selected_exclude = (builder.selected_exclude + 1)
+                                .min(builder.excludes.len().saturating_sub(1));
+                        }
+                    }
+                    RuleBuilderFocus::Extractions => {
+                        if !builder.extractions.is_empty() {
+                            builder.selected_extraction = (builder.selected_extraction + 1)
+                                .min(builder.extractions.len().saturating_sub(1));
+                        }
+                    }
+                    RuleBuilderFocus::IgnorePicker => {
+                        if !builder.ignore_options.is_empty() {
+                            builder.ignore_selected = (builder.ignore_selected + 1)
+                                .min(builder.ignore_options.len().saturating_sub(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // 'k' only for vim-style nav when NOT in text input mode
+            KeyCode::Char('k') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
                 match builder.focus {
                     RuleBuilderFocus::FileList => {
                         builder.selected_file = builder.selected_file.saturating_sub(1);
@@ -3752,6 +3802,43 @@ impl App {
                     }
                     RuleBuilderFocus::Extractions => {
                         builder.selected_extraction = builder.selected_extraction.saturating_sub(1);
+                    }
+                    RuleBuilderFocus::IgnorePicker => {
+                        builder.ignore_selected = builder.ignore_selected.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Up arrow: navigate lists OR move to previous field from text input
+            KeyCode::Up => {
+                match builder.focus {
+                    // In text input fields, Up moves to previous field
+                    RuleBuilderFocus::Tag => {
+                        builder.focus = RuleBuilderFocus::Excludes;
+                    }
+                    RuleBuilderFocus::ExcludeInput => {
+                        builder.focus = RuleBuilderFocus::Excludes;
+                    }
+                    // In lists, navigate within the list
+                    RuleBuilderFocus::FileList => {
+                        builder.selected_file = builder.selected_file.saturating_sub(1);
+                    }
+                    RuleBuilderFocus::Excludes => {
+                        if builder.selected_exclude == 0 {
+                            // At top of excludes, move to Pattern
+                            builder.focus = RuleBuilderFocus::Pattern;
+                        } else {
+                            builder.selected_exclude = builder.selected_exclude.saturating_sub(1);
+                        }
+                    }
+                    RuleBuilderFocus::Extractions => {
+                        if builder.selected_extraction == 0 {
+                            // At top of extractions, move to Tag
+                            builder.focus = RuleBuilderFocus::Tag;
+                        } else {
+                            builder.selected_extraction = builder.selected_extraction.saturating_sub(1);
+                        }
                     }
                     RuleBuilderFocus::IgnorePicker => {
                         builder.ignore_selected = builder.ignore_selected.saturating_sub(1);
@@ -3789,7 +3876,7 @@ impl App {
             }
 
             // 't' to run backtest (Phase 2 -> Phase 3) - only when not editing text
-            KeyCode::Char('t') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+            KeyCode::Char('t') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
                 use super::extraction::FileResultsPhase;
                 if matches!(builder.file_results_phase, FileResultsPhase::ExtractionPreview) {
                     // Transition to Backtest Results phase
@@ -4070,6 +4157,110 @@ impl App {
             format!("**/{}", pattern)
         };
 
+        // Check for "match all" patterns - use root folder counts directly
+        // The cache only has root-level entries, so traversing won't find subfolders
+        let is_match_all = glob_pattern == "**/*" || glob_pattern == "**" || pattern == "*";
+
+        // For recursive patterns like "**/*.csv", we need to query the database
+        // because the in-memory folder_cache only contains root-level entries
+        if glob_pattern.contains("**") && !is_match_all {
+            // Get source ID from glob_explorer
+            let source_id = match self.discover.glob_explorer.as_ref() {
+                Some(e) => e.cache_source_id.clone().unwrap_or_default(),
+                None => return,
+            };
+
+            if source_id.is_empty() {
+                return; // No source loaded yet
+            }
+
+            // Parse pattern for database query
+            let (extension, path_pattern) = Self::parse_glob_for_db(&glob_pattern);
+
+            // Show loading indicator
+            if let Some(builder) = self.discover.rule_builder.as_mut() {
+                builder.folder_matches.clear();
+                builder.match_count = 0;
+                builder.is_streaming = true;
+            }
+
+            // Spawn async database search
+            let pattern_for_msg = glob_pattern.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            self.pending_rule_builder_search = Some(rx);
+
+            tokio::spawn(async move {
+                let db_path = dirs::home_dir()
+                    .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+
+                let db = match crate::scout::Database::open(&db_path).await {
+                    Ok(db) => db,
+                    Err(_) => {
+                        let _ = tx.send(RuleBuilderSearchResult {
+                            folder_matches: vec![],
+                            total_count: 0,
+                            pattern: pattern_for_msg,
+                        }).await;
+                        return;
+                    }
+                };
+
+                // Count total matches
+                let total_count = db.count_files_by_pattern(
+                    &source_id,
+                    extension.as_deref(),
+                    path_pattern.as_deref(),
+                ).await.unwrap_or(0) as usize;
+
+                // Get sample results to show folder distribution
+                let results = db.search_files_by_pattern(
+                    &source_id,
+                    extension.as_deref(),
+                    path_pattern.as_deref(),
+                    1000,  // Get more results to show folder distribution
+                    0,
+                ).await.unwrap_or_default();
+
+                // Group by parent folder
+                let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
+                    std::collections::HashMap::new();
+
+                for (rel_path, _size, _mtime) in results {
+                    // Extract parent folder from path
+                    let folder = if let Some(idx) = rel_path.rfind('/') {
+                        rel_path[..idx].to_string()
+                    } else {
+                        ".".to_string()
+                    };
+                    let filename = rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string();
+                    let entry = folder_counts.entry(folder).or_insert((0, filename));
+                    entry.0 += 1;
+                }
+
+                // Convert to FolderMatch
+                let mut folder_matches: Vec<super::extraction::FolderMatch> = folder_counts
+                    .into_iter()
+                    .map(|(path, (count, sample))| super::extraction::FolderMatch {
+                        path: if path == "." { "./".to_string() } else { format!("{}/", path) },
+                        count,
+                        sample_filename: sample,
+                        files: Vec::new(),
+                    })
+                    .collect();
+
+                folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
+
+                let _ = tx.send(RuleBuilderSearchResult {
+                    folder_matches,
+                    total_count,
+                    pattern: pattern_for_msg,
+                }).await;
+            });
+
+            return;
+        }
+
         let matcher = match GlobBuilder::new(&glob_pattern)
             .case_insensitive(true)
             .build()
@@ -4093,59 +4284,86 @@ impl App {
                 None => return,
             };
 
-            let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
-                std::collections::HashMap::new();
+            // For "match all" patterns, use root folder info directly
+            // These already have accurate file counts from the database
+            if is_match_all {
+                if let Some(root_items) = folder_cache.get("") {
+                    let mut folder_matches: Vec<FolderMatch> = root_items
+                        .iter()
+                        .map(|item| FolderMatch {
+                            path: if item.is_file {
+                                "./".to_string()
+                            } else {
+                                format!("{}/", item.name)
+                            },
+                            count: item.file_count,
+                            sample_filename: item.name.clone(),
+                            files: Vec::new(),
+                        })
+                        .collect();
 
-            // Recursive function to traverse folder cache
-            fn traverse_cache(
-                cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
-                prefix: &str,
-                matcher: &globset::GlobMatcher,
-                folder_counts: &mut std::collections::HashMap<String, (usize, String)>,
-            ) {
-                if let Some(items) = cache.get(prefix) {
-                    for item in items {
-                        let full_path = if prefix.is_empty() {
-                            item.name.clone()
-                        } else {
-                            format!("{}{}", prefix, item.name)
-                        };
+                    folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
+                    let match_count = folder_matches.iter().map(|f| f.count).sum();
+                    (folder_matches, match_count)
+                } else {
+                    (Vec::new(), 0)
+                }
+            } else {
+                // For specific patterns, traverse the cache
+                let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
+                    std::collections::HashMap::new();
 
-                        if item.is_file {
-                            if matcher.is_match(&full_path) {
-                                let folder = if prefix.is_empty() {
-                                    ".".to_string()
-                                } else {
-                                    prefix.trim_end_matches('/').to_string()
-                                };
-                                let entry = folder_counts.entry(folder).or_insert((0, item.name.clone()));
-                                entry.0 += 1;
+                // Recursive function to traverse folder cache
+                fn traverse_cache(
+                    cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
+                    prefix: &str,
+                    matcher: &globset::GlobMatcher,
+                    folder_counts: &mut std::collections::HashMap<String, (usize, String)>,
+                ) {
+                    if let Some(items) = cache.get(prefix) {
+                        for item in items {
+                            let full_path = if prefix.is_empty() {
+                                item.name.clone()
+                            } else {
+                                format!("{}{}", prefix, item.name)
+                            };
+
+                            if item.is_file {
+                                if matcher.is_match(&full_path) {
+                                    let folder = if prefix.is_empty() {
+                                        ".".to_string()
+                                    } else {
+                                        prefix.trim_end_matches('/').to_string()
+                                    };
+                                    let entry = folder_counts.entry(folder).or_insert((0, item.name.clone()));
+                                    entry.0 += 1;
+                                }
+                            } else {
+                                let sub_prefix = format!("{}/", full_path);
+                                traverse_cache(cache, &sub_prefix, matcher, folder_counts);
                             }
-                        } else {
-                            let sub_prefix = format!("{}/", full_path);
-                            traverse_cache(cache, &sub_prefix, matcher, folder_counts);
                         }
                     }
                 }
+
+                traverse_cache(folder_cache, "", &matcher, &mut folder_counts);
+
+                // Convert to FolderMatch and sort
+                let mut folder_matches: Vec<FolderMatch> = folder_counts
+                    .into_iter()
+                    .filter(|(_, (count, _))| *count > 0)
+                    .map(|(path, (count, sample))| FolderMatch {
+                        path: if path == "." { "./".to_string() } else { format!("{}/", path) },
+                        count,
+                        sample_filename: sample,
+                        files: Vec::new(),
+                    })
+                    .collect();
+
+                folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
+                let match_count = folder_matches.iter().map(|f| f.count).sum();
+                (folder_matches, match_count)
             }
-
-            traverse_cache(folder_cache, "", &matcher, &mut folder_counts);
-
-            // Convert to FolderMatch and sort
-            let mut folder_matches: Vec<FolderMatch> = folder_counts
-                .into_iter()
-                .filter(|(_, (count, _))| *count > 0)
-                .map(|(path, (count, sample))| FolderMatch {
-                    path: if path == "." { "./".to_string() } else { format!("{}/", path) },
-                    count,
-                    sample_filename: sample,
-                    files: Vec::new(),
-                })
-                .collect();
-
-            folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
-            let match_count = folder_matches.iter().map(|f| f.count).sum();
-            (folder_matches, match_count)
         }; // shared borrow ends here
 
         // Update builder with mutable borrow
@@ -4454,8 +4672,8 @@ impl App {
     fn refresh_current_view(&mut self) {
         match self.mode {
             TuiMode::Home => {
-                // Home stats are currently static placeholders
-                // TODO: Load real stats from database
+                // Mark stats as needing refresh - will trigger reload on next tick
+                self.home.stats_loaded = false;
             }
             TuiMode::Discover => {
                 // Mark data as needing refresh - will trigger reload on next tick
@@ -4495,6 +4713,21 @@ impl App {
                 // Check sources/tags dropdown filtering
                 if self.discover.sources_filtering || self.discover.tags_filtering {
                     return true;
+                }
+                // Check Rule Builder text input fields (Pattern, Tag, ExcludeInput, ExtractionEdit)
+                if self.discover.view_state == DiscoverViewState::RuleBuilder {
+                    if let Some(ref builder) = self.discover.rule_builder {
+                        use super::extraction::RuleBuilderFocus;
+                        if matches!(
+                            builder.focus,
+                            RuleBuilderFocus::Pattern |
+                            RuleBuilderFocus::Tag |
+                            RuleBuilderFocus::ExcludeInput |
+                            RuleBuilderFocus::ExtractionEdit(_)
+                        ) {
+                            return true;
+                        }
+                    }
                 }
                 // All other text input states are in the view_state enum
                 matches!(
@@ -4738,17 +4971,17 @@ impl App {
         let job_id = self.add_scan_job(&path_display);
         self.current_scan_job_id = Some(job_id);
 
-        // Show confirmation with job ID
-        self.discover.status_message = Some((
-            format!("Scan started (Job #{}) - press [4] to view Jobs", job_id),
-            false,
-        ));
+        // Don't show "Scan started" yet - wait for validation to pass
+        // The status will update to "Scan started" after validation succeeds
+        // or show an error message if validation fails
+        self.discover.status_message = None;
 
         // Get database path
         let db_path = self.config.database.clone()
             .unwrap_or_else(crate::cli::config::default_db_path);
 
         let source_path = path_display;
+        let scan_job_id = job_id; // Capture for async block
 
         // Spawn async task for scanning
         tokio::spawn(async move {
@@ -4793,6 +5026,31 @@ impl App {
                     return;
                 }
 
+                // Check for overlapping sources (parent/child relationships)
+                // This prevents duplicate file tracking and conflicting tags
+                if let Err(e) = db.check_source_overlap(std::path::Path::new(&source_path)).await {
+                    let suggestion = match &e {
+                        crate::scout::error::ScoutError::SourceIsChildOfExisting { existing_name, .. } => {
+                            format!(
+                                "Either delete source '{}' first, or use tagging rules to organize files within that source.",
+                                existing_name
+                            )
+                        }
+                        crate::scout::error::ScoutError::SourceIsParentOfExisting { existing_name, .. } => {
+                            format!(
+                                "Either delete source '{}' first, or scan a non-overlapping directory.",
+                                existing_name
+                            )
+                        }
+                        _ => String::new(),
+                    };
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "{}\n\nSuggestion: {}",
+                        e, suggestion
+                    ))).await;
+                    return;
+                }
+
                 let source_id = format!("local:{}", source_path.replace(['/', '\\'], "_"));
 
                 let new_source = Source {
@@ -4812,6 +5070,9 @@ impl App {
 
                 new_source
             };
+
+            // Validation passed - notify TUI that scan is starting
+            let _ = tui_tx.send(TuiScanResult::Started { job_id: scan_job_id }).await;
 
             // Create progress channel that sends directly to TUI
             // We wrap tui_tx in a channel adapter so scanner can use its existing interface
@@ -4850,10 +5111,11 @@ impl App {
             let _ = forward_handle.await;
 
             match scan_result {
-                Ok(Ok(_result)) => {
+                Ok(Ok(result)) => {
                     // Scan complete - TUI will load files from DB
                     let _ = tui_tx.send(TuiScanResult::Complete {
                         source_path,
+                        files_persisted: result.stats.files_discovered as usize,
                     }).await;
                 }
                 Ok(Err(e)) => {
@@ -5175,9 +5437,9 @@ impl App {
             let mut cache: HashMap<String, Vec<FolderInfo>> = HashMap::new();
             cache.insert(String::new(), folder_infos);
 
-            // Get total file count for source
+            // Get total file count from denormalized scout_sources.file_count (O(1))
             let total_files: usize = match sqlx::query_as::<_, (i64,)>(
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ?"
+                "SELECT file_count FROM scout_sources WHERE id = ?"
             )
             .bind(&source_id_str)
             .fetch_one(db.pool())
@@ -5286,99 +5548,75 @@ impl App {
             let prefix = explorer.current_prefix.clone();
             let pattern = explorer.pattern.clone();
 
-            // Handle ** patterns with recursive tree search (NON-BLOCKING)
-            if pattern.contains("**") {
-                // Cancel any pending search by setting cancellation flag
-                if let Some(ref cancel_token) = self.glob_search_cancelled {
-                    cancel_token.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+            // Treat "**/*" and "**" as "show all" - use normal folder navigation
+            // Only do recursive search for specific patterns like "**/*.rs"
+            let is_match_all = pattern == "**/*" || pattern == "**" || pattern == "*" || pattern.is_empty();
+
+            // Handle ** patterns with database query (not in-memory cache)
+            // Skip for "match all" patterns - just use folder navigation
+            if pattern.contains("**") && !is_match_all {
+                // Cancel any pending search
                 self.pending_glob_search = None;
 
-                // Clone cache for background search
-                let cache = explorer.folder_cache.clone();
+                // Parse pattern to extract extension and path filter
+                let (extension, path_pattern) = Self::parse_glob_for_db(&pattern);
                 let pattern_for_search = pattern.clone();
+
+                // Get source ID for query
+                let source_id = explorer.cache_source_id.clone().unwrap_or_default();
 
                 // Show loading indicator immediately
                 let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
-                explorer.folders = vec![FolderInfo::loading(&format!("{} Searching for {}...", spinner_char, pattern))];
+                explorer.folders = vec![FolderInfo::loading(&format!("{} Searching...", spinner_char))];
 
-                // Create new cancellation token for this search
-                let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                self.glob_search_cancelled = Some(cancelled.clone());
-
-                // Spawn background task for CPU-bound search
+                // Spawn async task for database query
                 let (tx, rx) = mpsc::channel(1);
                 self.pending_glob_search = Some(rx);
 
-                tokio::task::spawn_blocking(move || {
-                    let simplified_pattern = if pattern_for_search.starts_with("**/") {
-                        pattern_for_search.strip_prefix("**/").unwrap_or(&pattern_for_search).to_string()
-                    } else {
-                        pattern_for_search.replace("**/", "")
-                    };
-                    let pattern_lower = simplified_pattern.to_lowercase();
+                tokio::spawn(async move {
+                    let db_path = dirs::home_dir()
+                        .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+                        .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
 
-                    // Collect individual matching files (with limit for performance)
-                    const MAX_RESULTS: usize = 1000;
-                    let mut matching_files: Vec<(String, String)> = Vec::new(); // (full_path, filename)
-                    let mut total_count = 0usize;
-                    let mut check_counter = 0u32;
-
-                    for (folder_prefix, entries) in &cache {
-                        for entry in entries {
-                            // Check cancellation every 1000 entries to avoid overhead
-                            check_counter += 1;
-                            if check_counter % 1000 == 0 {
-                                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                                    return; // Exit early - search was cancelled
-                                }
-                            }
-
-                            if entry.is_file {
-                                let name_lower = entry.name.to_lowercase();
-                                let matches_pattern = Self::glob_match_name(&name_lower, &pattern_lower);
-                                if matches_pattern {
-                                    total_count += 1;
-                                    // Only collect up to MAX_RESULTS for display
-                                    if matching_files.len() < MAX_RESULTS {
-                                        let full_path = if folder_prefix.is_empty() {
-                                            entry.name.clone()
-                                        } else {
-                                            format!("{}{}", folder_prefix, entry.name)
-                                        };
-                                        matching_files.push((full_path, entry.name.clone()));
-                                    }
-                                }
-                            }
+                    let db = match ScoutDatabase::open(&db_path).await {
+                        Ok(db) => db,
+                        Err(_) => {
+                            let _ = tx.send(GlobSearchResult {
+                                folders: vec![],
+                                total_count: 0,
+                                pattern: pattern_for_search,
+                            }).await;
+                            return;
                         }
-                    }
+                    };
 
-                    // Final cancellation check before building results
-                    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
+                    // Get count + first 100 results using indexed extension query
+                    let count = db.count_files_by_pattern(
+                        &source_id,
+                        extension.as_deref(),
+                        path_pattern.as_deref(),
+                    ).await.unwrap_or(0);
 
-                    // Convert to FolderInfo vec showing individual files
-                    let mut matches: Vec<FolderInfo> = matching_files
-                        .into_iter()
-                        .map(|(full_path, _filename)| {
-                            // Show full path, mark as file
-                            FolderInfo::with_path(full_path.clone(), Some(full_path), 1, true)
+                    let results = db.search_files_by_pattern(
+                        &source_id,
+                        extension.as_deref(),
+                        path_pattern.as_deref(),
+                        100,
+                        0,
+                    ).await.unwrap_or_default();
+
+                    // Convert to FolderInfo for display
+                    let folders: Vec<FolderInfo> = results.into_iter()
+                        .map(|(path, _size, _mtime)| {
+                            FolderInfo::with_path(path.clone(), Some(path), 1, true)
                         })
                         .collect();
 
-                    // Sort by file count descending (most matches first)
-                    // Sort alphabetically by path
-                    matches.sort_by(|a, b| a.name.cmp(&b.name));
-
-                    // Send result back via blocking channel send (only if not cancelled)
-                    if !cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = tx.blocking_send(GlobSearchResult {
-                            folders: matches,
-                            total_count,
-                            pattern: pattern_for_search,
-                        });
-                    }
+                    let _ = tx.send(GlobSearchResult {
+                        folders,
+                        total_count: count as usize,
+                        pattern: pattern_for_search,
+                    }).await;
                 });
 
                 return;
@@ -5415,9 +5653,10 @@ impl App {
         }
 
         // Check if we need to start a folder query (outside the borrow scope)
+        // Always query DB if cache is empty, even with "**" patterns (need to populate cache first)
         let needs_query = if let Some(ref explorer) = self.discover.glob_explorer {
             let prefix = &explorer.current_prefix;
-            !explorer.folder_cache.contains_key(prefix) && !explorer.pattern.contains("**")
+            !explorer.folder_cache.contains_key(prefix)
         } else {
             false
         };
@@ -5503,6 +5742,61 @@ impl App {
             // Simple substring match
             name.contains(pattern)
         }
+    }
+
+    /// Parse glob pattern into (extension, path_pattern) for database query.
+    ///
+    /// Extracts file extension and converts glob syntax to SQL LIKE pattern.
+    ///
+    /// # Examples
+    /// - "**/*.rs" → (Some("rs"), None)
+    /// - "**/src/**/*.rs" → (Some("rs"), Some("%/src/%"))
+    /// - "data_*.csv" → (Some("csv"), Some("data_%"))
+    /// - "**/*.tar.gz" → (Some("gz"), None)
+    fn parse_glob_for_db(pattern: &str) -> (Option<String>, Option<String>) {
+        // Extract extension from end if pattern ends with *.ext
+        let extension = if pattern.contains("*.") {
+            pattern.rsplit("*.").next()
+                .filter(|ext| !ext.contains('/') && !ext.contains('*'))
+                .map(|ext| ext.to_lowercase())
+        } else {
+            None
+        };
+
+        // Convert remaining pattern to LIKE syntax
+        let path_pattern = if pattern.contains('/') || pattern.contains("**") {
+            let mut like = pattern
+                .replace("**/", "%")
+                .replace("**", "%")
+                .replace('*', "%")
+                .replace('?', "_");
+
+            // Remove extension part if we extracted it (e.g., "%.rs" -> "%")
+            if extension.is_some() {
+                if let Some(idx) = like.rfind("%.") {
+                    like = like[..idx].to_string();
+                    // Ensure pattern still has content
+                    if like.is_empty() || like == "%" {
+                        return (extension, None);
+                    }
+                    // Add trailing % to match any file in the path
+                    if !like.ends_with('%') {
+                        like.push('%');
+                    }
+                }
+            }
+
+            // Skip trivial patterns that match everything
+            if like == "%" || like == "%%" || like.is_empty() {
+                None
+            } else {
+                Some(like)
+            }
+        } else {
+            None
+        };
+
+        (extension, path_pattern)
     }
 
     /// Start non-blocking sources load from Scout database
@@ -5665,6 +5959,81 @@ impl App {
         });
     }
 
+    /// Start non-blocking home stats load from database
+    fn start_stats_load(&mut self) {
+        // Skip if already loading
+        if self.pending_stats_load.is_some() {
+            return;
+        }
+
+        let db_path = dirs::home_dir()
+            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+
+        if !db_path.exists() {
+            self.home.stats_loaded = true;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel(1);
+        self.pending_stats_load = Some(rx);
+
+        // Spawn background task for DB query
+        tokio::spawn(async move {
+            use sqlx::SqlitePool;
+
+            let db_url = format!("sqlite:{}?mode=ro", db_path.display());
+            if let Ok(pool) = SqlitePool::connect(&db_url).await {
+                let mut stats = HomeStats::default();
+
+                // Count files from scout_files
+                if let Ok(row) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scout_files")
+                    .fetch_one(&pool)
+                    .await
+                {
+                    stats.file_count = row as usize;
+                }
+
+                // Count enabled sources from scout_sources
+                if let Ok(row) = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM scout_sources WHERE enabled = 1"
+                )
+                    .fetch_one(&pool)
+                    .await
+                {
+                    stats.source_count = row as usize;
+                }
+
+                // Count jobs by status from cf_processing_queue
+                if let Ok(rows) = sqlx::query_as::<_, (String, i64)>(
+                    "SELECT status, COUNT(*) as cnt FROM cf_processing_queue GROUP BY status"
+                )
+                    .fetch_all(&pool)
+                    .await
+                {
+                    for (status, count) in rows {
+                        match status.as_str() {
+                            "RUNNING" => stats.running_jobs = count as usize,
+                            "QUEUED" => stats.pending_jobs = count as usize,
+                            "FAILED" => stats.failed_jobs = count as usize,
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Count parsers from cf_parsers
+                if let Ok(row) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cf_parsers")
+                    .fetch_one(&pool)
+                    .await
+                {
+                    stats.parser_count = row as usize;
+                }
+
+                let _ = tx.send(stats).await;
+            }
+        });
+    }
+
     /// Persist pending tag and rule writes to the database
     async fn persist_pending_writes(&mut self) {
         use sqlx::SqlitePool;
@@ -5818,13 +6187,18 @@ impl App {
                 }
             }
             // Enter: Navigate to selected mode
-            // Card order: 0=Discover, 1=ParserBench, 2=Jobs, 3=Sources (Inspect placeholder)
+            // Card order: 0=Discover, 1=ParserBench, 2=Jobs, 3=Sources
             KeyCode::Enter => {
                 match self.home.selected_card {
                     0 => self.enter_discover_mode(),
                     1 => self.mode = TuiMode::ParserBench,
                     2 => self.mode = TuiMode::Jobs,
-                    3 => self.mode = TuiMode::Inspect, // TODO: TuiMode::Sources when implemented
+                    3 => {
+                        // [4] Sources: Go to Discover mode with Sources Manager open
+                        self.enter_discover_mode();
+                        self.discover.view_state = DiscoverViewState::SourcesManager;
+                        self.discover.sources_manager_selected = self.discover.selected_source_index();
+                    }
                     _ => self.mode = TuiMode::Home,
                 };
             }
@@ -6596,6 +6970,30 @@ impl App {
             self.start_sources_load();
         }
 
+        // Preload home stats on startup so Home screen shows real data
+        if !self.home.stats_loaded && self.pending_stats_load.is_none() {
+            self.start_stats_load();
+        }
+
+        // Poll for pending stats load results (non-blocking)
+        if let Some(ref mut rx) = self.pending_stats_load {
+            match rx.try_recv() {
+                Ok(stats) => {
+                    self.home.stats = stats;
+                    self.home.stats_loaded = true;
+                    self.pending_stats_load = None;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Still loading - that's fine
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Channel closed, mark as loaded (keep default stats)
+                    self.home.stats_loaded = true;
+                    self.pending_stats_load = None;
+                }
+            }
+        }
+
         // Poll for pending sources load results (non-blocking)
         if let Some(ref mut rx) = self.pending_sources_load {
             let recv_result = {
@@ -6733,6 +7131,39 @@ impl App {
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.pending_glob_search = None;
+                }
+            }
+        }
+
+        // Poll for pending Rule Builder pattern search results
+        if let Some(ref mut rx) = self.pending_rule_builder_search {
+            match rx.try_recv() {
+                Ok(result) => {
+                    // Only apply results if pattern still matches (user may have typed more)
+                    let current_pattern = self.discover.rule_builder
+                        .as_ref()
+                        .map(|b| b.pattern.clone())
+                        .unwrap_or_default();
+
+                    if result.pattern == current_pattern || result.pattern == format!("**/{}", current_pattern) {
+                        // Search complete! Update Rule Builder with results
+                        if let Some(ref mut builder) = self.discover.rule_builder {
+                            builder.folder_matches = result.folder_matches;
+                            builder.match_count = result.total_count;
+                            builder.is_streaming = false;
+                        }
+                    }
+                    // else: stale result, discard it
+                    self.pending_rule_builder_search = None;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Still searching - spinner is shown via builder.streaming flag
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.pending_rule_builder_search = None;
+                    if let Some(ref mut builder) = self.discover.rule_builder {
+                        builder.is_streaming = false;
+                    }
                 }
             }
         }
@@ -6980,11 +7411,18 @@ impl App {
                 match rx.try_recv() {
                     Ok(result) => {
                         match result {
+                            TuiScanResult::Started { job_id } => {
+                                // Validation passed, scan is actually starting
+                                self.discover.status_message = Some((
+                                    format!("Scan started (Job #{}) - press [4] to view Jobs", job_id),
+                                    false,
+                                ));
+                            }
                             TuiScanResult::Progress(progress) => {
                                 // Update progress - UI will display this
                                 self.discover.scan_progress = Some(progress);
                             }
-                            TuiScanResult::Complete { source_path } => {
+                            TuiScanResult::Complete { source_path, files_persisted } => {
                                 // Update job status to Completed
                                 if let Some(job_id) = self.current_scan_job_id {
                                     self.update_scan_job_status(job_id, JobStatus::Completed, None);
@@ -6995,6 +7433,9 @@ impl App {
                                     .file_name()
                                     .map(|n| n.to_string_lossy().to_string())
                                     .unwrap_or_else(|| source_path.clone());
+
+                                // Use accurate count from scanner (not stale progress update)
+                                let final_file_count = files_persisted;
 
                                 // Generate source ID matching scanner's format
                                 let source_id = SourceId(format!(
@@ -7007,22 +7448,44 @@ impl App {
                                 self.start_sources_load();
 
                                 // Select the newly scanned source
-                                self.discover.selected_source_id = Some(source_id);
+                                self.discover.selected_source_id = Some(source_id.clone());
 
-                                // Load files for the new source
+                                // Update rule builder with new source
+                                if let Some(ref mut builder) = self.discover.rule_builder {
+                                    builder.source_id = Some(source_id.as_str().to_string());
+                                }
+
+                                // Load files for the new source (this sets data_loaded = true)
                                 self.load_scout_files().await;
 
-                                let file_count = self.discover.files.len();
+                                // Reset cache state to force reload for the new source
+                                // IMPORTANT: Must be AFTER load_scout_files() because it sets data_loaded=true
+                                self.discover.data_loaded = false;
+                                self.pending_cache_load = None;
+                                self.cache_load_progress = None;
+                                if let Some(ref mut explorer) = self.discover.glob_explorer {
+                                    explorer.cache_loaded = false;
+                                    explorer.cache_source_id = None;
+                                    explorer.folder_cache.clear();
+                                    explorer.folders.clear();
+                                }
+
                                 self.discover.selected = 0;
                                 self.discover.scan_error = None;
-                                self.discover.view_state = DiscoverViewState::Files;
+                                // Stay in RuleBuilder mode (the default view)
+                                self.discover.view_state = DiscoverViewState::RuleBuilder;
                                 self.discover.scanning_path = None;
                                 self.discover.scan_progress = None;
                                 self.discover.scan_start_time = None;
                                 self.discover.status_message = Some((
-                                    format!("Scanned {} files from {}", file_count, source_name),
+                                    format!("Scanned {} files from {}", final_file_count, source_name),
                                     false,
                                 ));
+
+                                // Trigger home stats refresh so Home view shows updated counts
+                                self.home.stats_loaded = false;
+                                self.pending_stats_load = None;
+
                                 scan_complete = true;
                                 break;
                             }
@@ -7466,83 +7929,55 @@ if __name__ == "__main__":
 
     /// Handle Parser Bench mode keys
     fn handle_parser_bench_key(&mut self, key: KeyEvent) {
-        match self.parser_bench.view {
-            ParserBenchView::ParserList => {
-                match key.code {
-                    // Navigation
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !self.parser_bench.parsers.is_empty() {
-                            self.parser_bench.selected_parser =
-                                (self.parser_bench.selected_parser + 1) % self.parser_bench.parsers.len();
-                        }
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if !self.parser_bench.parsers.is_empty() {
-                            if self.parser_bench.selected_parser == 0 {
-                                self.parser_bench.selected_parser = self.parser_bench.parsers.len() - 1;
-                            } else {
-                                self.parser_bench.selected_parser -= 1;
-                            }
-                        }
-                    }
-                    // Test parser
-                    KeyCode::Char('t') | KeyCode::Enter => {
-                        // TODO: Start test flow
-                    }
-                    // Quick test
-                    KeyCode::Char('n') => {
-                        // TODO: Open file picker for quick test
-                    }
-                    // Refresh
-                    KeyCode::Char('r') => {
-                        self.parser_bench.parsers_loaded = false;
-                    }
-                    // Delete broken symlink
-                    KeyCode::Char('d') => {
-                        if !self.parser_bench.parsers.is_empty() {
-                            let parser = &self.parser_bench.parsers[self.parser_bench.selected_parser];
-                            if parser.symlink_broken {
-                                // Remove the broken symlink
-                                let _ = std::fs::remove_file(&parser.path);
-                                self.parser_bench.parsers_loaded = false; // Trigger reload
-                            }
-                        }
-                    }
-                    // Clear test result
-                    KeyCode::Esc => {
-                        if self.parser_bench.test_result.is_some() {
-                            self.parser_bench.test_result = None;
-                        } else {
-                            self.mode = TuiMode::Home;
-                        }
-                    }
-                    _ => {}
+        match key.code {
+            // Navigation
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.parser_bench.parsers.is_empty() {
+                    self.parser_bench.selected_parser =
+                        (self.parser_bench.selected_parser + 1) % self.parser_bench.parsers.len();
                 }
             }
-            ParserBenchView::ResultView => {
-                match key.code {
-                    // Re-run test
-                    KeyCode::Char('r') => {
-                        // TODO: Re-run last test
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !self.parser_bench.parsers.is_empty() {
+                    if self.parser_bench.selected_parser == 0 {
+                        self.parser_bench.selected_parser = self.parser_bench.parsers.len() - 1;
+                    } else {
+                        self.parser_bench.selected_parser -= 1;
                     }
-                    // Different file
-                    KeyCode::Char('f') => {
-                        self.parser_bench.view = ParserBenchView::ParserList;
-                        self.parser_bench.test_result = None;
-                    }
-                    // Back to list
-                    KeyCode::Esc => {
-                        self.parser_bench.view = ParserBenchView::ParserList;
-                        self.parser_bench.test_result = None;
-                    }
-                    _ => {}
                 }
             }
-            _ => {
-                if key.code == KeyCode::Esc {
-                    self.parser_bench.view = ParserBenchView::ParserList;
+            // Test parser
+            KeyCode::Char('t') | KeyCode::Enter => {
+                // TODO: Start test flow
+            }
+            // Quick test
+            KeyCode::Char('n') => {
+                // TODO: Open file picker for quick test
+            }
+            // Refresh
+            KeyCode::Char('r') => {
+                self.parser_bench.parsers_loaded = false;
+            }
+            // Delete broken symlink
+            KeyCode::Char('d') => {
+                if !self.parser_bench.parsers.is_empty() {
+                    let parser = &self.parser_bench.parsers[self.parser_bench.selected_parser];
+                    if parser.symlink_broken {
+                        // Remove the broken symlink
+                        let _ = std::fs::remove_file(&parser.path);
+                        self.parser_bench.parsers_loaded = false; // Trigger reload
+                    }
                 }
             }
+            // Clear test result / Back to home
+            KeyCode::Esc => {
+                if self.parser_bench.test_result.is_some() {
+                    self.parser_bench.test_result = None;
+                } else {
+                    self.mode = TuiMode::Home;
+                }
+            }
+            _ => {}
         }
     }
 }

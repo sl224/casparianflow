@@ -45,13 +45,6 @@ pub fn parsers_dir() -> PathBuf {
     casparian_home().join("parsers")
 }
 
-/// Ensure parsers directory exists and return its path
-pub fn ensure_parsers_dir() -> std::io::Result<PathBuf> {
-    let dir = parsers_dir();
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 /// Arguments for the config command
 #[derive(Debug, clap::Args)]
 pub struct ConfigArgs {

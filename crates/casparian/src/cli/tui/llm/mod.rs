@@ -29,24 +29,6 @@ use thiserror::Error;
 /// Errors that can occur during LLM operations
 #[derive(Debug, Error)]
 pub enum LlmError {
-    /// API key not found or invalid
-    // Variant reserved for future API key validation
-    #[allow(dead_code)]
-    #[error("API key error: {0}")]
-    ApiKey(String),
-
-    /// HTTP request failed
-    // Variant reserved for direct HTTP providers
-    #[allow(dead_code)]
-    #[error("HTTP error: {0}")]
-    Http(String),
-
-    /// Rate limit exceeded
-    // Variant reserved for rate limiting implementation
-    #[allow(dead_code)]
-    #[error("Rate limit exceeded: retry after {retry_after_ms}ms")]
-    RateLimit { retry_after_ms: u64 },
-
     /// Invalid response from provider
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
@@ -54,10 +36,6 @@ pub enum LlmError {
     /// Serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
-
-    /// Stream error
-    #[error("Stream error: {0}")]
-    Stream(String),
 
     /// Provider-specific error
     #[error("{provider} error: {message}")]

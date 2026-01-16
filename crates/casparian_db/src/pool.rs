@@ -11,9 +11,8 @@
 //!
 //! If both features are enabled, `postgres` takes priority (enterprise build).
 
-use std::path::Path;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{DatabaseType, License, LicenseError};
 
@@ -204,66 +203,6 @@ async fn apply_sqlite_optimizations(pool: &DbPool) -> Result<(), DbError> {
         .await?;
 
     Ok(())
-}
-
-/// Load license from the default location.
-///
-/// Looks for license file at:
-/// 1. `CASPARIAN_LICENSE` environment variable
-/// 2. `~/.casparian_flow/license.json`
-/// 3. `./license.json`
-///
-/// Returns community license if no file found.
-pub fn load_license() -> License {
-    // Check environment variable
-    if let Ok(path) = std::env::var("CASPARIAN_LICENSE") {
-        match License::load(Path::new(&path)) {
-            Ok(license) => {
-                info!("Loaded license from {}: {} ({:?})",
-                    path, license.organization, license.tier);
-                return license;
-            }
-            Err(e) => {
-                warn!("Failed to load license from {}: {}", path, e);
-            }
-        }
-    }
-
-    // Check home directory
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".casparian_flow").join("license.json");
-        if path.exists() {
-            match License::load(&path) {
-                Ok(license) => {
-                    info!("Loaded license from {:?}: {} ({:?})",
-                        path, license.organization, license.tier);
-                    return license;
-                }
-                Err(e) => {
-                    warn!("Failed to load license from {:?}: {}", path, e);
-                }
-            }
-        }
-    }
-
-    // Check current directory
-    let path = Path::new("license.json");
-    if path.exists() {
-        match License::load(path) {
-            Ok(license) => {
-                info!("Loaded license from ./license.json: {} ({:?})",
-                    license.organization, license.tier);
-                return license;
-            }
-            Err(e) => {
-                warn!("Failed to load license from ./license.json: {}", e);
-            }
-        }
-    }
-
-    // Default to community
-    info!("No license file found, using Community tier (SQLite only)");
-    License::community()
 }
 
 #[cfg(test)]

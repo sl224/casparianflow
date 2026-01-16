@@ -177,6 +177,15 @@ pub struct ScannedFile {
     pub path: String,
     /// Relative path from source root
     pub rel_path: String,
+    /// Parent directory path (for O(1) folder navigation)
+    /// e.g., "a/b/c.txt" → parent_path = "a/b"
+    pub parent_path: String,
+    /// Filename only (basename of rel_path)
+    /// e.g., "a/b/c.txt" → name = "c.txt"
+    pub name: String,
+    /// File extension (lowercase, without dot)
+    /// e.g., "csv", "json", "rs". None for files without extension.
+    pub extension: Option<String>,
     /// File size in bytes
     pub size: u64,
     /// Last modification time (Unix timestamp milliseconds)
@@ -212,15 +221,42 @@ pub struct ScannedFile {
     pub extracted_at: Option<DateTime<Utc>>,
 }
 
+/// Split a relative path into (parent_path, name).
+/// - "a/b/c.txt" → ("a/b", "c.txt")
+/// - "file.txt"  → ("", "file.txt")
+/// - ""          → ("", "")
+fn split_rel_path(rel_path: &str) -> (&str, &str) {
+    match rel_path.rfind('/') {
+        Some(idx) => (&rel_path[..idx], &rel_path[idx + 1..]),
+        None => ("", rel_path),
+    }
+}
+
+/// Extract file extension from filename.
+/// - "file.csv" → Some("csv")
+/// - "file.tar.gz" → Some("gz")
+/// - ".gitignore" → None (dotfiles without extension)
+/// - "README" → None
+fn extract_extension(name: &str) -> Option<String> {
+    name.rsplit_once('.')
+        .filter(|(base, _)| !base.is_empty())  // Skip dotfiles like ".gitignore"
+        .map(|(_, ext)| ext.to_lowercase())
+}
+
 impl ScannedFile {
     /// Create a new pending file
     pub fn new(source_id: &str, path: &str, rel_path: &str, size: u64, mtime: i64) -> Self {
         let now = Utc::now();
+        let (parent_path, name) = split_rel_path(rel_path);
+        let extension = extract_extension(name);
         Self {
             id: None,
             source_id: Arc::from(source_id),
             path: path.to_string(),
             rel_path: rel_path.to_string(),
+            parent_path: parent_path.to_string(),
+            name: name.to_string(),
+            extension,
             size,
             mtime,
             content_hash: None,
@@ -254,10 +290,15 @@ impl ScannedFile {
         mtime: i64,
     ) -> Self {
         let now = Utc::now();
+        let (parent_path, name) = split_rel_path(&rel_path);
+        let extension = extract_extension(name);
         Self {
             id: None,
             source_id, // PERF: No allocation - just Arc clone (ref count bump)
             path,
+            parent_path: parent_path.to_string(),
+            name: name.to_string(),
+            extension,
             rel_path,
             size,
             mtime,
@@ -279,11 +320,6 @@ impl ScannedFile {
         }
     }
 
-    /// Check if this file has any manual overrides (manual tag or manual plugin)
-    #[allow(dead_code)] // Will be used for processing integration
-    pub fn is_manual(&self) -> bool {
-        self.tag_source.as_deref() == Some("manual") || self.manual_plugin.is_some()
-    }
 }
 
 // ============================================================================
@@ -431,7 +467,6 @@ impl ExtractionLogStatus {
 
 /// Statistics from a scan operation
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Fields used in scan reporting
 pub struct ScanStats {
     /// Number of directories scanned
     pub dirs_scanned: u64,
@@ -455,7 +490,6 @@ pub struct ScanStats {
 
 /// Result of upserting a file into the database
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Used in internal scan operations
 pub struct UpsertResult {
     /// Database ID of the file
     pub id: i64,
@@ -480,7 +514,6 @@ pub struct BatchUpsertResult {
 
 /// Statistics from the database
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Will be used for status reporting
 pub struct DbStats {
     pub total_sources: u64,
     pub total_tagging_rules: u64,

@@ -1031,7 +1031,6 @@ fn format_with_commas(n: usize) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RuleBuilderFocus {
     /// Pattern input field
-    #[default]
     Pattern,
     /// Excludes list
     Excludes,
@@ -1045,7 +1044,8 @@ pub enum RuleBuilderFocus {
     ExtractionEdit(usize),
     /// Options section
     Options,
-    /// Right panel: file list
+    /// Right panel: file list (default - allows shortcuts like 's' for scan to work)
+    #[default]
     FileList,
     /// Ignore picker dialog
     IgnorePicker,
@@ -1260,8 +1260,8 @@ impl Default for RuleBuilderState {
             ignore_options: Vec::new(),
             ignore_selected: 0,
 
-            // UI state
-            focus: RuleBuilderFocus::Pattern,
+            // UI state - default to FileList so shortcuts like 's' work immediately
+            focus: RuleBuilderFocus::FileList,
 
             // Debouncing
             pattern_changed_at: None,

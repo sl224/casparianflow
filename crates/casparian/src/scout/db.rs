@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS scout_files (
     source_id TEXT NOT NULL REFERENCES scout_sources(id),
     path TEXT NOT NULL,
     rel_path TEXT NOT NULL,
+    parent_path TEXT NOT NULL DEFAULT '',    -- directory containing this file (for O(1) folder nav)
+    name TEXT NOT NULL DEFAULT '',           -- filename only (basename of rel_path)
+    extension TEXT,                          -- lowercase file extension (e.g., "csv", "json")
     size INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
     content_hash TEXT,
@@ -274,6 +277,7 @@ CREATE TABLE IF NOT EXISTS cf_ai_training_examples (
 CREATE INDEX IF NOT EXISTS idx_files_source ON scout_files(source_id);
 CREATE INDEX IF NOT EXISTS idx_files_status ON scout_files(status);
 CREATE INDEX IF NOT EXISTS idx_files_tag ON scout_files(tag);
+CREATE INDEX IF NOT EXISTS idx_files_extension ON scout_files(source_id, extension);
 CREATE INDEX IF NOT EXISTS idx_files_mtime ON scout_files(mtime);
 CREATE INDEX IF NOT EXISTS idx_files_path ON scout_files(path);
 CREATE INDEX IF NOT EXISTS idx_files_last_seen ON scout_files(last_seen_at);
@@ -291,6 +295,15 @@ CREATE INDEX IF NOT EXISTS idx_extraction_rules_enabled ON extraction_rules(enab
 CREATE INDEX IF NOT EXISTS idx_extraction_fields_rule ON extraction_fields(rule_id);
 CREATE INDEX IF NOT EXISTS idx_extraction_tag_conditions_rule ON extraction_tag_conditions(rule_id);
 CREATE INDEX IF NOT EXISTS idx_scout_folders_lookup ON scout_folders(source_id, prefix);
+
+-- O(1) folder navigation index: lookup files by parent directory
+CREATE INDEX IF NOT EXISTS idx_files_parent_path ON scout_files(source_id, parent_path);
+
+-- Composite indexes for Rule Builder queries (critical for large sources)
+-- Used by: load_scout_files() ORDER BY rel_path
+CREATE INDEX IF NOT EXISTS idx_files_source_relpath ON scout_files(source_id, rel_path);
+-- Used by: tag count queries GROUP BY tag
+CREATE INDEX IF NOT EXISTS idx_files_source_tag ON scout_files(source_id, tag);
 
 -- Extractor indexes (Phase 6)
 CREATE INDEX IF NOT EXISTS idx_files_extraction_status ON scout_files(extraction_status);
@@ -322,14 +335,49 @@ fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+/// Convert a glob pattern to SQL LIKE pattern.
+///
+/// # Examples
+/// - `*.csv` → `%.csv`
+/// - `data_*` → `data_%`
+/// - `**/*.csv` → `%.csv` (recursive match)
+/// - `report_?.csv` → `report__.csv` (single char)
+fn glob_to_like_pattern(glob: &str) -> String {
+    let mut result = String::with_capacity(glob.len() + 4);
+
+    // Handle ** (recursive) by treating as %
+    let glob = glob.replace("**/", "");
+    let glob = glob.replace("**", "%");
+
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => result.push('%'),
+            '?' => result.push('_'),
+            '%' => result.push('%'), // Already converted from **
+            '_' => {
+                // Escape literal underscore
+                result.push_str("\\_");
+            }
+            '\\' => {
+                // Escape sequence - pass through next char
+                if let Some(next) = chars.next() {
+                    result.push(next);
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+
+    result
+}
+
 /// Database wrapper with connection pool.
 #[derive(Clone)]
 pub struct Database {
     pool: DbPool,
 }
 
-// Many methods are used in tests and will be used for processing integration
-#[allow(dead_code)]
 impl Database {
     /// Open or create a database at the given path.
     ///
@@ -350,7 +398,7 @@ impl Database {
 
     /// Run migrations to add missing columns to existing databases
     async fn run_migrations(pool: &DbPool) -> Result<()> {
-        // Check if scout_files needs the extraction columns (added in Phase 6)
+        // Migration 1: Add extraction columns (Phase 6)
         let columns: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM pragma_table_info('scout_files') WHERE name IN ('metadata_raw', 'extraction_status', 'extracted_at')"
         )
@@ -358,8 +406,6 @@ impl Database {
         .await?;
 
         if columns.len() < 3 {
-            // Add missing columns - ALTER TABLE ADD COLUMN is safe (no-op if exists in some SQLite versions)
-            // Use separate queries since SQLite doesn't support multiple ADD COLUMN in one statement
             let migrations = [
                 "ALTER TABLE scout_files ADD COLUMN metadata_raw TEXT",
                 "ALTER TABLE scout_files ADD COLUMN extraction_status TEXT DEFAULT 'pending'",
@@ -367,13 +413,42 @@ impl Database {
             ];
 
             for migration in migrations {
-                // Ignore errors from columns that already exist
                 let _ = sqlx::query(migration).execute(pool).await;
             }
 
-            // Create indexes if they don't exist
             let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_extraction_status ON scout_files(extraction_status)").execute(pool).await;
             let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_extracted_at ON scout_files(extracted_at)").execute(pool).await;
+        }
+
+        // Migration 2: Add parent_path and name columns for O(1) folder navigation
+        let folder_cols: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('scout_files') WHERE name IN ('parent_path', 'name')"
+        )
+        .fetch_all(pool)
+        .await?;
+
+        if folder_cols.len() < 2 {
+            // Add columns
+            let _ = sqlx::query("ALTER TABLE scout_files ADD COLUMN parent_path TEXT NOT NULL DEFAULT ''").execute(pool).await;
+            let _ = sqlx::query("ALTER TABLE scout_files ADD COLUMN name TEXT NOT NULL DEFAULT ''").execute(pool).await;
+
+            // Create index for O(1) folder navigation
+            let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_parent_path ON scout_files(source_id, parent_path)").execute(pool).await;
+        }
+
+        // Migration 3: Add extension column for fast filtering by file type
+        let ext_cols: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('scout_files') WHERE name = 'extension'"
+        )
+        .fetch_all(pool)
+        .await?;
+
+        if ext_cols.is_empty() {
+            let _ = sqlx::query("ALTER TABLE scout_files ADD COLUMN extension TEXT")
+                .execute(pool).await;
+            let _ = sqlx::query(
+                "CREATE INDEX IF NOT EXISTS idx_files_extension ON scout_files(source_id, extension)"
+            ).execute(pool).await;
         }
 
         Ok(())
@@ -452,6 +527,115 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Populate scout_folders table for O(1) TUI navigation (called after scanning)
+    /// This pre-computes the folder hierarchy so get_folder_counts doesn't need to scan all files
+    pub async fn populate_folder_cache(&self, source_id: &str) -> Result<()> {
+        // Clear existing folder cache for this source
+        sqlx::query("DELETE FROM scout_folders WHERE source_id = ?")
+            .bind(source_id)
+            .execute(&self.pool)
+            .await?;
+
+        // Compute root-level folders (most expensive query, but run once per scan)
+        let root_folders: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT
+                CASE
+                    WHEN INSTR(parent_path, '/') > 0 THEN SUBSTR(parent_path, 1, INSTR(parent_path, '/') - 1)
+                    ELSE parent_path
+                END AS folder_name,
+                COUNT(*) as file_count
+            FROM scout_files
+            WHERE source_id = ? AND parent_path <> ''
+            GROUP BY folder_name
+            ORDER BY file_count DESC
+            LIMIT 500
+            "#,
+        )
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Insert root-level folders into scout_folders
+        for (name, count) in &root_folders {
+            sqlx::query(
+                "INSERT INTO scout_folders (source_id, prefix, name, file_count, is_folder) VALUES (?, '', ?, ?, 1)"
+            )
+            .bind(source_id)
+            .bind(name)
+            .bind(*count)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        // Also add root-level files (files with empty parent_path)
+        let root_files: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM scout_files WHERE source_id = ? AND parent_path = '' ORDER BY name LIMIT 200"
+        )
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (name,) in &root_files {
+            sqlx::query(
+                "INSERT INTO scout_folders (source_id, prefix, name, file_count, is_folder) VALUES (?, '', ?, 1, 0)"
+            )
+            .bind(source_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        tracing::info!(
+            source_id = source_id,
+            root_folders = root_folders.len(),
+            root_files = root_files.len(),
+            "Populated folder cache"
+        );
+
+        Ok(())
+    }
+
+    /// Get folder counts from scout_folders cache (O(1) lookup)
+    /// Returns None if cache is not populated for this source
+    pub async fn get_folder_counts_from_cache(
+        &self,
+        source_id: &str,
+        prefix: &str,
+    ) -> Result<Option<Vec<(String, i64, bool)>>> {
+        // Check if cache exists for this source/prefix
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT name, file_count, is_folder FROM scout_folders WHERE source_id = ? AND prefix = ? ORDER BY is_folder DESC, file_count DESC, name"
+        )
+        .bind(source_id)
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() && prefix.is_empty() {
+            // No cache for root level - return None to trigger live query
+            // But first check if source exists at all
+            let source_exists: Option<(i64,)> = sqlx::query_as(
+                "SELECT 1 FROM scout_sources WHERE id = ?"
+            )
+            .bind(source_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if source_exists.is_some() {
+                return Ok(None); // Source exists but no cache
+            }
+        }
+
+        // Convert to expected format
+        let results: Vec<(String, i64, bool)> = rows
+            .into_iter()
+            .map(|(name, count, is_folder)| (name, count, is_folder == 0))
+            .collect();
+
+        Ok(Some(results))
     }
 
     /// Get a source by ID
@@ -550,6 +734,73 @@ impl Database {
             .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Check if a new source path overlaps with any existing sources.
+    ///
+    /// Returns `Ok(())` if no overlap is detected.
+    /// Returns `Err(SourceIsChildOfExisting)` if new path is inside an existing source.
+    /// Returns `Err(SourceIsParentOfExisting)` if new path encompasses an existing source.
+    ///
+    /// # Arguments
+    /// * `new_path` - The canonical path of the proposed new source
+    ///
+    /// # Why This Matters
+    /// Overlapping sources cause:
+    /// - Duplicate files in database (same file tracked twice)
+    /// - Conflicting tags (different rules per source)
+    /// - Double processing (parsers run twice)
+    /// - Inflated file counts
+    pub async fn check_source_overlap(&self, new_path: &Path) -> Result<()> {
+        use super::error::ScoutError;
+
+        // Canonicalize the new path to resolve symlinks, `.`, `..`, etc.
+        let new_canonical = new_path.canonicalize().map_err(|e| {
+            ScoutError::Config(format!(
+                "Cannot resolve path '{}': {}",
+                new_path.display(),
+                e
+            ))
+        })?;
+
+        let existing_sources = self.list_sources().await?;
+
+        for source in existing_sources {
+            // Canonicalize existing source path
+            let existing_path = Path::new(&source.path);
+            let existing_canonical = match existing_path.canonicalize() {
+                Ok(p) => p,
+                Err(_) => {
+                    // Existing source path no longer exists - skip it
+                    // (User should clean up stale sources separately)
+                    continue;
+                }
+            };
+
+            // Check if new path is a child of existing source
+            // e.g., new=/data/projects/medical, existing=/data/projects
+            if new_canonical.starts_with(&existing_canonical) && new_canonical != existing_canonical
+            {
+                return Err(ScoutError::SourceIsChildOfExisting {
+                    new_path: new_path.display().to_string(),
+                    existing_name: source.name,
+                    existing_path: source.path,
+                });
+            }
+
+            // Check if new path is a parent of existing source
+            // e.g., new=/data/projects, existing=/data/projects/medical
+            if existing_canonical.starts_with(&new_canonical) && existing_canonical != new_canonical
+            {
+                return Err(ScoutError::SourceIsParentOfExisting {
+                    new_path: new_path.display().to_string(),
+                    existing_name: source.name,
+                    existing_path: source.path,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn row_to_source(row: &sqlx::sqlite::SqliteRow) -> Result<Source> {
@@ -689,13 +940,16 @@ impl Database {
                 // New file
                 let result = sqlx::query(
                     r#"
-                    INSERT INTO scout_files (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    INSERT INTO scout_files (source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                     "#,
                 )
                 .bind(file.source_id.as_ref())  // Arc<str> -> &str for sqlx
                 .bind(&file.path)
                 .bind(&file.rel_path)
+                .bind(&file.parent_path)
+                .bind(&file.name)
+                .bind(&file.extension)
                 .bind(file.size as i64)
                 .bind(file.mtime)
                 .bind(&file.content_hash)
@@ -782,7 +1036,8 @@ impl Database {
         // Note: This SELECT also needs chunking for large batches
         let existing = Self::query_existing_files(&mut tx, source_id, files).await?;
 
-        // SQLite limit: 999 parameters. With 9 params per row, max 100 rows per chunk.
+        // Chunk size for bulk inserts. Modern SQLite supports 32766 params (since 3.32.0).
+        // 100 rows per chunk is a good balance between fewer round-trips and memory usage.
         const CHUNK_SIZE: usize = 100;
 
         for chunk in files.chunks(CHUNK_SIZE) {
@@ -876,9 +1131,9 @@ impl Database {
             return Ok(());
         }
 
-        // Build multi-row VALUES: (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-        // 9 bind params per row: source_id, path, rel_path, size, mtime, content_hash, tag, first_seen_at, last_seen_at
-        let row_placeholder = "(?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)";
+        // Build multi-row VALUES: (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        // 12 bind params per row: source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, tag, first_seen_at, last_seen_at
+        let row_placeholder = "(?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)";
         let values: String = (0..files.len())
             .map(|_| row_placeholder)
             .collect::<Vec<_>>()
@@ -890,12 +1145,15 @@ impl Database {
         let sql = if tag.is_some() {
             format!(
                 r#"INSERT INTO scout_files
-                   (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                   (source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
                    VALUES {}
                    ON CONFLICT(source_id, path) DO UPDATE SET
                        size = excluded.size,
                        mtime = excluded.mtime,
                        content_hash = excluded.content_hash,
+                       parent_path = excluded.parent_path,
+                       name = excluded.name,
+                       extension = excluded.extension,
                        status = CASE
                            WHEN scout_files.size != excluded.size OR scout_files.mtime != excluded.mtime
                            THEN 'pending'
@@ -908,12 +1166,15 @@ impl Database {
         } else {
             format!(
                 r#"INSERT INTO scout_files
-                   (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                   (source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
                    VALUES {}
                    ON CONFLICT(source_id, path) DO UPDATE SET
                        size = excluded.size,
                        mtime = excluded.mtime,
                        content_hash = excluded.content_hash,
+                       parent_path = excluded.parent_path,
+                       name = excluded.name,
+                       extension = excluded.extension,
                        status = CASE
                            WHEN scout_files.size != excluded.size OR scout_files.mtime != excluded.mtime
                            THEN 'pending'
@@ -932,6 +1193,9 @@ impl Database {
                 .bind(file.source_id.as_ref())
                 .bind(&file.path)
                 .bind(&file.rel_path)
+                .bind(&file.parent_path)
+                .bind(&file.name)
+                .bind(&file.extension)
                 .bind(file.size as i64)
                 .bind(file.mtime)
                 .bind(&file.content_hash)
@@ -962,12 +1226,15 @@ impl Database {
             let file_tag = tag.or(file.tag.as_deref());
             let result = sqlx::query(
                 r#"INSERT INTO scout_files
-                   (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                   (source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                    ON CONFLICT(source_id, path) DO UPDATE SET
                        size = excluded.size,
                        mtime = excluded.mtime,
                        content_hash = excluded.content_hash,
+                       parent_path = excluded.parent_path,
+                       name = excluded.name,
+                       extension = excluded.extension,
                        status = CASE
                            WHEN scout_files.size != excluded.size OR scout_files.mtime != excluded.mtime
                            THEN 'pending'
@@ -979,6 +1246,9 @@ impl Database {
             .bind(file.source_id.as_ref())
             .bind(&file.path)
             .bind(&file.rel_path)
+            .bind(&file.parent_path)
+            .bind(&file.name)
+            .bind(&file.extension)
             .bind(file.size as i64)
             .bind(file.mtime)
             .bind(&file.content_hash)
@@ -1012,7 +1282,7 @@ impl Database {
     pub async fn get_file(&self, id: i64) -> Result<Option<ScannedFile>> {
         let row = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
                    first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE id = ?
             "#,
@@ -1031,7 +1301,7 @@ impl Database {
     pub async fn get_file_by_path(&self, source_id: &str, path: &str) -> Result<Option<ScannedFile>> {
         let row = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
                    first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ? AND path = ?
             "#,
@@ -1051,7 +1321,7 @@ impl Database {
     pub async fn list_files_by_source(&self, source_id: &str, limit: usize) -> Result<Vec<ScannedFile>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
                    first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ?
             ORDER BY mtime DESC
@@ -1070,7 +1340,7 @@ impl Database {
     pub async fn list_files_by_status(&self, status: FileStatus, limit: usize) -> Result<Vec<ScannedFile>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
                    first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE status = ?
             ORDER BY mtime DESC
@@ -1099,7 +1369,7 @@ impl Database {
     pub async fn list_untagged_files(&self, source_id: &str, limit: usize) -> Result<Vec<ScannedFile>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
                    first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ? AND tag IS NULL AND status = 'pending'
             ORDER BY mtime DESC
@@ -1118,7 +1388,7 @@ impl Database {
     pub async fn list_files_by_tag(&self, tag: &str, limit: usize) -> Result<Vec<ScannedFile>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
                    first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE tag = ?
             ORDER BY mtime DESC
@@ -1142,7 +1412,7 @@ impl Database {
     ) -> Result<Vec<ScannedFile>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error,
                    first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files WHERE source_id = ? AND status = ?
             ORDER BY mtime DESC
@@ -1266,41 +1536,50 @@ impl Database {
     fn row_to_file(row: &sqlx::sqlite::SqliteRow) -> Result<ScannedFile> {
         use super::types::ExtractionStatus;
 
-        let status_str: String = row.get(7);
+        // Column positions (extension added at position 6):
+        // 0:id, 1:source_id, 2:path, 3:rel_path, 4:parent_path, 5:name, 6:extension,
+        // 7:size, 8:mtime, 9:content_hash, 10:status, 11:tag, 12:tag_source,
+        // 13:rule_id, 14:manual_plugin, 15:error, 16:first_seen_at, 17:last_seen_at,
+        // 18:processed_at, 19:sentinel_job_id, 20:metadata_raw, 21:extraction_status, 22:extracted_at
+
+        let status_str: String = row.get(10);
         let status = FileStatus::parse(&status_str).unwrap_or(FileStatus::Pending);
 
-        let first_seen_millis: i64 = row.get(13);
-        let last_seen_millis: i64 = row.get(14);
-        let processed_at_millis: Option<i64> = row.get(15);
+        let first_seen_millis: i64 = row.get(16);
+        let last_seen_millis: i64 = row.get(17);
+        let processed_at_millis: Option<i64> = row.get(18);
 
         // Parse extraction status (Phase 6)
-        let extraction_status_str: Option<String> = row.get(18);
+        let extraction_status_str: Option<String> = row.get(21);
         let extraction_status = extraction_status_str
             .as_deref()
             .and_then(ExtractionStatus::parse)
             .unwrap_or(ExtractionStatus::Pending);
-        let extracted_at_millis: Option<i64> = row.get(19);
+        let extracted_at_millis: Option<i64> = row.get(22);
 
         Ok(ScannedFile {
             id: Some(row.get(0)),
             source_id: std::sync::Arc::from(row.get::<String, _>(1)),  // String -> Arc<str>
             path: row.get(2),
             rel_path: row.get(3),
-            size: row.get::<i64, _>(4) as u64,
-            mtime: row.get(5),
-            content_hash: row.get(6),
+            parent_path: row.get(4),
+            name: row.get(5),
+            extension: row.get(6),
+            size: row.get::<i64, _>(7) as u64,
+            mtime: row.get(8),
+            content_hash: row.get(9),
             status,
-            tag: row.get(8),
-            tag_source: row.get(9),
-            rule_id: row.get(10),
-            manual_plugin: row.get(11),
-            error: row.get(12),
+            tag: row.get(11),
+            tag_source: row.get(12),
+            rule_id: row.get(13),
+            manual_plugin: row.get(14),
+            error: row.get(15),
             first_seen_at: millis_to_datetime(first_seen_millis),
             last_seen_at: millis_to_datetime(last_seen_millis),
             processed_at: processed_at_millis.map(millis_to_datetime),
-            sentinel_job_id: row.get(16),
+            sentinel_job_id: row.get(19),
             // Extractor metadata fields (Phase 6)
-            metadata_raw: row.get(17),
+            metadata_raw: row.get(20),
             extraction_status,
             extracted_at: extracted_at_millis.map(millis_to_datetime),
         })
@@ -1362,12 +1641,12 @@ impl Database {
 
     /// Get folder counts at a specific depth for hierarchical browsing.
     ///
-    /// Returns folders (subdirectories) with file counts, plus leaf files at current level.
-    /// This is designed for fast navigation of large sources (400k+ files).
+    /// Uses the indexed `parent_path` column for O(1) folder navigation.
+    /// For glob filtering, uses LIKE queries on `rel_path`.
     ///
     /// # Arguments
     /// * `source_id` - The source to query
-    /// * `prefix` - Path prefix (empty for root, "folder/" for subfolder)
+    /// * `prefix` - Path prefix (empty for root, "folder" for subfolder - no trailing slash)
     /// * `glob_pattern` - Optional glob pattern filter (e.g., "*.csv")
     ///
     /// # Returns
@@ -1378,14 +1657,144 @@ impl Database {
         prefix: &str,
         glob_pattern: Option<&str>,
     ) -> Result<Vec<(String, i64, bool)>> {
-        // Query extracts the immediate child folder or filename from rel_path
-        // For paths like "a/b/c.csv" with prefix "a/":
-        //   - Extracts "b" (folder containing more files)
-        // For paths like "a/file.csv" with prefix "a/":
-        //   - Extracts "file.csv" (leaf file)
-        let prefix_len = prefix.len() as i32;
+        // Normalize prefix: remove trailing slash if present
+        let prefix = prefix.trim_end_matches('/');
 
-        let query = if glob_pattern.is_some() {
+        if let Some(pattern) = glob_pattern {
+            // With glob pattern: search matching files and group by immediate child
+            self.get_folder_counts_with_pattern(source_id, prefix, pattern).await
+        } else {
+            // No pattern: O(1) lookup using parent_path index
+            self.get_folder_counts_fast(source_id, prefix).await
+        }
+    }
+
+    /// Fast O(1) folder listing using parent_path index (no pattern filtering)
+    async fn get_folder_counts_fast(
+        &self,
+        source_id: &str,
+        parent_path: &str,
+    ) -> Result<Vec<(String, i64, bool)>> {
+        // For root level, try the pre-computed cache first (avoids 20+ second GROUP BY)
+        if parent_path.is_empty() {
+            if let Some(cached) = self.get_folder_counts_from_cache(source_id, "").await? {
+                if !cached.is_empty() {
+                    tracing::debug!(source_id = source_id, count = cached.len(), "Using cached folder counts");
+                    return Ok(cached);
+                }
+            }
+            // Cache not populated - fall through to live query (will be slow for large sources)
+            tracing::debug!(source_id = source_id, "Folder cache miss, using live query");
+        }
+
+        let mut results: Vec<(String, i64, bool)> = Vec::new();
+
+        // 1. Get files directly in this folder (O(1) via index)
+        let files: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT name, size FROM scout_files WHERE source_id = ? AND parent_path = ? ORDER BY name LIMIT 200",
+        )
+        .bind(source_id)
+        .bind(parent_path)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // 2. Get immediate subfolders with file counts
+        // A folder exists if any file has a parent_path that starts with "current/X"
+        let folder_prefix = if parent_path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", parent_path)
+        };
+
+        let subfolders: Vec<(String, i64)> = if parent_path.is_empty() {
+            // Root level: find top-level folders by extracting first path component
+            // NOTE: This is slow for large sources (20+ seconds). Cache should be used.
+            sqlx::query_as(
+                r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(parent_path, '/') > 0 THEN SUBSTR(parent_path, 1, INSTR(parent_path, '/') - 1)
+                        ELSE parent_path
+                    END AS folder_name,
+                    COUNT(*) as file_count
+                FROM scout_files
+                WHERE source_id = ? AND parent_path != ''
+                GROUP BY folder_name
+                ORDER BY file_count DESC
+                LIMIT 200
+                "#,
+            )
+            .bind(source_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            // Non-root: find immediate subfolders
+            sqlx::query_as(
+                r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(SUBSTR(parent_path, LENGTH(?) + 1), '/') > 0
+                        THEN SUBSTR(parent_path, LENGTH(?) + 1, INSTR(SUBSTR(parent_path, LENGTH(?) + 1), '/') - 1)
+                        ELSE SUBSTR(parent_path, LENGTH(?) + 1)
+                    END AS folder_name,
+                    COUNT(*) as file_count
+                FROM scout_files
+                WHERE source_id = ? AND parent_path LIKE ? || '%' AND parent_path != ?
+                GROUP BY folder_name
+                ORDER BY file_count DESC
+                LIMIT 200
+                "#,
+            )
+            .bind(&folder_prefix)
+            .bind(&folder_prefix)
+            .bind(&folder_prefix)
+            .bind(&folder_prefix)
+            .bind(source_id)
+            .bind(&folder_prefix)
+            .bind(parent_path)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        // Add folders first (sorted by count desc)
+        for (name, count) in subfolders {
+            if !name.is_empty() {
+                results.push((name, count, false));
+            }
+        }
+
+        // Add files (sorted by name)
+        for (name, _size) in files {
+            results.push((name, 1, true));
+        }
+
+        Ok(results)
+    }
+
+    /// Folder listing with glob pattern filtering using LIKE
+    async fn get_folder_counts_with_pattern(
+        &self,
+        source_id: &str,
+        prefix: &str,
+        pattern: &str,
+    ) -> Result<Vec<(String, i64, bool)>> {
+        // Convert glob pattern to SQL LIKE pattern
+        // *.csv -> %.csv
+        // data_* -> data_%
+        // **/*.csv -> %/%.csv (recursive)
+        let like_pattern = glob_to_like_pattern(pattern);
+
+        // Build the prefix filter
+        let path_filter = if prefix.is_empty() {
+            like_pattern.clone()
+        } else {
+            format!("{}/%", prefix)
+        };
+
+        // Query matching files and extract immediate child at prefix level
+        let prefix_len = if prefix.is_empty() { 0 } else { prefix.len() as i32 + 1 };
+
+        let rows: Vec<(String, i64, i32)> = sqlx::query_as(
             r#"
             SELECT
                 CASE
@@ -1397,59 +1806,25 @@ impl Database {
                 MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
             FROM scout_files
             WHERE source_id = ?
-              AND rel_path LIKE ? || '%'
-              AND rel_path GLOB ?
+              AND rel_path LIKE ?
+              AND rel_path LIKE ?
               AND LENGTH(rel_path) > ?
             GROUP BY item_name
             ORDER BY file_count DESC
             LIMIT 100
-            "#
-        } else {
-            r#"
-            SELECT
-                CASE
-                    WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
-                    THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
-                    ELSE SUBSTR(rel_path, ? + 1)
-                END AS item_name,
-                COUNT(*) as file_count,
-                MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
-            FROM scout_files
-            WHERE source_id = ?
-              AND rel_path LIKE ? || '%'
-              AND LENGTH(rel_path) > ?
-            GROUP BY item_name
-            ORDER BY file_count DESC
-            LIMIT 100
-            "#
-        };
-
-        let rows: Vec<(String, i64, i32)> = if let Some(pattern) = glob_pattern {
-            sqlx::query_as(query)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(source_id)
-                .bind(prefix)
-                .bind(pattern)
-                .bind(prefix_len)
-                .fetch_all(&self.pool)
-                .await?
-        } else {
-            sqlx::query_as(query)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(source_id)
-                .bind(prefix)
-                .bind(prefix_len)
-                .fetch_all(&self.pool)
-                .await?
-        };
+            "#,
+        )
+        .bind(prefix_len)
+        .bind(prefix_len)
+        .bind(prefix_len)
+        .bind(prefix_len)
+        .bind(prefix_len)
+        .bind(source_id)
+        .bind(&path_filter)
+        .bind(&like_pattern)
+        .bind(prefix_len)
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows
             .into_iter()
@@ -1461,6 +1836,7 @@ impl Database {
     /// Get sampled preview files for a prefix and optional pattern.
     ///
     /// Returns up to `limit` files matching the criteria, for display in preview pane.
+    /// Uses LIKE queries for portable glob-style matching.
     pub async fn get_preview_files(
         &self,
         source_id: &str,
@@ -1469,21 +1845,29 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<(String, i64, i64)>> {
         // Returns (rel_path, size, mtime)
+        let prefix = prefix.trim_end_matches('/');
+        let prefix_pattern = if prefix.is_empty() {
+            "%".to_string()
+        } else {
+            format!("{}/%", prefix)
+        };
+
         let rows: Vec<(String, i64, i64)> = if let Some(pattern) = glob_pattern {
+            let like_pattern = glob_to_like_pattern(pattern);
             sqlx::query_as(
                 r#"
                 SELECT rel_path, size, mtime
                 FROM scout_files
                 WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
-                  AND rel_path GLOB ?
+                  AND rel_path LIKE ?
+                  AND rel_path LIKE ?
                 ORDER BY mtime DESC
                 LIMIT ?
                 "#,
             )
             .bind(source_id)
-            .bind(prefix)
-            .bind(pattern)
+            .bind(&prefix_pattern)
+            .bind(&like_pattern)
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?
@@ -1493,13 +1877,13 @@ impl Database {
                 SELECT rel_path, size, mtime
                 FROM scout_files
                 WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
+                  AND rel_path LIKE ?
                 ORDER BY mtime DESC
                 LIMIT ?
                 "#,
             )
             .bind(source_id)
-            .bind(prefix)
+            .bind(&prefix_pattern)
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?
@@ -1509,25 +1893,34 @@ impl Database {
     }
 
     /// Get total file count for a prefix and optional pattern.
+    /// Uses LIKE queries for portable glob-style matching.
     pub async fn get_file_count_for_prefix(
         &self,
         source_id: &str,
         prefix: &str,
         glob_pattern: Option<&str>,
     ) -> Result<i64> {
+        let prefix = prefix.trim_end_matches('/');
+        let prefix_pattern = if prefix.is_empty() {
+            "%".to_string()
+        } else {
+            format!("{}/%", prefix)
+        };
+
         let count: (i64,) = if let Some(pattern) = glob_pattern {
+            let like_pattern = glob_to_like_pattern(pattern);
             sqlx::query_as(
                 r#"
                 SELECT COUNT(*)
                 FROM scout_files
                 WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
-                  AND rel_path GLOB ?
+                  AND rel_path LIKE ?
+                  AND rel_path LIKE ?
                 "#,
             )
             .bind(source_id)
-            .bind(prefix)
-            .bind(pattern)
+            .bind(&prefix_pattern)
+            .bind(&like_pattern)
             .fetch_one(&self.pool)
             .await?
         } else {
@@ -1536,16 +1929,254 @@ impl Database {
                 SELECT COUNT(*)
                 FROM scout_files
                 WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
+                  AND rel_path LIKE ?
                 "#,
             )
             .bind(source_id)
-            .bind(prefix)
+            .bind(&prefix_pattern)
             .fetch_one(&self.pool)
             .await?
         };
 
         Ok(count.0)
+    }
+
+    // ========================================================================
+    // Pattern Search (database-first, using extension index)
+    // ========================================================================
+
+    /// Search files by extension and optional path pattern.
+    ///
+    /// Uses the extension index for fast filtering, then applies LIKE pattern if provided.
+    /// Returns (rel_path, size, mtime) tuples for display.
+    ///
+    /// # Arguments
+    /// * `source_id` - The source to search
+    /// * `extension` - File extension to filter by (e.g., "rs", "csv"), or None for all
+    /// * `path_pattern` - SQL LIKE pattern for path (e.g., "%/src/%"), or None for all
+    /// * `limit` - Max results to return
+    /// * `offset` - Offset for pagination
+    pub async fn search_files_by_pattern(
+        &self,
+        source_id: &str,
+        extension: Option<&str>,
+        path_pattern: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        let rows: Vec<(String, i64, i64)> = match (extension, path_pattern) {
+            (Some(ext), Some(path_pat)) => {
+                sqlx::query_as(
+                    r#"SELECT rel_path, size, mtime FROM scout_files
+                       WHERE source_id = ? AND extension = ? AND rel_path LIKE ?
+                       ORDER BY mtime DESC LIMIT ? OFFSET ?"#
+                )
+                .bind(source_id)
+                .bind(ext)
+                .bind(path_pat)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (Some(ext), None) => {
+                sqlx::query_as(
+                    r#"SELECT rel_path, size, mtime FROM scout_files
+                       WHERE source_id = ? AND extension = ?
+                       ORDER BY mtime DESC LIMIT ? OFFSET ?"#
+                )
+                .bind(source_id)
+                .bind(ext)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, Some(path_pat)) => {
+                sqlx::query_as(
+                    r#"SELECT rel_path, size, mtime FROM scout_files
+                       WHERE source_id = ? AND rel_path LIKE ?
+                       ORDER BY mtime DESC LIMIT ? OFFSET ?"#
+                )
+                .bind(source_id)
+                .bind(path_pat)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as(
+                    r#"SELECT rel_path, size, mtime FROM scout_files
+                       WHERE source_id = ?
+                       ORDER BY mtime DESC LIMIT ? OFFSET ?"#
+                )
+                .bind(source_id)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Count files matching extension and optional path pattern.
+    ///
+    /// Uses the extension index for fast counting.
+    pub async fn count_files_by_pattern(
+        &self,
+        source_id: &str,
+        extension: Option<&str>,
+        path_pattern: Option<&str>,
+    ) -> Result<i64> {
+        let count: (i64,) = match (extension, path_pattern) {
+            (Some(ext), Some(path_pat)) => {
+                sqlx::query_as(
+                    r#"SELECT COUNT(*) FROM scout_files
+                       WHERE source_id = ? AND extension = ? AND rel_path LIKE ?"#
+                )
+                .bind(source_id)
+                .bind(ext)
+                .bind(path_pat)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            (Some(ext), None) => {
+                sqlx::query_as(
+                    r#"SELECT COUNT(*) FROM scout_files
+                       WHERE source_id = ? AND extension = ?"#
+                )
+                .bind(source_id)
+                .bind(ext)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            (None, Some(path_pat)) => {
+                sqlx::query_as(
+                    r#"SELECT COUNT(*) FROM scout_files
+                       WHERE source_id = ? AND rel_path LIKE ?"#
+                )
+                .bind(source_id)
+                .bind(path_pat)
+                .fetch_one(&self.pool)
+                .await?
+            }
+            (None, None) => {
+                sqlx::query_as(
+                    r#"SELECT COUNT(*) FROM scout_files
+                       WHERE source_id = ?"#
+                )
+                .bind(source_id)
+                .fetch_one(&self.pool)
+                .await?
+            }
+        };
+        Ok(count.0)
+    }
+
+    // ========================================================================
+    // O(1) Folder Navigation (using parent_path index)
+    // ========================================================================
+
+    /// Get items (files and subfolders) at a specific folder path using the indexed parent_path column.
+    ///
+    /// O(1) lookup via index on (source_id, parent_path).
+    /// Returns (name, is_folder, size) tuples for rendering in TUI.
+    ///
+    /// # Arguments
+    /// * `source_id` - The source to query
+    /// * `parent_path` - Parent directory (empty string "" for root, "a/b" for nested)
+    /// * `limit` - Max items to return
+    ///
+    /// # Returns
+    /// Vec of (name, is_folder, size) where:
+    /// - name: file or folder name
+    /// - is_folder: true if this is a directory (has children with this as parent)
+    /// - size: file size (0 for folders)
+    pub async fn get_folder_contents(
+        &self,
+        source_id: &str,
+        parent_path: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, bool, u64)>> {
+        // Get all files directly in this folder
+        let files: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT name, size
+            FROM scout_files
+            WHERE source_id = ? AND parent_path = ?
+            ORDER BY name
+            LIMIT ?
+            "#,
+        )
+        .bind(source_id)
+        .bind(parent_path)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Get unique immediate subfolders by looking at distinct parent_path prefixes
+        // For parent_path "a", find all unique "a/X" where X is the immediate child folder
+        let subfolder_prefix = if parent_path.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", parent_path)
+        };
+
+        let subfolders: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT
+                CASE
+                    WHEN ? = '' THEN SUBSTR(parent_path, 1, INSTR(parent_path || '/', '/') - 1)
+                    ELSE SUBSTR(parent_path, LENGTH(?) + 1, INSTR(SUBSTR(parent_path, LENGTH(?) + 1) || '/', '/') - 1)
+                END AS subfolder
+            FROM scout_files
+            WHERE source_id = ?
+              AND parent_path LIKE ? || '%'
+              AND parent_path != ?
+            ORDER BY subfolder
+            LIMIT ?
+            "#,
+        )
+        .bind(parent_path)
+        .bind(&subfolder_prefix)
+        .bind(&subfolder_prefix)
+        .bind(source_id)
+        .bind(&subfolder_prefix)
+        .bind(parent_path)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Combine results: folders first, then files
+        let mut results: Vec<(String, bool, u64)> = Vec::with_capacity(files.len() + subfolders.len());
+
+        for (folder_name,) in subfolders {
+            if !folder_name.is_empty() {
+                results.push((folder_name, true, 0));
+            }
+        }
+
+        for (name, size) in files {
+            results.push((name, false, size as u64));
+        }
+
+        Ok(results)
+    }
+
+    /// Count files directly in a folder (not recursive).
+    /// O(1) lookup via index on (source_id, parent_path).
+    pub async fn count_files_in_folder(&self, source_id: &str, parent_path: &str) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND parent_path = ?",
+        )
+        .bind(source_id)
+        .bind(parent_path)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
     }
 
     // ========================================================================
@@ -1719,7 +2350,7 @@ impl Database {
     pub async fn get_files_pending_extraction(&self) -> Result<Vec<ScannedFile>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, source_id, path, rel_path, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error, first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
+            SELECT id, source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, tag_source, rule_id, manual_plugin, error, first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at
             FROM scout_files
             WHERE extraction_status = 'pending'
             ORDER BY first_seen_at
@@ -2104,5 +2735,283 @@ mod tests {
 
         let fetched = db.get_file_by_path("src-1", "/data/test.txt").await.unwrap().unwrap();
         assert_eq!(fetched.tag, Some("original_tag".to_string()), "Tag should be preserved");
+    }
+
+    /// Test glob_to_like_pattern conversion
+    #[test]
+    fn test_glob_to_like_pattern() {
+        // Simple wildcards
+        assert_eq!(glob_to_like_pattern("*.csv"), "%.csv");
+        assert_eq!(glob_to_like_pattern("data*"), "data%");
+        assert_eq!(glob_to_like_pattern("report?.csv"), "report_.csv");
+
+        // Underscores are escaped (in glob, _ is literal; in LIKE, _ is wildcard)
+        assert_eq!(glob_to_like_pattern("data_*.csv"), "data\\_%.csv"); // _ escaped, then *, then .csv
+        assert_eq!(glob_to_like_pattern("report_?.csv"), "report\\__.csv"); // _ escaped, ? -> _, then .csv
+
+        // Recursive patterns
+        assert_eq!(glob_to_like_pattern("**/*.csv"), "%.csv");
+
+        // Mixed patterns
+        assert_eq!(glob_to_like_pattern("data/*.csv"), "data/%.csv");
+    }
+
+    /// Test O(1) folder navigation with parent_path
+    #[tokio::test]
+    async fn test_folder_navigation() {
+        let db = create_test_db().await;
+
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Test".to_string(),
+            source_type: SourceType::Local,
+            path: "/data".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // Create files in nested folder structure:
+        // /data/root.txt
+        // /data/docs/readme.md
+        // /data/docs/api/spec.json
+        // /data/logs/2024/jan.log
+        // /data/logs/2024/feb.log
+        let files = vec![
+            ScannedFile::new("src-1", "/data/root.txt", "root.txt", 100, 1000),
+            ScannedFile::new("src-1", "/data/docs/readme.md", "docs/readme.md", 200, 2000),
+            ScannedFile::new("src-1", "/data/docs/api/spec.json", "docs/api/spec.json", 300, 3000),
+            ScannedFile::new("src-1", "/data/logs/2024/jan.log", "logs/2024/jan.log", 400, 4000),
+            ScannedFile::new("src-1", "/data/logs/2024/feb.log", "logs/2024/feb.log", 500, 5000),
+        ];
+
+        db.batch_upsert_files(&files, None).await.unwrap();
+
+        // Verify parent_path and name are set correctly
+        let root_file = db.get_file_by_path("src-1", "/data/root.txt").await.unwrap().unwrap();
+        assert_eq!(root_file.parent_path, "");
+        assert_eq!(root_file.name, "root.txt");
+
+        let readme = db.get_file_by_path("src-1", "/data/docs/readme.md").await.unwrap().unwrap();
+        assert_eq!(readme.parent_path, "docs");
+        assert_eq!(readme.name, "readme.md");
+
+        let spec = db.get_file_by_path("src-1", "/data/docs/api/spec.json").await.unwrap().unwrap();
+        assert_eq!(spec.parent_path, "docs/api");
+        assert_eq!(spec.name, "spec.json");
+
+        // Test O(1) folder listing at root
+        let root_contents = db.get_folder_counts("src-1", "", None).await.unwrap();
+        // Should have: docs folder, logs folder, root.txt file
+        assert!(root_contents.iter().any(|(name, _, is_file)| name == "docs" && !is_file));
+        assert!(root_contents.iter().any(|(name, _, is_file)| name == "logs" && !is_file));
+        assert!(root_contents.iter().any(|(name, _, is_file)| name == "root.txt" && *is_file));
+
+        // Test folder listing at docs/
+        let docs_contents = db.get_folder_counts("src-1", "docs", None).await.unwrap();
+        assert!(docs_contents.iter().any(|(name, _, is_file)| name == "api" && !is_file));
+        assert!(docs_contents.iter().any(|(name, _, is_file)| name == "readme.md" && *is_file));
+
+        // Test count files in folder
+        let count = db.count_files_in_folder("src-1", "logs/2024").await.unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ========================================================================
+    // Source Overlap Detection Tests
+    // ========================================================================
+
+    use crate::scout::error::ScoutError;
+
+    #[tokio::test]
+    async fn test_source_overlap_no_sources() {
+        let db = create_test_db().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // No existing sources - should allow any path
+        let result = db.check_source_overlap(temp_dir.path()).await;
+        assert!(result.is_ok(), "Should allow source when no existing sources");
+    }
+
+    #[tokio::test]
+    async fn test_source_overlap_same_path() {
+        let db = create_test_db().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a source at temp_dir
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Parent".to_string(),
+            source_type: SourceType::Local,
+            path: temp_dir.path().display().to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // Same path is NOT overlap (it's a rescan of existing source)
+        // The overlap check should pass because paths are equal, not nested
+        let result = db.check_source_overlap(temp_dir.path()).await;
+        assert!(result.is_ok(), "Same path should be allowed (rescan scenario)");
+    }
+
+    #[tokio::test]
+    async fn test_source_overlap_child_of_existing() {
+        let db = create_test_db().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create subdirectory
+        let child_dir = temp_dir.path().join("projects").join("medical");
+        std::fs::create_dir_all(&child_dir).unwrap();
+
+        // Create parent source first
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Projects".to_string(),
+            source_type: SourceType::Local,
+            path: temp_dir.path().display().to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // Try to add child - should fail
+        let result = db.check_source_overlap(&child_dir).await;
+        assert!(result.is_err(), "Child of existing source should be rejected");
+
+        match result.unwrap_err() {
+            ScoutError::SourceIsChildOfExisting {
+                new_path,
+                existing_name,
+                ..
+            } => {
+                assert!(new_path.contains("medical"));
+                assert_eq!(existing_name, "Projects");
+            }
+            e => panic!("Expected SourceIsChildOfExisting, got: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_source_overlap_parent_of_existing() {
+        let db = create_test_db().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create subdirectory and make it a source first
+        let child_dir = temp_dir.path().join("data").join("medical");
+        std::fs::create_dir_all(&child_dir).unwrap();
+
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Medical".to_string(),
+            source_type: SourceType::Local,
+            path: child_dir.display().to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // Try to add parent - should fail
+        let result = db.check_source_overlap(temp_dir.path()).await;
+        assert!(result.is_err(), "Parent of existing source should be rejected");
+
+        match result.unwrap_err() {
+            ScoutError::SourceIsParentOfExisting {
+                existing_name,
+                existing_path,
+                ..
+            } => {
+                assert_eq!(existing_name, "Medical");
+                assert!(existing_path.contains("medical"));
+            }
+            e => panic!("Expected SourceIsParentOfExisting, got: {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_source_overlap_sibling_allowed() {
+        let db = create_test_db().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create two sibling directories
+        let dir_a = temp_dir.path().join("projects_a");
+        let dir_b = temp_dir.path().join("projects_b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        // Create source for dir_a
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Projects A".to_string(),
+            source_type: SourceType::Local,
+            path: dir_a.display().to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // dir_b is a sibling, not nested - should be allowed
+        let result = db.check_source_overlap(&dir_b).await;
+        assert!(result.is_ok(), "Sibling directories should be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_source_overlap_stale_source_skipped() {
+        let db = create_test_db().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a source pointing to non-existent path (stale)
+        let source = Source {
+            id: "src-stale".to_string(),
+            name: "Stale Source".to_string(),
+            source_type: SourceType::Local,
+            path: "/nonexistent/path/that/does/not/exist".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // New source should be allowed even though stale source exists
+        // (stale source can't be canonicalized, so it's skipped)
+        let result = db.check_source_overlap(temp_dir.path()).await;
+        assert!(result.is_ok(), "Should skip stale sources during overlap check");
+    }
+
+    #[tokio::test]
+    async fn test_source_overlap_multiple_existing() {
+        let db = create_test_db().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create three separate directories
+        let dir_a = temp_dir.path().join("a");
+        let dir_b = temp_dir.path().join("b");
+        let dir_c = temp_dir.path().join("c");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::create_dir_all(&dir_c).unwrap();
+
+        // Create sources for a and b
+        for (id, name, path) in [
+            ("src-a", "Source A", &dir_a),
+            ("src-b", "Source B", &dir_b),
+        ] {
+            let source = Source {
+                id: id.to_string(),
+                name: name.to_string(),
+                source_type: SourceType::Local,
+                path: path.display().to_string(),
+                poll_interval_secs: 30,
+                enabled: true,
+            };
+            db.upsert_source(&source).await.unwrap();
+        }
+
+        // dir_c is independent - should be allowed
+        let result = db.check_source_overlap(&dir_c).await;
+        assert!(result.is_ok(), "Independent directory should be allowed");
+
+        // Parent of all - should fail
+        let result = db.check_source_overlap(temp_dir.path()).await;
+        assert!(result.is_err(), "Parent of any existing source should be rejected");
     }
 }
