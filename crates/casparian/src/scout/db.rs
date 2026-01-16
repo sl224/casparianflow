@@ -8,8 +8,8 @@
 
 use super::error::Result;
 use super::types::{
-    DbStats, ExtractionLogStatus, ExtractionStatus, Extractor, FileStatus, ScannedFile, Source,
-    SourceType, TaggingRule, UpsertResult,
+    BatchUpsertResult, DbStats, ExtractionLogStatus, ExtractionStatus, Extractor, FileStatus,
+    ScannedFile, Source, SourceType, TaggingRule, UpsertResult,
 };
 use casparian_db::{DbConfig, DbPool, create_pool};
 use chrono::{DateTime, Utc};
@@ -755,6 +755,259 @@ impl Database {
         }
     }
 
+    /// Batch upsert files within a single transaction using bulk INSERT.
+    ///
+    /// Uses multi-row INSERT for ~10-20x speedup vs individual inserts.
+    /// Chunks batches to stay under SQLite's 999 parameter limit.
+    ///
+    /// First queries existing files to properly track new/changed/unchanged,
+    /// then uses bulk INSERT...ON CONFLICT for efficient upserts.
+    pub async fn batch_upsert_files(
+        &self,
+        files: &[ScannedFile],
+        tag: Option<&str>,
+    ) -> Result<BatchUpsertResult> {
+        if files.is_empty() {
+            return Ok(BatchUpsertResult::default());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let now = now_millis();
+        let mut stats = BatchUpsertResult::default();
+
+        // Get source_id from first file (all files in batch have same source)
+        let source_id = files[0].source_id.as_ref();
+
+        // Query existing files to determine new vs changed vs unchanged
+        // Note: This SELECT also needs chunking for large batches
+        let existing = Self::query_existing_files(&mut tx, source_id, files).await?;
+
+        // SQLite limit: 999 parameters. With 9 params per row, max 100 rows per chunk.
+        const CHUNK_SIZE: usize = 100;
+
+        for chunk in files.chunks(CHUNK_SIZE) {
+            // Pre-compute stats for this chunk (assuming all succeed)
+            let mut chunk_new = 0u64;
+            let mut chunk_changed = 0u64;
+            let mut chunk_unchanged = 0u64;
+
+            for file in chunk {
+                let is_new = !existing.contains_key(&file.path);
+                let is_changed = existing
+                    .get(&file.path)
+                    .is_some_and(|(size, mtime)| *size != file.size as i64 || *mtime != file.mtime);
+
+                if is_new {
+                    chunk_new += 1;
+                } else if is_changed {
+                    chunk_changed += 1;
+                } else {
+                    chunk_unchanged += 1;
+                }
+            }
+
+            // Try bulk insert
+            match Self::bulk_insert_chunk(&mut tx, chunk, tag, now).await {
+                Ok(()) => {
+                    stats.new += chunk_new;
+                    stats.changed += chunk_changed;
+                    stats.unchanged += chunk_unchanged;
+                }
+                Err(e) => {
+                    // Bulk failed - fall back to row-by-row to isolate bad row
+                    tracing::debug!(error = %e, "Bulk insert failed, falling back to row-by-row");
+                    Self::insert_rows_individually(
+                        &mut tx,
+                        chunk,
+                        tag,
+                        now,
+                        &existing,
+                        &mut stats,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(stats)
+    }
+
+    /// Query existing files for a batch (chunked to avoid parameter limit)
+    async fn query_existing_files(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        source_id: &str,
+        files: &[ScannedFile],
+    ) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+        let mut existing = std::collections::HashMap::with_capacity(files.len());
+
+        // Chunk the SELECT query too (999 params, 1 for source_id + N for paths)
+        const SELECT_CHUNK_SIZE: usize = 500;
+
+        for chunk in files.chunks(SELECT_CHUNK_SIZE) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let query = format!(
+                "SELECT path, size, mtime FROM scout_files WHERE source_id = ? AND path IN ({})",
+                placeholders
+            );
+
+            let mut q = sqlx::query_as::<_, (String, i64, i64)>(&query).bind(source_id);
+            for file in chunk {
+                q = q.bind(&file.path);
+            }
+
+            let rows = q.fetch_all(&mut **tx).await?;
+            for (path, size, mtime) in rows {
+                existing.insert(path, (size, mtime));
+            }
+        }
+
+        Ok(existing)
+    }
+
+    /// Bulk insert a chunk of files using multi-row VALUES
+    async fn bulk_insert_chunk(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        files: &[ScannedFile],
+        tag: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        // Build multi-row VALUES: (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        // 9 bind params per row: source_id, path, rel_path, size, mtime, content_hash, tag, first_seen_at, last_seen_at
+        let row_placeholder = "(?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)";
+        let values: String = (0..files.len())
+            .map(|_| row_placeholder)
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Two SQL patterns based on whether tag is provided:
+        // - With tag: ON CONFLICT updates tag to excluded.tag
+        // - Without tag: ON CONFLICT preserves existing tag
+        let sql = if tag.is_some() {
+            format!(
+                r#"INSERT INTO scout_files
+                   (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                   VALUES {}
+                   ON CONFLICT(source_id, path) DO UPDATE SET
+                       size = excluded.size,
+                       mtime = excluded.mtime,
+                       content_hash = excluded.content_hash,
+                       status = CASE
+                           WHEN scout_files.size != excluded.size OR scout_files.mtime != excluded.mtime
+                           THEN 'pending'
+                           ELSE scout_files.status
+                       END,
+                       tag = excluded.tag,
+                       last_seen_at = excluded.last_seen_at"#,
+                values
+            )
+        } else {
+            format!(
+                r#"INSERT INTO scout_files
+                   (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                   VALUES {}
+                   ON CONFLICT(source_id, path) DO UPDATE SET
+                       size = excluded.size,
+                       mtime = excluded.mtime,
+                       content_hash = excluded.content_hash,
+                       status = CASE
+                           WHEN scout_files.size != excluded.size OR scout_files.mtime != excluded.mtime
+                           THEN 'pending'
+                           ELSE scout_files.status
+                       END,
+                       last_seen_at = excluded.last_seen_at"#,
+                values
+            )
+        };
+
+        let mut query = sqlx::query(&sql);
+
+        for file in files {
+            let file_tag = tag.or(file.tag.as_deref());
+            query = query
+                .bind(file.source_id.as_ref())
+                .bind(&file.path)
+                .bind(&file.rel_path)
+                .bind(file.size as i64)
+                .bind(file.mtime)
+                .bind(&file.content_hash)
+                .bind(file_tag)
+                .bind(now)
+                .bind(now);
+        }
+
+        query.execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    /// Fallback: insert rows one at a time when bulk insert fails
+    async fn insert_rows_individually(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        files: &[ScannedFile],
+        tag: Option<&str>,
+        now: i64,
+        existing: &std::collections::HashMap<String, (i64, i64)>,
+        stats: &mut BatchUpsertResult,
+    ) {
+        for file in files {
+            let is_new = !existing.contains_key(&file.path);
+            let is_changed = existing
+                .get(&file.path)
+                .is_some_and(|(size, mtime)| *size != file.size as i64 || *mtime != file.mtime);
+
+            let file_tag = tag.or(file.tag.as_deref());
+            let result = sqlx::query(
+                r#"INSERT INTO scout_files
+                   (source_id, path, rel_path, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                   ON CONFLICT(source_id, path) DO UPDATE SET
+                       size = excluded.size,
+                       mtime = excluded.mtime,
+                       content_hash = excluded.content_hash,
+                       status = CASE
+                           WHEN scout_files.size != excluded.size OR scout_files.mtime != excluded.mtime
+                           THEN 'pending'
+                           ELSE scout_files.status
+                       END,
+                       tag = CASE WHEN ? IS NOT NULL THEN ? ELSE scout_files.tag END,
+                       last_seen_at = excluded.last_seen_at"#,
+            )
+            .bind(file.source_id.as_ref())
+            .bind(&file.path)
+            .bind(&file.rel_path)
+            .bind(file.size as i64)
+            .bind(file.mtime)
+            .bind(&file.content_hash)
+            .bind(file_tag)
+            .bind(now)
+            .bind(now)
+            .bind(tag)
+            .bind(tag)
+            .execute(&mut **tx)
+            .await;
+
+            match result {
+                Ok(_) => {
+                    if is_new {
+                        stats.new += 1;
+                    } else if is_changed {
+                        stats.changed += 1;
+                    } else {
+                        stats.unchanged += 1;
+                    }
+                }
+                Err(e) => {
+                    stats.errors += 1;
+                    tracing::debug!(file = %file.path, error = %e, "Failed to upsert file");
+                }
+            }
+        }
+    }
+
     /// Get a file by ID
     pub async fn get_file(&self, id: i64) -> Result<Option<ScannedFile>> {
         let row = sqlx::query(
@@ -1320,133 +1573,6 @@ impl Database {
     }
 
     // ========================================================================
-    // Folder Operations (Streaming Scanner)
-    // ========================================================================
-
-    /// Get folder children at a given prefix for TUI drill-down
-    /// Returns folders first (sorted), then files (sorted)
-    pub async fn get_folder_children(
-        &self,
-        source_id: &str,
-        prefix: &str,
-    ) -> Result<Vec<FolderEntry>> {
-        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
-            r#"
-            SELECT name, file_count, is_folder
-            FROM scout_folders
-            WHERE source_id = ? AND prefix = ?
-            ORDER BY is_folder DESC, name ASC
-            "#,
-        )
-        .bind(source_id)
-        .bind(prefix)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|(name, file_count, is_folder)| FolderEntry {
-                name,
-                file_count,
-                is_folder: is_folder != 0,
-            })
-            .collect())
-    }
-
-    /// Batch upsert folder counts during scan
-    /// Called by persist_task with aggregated deltas
-    pub async fn batch_upsert_folder_counts(
-        &self,
-        source_id: &str,
-        deltas: &std::collections::HashMap<(String, String), (i64, bool)>,
-    ) -> Result<()> {
-        let now = now_millis();
-
-        for ((prefix, name), (count, is_folder)) in deltas {
-            sqlx::query(
-                r#"
-                INSERT INTO scout_folders (source_id, prefix, name, file_count, is_folder, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source_id, prefix, name) DO UPDATE
-                SET file_count = file_count + excluded.file_count,
-                    updated_at = excluded.updated_at
-                "#,
-            )
-            .bind(source_id)
-            .bind(prefix)
-            .bind(name)
-            .bind(*count)
-            .bind(*is_folder as i32)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Decrement folder counts when files are deleted
-    /// Called during rescan cleanup
-    pub async fn decrement_folder_counts(
-        &self,
-        source_id: &str,
-        deltas: &std::collections::HashMap<(String, String), (i64, bool)>,
-    ) -> Result<()> {
-        let now = now_millis();
-
-        for ((prefix, name), (delta, _)) in deltas {
-            sqlx::query(
-                r#"
-                UPDATE scout_folders
-                SET file_count = file_count + ?,
-                    updated_at = ?
-                WHERE source_id = ? AND prefix = ? AND name = ?
-                "#,
-            )
-            .bind(*delta) // negative for decrements
-            .bind(now)
-            .bind(source_id)
-            .bind(prefix)
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
-        }
-
-        // Clean up zero-count folders
-        sqlx::query(
-            r#"
-            DELETE FROM scout_folders
-            WHERE source_id = ? AND file_count <= 0
-            "#,
-        )
-        .bind(source_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Clear all folder entries for a source (used before rescan)
-    pub async fn clear_folder_cache(&self, source_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM scout_folders WHERE source_id = ?")
-            .bind(source_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Check if folder data exists for a source
-    pub async fn has_folder_data(&self, source_id: &str) -> Result<bool> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scout_folders WHERE source_id = ? LIMIT 1",
-        )
-        .bind(source_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count.0 > 0)
-    }
-
-    // ========================================================================
     // Extractor Operations
     // ========================================================================
 
@@ -1684,14 +1810,6 @@ impl Database {
     }
 }
 
-/// Entry in folder hierarchy (from scout_folders table)
-#[derive(Debug, Clone)]
-pub struct FolderEntry {
-    pub name: String,
-    pub file_count: i64,
-    pub is_folder: bool,
-}
-
 /// Helper function to convert a database row to an Extractor
 fn row_to_extractor(row: &sqlx::sqlite::SqliteRow) -> Extractor {
     let paused_at_millis: Option<i64> = row.get(7);
@@ -1900,5 +2018,91 @@ mod tests {
         let (ts_a, ts_b, ts_c) = row;
         assert!(ts_b > ts_a, "B should have newer timestamp than A");
         assert!(ts_a > ts_c, "A should have newer timestamp than C");
+    }
+
+    /// Test bulk insert with multiple files
+    #[tokio::test]
+    async fn test_batch_upsert_files_bulk() {
+        let db = create_test_db().await;
+
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Test".to_string(),
+            source_type: SourceType::Local,
+            path: "/data".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // Create 150 files (tests chunking since limit is 100)
+        let files: Vec<ScannedFile> = (0..150)
+            .map(|i| ScannedFile::new("src-1", &format!("/data/file{}.txt", i), &format!("file{}.txt", i), 1000 + i, 12345))
+            .collect();
+
+        // First batch insert - all new
+        let result = db.batch_upsert_files(&files, Some("test_tag")).await.unwrap();
+        assert_eq!(result.new, 150, "Should have 150 new files");
+        assert_eq!(result.changed, 0);
+        assert_eq!(result.unchanged, 0);
+        assert_eq!(result.errors, 0);
+
+        // Verify files were inserted with tag
+        let tagged = db.list_files_by_tag("test_tag", 200).await.unwrap();
+        assert_eq!(tagged.len(), 150, "Should have 150 tagged files");
+
+        // Second batch insert - same files, no changes
+        let result = db.batch_upsert_files(&files, Some("test_tag")).await.unwrap();
+        assert_eq!(result.new, 0);
+        assert_eq!(result.changed, 0);
+        assert_eq!(result.unchanged, 150, "Should have 150 unchanged files");
+        assert_eq!(result.errors, 0);
+
+        // Third batch insert - modify some files
+        let modified_files: Vec<ScannedFile> = (0..150)
+            .map(|i| {
+                if i < 50 {
+                    // First 50 files: change size
+                    ScannedFile::new("src-1", &format!("/data/file{}.txt", i), &format!("file{}.txt", i), 2000 + i, 12345)
+                } else {
+                    // Remaining 100 files: unchanged
+                    ScannedFile::new("src-1", &format!("/data/file{}.txt", i), &format!("file{}.txt", i), 1000 + i, 12345)
+                }
+            })
+            .collect();
+
+        let result = db.batch_upsert_files(&modified_files, Some("test_tag")).await.unwrap();
+        assert_eq!(result.new, 0);
+        assert_eq!(result.changed, 50, "Should have 50 changed files");
+        assert_eq!(result.unchanged, 100, "Should have 100 unchanged files");
+        assert_eq!(result.errors, 0);
+    }
+
+    /// Test batch upsert without tag (preserves existing tags)
+    #[tokio::test]
+    async fn test_batch_upsert_files_no_tag() {
+        let db = create_test_db().await;
+
+        let source = Source {
+            id: "src-1".to_string(),
+            name: "Test".to_string(),
+            source_type: SourceType::Local,
+            path: "/data".to_string(),
+            poll_interval_secs: 30,
+            enabled: true,
+        };
+        db.upsert_source(&source).await.unwrap();
+
+        // Create file and tag it
+        let file = ScannedFile::new("src-1", "/data/test.txt", "test.txt", 1000, 12345);
+        let upsert_result = db.upsert_file(&file).await.unwrap();
+        db.tag_file(upsert_result.id, "original_tag").await.unwrap();
+
+        // Batch upsert with no tag - should preserve existing tag
+        let result = db.batch_upsert_files(&[file.clone()], None).await.unwrap();
+        assert_eq!(result.unchanged, 1);
+
+        let fetched = db.get_file_by_path("src-1", "/data/test.txt").await.unwrap().unwrap();
+        assert_eq!(fetched.tag, Some("original_tag".to_string()), "Tag should be preserved");
     }
 }

@@ -169,7 +169,7 @@ pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
     // Note: Scanner scans ALL files; CLI filters are applied post-scan
     let scanner = Scanner::new(db.clone());
     let scan_result = scanner
-        .scan_source_with_progress(&source, None, None)
+        .scan(&source, None, None)
         .await
         .map_err(|e| HelpfulError::new(format!("Scan failed: {}", e)))?;
 

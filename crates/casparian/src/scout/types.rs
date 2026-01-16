@@ -465,6 +465,19 @@ pub struct UpsertResult {
     pub is_changed: bool,
 }
 
+/// Result of batch upserting multiple files into the database
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BatchUpsertResult {
+    /// Count of new files (first time seen)
+    pub new: u64,
+    /// Count of changed files (modified since last scan)
+    pub changed: u64,
+    /// Count of unchanged files
+    pub unchanged: u64,
+    /// Count of files that failed to upsert
+    pub errors: u64,
+}
+
 /// Statistics from the database
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // Will be used for status reporting

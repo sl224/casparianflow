@@ -1241,7 +1241,8 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
     // Get progress - IMPORTANT: scan_progress contains the REAL values
     let progress = app.discover.scan_progress.as_ref();
-    let files = progress.map(|p| p.files_found).unwrap_or(0);
+    let files_found = progress.map(|p| p.files_found).unwrap_or(0);
+    let files_persisted = progress.map(|p| p.files_persisted).unwrap_or(0);
     let dirs = progress.map(|p| p.dirs_scanned).unwrap_or(0);
     let current = progress.and_then(|p| p.current_dir.clone());
 
@@ -1288,7 +1289,8 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let line0 = format!("  Path: {}", path_display);
     // Line 1: empty
     // Line 2: Stats (THE MAIN PROGRESS LINE)
-    let line2 = format!("  {} files | {} dirs | {}", files, dirs, time_str);
+    // Show crawled/persisted to diagnose bottlenecks
+    let line2 = format!("  {}/{} files | {} dirs | {}", files_found, files_persisted, dirs, time_str);
     // Line 3: empty
     // Line 4: Current directory hint
     let line4 = format!("  {}", hint);
@@ -1328,15 +1330,36 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     // === HEADER ===
-    // Format: " Rule Builder - [1] Source: X ▾  [2] Tags: All ▾  | 247 files match "
+    // Format: " Rule Builder - [1] Source: X ▾  [2] Tags: All ▾  | 247 files match | Scan: 12345 files "
     let source_name = app.discover.selected_source()
         .map(|s| s.name.clone())
         .unwrap_or_else(|| "All".to_string());
     let match_count = builder.match_count;
 
+    // Scan snapshot info - show source file count if cache is loaded
+    let scan_info = if let Some(ref explorer) = app.discover.glob_explorer {
+        if explorer.cache_loaded {
+            // Get file count from selected source
+            let file_count = app.discover.selected_source()
+                .map(|s| s.file_count)
+                .unwrap_or(0);
+            if file_count > 0 {
+                format!(" | Scan: {} files", file_count)
+            } else {
+                " | Scan: empty".to_string()
+            }
+        } else if app.discover.scan_error.is_some() {
+            " | No scan [s]".to_string()
+        } else {
+            " | Loading...".to_string()
+        }
+    } else {
+        " | No scan [s]".to_string()
+    };
+
     let header_text = format!(
-        " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  │ {} files match ",
-        source_name, match_count
+        " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  │ {} files match{}",
+        source_name, match_count, scan_info
     );
     let header = Paragraph::new(header_text)
         .style(Style::default().fg(Color::Green).bold())
@@ -1359,8 +1382,10 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
     draw_rule_builder_right_panel(frame, builder, h_chunks[1], app.discover.scan_error.as_deref());
 
     // === FOOTER ===
-    // Show cache loading progress if active, otherwise show keybindings
-    let (footer_text, footer_style) = if let Some(ref progress) = app.cache_load_progress {
+    // Priority: status_message > cache loading progress > keybindings
+    let (footer_text, footer_style) = if let Some((ref msg, is_error)) = app.discover.status_message {
+        (format!(" {} ", msg), if is_error { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) })
+    } else if let Some(ref progress) = app.cache_load_progress {
         // Show spinner with source name and elapsed time
         let spinner = spinner_char(app.tick_count);
         let status = progress.status_line();

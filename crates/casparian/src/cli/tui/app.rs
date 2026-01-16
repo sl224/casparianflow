@@ -13,7 +13,7 @@ use super::llm::claude_code::ClaudeCodeProvider;
 use super::llm::{registry_to_definitions, LlmProvider, StreamChunk};
 use super::TuiArgs;
 use crate::scout::{
-    Database as ScoutDatabase, FolderCache,
+    Database as ScoutDatabase,
     ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source, SourceType,
 };
 
@@ -1004,11 +1004,6 @@ impl FolderInfo {
     pub fn loading(message: &str) -> Self {
         Self { name: message.to_string(), path: None, file_count: 0, is_file: false }
     }
-
-    /// Create from a cache entry
-    pub fn from_cache_entry(name: &str, file_count: usize, is_file: bool) -> Self {
-        Self { name: name.to_string(), path: None, file_count, is_file }
-    }
 }
 
 /// Preview file for Glob Explorer
@@ -1607,6 +1602,8 @@ pub struct App {
     pending_glob_search: Option<mpsc::Receiver<GlobSearchResult>>,
     /// Cancellation token for pending glob search (set to true to cancel)
     glob_search_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Pending folder query (on-demand database query for navigation)
+    pending_folder_query: Option<mpsc::Receiver<FolderQueryMessage>>,
     /// Pending sources load (non-blocking DB query)
     pending_sources_load: Option<mpsc::Receiver<Vec<SourceInfo>>>,
     /// Pending jobs load (non-blocking DB query)
@@ -1628,6 +1625,18 @@ enum CacheLoadMessage {
         cache: HashMap<String, Vec<FolderInfo>>,
     },
     /// Error during loading
+    Error(String),
+}
+
+/// Message for on-demand folder queries
+enum FolderQueryMessage {
+    /// Query completed successfully
+    Complete {
+        prefix: String,
+        folders: Vec<FolderInfo>,
+        total_count: usize,
+    },
+    /// Error during query
     Error(String),
 }
 
@@ -1737,6 +1746,7 @@ impl App {
             tick_count: 0,
             pending_glob_search: None,
             glob_search_cancelled: None,
+            pending_folder_query: None,
             pending_sources_load: None,
             pending_jobs_load: None,
             last_jobs_poll: None,
@@ -1804,6 +1814,7 @@ impl App {
             tick_count: 0,
             pending_glob_search: None,
             glob_search_cancelled: None,
+            pending_folder_query: None,
             pending_sources_load: None,
             pending_jobs_load: None,
             last_jobs_poll: None,
@@ -1832,6 +1843,24 @@ impl App {
                 self.profiler.enabled = !self.profiler.enabled;
                 return;
             }
+            // Alt+Number: Global mode navigation (works from ANY mode, including Discover)
+            // Note: Ctrl+Number doesn't work reliably in terminals, so we use Alt instead
+            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.enter_discover_mode();
+                return;
+            }
+            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::ParserBench;
+                return;
+            }
+            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::Jobs;
+                return;
+            }
+            KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.mode = TuiMode::Inspect;
+                return;
+            }
             // Number keys for primary navigation (1-4)
             // Note: In Discover mode, 1/2/3 are overridden for panel focus
             // Don't intercept when chat is focused (allow typing numbers)
@@ -1848,9 +1877,13 @@ impl App {
                 return;
             }
             KeyCode::Char('4') if self.focus != AppFocus::Chat => {
-                // Key '4' is reserved for future use
-                // Sources management is handled via Discover mode (M key)
-                self.mode = TuiMode::Inspect;
+                // During scanning, '4' goes to Jobs (scan continues in background)
+                if self.mode == TuiMode::Discover && self.discover.view_state == DiscoverViewState::Scanning {
+                    self.mode = TuiMode::Jobs;
+                    self.discover.status_message = Some(("Scan running in background...".to_string(), false));
+                } else {
+                    self.mode = TuiMode::Inspect;
+                }
                 return;
             }
             // 0 or H: Return to Home (from any view)
@@ -3569,9 +3602,15 @@ impl App {
                 };
             }
 
-            // Escape cancels nested state (Rule Builder is persistent - no closing)
+            // Escape cancels nested state or exits Rule Builder from FileList
             KeyCode::Esc => {
                 match builder.focus {
+                    RuleBuilderFocus::FileList => {
+                        // Already on FileList - exit Discover mode (go to Home)
+                        // Rule Builder IS the Discover view, so exiting means leaving Discover
+                        self.mode = TuiMode::Home;
+                        return;
+                    }
                     RuleBuilderFocus::ExcludeInput => {
                         builder.exclude_input.clear();
                         builder.focus = RuleBuilderFocus::Excludes;
@@ -3589,8 +3628,7 @@ impl App {
                         builder.focus = RuleBuilderFocus::FileList;
                     }
                     _ => {
-                        // Rule Builder is the default Discover view - don't close
-                        // Move focus to FileList for navigation
+                        // First Escape moves to FileList
                         builder.focus = RuleBuilderFocus::FileList;
                     }
                 }
@@ -3975,7 +4013,7 @@ impl App {
         self.update_rule_builder_files(&initial_pattern);
 
         // Trigger cache load for pattern matching
-        self.load_folder_tree();
+        self.start_cache_load();
     }
 
     /// Update the Rule Builder's matched files based on the current pattern
@@ -4685,6 +4723,7 @@ impl App {
         self.discover.scan_progress = Some(ScoutProgress {
             dirs_scanned: 0,
             files_found: 0,
+            files_persisted: 0,
             current_dir: Some("Initializing...".to_string()),
         });
         self.discover.scan_start_time = Some(std::time::Instant::now());
@@ -4794,12 +4833,16 @@ impl App {
             let scan_result = {
                 let source_clone = source.clone();
                 tokio::task::spawn_blocking(move || {
-                    // Create a new runtime for the blocking task
-                    let rt = tokio::runtime::Builder::new_current_thread()
+                    // Create a multi-threaded runtime for the blocking task
+                    // CRITICAL: Scanner uses tokio::spawn internally for concurrent persist task.
+                    // A current-thread runtime causes deadlock because the persist task can't
+                    // run concurrently with the walker's blocking_send().
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2) // Minimum for concurrent walker + persist
                         .enable_all()
                         .build()
                         .unwrap();
-                    rt.block_on(scanner.scan_source_with_progress(&source_clone, Some(progress_tx), None))
+                    rt.block_on(scanner.scan(&source_clone, Some(progress_tx), None))
                 }).await
             };
 
@@ -5037,224 +5080,6 @@ impl App {
     /// State is updated atomically at the end.
     ///
     /// NOTE: Currently unused - replaced by preload_folder_cache() for O(1) navigation.
-    /// Kept for potential future use with complex SQL-based pattern filtering.
-    #[allow(dead_code)]
-    async fn load_folder_tree(&mut self) {
-        use sqlx::SqlitePool;
-
-        // Must have glob_explorer active and a source selected
-        let source_id = match &self.discover.selected_source_id {
-            Some(id) => id.clone(),
-            None => return,
-        };
-        let explorer = match &self.discover.glob_explorer {
-            Some(e) => e.clone(),
-            None => return,
-        };
-
-        let db_path = dirs::home_dir()
-            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-        if !db_path.exists() {
-            return;
-        }
-
-        let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-        let pool = match SqlitePool::connect(&db_url).await {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let prefix = &explorer.current_prefix;
-        let prefix_len = prefix.len() as i32;
-
-        // Convert glob pattern for SQLite compatibility
-        // SQLite GLOB: * matches any chars INCLUDING /
-        // So **/*.txt should become *.txt (removes redundant **/)
-        let sqlite_pattern: Option<String> = if explorer.pattern.is_empty() {
-            None
-        } else {
-            let p = explorer.pattern.as_str();
-            // Handle **/ prefix - SQLite's * already matches any depth
-            let converted = if p.starts_with("**/") {
-                p.strip_prefix("**/").unwrap_or(p).to_string()
-            } else {
-                // Also handle ** anywhere - replace **/ with *
-                p.replace("**/", "*").to_string()
-            };
-            Some(converted)
-        };
-        let glob_pattern = sqlite_pattern.as_deref();
-
-        // --- Batch Query 1: Folder counts at current depth ---
-        let folder_query = if glob_pattern.is_some() {
-            r#"
-            SELECT
-                CASE
-                    WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
-                    THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
-                    ELSE SUBSTR(rel_path, ? + 1)
-                END AS item_name,
-                COUNT(*) as file_count,
-                MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
-            FROM scout_files
-            WHERE source_id = ?
-              AND rel_path LIKE ? || '%'
-              AND rel_path GLOB ?
-              AND LENGTH(rel_path) > ?
-            GROUP BY item_name
-            ORDER BY file_count DESC
-            LIMIT 100
-            "#
-        } else {
-            r#"
-            SELECT
-                CASE
-                    WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
-                    THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
-                    ELSE SUBSTR(rel_path, ? + 1)
-                END AS item_name,
-                COUNT(*) as file_count,
-                MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
-            FROM scout_files
-            WHERE source_id = ?
-              AND rel_path LIKE ? || '%'
-              AND LENGTH(rel_path) > ?
-            GROUP BY item_name
-            ORDER BY file_count DESC
-            LIMIT 100
-            "#
-        };
-
-        let folders_result: Result<Vec<(String, i64, i32)>, _> = if let Some(pattern) = glob_pattern {
-            sqlx::query_as(folder_query)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(source_id.as_str())
-                .bind(prefix)
-                .bind(pattern)
-                .bind(prefix_len)
-                .fetch_all(&pool)
-                .await
-        } else {
-            sqlx::query_as(folder_query)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(prefix_len)
-                .bind(source_id.as_str())
-                .bind(prefix)
-                .bind(prefix_len)
-                .fetch_all(&pool)
-                .await
-        };
-
-        // --- Batch Query 2: Preview files ---
-        let preview_result: Result<Vec<(String, i64, i64)>, _> = if let Some(pattern) = glob_pattern {
-            sqlx::query_as(
-                r#"
-                SELECT rel_path, size, mtime
-                FROM scout_files
-                WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
-                  AND rel_path GLOB ?
-                ORDER BY mtime DESC
-                LIMIT 10
-                "#,
-            )
-            .bind(source_id.as_str())
-            .bind(prefix)
-            .bind(pattern)
-            .fetch_all(&pool)
-            .await
-        } else {
-            sqlx::query_as(
-                r#"
-                SELECT rel_path, size, mtime
-                FROM scout_files
-                WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
-                ORDER BY mtime DESC
-                LIMIT 10
-                "#,
-            )
-            .bind(source_id.as_str())
-            .bind(prefix)
-            .fetch_all(&pool)
-            .await
-        };
-
-        // --- Batch Query 3: Total count ---
-        let count_result: Result<(i64,), _> = if let Some(pattern) = glob_pattern {
-            sqlx::query_as(
-                r#"
-                SELECT COUNT(*)
-                FROM scout_files
-                WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
-                  AND rel_path GLOB ?
-                "#,
-            )
-            .bind(source_id.as_str())
-            .bind(prefix)
-            .bind(pattern)
-            .fetch_one(&pool)
-            .await
-        } else {
-            sqlx::query_as(
-                r#"
-                SELECT COUNT(*)
-                FROM scout_files
-                WHERE source_id = ?
-                  AND rel_path LIKE ? || '%'
-                "#,
-            )
-            .bind(source_id.as_str())
-            .bind(prefix)
-            .fetch_one(&pool)
-            .await
-        };
-
-        // --- ATOMIC STATE UPDATE ---
-        // Only update if all queries succeeded
-        if let (Ok(folders_raw), Ok(preview_raw), Ok((count,))) =
-            (folders_result, preview_result, count_result)
-        {
-            let folders: Vec<FolderInfo> = folders_raw
-                .into_iter()
-                .filter(|(name, _, _)| !name.is_empty())
-                .map(|(name, count, is_file)| FolderInfo::new(name, count as usize, is_file != 0))
-                .collect();
-
-            let preview_files: Vec<GlobPreviewFile> = preview_raw
-                .into_iter()
-                .map(|(rel_path, size, mtime)| GlobPreviewFile {
-                    rel_path,
-                    size: size as u64,
-                    mtime,
-                })
-                .collect();
-
-            let total_count = GlobFileCount::Exact(count as usize);
-
-            // Update explorer state atomically
-            if let Some(ref mut explorer) = self.discover.glob_explorer {
-                explorer.folders = folders;
-                explorer.preview_files = preview_files;
-                explorer.total_count = total_count;
-                explorer.selected_folder = 0;
-            }
-        }
-
-        // Mark as loaded (whether success or failure)
-        self.discover.data_loaded = true;
-    }
-
     /// Start non-blocking cache load for glob explorer.
     /// Checks preloaded caches first (instant), then loads from disk cache or scout_folders.
     fn start_cache_load(&mut self) {
@@ -5313,51 +5138,100 @@ impl App {
             explorer.cache_source_id = Some(source_id_str.clone());
         }
 
-        // Spawn background task for cache loading
+        // Spawn background task for database queries (live folder derivation)
         tokio::spawn(async move {
-            // Try to load from disk cache (fast path)
-            let source_id_for_cache = source_id_str.clone();
-            let cache_result = tokio::task::spawn_blocking(move || {
-                let folder_cache = FolderCache::load(&source_id_for_cache).ok()?;
-                // Convert SoA FolderCache to HashMap<String, Vec<FolderInfo>> for TUI traversal
-                // Note: folder_cache::FolderInfo -> app::FolderInfo conversion
-                let cache: HashMap<String, Vec<FolderInfo>> = folder_cache
-                    .to_folder_map()
-                    .into_iter()
-                    .map(|(prefix, entries)| {
-                        let folder_infos: Vec<FolderInfo> = entries
-                            .into_iter()
-                            .map(|e| FolderInfo::from_cache_entry(&e.name, e.file_count, e.is_file))
-                            .collect();
-                        (prefix, folder_infos)
-                    })
-                    .collect();
-                let tags: Vec<TagInfo> = folder_cache.get_tags().into_iter()
-                    .map(|t| TagInfo {
-                        name: t.name,
-                        count: t.count,
-                        is_special: t.is_special,
-                    })
-                    .collect();
-                Some((cache, folder_cache.total_files, tags))
-            }).await.ok().flatten();
+            // Open database connection
+            let db_path = dirs::home_dir()
+                .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+                .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
 
-            match cache_result {
-                Some((cache, total_files, tags)) => {
-                    let _ = tx.send(CacheLoadMessage::Complete {
-                        source_id: source_id_str,
-                        total_files,
-                        tags,
-                        cache,
-                    }).await;
-                }
-                None => {
-                    // No disk cache - user needs to scan first
+            let db = match ScoutDatabase::open(&db_path).await {
+                Ok(db) => db,
+                Err(e) => {
                     let _ = tx.send(CacheLoadMessage::Error(
-                        "No cache found. Run a scan first.".to_string()
+                        format!("Database error: {}", e)
                     )).await;
+                    return;
                 }
+            };
+
+            // Query root folders (prefix = "")
+            let root_folders = match db.get_folder_counts(&source_id_str, "", None).await {
+                Ok(folders) => folders,
+                Err(e) => {
+                    let _ = tx.send(CacheLoadMessage::Error(
+                        format!("Query error: {}", e)
+                    )).await;
+                    return;
+                }
+            };
+
+            // Convert to FolderInfo and build initial cache with just root
+            let folder_infos: Vec<FolderInfo> = root_folders
+                .into_iter()
+                .map(|(name, count, is_file)| FolderInfo::new(name, count as usize, is_file))
+                .collect();
+
+            let mut cache: HashMap<String, Vec<FolderInfo>> = HashMap::new();
+            cache.insert(String::new(), folder_infos);
+
+            // Get total file count for source
+            let total_files: usize = match sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM scout_files WHERE source_id = ?"
+            )
+            .bind(&source_id_str)
+            .fetch_one(db.pool())
+            .await {
+                Ok((count,)) => count as usize,
+                Err(_) => 0,
+            };
+
+            // Get tag counts
+            let tag_rows: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT tag, COUNT(*) as count FROM scout_files WHERE source_id = ? AND tag IS NOT NULL GROUP BY tag ORDER BY count DESC, tag"
+            )
+            .bind(&source_id_str)
+            .fetch_all(db.pool())
+            .await
+            .unwrap_or_default();
+
+            let untagged_count: i64 = sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND tag IS NULL"
+            )
+            .bind(&source_id_str)
+            .fetch_one(db.pool())
+            .await
+            .map(|(c,)| c)
+            .unwrap_or(0);
+
+            // Build tags list
+            let mut tags: Vec<TagInfo> = Vec::new();
+            tags.push(TagInfo {
+                name: "All files".to_string(),
+                count: total_files,
+                is_special: true,
+            });
+            for (tag_name, count) in tag_rows {
+                tags.push(TagInfo {
+                    name: tag_name,
+                    count: count as usize,
+                    is_special: false,
+                });
             }
+            if untagged_count > 0 {
+                tags.push(TagInfo {
+                    name: "untagged".to_string(),
+                    count: untagged_count as usize,
+                    is_special: true,
+                });
+            }
+
+            let _ = tx.send(CacheLoadMessage::Complete {
+                source_id: source_id_str,
+                total_files,
+                tags,
+                cache,
+            }).await;
         });
     }
 }
@@ -5406,8 +5280,7 @@ impl App {
     /// Used for navigation instead of SQL queries.
     /// If a pattern is set, filters entries in-memory using simple matching.
     fn update_folders_from_cache(&mut self) {
-        #[cfg(feature = "profiling")]
-        let _zone = self.profiler.zone("discover.folder_update");
+        // Note: profiling zone removed here to avoid borrow conflict with start_folder_query
 
         if let Some(ref mut explorer) = self.discover.glob_explorer {
             let prefix = explorer.current_prefix.clone();
@@ -5534,8 +5407,78 @@ impl App {
                     folders.iter().map(|f| f.file_count).sum()
                 );
                 explorer.selected_folder = 0;
+            } else {
+                // Prefix not in cache - trigger async database query
+                let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
+                explorer.folders = vec![FolderInfo::loading(&format!("{} Loading {}...", spinner_char, if prefix.is_empty() { "root" } else { &prefix }))];
             }
         }
+
+        // Check if we need to start a folder query (outside the borrow scope)
+        let needs_query = if let Some(ref explorer) = self.discover.glob_explorer {
+            let prefix = &explorer.current_prefix;
+            !explorer.folder_cache.contains_key(prefix) && !explorer.pattern.contains("**")
+        } else {
+            false
+        };
+
+        if needs_query {
+            if let Some(ref explorer) = self.discover.glob_explorer {
+                if let Some(source_id) = explorer.cache_source_id.clone() {
+                    let prefix = explorer.current_prefix.clone();
+                    let pattern = explorer.pattern.clone();
+                    self.start_folder_query(source_id, prefix, pattern);
+                }
+            }
+        }
+    }
+
+    /// Start an async database query for a folder prefix
+    fn start_folder_query(&mut self, source_id: String, prefix: String, glob_pattern: String) {
+        // Skip if already loading
+        if self.pending_folder_query.is_some() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel(1);
+        self.pending_folder_query = Some(rx);
+
+        let glob_opt = if glob_pattern.is_empty() { None } else { Some(glob_pattern) };
+
+        tokio::spawn(async move {
+            let db_path = dirs::home_dir()
+                .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
+                .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+
+            let db = match ScoutDatabase::open(&db_path).await {
+                Ok(db) => db,
+                Err(e) => {
+                    let _ = tx.send(FolderQueryMessage::Error(format!("Database error: {}", e))).await;
+                    return;
+                }
+            };
+
+            let rows = match db.get_folder_counts(&source_id, &prefix, glob_opt.as_deref()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(FolderQueryMessage::Error(format!("Query error: {}", e))).await;
+                    return;
+                }
+            };
+
+            let folders: Vec<FolderInfo> = rows
+                .into_iter()
+                .map(|(name, count, is_file)| FolderInfo::new(name, count as usize, is_file))
+                .collect();
+
+            let total_count = folders.iter().map(|f| f.file_count).sum();
+
+            let _ = tx.send(FolderQueryMessage::Complete {
+                prefix,
+                folders,
+                total_count,
+            }).await;
+        });
     }
 
     /// Simple glob pattern matching for file names
@@ -6864,6 +6807,49 @@ impl App {
             }
         }
 
+        // Poll for folder query results (lazy loading for navigation)
+        if let Some(ref mut rx) = self.pending_folder_query {
+            match rx.try_recv() {
+                Ok(FolderQueryMessage::Complete { prefix, folders, total_count }) => {
+                    // Cache the result for future navigation
+                    if let Some(ref mut explorer) = self.discover.glob_explorer {
+                        explorer.folder_cache.insert(prefix.clone(), folders.clone());
+
+                        // Update display if this is the current prefix
+                        if explorer.current_prefix == prefix {
+                            // Sort by count descending (single final sort as requested)
+                            let mut sorted_folders = folders;
+                            sorted_folders.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+                            explorer.folders = sorted_folders;
+                            explorer.total_count = GlobFileCount::Exact(total_count);
+                            explorer.selected_folder = 0;
+                        }
+                    }
+                    self.pending_folder_query = None;
+                }
+                Ok(FolderQueryMessage::Error(e)) => {
+                    // Show error in folders list
+                    if let Some(ref mut explorer) = self.discover.glob_explorer {
+                        explorer.folders = vec![FolderInfo::new(format!("Error: {}", e), 0, false)];
+                    }
+                    self.pending_folder_query = None;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Still loading - update spinner
+                    if let Some(ref mut explorer) = self.discover.glob_explorer {
+                        if explorer.folders.len() == 1 && explorer.folders[0].name.contains("Loading") {
+                            let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
+                            let prefix = &explorer.current_prefix;
+                            explorer.folders[0].name = format!("{} Loading {}...", spinner_char, if prefix.is_empty() { "root" } else { prefix });
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.pending_folder_query = None;
+                }
+            }
+        }
+
         // Load Scout data if in Discover mode (but NOT while scanning - don't block progress updates)
         if self.mode == TuiMode::Discover && self.discover.view_state != DiscoverViewState::Scanning {
             // Process pending DB writes FIRST (before any reloads)
@@ -6879,8 +6865,8 @@ impl App {
 
                 // Rule Builder is the default view (replaces old GlobExplorer UI per specs/rule_builder.md)
                 // Fallback initialization if not already done by enter_discover_mode()
-                // (e.g., tests that set mode directly)
-                if self.discover.rule_builder.is_none() {
+                // Only create if we're supposed to be in RuleBuilder view (not if user exited to Files)
+                if self.discover.rule_builder.is_none() && self.discover.view_state == DiscoverViewState::RuleBuilder {
                     let source_id = self.discover.selected_source_id
                         .as_ref()
                         .map(|id| id.as_str().to_string());
