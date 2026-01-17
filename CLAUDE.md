@@ -631,6 +631,7 @@ This project has meta-workflows for maintaining specs, code quality, and data mo
 | `data_model_maintenance_workflow` | "dead types", "data model", "type cleanup" | Audit Rust structs/enums for health |
 | `abstraction_audit_workflow` | "abstraction", "platform", "sqlite coupling", "llm provider" | Find platform-specific coupling for remediation |
 | `tui_testing_workflow` | "test TUI", "TUI validation" | tmux-based TUI testing |
+| `tui_parallel_coverage_workflow` | "parallel TUI test", "maximize coverage", "TUI coverage" | Parallel test execution for coverage |
 
 ### Routing Rules
 

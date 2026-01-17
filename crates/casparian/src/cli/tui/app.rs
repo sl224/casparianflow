@@ -102,6 +102,8 @@ pub struct JobsState {
     pub view_state: JobsViewState,
     /// Previous view state (for Esc navigation)
     pub previous_view_state: Option<JobsViewState>,
+    /// Previous app mode (for Esc navigation back to prior screen)
+    pub previous_mode: Option<TuiMode>,
     /// List of jobs
     pub jobs: Vec<JobInfo>,
     /// Currently selected job index (into filtered list)
@@ -508,6 +510,8 @@ pub struct SourcesState {
     pub selected_index: usize,
     /// Whether in edit mode
     pub editing: bool,
+    /// Whether we're creating a new source (vs editing)
+    pub creating: bool,
     /// Edit field value
     pub edit_value: String,
     /// Whether showing delete confirmation
@@ -1554,14 +1558,7 @@ impl App {
         // Set view state to Rule Builder immediately
         self.discover.view_state = DiscoverViewState::RuleBuilder;
 
-        // Auto-open Sources dropdown if no source is selected (first-time use)
-        // Otherwise stay in RuleBuilder view for returning users
-        if self.discover.selected_source_id.is_none() {
-            self.discover.view_state = DiscoverViewState::SourcesDropdown;
-            self.discover.sources_filter.clear();
-            self.discover.sources_filtering = false;
-            self.discover.preview_source = Some(self.discover.selected_source_index());
-        }
+        // Stay in RuleBuilder view; dropdowns open only on explicit user action.
     }
 
     fn resolve_db_target(&self) -> (DbBackend, std::path::PathBuf) {
@@ -1649,6 +1646,27 @@ impl App {
             // Discover Rule Builder shortcuts: [1]/[2] open local dropdowns
             KeyCode::Char('1') | KeyCode::Char('2')
                 if self.mode == TuiMode::Discover
+                    && self.discover.view_state == DiscoverViewState::RuleBuilder =>
+            {
+                match key.code {
+                    KeyCode::Char('1') => {
+                        self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                        self.discover.sources_filter.clear();
+                        self.discover.sources_filtering = false;
+                        self.discover.preview_source = Some(self.discover.selected_source_index());
+                    }
+                    KeyCode::Char('2') => {
+                        self.transition_discover_state(DiscoverViewState::TagsDropdown);
+                        self.discover.tags_filter.clear();
+                        self.discover.tags_filtering = false;
+                        self.discover.preview_tag = self.discover.selected_tag;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            KeyCode::Char('1') | KeyCode::Char('2')
+                if self.mode == TuiMode::Discover
                     && !self.in_text_input_mode()
                     && matches!(
                         self.discover.view_state,
@@ -1672,6 +1690,17 @@ impl App {
                 }
                 return;
             }
+            // Rule Builder shortcut: [3] focuses Files panel (no global nav)
+            KeyCode::Char('3')
+                if self.mode == TuiMode::Discover
+                    && !self.in_text_input_mode()
+                    && self.discover.view_state == DiscoverViewState::RuleBuilder =>
+            {
+                if let Some(ref mut builder) = self.discover.rule_builder {
+                    builder.focus = super::extraction::RuleBuilderFocus::FileList;
+                }
+                return;
+            }
             // ========== GLOBAL VIEW NAVIGATION (per keybinding matrix) ==========
             // Keys 1-4 are RESERVED for view navigation and work from ANY view.
             // Don't intercept when in text input.
@@ -1684,10 +1713,15 @@ impl App {
             // 2: Parser Bench
             KeyCode::Char('2') if !self.in_text_input_mode() => {
                 self.mode = TuiMode::ParserBench;
+                self.parser_bench.parsers_loaded = false;
+                self.load_parsers();
                 return;
             }
             // 3: Jobs
             KeyCode::Char('3') if !self.in_text_input_mode() => {
+                if self.mode != TuiMode::Jobs {
+                    self.jobs_state.previous_mode = Some(self.mode);
+                }
                 self.mode = TuiMode::Jobs;
                 return;
             }
@@ -1699,6 +1733,8 @@ impl App {
             // P: Parser Bench (separate from 1-4 navigation)
             KeyCode::Char('P') if !self.in_text_input_mode() => {
                 self.mode = TuiMode::ParserBench;
+                self.parser_bench.parsers_loaded = false;
+                self.load_parsers();
                 return;
             }
             // J: Toggle Jobs Drawer (global overlay)
@@ -1740,6 +1776,9 @@ impl App {
             KeyCode::Enter if self.jobs_drawer_open => {
                 // Jump to Jobs view with selected job
                 if !self.jobs_state.jobs.is_empty() {
+                    if self.mode != TuiMode::Jobs {
+                        self.jobs_state.previous_mode = Some(self.mode);
+                    }
                     self.jobs_state.selected_index = self.jobs_drawer_selected;
                     self.mode = TuiMode::Jobs;
                     self.jobs_drawer_open = false;
@@ -1900,7 +1939,6 @@ impl App {
         if !self.in_text_input_mode() && !matches!(self.discover.view_state,
             DiscoverViewState::RulesManager |
             DiscoverViewState::RuleCreation |
-            DiscoverViewState::RuleBuilder |
             DiscoverViewState::SourcesManager |
             DiscoverViewState::SourceEdit |
             DiscoverViewState::SourceDeleteConfirm
@@ -2975,6 +3013,22 @@ impl App {
             .collect()
     }
 
+    /// Get parser indices filtered by the current Parser Bench filter
+    pub fn filtered_parser_indices(&self) -> Vec<usize> {
+        let filter = self.parser_bench.filter.to_lowercase();
+        self.parser_bench
+            .parsers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                filter.is_empty()
+                    || p.name.to_lowercase().contains(&filter)
+                    || p.path.display().to_string().to_lowercase().contains(&filter)
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
     /// Handle keys when Sources dropdown is open
     /// Vim-style modal: navigation mode by default, '/' enters filter mode
     fn handle_sources_dropdown_key(&mut self, key: KeyEvent) {
@@ -2986,12 +3040,11 @@ impl App {
                     self.discover.sources_filtering = false;
                 }
                 KeyCode::Esc => {
-                    // Clear filter and exit filter mode
+                    // Clear filter and close dropdown
                     self.discover.sources_filter.clear();
                     self.discover.sources_filtering = false;
-                    // Reset preview to first item
-                    let filtered = self.filtered_sources();
-                    self.discover.preview_source = filtered.first().map(|(i, _)| *i);
+                    self.discover.preview_source = None;
+                    self.discover.view_state = DiscoverViewState::RuleBuilder;
                 }
                 KeyCode::Backspace => {
                     self.discover.sources_filter.pop();
@@ -3127,9 +3180,11 @@ impl App {
                     self.discover.tags_filtering = false;
                 }
                 KeyCode::Esc => {
-                    // Clear filter and exit filter mode
+                    // Clear filter and close dropdown
                     self.discover.tags_filter.clear();
                     self.discover.tags_filtering = false;
+                    self.discover.preview_tag = None;
+                    self.discover.view_state = DiscoverViewState::RuleBuilder;
                 }
                 KeyCode::Backspace => {
                     self.discover.tags_filter.pop();
@@ -3431,21 +3486,29 @@ impl App {
                 return;
             }
         };
+        let mut refresh_needed = false;
 
         if builder.source_id.is_none() {
             match key.code {
                 KeyCode::Esc => {
                     self.mode = TuiMode::Home;
                 }
+                KeyCode::Char('1') => {
+                    self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                    self.discover.sources_filter.clear();
+                    self.discover.sources_filtering = false;
+                    self.discover.preview_source = Some(self.discover.selected_source_index());
+                }
+                KeyCode::Char('s') => {
+                    self.transition_discover_state(DiscoverViewState::EnteringPath);
+                    self.discover.scan_path_input.clear();
+                    self.discover.scan_error = None;
+                }
                 _ => {
                     self.discover.status_message = Some((
                         "Select a source before building rules".to_string(),
                         true,
                     ));
-                    self.transition_discover_state(DiscoverViewState::SourcesDropdown);
-                    self.discover.sources_filter.clear();
-                    self.discover.sources_filtering = false;
-                    self.discover.preview_source = Some(self.discover.selected_source_index());
                 }
             }
             return;
@@ -3540,6 +3603,7 @@ impl App {
                         let pattern = builder.exclude_input.trim().to_string();
                         if !pattern.is_empty() {
                             builder.add_exclude(pattern);
+                            refresh_needed = true;
                         }
                         builder.exclude_input.clear();
                         builder.focus = RuleBuilderFocus::Excludes;
@@ -3552,6 +3616,7 @@ impl App {
                         // Apply selected ignore option
                         if let Some(option) = builder.ignore_options.get(builder.ignore_selected) {
                             builder.add_exclude(option.pattern.clone());
+                            refresh_needed = true;
                         }
                         builder.ignore_options.clear();
                         builder.focus = RuleBuilderFocus::FileList;
@@ -3674,6 +3739,7 @@ impl App {
             // Delete exclude with 'd' or 'x'
             KeyCode::Char('d') | KeyCode::Char('x') if builder.focus == RuleBuilderFocus::Excludes => {
                 builder.remove_exclude(builder.selected_exclude);
+                refresh_needed = true;
             }
 
             // Filter toggle in FileList (only in BacktestResults phase)
@@ -3810,8 +3876,14 @@ impl App {
         }
 
         // If pattern changed, update matched files
+        let mut needs_refresh = refresh_needed;
         if let Some(builder) = &self.discover.rule_builder {
             if builder.pattern != pattern_before {
+                needs_refresh = true;
+            }
+        }
+        if needs_refresh {
+            if let Some(builder) = &self.discover.rule_builder {
                 let pattern = builder.pattern.clone();
                 self.update_rule_builder_files(&pattern);
             }
@@ -3976,6 +4048,19 @@ impl App {
             format!("**/{}", pattern)
         };
 
+        let exclude_matchers: Vec<globset::GlobMatcher> = self
+            .discover
+            .rule_builder
+            .as_ref()
+            .map(|b| b.excludes.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|pattern| {
+                let glob = if pattern.contains('/') { pattern } else { format!("**/{}", pattern) };
+                GlobBuilder::new(&glob).case_insensitive(true).build().ok().map(|g| g.compile_matcher())
+            })
+            .collect();
+
         // Check for "match all" patterns - use root folder counts directly
         // The cache only has root-level entries, so traversing won't find subfolders
         let is_match_all = glob_pattern == "**/*" || glob_pattern == "**" || pattern == "*";
@@ -4008,6 +4093,12 @@ impl App {
             }
 
             let (backend, db_path) = self.resolve_db_target();
+            let exclude_patterns = self
+                .discover
+                .rule_builder
+                .as_ref()
+                .map(|b| b.excludes.clone())
+                .unwrap_or_default();
 
             // Spawn async database search
             let pattern_for_msg = glob_pattern.clone();
@@ -4027,6 +4118,14 @@ impl App {
                     }
                 };
 
+                let exclude_matchers: Vec<globset::GlobMatcher> = exclude_patterns
+                    .into_iter()
+                    .filter_map(|pattern| {
+                        let glob = if pattern.contains('/') { pattern } else { format!("**/{}", pattern) };
+                        GlobBuilder::new(&glob).case_insensitive(true).build().ok().map(|g| g.compile_matcher())
+                    })
+                    .collect();
+
                 let total_count = query.count_files(&conn, &source_id).await as usize;
 
                 let results = query
@@ -4038,6 +4137,9 @@ impl App {
                     std::collections::HashMap::new();
 
                 for (rel_path, _size, _mtime) in results {
+                    if exclude_matchers.iter().any(|m| m.is_match(&rel_path)) {
+                        continue;
+                    }
                     // Extract parent folder from path
                     let folder = if let Some(idx) = rel_path.rfind('/') {
                         rel_path[..idx].to_string()
@@ -4133,6 +4235,7 @@ impl App {
                     cache: &std::collections::HashMap<String, Vec<FsEntry>>,
                     prefix: &str,
                     matcher: &globset::GlobMatcher,
+                    exclude_matchers: &[globset::GlobMatcher],
                     folder_counts: &mut std::collections::HashMap<String, (usize, String)>,
                 ) {
                     if let Some(items) = cache.get(prefix) {
@@ -4144,7 +4247,8 @@ impl App {
                             };
 
                             if item.is_file() {
-                                if matcher.is_match(&full_path) {
+                                if matcher.is_match(&full_path)
+                                    && !exclude_matchers.iter().any(|m| m.is_match(&full_path)) {
                                     let folder = if prefix.is_empty() {
                                         ".".to_string()
                                     } else {
@@ -4155,13 +4259,13 @@ impl App {
                                 }
                             } else {
                                 let sub_prefix = format!("{}/", full_path);
-                                traverse_cache(cache, &sub_prefix, matcher, folder_counts);
+                                traverse_cache(cache, &sub_prefix, matcher, exclude_matchers, folder_counts);
                             }
                         }
                     }
                 }
 
-                traverse_cache(folder_cache, "", &matcher, &mut folder_counts);
+                traverse_cache(folder_cache, "", &matcher, &exclude_matchers, &mut folder_counts);
 
                 // Convert to FolderMatch and sort
                 let mut folder_matches: Vec<FolderMatch> = folder_counts
@@ -4244,70 +4348,45 @@ impl App {
             }
         };
 
-        // Traverse folder_cache with shared borrow - NO CLONE
-        let all_files = {
-            let folder_cache = match self.discover.glob_explorer.as_ref() {
-                Some(e) => &e.folder_cache,
-                None => return,
-            };
-
-            let mut files: Vec<String> = Vec::new();
-
-            fn collect_files(
-                cache: &std::collections::HashMap<String, Vec<FsEntry>>,
-                prefix: &str,
-                matcher: &globset::GlobMatcher,
-                files: &mut Vec<String>,
-                limit: usize,
-            ) {
-                if files.len() >= limit {
-                    return;
-                }
-                if let Some(items) = cache.get(prefix) {
-                    for item in items {
-                        if files.len() >= limit {
-                            return;
-                        }
-                        let full_path = if prefix.is_empty() {
-                            item.name().to_string()
-                        } else {
-                            format!("{}{}", prefix, item.name())
-                        };
-
-                        if item.is_file() {
-                            if matcher.is_match(&full_path) {
-                                files.push(full_path);
-                            }
-                        } else {
-                            let sub_prefix = format!("{}/", full_path);
-                            collect_files(cache, &sub_prefix, matcher, files, limit);
-                        }
-                    }
-                }
-            }
-
-            collect_files(folder_cache, "", &matcher, &mut files, 100);
-            files
-        }; // shared borrow ends here
-
-        // Convert to preview files with extractions
-        let preview_files: Vec<ExtractionPreviewFile> = all_files
+        let exclude_matchers: Vec<globset::GlobMatcher> = self
+            .discover
+            .rule_builder
+            .as_ref()
+            .map(|b| b.excludes.clone())
+            .unwrap_or_default()
             .into_iter()
-            .map(|path| {
-                let extractions = extract_field_values(&path, &parsed);
-                ExtractionPreviewFile {
-                    path: path.clone(),
-                    relative_path: path,
-                    extractions,
-                    warnings: Vec::new(),
-                }
+            .filter_map(|pattern| {
+                let glob = if pattern.contains('/') { pattern } else { format!("**/{}", pattern) };
+                GlobBuilder::new(&glob).case_insensitive(true).build().ok().map(|g| g.compile_matcher())
             })
             .collect();
 
+        let is_excluded = |path: &str| exclude_matchers.iter().any(|m| m.is_match(path));
+
+        let mut preview_files = Vec::new();
+        let mut match_count = 0usize;
+
+        for file in &self.discover.files {
+            let rel_path = file.rel_path.as_str();
+            if matcher.is_match(rel_path) && !is_excluded(rel_path) {
+                match_count += 1;
+                if preview_files.len() < 100 {
+                    let extractions = extract_field_values(rel_path, &parsed);
+                    preview_files.push(ExtractionPreviewFile {
+                        path: rel_path.to_string(),
+                        relative_path: rel_path.to_string(),
+                        extractions,
+                        warnings: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        // Convert to preview files with extractions
         // Update builder with mutable borrow
         if let Some(builder) = self.discover.rule_builder.as_mut() {
             builder.pattern_error = None;
-            builder.match_count = preview_files.len();
+            builder.match_count = match_count;
             builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
                 preview_files,
             };
@@ -4569,6 +4648,7 @@ impl App {
                 )
             }
             TuiMode::ParserBench => self.parser_bench.is_filtering,
+            TuiMode::Sources => self.sources_state.editing,
             _ => false,
         }
     }
@@ -6188,6 +6268,32 @@ impl App {
         });
     }
 
+    fn update_home_recent_jobs(&mut self) {
+        let mut summaries = Vec::new();
+        for job in self.jobs_state.jobs.iter().take(5) {
+            let progress_percent = if job.items_total > 0 {
+                Some(((job.items_processed as f64 / job.items_total as f64) * 100.0) as u8)
+            } else {
+                None
+            };
+
+            let duration_secs = job.completed_at.map(|end| {
+                (end - job.started_at).num_milliseconds() as f64 / 1000.0
+            });
+
+            summaries.push(JobSummary {
+                id: job.id,
+                job_type: job.job_type.as_str().to_string(),
+                description: job.name.clone(),
+                status: job.status,
+                progress_percent,
+                duration_secs,
+            });
+        }
+
+        self.home.recent_jobs = summaries;
+    }
+
     /// Start non-blocking home stats load from database
     fn start_stats_load(&mut self) {
         // Skip if already loading
@@ -6531,11 +6637,13 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     self.sources_state.editing = false;
+                    self.sources_state.creating = false;
                     self.sources_state.edit_value.clear();
                 }
                 KeyCode::Enter => {
                     // TODO: Save the edited source
                     self.sources_state.editing = false;
+                    self.sources_state.creating = false;
                     self.sources_state.edit_value.clear();
                 }
                 KeyCode::Char(c) => {
@@ -6565,12 +6673,14 @@ impl App {
             // n: New source
             KeyCode::Char('n') => {
                 self.sources_state.editing = true;
+                self.sources_state.creating = true;
                 self.sources_state.edit_value.clear();
             }
             // e: Edit source
             KeyCode::Char('e') => {
                 if source_count > 0 && self.sources_state.selected_index < source_count {
                     self.sources_state.editing = true;
+                    self.sources_state.creating = false;
                     let source = &self.discover.sources[self.sources_state.selected_index];
                     self.sources_state.edit_value = source.path.display().to_string();
                 }
@@ -6590,7 +6700,11 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                self.mode = TuiMode::Home;
+                if let Some(prev_mode) = self.jobs_state.previous_mode.take() {
+                    self.mode = prev_mode;
+                } else {
+                    self.mode = TuiMode::Home;
+                }
             }
             _ => {}
         }
@@ -7034,18 +7148,20 @@ impl App {
             }
         }
 
-        // Jobs mode: Trigger load on first visit or after poll interval
-        if self.mode == TuiMode::Jobs {
+        // Jobs/Home: Trigger load on first visit, poll while in Jobs view
+        if matches!(self.mode, TuiMode::Jobs | TuiMode::Home) {
             const JOBS_POLL_INTERVAL_MS: u64 = 2000; // Poll every 2 seconds when in Jobs view
 
-            let should_load = if !self.jobs_state.jobs_loaded {
-                // First load
-                true
-            } else if let Some(last_poll) = self.last_jobs_poll {
-                // Check if poll interval elapsed
-                last_poll.elapsed().as_millis() as u64 >= JOBS_POLL_INTERVAL_MS
+            let should_load = if self.mode == TuiMode::Jobs {
+                if !self.jobs_state.jobs_loaded {
+                    true
+                } else if let Some(last_poll) = self.last_jobs_poll {
+                    last_poll.elapsed().as_millis() as u64 >= JOBS_POLL_INTERVAL_MS
+                } else {
+                    false
+                }
             } else {
-                false
+                !self.jobs_state.jobs_loaded
             };
 
             if should_load && self.pending_jobs_load.is_none() {
@@ -7066,6 +7182,7 @@ impl App {
                     self.jobs_state.jobs = jobs;
                     self.jobs_state.jobs_loaded = true;
                     self.last_jobs_poll = Some(std::time::Instant::now());
+                    self.update_home_recent_jobs();
                     self.pending_jobs_load = None;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
@@ -7461,6 +7578,9 @@ impl App {
                     let mut builder = super::extraction::RuleBuilderState::new(source_id);
                     builder.pattern = "**/*".to_string();
                     self.discover.rule_builder = Some(builder);
+                }
+                if self.discover.files.is_empty() {
+                    self.load_scout_files().await;
                 }
 
                 // Check if cache is still loading (not yet loaded)
@@ -8033,21 +8153,59 @@ if __name__ == "__main__":
 
     /// Handle Parser Bench mode keys
     fn handle_parser_bench_key(&mut self, key: KeyEvent) {
+        if self.parser_bench.is_filtering {
+            match handle_text_input(key, &mut self.parser_bench.filter) {
+                TextInputResult::Committed => {
+                    self.parser_bench.is_filtering = false;
+                }
+                TextInputResult::Cancelled => {
+                    self.parser_bench.is_filtering = false;
+                    self.parser_bench.filter.clear();
+                }
+                TextInputResult::Continue | TextInputResult::NotHandled => {}
+            }
+            let filtered = self.filtered_parser_indices();
+            if let Some(first) = filtered.first().copied() {
+                if !filtered.contains(&self.parser_bench.selected_parser) {
+                    self.parser_bench.selected_parser = first;
+                }
+            } else {
+                self.parser_bench.selected_parser = 0;
+            }
+            return;
+        }
+
+        let filtered = self.filtered_parser_indices();
+        if let Some(first) = filtered.first().copied() {
+            if !filtered.contains(&self.parser_bench.selected_parser) {
+                self.parser_bench.selected_parser = first;
+            }
+        }
+
         match key.code {
             // Navigation
             KeyCode::Down => {
-                if !self.parser_bench.parsers.is_empty() {
-                    self.parser_bench.selected_parser =
-                        (self.parser_bench.selected_parser + 1) % self.parser_bench.parsers.len();
+                if !filtered.is_empty() {
+                    let current_pos = filtered
+                        .iter()
+                        .position(|idx| *idx == self.parser_bench.selected_parser)
+                        .unwrap_or(0);
+                    let next_pos = (current_pos + 1) % filtered.len();
+                    self.parser_bench.selected_parser = filtered[next_pos];
                 }
             }
             KeyCode::Up => {
-                if !self.parser_bench.parsers.is_empty() {
-                    if self.parser_bench.selected_parser == 0 {
-                        self.parser_bench.selected_parser = self.parser_bench.parsers.len() - 1;
+                if !filtered.is_empty() {
+                    let current_pos = filtered
+                        .iter()
+                        .position(|idx| *idx == self.parser_bench.selected_parser)
+                        .unwrap_or(0);
+                    let prev_pos = if current_pos == 0 {
+                        filtered.len() - 1
                     } else {
-                        self.parser_bench.selected_parser -= 1;
-                    }
+                        current_pos - 1
+                    };
+                    self.parser_bench.selected_parser = filtered[prev_pos];
                 }
             }
             // Test parser
@@ -8061,6 +8219,17 @@ if __name__ == "__main__":
             // Refresh
             KeyCode::Char('r') => {
                 self.parser_bench.parsers_loaded = false;
+            }
+            // Filter
+            KeyCode::Char('/') => {
+                self.parser_bench.is_filtering = true;
+            }
+            KeyCode::Esc => {
+                if !self.parser_bench.filter.is_empty() {
+                    self.parser_bench.filter.clear();
+                } else {
+                    self.mode = TuiMode::Home;
+                }
             }
             // Delete broken symlink
             KeyCode::Char('d') => {

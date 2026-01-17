@@ -1332,8 +1332,8 @@ impl Default for RuleBuilderState {
             ignore_options: Vec::new(),
             ignore_selected: 0,
 
-            // UI state - default to FileList so shortcuts like 's' work immediately
-            focus: RuleBuilderFocus::FileList,
+            // UI state - default to Pattern so typing edits immediately
+            focus: RuleBuilderFocus::Pattern,
 
             // Debouncing
             pattern_changed_at: None,

@@ -87,6 +87,7 @@ The Manager operates as a **single persistent instance** with:
 | `abstraction_audit_workflow` | 3-instance (Analyst, Validator, Coordinator) | Platform coupling audit | 2-4 rounds |
 | `tui_testing_workflow` | 1-instance | TUI test procedures | Per-scenario |
 | `tui_validation_workflow` | 1-instance orchestrator | TUI validation (context-driven) | 3 phases |
+| `tui_parallel_coverage_workflow` | 1-instance orchestrator | Parallel TUI testing, coverage maximization | 5 phases |
 | `code_philosophy_review_workflow` | 1-instance | "blow", "muratori", over-engineering review | 1 prompt |
 
 ### 3.3 Workflow Categories
@@ -106,6 +107,7 @@ Workflows fall into two categories with different output requirements:
 | `spec_refinement_workflow` | `actionable_findings.json` (IMPL_* gaps) |
 | `tui_testing_workflow` | `actionable_findings.json` (divergences) |
 | `tui_validation_workflow` | `actionable_findings.json` (TUI issues) |
+| `tui_parallel_coverage_workflow` | `actionable_findings.json` (coverage + issues) |
 
 **Characteristics:**
 - Identify issues but don't fix them

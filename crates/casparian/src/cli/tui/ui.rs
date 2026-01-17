@@ -629,6 +629,11 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
     // Edit overlay
     if app.sources_state.editing {
         let dialog_area = render_centered_dialog(frame, area, 60, 7);
+        let title = if app.sources_state.creating {
+            " Add Source "
+        } else {
+            " Edit Source "
+        };
         let para = Paragraph::new(format!(
             "Path: {}_\n\n[Enter] Save  [Esc] Cancel",
             app.sources_state.edit_value
@@ -636,7 +641,7 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::default())
         .block(
             Block::default()
-                .title(" Edit Source ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         );
@@ -791,6 +796,21 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     if is_open {
+        // Calculate dialog size - match Sources dropdown sizing
+        let width = (area.width * 40 / 100).max(30).min(area.width - 4);
+        let height = area.height.saturating_sub(8).max(10);
+
+        // Position at right side of screen
+        let dialog_area = Rect {
+            x: area.x + area.width.saturating_sub(width + 2),
+            y: area.y + 3,
+            width,
+            height,
+        };
+
+        // Clear the area first (proper overlay)
+        frame.render_widget(Clear, dialog_area);
+
         // Expanded dropdown with optional filter line
         let is_filtering = app.discover.tags_filtering;
 
@@ -798,7 +818,7 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .margin(1)
-            .split(area);
+            .split(dialog_area);
 
         // Top line: filter input OR hint
         if is_filtering {
@@ -833,7 +853,7 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             .collect();
 
         let mut lines: Vec<Line> = Vec::new();
-        let visible_height = inner_chunks[1].height as usize;
+        let visible_height = inner_chunks[1].height.saturating_sub(2) as usize;
 
         if filtered.is_empty() && !app.discover.tags.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -884,7 +904,7 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(Color::Cyan))
             .border_type(BorderType::Double)
             .title(Span::styled(" [2] Select Tag ", Style::default().fg(Color::Cyan).bold()));
-        frame.render_widget(block, area);
+        frame.render_widget(block, dialog_area);
     } else {
         // Collapsed: show selected tag or "All files"
         let selected_text = if let Some(tag_idx) = app.discover.selected_tag {
@@ -1449,10 +1469,22 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         " | No scan [s]".to_string()
     };
 
-    let header_text = format!(
-        " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  │ {} files match{}",
-        source_name, match_count, scan_info
-    );
+    let error_hint = app
+        .discover
+        .status_message
+        .as_ref()
+        .and_then(|(msg, is_error)| if *is_error { Some(msg.as_str()) } else { None });
+    let header_text = if let Some(msg) = error_hint {
+        format!(
+            " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  │ {} files match{}  ⚠ {}",
+            source_name, match_count, scan_info, msg
+        )
+    } else {
+        format!(
+            " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  │ {} files match{}",
+            source_name, match_count, scan_info
+        )
+    };
     let header = Paragraph::new(header_text)
         .style(Style::default().fg(Color::Green).bold())
         .block(Block::default().borders(Borders::BOTTOM));
@@ -1484,7 +1516,7 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         (format!(" {} {} ", spinner, status), Style::default().fg(Color::Yellow))
     } else {
         (
-            " [e] Sample  [E] Full  [s] Scan  [Tab] Nav  [Ctrl+S] Save  [Esc] Back  [0] Home  [3] Jobs  [4] Sources  [?] Help ".to_string(),
+            " [e] Sample  [E] Full  [s] Scan  [Tab] Nav  [Ctrl+S] Save  [Esc] Back  [0] Home  [3] Files  [J] Jobs  [4] Sources  [?] Help ".to_string(),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -2312,6 +2344,33 @@ fn draw_parser_list(frame: &mut Frame, app: &App, area: Rect) {
 
     let parsers_dir = crate::cli::config::parsers_dir();
     let title = format!(" Parsers ({}) ", parsers_dir.display());
+    let filtered_indices = app.filtered_parser_indices();
+
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+
+    if app.parser_bench.is_filtering {
+        let filter_text = format!("/{}", app.parser_bench.filter);
+        let filter_line = Paragraph::new(vec![Line::from(vec![
+            Span::styled(filter_text, Style::default().fg(Color::Yellow)),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ])]);
+        frame.render_widget(filter_line, chunks[0]);
+    } else if !app.parser_bench.filter.is_empty() {
+        let hint = format!("/{} (Esc:clear)", app.parser_bench.filter);
+        let hint_line = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(hint_line, chunks[0]);
+    } else {
+        let hint_line = Paragraph::new("[/] filter  [r] refresh")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(hint_line, chunks[0]);
+    }
 
     if app.parser_bench.parsers.is_empty() {
         // Show empty state with instructions
@@ -2332,32 +2391,39 @@ fn draw_parser_list(frame: &mut Frame, app: &App, area: Rect) {
         ];
         let content = empty_msg.join("\n");
         let widget = Paragraph::new(content)
-            .style(Style::default().fg(Color::DarkGray))
-            .block(Block::default().borders(Borders::ALL).title(title));
-        frame.render_widget(widget, area);
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(widget, chunks[1]);
+        return;
+    }
+
+    if filtered_indices.is_empty() {
+        let widget = Paragraph::new("  No parsers match the filter.")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(widget, chunks[1]);
         return;
     }
 
     // Build list items
-    let items: Vec<ListItem> = app
-        .parser_bench
-        .parsers
+    let items: Vec<ListItem> = filtered_indices
         .iter()
-        .enumerate()
-        .map(|(i, parser)| {
+        .map(|i| {
+            let parser = &app.parser_bench.parsers[*i];
             let symbol = parser.health.symbol();
             let version = parser.version.as_deref().unwrap_or("—");
             let name = &parser.name;
+            let is_selected = *i == app.parser_bench.selected_parser;
+            let prefix = if is_selected { "▸" } else { " " };
 
             // Format: ● parser_name     v1.0.0
             let line = format!(
-                " {} {:<20} {}",
+                "{} {} {:<20} {}",
+                prefix,
                 symbol,
                 truncate_end(name, 20),
                 version
             );
 
-            let style = if i == app.parser_bench.selected_parser {
+            let style = if is_selected {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else if parser.symlink_broken {
                 Style::default().fg(Color::Red)
@@ -2375,11 +2441,15 @@ fn draw_parser_list(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
+    let list = List::new(items);
 
+    let selected_pos = filtered_indices
+        .iter()
+        .position(|idx| *idx == app.parser_bench.selected_parser)
+        .unwrap_or(0);
     let mut state = ListState::default();
-    state.select(Some(app.parser_bench.selected_parser));
-    frame.render_stateful_widget(list, area, &mut state);
+    state.select(Some(selected_pos));
+    frame.render_stateful_widget(list, chunks[1], &mut state);
 }
 
 /// Truncate string at the end if too long
@@ -2396,6 +2466,14 @@ fn draw_parser_details(frame: &mut Frame, app: &App, area: Rect) {
     if app.parser_bench.parsers.is_empty() {
         // No parser selected, show instructions
         let content = Paragraph::new("\n\n  Select a parser to see details\n\n  or press [n] to quick test any .py file")
+            .style(Style::default().fg(Color::DarkGray))
+            .block(Block::default().borders(Borders::ALL).title(" Details "));
+        frame.render_widget(content, area);
+        return;
+    }
+
+    if app.filtered_parser_indices().is_empty() {
+        let content = Paragraph::new("\n\n  No parsers match the current filter.")
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL).title(" Details "));
         frame.render_widget(content, area);
@@ -2811,8 +2889,13 @@ fn render_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, _wid
     // Line 3: First failure (for failed jobs only)
     if job.status == JobStatus::Failed && !job.failures.is_empty() {
         let first_failure = &job.failures[0];
+        let failure_hint = if first_failure.file_path.is_empty() {
+            first_failure.error.as_str()
+        } else {
+            &first_failure.file_path
+        };
         lines.push(Line::from(Span::styled(
-            format!("           First failure: {}", truncate_path(&first_failure.file_path, 50)),
+            format!("           First failure: {}", truncate_path(failure_hint, 50)),
             Style::default().fg(Color::Red),
         )));
     }
@@ -3115,7 +3198,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
                     "",
                     "  RULE BUILDER KEYS                      NAVIGATION",
                     "  ─────────────────                      ──────────",
-                    "  Tab/Shift+Tab  Cycle between fields    3         Jobs view",
+                    "  Tab/Shift+Tab  Cycle between fields    3         Focus Files panel",
                     "  ↑/↓ arrows     Move between fields     4         Sources view",
                     "  ←/→ arrows     Switch panels           0 / H     Home",
                     "                                         Esc       Back / Close",
