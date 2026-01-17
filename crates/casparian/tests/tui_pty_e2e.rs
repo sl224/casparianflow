@@ -13,8 +13,7 @@
 //!
 //! 1. TUI starts and renders
 //! 2. Keystrokes are received and processed
-//! 3. Chat messages appear on screen
-//! 4. Claude Code integration works end-to-end
+//! 3. View switching works via hotkeys
 //!
 //! ## Feature Flag
 //!
@@ -225,8 +224,8 @@ fn test_tui_starts_in_pty() {
     let reader = pair.master.try_clone_reader().unwrap();
     let mut writer = pair.master.take_writer().unwrap();
 
-    // Wait for TUI to start (should show welcome or Chat)
-    let result = read_with_timeout(reader, "Chat", Duration::from_secs(30));
+    // Wait for TUI to start (should show Home)
+    let result = read_with_timeout(reader, "Home", Duration::from_secs(30));
 
     // Send Ctrl+C to quit
     let _ = writer.write_all(&[0x03]); // Ctrl+C
@@ -241,180 +240,13 @@ fn test_tui_starts_in_pty() {
             println!("TUI started successfully!");
             println!("First 500 chars: {}", output.chars().take(500).collect::<String>());
             assert!(
-                output.contains("Chat") || output.contains("Welcome") || output.contains("F1"),
-                "TUI should show chat interface"
+                output.contains("Home") || output.contains("Casparian"),
+                "TUI should show the home screen"
             );
         }
         Err(e) => {
             println!("TUI test inconclusive: {}", e);
             // Don't fail - PTY might not work in all environments
-        }
-    }
-}
-
-/// Test: Type a message and see it echoed (without Claude)
-#[test]
-fn test_tui_typing() {
-    let binary = match find_casparian_binary() {
-        Some(b) => b,
-        None => {
-            println!("Skipping: casparian binary not found");
-            return;
-        }
-    };
-
-    let pty_system = native_pty_system();
-
-    let pair = match pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            println!("Skipping PTY test: {}", e);
-            return;
-        }
-    };
-
-    let mut cmd = CommandBuilder::new(&binary);
-    cmd.arg("tui");
-
-    let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();
-    cmd.cwd(workspace_dir);
-
-    let mut child = match pair.slave.spawn_command(cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("Skipping: could not spawn TUI: {}", e);
-            return;
-        }
-    };
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let mut writer = pair.master.take_writer().unwrap();
-    let mut pty_reader = PtyReader::new(reader);
-
-    // Wait for TUI to start
-    let _ = pty_reader.wait_for("Chat", Duration::from_secs(30));
-
-    // Type "hello"
-    let _ = writer.write_all(b"hello");
-    thread::sleep(Duration::from_millis(200));
-
-    // Read output - should see "hello" in the input area
-    let output = pty_reader.read_available(Duration::from_millis(500));
-
-    // Press Escape to clear
-    let _ = writer.write_all(&[0x1b]); // Escape
-
-    // Press Ctrl+C to quit
-    thread::sleep(Duration::from_millis(100));
-    let _ = writer.write_all(&[0x03]);
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    println!("Typing test output: {}", output.chars().take(500).collect::<String>());
-
-    // The word "hello" should appear somewhere in the rendered output
-    if output.contains("hello") {
-        println!("SUCCESS: Typed text appeared in TUI");
-    } else {
-        println!("Note: Could not verify typed text (may be rendering issue)");
-    }
-}
-
-/// Test: Full flow - type message, get Claude response (if available)
-#[test]
-fn test_tui_claude_chat() {
-    let binary = match find_casparian_binary() {
-        Some(b) => b,
-        None => {
-            println!("Skipping: casparian binary not found");
-            return;
-        }
-    };
-
-    // First check if Claude Code is available
-    let claude_available = std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !claude_available {
-        println!("Skipping Claude chat test: claude CLI not installed");
-        return;
-    }
-
-    let pty_system = native_pty_system();
-
-    let pair = match pty_system.openpty(PtySize {
-        rows: 30,
-        cols: 100,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            println!("Skipping PTY test: {}", e);
-            return;
-        }
-    };
-
-    let mut cmd = CommandBuilder::new(&binary);
-    cmd.arg("tui");
-
-    let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_dir = crate_dir.parent().unwrap().parent().unwrap();
-    cmd.cwd(workspace_dir);
-
-    let mut child = match pair.slave.spawn_command(cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("Skipping: could not spawn TUI: {}", e);
-            return;
-        }
-    };
-
-    let reader = pair.master.try_clone_reader().unwrap();
-    let mut writer = pair.master.take_writer().unwrap();
-    let mut pty_reader = PtyReader::new(reader);
-
-    // Wait for TUI to start
-    let _ = pty_reader.wait_for("Chat", Duration::from_secs(30));
-
-    // Type a simple message
-    let _ = writer.write_all(b"say hello");
-    thread::sleep(Duration::from_millis(100));
-
-    // Press Enter to send
-    let _ = writer.write_all(b"\r"); // Enter key
-    thread::sleep(Duration::from_millis(100));
-
-    // Wait for response (Claude takes a few seconds)
-    println!("Waiting for Claude response...");
-    let result = pty_reader.wait_for("hello", Duration::from_secs(60));
-
-    // Quit
-    let _ = writer.write_all(&[0x03]); // Ctrl+C
-    thread::sleep(Duration::from_millis(100));
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    match result {
-        Ok(output) => {
-            println!("=== FULL E2E TEST PASSED ===");
-            println!("Claude responded in TUI!");
-            println!("Output sample: {}", output.chars().take(800).collect::<String>());
-        }
-        Err(e) => {
-            println!("Claude chat test: {}", e);
-            println!("This may be due to Claude taking longer than expected.");
         }
     }
 }
@@ -465,7 +297,7 @@ fn test_tui_view_switching() {
     let mut pty_reader = PtyReader::new(reader);
 
     // Wait for TUI to start
-    let _ = pty_reader.wait_for("Chat", Duration::from_secs(30));
+    let _ = pty_reader.wait_for("Home", Duration::from_secs(30));
 
     // Press F2 to switch to Monitor view
     // F2 escape sequence: ESC [ 1 2 ~

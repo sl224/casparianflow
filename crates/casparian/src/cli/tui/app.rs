@@ -1,19 +1,24 @@
 //! Application state for the TUI
+//!
+//! # Dead Code Justification
+//! Several struct fields and enum variants in this module are defined for
+//! upcoming TUI features (Jobs view, Parser Bench, Monitoring) per the spec.
+//! They are scaffolding for active development. See specs/views/*.md.
+#![allow(dead_code)]
 
+use casparian_db::{DbConnection, DbValue};
 use casparian_mcp::tools::{create_default_registry, ToolRegistry};
 use casparian_mcp::types::ToolResult;
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
-use super::llm::claude_code::ClaudeCodeProvider;
-use super::llm::{registry_to_definitions, LlmProvider, StreamChunk};
 use super::TuiArgs;
+use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
 use crate::scout::{
-    Database as ScoutDatabase,
+    scan_path, Database as ScoutDatabase,
     ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source, SourceType,
 };
 
@@ -21,11 +26,11 @@ use crate::scout::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TuiMode {
     #[default]
-    Home,        // Home hub with 4 cards
+    Home,        // Home hub: quick start + status dashboard
     Discover,    // File discovery and tagging
-    ParserBench, // Parser development workbench
-    Inspect,     // Output inspection
     Jobs,        // Job queue management
+    Sources,     // Sources management
+    ParserBench, // Parser development workbench (accessed via P key)
     Settings,    // Application settings
 }
 
@@ -41,30 +46,6 @@ pub struct HomeStats {
     pub paused_parsers: usize,
 }
 
-/// State for data inspection mode
-#[derive(Debug, Clone, Default)]
-pub struct InspectState {
-    /// List of output tables
-    pub tables: Vec<TableInfo>,
-    /// Currently selected table index
-    pub selected_table: usize,
-    /// SQL query input
-    pub query_input: String,
-    /// Query result preview
-    pub query_result: Option<String>,
-    /// Is query input focused
-    pub query_focused: bool,
-}
-
-/// Information about an output table
-#[derive(Debug, Clone)]
-pub struct TableInfo {
-    pub name: String,
-    pub row_count: u64,
-    pub column_count: usize,
-    pub size_bytes: u64,
-    pub last_updated: DateTime<Local>,
-}
 
 /// Settings category in the Settings view
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -280,6 +261,8 @@ pub enum JobType {
     #[default]
     Parse,
     Backtest,
+    /// Schema analysis job (pattern seeds, archetypes, naming schemes, synonyms)
+    SchemaEval,
 }
 
 impl JobType {
@@ -289,8 +272,18 @@ impl JobType {
             JobType::Scan => "SCAN",
             JobType::Parse => "PARSE",
             JobType::Backtest => "BACKTEST",
+            JobType::SchemaEval => "SCHEMA",
         }
     }
+}
+
+/// Mode for schema evaluation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaEvalMode {
+    /// Quick sample evaluation (structure-aware sampling, ~50 paths per prefix)
+    Sample,
+    /// Full evaluation (all matching paths)
+    Full,
 }
 
 /// Information about a job (per jobs_redesign.md spec Section 8.1)
@@ -477,12 +470,48 @@ pub struct PipelineStage {
 /// State for the home hub screen
 #[derive(Debug, Clone, Default)]
 pub struct HomeState {
-    /// Currently selected card index (0-3)
-    pub selected_card: usize,
-    /// Statistics displayed on cards
+    /// Selected source index in the Quick Start panel
+    pub selected_source_index: usize,
+    /// Filter text for Quick Start sources list
+    pub filter: String,
+    /// Whether filter input mode is active
+    pub filtering: bool,
+    /// Recent jobs for the activity panel
+    pub recent_jobs: Vec<JobSummary>,
+    /// Last error message (if any)
+    pub last_error: Option<String>,
+    /// Statistics displayed on cards (legacy, used for stats loading)
     pub stats: HomeStats,
     /// Whether stats have been loaded from database
     pub stats_loaded: bool,
+}
+
+/// Summary of a job for display in Home activity panel
+#[derive(Debug, Clone)]
+pub struct JobSummary {
+    pub id: i64,
+    pub job_type: String,
+    pub description: String,
+    pub status: JobStatus,
+    pub progress_percent: Option<u8>,
+    pub duration_secs: Option<f64>,
+}
+
+// =============================================================================
+// Sources View Types
+// =============================================================================
+
+/// State for Sources view (key 4)
+#[derive(Debug, Clone, Default)]
+pub struct SourcesState {
+    /// Selected source index
+    pub selected_index: usize,
+    /// Whether in edit mode
+    pub editing: bool,
+    /// Edit field value
+    pub edit_value: String,
+    /// Whether showing delete confirmation
+    pub confirm_delete: bool,
 }
 
 // =============================================================================
@@ -633,14 +662,6 @@ pub struct SchemaColumn {
     pub dtype: String,
 }
 
-/// Focus areas for input handling
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AppFocus {
-    #[default]
-    Main,
-    Chat,
-}
-
 /// Focus areas within Discover mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiscoverFocus {
@@ -777,9 +798,6 @@ pub enum DiscoverViewState {
     SourceDeleteConfirm, // Delete confirmation dialog
     // --- Background scanning ---
     Scanning,           // Directory scan in progress (non-blocking)
-    // AI Wizards consolidated into Rule Builder (v3.0)
-    // - Use GlobExplorer EditRule phase with Tab key for AI assistance
-    // - ParserLab will be standalone mode (not yet implemented)
 }
 
 /// Source information for Discover mode sidebar
@@ -837,6 +855,39 @@ pub enum TuiScanResult {
     Error(String),
 }
 
+/// Result from background schema evaluation job
+pub enum SchemaEvalResult {
+    /// Schema eval started
+    Started { job_id: i64 },
+    /// Progress update (0-100)
+    Progress { progress: u8, paths_analyzed: usize, total_paths: usize },
+    /// Schema eval completed successfully
+    Complete {
+        job_id: i64,
+        pattern: String,
+        pattern_seeds: Vec<super::extraction::PatternSeed>,
+        path_archetypes: Vec<super::extraction::PathArchetype>,
+        naming_schemes: Vec<super::extraction::NamingScheme>,
+        synonym_suggestions: Vec<super::extraction::SynonymSuggestion>,
+        paths_analyzed: usize,
+    },
+    /// Schema eval failed
+    Error(String),
+}
+
+/// Result from background sample schema evaluation
+pub enum SampleEvalResult {
+    Complete {
+        pattern: String,
+        pattern_seeds: Vec<super::extraction::PatternSeed>,
+        path_archetypes: Vec<super::extraction::PathArchetype>,
+        naming_schemes: Vec<super::extraction::NamingScheme>,
+        synonym_suggestions: Vec<super::extraction::SynonymSuggestion>,
+        paths_analyzed: usize,
+    },
+    Error(String),
+}
+
 /// Pending rule write for persistence
 #[derive(Debug, Clone)]
 pub struct PendingRuleWrite {
@@ -863,7 +914,7 @@ pub struct GlobExplorerState {
 
     // --- Derived state (loaded atomically from DB) ---
     /// Folders/files at current level with file counts
-    pub folders: Vec<FolderInfo>,
+    pub folders: Vec<FsEntry>,
     /// Sampled preview files (max 10)
     pub preview_files: Vec<GlobPreviewFile>,
     /// Total file count for current prefix + pattern
@@ -871,9 +922,9 @@ pub struct GlobExplorerState {
 
     // --- O(1) Navigation Cache ---
     /// Preloaded folder hierarchy - key is prefix, value is children at that level
-    /// Example: "" -> [FolderInfo{name: "logs", ...}, FolderInfo{name: "data", ...}]
-    ///          "logs/" -> [FolderInfo{name: "app.log", is_file: true}, ...]
-    pub folder_cache: HashMap<String, Vec<FolderInfo>>,
+    /// Example: "" -> [FsEntry::Folder { name: "logs", .. }, FsEntry::Folder { name: "data", .. }]
+    ///          "logs/" -> [FsEntry::File { name: "app.log", .. }, ...]
+    pub folder_cache: HashMap<String, Vec<FsEntry>>,
     /// Whether cache has been loaded for current source
     pub cache_loaded: bool,
     /// Source ID for which cache was loaded (to detect source changes)
@@ -957,34 +1008,97 @@ impl Default for GlobExplorerState {
     }
 }
 
-/// Folder/file info for hierarchical browsing
+/// Filesystem entry for hierarchical browsing
 #[derive(Debug, Clone)]
-pub struct FolderInfo {
-    /// Display name (may include pattern suffix like "data/reports/*.csv")
-    pub name: String,
-    /// Raw path for navigation (e.g., "data/reports" without pattern suffix)
-    /// If None, uses `name` for navigation
-    pub path: Option<String>,
-    /// Number of files in/under this folder
-    pub file_count: usize,
-    /// True if this is a leaf file (not a folder)
-    pub is_file: bool,
+pub enum FsEntry {
+    Folder {
+        /// Display name (may include pattern suffix like "data/reports/*.csv")
+        name: String,
+        /// Raw path for navigation (e.g., "data/reports" without pattern suffix)
+        /// If None, uses `name` for navigation
+        path: Option<String>,
+        /// Number of files in/under this folder
+        file_count: usize,
+    },
+    File {
+        /// Display name
+        name: String,
+        /// Raw path for navigation (e.g., "data/reports/file.csv")
+        /// If None, uses `name` for navigation
+        path: Option<String>,
+        /// Number of files represented (usually 1)
+        file_count: usize,
+    },
+    Loading {
+        /// Status message
+        message: String,
+    },
 }
 
-impl FolderInfo {
-    /// Create a new folder/file info
-    pub fn new(name: String, file_count: usize, is_file: bool) -> Self {
-        Self { name, path: None, file_count, is_file }
+impl FsEntry {
+    /// Create a folder entry
+    pub fn folder(name: String, file_count: usize) -> Self {
+        Self::Folder { name, path: None, file_count }
     }
 
-    /// Create a folder info with explicit navigation path
+    /// Create a file entry
+    pub fn file(name: String, file_count: usize) -> Self {
+        Self::File { name, path: None, file_count }
+    }
+
+    /// Create a folder/file entry
+    pub fn new(name: String, file_count: usize, is_file: bool) -> Self {
+        Self::with_path(name, None, file_count, is_file)
+    }
+
+    /// Create a folder/file entry with explicit navigation path
     pub fn with_path(name: String, path: Option<String>, file_count: usize, is_file: bool) -> Self {
-        Self { name, path, file_count, is_file }
+        if is_file {
+            Self::File { name, path, file_count }
+        } else {
+            Self::Folder { name, path, file_count }
+        }
     }
 
     /// Create a loading placeholder
     pub fn loading(message: &str) -> Self {
-        Self { name: message.to_string(), path: None, file_count: 0, is_file: false }
+        Self::Loading { message: message.to_string() }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            FsEntry::Folder { name, .. } => name,
+            FsEntry::File { name, .. } => name,
+            FsEntry::Loading { message } => message,
+        }
+    }
+
+    pub fn file_count(&self) -> usize {
+        match self {
+            FsEntry::Folder { file_count, .. } => *file_count,
+            FsEntry::File { file_count, .. } => *file_count,
+            FsEntry::Loading { .. } => 0,
+        }
+    }
+
+    pub fn nav_path(&self) -> Option<&str> {
+        match self {
+            FsEntry::Folder { name, path, .. } | FsEntry::File { name, path, .. } => {
+                Some(path.as_deref().unwrap_or(name))
+            }
+            FsEntry::Loading { .. } => None,
+        }
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            FsEntry::Folder { path, .. } | FsEntry::File { path, .. } => path.as_deref(),
+            FsEntry::Loading { .. } => None,
+        }
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self, FsEntry::File { .. })
     }
 }
 
@@ -1215,315 +1329,8 @@ pub struct FileInfo {
     pub tags: Vec<String>,
 }
 
-/// Result from a pending Claude response
-pub enum PendingResponse {
-    /// Response text received with tool calls info
-    Text {
-        content: String,
-        tools_used: Vec<String>,
-    },
-    /// Error occurred
-    Error(String),
-}
-
-/// Maximum number of messages to keep in input history
-const MAX_INPUT_HISTORY: usize = 50;
-
-/// Maximum number of chat messages to keep (prevents unbounded memory growth)
-const MAX_CHAT_MESSAGES: usize = 500;
-
 /// Maximum number of jobs to keep in the jobs list (prevents unbounded memory growth)
 const MAX_JOBS: usize = 200;
-
-/// Format tool call for display
-fn format_tool_call(name: &str, arguments: &Value) -> String {
-    let mut result = format!("\n[Tool: {}]\n", name);
-
-    // Format arguments in a readable way
-    if let Value::Object(obj) = arguments {
-        for (key, value) in obj {
-            let value_str = match value {
-                Value::String(s) => {
-                    // Truncate long strings
-                    if s.len() > 100 {
-                        format!("\"{}...\"", &s[..97])
-                    } else {
-                        format!("\"{}\"", s)
-                    }
-                }
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => "null".to_string(),
-                Value::Array(arr) => {
-                    if arr.len() <= 3 {
-                        format!("{:?}", arr)
-                    } else {
-                        format!("[{} items]", arr.len())
-                    }
-                }
-                Value::Object(_) => "{...}".to_string(),
-            };
-            result.push_str(&format!("  {}: {}\n", key, value_str));
-        }
-    }
-
-    result
-}
-
-/// Chat message
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub role: MessageRole,
-    pub content: String,
-    pub timestamp: DateTime<Local>,
-}
-
-impl Message {
-    pub fn new(role: MessageRole, content: String) -> Self {
-        Self {
-            role,
-            content,
-            timestamp: Local::now(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageRole {
-    User,
-    Assistant,
-    System,
-    #[allow(dead_code)]
-    Tool,
-}
-
-/// Input history for recalling previous messages
-#[derive(Debug, Default)]
-pub struct InputHistory {
-    /// Previous inputs
-    entries: Vec<String>,
-    /// Current position in history (None = new input)
-    position: Option<usize>,
-    /// Draft input being typed (preserved when browsing history)
-    draft: String,
-}
-
-impl InputHistory {
-    /// Add an entry to history
-    pub fn push(&mut self, input: String) {
-        if !input.is_empty() {
-            // Don't add duplicates of the last entry
-            if self.entries.last() != Some(&input) {
-                self.entries.push(input);
-                // Keep history bounded
-                if self.entries.len() > MAX_INPUT_HISTORY {
-                    self.entries.remove(0);
-                }
-            }
-        }
-        self.position = None;
-        self.draft.clear();
-    }
-
-    /// Move up in history (older entries)
-    pub fn up(&mut self, current_input: &str) -> Option<&str> {
-        if self.entries.is_empty() {
-            return None;
-        }
-
-        match self.position {
-            None => {
-                // Save current input as draft before browsing history
-                self.draft = current_input.to_string();
-                self.position = Some(self.entries.len() - 1);
-                Some(&self.entries[self.entries.len() - 1])
-            }
-            Some(pos) if pos > 0 => {
-                self.position = Some(pos - 1);
-                Some(&self.entries[pos - 1])
-            }
-            Some(_) => {
-                // Already at oldest entry
-                Some(&self.entries[0])
-            }
-        }
-    }
-
-    /// Move down in history (newer entries)
-    pub fn down(&mut self) -> Option<&str> {
-        match self.position {
-            None => None, // Already at current input
-            Some(pos) => {
-                if pos < self.entries.len() - 1 {
-                    self.position = Some(pos + 1);
-                    Some(&self.entries[pos + 1])
-                } else {
-                    // Return to draft input
-                    self.position = None;
-                    Some(&self.draft)
-                }
-            }
-        }
-    }
-
-    /// Reset position (when user starts typing)
-    pub fn reset_position(&mut self) {
-        self.position = None;
-    }
-}
-
-/// Chat state
-#[derive(Debug)]
-pub struct ChatState {
-    /// Messages in the conversation
-    pub messages: Vec<Message>,
-    /// Current input buffer (supports multi-line)
-    pub input: String,
-    /// Cursor position in input (byte offset)
-    pub cursor: usize,
-    /// Scroll offset for message list (in lines)
-    pub scroll: usize,
-    /// Whether waiting for LLM response
-    pub awaiting_response: bool,
-    /// Input history
-    pub input_history: InputHistory,
-    /// Whether in history browsing mode
-    pub browsing_history: bool,
-    /// Recent tools used (for display in context pane)
-    pub recent_tools: Vec<String>,
-}
-
-impl Default for ChatState {
-    fn default() -> Self {
-        Self {
-            messages: vec![Message::new(
-                MessageRole::System,
-                "Welcome to Casparian TUI. Type a message to chat with Claude about your data pipelines.\n\nKeyboard shortcuts:\n  Shift+Enter: New line\n  Enter: Send message\n  Up/Down: Browse input history (when input is single-line)\n  Ctrl+Up/Down: Scroll messages\n  Esc: Clear input".into(),
-            )],
-            input: String::new(),
-            cursor: 0,
-            scroll: 0,
-            awaiting_response: false,
-            input_history: InputHistory::default(),
-            browsing_history: false,
-            recent_tools: Vec::new(),
-        }
-    }
-}
-
-impl ChatState {
-    /// Estimate total line count for scroll bounds
-    /// This is a rough estimate used to prevent unbounded scroll growth
-    pub fn estimated_total_lines(&self) -> usize {
-        // Estimate ~5 lines per message on average (header + wrapped content)
-        // This is intentionally generous to allow scrolling
-        self.messages.iter().map(|m| {
-            // 2 lines for header + at least 1 for content, plus estimate based on content length
-            2 + (m.content.len() / 50).max(1)
-        }).sum()
-    }
-
-    /// Get current line and column from cursor position
-    pub fn cursor_line_col(&self) -> (usize, usize) {
-        let before_cursor = &self.input[..self.cursor];
-        let line = before_cursor.matches('\n').count();
-        let col = before_cursor.rfind('\n').map_or(self.cursor, |pos| self.cursor - pos - 1);
-        (line, col)
-    }
-
-    /// Get the number of lines in the input
-    pub fn input_line_count(&self) -> usize {
-        self.input.matches('\n').count() + 1
-    }
-
-    /// Check if input is single-line (for history browsing)
-    pub fn is_single_line(&self) -> bool {
-        !self.input.contains('\n')
-    }
-
-    /// Insert a newline at cursor position
-    pub fn insert_newline(&mut self) {
-        self.input.insert(self.cursor, '\n');
-        self.cursor += 1;
-    }
-
-    /// Move cursor up one line
-    pub fn cursor_up(&mut self) {
-        let (line, col) = self.cursor_line_col();
-        if line == 0 {
-            return;
-        }
-
-        // Find the start of current line
-        let current_line_start = self.input[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |pos| pos + 1);
-
-        // Find the start of previous line
-        let prev_line_start = if current_line_start == 0 {
-            0
-        } else {
-            self.input[..current_line_start - 1]
-                .rfind('\n')
-                .map_or(0, |pos| pos + 1)
-        };
-
-        // Find the end of previous line (or use the column)
-        let prev_line_len = current_line_start - 1 - prev_line_start;
-        let new_col = col.min(prev_line_len);
-        self.cursor = prev_line_start + new_col;
-    }
-
-    /// Move cursor down one line
-    pub fn cursor_down(&mut self) {
-        let (line, col) = self.cursor_line_col();
-        let total_lines = self.input_line_count();
-        if line >= total_lines - 1 {
-            return;
-        }
-
-        // Find the end of current line
-        let current_line_end = self.input[self.cursor..]
-            .find('\n')
-            .map(|pos| self.cursor + pos)
-            .unwrap_or(self.input.len());
-
-        if current_line_end >= self.input.len() {
-            return;
-        }
-
-        // Next line starts after the newline
-        let next_line_start = current_line_end + 1;
-
-        // Find the end of next line
-        let next_line_end = self.input[next_line_start..]
-            .find('\n')
-            .map(|pos| next_line_start + pos)
-            .unwrap_or(self.input.len());
-
-        let next_line_len = next_line_end - next_line_start;
-        let new_col = col.min(next_line_len);
-        self.cursor = next_line_start + new_col;
-    }
-
-    /// Add a message and trim old messages if over limit
-    /// Keeps the first system message (welcome) and removes oldest non-system messages
-    pub fn push_message(&mut self, message: Message) {
-        self.messages.push(message);
-        self.trim_messages();
-    }
-
-    /// Trim old messages to prevent unbounded memory growth
-    /// Preserves the welcome system message at index 0
-    fn trim_messages(&mut self) {
-        if self.messages.len() > MAX_CHAT_MESSAGES {
-            // Keep first message (welcome) and remove oldest after it
-            let excess = self.messages.len() - MAX_CHAT_MESSAGES;
-            // Remove from index 1 (after welcome message)
-            self.messages.drain(1..1 + excess);
-        }
-    }
-}
 
 /// Main application state
 pub struct App {
@@ -1531,45 +1338,46 @@ pub struct App {
     pub running: bool,
     /// Current TUI mode/screen
     pub mode: TuiMode,
-    /// Whether the AI chat sidebar is visible
-    pub show_chat_sidebar: bool,
     /// Whether the help overlay is visible (per spec Section 3.1)
     pub show_help: bool,
-    /// Current input focus (Main vs Chat)
-    pub focus: AppFocus,
     /// Home hub state
     pub home: HomeState,
     /// Discover mode state
     pub discover: DiscoverState,
     /// Parser Bench mode state
     pub parser_bench: ParserBenchState,
-    /// Chat state
-    pub chat: ChatState,
-    /// Inspect mode state
-    pub inspect: InspectState,
     /// Jobs mode state
     pub jobs_state: JobsState,
+    /// Sources mode state
+    pub sources_state: SourcesState,
     /// Settings mode state
     pub settings: SettingsState,
+    /// Whether the Jobs drawer overlay is visible (toggle with J)
+    pub jobs_drawer_open: bool,
+    /// Selected job in the drawer (for Enter navigation)
+    pub jobs_drawer_selected: usize,
+    /// Whether the Sources drawer overlay is visible (toggle with S)
+    pub sources_drawer_open: bool,
+    /// Selected source in the drawer (for Enter navigation)
+    pub sources_drawer_selected: usize,
     /// Tool registry for executing MCP tools
     pub tools: ToolRegistry,
-    /// LLM provider (Claude Code if available)
-    pub llm: Option<ClaudeCodeProvider>,
-    /// Injected LLM provider (for testing with mock providers)
-    #[cfg(test)]
-    pub llm_provider: Option<std::sync::Arc<dyn super::llm::LlmProvider + Send + Sync>>,
     /// Configuration
     #[allow(dead_code)]
     pub config: TuiArgs,
     /// Last error message
     #[allow(dead_code)]
     pub error: Option<String>,
-    /// Pending response from Claude (non-blocking)
-    pending_response: Option<mpsc::Receiver<PendingResponse>>,
     /// Pending scan result from background directory scan
     pending_scan: Option<mpsc::Receiver<TuiScanResult>>,
     /// Job ID for the currently running scan (for status updates)
     current_scan_job_id: Option<i64>,
+    /// Job ID for the currently running schema eval (for status updates)
+    current_schema_eval_job_id: Option<i64>,
+    /// Pending schema eval result from background analysis
+    pending_schema_eval: Option<mpsc::Receiver<SchemaEvalResult>>,
+    /// Pending sample schema eval result
+    pending_sample_eval: Option<mpsc::Receiver<SampleEvalResult>>,
     /// Pending cache load for glob explorer (streaming chunks)
     pending_cache_load: Option<mpsc::Receiver<CacheLoadMessage>>,
     /// Progress tracking for streaming cache load
@@ -1606,7 +1414,7 @@ enum CacheLoadMessage {
         source_id: String,
         total_files: usize,
         tags: Vec<TagInfo>,
-        cache: HashMap<String, Vec<FolderInfo>>,
+        cache: HashMap<String, Vec<FsEntry>>,
     },
     /// Error during loading
     Error(String),
@@ -1617,7 +1425,7 @@ enum FolderQueryMessage {
     /// Query completed successfully
     Complete {
         prefix: String,
-        folders: Vec<FolderInfo>,
+        folders: Vec<FsEntry>,
         total_count: usize,
     },
     /// Error during query
@@ -1665,7 +1473,7 @@ pub struct CacheLoadTiming {
 
 /// Result of background glob search
 struct GlobSearchResult {
-    folders: Vec<FolderInfo>,
+    folders: Vec<FsEntry>,
     total_count: usize,
     pattern: String,
 }
@@ -1680,39 +1488,19 @@ struct RuleBuilderSearchResult {
 impl App {
     /// Create new app with given args
     pub fn new(args: TuiArgs) -> Self {
-        // Check if Claude Code is available
-        let llm = if ClaudeCodeProvider::is_available() {
-            Some(
-                ClaudeCodeProvider::new()
-                    .allowed_tools(vec![
-                        "Read".to_string(),
-                        "Grep".to_string(),
-                        "Glob".to_string(),
-                        "Bash".to_string(),
-                    ])
-                    .system_prompt(
-                        "You are helping the user with Casparian Flow, a data pipeline tool. \
-                         You have access to MCP tools for scanning files, discovering schemas, \
-                         and building data pipelines. Be concise and helpful.",
-                    )
-                    .max_turns(5),
-            )
-        } else {
-            None
-        };
-
         Self {
             running: true,
             mode: TuiMode::Home,
-            show_chat_sidebar: false,
             show_help: false,
-            focus: AppFocus::Main,
             home: HomeState::default(),
             discover: DiscoverState::default(),
             parser_bench: ParserBenchState::default(),
-            chat: ChatState::default(),
-            inspect: InspectState::default(),
             jobs_state: JobsState::default(),
+            sources_state: SourcesState::default(),
+            jobs_drawer_open: false,
+            jobs_drawer_selected: 0,
+            sources_drawer_open: false,
+            sources_drawer_selected: 0,
             settings: SettingsState {
                 default_source_path: "~/data".to_string(),
                 auto_scan_on_startup: true,
@@ -1723,14 +1511,13 @@ impl App {
                 ..Default::default()
             },
             tools: create_default_registry(),
-            llm,
-            #[cfg(test)]
-            llm_provider: None,
             config: args,
             error: None,
-            pending_response: None,
             pending_scan: None,
             current_scan_job_id: None,
+            current_schema_eval_job_id: None,
+            pending_schema_eval: None,
+            pending_sample_eval: None,
             pending_cache_load: None,
             cache_load_progress: None,
             last_cache_load_timing: None,
@@ -1767,56 +1554,75 @@ impl App {
         // Set view state to Rule Builder immediately
         self.discover.view_state = DiscoverViewState::RuleBuilder;
 
-        // Only auto-open Sources dropdown if no source is selected (first-time use)
+        // Auto-open Sources dropdown if no source is selected (first-time use)
         // Otherwise stay in RuleBuilder view for returning users
-        if self.discover.selected_source_id.is_none() && self.discover.sources.is_empty() {
+        if self.discover.selected_source_id.is_none() {
             self.discover.view_state = DiscoverViewState::SourcesDropdown;
             self.discover.sources_filter.clear();
+            self.discover.sources_filtering = false;
             self.discover.preview_source = Some(self.discover.selected_source_index());
         }
     }
 
-    /// Create app with injected LLM provider (for testing with mock providers)
-    #[cfg(test)]
-    pub fn new_with_provider(
-        args: TuiArgs,
-        provider: std::sync::Arc<dyn super::llm::LlmProvider + Send + Sync>,
-    ) -> Self {
-        Self {
-            running: true,
-            mode: TuiMode::Home,
-            show_chat_sidebar: false,
-            show_help: false,
-            focus: AppFocus::Main,
-            home: HomeState::default(),
-            discover: DiscoverState::default(),
-            parser_bench: ParserBenchState::default(),
-            chat: ChatState::default(),
-            inspect: InspectState::default(),
-            jobs_state: JobsState::default(),
-            settings: SettingsState::default(),
-            tools: create_default_registry(),
-            llm: None,
-            llm_provider: Some(provider),
-            config: args,
-            error: None,
-            pending_response: None,
-            pending_scan: None,
-            current_scan_job_id: None,
-            pending_cache_load: None,
-            cache_load_progress: None,
-            last_cache_load_timing: None,
-            tick_count: 0,
-            pending_glob_search: None,
-            pending_rule_builder_search: None,
-            glob_search_cancelled: None,
-            pending_folder_query: None,
-            pending_sources_load: None,
-            pending_jobs_load: None,
-            pending_stats_load: None,
-            last_jobs_poll: None,
-            #[cfg(feature = "profiling")]
-            profiler: casparian_profiler::Profiler::new(250),
+    fn resolve_db_target(&self) -> (DbBackend, std::path::PathBuf) {
+        if let Some(ref path) = self.config.database {
+            let backend = match path.extension().and_then(|ext| ext.to_str()) {
+                Some("duckdb") => DbBackend::DuckDb,
+                _ => DbBackend::Sqlite,
+            };
+            (backend, path.clone())
+        } else {
+            (default_db_backend(), active_db_path())
+        }
+    }
+
+    async fn open_db_readonly(&self) -> Option<DbConnection> {
+        let (backend, path) = self.resolve_db_target();
+        Self::open_db_readonly_with(backend, &path).await
+    }
+
+    async fn open_db_write(&self) -> Option<DbConnection> {
+        let (backend, path) = self.resolve_db_target();
+        Self::open_db_write_with(backend, &path).await
+    }
+
+    async fn open_db_readonly_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
+        if !path.exists() {
+            return None;
+        }
+
+        match backend {
+            DbBackend::Sqlite => DbConnection::open_sqlite(path).await.ok(),
+            DbBackend::DuckDb => {
+                #[cfg(feature = "duckdb")]
+                {
+                    DbConnection::open_duckdb_readonly(path).await.ok()
+                }
+                #[cfg(not(feature = "duckdb"))]
+                {
+                    None
+                }
+            }
+        }
+    }
+
+    async fn open_db_write_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
+        if !path.exists() {
+            return None;
+        }
+
+        match backend {
+            DbBackend::Sqlite => DbConnection::open_sqlite(path).await.ok(),
+            DbBackend::DuckDb => {
+                #[cfg(feature = "duckdb")]
+                {
+                    DbConnection::open_duckdb(path).await.ok()
+                }
+                #[cfg(not(feature = "duckdb"))]
+                {
+                    None
+                }
+            }
         }
     }
 
@@ -1836,164 +1642,230 @@ impl App {
                 return;
             }
             #[cfg(feature = "profiling")]
-            KeyCode::Char('`') if self.focus != AppFocus::Chat => {
+            KeyCode::Char('`') => {
                 self.profiler.enabled = !self.profiler.enabled;
                 return;
             }
-            // Alt+Number: Global mode navigation (works from ANY mode, including Discover)
-            // Note: Ctrl+Number doesn't work reliably in terminals, so we use Alt instead
-            KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.enter_discover_mode();
-                return;
-            }
-            KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.mode = TuiMode::ParserBench;
-                return;
-            }
-            KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.mode = TuiMode::Jobs;
-                return;
-            }
-            KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.mode = TuiMode::Inspect;
-                return;
-            }
-            // Number keys for primary navigation (1-4)
-            // Note: In Discover mode, 1/2/3 are overridden for panel focus
-            // Don't intercept when chat is focused (allow typing numbers)
-            KeyCode::Char('1') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
-                self.enter_discover_mode();
-                return;
-            }
-            KeyCode::Char('2') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
-                self.mode = TuiMode::ParserBench;
-                return;
-            }
-            KeyCode::Char('3') if self.focus != AppFocus::Chat && self.mode != TuiMode::Discover => {
-                self.mode = TuiMode::Jobs;
-                return;
-            }
-            KeyCode::Char('4') if self.focus != AppFocus::Chat => {
-                // During scanning, '4' goes to Jobs (scan continues in background)
-                if self.mode == TuiMode::Discover && self.discover.view_state == DiscoverViewState::Scanning {
-                    self.mode = TuiMode::Jobs;
-                    self.discover.status_message = Some(("Scan running in background...".to_string(), false));
-                } else if self.mode == TuiMode::Home {
-                    // From Home: [4] Sources card goes to Sources Manager within Discover
-                    self.enter_discover_mode();
-                    self.discover.view_state = DiscoverViewState::SourcesManager;
-                    self.discover.sources_manager_selected = self.discover.selected_source_index();
-                } else {
-                    self.mode = TuiMode::Inspect;
+            // Discover Rule Builder shortcuts: [1]/[2] open local dropdowns
+            KeyCode::Char('1') | KeyCode::Char('2')
+                if self.mode == TuiMode::Discover
+                    && !self.in_text_input_mode()
+                    && matches!(
+                        self.discover.view_state,
+                        DiscoverViewState::RuleBuilder | DiscoverViewState::Files
+                    ) =>
+            {
+                match key.code {
+                    KeyCode::Char('1') => {
+                        self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                        self.discover.sources_filter.clear();
+                        self.discover.sources_filtering = false;
+                        self.discover.preview_source = Some(self.discover.selected_source_index());
+                    }
+                    KeyCode::Char('2') => {
+                        self.transition_discover_state(DiscoverViewState::TagsDropdown);
+                        self.discover.tags_filter.clear();
+                        self.discover.tags_filtering = false;
+                        self.discover.preview_tag = self.discover.selected_tag;
+                    }
+                    _ => {}
                 }
                 return;
             }
+            // ========== GLOBAL VIEW NAVIGATION (per keybinding matrix) ==========
+            // Keys 1-4 are RESERVED for view navigation and work from ANY view.
+            // Don't intercept when in text input.
+
+            // 1: Discover
+            KeyCode::Char('1') if !self.in_text_input_mode() => {
+                self.enter_discover_mode();
+                return;
+            }
+            // 2: Parser Bench
+            KeyCode::Char('2') if !self.in_text_input_mode() => {
+                self.mode = TuiMode::ParserBench;
+                return;
+            }
+            // 3: Jobs
+            KeyCode::Char('3') if !self.in_text_input_mode() => {
+                self.mode = TuiMode::Jobs;
+                return;
+            }
+            // 4: Sources
+            KeyCode::Char('4') if !self.in_text_input_mode() => {
+                self.mode = TuiMode::Sources;
+                return;
+            }
+            // P: Parser Bench (separate from 1-4 navigation)
+            KeyCode::Char('P') if !self.in_text_input_mode() => {
+                self.mode = TuiMode::ParserBench;
+                return;
+            }
+            // J: Toggle Jobs Drawer (global overlay)
+            KeyCode::Char('J') if !self.in_text_input_mode() => {
+                self.jobs_drawer_open = !self.jobs_drawer_open;
+                if self.jobs_drawer_open {
+                    self.sources_drawer_open = false;
+                    self.jobs_drawer_selected = self.jobs_state.selected_index;
+                }
+                return;
+            }
+            // S: Toggle Sources Drawer (global overlay, except Discover)
+            KeyCode::Char('S') if !self.in_text_input_mode() && self.mode != TuiMode::Discover => {
+                self.sources_drawer_open = !self.sources_drawer_open;
+                if self.sources_drawer_open {
+                    self.jobs_drawer_open = false;
+                    let drawer_sources = self.sources_drawer_sources();
+                    self.sources_drawer_selected = drawer_sources
+                        .iter()
+                        .position(|idx| *idx == self.sources_state.selected_index)
+                        .unwrap_or(0);
+                }
+                return;
+            }
+            // Jobs Drawer navigation (when drawer is open)
+            KeyCode::Up if self.jobs_drawer_open => {
+                if self.jobs_drawer_selected > 0 {
+                    self.jobs_drawer_selected -= 1;
+                }
+                return;
+            }
+            KeyCode::Down if self.jobs_drawer_open => {
+                let job_count = self.jobs_state.jobs.len();
+                if self.jobs_drawer_selected < job_count.saturating_sub(1) {
+                    self.jobs_drawer_selected += 1;
+                }
+                return;
+            }
+            KeyCode::Enter if self.jobs_drawer_open => {
+                // Jump to Jobs view with selected job
+                if !self.jobs_state.jobs.is_empty() {
+                    self.jobs_state.selected_index = self.jobs_drawer_selected;
+                    self.mode = TuiMode::Jobs;
+                    self.jobs_drawer_open = false;
+                }
+                return;
+            }
+            KeyCode::Esc if self.jobs_drawer_open => {
+                self.jobs_drawer_open = false;
+                return;
+            }
+            // Sources Drawer navigation (when drawer is open)
+            KeyCode::Up if self.sources_drawer_open => {
+                if self.sources_drawer_selected > 0 {
+                    self.sources_drawer_selected -= 1;
+                }
+                return;
+            }
+            KeyCode::Down if self.sources_drawer_open => {
+                let source_count = self.sources_drawer_sources().len();
+                if self.sources_drawer_selected < source_count.saturating_sub(1) {
+                    self.sources_drawer_selected += 1;
+                }
+                return;
+            }
+            KeyCode::Enter if self.sources_drawer_open => {
+                if let Some(source) = self.sources_drawer_selected_source() {
+                    self.sources_state.selected_index = source;
+                    self.mode = TuiMode::Sources;
+                    self.sources_drawer_open = false;
+                }
+                return;
+            }
+            KeyCode::Char('s') if self.sources_drawer_open => {
+                if let Some(source_idx) = self.sources_drawer_selected_source() {
+                    let path = self.discover.sources[source_idx].path.display().to_string();
+                    self.sources_drawer_open = false;
+                    self.enter_discover_mode();
+                    self.scan_directory(&path);
+                }
+                return;
+            }
+            KeyCode::Char('e') if self.sources_drawer_open => {
+                if let Some(source_idx) = self.sources_drawer_selected_source() {
+                    let source = &self.discover.sources[source_idx];
+                    self.sources_state.selected_index = source_idx;
+                    self.sources_state.editing = true;
+                    self.sources_state.edit_value = source.path.display().to_string();
+                    self.mode = TuiMode::Sources;
+                    self.sources_drawer_open = false;
+                }
+                return;
+            }
+            KeyCode::Char('d') if self.sources_drawer_open => {
+                if let Some(source_idx) = self.sources_drawer_selected_source() {
+                    self.sources_state.selected_index = source_idx;
+                    self.sources_state.confirm_delete = true;
+                    self.mode = TuiMode::Sources;
+                    self.sources_drawer_open = false;
+                }
+                return;
+            }
+            KeyCode::Char('n') if self.sources_drawer_open => {
+                self.sources_drawer_open = false;
+                self.enter_discover_mode();
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
+                self.discover.scan_path_input.clear();
+                self.discover.scan_error = None;
+                self.discover.path_suggestions.clear();
+                return;
+            }
+            KeyCode::Esc if self.sources_drawer_open => {
+                self.sources_drawer_open = false;
+                return;
+            }
             // 0 or H: Return to Home (from any view)
-            // Don't intercept when chat is focused
-            KeyCode::Char('0') if self.focus != AppFocus::Chat => {
+            KeyCode::Char('0') => {
                 self.mode = TuiMode::Home;
                 return;
             }
-            KeyCode::Char('H') if self.focus != AppFocus::Chat => {
+            KeyCode::Char('H') => {
                 self.mode = TuiMode::Home;
                 return;
             }
             // q: Quit application (per spec Section 3.1)
             // Don't intercept when in text input mode
-            KeyCode::Char('q') if self.focus != AppFocus::Chat && !self.in_text_input_mode() => {
+            KeyCode::Char('q') if !self.in_text_input_mode() => {
                 // TODO: Add confirmation dialog if unsaved changes
                 self.running = false;
                 return;
             }
             // r: Refresh current view (per spec Section 3.3)
             // Don't intercept when in text input mode
-            KeyCode::Char('r') if self.focus != AppFocus::Chat && !self.in_text_input_mode() => {
+            KeyCode::Char('r') if !self.in_text_input_mode() => {
                 self.refresh_current_view();
                 return;
             }
             // ?: Toggle help overlay (per spec Section 3.1)
             // Don't intercept when in text input mode
-            KeyCode::Char('?') if self.focus != AppFocus::Chat && !self.in_text_input_mode() => {
+            KeyCode::Char('?') if !self.in_text_input_mode() => {
                 self.show_help = !self.show_help;
                 return;
             }
             // ,: Open Settings (per specs/views/settings.md Section 4)
             // Don't intercept when in text input mode
-            KeyCode::Char(',') if self.focus != AppFocus::Chat && !self.in_text_input_mode() => {
+            KeyCode::Char(',') if !self.in_text_input_mode() => {
                 if self.mode != TuiMode::Settings {
                     self.settings.previous_mode = Some(self.mode);
                     self.mode = TuiMode::Settings;
                 }
                 return;
             }
-            // Alt+A: Toggle AI Chat Sidebar
-            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.show_chat_sidebar = !self.show_chat_sidebar;
-                // If opening, focus chat? Maybe not by default, user can Tab
-                // If closing and focus was Chat, move back to Main
-                if !self.show_chat_sidebar && self.focus == AppFocus::Chat {
-                    self.focus = AppFocus::Main;
-                }
-                return;
-            }
-            // Tab: Cycle Focus (if sidebar is open)
-            KeyCode::Tab => {
-                if self.show_chat_sidebar {
-                    self.focus = match self.focus {
-                        AppFocus::Main => AppFocus::Chat,
-                        AppFocus::Chat => AppFocus::Main,
-                    };
-                    return;
-                }
-            }
             // Esc: Close help overlay first, then handle other escapes
             KeyCode::Esc if self.show_help => {
                 self.show_help = false;
                 return;
             }
-            // Esc: Return to Home from any mode (except Home itself)
-            // But NOT if we're in a focused state (e.g., query input in Inspect mode, or Chat focus)
-            KeyCode::Esc if self.mode != TuiMode::Home => {
-                // If Chat is focused, Esc moves focus back to Main first
-                if self.focus == AppFocus::Chat {
-                    self.focus = AppFocus::Main;
-                    return;
-                }
-                // Skip global Esc handling if mode-specific handler should handle it
-                // Discover mode has layered Esc: dialog -> filter -> sidebar -> Home
-                let glob_explorer_needs_local_esc = self.discover.glob_explorer.as_ref()
-                    .map(|e| !matches!(e.phase, GlobExplorerPhase::Browse))
-                    .unwrap_or(false);
-                let discover_needs_local_esc = self.mode == TuiMode::Discover && (
-                    // Any state other than Files needs local Esc
-                    self.discover.view_state != DiscoverViewState::Files ||
-                    !self.discover.filter.is_empty() ||
-                    self.discover.focus != DiscoverFocus::Files ||
-                    glob_explorer_needs_local_esc
-                );
-                let inspect_has_dialog = self.mode == TuiMode::Inspect && self.inspect.query_focused;
-
-                if !discover_needs_local_esc && !inspect_has_dialog {
-                    self.mode = TuiMode::Home;
-                    return;
-                }
-            }
             _ => {}
-        }
-
-        // If Focus is Chat, route keys to Chat handler
-        if self.focus == AppFocus::Chat {
-            self.handle_chat_key(key).await;
-            return;
         }
 
         // Mode-specific keys (Main Focus)
         match self.mode {
             TuiMode::Home => self.handle_home_key(key),
             TuiMode::Discover => self.handle_discover_key(key),
-            TuiMode::ParserBench => self.handle_parser_bench_key(key),
-            TuiMode::Inspect => self.handle_inspect_key(key),
             TuiMode::Jobs => self.handle_jobs_key(key),
+            TuiMode::Sources => self.handle_sources_key(key),
+            TuiMode::ParserBench => self.handle_parser_bench_key(key),
             TuiMode::Settings => self.handle_settings_key(key),
         }
     }
@@ -2320,22 +2192,11 @@ impl App {
                 }
 
                 // Not in text input mode - handle shortcuts
+                // NOTE: Keys 1-4 are now handled globally for view navigation.
+                // Use Tab/arrow keys for panel focus cycling within Discover.
                 match key.code {
-                    KeyCode::Char('1') => {
-                        self.discover.focus = DiscoverFocus::Sources;
-                        self.transition_discover_state(DiscoverViewState::SourcesDropdown);
-                        self.discover.sources_filter.clear();
-                        self.discover.preview_source = Some(self.discover.selected_source_index());
-                    }
-                    KeyCode::Char('2') => {
-                        self.discover.focus = DiscoverFocus::Tags;
-                        self.transition_discover_state(DiscoverViewState::TagsDropdown);
-                        self.discover.tags_filter.clear();
-                        self.discover.preview_tag = self.discover.selected_tag;
-                    }
-                    KeyCode::Char('3') => self.discover.focus = DiscoverFocus::Files,
                     KeyCode::Char('n') => self.open_rule_creation_dialog(),
-                    // Note: R and M are now handled globally above, so they work from dropdowns too
+                    // Tab: Toggle preview panel or cycle focus
                     KeyCode::Tab if self.discover.focus == DiscoverFocus::Files => {
                         // If in glob explorer EditRule phase, let it handle Tab for section cycling
                         if let Some(ref explorer) = self.discover.glob_explorer {
@@ -2357,6 +2218,9 @@ impl App {
                         }
                         self.discover.filter.clear();
                         self.discover.selected = 0;
+                    }
+                    KeyCode::Esc => {
+                        self.mode = TuiMode::Home;
                     }
                     _ => match self.discover.focus {
                         DiscoverFocus::Files => self.handle_discover_files_key(key),
@@ -2384,12 +2248,12 @@ impl App {
                 self.discover.glob_explorer = Some(GlobExplorerState::default());
                 self.discover.data_loaded = false; // Trigger reload
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if self.discover.selected < self.filtered_files().len().saturating_sub(1) {
                     self.discover.selected += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if self.discover.selected > 0 {
                     self.discover.selected -= 1;
                 }
@@ -2600,7 +2464,7 @@ impl App {
 
         // Navigation mode (Browse phase)
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 // Navigate down in folder list
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if explorer.selected_folder < explorer.folders.len().saturating_sub(1) {
@@ -2608,7 +2472,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 // Navigate up in folder list, or move to pattern input at top
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if explorer.selected_folder > 0 {
@@ -2620,13 +2484,13 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Enter | KeyCode::Right => {
                 // Drill into selected folder - O(1) using cache
-                // l/Right follows vim/ranger convention for hierarchical navigation
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if let Some(folder) = explorer.folders.get(explorer.selected_folder).cloned() {
                         // Don't drill into files or the loading placeholder
-                        if !folder.is_file && !folder.name.contains("Loading folder hierarchy") && !folder.name.contains("Searching") {
+                        let folder_name = folder.name().to_string();
+                        if !folder.is_file() && !folder_name.contains("Loading folder hierarchy") && !folder_name.contains("Searching") {
                             // Save current (prefix, pattern) to history for back navigation
                             explorer.nav_history.push((
                                 explorer.current_prefix.clone(),
@@ -2634,7 +2498,7 @@ impl App {
                             ));
 
                             // Determine new prefix based on whether this is a ** result or normal folder
-                            if let Some(ref full_path) = folder.path {
+                            if let Some(full_path) = folder.path() {
                                 // ** result: path is the full folder path, use it directly
                                 explorer.current_prefix = format!("{}/", full_path);
                                 // Clear ** from pattern when drilling into a ** result
@@ -2643,7 +2507,7 @@ impl App {
                                 }
                             } else {
                                 // Normal folder: append folder name to current prefix
-                                explorer.current_prefix = format!("{}{}/", explorer.current_prefix, folder.name);
+                                explorer.current_prefix = format!("{}{}/", explorer.current_prefix, folder_name);
                             }
 
                             // Stay in Browse phase (navigation) - phase doesn't change based on folder depth
@@ -2654,9 +2518,8 @@ impl App {
                 // Update from cache - O(1) hashmap lookup, no SQL
                 self.update_folders_from_cache();
             }
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+            KeyCode::Left | KeyCode::Backspace => {
                 // Go back to parent folder - O(1) using cache
-                // h/Left follows vim/ranger convention for hierarchical navigation
                 // Backspace kept for backwards compatibility
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if let Some((prev_prefix, prev_pattern)) = explorer.nav_history.pop() {
@@ -2664,7 +2527,7 @@ impl App {
                         explorer.pattern = prev_pattern;
                         // Stay in Browse phase
                         self.update_folders_from_cache();
-                    } else if key.code == KeyCode::Left || key.code == KeyCode::Char('h') {
+                    } else if key.code == KeyCode::Left {
                         // At root level, Left/h moves focus to sidebar
                         self.discover.focus = DiscoverFocus::Sources;
                     }
@@ -2742,18 +2605,18 @@ impl App {
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if let Some(folder) = explorer.folders.get(explorer.selected_folder) {
                         // Build exclusion pattern from current item
-                        let exclude_pattern = if folder.is_file {
+                        let exclude_pattern = if folder.is_file() {
                             // Exclude specific file
-                            if let Some(ref path) = folder.path {
-                                path.clone()
+                            if let Some(path) = folder.path() {
+                                path.to_string()
                             } else {
-                                format!("{}{}", explorer.current_prefix, folder.name)
+                                format!("{}{}", explorer.current_prefix, folder.name())
                             }
                         } else {
                             // Exclude folder and all contents
-                            let path = folder.path.clone().unwrap_or_else(|| {
-                                format!("{}{}", explorer.current_prefix, folder.name)
-                            });
+                            let path = folder.path()
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| format!("{}{}", explorer.current_prefix, folder.name()));
                             format!("{}/**", path)
                         };
                         // Add to excludes if not already present
@@ -2861,7 +2724,7 @@ impl App {
                 }
             }
             // Section-specific key handling
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if matches!(focus, RuleEditorFocus::FieldList | RuleEditorFocus::Conditions) {
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
                         explorer.phase = GlobExplorerPhase::EditRule {
@@ -2872,7 +2735,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if matches!(focus, RuleEditorFocus::FieldList | RuleEditorFocus::Conditions) {
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
                         explorer.phase = GlobExplorerPhase::EditRule {
@@ -3014,7 +2877,7 @@ impl App {
                     explorer.test_state = None;
                 }
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 // Scroll test results down
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if let Some(ref mut test_state) = explorer.test_state {
@@ -3022,7 +2885,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 // Scroll test results up
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if let Some(ref mut test_state) = explorer.test_state {
@@ -3083,10 +2946,6 @@ impl App {
                     explorer.test_state = None;
                     explorer.publish_state = None;
                 }
-            }
-            KeyCode::Char('j') => {
-                // View job status - switch to Jobs mode
-                self.mode = TuiMode::Jobs;
             }
             _ => {}
         }
@@ -3151,7 +3010,7 @@ impl App {
         let filtered = self.filtered_sources();
 
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 // Navigate down in dropdown - DON'T reload files here (perf fix)
                 // Files only reload on Enter (confirm selection)
                 if let Some(preview_idx) = self.discover.preview_source {
@@ -3164,7 +3023,7 @@ impl App {
                     self.discover.preview_source = Some(filtered[0].0);
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 // Navigate up in dropdown - DON'T reload files here (perf fix)
                 if let Some(preview_idx) = self.discover.preview_source {
                     if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
@@ -3245,11 +3104,11 @@ impl App {
                 self.discover.scan_path_input.clear();
                 self.discover.scan_error = None;
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right => {
                 // Move focus to Files/Folder area
                 self.discover.focus = DiscoverFocus::Files;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 // Move focus to Tags
                 self.discover.focus = DiscoverFocus::Tags;
             }
@@ -3289,7 +3148,7 @@ impl App {
         let filtered = self.filtered_tags();
 
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if let Some(preview_idx) = self.discover.preview_tag {
                     if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
                         if pos + 1 < filtered.len() {
@@ -3304,7 +3163,7 @@ impl App {
                     self.discover.selected = 0;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if let Some(preview_idx) = self.discover.preview_tag {
                     if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
                         if pos > 0 {
@@ -3360,11 +3219,11 @@ impl App {
         // Tags panel doesn't have specific keybindings when dropdown is closed
         // Press 2 to open dropdown, R to manage rules
         match key.code {
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right => {
                 // Move focus to Files/Folder area
                 self.discover.focus = DiscoverFocus::Files;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 // Move focus to Sources
                 self.discover.focus = DiscoverFocus::Sources;
             }
@@ -3375,12 +3234,12 @@ impl App {
     /// Handle keys when Rules Manager dialog is open
     fn handle_rules_manager_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if self.discover.selected_rule < self.discover.rules.len().saturating_sub(1) {
                     self.discover.selected_rule += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if self.discover.selected_rule > 0 {
                     self.discover.selected_rule -= 1;
                 }
@@ -3429,12 +3288,12 @@ impl App {
     /// Handle keys when Sources Manager dialog is open (spec v1.7)
     fn handle_sources_manager_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if self.discover.sources_manager_selected < self.discover.sources.len().saturating_sub(1) {
                     self.discover.sources_manager_selected += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if self.discover.sources_manager_selected > 0 {
                     self.discover.sources_manager_selected -= 1;
                 }
@@ -3573,6 +3432,25 @@ impl App {
             }
         };
 
+        if builder.source_id.is_none() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.mode = TuiMode::Home;
+                }
+                _ => {
+                    self.discover.status_message = Some((
+                        "Select a source before building rules".to_string(),
+                        true,
+                    ));
+                    self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                    self.discover.sources_filter.clear();
+                    self.discover.sources_filtering = false;
+                    self.discover.preview_source = Some(self.discover.selected_source_index());
+                }
+            }
+            return;
+        }
+
         match key.code {
             // Tab cycles focus (per spec Section 8)
             KeyCode::Tab => {
@@ -3608,8 +3486,6 @@ impl App {
             KeyCode::Esc => {
                 match builder.focus {
                     RuleBuilderFocus::FileList => {
-                        // Already on FileList - exit Discover mode (go to Home)
-                        // Rule Builder IS the Discover view, so exiting means leaving Discover
                         self.mode = TuiMode::Home;
                         return;
                     }
@@ -3638,24 +3514,23 @@ impl App {
 
             // Enter: confirm action based on focus (phase-aware for FileList)
             KeyCode::Enter => {
-                use super::extraction::FileResultsPhase;
                 match builder.focus {
                     RuleBuilderFocus::FileList => {
                         // Phase-aware Enter behavior
-                        match builder.file_results_phase {
-                            FileResultsPhase::Exploration => {
+                        match &mut builder.file_results {
+                            super::extraction::FileResultsState::Exploration { expanded_folder_indices, .. } => {
                                 // Toggle folder expansion
                                 let idx = builder.selected_file;
-                                if builder.expanded_folder_indices.contains(&idx) {
-                                    builder.expanded_folder_indices.remove(&idx);
+                                if expanded_folder_indices.contains(&idx) {
+                                    expanded_folder_indices.remove(&idx);
                                 } else {
-                                    builder.expanded_folder_indices.insert(idx);
+                                    expanded_folder_indices.insert(idx);
                                 }
                             }
-                            FileResultsPhase::ExtractionPreview => {
+                            super::extraction::FileResultsState::ExtractionPreview { .. } => {
                                 // Could show file details or do nothing
                             }
-                            FileResultsPhase::BacktestResults => {
+                            super::extraction::FileResultsState::BacktestResults { .. } => {
                                 // Could show error details for failed files
                             }
                         }
@@ -3707,46 +3582,8 @@ impl App {
                 }
             }
 
-            // Navigation within sections (phase-aware for FileList)
-            // 'j' only for vim-style nav when NOT in text input mode
-            KeyCode::Char('j') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
-                use super::extraction::FileResultsPhase;
-                match builder.focus {
-                    RuleBuilderFocus::FileList => {
-                        let max_index = match builder.file_results_phase {
-                            FileResultsPhase::Exploration => builder.folder_matches.len().saturating_sub(1),
-                            FileResultsPhase::ExtractionPreview => builder.preview_files.len().saturating_sub(1),
-                            FileResultsPhase::BacktestResults => builder.visible_indices.len().saturating_sub(1),
-                        };
-                        if max_index > 0 {
-                            builder.selected_file = (builder.selected_file + 1).min(max_index);
-                        }
-                    }
-                    RuleBuilderFocus::Excludes => {
-                        if !builder.excludes.is_empty() {
-                            builder.selected_exclude = (builder.selected_exclude + 1)
-                                .min(builder.excludes.len().saturating_sub(1));
-                        }
-                    }
-                    RuleBuilderFocus::Extractions => {
-                        if !builder.extractions.is_empty() {
-                            builder.selected_extraction = (builder.selected_extraction + 1)
-                                .min(builder.extractions.len().saturating_sub(1));
-                        }
-                    }
-                    RuleBuilderFocus::IgnorePicker => {
-                        if !builder.ignore_options.is_empty() {
-                            builder.ignore_selected = (builder.ignore_selected + 1)
-                                .min(builder.ignore_options.len().saturating_sub(1));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
             // Down arrow: navigate lists OR move to next field from text input
             KeyCode::Down => {
-                use super::extraction::FileResultsPhase;
                 match builder.focus {
                     // In text input fields, Down moves to next field
                     RuleBuilderFocus::Pattern => {
@@ -3760,10 +3597,16 @@ impl App {
                     }
                     // In lists, navigate within the list
                     RuleBuilderFocus::FileList => {
-                        let max_index = match builder.file_results_phase {
-                            FileResultsPhase::Exploration => builder.folder_matches.len().saturating_sub(1),
-                            FileResultsPhase::ExtractionPreview => builder.preview_files.len().saturating_sub(1),
-                            FileResultsPhase::BacktestResults => builder.visible_indices.len().saturating_sub(1),
+                        let max_index = match &builder.file_results {
+                            super::extraction::FileResultsState::Exploration { folder_matches, .. } => {
+                                folder_matches.len().saturating_sub(1)
+                            }
+                            super::extraction::FileResultsState::ExtractionPreview { preview_files } => {
+                                preview_files.len().saturating_sub(1)
+                            }
+                            super::extraction::FileResultsState::BacktestResults { visible_indices, .. } => {
+                                visible_indices.len().saturating_sub(1)
+                            }
                         };
                         if max_index > 0 {
                             builder.selected_file = (builder.selected_file + 1).min(max_index);
@@ -3786,25 +3629,6 @@ impl App {
                             builder.ignore_selected = (builder.ignore_selected + 1)
                                 .min(builder.ignore_options.len().saturating_sub(1));
                         }
-                    }
-                    _ => {}
-                }
-            }
-
-            // 'k' only for vim-style nav when NOT in text input mode
-            KeyCode::Char('k') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
-                match builder.focus {
-                    RuleBuilderFocus::FileList => {
-                        builder.selected_file = builder.selected_file.saturating_sub(1);
-                    }
-                    RuleBuilderFocus::Excludes => {
-                        builder.selected_exclude = builder.selected_exclude.saturating_sub(1);
-                    }
-                    RuleBuilderFocus::Extractions => {
-                        builder.selected_extraction = builder.selected_extraction.saturating_sub(1);
-                    }
-                    RuleBuilderFocus::IgnorePicker => {
-                        builder.ignore_selected = builder.ignore_selected.saturating_sub(1);
                     }
                     _ => {}
                 }
@@ -3854,44 +3678,44 @@ impl App {
 
             // Filter toggle in FileList (only in BacktestResults phase)
             KeyCode::Char('a') if builder.focus == RuleBuilderFocus::FileList => {
-                use super::extraction::FileResultsPhase;
-                if matches!(builder.file_results_phase, FileResultsPhase::BacktestResults) {
-                    builder.result_filter = super::extraction::ResultFilter::All;
+                if let super::extraction::FileResultsState::BacktestResults { result_filter, .. } = &mut builder.file_results {
+                    *result_filter = super::extraction::ResultFilter::All;
                     builder.update_visible();
                 }
             }
             KeyCode::Char('p') if builder.focus == RuleBuilderFocus::FileList => {
-                use super::extraction::FileResultsPhase;
-                if matches!(builder.file_results_phase, FileResultsPhase::BacktestResults) {
-                    builder.result_filter = super::extraction::ResultFilter::PassOnly;
+                if let super::extraction::FileResultsState::BacktestResults { result_filter, .. } = &mut builder.file_results {
+                    *result_filter = super::extraction::ResultFilter::PassOnly;
                     builder.update_visible();
                 }
             }
             KeyCode::Char('f') if builder.focus == RuleBuilderFocus::FileList => {
-                use super::extraction::FileResultsPhase;
-                if matches!(builder.file_results_phase, FileResultsPhase::BacktestResults) {
-                    builder.result_filter = super::extraction::ResultFilter::FailOnly;
+                if let super::extraction::FileResultsState::BacktestResults { result_filter, .. } = &mut builder.file_results {
+                    *result_filter = super::extraction::ResultFilter::FailOnly;
                     builder.update_visible();
                 }
             }
 
             // 't' to run backtest (Phase 2 -> Phase 3) - only when not editing text
             KeyCode::Char('t') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
-                use super::extraction::FileResultsPhase;
-                if matches!(builder.file_results_phase, FileResultsPhase::ExtractionPreview) {
-                    // Transition to Backtest Results phase
-                    builder.file_results_phase = FileResultsPhase::BacktestResults;
-                    // Reset selection and populate matched_files from preview_files
-                    builder.selected_file = 0;
-                    builder.matched_files = builder.preview_files.iter().map(|pf| {
-                        super::extraction::RuleBuilderFile {
+                if let super::extraction::FileResultsState::ExtractionPreview { preview_files } = &builder.file_results {
+                    let matched_files: Vec<super::extraction::MatchedFile> = preview_files
+                        .iter()
+                        .map(|pf| super::extraction::MatchedFile {
                             path: pf.path.clone(),
                             relative_path: pf.relative_path.clone(),
                             extractions: pf.extractions.clone(),
                             test_result: super::extraction::FileTestResult::NotTested,
-                        }
-                    }).collect();
-                    builder.visible_indices = (0..builder.matched_files.len()).collect();
+                        })
+                        .collect();
+                    let visible_indices: Vec<usize> = (0..matched_files.len()).collect();
+                    builder.selected_file = 0;
+                    builder.file_results = super::extraction::FileResultsState::BacktestResults {
+                        matched_files,
+                        visible_indices,
+                        backtest: super::extraction::BacktestSummary::default(),
+                        result_filter: super::extraction::ResultFilter::All,
+                    };
                     // TODO: Actually run backtest async and update test_result
                 }
             }
@@ -3911,20 +3735,6 @@ impl App {
                 }
             }
 
-            // '1' opens Sources dropdown, '2' opens Tags dropdown (per spec Section 3)
-            KeyCode::Char('1') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
-                self.transition_discover_state(DiscoverViewState::SourcesDropdown);
-                self.discover.sources_filter.clear();
-                self.discover.preview_source = Some(self.discover.selected_source_index());
-                return; // Exit early, don't continue to text input
-            }
-            KeyCode::Char('2') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
-                self.transition_discover_state(DiscoverViewState::TagsDropdown);
-                self.discover.tags_filter.clear();
-                self.discover.preview_tag = self.discover.selected_tag;
-                return; // Exit early, don't continue to text input
-            }
-
             // 's' opens scan dialog (when not in text input)
             KeyCode::Char('s') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) && !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.transition_discover_state(DiscoverViewState::EnteringPath);
@@ -3934,6 +3744,18 @@ impl App {
                     .unwrap_or_default();
                 self.discover.scan_error = None;
                 return; // Exit early
+            }
+
+            // 'e' runs quick sample schema evaluation (RULE_BUILDER_UI_PLAN.md)
+            // Structure-aware sampling: buckets by prefix, N per bucket, capped at 200
+            KeyCode::Char('e') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+                self.run_sample_schema_eval();
+            }
+
+            // 'E' (shift+e) triggers full evaluation as background job (RULE_BUILDER_UI_PLAN.md)
+            // Runs complete schema analysis on ALL matched files with progress tracking
+            KeyCode::Char('E') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput) => {
+                self.start_full_schema_eval();
             }
 
             // Text input for Pattern, Tag, and ExcludeInput
@@ -4107,7 +3929,6 @@ impl App {
     /// Update the Rule Builder's file results based on the current pattern.
     /// Detects phase based on whether pattern contains <field> placeholders.
     fn update_rule_builder_files(&mut self, pattern: &str) {
-        use super::extraction::FileResultsPhase;
 
         let builder = match self.discover.rule_builder.as_mut() {
             Some(b) => b,
@@ -4115,12 +3936,12 @@ impl App {
         };
 
         if pattern.is_empty() {
-            builder.matched_files.clear();
-            builder.visible_indices.clear();
-            builder.folder_matches.clear();
-            builder.preview_files.clear();
             builder.match_count = 0;
-            builder.file_results_phase = FileResultsPhase::Exploration;
+            builder.file_results = super::extraction::FileResultsState::Exploration {
+                folder_matches: Vec::new(),
+                expanded_folder_indices: std::collections::HashSet::new(),
+                detected_patterns: Vec::new(),
+            };
             return;
         }
 
@@ -4129,11 +3950,9 @@ impl App {
 
         if has_placeholders {
             // Phase 2: Extraction Preview
-            builder.file_results_phase = FileResultsPhase::ExtractionPreview;
             self.update_rule_builder_extraction_preview(pattern);
         } else {
             // Phase 1: Exploration (folder counts)
-            builder.file_results_phase = FileResultsPhase::Exploration;
             self.update_rule_builder_exploration(pattern);
         }
     }
@@ -4175,14 +3994,20 @@ impl App {
             }
 
             // Parse pattern for database query
-            let (extension, path_pattern) = Self::parse_glob_for_db(&glob_pattern);
+            let query = super::pattern_query::PatternQuery::from_glob(&glob_pattern);
 
             // Show loading indicator
             if let Some(builder) = self.discover.rule_builder.as_mut() {
-                builder.folder_matches.clear();
                 builder.match_count = 0;
                 builder.is_streaming = true;
+                builder.file_results = super::extraction::FileResultsState::Exploration {
+                    folder_matches: Vec::new(),
+                    expanded_folder_indices: std::collections::HashSet::new(),
+                    detected_patterns: Vec::new(),
+                };
             }
+
+            let (backend, db_path) = self.resolve_db_target();
 
             // Spawn async database search
             let pattern_for_msg = glob_pattern.clone();
@@ -4190,13 +4015,9 @@ impl App {
             self.pending_rule_builder_search = Some(rx);
 
             tokio::spawn(async move {
-                let db_path = dirs::home_dir()
-                    .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-                let db = match crate::scout::Database::open(&db_path).await {
-                    Ok(db) => db,
-                    Err(_) => {
+                let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                    Some(conn) => conn,
+                    None => {
                         let _ = tx.send(RuleBuilderSearchResult {
                             folder_matches: vec![],
                             total_count: 0,
@@ -4206,21 +4027,11 @@ impl App {
                     }
                 };
 
-                // Count total matches
-                let total_count = db.count_files_by_pattern(
-                    &source_id,
-                    extension.as_deref(),
-                    path_pattern.as_deref(),
-                ).await.unwrap_or(0) as usize;
+                let total_count = query.count_files(&conn, &source_id).await as usize;
 
-                // Get sample results to show folder distribution
-                let results = db.search_files_by_pattern(
-                    &source_id,
-                    extension.as_deref(),
-                    path_pattern.as_deref(),
-                    1000,  // Get more results to show folder distribution
-                    0,
-                ).await.unwrap_or_default();
+                let results = query
+                    .search_files(&conn, &source_id, 1000, 0)
+                    .await;
 
                 // Group by parent folder
                 let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
@@ -4269,9 +4080,13 @@ impl App {
             Ok(m) => m,
             Err(_) => {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.folder_matches.clear();
                     builder.match_count = 0;
                     builder.pattern_error = Some("Invalid pattern".to_string());
+                    builder.file_results = super::extraction::FileResultsState::Exploration {
+                        folder_matches: Vec::new(),
+                        expanded_folder_indices: std::collections::HashSet::new(),
+                        detected_patterns: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -4291,13 +4106,13 @@ impl App {
                     let mut folder_matches: Vec<FolderMatch> = root_items
                         .iter()
                         .map(|item| FolderMatch {
-                            path: if item.is_file {
+                            path: if item.is_file() {
                                 "./".to_string()
                             } else {
-                                format!("{}/", item.name)
+                                format!("{}/", item.name())
                             },
-                            count: item.file_count,
-                            sample_filename: item.name.clone(),
+                            count: item.file_count(),
+                            sample_filename: item.name().to_string(),
                             files: Vec::new(),
                         })
                         .collect();
@@ -4315,7 +4130,7 @@ impl App {
 
                 // Recursive function to traverse folder cache
                 fn traverse_cache(
-                    cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
+                    cache: &std::collections::HashMap<String, Vec<FsEntry>>,
                     prefix: &str,
                     matcher: &globset::GlobMatcher,
                     folder_counts: &mut std::collections::HashMap<String, (usize, String)>,
@@ -4323,19 +4138,19 @@ impl App {
                     if let Some(items) = cache.get(prefix) {
                         for item in items {
                             let full_path = if prefix.is_empty() {
-                                item.name.clone()
+                                item.name().to_string()
                             } else {
-                                format!("{}{}", prefix, item.name)
+                                format!("{}{}", prefix, item.name())
                             };
 
-                            if item.is_file {
+                            if item.is_file() {
                                 if matcher.is_match(&full_path) {
                                     let folder = if prefix.is_empty() {
                                         ".".to_string()
                                     } else {
                                         prefix.trim_end_matches('/').to_string()
                                     };
-                                    let entry = folder_counts.entry(folder).or_insert((0, item.name.clone()));
+                                    let entry = folder_counts.entry(folder).or_insert((0, item.name().to_string()));
                                     entry.0 += 1;
                                 }
                             } else {
@@ -4370,7 +4185,11 @@ impl App {
         if let Some(builder) = self.discover.rule_builder.as_mut() {
             builder.pattern_error = None;
             builder.match_count = match_count;
-            builder.folder_matches = folder_matches;
+            builder.file_results = super::extraction::FileResultsState::Exploration {
+                folder_matches,
+                expanded_folder_indices: std::collections::HashSet::new(),
+                detected_patterns: Vec::new(),
+            };
             builder.selected_file = 0;
         }
     }
@@ -4390,9 +4209,11 @@ impl App {
             Ok(p) => p,
             Err(e) => {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.preview_files.clear();
                     builder.match_count = 0;
                     builder.pattern_error = Some(e.message);
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -4413,9 +4234,11 @@ impl App {
             Ok(m) => m,
             Err(_) => {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.preview_files.clear();
                     builder.match_count = 0;
                     builder.pattern_error = Some("Invalid glob pattern".to_string());
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -4431,7 +4254,7 @@ impl App {
             let mut files: Vec<String> = Vec::new();
 
             fn collect_files(
-                cache: &std::collections::HashMap<String, Vec<FolderInfo>>,
+                cache: &std::collections::HashMap<String, Vec<FsEntry>>,
                 prefix: &str,
                 matcher: &globset::GlobMatcher,
                 files: &mut Vec<String>,
@@ -4446,12 +4269,12 @@ impl App {
                             return;
                         }
                         let full_path = if prefix.is_empty() {
-                            item.name.clone()
+                            item.name().to_string()
                         } else {
-                            format!("{}{}", prefix, item.name)
+                            format!("{}{}", prefix, item.name())
                         };
 
-                        if item.is_file {
+                        if item.is_file() {
                             if matcher.is_match(&full_path) {
                                 files.push(full_path);
                             }
@@ -4485,7 +4308,9 @@ impl App {
         if let Some(builder) = self.discover.rule_builder.as_mut() {
             builder.pattern_error = None;
             builder.match_count = preview_files.len();
-            builder.preview_files = preview_files;
+            builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                preview_files,
+            };
             builder.selected_file = 0;
         }
     }
@@ -4690,9 +4515,9 @@ impl App {
                 // For now just reset the view
                 self.jobs_state.selected_index = 0;
             }
-            TuiMode::Inspect => {
-                // TODO: Reload tables from output directory
-                self.inspect.selected_table = 0;
+            TuiMode::Sources => {
+                // Mark sources as needing refresh - will trigger reload on next tick
+                self.discover.sources_loaded = false;
             }
             TuiMode::Settings => {
                 // Settings don't need refresh - they're always current
@@ -4743,7 +4568,6 @@ impl App {
                     DiscoverViewState::SourceEdit  // Added for Sources Manager
                 )
             }
-            TuiMode::Inspect => self.inspect.query_focused,
             TuiMode::ParserBench => self.parser_bench.is_filtering,
             _ => false,
         }
@@ -4913,6 +4737,275 @@ impl App {
         }
     }
 
+    /// Create a new schema eval job and add it to the jobs list.
+    ///
+    /// Returns the job ID for tracking status updates.
+    fn add_schema_eval_job(&mut self, mode: SchemaEvalMode, paths_total: usize) -> i64 {
+        let job_id = chrono::Local::now().timestamp_millis();
+
+        let job = JobInfo {
+            id: job_id,
+            file_version_id: None,
+            job_type: JobType::SchemaEval,
+            name: match mode {
+                SchemaEvalMode::Sample => "schema-sample".to_string(),
+                SchemaEvalMode::Full => "schema-full".to_string(),
+            },
+            version: None,
+            status: JobStatus::Running,
+            started_at: chrono::Local::now(),
+            completed_at: None,
+            items_total: paths_total as u32,
+            items_processed: 0,
+            items_failed: 0,
+            output_path: None,
+            output_size_bytes: None,
+            backtest: None,
+            failures: vec![],
+        };
+
+        self.jobs_state.push_job(job);
+        job_id
+    }
+
+    /// Update the status of a schema eval job.
+    fn update_schema_eval_job(&mut self, job_id: i64, status: JobStatus, processed: u32, error: Option<String>) {
+        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
+            job.status = status;
+            job.items_processed = processed;
+            if status == JobStatus::Completed || status == JobStatus::Failed || status == JobStatus::Cancelled {
+                job.completed_at = Some(chrono::Local::now());
+            }
+            if let Some(err) = error {
+                job.failures.push(JobFailure {
+                    file_path: "".to_string(),
+                    error: err,
+                    line: None,
+                });
+            }
+        }
+    }
+
+    fn set_schema_eval_job_total(&mut self, job_id: i64, total: u32) {
+        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
+            if job.items_total == 0 {
+                job.items_total = total;
+            }
+        }
+    }
+
+    /// Run sample schema evaluation (quick, async).
+    ///
+    /// Uses structure-aware sampling: buckets paths by prefix and takes N per bucket.
+    fn run_sample_schema_eval(&mut self) {
+        let builder = match self.discover.rule_builder.as_ref() {
+            Some(b) => b,
+            None => return,
+        };
+
+        if matches!(builder.eval_state, super::extraction::EvalState::Running { .. })
+            || self.pending_schema_eval.is_some()
+            || self.pending_sample_eval.is_some()
+        {
+            return;
+        }
+
+        let source_id = match builder.source_id.as_deref() {
+            Some(id) => id.to_string(),
+            None => return,
+        };
+        let pattern = builder.pattern.clone();
+        let (backend, db_path) = self.resolve_db_target();
+
+        let (tx, rx) = mpsc::channel::<SampleEvalResult>(16);
+        self.pending_sample_eval = Some(rx);
+
+        tokio::spawn(async move {
+            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                Some(conn) => conn,
+                None => {
+                    let _ = tx.send(SampleEvalResult::Error("Database error: failed to open".to_string())).await;
+                    return;
+                }
+            };
+
+            let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
+                Ok(p) => p,
+                Err(err) => {
+                    let _ = tx.send(SampleEvalResult::Error(err)).await;
+                    return;
+                }
+            };
+            let matcher = match super::pattern_query::build_eval_matcher(&glob_pattern) {
+                Ok(m) => m,
+                Err(err) => {
+                    let _ = tx.send(SampleEvalResult::Error(err)).await;
+                    return;
+                }
+            };
+
+            let paths = super::pattern_query::sample_paths_for_eval(
+                &conn,
+                &source_id,
+                &glob_pattern,
+                &matcher,
+            )
+            .await;
+            if paths.is_empty() {
+                let _ = tx.send(SampleEvalResult::Error("No files to analyze".to_string())).await;
+                return;
+            }
+
+            let mut state = super::extraction::RuleBuilderState::default();
+            super::extraction::analyze_paths_for_schema_ui(&mut state, &paths, 8);
+
+            let _ = tx.send(SampleEvalResult::Complete {
+                pattern,
+                pattern_seeds: state.pattern_seeds,
+                path_archetypes: state.path_archetypes,
+                naming_schemes: state.naming_schemes,
+                synonym_suggestions: state.synonym_suggestions,
+                paths_analyzed: paths.len(),
+            }).await;
+        });
+    }
+
+    /// Start full schema evaluation as a background job.
+    fn start_full_schema_eval(&mut self) {
+        let (pattern, source_id, full_eval_running) = match self.discover.rule_builder.as_ref() {
+            Some(builder) => (
+                builder.pattern.clone(),
+                builder.source_id.clone(),
+                matches!(builder.eval_state, super::extraction::EvalState::Running { .. }),
+            ),
+            None => return,
+        };
+
+        if full_eval_running {
+            return;
+        }
+
+        let source_id = match source_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                self.discover.status_message = Some(("No source selected".to_string(), true));
+                return;
+            }
+        };
+
+        // Create job
+        let job_id = self.add_schema_eval_job(SchemaEvalMode::Full, 0);
+        self.current_schema_eval_job_id = Some(job_id);
+
+        // Mark as running
+        if let Some(builder) = self.discover.rule_builder.as_mut() {
+            builder.eval_state = super::extraction::EvalState::Running { progress: 0 };
+        }
+
+        // Channel for results
+        let (tx, rx) = mpsc::channel::<SchemaEvalResult>(16);
+        self.pending_schema_eval = Some(rx);
+
+        // Spawn background task
+        let (backend, db_path) = self.resolve_db_target();
+
+        tokio::spawn(async move {
+            let _ = tx.send(SchemaEvalResult::Started { job_id }).await;
+
+            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                Some(conn) => conn,
+                None => {
+                    let _ = tx.send(SchemaEvalResult::Error("Database error: failed to open".to_string())).await;
+                    return;
+                }
+            };
+
+            let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
+                Ok(p) => p,
+                Err(err) => {
+                    let _ = tx.send(SchemaEvalResult::Error(err)).await;
+                    return;
+                }
+            };
+            let matcher = match super::pattern_query::build_eval_matcher(&glob_pattern) {
+                Ok(m) => m,
+                Err(err) => {
+                    let _ = tx.send(SchemaEvalResult::Error(err)).await;
+                    return;
+                }
+            };
+
+            let query = super::pattern_query::PatternQuery::from_glob(&glob_pattern);
+            let total_candidates = query.count_files(&conn, &source_id).await as usize;
+
+            let _ = tx.send(SchemaEvalResult::Progress {
+                progress: 0,
+                paths_analyzed: 0,
+                total_paths: total_candidates,
+            }).await;
+
+            let mut offset = 0usize;
+            let batch_size = 1000usize;
+            let mut processed = 0usize;
+            let mut matched_paths: Vec<String> = Vec::new();
+
+            loop {
+                let results = query
+                    .search_files(&conn, &source_id, batch_size, offset)
+                    .await;
+
+                if results.is_empty() {
+                    break;
+                }
+
+                for (rel_path, _size, _mtime) in results.iter() {
+                    if matcher.is_match(rel_path) {
+                        matched_paths.push(rel_path.clone());
+                    }
+                }
+
+                processed += results.len();
+                offset += results.len();
+
+                if processed % 2000 == 0 || processed >= total_candidates {
+                    let progress = if total_candidates == 0 {
+                        100
+                    } else {
+                        ((processed.saturating_mul(100)) / total_candidates).min(99) as u8
+                    };
+                    let _ = tx.send(SchemaEvalResult::Progress {
+                        progress,
+                        paths_analyzed: processed,
+                        total_paths: total_candidates,
+                    }).await;
+                }
+            }
+
+            if matched_paths.is_empty() {
+                let _ = tx.send(SchemaEvalResult::Error("No files to analyze".to_string())).await;
+                return;
+            }
+
+            let mut state = super::extraction::RuleBuilderState::default();
+            super::extraction::analyze_paths_for_schema_ui(&mut state, &matched_paths, 8);
+
+            let _ = tx.send(SchemaEvalResult::Complete {
+                job_id,
+                pattern,
+                pattern_seeds: state.pattern_seeds,
+                path_archetypes: state.path_archetypes,
+                naming_schemes: state.naming_schemes,
+                synonym_suggestions: state.synonym_suggestions,
+                paths_analyzed: matched_paths.len(),
+            }).await;
+        });
+
+        self.discover.status_message = Some((
+            "Full eval started...".to_string(),
+            false,
+        ));
+    }
+
     /// Scan a directory using the unified parallel scanner.
     ///
     /// Uses `scout::Scanner` for parallel walking and DB persistence.
@@ -4922,31 +5015,11 @@ impl App {
 
         let path_input = Path::new(path);
 
-        // Expand ~ to home directory (synchronous, fast)
-        let expanded_path = if path_input.starts_with("~") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(path_input.strip_prefix("~").unwrap_or(path_input))
-            } else {
-                path_input.to_path_buf()
-            }
-        } else {
-            path_input.to_path_buf()
-        };
+        let expanded_path = scan_path::expand_scan_path(path_input);
 
         // Path validation - synchronous (fast filesystem checks)
-        if !expanded_path.exists() {
-            self.discover.scan_error = Some(format!("Path not found: {}", expanded_path.display()));
-            return;
-        }
-
-        if !expanded_path.is_dir() {
-            self.discover.scan_error = Some(format!("Not a directory: {}", expanded_path.display()));
-            return;
-        }
-
-        // Check if directory is readable
-        if std::fs::read_dir(&expanded_path).is_err() {
-            self.discover.scan_error = Some(format!("Cannot read directory: {}", expanded_path.display()));
+        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+            self.discover.scan_error = Some(err.to_string());
             return;
         }
 
@@ -4978,7 +5051,7 @@ impl App {
 
         // Get database path
         let db_path = self.config.database.clone()
-            .unwrap_or_else(crate::cli::config::default_db_path);
+            .unwrap_or_else(crate::cli::config::active_db_path);
 
         let source_path = path_display;
         let scan_job_id = job_id; // Capture for async block
@@ -5232,8 +5305,6 @@ impl App {
     /// selected, the file list will be empty with a helpful message.
     /// When sources dropdown is open, uses preview_source for live preview.
     async fn load_scout_files(&mut self) {
-        use sqlx::SqlitePool;
-
         // First check if we have a directly-set source ID (e.g., after scan completion)
         // This handles the case where sources list hasn't loaded yet
         let selected_source_id = if let Some(ref id) = self.discover.selected_source_id {
@@ -5263,76 +5334,96 @@ impl App {
             }
         };
 
-        // Get database path
-        let db_path = dirs::home_dir()
-            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-        if !db_path.exists() {
-            self.discover.scan_error = Some("No Scout database found. Press 's' to scan a folder.".to_string());
-            self.discover.data_loaded = true;
-            return;
-        }
-
-        // Connect and query - filter by selected source
-        let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-        match SqlitePool::connect(&db_url).await {
-            Ok(pool) => {
-                // Query matches scout_files schema, filtered by source_id
-                let query = r#"
-                    SELECT path, rel_path, source_id, size, mtime, tag
-                    FROM scout_files
-                    WHERE source_id = ?
-                    ORDER BY rel_path
-                    LIMIT 1000
-                "#;
-
-                match sqlx::query_as::<_, (String, String, String, i64, i64, Option<String>)>(query)
-                    .bind(selected_source_id.as_str())
-                    .fetch_all(&pool)
-                    .await
-                {
-                    Ok(rows) => {
-                        let files: Vec<FileInfo> = rows
-                            .into_iter()
-                            .map(|(path, rel_path, _source_id, size, mtime_millis, tag)| {
-                                // Convert mtime from milliseconds to DateTime
-                                let modified = chrono::DateTime::from_timestamp_millis(mtime_millis)
-                                    .map(|dt| dt.with_timezone(&chrono::Local))
-                                    .unwrap_or_else(chrono::Local::now);
-
-                                // Single tag becomes a vec (for UI compatibility)
-                                let tags = tag.into_iter().collect();
-
-                                let is_dir = std::path::Path::new(&path).is_dir();
-
-                                FileInfo {
-                                    path,
-                                    rel_path,
-                                    size: size as u64,
-                                    modified,
-                                    is_dir,
-                                    tags,
-                                }
-                            })
-                            .collect();
-
-                        self.discover.files = files;
-                        self.discover.selected = 0;
-                        self.discover.data_loaded = true;
-                        self.discover.scan_error = None;
-                    }
-                    Err(e) => {
-                        self.discover.scan_error = Some(format!("Query failed: {}", e));
-                        self.discover.data_loaded = true;
-                    }
-                }
-            }
-            Err(e) => {
-                self.discover.scan_error = Some(format!("DB connection failed: {}", e));
+        let conn = match self.open_db_readonly().await {
+            Some(conn) => conn,
+            None => {
+                self.discover.scan_error = Some("No Scout database found. Press 's' to scan a folder.".to_string());
                 self.discover.data_loaded = true;
+                return;
             }
+        };
+
+        let query = r#"
+            SELECT path, rel_path, source_id, size, mtime, tag
+            FROM scout_files
+            WHERE source_id = ?
+            ORDER BY rel_path
+            LIMIT 1000
+        "#;
+
+        let rows = match conn.query_all(query, &[DbValue::Text(selected_source_id.as_str().to_string())]).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                self.discover.scan_error = Some(format!("Query failed: {}", e));
+                self.discover.data_loaded = true;
+                return;
+            }
+        };
+
+        let mut files: Vec<FileInfo> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let path: String = match row.get(0) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.discover.scan_error = Some(format!("Query failed: {}", e));
+                    self.discover.data_loaded = true;
+                    return;
+                }
+            };
+            let rel_path: String = match row.get(1) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.discover.scan_error = Some(format!("Query failed: {}", e));
+                    self.discover.data_loaded = true;
+                    return;
+                }
+            };
+            let size: i64 = match row.get(3) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.discover.scan_error = Some(format!("Query failed: {}", e));
+                    self.discover.data_loaded = true;
+                    return;
+                }
+            };
+            let mtime_millis: i64 = match row.get(4) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.discover.scan_error = Some(format!("Query failed: {}", e));
+                    self.discover.data_loaded = true;
+                    return;
+                }
+            };
+            let tag: Option<String> = match row.get(5) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.discover.scan_error = Some(format!("Query failed: {}", e));
+                    self.discover.data_loaded = true;
+                    return;
+                }
+            };
+
+            let modified = chrono::DateTime::from_timestamp_millis(mtime_millis)
+                .map(|dt| dt.with_timezone(&chrono::Local))
+                .unwrap_or_else(chrono::Local::now);
+
+            let tags = tag.into_iter().collect();
+            let is_dir = std::path::Path::new(&path).is_dir();
+
+            files.push(FileInfo {
+                path,
+                rel_path,
+                size: size as u64,
+                modified,
+                is_dir,
+                tags,
+            });
         }
+
+        self.discover.files = files;
+        self.discover.selected = 0;
+        self.discover.data_loaded = true;
+        self.discover.scan_error = None;
     }
 
     /// Load folder tree for Glob Explorer (hierarchical file browsing).
@@ -5400,25 +5491,21 @@ impl App {
             explorer.cache_source_id = Some(source_id_str.clone());
         }
 
+        let (backend, db_path) = self.resolve_db_target();
+
         // Spawn background task for database queries (live folder derivation)
         tokio::spawn(async move {
-            // Open database connection
-            let db_path = dirs::home_dir()
-                .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-                .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-            let db = match ScoutDatabase::open(&db_path).await {
-                Ok(db) => db,
-                Err(e) => {
+            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                Some(conn) => conn,
+                None => {
                     let _ = tx.send(CacheLoadMessage::Error(
-                        format!("Database error: {}", e)
+                        "Database error: failed to open".to_string()
                     )).await;
                     return;
                 }
             };
 
-            // Query root folders (prefix = "")
-            let root_folders = match db.get_folder_counts(&source_id_str, "", None).await {
+            let root_folders = match App::query_folder_counts(&conn, &source_id_str, "", None).await {
                 Ok(folders) => folders,
                 Err(e) => {
                     let _ = tx.send(CacheLoadMessage::Error(
@@ -5428,43 +5515,28 @@ impl App {
                 }
             };
 
-            // Convert to FolderInfo and build initial cache with just root
-            let folder_infos: Vec<FolderInfo> = root_folders
+            let folder_infos: Vec<FsEntry> = root_folders
                 .into_iter()
-                .map(|(name, count, is_file)| FolderInfo::new(name, count as usize, is_file))
+                .map(|(name, count, is_file)| FsEntry::new(name, count as usize, is_file))
                 .collect();
 
-            let mut cache: HashMap<String, Vec<FolderInfo>> = HashMap::new();
+            let mut cache: HashMap<String, Vec<FsEntry>> = HashMap::new();
             cache.insert(String::new(), folder_infos);
 
-            // Get total file count from denormalized scout_sources.file_count (O(1))
-            let total_files: usize = match sqlx::query_as::<_, (i64,)>(
-                "SELECT file_count FROM scout_sources WHERE id = ?"
-            )
-            .bind(&source_id_str)
-            .fetch_one(db.pool())
-            .await {
-                Ok((count,)) => count as usize,
-                Err(_) => 0,
-            };
+            let total_files: usize = conn.query_scalar::<i64>(
+                "SELECT file_count FROM scout_sources WHERE id = ?",
+                &[DbValue::Text(source_id_str.clone())],
+            ).await.unwrap_or(0) as usize;
 
-            // Get tag counts
-            let tag_rows: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT tag, COUNT(*) as count FROM scout_files WHERE source_id = ? AND tag IS NOT NULL GROUP BY tag ORDER BY count DESC, tag"
-            )
-            .bind(&source_id_str)
-            .fetch_all(db.pool())
-            .await
-            .unwrap_or_default();
+            let tag_rows = conn.query_all(
+                "SELECT tag, COUNT(*) as count FROM scout_files WHERE source_id = ? AND tag IS NOT NULL GROUP BY tag ORDER BY count DESC, tag",
+                &[DbValue::Text(source_id_str.clone())],
+            ).await.unwrap_or_default();
 
-            let untagged_count: i64 = sqlx::query_as::<_, (i64,)>(
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND tag IS NULL"
-            )
-            .bind(&source_id_str)
-            .fetch_one(db.pool())
-            .await
-            .map(|(c,)| c)
-            .unwrap_or(0);
+            let untagged_count: i64 = conn.query_scalar::<i64>(
+                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND tag IS NULL",
+                &[DbValue::Text(source_id_str.clone())],
+            ).await.unwrap_or(0);
 
             // Build tags list
             let mut tags: Vec<TagInfo> = Vec::new();
@@ -5473,7 +5545,15 @@ impl App {
                 count: total_files,
                 is_special: true,
             });
-            for (tag_name, count) in tag_rows {
+            for row in tag_rows {
+                let tag_name: String = match row.get(0) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let count: i64 = match row.get(1) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 tags.push(TagInfo {
                     name: tag_name,
                     count: count as usize,
@@ -5559,7 +5639,7 @@ impl App {
                 self.pending_glob_search = None;
 
                 // Parse pattern to extract extension and path filter
-                let (extension, path_pattern) = Self::parse_glob_for_db(&pattern);
+                let query = super::pattern_query::PatternQuery::from_glob(&pattern);
                 let pattern_for_search = pattern.clone();
 
                 // Get source ID for query
@@ -5567,20 +5647,18 @@ impl App {
 
                 // Show loading indicator immediately
                 let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
-                explorer.folders = vec![FolderInfo::loading(&format!("{} Searching...", spinner_char))];
+                explorer.folders = vec![FsEntry::loading(&format!("{} Searching...", spinner_char))];
+
+                let (backend, db_path) = self.resolve_db_target();
 
                 // Spawn async task for database query
                 let (tx, rx) = mpsc::channel(1);
                 self.pending_glob_search = Some(rx);
 
                 tokio::spawn(async move {
-                    let db_path = dirs::home_dir()
-                        .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-                        .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-                    let db = match ScoutDatabase::open(&db_path).await {
-                        Ok(db) => db,
-                        Err(_) => {
+                    let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                        Some(conn) => conn,
+                        None => {
                             let _ = tx.send(GlobSearchResult {
                                 folders: vec![],
                                 total_count: 0,
@@ -5590,25 +5668,14 @@ impl App {
                         }
                     };
 
-                    // Get count + first 100 results using indexed extension query
-                    let count = db.count_files_by_pattern(
-                        &source_id,
-                        extension.as_deref(),
-                        path_pattern.as_deref(),
-                    ).await.unwrap_or(0);
+                    let count = query.count_files(&conn, &source_id).await;
 
-                    let results = db.search_files_by_pattern(
-                        &source_id,
-                        extension.as_deref(),
-                        path_pattern.as_deref(),
-                        100,
-                        0,
-                    ).await.unwrap_or_default();
+                    let results = query.search_files(&conn, &source_id, 100, 0).await;
 
-                    // Convert to FolderInfo for display
-                    let folders: Vec<FolderInfo> = results.into_iter()
+                    // Convert to FsEntry for display
+                    let folders: Vec<FsEntry> = results.into_iter()
                         .map(|(path, _size, _mtime)| {
-                            FolderInfo::with_path(path.clone(), Some(path), 1, true)
+                            FsEntry::with_path(path.clone(), Some(path), 1, true)
                         })
                         .collect();
 
@@ -5624,13 +5691,13 @@ impl App {
 
             // Normal pattern: filter current level only
             if let Some(cached_folders) = explorer.folder_cache.get(&prefix) {
-                let mut folders: Vec<FolderInfo> = if pattern.is_empty() {
+                let mut folders: Vec<FsEntry> = if pattern.is_empty() {
                     cached_folders.clone()
                 } else {
                     let pattern_lower = pattern.to_lowercase();
                     cached_folders.iter()
                         .filter(|f| {
-                            let name_lower = f.name.to_lowercase();
+                            let name_lower = f.name().to_lowercase();
                             Self::glob_match_name(&name_lower, &pattern_lower)
                         })
                         .cloned()
@@ -5638,17 +5705,17 @@ impl App {
                 };
 
                 // Sort by file count descending (most matches first)
-                folders.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+                folders.sort_by(|a, b| b.file_count().cmp(&a.file_count()));
 
                 explorer.folders = folders.clone();
                 explorer.total_count = GlobFileCount::Exact(
-                    folders.iter().map(|f| f.file_count).sum()
+                    folders.iter().map(|f| f.file_count()).sum()
                 );
                 explorer.selected_folder = 0;
             } else {
                 // Prefix not in cache - trigger async database query
                 let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
-                explorer.folders = vec![FolderInfo::loading(&format!("{} Loading {}...", spinner_char, if prefix.is_empty() { "root" } else { &prefix }))];
+                explorer.folders = vec![FsEntry::loading(&format!("{} Loading {}...", spinner_char, if prefix.is_empty() { "root" } else { &prefix }))];
             }
         }
 
@@ -5684,20 +5751,18 @@ impl App {
 
         let glob_opt = if glob_pattern.is_empty() { None } else { Some(glob_pattern) };
 
-        tokio::spawn(async move {
-            let db_path = dirs::home_dir()
-                .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-                .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+        let (backend, db_path) = self.resolve_db_target();
 
-            let db = match ScoutDatabase::open(&db_path).await {
-                Ok(db) => db,
-                Err(e) => {
-                    let _ = tx.send(FolderQueryMessage::Error(format!("Database error: {}", e))).await;
+        tokio::spawn(async move {
+            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                Some(conn) => conn,
+                None => {
+                    let _ = tx.send(FolderQueryMessage::Error("Database error: failed to open".to_string())).await;
                     return;
                 }
             };
 
-            let rows = match db.get_folder_counts(&source_id, &prefix, glob_opt.as_deref()).await {
+            let rows = match App::query_folder_counts(&conn, &source_id, &prefix, glob_opt.as_deref()).await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(FolderQueryMessage::Error(format!("Query error: {}", e))).await;
@@ -5705,12 +5770,12 @@ impl App {
                 }
             };
 
-            let folders: Vec<FolderInfo> = rows
+            let folders: Vec<FsEntry> = rows
                 .into_iter()
-                .map(|(name, count, is_file)| FolderInfo::new(name, count as usize, is_file))
+                .map(|(name, count, is_file)| FsEntry::new(name, count as usize, is_file))
                 .collect();
 
-            let total_count = folders.iter().map(|f| f.file_count).sum();
+            let total_count = folders.iter().map(|f| f.file_count()).sum();
 
             let _ = tx.send(FolderQueryMessage::Complete {
                 prefix,
@@ -5744,60 +5809,186 @@ impl App {
         }
     }
 
-    /// Parse glob pattern into (extension, path_pattern) for database query.
-    ///
-    /// Extracts file extension and converts glob syntax to SQL LIKE pattern.
-    ///
-    /// # Examples
-    /// - "**/*.rs" → (Some("rs"), None)
-    /// - "**/src/**/*.rs" → (Some("rs"), Some("%/src/%"))
-    /// - "data_*.csv" → (Some("csv"), Some("data_%"))
-    /// - "**/*.tar.gz" → (Some("gz"), None)
-    fn parse_glob_for_db(pattern: &str) -> (Option<String>, Option<String>) {
-        // Extract extension from end if pattern ends with *.ext
-        let extension = if pattern.contains("*.") {
-            pattern.rsplit("*.").next()
-                .filter(|ext| !ext.contains('/') && !ext.contains('*'))
-                .map(|ext| ext.to_lowercase())
-        } else {
-            None
-        };
+    fn glob_to_like_pattern(glob: &str) -> String {
+        let mut result = String::with_capacity(glob.len() + 4);
 
-        // Convert remaining pattern to LIKE syntax
-        let path_pattern = if pattern.contains('/') || pattern.contains("**") {
-            let mut like = pattern
-                .replace("**/", "%")
-                .replace("**", "%")
-                .replace('*', "%")
-                .replace('?', "_");
+        let glob = glob.replace("**/", "");
+        let glob = glob.replace("**", "%");
 
-            // Remove extension part if we extracted it (e.g., "%.rs" -> "%")
-            if extension.is_some() {
-                if let Some(idx) = like.rfind("%.") {
-                    like = like[..idx].to_string();
-                    // Ensure pattern still has content
-                    if like.is_empty() || like == "%" {
-                        return (extension, None);
+        let mut chars = glob.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '*' => result.push('%'),
+                '?' => result.push('_'),
+                '%' => result.push('%'),
+                '_' => result.push_str("\\_"),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        result.push(next);
                     }
-                    // Add trailing % to match any file in the path
-                    if !like.ends_with('%') {
-                        like.push('%');
-                    }
+                }
+                _ => result.push(c),
+            }
+        }
+
+        result
+    }
+
+    async fn query_folder_counts(
+        conn: &DbConnection,
+        source_id: &str,
+        prefix: &str,
+        glob_pattern: Option<&str>,
+    ) -> Result<Vec<(String, i64, bool)>, casparian_db::BackendError> {
+        let prefix = prefix.trim_end_matches('/');
+
+        if let Some(pattern) = glob_pattern {
+            let like_pattern = Self::glob_to_like_pattern(pattern);
+            let path_filter = if prefix.is_empty() {
+                like_pattern.clone()
+            } else {
+                format!("{}/%", prefix)
+            };
+            let prefix_len = if prefix.is_empty() { 0 } else { prefix.len() as i64 + 1 };
+
+            let rows = conn.query_all(
+                r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
+                        THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
+                        ELSE SUBSTR(rel_path, ? + 1)
+                    END AS item_name,
+                    COUNT(*) as file_count,
+                    MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
+                FROM scout_files
+                WHERE source_id = ?
+                  AND rel_path LIKE ?
+                  AND rel_path LIKE ?
+                  AND LENGTH(rel_path) > ?
+                GROUP BY item_name
+                ORDER BY file_count DESC
+                LIMIT 100
+                "#,
+                &[
+                    DbValue::Integer(prefix_len),
+                    DbValue::Integer(prefix_len),
+                    DbValue::Integer(prefix_len),
+                    DbValue::Integer(prefix_len),
+                    DbValue::Integer(prefix_len),
+                    DbValue::Text(source_id.to_string()),
+                    DbValue::Text(path_filter),
+                    DbValue::Text(like_pattern),
+                    DbValue::Integer(prefix_len),
+                ],
+            ).await?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                let name: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                let is_file_flag: i64 = row.get(2)?;
+                if !name.is_empty() {
+                    results.push((name, count, is_file_flag != 0));
                 }
             }
 
-            // Skip trivial patterns that match everything
-            if like == "%" || like == "%%" || like.is_empty() {
-                None
-            } else {
-                Some(like)
+            return Ok(results);
+        }
+
+        if prefix.is_empty() {
+            let cached_rows = conn.query_all(
+                "SELECT name, file_count, is_folder FROM scout_folders WHERE source_id = ? AND prefix = ? ORDER BY is_folder DESC, file_count DESC, name",
+                &[
+                    DbValue::Text(source_id.to_string()),
+                    DbValue::Text(prefix.to_string()),
+                ],
+            ).await?;
+
+            if !cached_rows.is_empty() {
+                let mut results = Vec::new();
+                for row in cached_rows {
+                    let name: String = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    let is_folder: i64 = row.get(2)?;
+                    results.push((name, count, is_folder == 0));
+                }
+                return Ok(results);
             }
+        }
+
+        let files = conn.query_all(
+            "SELECT name, size FROM scout_files WHERE source_id = ? AND parent_path = ? ORDER BY name LIMIT 200",
+            &[
+                DbValue::Text(source_id.to_string()),
+                DbValue::Text(prefix.to_string()),
+            ],
+        ).await?;
+
+        let mut results: Vec<(String, i64, bool)> = Vec::new();
+
+        let subfolders = if prefix.is_empty() {
+            conn.query_all(
+                r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(parent_path, '/') > 0 THEN SUBSTR(parent_path, 1, INSTR(parent_path, '/') - 1)
+                        ELSE parent_path
+                    END AS folder_name,
+                    COUNT(*) as file_count
+                FROM scout_files
+                WHERE source_id = ? AND parent_path != ''
+                GROUP BY folder_name
+                ORDER BY file_count DESC
+                LIMIT 200
+                "#,
+                &[DbValue::Text(source_id.to_string())],
+            ).await?
         } else {
-            None
+            let folder_prefix = format!("{}/", prefix);
+            conn.query_all(
+                r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(SUBSTR(parent_path, LENGTH(?) + 1), '/') > 0
+                        THEN SUBSTR(parent_path, LENGTH(?) + 1, INSTR(SUBSTR(parent_path, LENGTH(?) + 1), '/') - 1)
+                        ELSE SUBSTR(parent_path, LENGTH(?) + 1)
+                    END AS folder_name,
+                    COUNT(*) as file_count
+                FROM scout_files
+                WHERE source_id = ? AND parent_path LIKE ? || '%' AND parent_path != ?
+                GROUP BY folder_name
+                ORDER BY file_count DESC
+                LIMIT 200
+                "#,
+                &[
+                    DbValue::Text(folder_prefix.clone()),
+                    DbValue::Text(folder_prefix.clone()),
+                    DbValue::Text(folder_prefix.clone()),
+                    DbValue::Text(folder_prefix.clone()),
+                    DbValue::Text(source_id.to_string()),
+                    DbValue::Text(folder_prefix.clone()),
+                    DbValue::Text(prefix.to_string()),
+                ],
+            ).await?
         };
 
-        (extension, path_pattern)
+        for row in subfolders {
+            let name: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            if !name.is_empty() {
+                results.push((name, count, false));
+            }
+        }
+
+        for row in files {
+            let name: String = row.get(0)?;
+            results.push((name, 1, true));
+        }
+
+        Ok(results)
     }
+
 
     /// Start non-blocking sources load from Scout database
     fn start_sources_load(&mut self) {
@@ -5806,9 +5997,7 @@ impl App {
             return;
         }
 
-        let db_path = dirs::home_dir()
-            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+        let (backend, db_path) = self.resolve_db_target();
 
         if !db_path.exists() {
             self.discover.sources_loaded = true;
@@ -5820,34 +6009,48 @@ impl App {
 
         // Spawn background task for DB query
         tokio::spawn(async move {
-            use sqlx::SqlitePool;
+            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                Some(conn) => conn,
+                None => return,
+            };
 
-            let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-            if let Ok(pool) = SqlitePool::connect(&db_url).await {
-                // Use denormalized file_count column (O(n) instead of O(n×m))
-                let query = r#"
-                    SELECT id, name, path, file_count
-                    FROM scout_sources
-                    WHERE enabled = 1
-                    ORDER BY updated_at DESC
-                "#;
+            // Use denormalized file_count column (O(n) instead of O(n×m))
+            let query = r#"
+                SELECT id, name, path, file_count
+                FROM scout_sources
+                WHERE enabled = 1
+                ORDER BY updated_at DESC
+            "#;
 
-                if let Ok(rows) = sqlx::query_as::<_, (String, String, String, i64)>(query)
-                    .fetch_all(&pool)
-                    .await
-                {
-                    let sources: Vec<SourceInfo> = rows
-                        .into_iter()
-                        .map(|(id, name, path, file_count)| SourceInfo {
-                            id: SourceId::from(id),
-                            name,
-                            path: std::path::PathBuf::from(path),
-                            file_count: file_count as usize,
-                        })
-                        .collect();
+            if let Ok(rows) = conn.query_all(query, &[]).await {
+                let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let id: String = match row.get(0) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let name: String = match row.get(1) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let path: String = match row.get(2) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let file_count: i64 = match row.get(3) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
 
-                    let _ = tx.send(sources).await;
+                    sources.push(SourceInfo {
+                        id: SourceId::from(id),
+                        name,
+                        path: std::path::PathBuf::from(path),
+                        file_count: file_count as usize,
+                    });
                 }
+
+                let _ = tx.send(sources).await;
             }
         });
     }
@@ -5859,9 +6062,7 @@ impl App {
             return;
         }
 
-        let db_path = dirs::home_dir()
-            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+        let (backend, db_path) = self.resolve_db_target();
 
         if !db_path.exists() {
             self.jobs_state.jobs_loaded = true;
@@ -5873,88 +6074,116 @@ impl App {
 
         // Spawn background task for DB query
         tokio::spawn(async move {
-            use sqlx::SqlitePool;
+            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                Some(conn) => conn,
+                None => return,
+            };
 
-            let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-            if let Ok(pool) = SqlitePool::connect(&db_url).await {
-                let query = r#"
-                    SELECT
-                        q.id,
-                        q.file_version_id,
-                        q.plugin_name,
-                        q.status,
-                        q.claim_time,
-                        q.end_time,
-                        q.result_summary,
-                        q.error_message
-                    FROM cf_processing_queue q
-                    ORDER BY
-                        CASE q.status
-                            WHEN 'RUNNING' THEN 1
-                            WHEN 'QUEUED' THEN 2
-                            WHEN 'FAILED' THEN 3
-                            WHEN 'COMPLETED' THEN 4
-                        END,
-                        q.id DESC
-                    LIMIT 100
-                "#;
+            let query = r#"
+                SELECT
+                    q.id,
+                    q.file_version_id,
+                    q.plugin_name,
+                    q.status,
+                    q.claim_time,
+                    q.end_time,
+                    q.result_summary,
+                    q.error_message
+                FROM cf_processing_queue q
+                ORDER BY
+                    CASE q.status
+                        WHEN 'RUNNING' THEN 1
+                        WHEN 'QUEUED' THEN 2
+                        WHEN 'FAILED' THEN 3
+                        WHEN 'COMPLETED' THEN 4
+                    END,
+                    q.id DESC
+                LIMIT 100
+            "#;
 
-                if let Ok(rows) = sqlx::query_as::<_, (i64, Option<i64>, String, String, Option<String>, Option<String>, Option<String>, Option<String>)>(query)
-                    .fetch_all(&pool)
-                    .await
-                {
-                    let jobs: Vec<JobInfo> = rows
-                        .into_iter()
-                        .map(|(id, file_version_id, plugin_name, status, claim_time, end_time, result_summary, error_message)| {
-                            let status = match status.as_str() {
-                                "RUNNING" => JobStatus::Running,
-                                "QUEUED" => JobStatus::Pending,
-                                "COMPLETED" => JobStatus::Completed,
-                                "FAILED" => JobStatus::Failed,
-                                _ => JobStatus::Pending,
-                            };
+            if let Ok(rows) = conn.query_all(query, &[]).await {
+                let mut jobs: Vec<JobInfo> = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let id: i64 = match row.get(0) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let file_version_id: Option<i64> = match row.get(1) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let plugin_name: String = match row.get(2) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let status_str: String = match row.get(3) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let claim_time: Option<String> = match row.get(4) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let end_time: Option<String> = match row.get(5) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let result_summary: Option<String> = match row.get(6) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let error_message: Option<String> = match row.get(7) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
 
-                            let started_at = claim_time
-                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                                .map(|dt| dt.with_timezone(&Local))
-                                .unwrap_or_else(Local::now);
+                    let status = match status_str.as_str() {
+                        "RUNNING" => JobStatus::Running,
+                        "QUEUED" => JobStatus::Pending,
+                        "COMPLETED" => JobStatus::Completed,
+                        "FAILED" => JobStatus::Failed,
+                        _ => JobStatus::Pending,
+                    };
 
-                            let completed_at = end_time
-                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                                .map(|dt| dt.with_timezone(&Local));
+                    let started_at = claim_time
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Local))
+                        .unwrap_or_else(Local::now);
 
-                            let failures = if let Some(ref err) = error_message {
-                                vec![JobFailure {
-                                    file_path: String::new(),
-                                    error: err.clone(),
-                                    line: None,
-                                }]
-                            } else {
-                                vec![]
-                            };
+                    let completed_at = end_time
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&Local));
 
-                            JobInfo {
-                                id,
-                                file_version_id,
-                                job_type: JobType::Parse,
-                                name: plugin_name,
-                                version: None,
-                                status,
-                                started_at,
-                                completed_at,
-                                items_total: 0,
-                                items_processed: if result_summary.is_some() { 1 } else { 0 },
-                                items_failed: if error_message.is_some() { 1 } else { 0 },
-                                output_path: None,
-                                output_size_bytes: None,
-                                backtest: None,
-                                failures,
-                            }
-                        })
-                        .collect();
+                    let failures = if let Some(ref err) = error_message {
+                        vec![JobFailure {
+                            file_path: String::new(),
+                            error: err.clone(),
+                            line: None,
+                        }]
+                    } else {
+                        vec![]
+                    };
 
-                    let _ = tx.send(jobs).await;
+                    jobs.push(JobInfo {
+                        id,
+                        file_version_id,
+                        job_type: JobType::Parse,
+                        name: plugin_name,
+                        version: None,
+                        status,
+                        started_at,
+                        completed_at,
+                        items_total: 0,
+                        items_processed: if result_summary.is_some() { 1 } else { 0 },
+                        items_failed: if error_message.is_some() { 1 } else { 0 },
+                        output_path: None,
+                        output_size_bytes: None,
+                        backtest: None,
+                        failures,
+                    });
                 }
+
+                let _ = tx.send(jobs).await;
             }
         });
     }
@@ -5966,9 +6195,7 @@ impl App {
             return;
         }
 
-        let db_path = dirs::home_dir()
-            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+        let (backend, db_path) = self.resolve_db_target();
 
         if !db_path.exists() {
             self.home.stats_loaded = true;
@@ -5980,64 +6207,56 @@ impl App {
 
         // Spawn background task for DB query
         tokio::spawn(async move {
-            use sqlx::SqlitePool;
+            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                Some(conn) => conn,
+                None => return,
+            };
 
-            let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-            if let Ok(pool) = SqlitePool::connect(&db_url).await {
-                let mut stats = HomeStats::default();
+            let mut stats = HomeStats::default();
 
-                // Count files from scout_files
-                if let Ok(row) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM scout_files")
-                    .fetch_one(&pool)
-                    .await
-                {
-                    stats.file_count = row as usize;
-                }
+            if let Ok(count) = conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_files", &[]).await {
+                stats.file_count = count as usize;
+            }
 
-                // Count enabled sources from scout_sources
-                if let Ok(row) = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM scout_sources WHERE enabled = 1"
-                )
-                    .fetch_one(&pool)
-                    .await
-                {
-                    stats.source_count = row as usize;
-                }
+            if let Ok(count) = conn.query_scalar::<i64>(
+                "SELECT COUNT(*) FROM scout_sources WHERE enabled = 1",
+                &[],
+            ).await {
+                stats.source_count = count as usize;
+            }
 
-                // Count jobs by status from cf_processing_queue
-                if let Ok(rows) = sqlx::query_as::<_, (String, i64)>(
-                    "SELECT status, COUNT(*) as cnt FROM cf_processing_queue GROUP BY status"
-                )
-                    .fetch_all(&pool)
-                    .await
-                {
-                    for (status, count) in rows {
-                        match status.as_str() {
-                            "RUNNING" => stats.running_jobs = count as usize,
-                            "QUEUED" => stats.pending_jobs = count as usize,
-                            "FAILED" => stats.failed_jobs = count as usize,
-                            _ => {}
-                        }
+            if let Ok(rows) = conn.query_all(
+                "SELECT status, COUNT(*) as cnt FROM cf_processing_queue GROUP BY status",
+                &[],
+            ).await {
+                for row in rows {
+                    let status: String = match row.get(0) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let count: i64 = match row.get(1) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    match status.as_str() {
+                        "RUNNING" => stats.running_jobs = count as usize,
+                        "QUEUED" => stats.pending_jobs = count as usize,
+                        "FAILED" => stats.failed_jobs = count as usize,
+                        _ => {}
                     }
                 }
-
-                // Count parsers from cf_parsers
-                if let Ok(row) = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM cf_parsers")
-                    .fetch_one(&pool)
-                    .await
-                {
-                    stats.parser_count = row as usize;
-                }
-
-                let _ = tx.send(stats).await;
             }
+
+            if let Ok(count) = conn.query_scalar::<i64>("SELECT COUNT(*) FROM cf_parsers", &[]).await {
+                stats.parser_count = count as usize;
+            }
+
+            let _ = tx.send(stats).await;
         });
     }
 
     /// Persist pending tag and rule writes to the database
     async fn persist_pending_writes(&mut self) {
-        use sqlx::SqlitePool;
-
         // Skip if nothing to persist
         if self.discover.pending_tag_writes.is_empty()
             && self.discover.pending_rule_writes.is_empty()
@@ -6045,29 +6264,21 @@ impl App {
             return;
         }
 
-        let db_path = dirs::home_dir()
-            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
-
-        if !db_path.exists() {
-            return;
-        }
-
-        // Need write mode for updates
-        let db_url = format!("sqlite:{}", db_path.display());
-        let pool = match SqlitePool::connect(&db_url).await {
-            Ok(p) => p,
-            Err(_) => return,
+        let conn = match self.open_db_write().await {
+            Some(conn) => conn,
+            None => return,
         };
 
         // Persist tag updates to scout_files
         let tag_writes = std::mem::take(&mut self.discover.pending_tag_writes);
         for write in tag_writes {
-            let _ = sqlx::query("UPDATE scout_files SET tag = ? WHERE path = ?")
-                .bind(&write.tag)
-                .bind(&write.file_path)
-                .execute(&pool)
-                .await;
+            let _ = conn.execute(
+                "UPDATE scout_files SET tag = ? WHERE path = ?",
+                &[
+                    DbValue::Text(write.tag),
+                    DbValue::Text(write.file_path),
+                ],
+            ).await;
         }
 
         // Persist rules to scout_tagging_rules
@@ -6077,30 +6288,33 @@ impl App {
             let rule_name = format!("{} → {}", write.pattern, write.tag);
             let now = chrono::Utc::now().timestamp();
 
-            let _ = sqlx::query(
+            let _ = conn.execute(
                 r#"INSERT OR IGNORE INTO scout_tagging_rules
                    (id, name, source_id, pattern, tag, priority, enabled, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, 100, 1, ?, ?)"#
-            )
-                .bind(&rule_id)
-                .bind(&rule_name)
-                .bind(write.source_id.as_str())
-                .bind(&write.pattern)
-                .bind(&write.tag)
-                .bind(now)
-                .bind(now)
-                .execute(&pool)
-                .await;
+                ,
+                &[
+                    DbValue::Text(rule_id),
+                    DbValue::Text(rule_name),
+                    DbValue::Text(write.source_id.as_str().to_string()),
+                    DbValue::Text(write.pattern),
+                    DbValue::Text(write.tag),
+                    DbValue::Integer(now),
+                    DbValue::Integer(now),
+                ],
+            ).await;
         }
 
         // Touch source for MRU ordering (updates updated_at timestamp)
         if let Some(source_id) = std::mem::take(&mut self.discover.pending_source_touch) {
             let now = chrono::Utc::now().timestamp_millis();
-            let result = sqlx::query("UPDATE scout_sources SET updated_at = ? WHERE id = ?")
-                .bind(now)
-                .bind(&source_id)
-                .execute(&pool)
-                .await;
+            let result = conn.execute(
+                "UPDATE scout_sources SET updated_at = ? WHERE id = ?",
+                &[
+                    DbValue::Integer(now),
+                    DbValue::Text(source_id.clone()),
+                ],
+            ).await;
             // Trigger sources reload to reflect new MRU ordering
             if result.is_ok() {
                 self.discover.sources_loaded = false;
@@ -6110,8 +6324,6 @@ impl App {
 
     /// Load tagging rules for the Rules Manager dialog
     async fn load_rules_for_manager(&mut self) {
-        use sqlx::SqlitePool;
-
         // Get source ID for selected source
         let source_id = match self.discover.sources.get(self.discover.selected_source_index()) {
             Some(source) => source.id.clone(),
@@ -6121,279 +6333,264 @@ impl App {
             }
         };
 
-        let db_path = dirs::home_dir()
-            .map(|h| h.join(".casparian_flow/casparian_flow.sqlite3"))
-            .unwrap_or_else(|| std::path::PathBuf::from("casparian_flow.sqlite3"));
+        let conn = match self.open_db_readonly().await {
+            Some(conn) => conn,
+            None => return,
+        };
 
-        if !db_path.exists() {
-            return;
+        let query = r#"
+            SELECT id, pattern, tag, priority, enabled
+            FROM scout_tagging_rules
+            WHERE source_id = ?
+            ORDER BY priority DESC, pattern
+        "#;
+
+        let rows = match conn.query_all(query, &[DbValue::Text(source_id.as_str().to_string())]).await {
+            Ok(rows) => rows,
+            Err(_) => return,
+        };
+
+        let mut rules: Vec<RuleInfo> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = match row.get(0) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let pattern: String = match row.get(1) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let tag: String = match row.get(2) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let priority: i32 = match row.get(3) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let enabled: bool = match row.get(4) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+
+            rules.push(RuleInfo {
+                id: RuleId::new(id),
+                pattern,
+                tag,
+                priority,
+                enabled,
+            });
         }
 
-        let db_url = format!("sqlite:{}?mode=ro", db_path.display());
-        if let Ok(pool) = SqlitePool::connect(&db_url).await {
-            let query = r#"
-                SELECT id, pattern, tag, priority, enabled
-                FROM scout_tagging_rules
-                WHERE source_id = ?
-                ORDER BY priority DESC, pattern
-            "#;
+        self.discover.rules = rules;
 
-            if let Ok(rows) = sqlx::query_as::<_, (i64, String, String, i32, bool)>(query)
-                .bind(source_id.as_str())
-                .fetch_all(&pool)
-                .await
-            {
-                self.discover.rules = rows
-                    .into_iter()
-                    .map(|(id, pattern, tag, priority, enabled)| RuleInfo {
-                        id: RuleId::new(id),
-                        pattern,
-                        tag,
-                        priority,
-                        enabled,
-                    })
-                    .collect();
-
-                // Clamp selected rule if it's out of bounds
-                if self.discover.selected_rule >= self.discover.rules.len() && !self.discover.rules.is_empty() {
-                    self.discover.selected_rule = 0;
-                }
-            }
+        // Clamp selected rule if it's out of bounds
+        if self.discover.selected_rule >= self.discover.rules.len() && !self.discover.rules.is_empty() {
+            self.discover.selected_rule = 0;
         }
     }
 
     /// Handle home hub keys
+    /// Handle Home view keys (Quick Start + Status dashboard)
+    /// Navigation: ↑↓ to select source, Enter to start scan
     fn handle_home_key(&mut self, key: KeyEvent) {
+        if self.home.filtering {
+            match handle_text_input(key, &mut self.home.filter) {
+                TextInputResult::Committed => {
+                    self.home.filtering = false;
+                    return;
+                }
+                TextInputResult::Cancelled => {
+                    self.home.filtering = false;
+                    self.home.filter.clear();
+                    return;
+                }
+                TextInputResult::Continue => {
+                    return;
+                }
+                TextInputResult::NotHandled => {}
+            }
+        }
+
+        let filter_lower = self.home.filter.to_lowercase();
+        let filtered_indices: Vec<usize> = self.discover.sources.iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                filter_lower.is_empty()
+                    || source.name.to_lowercase().contains(&filter_lower)
+                    || source.path.display().to_string().to_lowercase().contains(&filter_lower)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if let Some(first_idx) = filtered_indices.first().copied() {
+            if !filtered_indices.contains(&self.home.selected_source_index) {
+                self.home.selected_source_index = first_idx;
+            }
+        } else {
+            self.home.selected_source_index = 0;
+        }
+
+        let source_count = filtered_indices.len();
         match key.code {
-            // Arrow key navigation
-            KeyCode::Left | KeyCode::Char('h') => {
-                if self.home.selected_card % 2 != 0 {
-                    self.home.selected_card -= 1;
-                }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if self.home.selected_card % 2 == 0 && self.home.selected_card < 3 {
-                    self.home.selected_card += 1;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.home.selected_card >= 2 {
-                    self.home.selected_card -= 2;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.home.selected_card < 2 {
-                    self.home.selected_card += 2;
-                }
-            }
-            // Enter: Navigate to selected mode
-            // Card order: 0=Discover, 1=ParserBench, 2=Jobs, 3=Sources
-            KeyCode::Enter => {
-                match self.home.selected_card {
-                    0 => self.enter_discover_mode(),
-                    1 => self.mode = TuiMode::ParserBench,
-                    2 => self.mode = TuiMode::Jobs,
-                    3 => {
-                        // [4] Sources: Go to Discover mode with Sources Manager open
-                        self.enter_discover_mode();
-                        self.discover.view_state = DiscoverViewState::SourcesManager;
-                        self.discover.sources_manager_selected = self.discover.selected_source_index();
+            // Navigate up in source list
+            KeyCode::Up => {
+                if let Some(pos) = filtered_indices.iter().position(|idx| *idx == self.home.selected_source_index) {
+                    if pos > 0 {
+                        self.home.selected_source_index = filtered_indices[pos - 1];
                     }
-                    _ => self.mode = TuiMode::Home,
-                };
+                }
             }
-            // Number keys 1-4 are handled by global key handler
+            // Navigate down in source list
+            KeyCode::Down => {
+                if let Some(pos) = filtered_indices.iter().position(|idx| *idx == self.home.selected_source_index) {
+                    if pos + 1 < source_count {
+                        self.home.selected_source_index = filtered_indices[pos + 1];
+                    }
+                }
+            }
+            // Enter: Start scan job for selected source
+            KeyCode::Enter => {
+                if source_count > 0 && self.home.selected_source_index < self.discover.sources.len() {
+                    // Get the selected source and trigger a scan
+                    let source = &self.discover.sources[self.home.selected_source_index];
+                    let source_id = source.id.clone();
+                    self.start_scan_for_source(&source_id.0);
+                }
+            }
+            // /: Filter sources
+            KeyCode::Char('/') => {
+                self.home.filtering = true;
+            }
+            // s: Scan a new folder (via Discover)
+            KeyCode::Char('s') => {
+                self.enter_discover_mode();
+                self.transition_discover_state(DiscoverViewState::EnteringPath);
+                self.discover.scan_path_input.clear();
+                self.discover.scan_error = None;
+                self.discover.path_suggestions.clear();
+            }
+            // Global keys 1-4, J, P, etc. are handled by global key handler
             _ => {}
         }
     }
 
-    /// Handle chat view keys
-    async fn handle_chat_key(&mut self, key: KeyEvent) {
+    /// Start a scan job for the given source (called from Home)
+    fn start_scan_for_source(&mut self, source_id: &str) {
+        let path = self
+            .discover
+            .sources
+            .iter()
+            .find(|s| s.id.as_str() == source_id)
+            .map(|s| s.path.display().to_string());
+
+        if let Some(path) = path {
+            self.enter_discover_mode();
+            self.scan_directory(&path);
+        } else {
+            self.discover.status_message = Some((
+                "Selected source no longer exists. Refresh sources and try again.".to_string(),
+                true,
+            ));
+        }
+    }
+
+    pub fn sources_drawer_sources(&self) -> Vec<usize> {
+        let count = self.discover.sources.len().min(5);
+        (0..count).collect()
+    }
+
+    pub fn sources_drawer_selected_source(&self) -> Option<usize> {
+        self.sources_drawer_sources()
+            .get(self.sources_drawer_selected)
+            .copied()
+    }
+
+    /// Handle Sources view keys (key 4)
+    /// Per keybinding matrix: n=new, e=edit, r=rescan, d=delete
+    fn handle_sources_key(&mut self, key: KeyEvent) {
+        let source_count = self.discover.sources.len();
+
+        // Handle delete confirmation first
+        if self.sources_state.confirm_delete {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    // TODO: Actually delete the source
+                    self.sources_state.confirm_delete = false;
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.sources_state.confirm_delete = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Handle editing mode
+        if self.sources_state.editing {
+            match key.code {
+                KeyCode::Esc => {
+                    self.sources_state.editing = false;
+                    self.sources_state.edit_value.clear();
+                }
+                KeyCode::Enter => {
+                    // TODO: Save the edited source
+                    self.sources_state.editing = false;
+                    self.sources_state.edit_value.clear();
+                }
+                KeyCode::Char(c) => {
+                    self.sources_state.edit_value.push(c);
+                }
+                KeyCode::Backspace => {
+                    self.sources_state.edit_value.pop();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Normal mode
         match key.code {
-            KeyCode::Char(c) => {
-                // Any typing resets history browsing
-                self.chat.input_history.reset_position();
-                self.chat.browsing_history = false;
-                self.chat.input.insert(self.cursor_byte_pos(), c);
-                self.chat.cursor += c.len_utf8();
-            }
-            KeyCode::Backspace => {
-                if self.chat.cursor > 0 {
-                    // Find the previous character boundary
-                    let mut new_cursor = self.chat.cursor - 1;
-                    while new_cursor > 0 && !self.chat.input.is_char_boundary(new_cursor) {
-                        new_cursor -= 1;
-                    }
-                    self.chat.input.remove(new_cursor);
-                    self.chat.cursor = new_cursor;
-                }
-            }
-            KeyCode::Delete => {
-                if self.chat.cursor < self.chat.input.len() {
-                    self.chat.input.remove(self.chat.cursor);
-                }
-            }
-            KeyCode::Left => {
-                if self.chat.cursor > 0 {
-                    // Move to previous character boundary
-                    self.chat.cursor -= 1;
-                    while self.chat.cursor > 0 && !self.chat.input.is_char_boundary(self.chat.cursor) {
-                        self.chat.cursor -= 1;
-                    }
-                }
-            }
-            KeyCode::Right => {
-                if self.chat.cursor < self.chat.input.len() {
-                    // Move to next character boundary
-                    self.chat.cursor += 1;
-                    while self.chat.cursor < self.chat.input.len()
-                        && !self.chat.input.is_char_boundary(self.chat.cursor)
-                    {
-                        self.chat.cursor += 1;
-                    }
-                }
-            }
-            KeyCode::Home => {
-                // Move to start of current line
-                let line_start = self.chat.input[..self.chat.cursor]
-                    .rfind('\n')
-                    .map_or(0, |pos| pos + 1);
-                self.chat.cursor = line_start;
-            }
-            KeyCode::End => {
-                // Move to end of current line
-                let line_end = self.chat.input[self.chat.cursor..]
-                    .find('\n')
-                    .map(|pos| self.chat.cursor + pos)
-                    .unwrap_or(self.chat.input.len());
-                self.chat.cursor = line_end;
-            }
-            KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    // Shift+Enter: Insert newline
-                    self.chat.insert_newline();
-                } else if !self.chat.input.is_empty() && !self.chat.awaiting_response {
-                    // Enter: Send message
-                    self.send_message().await;
-                }
-            }
+            // Navigate up/down in source list
             KeyCode::Up => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // Ctrl+Up: Scroll messages up
-                    if self.chat.scroll == usize::MAX {
-                        self.chat.scroll = self.chat.estimated_total_lines();
-                    }
-                    if self.chat.scroll > 0 {
-                        self.chat.scroll -= 1;
-                    }
-                } else if self.chat.is_single_line() && self.chat.input.is_empty() {
-                    // Up in empty single-line input: Browse history
-                    if let Some(prev) = self.chat.input_history.up(&self.chat.input) {
-                        self.chat.input = prev.to_string();
-                        self.chat.cursor = self.chat.input.len();
-                        self.chat.browsing_history = true;
-                    }
-                } else if !self.chat.is_single_line() {
-                    // Up in multi-line: Move cursor up
-                    self.chat.cursor_up();
-                } else if self.chat.is_single_line() {
-                    // Up in non-empty single-line: Browse history
-                    if let Some(prev) = self.chat.input_history.up(&self.chat.input) {
-                        self.chat.input = prev.to_string();
-                        self.chat.cursor = self.chat.input.len();
-                        self.chat.browsing_history = true;
-                    }
+                if self.sources_state.selected_index > 0 {
+                    self.sources_state.selected_index -= 1;
                 }
             }
             KeyCode::Down => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    // Ctrl+Down: Scroll messages down (with upper bound)
-                    let max_scroll = self.chat.estimated_total_lines();
-                    if self.chat.scroll < max_scroll {
-                        self.chat.scroll += 1;
-                    }
-                } else if self.chat.browsing_history {
-                    // Down while browsing history: Move forward
-                    if let Some(next) = self.chat.input_history.down() {
-                        self.chat.input = next.to_string();
-                        self.chat.cursor = self.chat.input.len();
-                    }
-                } else if !self.chat.is_single_line() {
-                    // Down in multi-line: Move cursor down
-                    self.chat.cursor_down();
+                if source_count > 0 && self.sources_state.selected_index < source_count.saturating_sub(1) {
+                    self.sources_state.selected_index += 1;
+                }
+            }
+            // n: New source
+            KeyCode::Char('n') => {
+                self.sources_state.editing = true;
+                self.sources_state.edit_value.clear();
+            }
+            // e: Edit source
+            KeyCode::Char('e') => {
+                if source_count > 0 && self.sources_state.selected_index < source_count {
+                    self.sources_state.editing = true;
+                    let source = &self.discover.sources[self.sources_state.selected_index];
+                    self.sources_state.edit_value = source.path.display().to_string();
+                }
+            }
+            // r: Rescan source
+            KeyCode::Char('r') => {
+                if source_count > 0 && self.sources_state.selected_index < source_count {
+                    let source = &self.discover.sources[self.sources_state.selected_index];
+                    let source_id = source.id.0.clone();
+                    self.start_scan_for_source(&source_id);
+                }
+            }
+            // d: Delete source (with confirmation)
+            KeyCode::Char('d') => {
+                if source_count > 0 && self.sources_state.selected_index < source_count {
+                    self.sources_state.confirm_delete = true;
                 }
             }
             KeyCode::Esc => {
-                self.chat.input.clear();
-                self.chat.cursor = 0;
-                self.chat.browsing_history = false;
-                self.chat.input_history.reset_position();
-            }
-            KeyCode::PageUp => {
-                // Page up: Scroll messages up by multiple lines
-                if self.chat.scroll == usize::MAX {
-                    self.chat.scroll = self.chat.estimated_total_lines();
-                }
-                self.chat.scroll = self.chat.scroll.saturating_sub(10);
-            }
-            KeyCode::PageDown => {
-                // Page down: Scroll messages down by multiple lines (with upper bound)
-                let max_scroll = self.chat.estimated_total_lines();
-                self.chat.scroll = (self.chat.scroll + 10).min(max_scroll);
-            }
-            _ => {}
-        }
-    }
-
-    /// Get byte position for cursor (handles UTF-8)
-    fn cursor_byte_pos(&self) -> usize {
-        self.chat.cursor.min(self.chat.input.len())
-    }
-
-    /// Handle inspect mode keys
-    fn handle_inspect_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Query input when focused - must come before specific char matches!
-            KeyCode::Char(c) if self.inspect.query_focused => {
-                self.inspect.query_input.push(c);
-            }
-            KeyCode::Backspace if self.inspect.query_focused => {
-                self.inspect.query_input.pop();
-            }
-            KeyCode::Enter if self.inspect.query_focused => {
-                // Execute query (placeholder - would call query_output tool)
-                if !self.inspect.query_input.is_empty() {
-                    self.inspect.query_result = Some(format!(
-                        "Query executed: {}\n(Query results would appear here)",
-                        self.inspect.query_input
-                    ));
-                }
-            }
-            KeyCode::Esc if self.inspect.query_focused => {
-                self.inspect.query_focused = false;
-            }
-            // Table navigation (only when query not focused)
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.inspect.selected_table < self.inspect.tables.len().saturating_sub(1) {
-                    self.inspect.selected_table += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.inspect.selected_table > 0 {
-                    self.inspect.selected_table -= 1;
-                }
-            }
-            // Toggle query input focus
-            KeyCode::Char('/') => {
-                self.inspect.query_focused = !self.inspect.query_focused;
-            }
-            // Export selected table
-            KeyCode::Char('e') => {
-                // TODO: Export table to file
-            }
-            // Filter mode
-            KeyCode::Char('f') => {
-                // TODO: Open filter dialog
+                self.mode = TuiMode::Home;
             }
             _ => {}
         }
@@ -6417,12 +6614,12 @@ impl App {
 
         match key.code {
             // Job navigation (within filtered list)
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if self.jobs_state.selected_index < filtered_count.saturating_sub(1) {
                     self.jobs_state.selected_index += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if self.jobs_state.selected_index > 0 {
                     self.jobs_state.selected_index -= 1;
                 }
@@ -6459,19 +6656,11 @@ impl App {
                     }
                 }
             }
-            // Filter by status (uses set_filter to clamp selection)
-            KeyCode::Char('1') => {
-                self.jobs_state.set_filter(Some(JobStatus::Pending));
+            // f: Open filter dialog (per keybinding matrix - keys 1-4 are reserved for navigation)
+            KeyCode::Char('f') => {
+                self.jobs_state.transition_state(JobsViewState::FilterDialog);
             }
-            KeyCode::Char('2') => {
-                self.jobs_state.set_filter(Some(JobStatus::Running));
-            }
-            KeyCode::Char('3') => {
-                self.jobs_state.set_filter(Some(JobStatus::Completed));
-            }
-            KeyCode::Char('4') => {
-                self.jobs_state.set_filter(Some(JobStatus::Failed));
-            }
+            // Quick filter reset (0 still works as a shortcut)
             KeyCode::Char('0') => {
                 self.jobs_state.set_filter(None); // Show all
             }
@@ -6482,10 +6671,6 @@ impl App {
             // Go to last job
             KeyCode::Char('G') => {
                 self.jobs_state.selected_index = filtered_count.saturating_sub(1);
-            }
-            // Open filter dialog
-            KeyCode::Char('f') => {
-                self.jobs_state.transition_state(JobsViewState::FilterDialog);
             }
             // Stop running backtest (requires confirmation)
             KeyCode::Char('S') => {
@@ -6526,7 +6711,7 @@ impl App {
                 self.show_help = true;
             }
             // Open log viewer
-            KeyCode::Char('l') => {
+            KeyCode::Char('L') => {
                 if !self.jobs_state.filtered_jobs().is_empty() {
                     self.jobs_state.transition_state(JobsViewState::LogViewer);
                 }
@@ -6540,6 +6725,9 @@ impl App {
                         let _ = path; // Silence warning for now
                     }
                 }
+            }
+            KeyCode::Esc => {
+                self.mode = TuiMode::Home;
             }
             _ => {}
         }
@@ -6561,7 +6749,7 @@ impl App {
                 }
             }
             // View logs (placeholder)
-            KeyCode::Char('l') => {
+            KeyCode::Char('L') => {
                 // TODO: Open log viewer
             }
             // Copy output path to clipboard (placeholder)
@@ -6599,10 +6787,10 @@ impl App {
                 self.jobs_state.return_to_previous_state();
             }
             // TODO: Scroll logs up/down
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 // Scroll down
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 // Scroll up
             }
             _ => {}
@@ -6655,15 +6843,6 @@ impl App {
 
         // Normal navigation mode
         match key.code {
-            // Close settings, return to previous mode
-            KeyCode::Esc => {
-                if let Some(prev) = self.settings.previous_mode {
-                    self.mode = prev;
-                } else {
-                    self.mode = TuiMode::Home;
-                }
-                self.settings.previous_mode = None;
-            }
             // Navigate categories
             KeyCode::Tab => {
                 self.settings.category = match self.settings.category {
@@ -6682,13 +6861,13 @@ impl App {
                 self.settings.selected_index = 0;
             }
             // Navigate within category
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 let max = self.settings.category_item_count().saturating_sub(1);
                 if self.settings.selected_index < max {
                     self.settings.selected_index += 1;
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if self.settings.selected_index > 0 {
                     self.settings.selected_index -= 1;
                 }
@@ -6758,196 +6937,6 @@ impl App {
         // TODO: Persist to config.toml
     }
 
-    /// Send user message (non-blocking - spawns Claude in background)
-    async fn send_message(&mut self) {
-        let content = std::mem::take(&mut self.chat.input);
-        self.chat.cursor = 0;
-
-        // Add to history
-        self.chat.input_history.push(content.clone());
-        self.chat.browsing_history = false;
-
-        // Add user message
-        self.chat.push_message(Message::new(
-            MessageRole::User,
-            content.clone(),
-        ));
-
-        // Auto-scroll to bottom
-        self.chat.scroll = usize::MAX;
-
-        // Mark as awaiting response
-        self.chat.awaiting_response = true;
-
-        // Build LLM messages from our chat messages
-        let llm_messages: Vec<super::llm::Message> = self
-            .chat
-            .messages
-            .iter()
-            .filter_map(|m| match m.role {
-                MessageRole::User => Some(super::llm::Message::user(&m.content)),
-                MessageRole::Assistant => Some(super::llm::Message::assistant(&m.content)),
-                _ => None,
-            })
-            .collect();
-
-        // Get tool definitions
-        let tool_defs = registry_to_definitions(&self.tools);
-
-        // Check for injected provider first (test mode)
-        #[cfg(test)]
-        if let Some(ref provider) = self.llm_provider {
-            let (tx, rx) = mpsc::channel::<PendingResponse>(1);
-            self.pending_response = Some(rx);
-
-            let provider = provider.clone();
-            tokio::spawn(async move {
-                Self::run_llm_request(provider, llm_messages, tool_defs, tx).await;
-            });
-
-            self.chat.push_message(Message::new(
-                MessageRole::Assistant,
-                "Thinking...".to_string(),
-            ));
-            return;
-        }
-
-        // Try to use Claude Code if available
-        if self.llm.is_some() {
-            // Create channel for response
-            let (tx, rx) = mpsc::channel::<PendingResponse>(1);
-            self.pending_response = Some(rx);
-
-            // Spawn background task to get Claude response
-            // Note: We create a new provider instance since ClaudeCodeProvider is cheap
-            let provider = ClaudeCodeProvider::new()
-                .allowed_tools(vec![
-                    "Read".to_string(),
-                    "Grep".to_string(),
-                    "Glob".to_string(),
-                    "Bash".to_string(),
-                ])
-                .system_prompt(
-                    "You are helping the user with Casparian Flow, a data pipeline tool. \
-                     You have access to MCP tools for scanning files, discovering schemas, \
-                     and building data pipelines. Be concise and helpful.",
-                )
-                .max_turns(5);
-
-            tokio::spawn(async move {
-                match provider.chat_stream(&llm_messages, &tool_defs, None).await {
-                    Ok(mut stream) => {
-                        let mut response_text = String::new();
-                        let mut tools_used = Vec::new();
-
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                StreamChunk::Text(text) => {
-                                    response_text.push_str(&text);
-                                }
-                                StreamChunk::ToolCall { name, arguments } => {
-                                    // Track tool name for context pane
-                                    tools_used.push(name.clone());
-                                    // Show tool name and arguments
-                                    response_text.push_str(&format_tool_call(&name, &arguments));
-                                }
-                                StreamChunk::Done { .. } => {
-                                    break;
-                                }
-                                StreamChunk::Error(e) => {
-                                    response_text.push_str(&format!("\n[Error: {}]\n", e));
-                                    break;
-                                }
-                            }
-                        }
-
-                        if response_text.is_empty() {
-                            let _ = tx.send(PendingResponse::Error(
-                                "(No response from Claude Code)".to_string()
-                            )).await;
-                        } else {
-                            let _ = tx.send(PendingResponse::Text {
-                                content: response_text,
-                                tools_used,
-                            }).await;
-                        }
-                    }
-                    Err(e) => {
-                        let _ = tx.send(PendingResponse::Error(format!("LLM Error: {}", e))).await;
-                    }
-                }
-            });
-
-            // Add a "thinking" message that will be replaced
-            self.chat.push_message(Message::new(
-                MessageRole::Assistant,
-                "Thinking...".to_string(),
-            ));
-        } else {
-            // No Claude Code available - show helpful message
-            self.chat.push_message(Message::new(
-                MessageRole::System,
-                "Claude Code not available. Install Claude Code (`npm install -g @anthropic-ai/claude-code`) \
-                 to enable AI chat.\n\nFor now, you can use the MCP tools directly or try:\n  \
-                 F2 - Monitor view\n  F3 - Help".to_string(),
-            ));
-            self.chat.awaiting_response = false;
-        }
-    }
-
-    /// Helper to run LLM request in background (used by tests with injected provider)
-    #[cfg(test)]
-    async fn run_llm_request(
-        provider: std::sync::Arc<dyn super::llm::LlmProvider + Send + Sync>,
-        llm_messages: Vec<super::llm::Message>,
-        tool_defs: Vec<super::llm::ToolDefinition>,
-        tx: mpsc::Sender<PendingResponse>,
-    ) {
-        match provider.chat_stream(&llm_messages, &tool_defs, None).await {
-            Ok(mut stream) => {
-                let mut response_text = String::new();
-                let mut tools_used = Vec::new();
-
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        StreamChunk::Text(text) => {
-                            response_text.push_str(&text);
-                        }
-                        StreamChunk::ToolCall { name, arguments } => {
-                            tools_used.push(name.clone());
-                            response_text.push_str(&format_tool_call(&name, &arguments));
-                        }
-                        StreamChunk::Done { .. } => {
-                            break;
-                        }
-                        StreamChunk::Error(e) => {
-                            response_text.push_str(&format!("\n[Error: {}]\n", e));
-                            break;
-                        }
-                    }
-                }
-
-                if response_text.is_empty() {
-                    let _ = tx
-                        .send(PendingResponse::Error(
-                            "(No response from LLM)".to_string(),
-                        ))
-                        .await;
-                } else {
-                    let _ = tx.send(PendingResponse::Text {
-                        content: response_text,
-                        tools_used,
-                    }).await;
-                }
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(PendingResponse::Error(format!("LLM Error: {}", e)))
-                    .await;
-            }
-        }
-    }
-
     /// Execute a tool directly
     #[allow(dead_code)]
     pub async fn execute_tool(&self, name: &str, args: Value) -> Result<ToolResult, String> {
@@ -7007,6 +6996,31 @@ impl App {
                     self.discover.sources = sources;
                     self.discover.sources_loaded = true;
                     self.discover.validate_source_selection();
+                    let drawer_count = self.sources_drawer_sources().len();
+                    if drawer_count == 0 {
+                        self.sources_drawer_selected = 0;
+                    } else if self.sources_drawer_selected >= drawer_count {
+                        self.sources_drawer_selected = drawer_count - 1;
+                    }
+                    if let (Some(ref mut builder), Some(ref source_id)) =
+                        (self.discover.rule_builder.as_mut(), self.discover.selected_source_id.as_ref())
+                    {
+                        if builder.source_id.as_deref() != Some(source_id.as_str()) {
+                            builder.source_id = Some(source_id.as_str().to_string());
+                        }
+                    }
+                    if self.mode == TuiMode::Discover
+                        && self.discover.selected_source_id.is_none()
+                        && matches!(
+                            self.discover.view_state,
+                            DiscoverViewState::RuleBuilder | DiscoverViewState::Files
+                        )
+                    {
+                        self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                        self.discover.sources_filter.clear();
+                        self.discover.sources_filtering = false;
+                        self.discover.preview_source = Some(self.discover.selected_source_index());
+                    }
                     self.pending_sources_load = None;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
@@ -7123,9 +7137,13 @@ impl App {
                 Err(mpsc::error::TryRecvError::Empty) => {
                     // Still searching - update spinner
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if explorer.folders.len() == 1 && explorer.folders[0].name.contains("Searching") {
-                            let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
-                            explorer.folders[0].name = format!("{} Searching for {}...", spinner_char, explorer.pattern);
+                        if explorer.folders.len() == 1 {
+                            if let Some(FsEntry::Loading { message }) = explorer.folders.get_mut(0) {
+                                if message.contains("Searching") {
+                                    let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
+                                    *message = format!("{} Searching for {}...", spinner_char, explorer.pattern);
+                                }
+                            }
                         }
                     }
                 }
@@ -7147,10 +7165,20 @@ impl App {
 
                     if result.pattern == current_pattern || result.pattern == format!("**/{}", current_pattern) {
                         // Search complete! Update Rule Builder with results
+                        let has_matches = result.total_count > 0;
                         if let Some(ref mut builder) = self.discover.rule_builder {
-                            builder.folder_matches = result.folder_matches;
+                            builder.file_results = super::extraction::FileResultsState::Exploration {
+                                folder_matches: result.folder_matches,
+                                expanded_folder_indices: std::collections::HashSet::new(),
+                                detected_patterns: Vec::new(),
+                            };
                             builder.match_count = result.total_count;
                             builder.is_streaming = false;
+                        }
+                        // Auto-run sample eval when pattern matches files
+                        // Only if: matches found, not running full eval, not just switched patterns
+                        if has_matches && self.pending_schema_eval.is_none() && self.pending_sample_eval.is_none() {
+                            self.run_sample_schema_eval();
                         }
                     }
                     // else: stale result, discard it
@@ -7164,6 +7192,127 @@ impl App {
                     if let Some(ref mut builder) = self.discover.rule_builder {
                         builder.is_streaming = false;
                     }
+                }
+            }
+        }
+
+        // Poll for pending schema eval results (background full eval job)
+        if let Some(ref mut rx) = self.pending_schema_eval {
+            match rx.try_recv() {
+                Ok(SchemaEvalResult::Started { job_id }) => {
+                    // Job started - already tracked via add_schema_eval_job
+                    tracing::debug!(job_id = job_id, "Schema eval job started");
+                }
+                Ok(SchemaEvalResult::Progress { progress, paths_analyzed, total_paths }) => {
+                    // Update progress
+                    if let Some(ref mut builder) = self.discover.rule_builder {
+                        builder.eval_state = super::extraction::EvalState::Running { progress };
+                    }
+                    if let Some(job_id) = self.current_schema_eval_job_id {
+                        self.set_schema_eval_job_total(job_id, total_paths as u32);
+                        self.update_schema_eval_job(job_id, JobStatus::Running, paths_analyzed as u32, None);
+                    }
+                }
+                Ok(SchemaEvalResult::Complete {
+                    job_id,
+                    pattern,
+                    pattern_seeds,
+                    path_archetypes,
+                    naming_schemes,
+                    synonym_suggestions,
+                    paths_analyzed,
+                }) => {
+                    // Update Rule Builder state with results
+                    if let Some(ref mut builder) = self.discover.rule_builder {
+                        if builder.pattern == pattern {
+                            builder.pattern_seeds = pattern_seeds;
+                            builder.path_archetypes = path_archetypes;
+                            builder.naming_schemes = naming_schemes;
+                            builder.synonym_suggestions = synonym_suggestions;
+                        }
+                        builder.eval_state = super::extraction::EvalState::Idle;
+                    }
+                    // Update job status
+                    self.update_schema_eval_job(job_id, JobStatus::Completed, paths_analyzed as u32, None);
+                    self.current_schema_eval_job_id = None;
+                    self.pending_schema_eval = None;
+
+                    // Status message
+                    if let Some(ref builder) = self.discover.rule_builder {
+                        if builder.pattern == pattern {
+                            self.discover.status_message = Some((
+                                format!("Full eval: {} patterns, {} archetypes, {} schemes, {} synonyms",
+                                    builder.pattern_seeds.len(),
+                                    builder.path_archetypes.len(),
+                                    builder.naming_schemes.len(),
+                                    builder.synonym_suggestions.len(),
+                                ),
+                                false,
+                            ));
+                        }
+                    }
+                }
+                Ok(SchemaEvalResult::Error(err)) => {
+                    // Job failed
+                    if let Some(ref mut builder) = self.discover.rule_builder {
+                        builder.eval_state = super::extraction::EvalState::Idle;
+                    }
+                    if let Some(job_id) = self.current_schema_eval_job_id {
+                        self.update_schema_eval_job(job_id, JobStatus::Failed, 0, Some(err.clone()));
+                    }
+                    self.current_schema_eval_job_id = None;
+                    self.pending_schema_eval = None;
+                    self.discover.status_message = Some((format!("Schema eval failed: {}", err), true));
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // Still running - that's fine
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // Channel closed unexpectedly
+                    if let Some(ref mut builder) = self.discover.rule_builder {
+                        builder.eval_state = super::extraction::EvalState::Idle;
+                    }
+                    if let Some(job_id) = self.current_schema_eval_job_id {
+                        self.update_schema_eval_job(job_id, JobStatus::Failed, 0, Some("Channel disconnected".to_string()));
+                    }
+                    self.current_schema_eval_job_id = None;
+                    self.pending_schema_eval = None;
+                }
+            }
+        }
+
+        // Poll for pending sample schema eval results
+        if let Some(ref mut rx) = self.pending_sample_eval {
+            match rx.try_recv() {
+                Ok(SampleEvalResult::Complete {
+                    pattern,
+                    pattern_seeds,
+                    path_archetypes,
+                    naming_schemes,
+                    synonym_suggestions,
+                    paths_analyzed,
+                }) => {
+                    if let Some(ref mut builder) = self.discover.rule_builder {
+                        if builder.pattern == pattern {
+                            builder.pattern_seeds = pattern_seeds;
+                            builder.path_archetypes = path_archetypes;
+                            builder.naming_schemes = naming_schemes;
+                            builder.synonym_suggestions = synonym_suggestions;
+                            self.discover.status_message = Some((
+                                format!("Sample: {} paths analyzed", paths_analyzed),
+                                false,
+                            ));
+                        }
+                    }
+                    self.pending_sample_eval = None;
+                }
+                Ok(SampleEvalResult::Error(err)) => {
+                    self.discover.status_message = Some((format!("Sample eval failed: {}", err), true));
+                    self.pending_sample_eval = None;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.pending_sample_eval = None;
                 }
             }
         }
@@ -7199,7 +7348,7 @@ impl App {
                         if let Some(root_folders) = explorer.folder_cache.get("") {
                             explorer.folders = root_folders.clone();
                             explorer.total_count = GlobFileCount::Exact(
-                                root_folders.iter().map(|f| f.file_count).sum()
+                                root_folders.iter().map(|f| f.file_count()).sum()
                             );
                         }
                     }
@@ -7250,7 +7399,7 @@ impl App {
                         if explorer.current_prefix == prefix {
                             // Sort by count descending (single final sort as requested)
                             let mut sorted_folders = folders;
-                            sorted_folders.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+                            sorted_folders.sort_by(|a, b| b.file_count().cmp(&a.file_count()));
                             explorer.folders = sorted_folders;
                             explorer.total_count = GlobFileCount::Exact(total_count);
                             explorer.selected_folder = 0;
@@ -7261,17 +7410,25 @@ impl App {
                 Ok(FolderQueryMessage::Error(e)) => {
                     // Show error in folders list
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        explorer.folders = vec![FolderInfo::new(format!("Error: {}", e), 0, false)];
+                        explorer.folders = vec![FsEntry::loading(&format!("Error: {}", e))];
                     }
                     self.pending_folder_query = None;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     // Still loading - update spinner
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if explorer.folders.len() == 1 && explorer.folders[0].name.contains("Loading") {
-                            let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
-                            let prefix = &explorer.current_prefix;
-                            explorer.folders[0].name = format!("{} Loading {}...", spinner_char, if prefix.is_empty() { "root" } else { prefix });
+                        if explorer.folders.len() == 1 {
+                            if let Some(FsEntry::Loading { message }) = explorer.folders.get_mut(0) {
+                                if message.contains("Loading") {
+                                    let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
+                                    let prefix = &explorer.current_prefix;
+                                    *message = format!(
+                                        "{} Loading {}...",
+                                        spinner_char,
+                                        if prefix.is_empty() { "root" } else { prefix }
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -7321,9 +7478,11 @@ impl App {
 
                         // Check if we're still loading
                         if let Some(ref progress) = self.cache_load_progress {
-                            if explorer.folders.is_empty() || explorer.folders[0].name.contains("Loading") {
+                            let needs_loading = explorer.folders.is_empty()
+                                || matches!(explorer.folders.get(0), Some(FsEntry::Loading { message }) if message.contains("Loading"));
+                            if needs_loading {
                                 let elapsed = progress.started_at.elapsed().as_secs_f32();
-                                explorer.folders = vec![FolderInfo::loading(&format!(
+                                explorer.folders = vec![FsEntry::loading(&format!(
                                     "{} Loading {}... ({:.1}s)",
                                     spinner_char,
                                     progress.source_name,
@@ -7331,7 +7490,7 @@ impl App {
                                 ))];
                             }
                         } else if explorer.folders.is_empty() {
-                            explorer.folders = vec![FolderInfo::loading(&format!("{} Loading folder hierarchy...", spinner_char))];
+                            explorer.folders = vec![FsEntry::loading(&format!("{} Loading folder hierarchy...", spinner_char))];
                         }
                     }
                 }
@@ -7344,61 +7503,6 @@ impl App {
             // Load rules for Rules Manager if it's open
             if self.discover.view_state == DiscoverViewState::RulesManager && self.discover.rules.is_empty() {
                 self.load_rules_for_manager().await;
-            }
-        }
-
-        // Poll for pending Claude response
-        if let Some(ref mut rx) = self.pending_response {
-            // Try to receive without blocking
-            match rx.try_recv() {
-                Ok(response) => {
-                    // Replace the "Thinking..." message with actual response
-                    // Note: Use starts_with() because animation changes dots count
-                    if let Some(last_msg) = self.chat.messages.last_mut() {
-                        if last_msg.role == MessageRole::Assistant && last_msg.content.starts_with("Thinking") {
-                            match response {
-                                PendingResponse::Text { content, tools_used } => {
-                                    last_msg.content = content;
-                                    // Update recent tools for context pane
-                                    if !tools_used.is_empty() {
-                                        self.chat.recent_tools = tools_used;
-                                    }
-                                }
-                                PendingResponse::Error(err) => {
-                                    last_msg.content = err;
-                                    last_msg.role = MessageRole::System;
-                                }
-                            }
-                        }
-                    }
-                    self.chat.awaiting_response = false;
-                    self.pending_response = None;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // Still waiting, update thinking animation
-                    if let Some(last_msg) = self.chat.messages.last_mut() {
-                        if last_msg.role == MessageRole::Assistant && last_msg.content.starts_with("Thinking") {
-                            // Cycle through animation: Thinking... -> Thinking.... -> Thinking.....
-                            let dots = last_msg.content.matches('.').count();
-                            if dots >= 5 {
-                                last_msg.content = "Thinking.".to_string();
-                            } else {
-                                last_msg.content.push('.');
-                            }
-                        }
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // Channel closed without response
-                    if let Some(last_msg) = self.chat.messages.last_mut() {
-                        if last_msg.role == MessageRole::Assistant && last_msg.content.starts_with("Thinking") {
-                            last_msg.content = "(Claude process ended unexpectedly)".to_string();
-                            last_msg.role = MessageRole::System;
-                        }
-                    }
-                    self.chat.awaiting_response = false;
-                    self.pending_response = None;
-                }
             }
         }
 
@@ -7931,13 +8035,13 @@ if __name__ == "__main__":
     fn handle_parser_bench_key(&mut self, key: KeyEvent) {
         match key.code {
             // Navigation
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if !self.parser_bench.parsers.is_empty() {
                     self.parser_bench.selected_parser =
                         (self.parser_bench.selected_parser + 1) % self.parser_bench.parsers.len();
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if !self.parser_bench.parsers.is_empty() {
                     if self.parser_bench.selected_parser == 0 {
                         self.parser_bench.selected_parser = self.parser_bench.parsers.len() - 1;
@@ -7988,9 +8092,10 @@ mod tests {
 
     fn test_args() -> TuiArgs {
         TuiArgs {
-            database: None,
-            api_key: None,
-            model: "test".into(),
+            database: Some(std::env::temp_dir().join(format!(
+                "casparian_test_{}.sqlite3",
+                uuid::Uuid::new_v4()
+            ))),
         }
     }
 
@@ -8014,9 +8119,22 @@ mod tests {
         });
         assert!(matches!(app.mode, TuiMode::Home));
 
-        // Now '2' should switch to Parser Bench (per spec)
+        // Now '2' should switch to Parser Bench
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
+                .await;
+        });
+        assert!(matches!(app.mode, TuiMode::ParserBench));
+
+        // Return Home, then use 'P' to switch to Parser Bench
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
+                .await;
+        });
+        assert!(matches!(app.mode, TuiMode::Home));
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE))
                 .await;
         });
         assert!(matches!(app.mode, TuiMode::ParserBench));
@@ -8030,151 +8148,38 @@ mod tests {
     }
 
     #[test]
-    fn test_home_card_navigation() {
+    fn test_home_source_navigation() {
         let mut app = App::new(test_args());
-        assert_eq!(app.home.selected_card, 0);
+        // Add some test sources
+        app.discover.sources = vec![
+            SourceInfo {
+                id: SourceId("src1".to_string()),
+                name: "Source 1".to_string(),
+                path: std::path::PathBuf::from("/test/source1"),
+                file_count: 10,
+            },
+            SourceInfo {
+                id: SourceId("src2".to_string()),
+                name: "Source 2".to_string(),
+                path: std::path::PathBuf::from("/test/source2"),
+                file_count: 20,
+            },
+        ];
+        assert_eq!(app.home.selected_source_index, 0);
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Right arrow should move to card 1
-            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
-                .await;
-        });
-        assert_eq!(app.home.selected_card, 1);
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Down arrow should move to card 3
+            // Down arrow should move to source 1
             app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         });
-        assert_eq!(app.home.selected_card, 3);
+        assert_eq!(app.home.selected_source_index, 1);
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Enter should navigate to Inspect mode (card 3 = Sources placeholder)
-            // Card order: 0=Discover, 1=ParserBench, 2=Jobs, 3=Sources(Inspect)
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            // Up arrow should move back to source 0
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
                 .await;
         });
-        assert!(matches!(app.mode, TuiMode::Inspect)); // Sources placeholder
-    }
-
-    #[test]
-    fn test_chat_input() {
-        let mut app = App::new(test_args());
-        // Enable chat sidebar and focus on it
-        app.show_chat_sidebar = true;
-        app.focus = AppFocus::Chat;
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Type "hello"
-            for c in "hello".chars() {
-                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                    .await;
-            }
-        });
-
-        assert_eq!(app.chat.input, "hello");
-        assert_eq!(app.chat.cursor, 5);
-    }
-
-    #[test]
-    fn test_chat_backspace() {
-        let mut app = App::new(test_args());
-        // Enable chat sidebar and focus on it
-        app.show_chat_sidebar = true;
-        app.focus = AppFocus::Chat;
-        app.chat.input = "hello".into();
-        app.chat.cursor = 5;
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-                .await;
-        });
-
-        assert_eq!(app.chat.input, "hell");
-        assert_eq!(app.chat.cursor, 4);
-    }
-
-    #[test]
-    fn test_multiline_input() {
-        let mut app = App::new(test_args());
-        // Enable chat sidebar and focus on it
-        app.show_chat_sidebar = true;
-        app.focus = AppFocus::Chat;
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Type "line1"
-            for c in "line1".chars() {
-                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                    .await;
-            }
-            // Shift+Enter for newline
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
-                .await;
-            // Type "line2"
-            for c in "line2".chars() {
-                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                    .await;
-            }
-        });
-
-        assert_eq!(app.chat.input, "line1\nline2");
-        assert_eq!(app.chat.input_line_count(), 2);
-    }
-
-    #[test]
-    fn test_input_history() {
-        let mut history = InputHistory::default();
-
-        // Add some entries
-        history.push("first".into());
-        history.push("second".into());
-        history.push("third".into());
-
-        // Browse up
-        assert_eq!(history.up(""), Some("third"));
-        assert_eq!(history.up(""), Some("second"));
-        assert_eq!(history.up(""), Some("first"));
-        assert_eq!(history.up(""), Some("first")); // At oldest
-
-        // Browse down
-        assert_eq!(history.down(), Some("second"));
-        assert_eq!(history.down(), Some("third"));
-        assert_eq!(history.down(), Some("")); // Back to draft
-    }
-
-    #[test]
-    fn test_input_history_preserves_draft() {
-        let mut history = InputHistory::default();
-        history.push("old".into());
-
-        // Start typing, then browse history
-        let draft = "typing something";
-        assert_eq!(history.up(draft), Some("old"));
-
-        // Return to draft
-        assert_eq!(history.down(), Some(draft));
-    }
-
-    #[test]
-    fn test_cursor_line_col() {
-        let mut state = ChatState::default();
-        state.input = "line1\nline2\nline3".into();
-
-        // Start of first line
-        state.cursor = 0;
-        assert_eq!(state.cursor_line_col(), (0, 0));
-
-        // End of first line
-        state.cursor = 5;
-        assert_eq!(state.cursor_line_col(), (0, 5));
-
-        // Start of second line
-        state.cursor = 6;
-        assert_eq!(state.cursor_line_col(), (1, 0));
-
-        // Middle of second line
-        state.cursor = 8;
-        assert_eq!(state.cursor_line_col(), (1, 2));
+        assert_eq!(app.home.selected_source_index, 0);
     }
 
     #[tokio::test]
@@ -8212,283 +8217,18 @@ mod tests {
     }
 
     #[test]
-    fn test_esc_returns_to_home() {
+    fn test_esc_returns_home_from_jobs() {
         let mut app = App::new(test_args());
-        // Start in Discover mode
-        app.mode = TuiMode::Discover;
-        app.chat.input = "some text".into();
-        app.chat.cursor = 9;
+        // Start in Jobs mode
+        app.mode = TuiMode::Jobs;
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 .await;
         });
 
-        // Esc returns to Home mode from Discover
+        // Esc returns to Home when no dialog is open
         assert!(matches!(app.mode, TuiMode::Home));
-    }
-
-    #[tokio::test]
-    async fn test_pending_response_polling() {
-        // Test the non-blocking response mechanism
-        let mut app = App::new(test_args());
-
-        // Simulate adding a "Thinking..." message and pending response
-        app.chat.messages.push(Message::new(
-            MessageRole::Assistant,
-            "Thinking...".to_string(),
-        ));
-        app.chat.awaiting_response = true;
-
-        // Create channel and send a response
-        let (tx, rx) = mpsc::channel::<PendingResponse>(1);
-        app.pending_response = Some(rx);
-
-        // Send response in background
-        tokio::spawn(async move {
-            tx.send(PendingResponse::Text {
-                content: "Hello from Claude!".to_string(),
-                tools_used: vec![],
-            })
-                .await
-                .unwrap();
-        });
-
-        // Give time for the message to be sent
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // Call tick to poll the response
-        app.tick().await;
-
-        // Verify the message was updated
-        let last_msg = app.chat.messages.last().unwrap();
-        assert_eq!(last_msg.content, "Hello from Claude!");
-        assert!(!app.chat.awaiting_response);
-        assert!(app.pending_response.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_pending_response_thinking_animation() {
-        // Test the thinking animation when no response yet
-        let mut app = App::new(test_args());
-
-        // Simulate adding a "Thinking..." message
-        app.chat.messages.push(Message::new(
-            MessageRole::Assistant,
-            "Thinking...".to_string(),
-        ));
-        app.chat.awaiting_response = true;
-
-        // Create channel but don't send anything
-        let (_tx, rx) = mpsc::channel::<PendingResponse>(1);
-        app.pending_response = Some(rx);
-
-        // Call tick - should animate the dots
-        app.tick().await;
-
-        // Verify the message got more dots
-        let last_msg = app.chat.messages.last().unwrap();
-        assert!(last_msg.content.starts_with("Thinking"));
-        assert!(last_msg.content.len() > "Thinking...".len());
-    }
-
-    /// CRITICAL TEST: Catches the animation bug where response wasn't applied
-    /// because the check used == "Thinking..." instead of starts_with()
-    #[tokio::test]
-    async fn test_response_replaces_animated_thinking() {
-        let mut app = App::new(test_args());
-
-        // Setup initial "Thinking..." message
-        app.chat.messages.push(Message::new(
-            MessageRole::Assistant,
-            "Thinking...".to_string(),
-        ));
-        app.chat.awaiting_response = true;
-
-        // Create channel but DON'T send response yet
-        let (tx, rx) = mpsc::channel::<PendingResponse>(1);
-        app.pending_response = Some(rx);
-
-        // Run multiple ticks to animate (no response yet)
-        for i in 0..4 {
-            app.tick().await;
-            let content = &app.chat.messages.last().unwrap().content;
-            println!("Tick {}: {}", i + 1, content);
-            assert!(content.starts_with("Thinking"), "Should still be thinking");
-        }
-
-        // Verify animation actually ran (not still exactly "Thinking...")
-        let animated_content = app.chat.messages.last().unwrap().content.clone();
-        assert_ne!(
-            animated_content, "Thinking...",
-            "Animation should have changed the dots"
-        );
-
-        // NOW send the response
-        tx.send(PendingResponse::Text {
-            content: "Response from Claude".to_string(),
-            tools_used: vec![],
-        })
-            .await
-            .unwrap();
-
-        // Run tick to process response
-        app.tick().await;
-
-        // CRITICAL: This is where the bug manifested
-        // With == "Thinking..." check, this would fail because animation changed dots
-        let final_msg = app.chat.messages.last().unwrap();
-        assert_eq!(
-            final_msg.content, "Response from Claude",
-            "Response should replace animated message - BUG if this fails!"
-        );
-        assert!(!app.chat.awaiting_response);
-        assert!(app.pending_response.is_none());
-    }
-
-    /// TRUE END-TO-END TEST: Full flow from user input to Claude response
-    ///
-    /// This test catches bugs that mocked tests miss by:
-    /// 1. Actually calling send_message() (not injecting mock channel)
-    /// 2. Using real ClaudeCodeProvider.chat_stream()
-    /// 3. Polling tick() like the real TUI event loop
-    /// 4. Verifying response replaces "Thinking..."
-    ///
-    /// This is the test that would have caught the "no response" bug.
-    #[tokio::test]
-    async fn test_full_chat_flow_with_real_claude() {
-        // Skip if Claude CLI not available
-        if !ClaudeCodeProvider::is_available() {
-            println!("Skipping test_full_chat_flow_with_real_claude: claude CLI not installed");
-            return;
-        }
-
-        let mut app = App::new(test_args());
-        // Must be in Discover mode for chat to work
-        app.mode = TuiMode::Discover;
-        app.show_chat_sidebar = true;
-        app.focus = AppFocus::Chat;
-
-        // Verify Claude Code is available in the app
-        if app.llm.is_none() {
-            println!("Skipping: app.llm is None despite Claude being available");
-            return;
-        }
-
-        // Step 1: Type a simple message
-        app.chat.input = "say hello".to_string();
-        app.chat.cursor = app.chat.input.len();
-
-        // Step 2: Press Enter to send
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
-
-        // Verify "Thinking..." was added
-        assert!(app.chat.awaiting_response, "Should be awaiting response");
-        assert!(
-            app.chat
-                .messages
-                .last()
-                .map(|m| m.content.starts_with("Thinking"))
-                .unwrap_or(false),
-            "Should have Thinking... message"
-        );
-        assert!(
-            app.pending_response.is_some(),
-            "Should have pending_response channel"
-        );
-
-        // Step 3: Poll tick() until response arrives (max 60 seconds)
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(60);
-        let mut got_response = false;
-        let mut saw_animation = false;
-        let mut last_content = String::new();
-
-        while start.elapsed() < timeout {
-            app.tick().await;
-
-            let current_content = app
-                .chat
-                .messages
-                .last()
-                .map(|m| m.content.clone())
-                .unwrap_or_default();
-
-            // Track if animation ran
-            if current_content.starts_with("Thinking") && current_content != last_content {
-                println!("Animation frame: {}", current_content);
-                if current_content != "Thinking..." {
-                    saw_animation = true;
-                }
-            }
-
-            // Check if we got a real response
-            if !current_content.starts_with("Thinking")
-                && !current_content.is_empty()
-                && app.chat.messages.len() >= 2
-            {
-                // Not "Thinking..." anymore = got response!
-                got_response = true;
-                println!("Got response: {}", current_content.chars().take(100).collect::<String>());
-                break;
-            }
-
-            last_content = current_content;
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-
-        // Step 4: Assert the test results
-        let final_msg = app.chat.messages.last().unwrap();
-
-        // This is the critical check that would have caught the bug
-        assert!(
-            !final_msg.content.starts_with("Thinking"),
-            "FAILURE: Response never arrived! Content is still: '{}'.\n\
-             This means the spawned task didn't send a response through the channel.\n\
-             Check: 1) Is chat_stream() returning? 2) Is the channel send working?",
-            final_msg.content
-        );
-
-        assert!(got_response, "Should have received response from Claude");
-        assert!(!app.chat.awaiting_response, "Should no longer be awaiting");
-        assert!(app.pending_response.is_none(), "Channel should be consumed");
-
-        println!(
-            "TRUE E2E TEST PASSED: Animation ran: {}, Final content length: {}",
-            saw_animation,
-            final_msg.content.len()
-        );
-    }
-
-    /// Test that channel disconnection is handled gracefully
-    #[tokio::test]
-    async fn test_channel_disconnection_handling() {
-        let mut app = App::new(test_args());
-
-        // Setup "Thinking..." message
-        app.chat.messages.push(Message::new(
-            MessageRole::Assistant,
-            "Thinking...".to_string(),
-        ));
-        app.chat.awaiting_response = true;
-
-        // Create channel and immediately drop the sender
-        let (tx, rx) = mpsc::channel::<PendingResponse>(1);
-        app.pending_response = Some(rx);
-        drop(tx); // Simulate task ending without sending
-
-        // Call tick - should handle disconnection
-        app.tick().await;
-
-        // Should show error message
-        let last_msg = app.chat.messages.last().unwrap();
-        assert!(
-            last_msg.content.contains("unexpectedly") || last_msg.role == MessageRole::System,
-            "Should show disconnection error. Got: {}",
-            last_msg.content
-        );
-        assert!(!app.chat.awaiting_response);
     }
 
     // =========================================================================
@@ -8618,7 +8358,7 @@ mod tests {
         // Navigate down to last item
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for _ in 0..10 {
-                app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                     .await;
             }
         });
@@ -8628,7 +8368,7 @@ mod tests {
         // Navigate up past beginning
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for _ in 0..10 {
-                app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+                app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
                     .await;
             }
         });
@@ -8649,7 +8389,7 @@ mod tests {
 
         // Try to navigate - should stay at 0 since only 1 item
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         });
         assert_eq!(app.jobs_state.selected_index, 0);
@@ -8689,7 +8429,7 @@ mod tests {
         // Navigate through all 100 sources and measure time
         let start = Instant::now();
         for _ in 0..99 {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         }
         let elapsed = start.elapsed();
@@ -8735,7 +8475,7 @@ mod tests {
         // Navigate through 1000 files and measure time
         let start = Instant::now();
         for _ in 0..1000 {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         }
         let elapsed = start.elapsed();
@@ -8793,7 +8533,7 @@ mod tests {
         // Navigate through 500 jobs and measure time
         let start = Instant::now();
         for _ in 0..500 {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         }
         let elapsed = start.elapsed();
@@ -8860,122 +8600,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Inspect Mode Tests - Critical Path Coverage
-    // =========================================================================
-
-    fn create_test_tables() -> Vec<TableInfo> {
-        vec![
-            TableInfo {
-                name: "orders".into(),
-                row_count: 1000,
-                column_count: 5,
-                size_bytes: 50000,
-                last_updated: Local::now(),
-            },
-            TableInfo {
-                name: "customers".into(),
-                row_count: 500,
-                column_count: 8,
-                size_bytes: 25000,
-                last_updated: Local::now(),
-            },
-        ]
-    }
-
-    #[test]
-    fn test_inspect_navigation() {
-        let mut app = App::new(test_args());
-        app.mode = TuiMode::Inspect;
-        app.inspect.tables = create_test_tables();
-        app.inspect.selected_table = 0;
-
-        // Navigate down
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-                .await;
-        });
-        assert_eq!(app.inspect.selected_table, 1);
-
-        // Try to go past end
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-                .await;
-        });
-        assert_eq!(app.inspect.selected_table, 1); // Stays at last
-
-        // Navigate up
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
-                .await;
-        });
-        assert_eq!(app.inspect.selected_table, 0);
-    }
-
-    #[test]
-    fn test_inspect_query_focus_toggle() {
-        let mut app = App::new(test_args());
-        app.mode = TuiMode::Inspect;
-        app.inspect.tables = create_test_tables();
-        assert!(!app.inspect.query_focused);
-
-        // Press / to focus query
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
-                .await;
-        });
-        assert!(app.inspect.query_focused);
-
-        // Press Esc to unfocus
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
-        assert!(!app.inspect.query_focused);
-    }
-
-    #[test]
-    fn test_inspect_query_input() {
-        let mut app = App::new(test_args());
-        app.mode = TuiMode::Inspect;
-        app.inspect.tables = create_test_tables();
-        app.inspect.query_focused = true;
-
-        // Type a query
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for c in "SELECT".chars() {
-                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                    .await;
-            }
-        });
-        assert_eq!(app.inspect.query_input, "SELECT");
-
-        // Backspace
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-                .await;
-        });
-        assert_eq!(app.inspect.query_input, "SELEC");
-    }
-
-    #[test]
-    fn test_inspect_navigation_blocked_when_query_focused() {
-        let mut app = App::new(test_args());
-        app.mode = TuiMode::Inspect;
-        app.inspect.tables = create_test_tables();
-        app.inspect.selected_table = 0;
-        app.inspect.query_focused = true;
-
-        // Try to navigate with j - should NOT move selection (j goes to query)
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-                .await;
-        });
-        // Selection unchanged, but 'j' was typed into query
-        assert_eq!(app.inspect.selected_table, 0);
-        assert_eq!(app.inspect.query_input, "j");
-    }
-
-    // =========================================================================
     // JobStatus Display Method Tests
     // =========================================================================
 
@@ -9010,30 +8634,12 @@ mod tests {
 
         // Try to navigate - should not panic
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
-            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
                 .await;
         });
         assert_eq!(app.jobs_state.selected_index, 0);
-    }
-
-    #[test]
-    fn test_inspect_empty_tables_navigation() {
-        let mut app = App::new(test_args());
-        app.mode = TuiMode::Inspect;
-        // Empty tables list
-        app.inspect.tables = vec![];
-        app.inspect.selected_table = 0;
-
-        // Try to navigate - should not panic
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
-                .await;
-            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
-                .await;
-        });
-        assert_eq!(app.inspect.selected_table, 0);
     }
 
     #[test]
@@ -9317,13 +8923,13 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_esc_goes_home_when_no_dialog() {
+    fn test_discover_esc_no_view_change_when_no_dialog() {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
         // No dialogs open - view_state should be Files
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
-        // Esc should go to Home
+        // Esc should not change views
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
                 .await;
@@ -9340,28 +8946,28 @@ mod tests {
 
         // Navigate down with j
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         });
         assert_eq!(app.discover.selected, 1);
 
         // Navigate down again
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         });
         assert_eq!(app.discover.selected, 2);
 
         // Try to navigate past end
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
                 .await;
         });
         assert_eq!(app.discover.selected, 2); // Stays at last
 
         // Navigate up
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
                 .await;
         });
         assert_eq!(app.discover.selected, 1);
@@ -9781,8 +9387,8 @@ mod tests {
         // Should be back in Files state with files populated
         assert_eq!(
             app.discover.view_state,
-            DiscoverViewState::Files,
-            "Should return to Files after scan completes"
+            DiscoverViewState::RuleBuilder,
+            "Should return to RuleBuilder after scan completes"
         );
         assert!(
             !app.discover.files.is_empty(),
@@ -9840,7 +9446,7 @@ mod tests {
         // Verify scan completed successfully
         assert_eq!(
             app.discover.view_state,
-            DiscoverViewState::Files,
+            DiscoverViewState::RuleBuilder,
             "Scan should complete"
         );
 
@@ -10189,6 +9795,8 @@ mod tests {
     async fn test_scan_partial_batches_not_lost() {
         // Test that partial batches (less than BATCH_SIZE=1000) are correctly flushed
         // This validates the FlushGuard drop behavior
+        use std::time::Duration;
+
         let temp_dir = tempfile::TempDir::new().unwrap();
 
         // Create exactly 150 files - less than BATCH_SIZE (1000)
@@ -10204,12 +9812,14 @@ mod tests {
         let path = temp_dir.path().to_string_lossy().to_string();
         app.scan_directory(&path);
 
-        // Wait for scan to complete
-        let mut iterations = 0;
-        while app.discover.view_state == DiscoverViewState::Scanning && iterations < 500 {
+        // Wait for scan to complete (with timeout)
+        let start = std::time::Instant::now();
+        while app.discover.view_state == DiscoverViewState::Scanning {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("Scan did not complete within 10 seconds");
+            }
             app.tick().await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            iterations += 1;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         // All 150 files should be present - partial batch was flushed

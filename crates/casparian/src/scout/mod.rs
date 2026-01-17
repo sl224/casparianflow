@@ -6,6 +6,7 @@
 pub mod db;
 pub mod error;
 pub mod extractor;
+pub mod scan_path;
 pub mod scanner;
 pub mod tagger;
 pub mod types;

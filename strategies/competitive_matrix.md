@@ -158,14 +158,7 @@ These competitors appear across multiple verticals:
 
 ## 4. Pricing Philosophy Comparison
 
-| Vertical | Our Entry Price | Typical Alternative | Savings |
-|----------|-----------------|---------------------|---------|
-| Finance | $15K/desk/year | $50-100K (TCA tools) | 70-85% |
-| Healthcare | $15K/year | $50K+ (analytics platforms) | 70% |
-| Defense | $50K/deployment | $1M+ (Palantir) | 95% |
-| Legal | $10K/firm/year | $150K+ (Relativity) | 93% |
-| Manufacturing | $15K/plant/year | $100K+ (historian licenses) | 85% |
-| Mid-Size | $200/user/month | $2K/month (Fivetran) | 90% |
+Pricing tiers and entry points are centralized in `specs/pricing_v2_refined.md`. Use those values for competitive framing and avoid restating tier prices here. Defense remains deployment-based; all other verticals follow the universal ladder.
 
 ---
 

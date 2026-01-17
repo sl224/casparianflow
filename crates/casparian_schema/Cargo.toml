@@ -27,7 +27,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Database abstraction
 casparian_db = { path = "../casparian_db" }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { workspace = true, default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 
 # Error handling
 thiserror.workspace = true

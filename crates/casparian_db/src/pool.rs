@@ -113,6 +113,8 @@ impl DbConfig {
             max_connections: match db_type {
                 #[cfg(feature = "sqlite")]
                 DatabaseType::Sqlite => 5,
+                #[cfg(feature = "duckdb")]
+                DatabaseType::DuckDb => 1, // DuckDB is single-writer
                 #[cfg(feature = "postgres")]
                 DatabaseType::Postgres => 10,
             },
@@ -146,7 +148,24 @@ impl DbConfig {
 /// - The license doesn't allow the database type
 /// - The database type isn't compiled in
 /// - Connection fails
+/// - DuckDB URL is passed (use `DbConnection::open_duckdb()` instead)
+///
+/// # Note
+///
+/// DuckDB is not supported via `create_pool()` because it requires single-writer
+/// file locking and doesn't use sqlx connection pools. Use `DbConnection::open_duckdb()`
+/// from the `backend` module for DuckDB access.
 pub async fn create_pool(config: DbConfig) -> Result<DbPool, DbError> {
+    // DuckDB should not be used via create_pool - it needs special handling
+    // via DbConnection::open_duckdb() for file locking
+    #[cfg(feature = "duckdb")]
+    if config.db_type == DatabaseType::DuckDb {
+        return Err(DbError::NotCompiled(
+            "DuckDB".to_string(),
+            "duckdb (use DbConnection::open_duckdb() instead of create_pool)".to_string(),
+        ));
+    }
+
     // Check license for enterprise features
     if config.db_type.requires_license() {
         config.license.allows(config.db_type)?;
@@ -156,9 +175,9 @@ pub async fn create_pool(config: DbConfig) -> Result<DbPool, DbError> {
         );
     }
 
-    // Create pool based on compiled feature
+    // Create pool based on compiled feature and db_type
     #[cfg(feature = "sqlite")]
-    {
+    if config.db_type == DatabaseType::Sqlite {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.url)
@@ -170,8 +189,8 @@ pub async fn create_pool(config: DbConfig) -> Result<DbPool, DbError> {
         return Ok(pool);
     }
 
-    #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
-    {
+    #[cfg(feature = "postgres")]
+    if config.db_type == DatabaseType::Postgres {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.url)
@@ -181,11 +200,17 @@ pub async fn create_pool(config: DbConfig) -> Result<DbPool, DbError> {
         return Ok(pool);
     }
 
-    // This should be unreachable if at least one feature is enabled
-    #[allow(unreachable_code)]
+    // Database type not compiled in or not supported
     Err(DbError::NotCompiled(
-        "unknown".to_string(),
-        "sqlite or postgres".to_string(),
+        format!("{}", config.db_type),
+        match config.db_type {
+            #[cfg(feature = "sqlite")]
+            DatabaseType::Sqlite => "sqlite".to_string(),
+            #[cfg(feature = "duckdb")]
+            DatabaseType::DuckDb => "duckdb".to_string(),
+            #[cfg(feature = "postgres")]
+            DatabaseType::Postgres => "postgres".to_string(),
+        },
     ))
 }
 

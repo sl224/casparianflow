@@ -1,8 +1,10 @@
 //! Simple script to download the default LLM model for AI Wizards
 //! Run with: cargo run --features local-llm --example download_model
 
+#[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
 
+#[cfg(feature = "hf-hub")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Downloading Qwen2.5-Coder-1.5B model for AI Wizards...\n");
 
@@ -44,5 +46,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Path: {:?}", model_path);
     println!("Size: {} MB", size / 1_000_000);
 
+    Ok(())
+}
+
+#[cfg(not(feature = "hf-hub"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("This example requires the `local-llm` feature (enables `hf-hub`).");
+    eprintln!("Run: cargo run --features local-llm --example download_model");
     Ok(())
 }

@@ -1,7 +1,7 @@
 # Streaming Scanner Architecture
 
-**Version:** 1.1
-**Status:** DRAFT
+**Version:** 1.2
+**Status:** DRAFT (Reliability fixes implemented, incremental folder updates pending)
 **Created:** 2026-01-14
 **Related:** specs/views/discover.md (Glob Explorer), CLAUDE.md (Database)
 
@@ -38,7 +38,7 @@ The current scanner architecture has a hard memory ceiling:
 - Distributed scanning (single machine)
 - Incremental diff scanning (future enhancement)
 
-### 1.4 Implementation Gap (2026-01-14)
+### 1.4 Implementation Gap: Incremental Folder Updates (2026-01-14)
 
 > **STATUS: SPEC-IMPLEMENTATION MISMATCH**
 >
@@ -74,6 +74,33 @@ while let Some(files) = rx.recv().await {
 1. Move `batch_update_folder_counts()` INTO the persist loop (per batch)
 2. Remove post-scan `build_folder_counts()` call
 3. Handle UPSERT with `ON CONFLICT` for incremental count updates
+
+### 1.5 Scanner Reliability Fixes (2026-01-16)
+
+> **STATUS: IMPLEMENTED**
+>
+> All 10 issues from `docs/SCAN_REVIEW.md` have been fixed. These address scanner
+> reliability, cross-platform compatibility, and progress reporting accuracy.
+
+**Critical Fixes:**
+- **GAP-SCAN-001**: `scan_ok` flag prevents marking files deleted on partial/failed scans
+- **GAP-SCAN-002**: Batch upsert now clears `error`/`sentinel_job_id` on file change
+
+**High Priority Fixes:**
+- **GAP-SCAN-003**: Cross-platform path normalization (forward slashes)
+- **GAP-SCAN-004**: Folder cache truncation tracking for UI indicators
+
+**Medium Priority Fixes:**
+- **GAP-SCAN-005**: Separate `files_found` vs `files_persisted` counters
+- **GAP-SCAN-006**: Immediate directory counting (not batched)
+- **GAP-SCAN-007**: `AtomicU64` for byte counts (32-bit safe)
+- **GAP-SCAN-008**: Progress updates per-file, not per-batch
+- **GAP-SCAN-009**: Reliable symlink detection via `entry.file_type()`
+
+**Low Priority Fixes:**
+- **GAP-SCAN-010**: Correct SQLite bulk insert chunk size (83 rows)
+
+See `docs/SCAN_REVIEW.md` for detailed implementation notes.
 
 ---
 
@@ -882,3 +909,4 @@ async fn test_tui_folder_navigation() {
 |---------|------|---------|
 | 1.0 | 2026-01-14 | Initial specification |
 | 1.1 | 2026-01-14 | Gap fixes: batch upserts (4.2), count decrement (4.3), staleness detection (4.5), partial cancel state (6.3), .bin.zst migration (8.2) |
+| 1.2 | 2026-01-16 | Added Section 1.5: Scanner reliability fixes (GAP-SCAN-001 through GAP-SCAN-010) from docs/SCAN_REVIEW.md |

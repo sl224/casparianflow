@@ -7,6 +7,7 @@
 
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{color_for_extension, format_size, format_time, print_table_colored};
+use crate::scout::scan_path;
 use crate::scout::{Database, ScannedFile, Scanner, Source, SourceType};
 use comfy_table::Color;
 use crossterm::{
@@ -48,7 +49,7 @@ pub struct ScanArgs {
 pub struct DiscoveredFile {
     pub path: PathBuf,
     pub name: String,
-    pub extension: String,
+    pub extension: Option<String>,
     pub size: u64,
     #[serde(with = "system_time_serde")]
     pub modified: SystemTime,
@@ -88,12 +89,9 @@ mod system_time_serde {
     }
 }
 
-/// Get the default database path
+/// Get the active database path
 fn get_db_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".casparian_flow")
-        .join("casparian_flow.sqlite3")
+    crate::cli::config::active_db_path()
 }
 
 /// Build a GlobSet from pattern strings
@@ -140,18 +138,21 @@ fn matches_patterns(
 /// Uses the consolidated Scanner for file discovery, storage, and cache building.
 /// CLI-specific filters are applied post-scan for display and tagging.
 pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
-    // Validate path exists
-    if !args.path.exists() {
-        return Err(HelpfulError::path_not_found(&args.path).into());
-    }
-
-    // Validate path is a directory
-    if !args.path.is_dir() {
-        return Err(HelpfulError::not_a_directory(&args.path).into());
+    let expanded_path = scan_path::expand_scan_path(&args.path);
+    if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+        return Err(match err {
+            scan_path::ScanPathError::NotFound(path) => HelpfulError::path_not_found(&path),
+            scan_path::ScanPathError::NotDirectory(path) => HelpfulError::not_a_directory(&path),
+            scan_path::ScanPathError::NotReadable(path) => HelpfulError::new(format!(
+                "Cannot read directory: {}",
+                path.display()
+            )),
+        }
+        .into());
     }
 
     // Canonicalize scan path
-    let scan_path = args.path.canonicalize().unwrap_or_else(|_| args.path.clone());
+    let scan_path = scan_path::canonicalize_scan_path(&expanded_path);
 
     // Setup database
     let db_path = get_db_path();
@@ -226,8 +227,7 @@ fn scanned_to_discovered(file: &ScannedFile) -> DiscoveredFile {
     let extension = path
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+        .map(|ext| ext.to_lowercase());
     let modified = UNIX_EPOCH + Duration::from_millis(file.mtime as u64);
 
     DiscoveredFile {
@@ -321,8 +321,11 @@ fn apply_cli_filters(
         }
 
         // Apply type filter
-        if !type_filters.is_empty() && !type_filters.contains(&discovered.extension) {
-            continue;
+        if !type_filters.is_empty() {
+            let ext = discovered.extension.as_deref().unwrap_or("");
+            if !type_filters.iter().any(|t| t == ext) {
+                continue;
+            }
         }
 
         files.push(discovered);
@@ -404,11 +407,11 @@ fn build_summary(files: &[DiscoveredFile], directories_scanned: usize) -> ScanSu
     for file in files {
         total_size += file.size;
 
-        let ext = if file.extension.is_empty() {
-            "(no ext)".to_string()
-        } else {
-            file.extension.clone()
-        };
+        let ext = file
+            .extension
+            .as_deref()
+            .unwrap_or("(no ext)")
+            .to_string();
 
         *files_by_type.entry(ext.clone()).or_insert(0) += 1;
         *size_by_type.entry(ext).or_insert(0) += file.size;
@@ -489,11 +492,12 @@ fn output_table(result: &ScanResult, stored: usize, tagged: usize, tag: Option<&
         .files
         .iter()
         .map(|file| {
-            let ext_color = color_for_extension(&file.extension);
-            let ext_display = if file.extension.is_empty() {
+            let ext_value = file.extension.as_deref().unwrap_or("");
+            let ext_color = color_for_extension(ext_value);
+            let ext_display = if ext_value.is_empty() {
                 "-".to_string()
             } else {
-                file.extension.clone()
+                ext_value.to_string()
             };
 
             // Get relative path from scan root
@@ -743,7 +747,13 @@ fn draw_interactive(frame: &mut Frame, state: &mut InteractiveState) {
         .files
         .iter()
         .map(|file| {
-            let ext_style = match file.extension.as_str() {
+            let ext_value = file.extension.as_deref().unwrap_or("");
+            let ext_display = if ext_value.is_empty() {
+                "-".to_string()
+            } else {
+                ext_value.to_uppercase()
+            };
+            let ext_style = match ext_value {
                 "csv" | "tsv" => Style::default().fg(ratatui::style::Color::Green),
                 "json" | "jsonl" | "ndjson" => Style::default().fg(ratatui::style::Color::Yellow),
                 "parquet" | "pq" => Style::default().fg(ratatui::style::Color::Magenta),
@@ -759,7 +769,7 @@ fn draw_interactive(frame: &mut Frame, state: &mut InteractiveState) {
 
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{:<4} ", file.extension.to_uppercase()),
+                    format!("{:<4} ", ext_display),
                     ext_style,
                 ),
                 Span::raw(format!("{:>8}  ", format_size(file.size))),
@@ -814,7 +824,52 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _temp_dir: TempDir,
+        prev_home: Option<String>,
+        prev_backend: Option<String>,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let lock = TEST_ENV_LOCK.lock().expect("test env lock");
+            let temp_dir = TempDir::new().unwrap();
+            let prev_home = std::env::var("CASPARIAN_HOME").ok();
+            let prev_backend = std::env::var("CASPARIAN_DB_BACKEND").ok();
+
+            std::env::set_var("CASPARIAN_HOME", temp_dir.path());
+            std::env::set_var("CASPARIAN_DB_BACKEND", "sqlite");
+
+            Self {
+                _lock: lock,
+                _temp_dir: temp_dir,
+                prev_home,
+                prev_backend,
+            }
+        }
+    }
+
+    impl Drop for TestEnv {
+        fn drop(&mut self) {
+            if let Some(home) = self.prev_home.take() {
+                std::env::set_var("CASPARIAN_HOME", home);
+            } else {
+                std::env::remove_var("CASPARIAN_HOME");
+            }
+
+            if let Some(backend) = self.prev_backend.take() {
+                std::env::set_var("CASPARIAN_DB_BACKEND", backend);
+            } else {
+                std::env::remove_var("CASPARIAN_DB_BACKEND");
+            }
+        }
+    }
 
     fn create_test_files(dir: &Path) {
         // Create test files
@@ -842,6 +897,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_basic() {
+        let _env = TestEnv::new();
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
 
@@ -865,6 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_type_filter() {
+        let _env = TestEnv::new();
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
 
@@ -888,6 +945,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_non_recursive() {
+        let _env = TestEnv::new();
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
 
@@ -911,6 +969,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_nonexistent_path() {
+        let _env = TestEnv::new();
         let args = ScanArgs {
             path: PathBuf::from("/nonexistent/path/that/does/not/exist"),
             types: vec![],
@@ -964,21 +1023,21 @@ mod tests {
             DiscoveredFile {
                 path: PathBuf::from("test.csv"),
                 name: "test.csv".to_string(),
-                extension: "csv".to_string(),
+                extension: Some("csv".to_string()),
                 size: 100,
                 modified: SystemTime::now(),
             },
             DiscoveredFile {
                 path: PathBuf::from("data.csv"),
                 name: "data.csv".to_string(),
-                extension: "csv".to_string(),
+                extension: Some("csv".to_string()),
                 size: 200,
                 modified: SystemTime::now(),
             },
             DiscoveredFile {
                 path: PathBuf::from("info.json"),
                 name: "info.json".to_string(),
-                extension: "json".to_string(),
+                extension: Some("json".to_string()),
                 size: 50,
                 modified: SystemTime::now(),
             },

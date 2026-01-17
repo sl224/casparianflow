@@ -477,7 +477,22 @@ This is almost a verbatim description of Casparian's capabilities.
 4. Monitor [defensesbirsttr.mil](https://www.defensesbirsttr.mil) weekly for reauthorization news
 5. Draft technical approach for interoperability-focused topic
 
-### 7.3 Pricing Strategy - Value-Based
+### 7.3 Killer Demo Clips (Defense)
+
+**Flagship: "Air-Gapped CoT Replay"**
+- Hook: "No cloud. No server. Laptop-only CoT analytics."
+- Scan + auto-tag: `casparian scan /mission_data --auto-tag` (CoT + imagery tags)
+- Parse: `casparian process --tag cot_logs`
+- Query: filter tracks by callsign/time window
+- Export: CoT replay file for TAK
+- Close: "Local-first. Deploy anywhere."
+
+**Secondary: "PCAP to Flows in 60s"**
+- Drop a PCAP folder, parse to flow table
+- Query: top talkers or DNS anomalies
+- Emphasize: batch analysis without Wireshark
+
+### 7.4 Pricing Strategy - Value-Based
 
 > **Pricing Philosophy:** Defense buyers expect enterprise pricing. Low prices signal "not serious." See [STRATEGY.md](../STRATEGY.md#value-based-pricing-strategy) for framework.
 
@@ -552,7 +567,7 @@ This is almost a verbatim description of Casparian's capabilities.
 
 Note: SBIR funding counted separately from commercial ARR.
 
-### 7.4 Compliance Roadmap
+### 7.5 Compliance Roadmap
 
 | Milestone | Timeline | Purpose |
 |-----------|----------|---------|
@@ -779,4 +794,3 @@ HAVING passage_count > 5;
 | 2026-01-08 | 0.1 | Initial draft based on research and analysis |
 | 2026-01-08 | 0.2 | Gap analysis integration: Added PCAP parser (Priority 2); Enhanced KML/KMZ section with schemas; Updated format priority and roadmap |
 | 2026-01-08 | 0.3 | **SBIR research:** Added detailed SBIR/STTR section with best-fit topics (A254-011, GenAI Tactical Network); Created companion doc [dod_sbir_opportunities.md](dod_sbir_opportunities.md); Noted program expiration and reauthorization status |
-

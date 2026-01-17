@@ -14,6 +14,9 @@ members = [
     "crates/casparian_profiler",
     "crates/casparian_db",
 ]
+default-members = [
+    "crates/casparian",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,7 +27,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1.42", features = ["full"] }
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "io-std", "process", "net"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -39,11 +42,15 @@ thiserror = "1.0"
 zeromq = "0.4"
 
 # Arrow & Parquet (for future use in data plane)
-arrow = "53.3"
-parquet = "53.3"
+# Upgraded to 54.x to fix chrono 0.4.43 incompatibility in arrow-arith 53.x
+arrow = "54"
+parquet = "54"
+
+# Note: We need chrono with serde for time handling
+chrono = { version = "0.4", features = ["serde"] }
 
 # Database (for future use in sentinel)
-sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "postgres", "any", "chrono"] }
+sqlx = { version = "0.8", default-features = false }
 
 # Tracing/Logging
 tracing = "0.1"
@@ -51,6 +58,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI parsing (for future use)
 clap = { version = "4.5", features = ["derive", "env"] }
-
-# Parallel processing
-rayon = "1.10"

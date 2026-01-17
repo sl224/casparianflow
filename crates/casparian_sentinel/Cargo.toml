@@ -27,7 +27,7 @@ serde_json.workspace = true
 
 # Database
 casparian_db = { path = "../casparian_db" }
-sqlx.workspace = true
+sqlx = { workspace = true, default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 
 # Error handling
 anyhow.workspace = true
@@ -42,7 +42,6 @@ clap.workspace = true
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.11", features = ["v4"] }
 sha2 = "0.10"
 
 [dev-dependencies]

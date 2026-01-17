@@ -9,12 +9,58 @@ pub mod output;
 
 // W1: Core commands (fully implemented)
 pub mod scan;
+#[cfg(feature = "data-plane")]
 pub mod preview;
+#[cfg(not(feature = "data-plane"))]
+pub mod preview {
+    use std::path::PathBuf;
+
+    #[derive(Debug)]
+    pub struct PreviewArgs {
+        pub file: PathBuf,
+        pub rows: usize,
+        pub schema: bool,
+        pub raw: bool,
+        pub head: Option<usize>,
+        pub delimiter: Option<char>,
+        pub json: bool,
+    }
+
+    pub fn run(_args: PreviewArgs) -> anyhow::Result<()> {
+        anyhow::bail!("preview requires the `data-plane` feature")
+    }
+}
 pub mod run;
 pub mod backfill;
 
 // W2: Tagging commands (stubs)
+#[cfg(feature = "data-plane")]
 pub mod tag;
+#[cfg(not(feature = "data-plane"))]
+pub mod tag {
+    use std::path::PathBuf;
+
+    #[derive(Debug)]
+    pub struct TagArgs {
+        pub path: Option<PathBuf>,
+        pub topic: Option<String>,
+        pub dry_run: bool,
+        pub no_queue: bool,
+    }
+
+    #[derive(Debug)]
+    pub struct UntagArgs {
+        pub path: PathBuf,
+    }
+
+    pub fn run(_args: TagArgs) -> anyhow::Result<()> {
+        anyhow::bail!("tag requires the `data-plane` feature")
+    }
+
+    pub fn run_untag(_args: UntagArgs) -> anyhow::Result<()> {
+        anyhow::bail!("untag requires the `data-plane` feature")
+    }
+}
 pub mod files;
 
 // W3: Parser commands (stubs)

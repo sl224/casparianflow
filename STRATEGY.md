@@ -526,81 +526,30 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 
 Per Marc Andreessen's framework:
 
-1. **Proves the moat:** If customers pay $15K/year, it proves differentiation is real
+1. **Proves the moat:** If customers pay $6K/month, it proves differentiation is real
 2. **Funds growth:** Higher margins enable enterprise sales investment
 3. **Signals quality:** Defense/healthcare buyers are suspicious of cheap software
 4. **Enables customer success:** Higher-paying customers get white-glove onboarding
 5. **Faster iteration:** Revenue funds R&D for better product
 
-### Revised Pricing Strategy (Value-Based)
+### Pricing Strategy (System of Record)
 
-#### Finance Vertical
-
-| Tier | Price | Value Capture | Target |
-|------|-------|---------------|--------|
-| **Starter** | Free | N/A | Students, evaluation |
-| **Professional** | $500/user/month | ~3% of value | Individual analysts |
-| **Trading Desk** | $15,000/desk/year | ~10% of value | Operations teams |
-| **Enterprise** | $50,000+/year | Custom | Multi-desk, compliance |
-
-**Justification:** Trade Support Engineer fully loaded cost = $150K/year. Time savings = 6+ hours/day. Settlement risk reduction = incalculable. $15K/desk captures ~10% of quantifiable value.
-
-#### Legal Vertical
-
-| Tier | Price | Value Capture | Target |
-|------|-------|---------------|--------|
-| **Solo** | Free | N/A | Solo practitioners, evaluation |
-| **Firm** | $500/user/month | ~5% of value | Small firms |
-| **Litigation Team** | $20,000/year | ~10% of value | Active litigation teams |
-| **Enterprise** | $75,000+/year | Custom | Multi-office firms |
-
-**Justification:** Current vendor processing = $5-15K per matter × 20-50 matters/year = $100-750K/year. $20K captures 3-20% of savings.
-
-#### Defense Vertical
-
-| Tier | Price | Value Capture | Target |
-|------|-------|---------------|--------|
-| **Open Source** | Free | N/A | Evaluation, ATAK-CIV users |
-| **Tactical** | $50,000/deployment/year | ~5% of value | Single-site tactical |
-| **Mission** | $150,000/deployment/year | ~10% of value | Multi-format, 24x7 support |
-| **Program** | $500,000+/year | Custom | Multi-site, SBIR Phase III |
-
-**Justification:** No laptop-deployable alternative exists. Palantir contracts = $10B+. Air-gapped capability is rare. Defense budgets expect enterprise pricing.
-
-#### Healthcare Vertical
-
-| Tier | Price | Value Capture | Target |
-|------|-------|---------------|--------|
-| **Community** | Free | N/A | Small clinics, evaluation |
-| **Clinic** | $250/month | ~3% of value | Small practices |
-| **Hospital** | $25,000/year | ~10% of value | Single facility |
-| **Health System** | $100,000+/year | Custom | Multi-facility |
-
-**Justification:** HL7 interface projects = $100K+ and 6-month wait. Compliance audit prep = $20-50K. $25K captures 10-20% of avoided costs.
-
-#### MSP/SMB Channel
-
-| Tier | Price | MSP Markup | End Client Cost |
-|------|-------|------------|-----------------|
-| **Per-Client** | $25-50/client/month | 3-5x | $75-200/month |
-| **White-Label** | $2,500/month base | Full control | MSP sets price |
-
-**Note:** MSP channel uses lower per-unit pricing because volume and channel leverage justify different economics.
+Pricing tiers, units, and vertical mappings live in `specs/pricing_v2_refined.md`. Strategy docs should not restate tier tables. Use the universal ladder plus the vertical mapping in that doc, with Defense as the only pricing-unit exception.
 
 ### Pricing Implementation Roadmap
 
 **Phase 1: Finance Validation (Months 1-3)**
-- Approach 5 trading desks with $15K/desk/year offer
+- Offer the Trading Desk tier and test willingness-to-pay
 - If accepted: moat validated, continue at this price
 - If rejected: gather feedback, adjust
 
 **Phase 2: Legal Testing (Months 3-6)**
-- Offer litigation teams $20K/year
-- Position: "$20K/year vs. $100K+/year in vendor costs"
+- Offer the Litigation Team tier
+- Position against vendor processing spend and turnaround speed
 
 **Phase 3: Defense SBIR (Parallel)**
-- Price at $50K-150K from day one
-- Defense expects enterprise pricing; low prices signal "not serious"
+- Offer Tactical/Mission tiers from day one
+- Defense expects enterprise procurement signals
 
 ### Competitive Pricing Context
 
@@ -612,88 +561,11 @@ Per Marc Andreessen's framework:
 | Palantir | $1M+/year | Upstream enabler, different value |
 | Fivetran (at scale) | $500,000+/year | 10% of price, industry formats |
 
-Even at $50K/year, Casparian is **the cheap option** compared to enterprise alternatives.
+Even at ~$96K/year (Enterprise tier), Casparian is **the cheap option** compared to enterprise alternatives.
 
-### Revenue Impact (Revised Projections)
+### Revenue Modeling
 
-**Conservative scenario with value-based pricing:**
-
-| Vertical | Year 1 Customers | Avg Price | Revenue |
-|----------|------------------|-----------|---------|
-| Finance | 20 desks | $15,000 | $300,000 |
-| Legal | 30 firms | $10,000 | $300,000 |
-| Defense | 3 deployments | $50,000 | $150,000 |
-| Healthcare | 10 hospitals | $15,000 | $150,000 |
-| MSP/SMB | 50 accounts | $3,000 | $150,000 |
-| **Total Y1** | | | **$1,050,000** |
-
-This is **4x the previous $250K target** with similar sales effort—just higher prices.
-
-### Revenue Projections: Scenario Analysis
-
-**Caveat:** These are modeled scenarios, not projections. Actual revenue depends on validated pricing and conversion rates.
-
-#### Scenario A: Direct Sales Only (No MSP Channel)
-
-| Segment | # Customers | Avg MRR | Annual Revenue |
-|---------|-------------|---------|----------------|
-| Pro (individuals) | 200 | $50 | $120K |
-| Team (mid-market) | 50 | $400 | $240K |
-| Enterprise | 10 | $2,000 | $240K |
-| **Total** | **260** | | **$600K ARR** |
-
-*Assumption: 1-2% conversion from free tier, 18-month enterprise sales cycle*
-
-#### Scenario B: MSP Channel Focus
-
-| MSP Tier | # MSPs | Avg Clients | Price/Client | Annual Revenue |
-|----------|--------|-------------|--------------|----------------|
-| Tier 1 (small) | 100 | 5 | $20/mo | $120K |
-| Tier 2 (mid) | 50 | 25 | $20/mo | $300K |
-| Tier 3 (large) | 10 | 75 | $25/mo | $225K |
-| White-label OEM | 5 | N/A | $1,500/mo | $90K |
-| **Total** | **165 MSPs** | **~2,000 end clients** | | **$735K ARR** |
-
-*Assumption: Per-client pricing; MSP marks up 3-5x to end clients ($60-100/client)*
-
-#### Scenario C: Hybrid (MSP + Direct)
-
-| Channel | Annual Revenue | % of Total |
-|---------|----------------|------------|
-| MSP channel | $500K | 45% |
-| Direct mid-market | $300K | 27% |
-| Enterprise | $300K | 27% |
-| **Total** | | **$1.1M ARR** |
-
-*This is the most likely scenario at 24-month maturity*
-
-#### Why MSP Channel Changes the Math
-
-| Factor | Direct to SMB | Via MSP Channel |
-|--------|---------------|-----------------|
-| Technical buyer? | NO (practice owner) | YES (MSP technician) |
-| Sales motion | Impossible (no IT staff) | B2B (MSP is the customer) |
-| Support burden | High (non-technical users) | Low (MSP handles end-user) |
-| Price sensitivity | High | Lower (MSP bundles) |
-| Scalability | Linear (1 customer = 1 SMB) | Leverage (1 MSP = 10-50 SMBs) |
-
-**Key insight:** 100 MSP customers could represent 1,000-5,000 end SMB clients. The MSP channel provides leverage that direct SMB sales cannot.
-
-#### Revenue Confidence Levels
-
-| Scenario | 12-Month | 24-Month | Confidence |
-|----------|----------|----------|------------|
-| Conservative | $100K | $400K | High |
-| Base case | $250K | $800K | Medium |
-| Optimistic | $500K | $1.5M | Low |
-
-**What we still don't know:**
-1. Will MSPs pay $20/client/month? (Need 5 pilot MSPs to validate)
-2. MSP sales cycle length (estimated 30-90 days vs. 12-18 months enterprise)
-3. Churn rate (MSPs may drop tools faster than enterprises)
-4. White-label demand (requires more product maturity)
-
-**Recommendation:** Target 5 MSP pilots in first 90 days to validate per-client pricing model.
+Revenue scenarios depend on the pricing ladder in `specs/pricing_v2_refined.md` and should live in a dedicated financial model to avoid drift. Keep narrative strategy here; maintain numbers in the model.
 
 ### Non-Dilutive Funding: Open Core Strategy
 

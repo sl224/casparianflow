@@ -666,7 +666,7 @@ fn main() -> Result<()> {
             venvs_dir,
         } => {
             // Use config module for defaults
-            let db_path = database.unwrap_or_else(cli::config::default_db_path);
+            let db_path = database.unwrap_or_else(cli::config::active_db_path);
             let output_dir = output.unwrap_or_else(cli::config::output_dir);
             run_unified(addr, db_path, output_dir, data_threads, venvs_dir)
         }
@@ -921,7 +921,7 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
     rt.block_on(async move {
         // Resolve database URL: if it's the default, use config module resolution
         let database_url = if args.database == "sqlite://casparian_flow.db" {
-            let db_path = cli::config::default_db_path();
+            let db_path = cli::config::active_db_path();
             format!("sqlite:{}?mode=rwc", db_path.display())
         } else {
             args.database
@@ -1298,72 +1298,7 @@ fn process_single_job(
     match result {
         Ok(bridge_result) => {
             std::fs::create_dir_all(output_dir)?;
-
-            // Handle outputs based on output_info (multi-output support)
-            let mut output_paths: Vec<String> = vec![];
-
-            if bridge_result.output_info.is_empty() {
-                // Legacy: single parquet output (no output_info)
-                let output_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
-                if !bridge_result.batches.is_empty() {
-                    let batch_refs: Vec<&arrow::array::RecordBatch> = bridge_result.batches.iter().collect();
-                    write_parquet_output(&output_path, &batch_refs)?;
-                    info!(output = %output_path.display(), batches = bridge_result.batches.len(), "Wrote parquet output");
-                }
-                output_paths.push(output_path.to_string_lossy().to_string());
-            } else {
-                // Multi-output: route each output to its appropriate sink
-                // Group by sink type for efficiency
-                let mut sqlite_outputs: Vec<(String, &arrow::array::RecordBatch)> = vec![];
-                let mut parquet_batches: Vec<&arrow::array::RecordBatch> = vec![];
-
-                for (i, output_info) in bridge_result.output_info.iter().enumerate() {
-                    if i >= bridge_result.batches.len() {
-                        warn!("Output info {} has no corresponding batch", output_info.name);
-                        continue;
-                    }
-
-                    let batch = &bridge_result.batches[i];
-                    let table_name = output_info.table.as_ref().unwrap_or(&output_info.name);
-
-                    match output_info.sink.as_str() {
-                        "sqlite" => {
-                            sqlite_outputs.push((table_name.clone(), batch));
-                        }
-                        "parquet" => {
-                            parquet_batches.push(batch);
-                        }
-                        "csv" => {
-                            let csv_path = output_dir.join(format!("{}_{}.csv", table_name, job_id));
-                            write_csv_output(&csv_path, batch)?;
-                            info!(output = %csv_path.display(), table = %table_name, "Wrote CSV output");
-                            output_paths.push(csv_path.to_string_lossy().to_string());
-                        }
-                        other => {
-                            warn!("Unknown sink type '{}', defaulting to parquet", other);
-                            parquet_batches.push(batch);
-                        }
-                    }
-                }
-
-                // Write all SQLite outputs to a single database
-                if !sqlite_outputs.is_empty() {
-                    let sqlite_path = output_dir.join(format!("{}_{}.db", plugin_name, job_id));
-                    write_sqlite_outputs(&sqlite_path, &sqlite_outputs)?;
-                    let table_count = sqlite_outputs.len();
-                    let row_count: usize = sqlite_outputs.iter().map(|(_, b)| b.num_rows()).sum();
-                    info!(output = %sqlite_path.display(), tables = table_count, rows = row_count, "Wrote SQLite output");
-                    output_paths.push(sqlite_path.to_string_lossy().to_string());
-                }
-
-                // Write parquet outputs
-                if !parquet_batches.is_empty() {
-                    let parquet_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
-                    write_parquet_output(&parquet_path, &parquet_batches)?;
-                    info!(output = %parquet_path.display(), batches = parquet_batches.len(), "Wrote parquet output");
-                    output_paths.push(parquet_path.to_string_lossy().to_string());
-                }
-            }
+            let output_paths = handle_bridge_outputs(&bridge_result, output_dir, &plugin_name, job_id)?;
 
             let result_summary = output_paths.join(";");
             info!(job_id, elapsed_ms = elapsed.as_millis(), outputs = %result_summary, "Job completed");
@@ -1434,6 +1369,87 @@ fn is_stdlib_module(module: &str) -> bool {
 }
 
 /// Write Arrow batches to a Parquet file
+fn handle_bridge_outputs(
+    bridge_result: &bridge::BridgeResult,
+    output_dir: &std::path::Path,
+    plugin_name: &str,
+    job_id: i64,
+) -> Result<Vec<String>> {
+    #[cfg(feature = "data-plane")]
+    {
+        let mut output_paths: Vec<String> = vec![];
+
+        if bridge_result.output_info.is_empty() {
+            let output_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
+            if !bridge_result.batches.is_empty() {
+                let batch_refs: Vec<&arrow::array::RecordBatch> = bridge_result.batches.iter().collect();
+                write_parquet_output(&output_path, &batch_refs)?;
+                info!(output = %output_path.display(), batches = bridge_result.batches.len(), "Wrote parquet output");
+            }
+            output_paths.push(output_path.to_string_lossy().to_string());
+        } else {
+            let mut sqlite_outputs: Vec<(String, &arrow::array::RecordBatch)> = vec![];
+            let mut parquet_batches: Vec<&arrow::array::RecordBatch> = vec![];
+
+            for (i, output_info) in bridge_result.output_info.iter().enumerate() {
+                if i >= bridge_result.batches.len() {
+                    warn!("Output info {} has no corresponding batch", output_info.name);
+                    continue;
+                }
+
+                let batch = &bridge_result.batches[i];
+                let table_name = output_info.table.as_ref().unwrap_or(&output_info.name);
+
+                match output_info.sink.as_str() {
+                    "sqlite" => {
+                        sqlite_outputs.push((table_name.clone(), batch));
+                    }
+                    "parquet" => {
+                        parquet_batches.push(batch);
+                    }
+                    "csv" => {
+                        let csv_path = output_dir.join(format!("{}_{}.csv", table_name, job_id));
+                        write_csv_output(&csv_path, batch)?;
+                        info!(output = %csv_path.display(), table = %table_name, "Wrote CSV output");
+                        output_paths.push(csv_path.to_string_lossy().to_string());
+                    }
+                    other => {
+                        warn!("Unknown sink type '{}', defaulting to parquet", other);
+                        parquet_batches.push(batch);
+                    }
+                }
+            }
+
+            if !sqlite_outputs.is_empty() {
+                let sqlite_path = output_dir.join(format!("{}_{}.db", plugin_name, job_id));
+                write_sqlite_outputs(&sqlite_path, &sqlite_outputs)?;
+                let table_count = sqlite_outputs.len();
+                let row_count: usize = sqlite_outputs.iter().map(|(_, b)| b.num_rows()).sum();
+                info!(output = %sqlite_path.display(), tables = table_count, rows = row_count, "Wrote SQLite output");
+                output_paths.push(sqlite_path.to_string_lossy().to_string());
+            }
+
+            if !parquet_batches.is_empty() {
+                let parquet_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
+                write_parquet_output(&parquet_path, &parquet_batches)?;
+                info!(output = %parquet_path.display(), batches = parquet_batches.len(), "Wrote parquet output");
+                output_paths.push(parquet_path.to_string_lossy().to_string());
+            }
+        }
+
+        Ok(output_paths)
+    }
+    #[cfg(not(feature = "data-plane"))]
+    {
+        let _ = bridge_result;
+        let _ = output_dir;
+        let _ = plugin_name;
+        let _ = job_id;
+        anyhow::bail!("data outputs require the `data-plane` feature")
+    }
+}
+
+#[cfg(feature = "data-plane")]
 fn write_parquet_output(
     path: &std::path::Path,
     batches: &[&arrow::array::RecordBatch],
@@ -1458,6 +1474,7 @@ fn write_parquet_output(
 }
 
 /// Write Arrow batches to SQLite database tables
+#[cfg(feature = "data-plane")]
 fn write_sqlite_outputs(
     path: &std::path::Path,
     outputs: &[(String, &arrow::array::RecordBatch)],
@@ -1550,6 +1567,7 @@ fn write_sqlite_outputs(
 }
 
 /// Write Arrow batch to CSV file
+#[cfg(feature = "data-plane")]
 fn write_csv_output(path: &std::path::Path, batch: &arrow::array::RecordBatch) -> Result<()> {
     use arrow::csv::WriterBuilder;
 

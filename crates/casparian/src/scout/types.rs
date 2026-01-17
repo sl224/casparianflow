@@ -470,8 +470,10 @@ impl ExtractionLogStatus {
 pub struct ScanStats {
     /// Number of directories scanned
     pub dirs_scanned: u64,
-    /// Number of files discovered
+    /// GAP-SCAN-005: Number of files found by walker (regardless of persist success)
     pub files_discovered: u64,
+    /// GAP-SCAN-005: Number of files successfully persisted to database
+    pub files_persisted: u64,
     /// Number of new files
     pub files_new: u64,
     /// Number of changed files
@@ -526,6 +528,56 @@ pub struct DbStats {
     pub files_failed: u64,
     pub bytes_pending: u64,
     pub bytes_processed: u64,
+}
+
+/// GAP-SCAN-004: Statistics from populating the folder cache
+#[derive(Debug, Clone, Default)]
+pub struct FolderCacheStats {
+    /// Number of folders stored in cache
+    pub folders_cached: u64,
+    /// Number of files stored in cache (root-level only)
+    pub files_cached: u64,
+    /// Number of folders that were truncated (not stored)
+    pub folders_truncated: u64,
+    /// Number of files that were truncated (not stored)
+    pub files_truncated: u64,
+    /// True if any truncation occurred
+    pub is_truncated: bool,
+}
+
+/// GAP-SCAN-004: Truncation info for folder cache
+#[derive(Debug, Clone, Default)]
+pub struct FolderCacheTruncation {
+    /// Number of folders not shown due to limit
+    pub folders_truncated: u64,
+    /// Number of files not shown due to limit
+    pub files_truncated: u64,
+    /// Total number of folders in source
+    pub total_folders: u64,
+    /// Total number of root-level files in source
+    pub total_files: u64,
+}
+
+impl FolderCacheTruncation {
+    /// Returns true if any truncation occurred
+    pub fn is_truncated(&self) -> bool {
+        self.folders_truncated > 0 || self.files_truncated > 0
+    }
+
+    /// Returns a human-readable summary like "+50 more folders, +100 more files"
+    pub fn summary(&self) -> Option<String> {
+        if !self.is_truncated() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.folders_truncated > 0 {
+            parts.push(format!("+{} more folders", self.folders_truncated));
+        }
+        if self.files_truncated > 0 {
+            parts.push(format!("+{} more files", self.files_truncated));
+        }
+        Some(parts.join(", "))
+    }
 }
 
 #[cfg(test)]

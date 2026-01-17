@@ -2,7 +2,7 @@
 //!
 //! Data-oriented design: structs for data, functions for behavior.
 
-use crate::cli::config::default_db_path;
+use crate::cli::config::active_db_path;
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table};
@@ -93,7 +93,7 @@ async fn run_async(action: SourceAction) -> anyhow::Result<()> {
         return use_source(name, clear).await;
     }
 
-    let db_path = default_db_path();
+    let db_path = active_db_path();
     let db = Database::open(&db_path).await.map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
@@ -471,7 +471,7 @@ async fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
 
     // Validate source exists before setting
     let source_name = name.unwrap();
-    let db_path = default_db_path();
+    let db_path = active_db_path();
     let db = Database::open(&db_path).await.map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))

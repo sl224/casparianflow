@@ -45,12 +45,9 @@ const VALID_STATUSES: &[&str] = &[
     "deleted",
 ];
 
-/// Get the default database path
+/// Get the active database path
 fn get_db_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".casparian_flow")
-        .join("casparian_flow.sqlite3")
+    crate::cli::config::active_db_path()
 }
 
 /// Validate status filter

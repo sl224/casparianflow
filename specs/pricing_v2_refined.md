@@ -73,14 +73,36 @@ This matches pricing to where the customer IS, not where you wish they were.
 
 ## 3. Revised Pricing Tiers (All Verticals)
 
+**System of record:** This document is the single source of truth for pricing tiers, unit definitions, and vertical mappings. Other strategy docs should reference this section instead of restating tier tables.
+
 ### 3.1 Universal Tier Structure
 
 | Tier | Monthly | Annual | Target | Sales Motion |
 |------|---------|--------|--------|--------------|
 | **Free** | $0 | $0 | Evaluation, individuals | Self-serve |
-| **Team** | $500/user | $5,000/user | Small teams (2-5 users) | Self-serve + support |
-| **Department** | $2,500/month | $25,000/year | Department-level (5-20 users) | Inside sales |
-| **Enterprise** | $8,000+/month | $80,000+/year | Organization-wide | Field sales |
+| **Team** | $500/user/month | $6,000/user/year | Small teams (2-5 users) | Self-serve + support |
+| **Department** | $2,500/month | $30,000/year | Department-level (5-20 users) | Inside sales |
+| **Enterprise** | $8,000+/month | $96,000+/year | Organization-wide | Field sales |
+
+### 3.1.1 Unified Tier Mapping (Universal → Vertical)
+
+Use this mapping to keep vertical tiers consistent with the universal ladder. Defense remains an exception due to deployment-based procurement.
+
+| Universal Tier | Finance | Legal | Healthcare | Defense |
+|---------------|---------|-------|------------|---------|
+| **Free** | Free | Free | Community | Open Source |
+| **Team** | Analyst | Solo | Clinic | Tactical (annual, per deployment) |
+| **Department** | Team | Firm | Department | Mission (annual, per deployment) |
+| **Enterprise** | Trading Desk / Enterprise | Litigation Team / Enterprise | Hospital / Health System | Program (annual, per program) |
+
+### 3.1.2 Vertical Addenda (What Changes by Vertical)
+
+| Vertical | Pricing Unit | Primary Exception | Notes |
+|----------|--------------|-------------------|-------|
+| **Finance** | Per month (team/desk) | None | Trading desk pricing anchors expansion. |
+| **Legal** | Per month (firm/team) | None | Volume limits define Solo/Firm tiers. |
+| **Healthcare** | Per month (clinic/department/hospital) | None | BAA and audit features gate Hospital+. |
+| **Defense** | Annual (per deployment/program) | Deployment-based procurement | Defense stays on deployment/program pricing. |
 
 ### 3.2 Finance Vertical (Revised)
 

@@ -2,7 +2,7 @@
 //!
 //! Data-oriented design: structs for data, functions for behavior.
 
-use crate::cli::config::default_db_path;
+use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::print_table;
 use crate::scout::{Database, TaggingRule};
@@ -103,7 +103,7 @@ pub fn run(action: RuleAction) -> anyhow::Result<()> {
 }
 
 async fn run_async(action: RuleAction) -> anyhow::Result<()> {
-    let db_path = default_db_path();
+    let db_path = active_db_path();
     let db = Database::open(&db_path).await.map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))

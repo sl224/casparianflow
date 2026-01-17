@@ -12,7 +12,7 @@ description = "Docker-based test utilities for PostgreSQL and MSSQL testing"
 tokio = { workspace = true }
 
 # Database
-sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres"] }
+sqlx = { workspace = true, default-features = false, features = ["runtime-tokio-native-tls", "postgres", "chrono", "macros"] }
 
 # MSSQL support (optional)
 tiberius = { version = "0.12", optional = true, features = ["chrono"] }
@@ -33,9 +33,6 @@ uuid = { version = "1.11", features = ["v4"] }
 
 # Tracing
 tracing = { workspace = true }
-
-[dev-dependencies]
-tokio-test = "0.4"
 
 [features]
 default = []

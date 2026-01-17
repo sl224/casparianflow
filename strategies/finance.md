@@ -505,6 +505,20 @@ ORDER BY last_update DESC;
 | "ISO 20022 for analysts" guide | Post-migration audience | Medium |
 | "Bloomberg alternatives" blog | SEO, cost-conscious buyers | Medium |
 
+#### Killer Demo Clips (Cash-First)
+
+**Flagship: "Trade Break in 60 Seconds (Local-First)"**
+- Hook: "T+1 is live. Here's a break resolved in 60 seconds, offline."
+- Scan + auto-tag: `casparian scan /logs --auto-tag` (show AI tags and patterns)
+- Parse: `casparian process --tag fix_logs` (show tables created)
+- Query: pull a trade timeline, highlight missing step
+- Export: `casparian export --format csv` (share with compliance)
+- Close: "No cloud. No pipeline. $X saved per break."
+
+**Secondary: "No-IT Audit Trail"**
+- Scan a week of logs, parse, run compliance query
+- Emphasize: local-first, no dependencies, auditable outputs
+
 ### 8.3 Pricing (Finance Vertical) - Value-Based
 
 > **Pricing Philosophy:** Price by the value created, not by cost. See [STRATEGY.md](../STRATEGY.md#value-based-pricing-strategy) for framework.
@@ -519,45 +533,13 @@ ORDER BY last_update DESC;
 
 **Additional value:** Settlement risk reduction (T+1 pressure), audit trail for compliance, knowledge retention when staff leaves.
 
-#### Pricing Tiers (Capturing 10-15% of Value)
+#### Pricing
 
-| Tier | Price | Value Capture | Features | Target |
-|------|-------|---------------|----------|--------|
-| **Starter** | Free | N/A | EDGAR parser, 10 companies | Students, evaluation |
-| **Professional** | $500/user/month | ~5% | FIX parser, unlimited companies, email support | Individual analysts |
-| **Trading Desk** | $15,000/desk/year | ~10-15% | Unlimited users per desk, multi-venue FIX, custom tags, priority support | Operations teams |
-| **Enterprise** | $50,000+/year | Custom | Multi-desk, ISO 20022, audit trails, SSO, dedicated success manager | Banks, compliance |
+Pricing tiers and unit definitions are centralized in `specs/pricing_v2_refined.md`. Use the Finance mapping (Analyst → Team → Trading Desk → Enterprise) from the system-of-record and keep desk-level ROI framing from the value analysis above.
 
-#### Pricing Justification
+#### Revenue Modeling
 
-**Trading Desk tier ($15,000/year):**
-- Current workflow: 40 min/break × 10 breaks/day = 6.7 hours/day wasted
-- At $75/hour (Trade Support Engineer rate): **$125K/year in labor**
-- $15K captures 12% of quantifiable labor savings alone
-- Settlement risk reduction adds unquantifiable additional value
-
-**Comparison to alternatives:**
-- Manual grep + Excel: "Free" but costs $125K+ in labor
-- Enterprise TCA tools: $50-100K+ but wrong use case (analytics, not break resolution)
-- Bloomberg Terminal: $32K/seat but for data access, not parsing
-- **Casparian at $15K: 10-50% of alternatives, purpose-built**
-
-#### Why Not Price Lower?
-
-Per Andreessen's framework:
-1. **$400/month doesn't prove the moat** - Too cheap to test if product is must-have
-2. **$400/month doesn't fund sales** - Need enterprise sales team for trading desks
-3. **$400/month signals "not enterprise-grade"** - Operations managers skeptical of cheap tools
-4. **$400/month can't fund customer success** - Trading desks need white-glove onboarding
-
-#### Revenue Projection (Finance Vertical)
-
-| Metric | 6-Month | 12-Month | 24-Month |
-|--------|---------|----------|----------|
-| Trading Desk customers | 10 | 30 | 75 |
-| Avg contract value | $15,000 | $15,000 | $18,000 |
-| Finance MRR | $12,500 | $37,500 | $112,500 |
-| Finance ARR | $150,000 | $450,000 | $1,350,000 |
+Finance revenue scenarios should be maintained in a dedicated model that references the pricing spec to avoid drift.
 
 ---
 

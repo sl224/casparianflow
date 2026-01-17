@@ -10,7 +10,10 @@ pub enum ScoutError {
     Io(#[from] io::Error),
 
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] casparian_db::BackendError),
+
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] sqlx::Error),
 
     #[error("Database pool error: {0}")]
     DbPool(#[from] casparian_db::DbError),

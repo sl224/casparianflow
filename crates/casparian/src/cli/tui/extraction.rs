@@ -2,6 +2,12 @@
 //!
 //! Types for defining, testing, and publishing extraction rules via the TUI.
 //! Aligned with specs/views/discover.md v2.2 Phase 18 and specs/extraction.md.
+//!
+//! # Dead Code Justification
+//! This module contains scaffolding types for the Rule Builder TUI feature
+//! currently under active development. Types are defined ahead of their UI
+//! integration to establish stable contracts. See specs/rule_builder.md.
+#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -728,7 +734,7 @@ impl PublishState {
 // Types for the unified Rule Builder interface that consolidates:
 // - GlobExplorer (pattern exploration)
 // - RuleCreation (rule editing)
-// - Pathfinder/Labeling/SemanticPath (AI assistance via Tab key)
+// - Pathfinder/Labeling/SemanticPath
 //
 // See: specs/views/discover.md v3.0, specs/meta/sessions/ai_consolidation/design.md
 
@@ -778,17 +784,37 @@ impl ResultFilter {
 // File Results Panel Types (spec Section 4)
 // =============================================================================
 
-/// Which phase the file results panel is in (spec Section 4.1)
-/// Automatically transitions based on pattern content and user actions
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum FileResultsPhase {
+/// State for the file results panel (spec Section 4.1)
+/// Encodes mutually exclusive phases with their data.
+#[derive(Debug, Clone)]
+pub enum FileResultsState {
     /// Folder counts + sample filenames (pattern has no <field>)
-    #[default]
-    Exploration,
+    Exploration {
+        folder_matches: Vec<FolderMatch>,
+        expanded_folder_indices: HashSet<usize>,
+        detected_patterns: Vec<String>,
+    },
     /// Per-file with extracted values (pattern has <field>)
-    ExtractionPreview,
+    ExtractionPreview {
+        preview_files: Vec<ExtractionPreviewFile>,
+    },
     /// Per-file pass/fail with errors (user pressed 't')
-    BacktestResults,
+    BacktestResults {
+        matched_files: Vec<MatchedFile>,
+        visible_indices: Vec<usize>,
+        backtest: BacktestSummary,
+        result_filter: ResultFilter,
+    },
+}
+
+impl Default for FileResultsState {
+    fn default() -> Self {
+        FileResultsState::Exploration {
+            folder_matches: Vec::new(),
+            expanded_folder_indices: HashSet::new(),
+            detected_patterns: Vec::new(),
+        }
+    }
 }
 
 /// A folder with match count and sample (Phase 1: Exploration)
@@ -871,33 +897,20 @@ impl Default for FileTestResult {
     }
 }
 
-/// Extended file info for Rule Builder with test status
+/// Matched file for Rule Builder right panel
 #[derive(Debug, Clone)]
-pub struct MatchedFileInfo {
-    /// Relative path from source root
-    pub rel_path: String,
-    /// File size in bytes
-    pub size: u64,
-    /// Modification time (unix timestamp)
-    pub mtime: i64,
-    /// Test result status
+pub struct MatchedFile {
+    /// Full path
+    pub path: String,
+    /// Relative path for display
+    pub relative_path: String,
+    /// Extracted field values (after backtest)
+    pub extractions: HashMap<String, String>,
+    /// Test result
     pub test_result: FileTestResult,
-    /// Extracted field values (populated after test)
-    pub extracted_fields: Option<HashMap<String, String>>,
 }
 
-impl MatchedFileInfo {
-    /// Create from basic file info
-    pub fn new(rel_path: String, size: u64, mtime: i64) -> Self {
-        Self {
-            rel_path,
-            size,
-            mtime,
-            test_result: FileTestResult::NotTested,
-            extracted_fields: None,
-        }
-    }
-
+impl MatchedFile {
     /// Check if this file passes the current filter
     pub fn passes_filter(&self, filter: ResultFilter) -> bool {
         match filter {
@@ -1051,16 +1064,6 @@ pub enum RuleBuilderFocus {
     IgnorePicker,
 }
 
-/// Analysis state for AI assistance
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum AnalysisState {
-    #[default]
-    Idle,
-    Analyzing,
-    Complete,
-    Error(String),
-}
-
 /// Extraction field for Rule Builder (simplified from FieldDraft)
 #[derive(Debug, Clone)]
 pub struct RuleBuilderField {
@@ -1092,19 +1095,6 @@ impl RuleBuilderField {
     }
 }
 
-/// Matched file for Rule Builder right panel
-#[derive(Debug, Clone)]
-pub struct RuleBuilderFile {
-    /// Full path
-    pub path: String,
-    /// Relative path for display
-    pub relative_path: String,
-    /// Extracted field values (after backtest)
-    pub extractions: HashMap<String, String>,
-    /// Test result
-    pub test_result: FileTestResult,
-}
-
 /// Ignore picker option
 #[derive(Debug, Clone)]
 pub struct IgnoreOption {
@@ -1112,6 +1102,110 @@ pub struct IgnoreOption {
     pub pattern: String,
     /// Number of files affected
     pub affected_count: usize,
+}
+
+// =============================================================================
+// Schema-First UI Types (RULE_BUILDER_UI_PLAN.md)
+// =============================================================================
+// Types for the schema-first Rule Builder UI with path archetypes,
+// naming schemes, and synonym detection.
+
+/// A pattern seed suggestion (common glob patterns detected from files)
+#[derive(Debug, Clone)]
+pub struct PatternSeed {
+    /// The glob pattern (e.g., "*.csv", "**/*.csv", "*_report*.csv")
+    pub pattern: String,
+    /// Number of files matching this pattern
+    pub match_count: usize,
+    /// Whether this is an extension-based pattern
+    pub is_extension: bool,
+}
+
+/// A path archetype representing a common directory structure pattern
+/// Example: "program_<code>/mission_<id>/<date>/..." with 2,130 files across 42 folders
+#[derive(Debug, Clone)]
+pub struct PathArchetype {
+    /// Normalized template path (e.g., "program_<code>/mission_<id>/<date>/...")
+    pub template: String,
+    /// Number of files matching this archetype
+    pub file_count: usize,
+    /// Number of unique folders
+    pub folder_count: usize,
+    /// Sample paths that match this archetype (for preview)
+    pub sample_paths: Vec<String>,
+    /// Depth of the pattern (number of segments)
+    pub depth: usize,
+}
+
+/// A naming scheme representing a common filename pattern
+/// Example: "report_<date>_<region>.csv" with 412 files
+#[derive(Debug, Clone)]
+pub struct NamingScheme {
+    /// Normalized filename template (e.g., "report_<date>_<region>.csv")
+    pub template: String,
+    /// Number of files matching this scheme
+    pub file_count: usize,
+    /// Example filename
+    pub example: String,
+    /// Detected fields in the scheme
+    pub fields: Vec<String>,
+}
+
+/// Confidence level for synonym suggestions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynonymConfidence {
+    /// Lexicon match (e.g., msn → mission)
+    High,
+    /// Edit distance or prefix match
+    Medium,
+    /// Neighbor-based inference only
+    Low,
+}
+
+/// A synonym suggestion for path token normalization
+/// Example: "msn" ↔ "mission" (high confidence)
+#[derive(Debug, Clone)]
+pub struct SynonymSuggestion {
+    /// The abbreviated/variant token
+    pub short_form: String,
+    /// The canonical/expanded token
+    pub canonical_form: String,
+    /// Confidence level
+    pub confidence: SynonymConfidence,
+    /// Reasoning for the suggestion
+    pub reason: String,
+    /// Score (for ranking)
+    pub score: u8,
+    /// Whether user has applied this suggestion
+    pub applied: bool,
+}
+
+/// Schema evaluation state for the rule builder
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalState {
+    Idle,
+    Running { progress: u8 },
+}
+
+/// Built-in abbreviation lexicon for synonym detection
+pub fn get_abbreviation_lexicon() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("msn", "mission"),
+        ("flt", "flight"),
+        ("cfg", "config"),
+        ("img", "image"),
+        ("idx", "index"),
+        ("ops", "operations"),
+        ("rpt", "report"),
+        ("tmp", "temp"),
+        ("usr", "user"),
+        ("sys", "system"),
+        ("msg", "message"),
+        ("doc", "document"),
+        ("env", "environment"),
+        ("srv", "server"),
+        ("app", "application"),
+    ]
 }
 
 /// Full Rule Builder state
@@ -1129,8 +1223,6 @@ pub struct RuleBuilderState {
     pub exclude_input: String,
     /// Tag name
     pub tag: String,
-    /// Tag suggestions from AI
-    pub tag_suggestions: Vec<(String, f32)>,
     /// Extraction fields
     pub extractions: Vec<RuleBuilderField>,
     /// Rule enabled flag
@@ -1138,35 +1230,31 @@ pub struct RuleBuilderState {
     /// Run job on save flag
     pub run_job_on_save: bool,
 
-    // --- Analysis state ---
-    /// Current AI analysis state
-    pub analysis_state: AnalysisState,
-    /// User hint for AI
-    pub hint: String,
+    // --- File Results State (spec Section 4) ---
+    /// Current state of the file results panel
+    pub file_results: FileResultsState,
 
-    // --- File Results Phase (spec Section 4) ---
-    /// Current phase of the file results panel
-    pub file_results_phase: FileResultsPhase,
-
-    // --- Phase 1: Exploration ---
-    /// Folder matches with counts (sorted by count descending)
-    pub folder_matches: Vec<FolderMatch>,
-    /// Indices of expanded folders
-    pub expanded_folder_indices: HashSet<usize>,
-    /// Detected patterns from filenames (e.g., "orders_<date:YYYYMMDD>.csv")
-    pub detected_patterns: Vec<String>,
-
-    // --- Phase 2: Extraction Preview ---
-    /// Files with extraction preview
-    pub preview_files: Vec<ExtractionPreviewFile>,
-
-    // --- Phase 3: Backtest Results ---
-    /// Files matched by current pattern (with test results)
-    pub matched_files: Vec<RuleBuilderFile>,
+    // --- Schema-First UI (RULE_BUILDER_UI_PLAN.md) ---
+    /// Pattern seeds - common glob patterns detected from file extensions and names
+    pub pattern_seeds: Vec<PatternSeed>,
+    /// Path archetypes - structure-aware path template summaries
+    pub path_archetypes: Vec<PathArchetype>,
+    /// Naming schemes - common filename patterns
+    pub naming_schemes: Vec<NamingScheme>,
+    /// Synonym suggestions - detected abbreviation mappings
+    pub synonym_suggestions: Vec<SynonymSuggestion>,
+    /// Selected pattern seed index
+    pub selected_pattern_seed: usize,
+    /// Selected path archetype index
+    pub selected_archetype: usize,
+    /// Selected naming scheme index
+    pub selected_naming_scheme: usize,
+    /// Selected synonym suggestion index
+    pub selected_synonym: usize,
+    /// Schema evaluation state
+    pub eval_state: EvalState,
     /// Total match count
     pub match_count: usize,
-    /// Indices of visible files (after filtering)
-    pub visible_indices: Vec<usize>,
 
     // --- Selection & Navigation ---
     /// Selected index in right panel (folder or file depending on phase)
@@ -1175,12 +1263,6 @@ pub struct RuleBuilderState {
     pub selected_extraction: usize,
     /// Selected exclude index
     pub selected_exclude: usize,
-
-    // --- Backtest state ---
-    /// Backtest summary
-    pub backtest: BacktestSummary,
-    /// Current result filter
-    pub result_filter: ResultFilter,
 
     // --- Ignore picker state ---
     /// Options for ignore picker dialog
@@ -1222,39 +1304,29 @@ impl Default for RuleBuilderState {
             excludes: Vec::new(),
             exclude_input: String::new(),
             tag: String::new(),
-            tag_suggestions: Vec::new(),
             extractions: Vec::new(),
             enabled: true,
             run_job_on_save: true,
 
-            // Analysis state
-            analysis_state: AnalysisState::Idle,
-            hint: String::new(),
+            // File Results State (default: Exploration)
+            file_results: FileResultsState::default(),
 
-            // File Results Phase (default: Exploration)
-            file_results_phase: FileResultsPhase::Exploration,
-
-            // Phase 1: Exploration
-            folder_matches: Vec::new(),
-            expanded_folder_indices: HashSet::new(),
-            detected_patterns: Vec::new(),
-
-            // Phase 2: Extraction Preview
-            preview_files: Vec::new(),
-
-            // Phase 3: Backtest Results
-            matched_files: Vec::new(),
+            // Schema-First UI
+            pattern_seeds: Vec::new(),
+            path_archetypes: Vec::new(),
+            naming_schemes: Vec::new(),
+            synonym_suggestions: Vec::new(),
+            selected_pattern_seed: 0,
+            selected_archetype: 0,
+            selected_naming_scheme: 0,
+            selected_synonym: 0,
+            eval_state: EvalState::Idle,
             match_count: 0,
-            visible_indices: Vec::new(),
 
             // Selection & Navigation
             selected_file: 0,
             selected_extraction: 0,
             selected_exclude: 0,
-
-            // Backtest state
-            backtest: BacktestSummary::default(),
-            result_filter: ResultFilter::All,
 
             // Ignore picker
             ignore_options: Vec::new(),
@@ -1303,35 +1375,43 @@ impl RuleBuilderState {
     }
 
     /// Get visible files based on current filter
-    pub fn visible_files(&self) -> impl Iterator<Item = &RuleBuilderFile> {
-        self.visible_indices.iter().filter_map(|&i| self.matched_files.get(i))
+    pub fn visible_files(&self) -> Box<dyn Iterator<Item = &MatchedFile> + '_> {
+        match &self.file_results {
+            FileResultsState::BacktestResults { matched_files, visible_indices, .. } => {
+                Box::new(visible_indices.iter().filter_map(move |&i| matched_files.get(i)))
+            }
+            _ => Box::new(std::iter::empty()),
+        }
     }
 
-    /// Update visible indices based on current filter
+    /// Update visible indices based on current filter (BacktestResults only)
     pub fn update_visible(&mut self) {
-        self.visible_indices = self.matched_files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| {
-                match self.result_filter {
-                    ResultFilter::All => !f.test_result.is_excluded(),
-                    ResultFilter::PassOnly => f.test_result.is_pass(),
-                    ResultFilter::FailOnly => f.test_result.is_fail(),
-                }
-            })
-            .map(|(i, _)| i)
-            .collect();
+        if let FileResultsState::BacktestResults {
+            matched_files,
+            visible_indices,
+            result_filter,
+            ..
+        } = &mut self.file_results {
+            *visible_indices = matched_files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.passes_filter(*result_filter))
+                .map(|(i, _)| i)
+                .collect();
 
-        // Clamp selection
-        if !self.visible_indices.is_empty() && self.selected_file >= self.visible_indices.len() {
-            self.selected_file = self.visible_indices.len().saturating_sub(1);
+            // Clamp selection
+            if !visible_indices.is_empty() && self.selected_file >= visible_indices.len() {
+                self.selected_file = visible_indices.len().saturating_sub(1);
+            }
         }
     }
 
     /// Cycle result filter (a → p → f → a)
     pub fn cycle_filter(&mut self) {
-        self.result_filter = self.result_filter.next();
-        self.update_visible();
+        if let FileResultsState::BacktestResults { result_filter, .. } = &mut self.file_results {
+            *result_filter = result_filter.next();
+            self.update_visible();
+        }
     }
 
     /// Add exclusion pattern
@@ -1737,6 +1817,518 @@ fn extract_placeholder_value(glob_segment: &str, matched_segment: &str) -> Strin
     matched_segment.to_string()
 }
 
+// =============================================================================
+// Schema-First Algorithms (RULE_BUILDER_UI_PLAN.md)
+// =============================================================================
+// Deterministic algorithms for token normalization, path archetype extraction,
+// naming scheme detection, and synonym detection.
+
+use regex::Regex;
+use std::sync::LazyLock;
+
+// Compiled regex patterns for token normalization
+static DATE_YYYY_MM_DD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\d{4}[-/]\d{2}[-/]\d{2}$").unwrap()
+});
+static DATE_YYYYMMDD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\d{8}$").unwrap()
+});
+static DATE_YYYY_MM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\d{4}[-/]\d{2}$").unwrap()
+});
+static DATE_YYYY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\d{4}$").unwrap()
+});
+static UUID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$").unwrap()
+});
+static INTEGER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\d{2,}$").unwrap()
+});
+
+/// Normalized token type for schema extraction
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NormalizedToken {
+    /// Date-like token (YYYY-MM-DD, YYYYMMDD, etc.)
+    Date,
+    /// UUID-like token
+    Uuid,
+    /// Integer sequence (2+ digits)
+    Integer,
+    /// Literal token (preserved as-is)
+    Literal(String),
+}
+
+impl NormalizedToken {
+    /// Get the placeholder representation for templates
+    pub fn placeholder(&self) -> &str {
+        match self {
+            NormalizedToken::Date => "<date>",
+            NormalizedToken::Uuid => "<uuid>",
+            NormalizedToken::Integer => "<n>",
+            NormalizedToken::Literal(s) => s.as_str(),
+        }
+    }
+}
+
+/// Normalize a single token according to the spec.
+///
+/// - Replace date-like tokens → `<date>`
+/// - Replace UUIDs → `<uuid>`
+/// - Replace integer sequences (2+ digits) → `<n>`
+/// - Preserve delimiters `_` `-` `.`
+pub fn normalize_token(token: &str) -> NormalizedToken {
+    let token_lower = token.to_lowercase();
+
+    // Check for date patterns
+    if DATE_YYYY_MM_DD.is_match(token) {
+        return NormalizedToken::Date;
+    }
+    if DATE_YYYYMMDD.is_match(token) {
+        // Only if it looks like a valid date (e.g., 20240115)
+        if let Ok(year) = token[0..4].parse::<u32>() {
+            if (1900..=2100).contains(&year) {
+                return NormalizedToken::Date;
+            }
+        }
+    }
+    if DATE_YYYY_MM.is_match(token) {
+        return NormalizedToken::Date;
+    }
+    // Only treat as year if it's a valid year range
+    if DATE_YYYY.is_match(token) {
+        if let Ok(year) = token.parse::<u32>() {
+            if (1900..=2100).contains(&year) {
+                return NormalizedToken::Date;
+            }
+        }
+    }
+
+    // Check for UUID
+    if UUID_PATTERN.is_match(token) {
+        return NormalizedToken::Uuid;
+    }
+
+    // Check for integer sequence (2+ digits)
+    if INTEGER_PATTERN.is_match(token) {
+        return NormalizedToken::Integer;
+    }
+
+    // Preserve as literal
+    NormalizedToken::Literal(token_lower)
+}
+
+/// Tokenize a path segment by splitting on `_`, `-`, `.`
+pub fn tokenize_segment(segment: &str) -> Vec<String> {
+    segment
+        .split(|c| c == '_' || c == '-' || c == '.')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Normalize a full path into a template.
+/// Returns the normalized template and the original path.
+pub fn normalize_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.is_empty() {
+                return segment.to_string();
+            }
+
+            // First, check if the WHOLE segment is a recognizable pattern (date, UUID)
+            // This prevents date strings like "2024-01-15" from being split into parts
+            let whole_segment_normalized = normalize_token(segment);
+            match whole_segment_normalized {
+                NormalizedToken::Date | NormalizedToken::Uuid => {
+                    return whole_segment_normalized.placeholder().to_string();
+                }
+                _ => {}
+            }
+
+            // Not a whole-segment pattern, so tokenize
+            let tokens = tokenize_segment(segment);
+            if tokens.is_empty() {
+                return segment.to_string();
+            }
+
+            // Normalize each token
+            let normalized: Vec<_> = tokens
+                .iter()
+                .map(|t| normalize_token(t))
+                .collect();
+
+            // Reconstruct with original delimiters (simplified: use _)
+            let parts: Vec<_> = normalized
+                .iter()
+                .map(|n| n.placeholder())
+                .collect();
+
+            // If all tokens normalize to placeholders, return template
+            // Otherwise, try to preserve the structure
+            if normalized.iter().all(|n| matches!(n, NormalizedToken::Literal(_))) {
+                // All literals - return as-is (lowercase)
+                segment.to_lowercase()
+            } else {
+                // Has normalized tokens - reconstruct
+                parts.join("_")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Extract path archetypes from a list of file paths.
+///
+/// Groups paths by their normalized template and returns the top N archetypes.
+pub fn extract_path_archetypes(paths: &[String], top_n: usize) -> Vec<PathArchetype> {
+    let mut template_groups: HashMap<String, Vec<&String>> = HashMap::new();
+
+    for path in paths {
+        // Get parent directory (exclude filename)
+        let parent = if let Some(pos) = path.rfind('/') {
+            &path[..pos]
+        } else {
+            continue; // Skip files without directory
+        };
+
+        let template = normalize_path(parent);
+        template_groups.entry(template).or_default().push(path);
+    }
+
+    // Convert to archetypes and sort by count
+    let mut archetypes: Vec<PathArchetype> = template_groups
+        .into_iter()
+        .map(|(template, files)| {
+            let unique_folders: std::collections::HashSet<_> = files
+                .iter()
+                .filter_map(|p| p.rfind('/').map(|pos| &p[..pos]))
+                .collect();
+
+            let depth = template.matches('/').count() + 1;
+
+            PathArchetype {
+                template: if template.is_empty() { ".".to_string() } else { format!("{}/...", template) },
+                file_count: files.len(),
+                folder_count: unique_folders.len(),
+                sample_paths: files.iter().take(3).map(|s| (*s).clone()).collect(),
+                depth,
+            }
+        })
+        .collect();
+
+    // Sort by file count descending
+    archetypes.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    archetypes.truncate(top_n);
+    archetypes
+}
+
+/// Extract naming schemes from a list of file paths.
+///
+/// Groups filenames by their normalized template and returns the top N schemes.
+pub fn extract_naming_schemes(paths: &[String], top_n: usize) -> Vec<NamingScheme> {
+    let mut template_groups: HashMap<String, Vec<&String>> = HashMap::new();
+
+    for path in paths {
+        // Extract filename
+        let filename = path.rsplit('/').next().unwrap_or(path);
+
+        // Separate extension
+        let (name, ext) = if let Some(dot_pos) = filename.rfind('.') {
+            (&filename[..dot_pos], Some(&filename[dot_pos..]))
+        } else {
+            (filename, None)
+        };
+
+        // Tokenize and normalize the filename (without extension)
+        let tokens = tokenize_segment(name);
+        let normalized: Vec<_> = tokens.iter().map(|t| normalize_token(t)).collect();
+
+        // Build template
+        let mut template_parts: Vec<String> = Vec::new();
+        let mut fields: Vec<String> = Vec::new();
+
+        for (i, norm) in normalized.iter().enumerate() {
+            match norm {
+                NormalizedToken::Date => {
+                    template_parts.push("<date>".to_string());
+                    fields.push(format!("field_{}", i));
+                }
+                NormalizedToken::Uuid => {
+                    template_parts.push("<uuid>".to_string());
+                    fields.push(format!("field_{}", i));
+                }
+                NormalizedToken::Integer => {
+                    template_parts.push("<n>".to_string());
+                    fields.push(format!("field_{}", i));
+                }
+                NormalizedToken::Literal(s) => {
+                    template_parts.push(s.clone());
+                }
+            }
+        }
+
+        let mut template = template_parts.join("_");
+        if let Some(e) = ext {
+            template.push_str(e);
+        }
+
+        // Only include if there's at least one field
+        if !fields.is_empty() {
+            template_groups.entry(template).or_default().push(path);
+        }
+    }
+
+    // Convert to naming schemes
+    let mut schemes: Vec<NamingScheme> = template_groups
+        .into_iter()
+        .map(|(template, files)| {
+            let example = files.first()
+                .and_then(|p| p.rsplit('/').next())
+                .unwrap_or("")
+                .to_string();
+
+            // Re-extract fields for this template
+            let fields: Vec<String> = template
+                .split(|c| c == '_' || c == '-' || c == '.')
+                .enumerate()
+                .filter_map(|(i, part)| {
+                    if part.starts_with('<') && part.ends_with('>') {
+                        Some(format!("field_{}", i))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            NamingScheme {
+                template,
+                file_count: files.len(),
+                example,
+                fields,
+            }
+        })
+        .collect();
+
+    // Sort by file count descending
+    schemes.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    schemes.truncate(top_n);
+    schemes
+}
+
+/// Extract pattern seeds (common glob patterns) from file paths.
+pub fn extract_pattern_seeds(paths: &[String], top_n: usize) -> Vec<PatternSeed> {
+    let mut extension_counts: HashMap<String, usize> = HashMap::new();
+
+    for path in paths {
+        // Extract extension
+        if let Some(filename) = path.rsplit('/').next() {
+            if let Some(dot_pos) = filename.rfind('.') {
+                let ext = &filename[dot_pos..];
+                *extension_counts.entry(ext.to_lowercase()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Build pattern seeds from extensions
+    let mut seeds: Vec<PatternSeed> = extension_counts
+        .into_iter()
+        .map(|(ext, count)| {
+            PatternSeed {
+                pattern: format!("**/*{}", ext),
+                match_count: count,
+                is_extension: true,
+            }
+        })
+        .collect();
+
+    // Sort by count descending
+    seeds.sort_by(|a, b| b.match_count.cmp(&a.match_count));
+    seeds.truncate(top_n);
+    seeds
+}
+
+/// Compute edit distance between two strings (Levenshtein).
+fn edit_distance(a: &str, b: &str) -> usize {
+    let m = a.len();
+    let n = b.len();
+
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+
+    let mut dp = vec![vec![0; n + 1]; m + 1];
+
+    for i in 0..=m { dp[i][0] = i; }
+    for j in 0..=n { dp[0][j] = j; }
+
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+
+    for i in 1..=m {
+        for j in 1..=n {
+            let cost = if a_chars[i-1] == b_chars[j-1] { 0 } else { 1 };
+            dp[i][j] = (dp[i-1][j] + 1)
+                .min(dp[i][j-1] + 1)
+                .min(dp[i-1][j-1] + cost);
+        }
+    }
+
+    dp[m][n]
+}
+
+/// Detect synonym suggestions from a list of file paths.
+///
+/// Uses the algorithm from RULE_BUILDER_UI_PLAN.md:
+/// 1. Tokenize paths
+/// 2. Normalize tokens
+/// 3. Detect candidates via edit distance, prefix matching, and lexicon
+/// 4. Score and filter candidates
+pub fn detect_synonyms(paths: &[String], min_sample_count: usize) -> Vec<SynonymSuggestion> {
+    if paths.len() < min_sample_count {
+        return Vec::new();
+    }
+
+    // Collect tokens at each depth with their frequency
+    let mut tokens_by_depth: HashMap<usize, HashMap<String, usize>> = HashMap::new();
+
+    for path in paths {
+        for (depth, segment) in path.split('/').enumerate() {
+            let tokens = tokenize_segment(segment);
+            for token in tokens {
+                let lower = token.to_lowercase();
+                // Skip very short tokens and normalized tokens
+                if lower.len() < 2 { continue; }
+                if normalize_token(&lower) != NormalizedToken::Literal(lower.clone()) {
+                    continue;
+                }
+                *tokens_by_depth
+                    .entry(depth)
+                    .or_default()
+                    .entry(lower)
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    let lexicon = get_abbreviation_lexicon();
+    let mut suggestions: Vec<SynonymSuggestion> = Vec::new();
+    let mut seen_pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+    // Check lexicon matches first
+    for (short, canonical) in lexicon {
+        for tokens in tokens_by_depth.values() {
+            if tokens.contains_key(*short) {
+                let pair = (short.to_string(), canonical.to_string());
+                if seen_pairs.insert(pair.clone()) {
+                    suggestions.push(SynonymSuggestion {
+                        short_form: short.to_string(),
+                        canonical_form: canonical.to_string(),
+                        confidence: SynonymConfidence::High,
+                        reason: "Lexicon match".to_string(),
+                        score: 3,
+                        applied: false,
+                    });
+                }
+            }
+        }
+    }
+
+    // Check edit distance and prefix matches within same depth
+    for tokens in tokens_by_depth.values() {
+        let token_list: Vec<_> = tokens.keys().cloned().collect();
+        for (i, a) in token_list.iter().enumerate() {
+            for b in token_list.iter().skip(i + 1) {
+                // Skip if same or already seen
+                if a == b { continue; }
+
+                let pair = if a < b {
+                    (a.clone(), b.clone())
+                } else {
+                    (b.clone(), a.clone())
+                };
+                if seen_pairs.contains(&pair) { continue; }
+
+                let mut score = 0u8;
+                let mut reasons = Vec::new();
+
+                // Edit distance check
+                let dist = edit_distance(a, b);
+                if dist <= 2 && dist > 0 {
+                    score += if dist == 1 { 2 } else { 1 };
+                    reasons.push(format!("edit distance {}", dist));
+                }
+
+                // Prefix check
+                if a.len() >= 3 && b.len() >= 3 {
+                    if a.starts_with(b) || b.starts_with(a) {
+                        let len_diff = (a.len() as i32 - b.len() as i32).abs();
+                        if len_diff <= 3 {
+                            score += 1;
+                            reasons.push("prefix match".to_string());
+                        }
+                    }
+                }
+
+                // Only suggest if score >= 2
+                if score >= 2 {
+                    seen_pairs.insert(pair);
+                    let (short, canonical) = if a.len() < b.len() {
+                        (a.clone(), b.clone())
+                    } else {
+                        (b.clone(), a.clone())
+                    };
+
+                    let confidence = if score >= 3 {
+                        SynonymConfidence::High
+                    } else {
+                        SynonymConfidence::Medium
+                    };
+
+                    suggestions.push(SynonymSuggestion {
+                        short_form: short,
+                        canonical_form: canonical,
+                        confidence,
+                        reason: reasons.join(", "),
+                        score,
+                        applied: false,
+                    });
+                }
+            }
+        }
+    }
+
+    // Sort by score descending, then by confidence
+    suggestions.sort_by(|a, b| {
+        b.score.cmp(&a.score)
+            .then_with(|| {
+                let conf_ord = |c: &SynonymConfidence| match c {
+                    SynonymConfidence::High => 0,
+                    SynonymConfidence::Medium => 1,
+                    SynonymConfidence::Low => 2,
+                };
+                conf_ord(&a.confidence).cmp(&conf_ord(&b.confidence))
+            })
+    });
+
+    // Limit to top 5 per the spec
+    suggestions.truncate(5);
+    suggestions
+}
+
+/// Analyze paths and populate schema-first UI fields in RuleBuilderState.
+///
+/// This is the main entry point for the schema-first analysis.
+pub fn analyze_paths_for_schema_ui(
+    state: &mut RuleBuilderState,
+    paths: &[String],
+    top_n: usize,
+) {
+    state.pattern_seeds = extract_pattern_seeds(paths, top_n);
+    state.path_archetypes = extract_path_archetypes(paths, top_n);
+    state.naming_schemes = extract_naming_schemes(paths, top_n);
+    state.synonym_suggestions = detect_synonyms(paths, 30); // min 30 paths for synonym detection
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1850,5 +2442,192 @@ mod tests {
         assert!(!is_valid_field_name("123field"));     // starts with digit
         assert!(!is_valid_field_name("field-name"));   // contains hyphen
         assert!(!is_valid_field_name(""));             // empty
+    }
+
+    // =========================================================================
+    // Schema-First Algorithm Tests (RULE_BUILDER_UI_PLAN.md)
+    // =========================================================================
+
+    #[test]
+    fn test_normalize_token_date_formats() {
+        // YYYY-MM-DD
+        assert_eq!(normalize_token("2024-01-15"), NormalizedToken::Date);
+        assert_eq!(normalize_token("2024/01/15"), NormalizedToken::Date);
+
+        // YYYYMMDD
+        assert_eq!(normalize_token("20240115"), NormalizedToken::Date);
+
+        // YYYY-MM
+        assert_eq!(normalize_token("2024-01"), NormalizedToken::Date);
+        assert_eq!(normalize_token("2024/01"), NormalizedToken::Date);
+
+        // YYYY (valid year range)
+        assert_eq!(normalize_token("2024"), NormalizedToken::Date);
+        assert_eq!(normalize_token("1999"), NormalizedToken::Date);
+
+        // Not a year (too small/large)
+        assert_eq!(normalize_token("1800"), NormalizedToken::Integer);
+        assert_eq!(normalize_token("2500"), NormalizedToken::Integer);
+    }
+
+    #[test]
+    fn test_normalize_token_uuid() {
+        assert_eq!(
+            normalize_token("550e8400-e29b-41d4-a716-446655440000"),
+            NormalizedToken::Uuid
+        );
+        // Not a UUID (wrong format)
+        assert!(matches!(
+            normalize_token("550e8400-e29b-41d4-a716"),
+            NormalizedToken::Literal(_)
+        ));
+    }
+
+    #[test]
+    fn test_normalize_token_integer() {
+        assert_eq!(normalize_token("42"), NormalizedToken::Integer);
+        assert_eq!(normalize_token("001"), NormalizedToken::Integer);
+        assert_eq!(normalize_token("12345"), NormalizedToken::Integer);
+        // Single digit is literal
+        assert_eq!(normalize_token("5"), NormalizedToken::Literal("5".to_string()));
+    }
+
+    #[test]
+    fn test_normalize_token_literal() {
+        assert_eq!(normalize_token("mission"), NormalizedToken::Literal("mission".to_string()));
+        assert_eq!(normalize_token("Report"), NormalizedToken::Literal("report".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_segment() {
+        assert_eq!(tokenize_segment("mission_042"), vec!["mission", "042"]);
+        assert_eq!(tokenize_segment("report-2024-01"), vec!["report", "2024", "01"]);
+        assert_eq!(tokenize_segment("file.csv"), vec!["file", "csv"]);
+        assert_eq!(tokenize_segment("a_b-c.d"), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_normalize_path() {
+        // Path with dates and IDs
+        let path = "ops/mission_042/2024-01-15";
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, "ops/mission_<n>/<date>");
+
+        // Path with all literals
+        let path = "data/sales/reports";
+        let normalized = normalize_path(path);
+        assert_eq!(normalized, "data/sales/reports");
+    }
+
+    #[test]
+    fn test_extract_path_archetypes() {
+        let paths = vec![
+            "ops/mission_001/2024-01-01/telemetry.csv".to_string(),
+            "ops/mission_001/2024-01-02/telemetry.csv".to_string(),
+            "ops/mission_002/2024-01-01/telemetry.csv".to_string(),
+            "data/reports/summary.csv".to_string(),
+        ];
+
+        let archetypes = extract_path_archetypes(&paths, 10);
+        assert!(!archetypes.is_empty());
+
+        // The mission paths should be grouped together
+        let mission_archetype = archetypes.iter()
+            .find(|a| a.template.contains("mission"));
+        assert!(mission_archetype.is_some());
+        assert_eq!(mission_archetype.unwrap().file_count, 3);
+    }
+
+    #[test]
+    fn test_extract_naming_schemes() {
+        // Use paths with same literal prefix/suffix but varying numeric/date parts
+        // so they group together in the same template
+        let paths = vec![
+            "data/report_2024-01-01_final.csv".to_string(),
+            "data/report_2024-01-02_final.csv".to_string(),
+            "data/report_2024-02-15_final.csv".to_string(),
+            "data/summary.txt".to_string(),
+        ];
+
+        let schemes = extract_naming_schemes(&paths, 10);
+        assert!(!schemes.is_empty());
+
+        // Should find the report_<date>_<n>_<n>_final.csv pattern (3 files)
+        let report_scheme = schemes.iter()
+            .find(|s| s.template.contains("report"));
+        assert!(report_scheme.is_some());
+        // All 3 report files share the same template
+        assert_eq!(report_scheme.unwrap().file_count, 3);
+    }
+
+    #[test]
+    fn test_extract_pattern_seeds() {
+        let paths = vec![
+            "data/file1.csv".to_string(),
+            "data/file2.csv".to_string(),
+            "logs/app.log".to_string(),
+            "docs/readme.md".to_string(),
+        ];
+
+        let seeds = extract_pattern_seeds(&paths, 10);
+        assert!(!seeds.is_empty());
+
+        // CSV should be the top seed (2 files)
+        assert_eq!(seeds[0].pattern, "**/*.csv");
+        assert_eq!(seeds[0].match_count, 2);
+    }
+
+    #[test]
+    fn test_edit_distance() {
+        assert_eq!(edit_distance("msn", "mission"), 4);
+        assert_eq!(edit_distance("cfg", "config"), 3);
+        assert_eq!(edit_distance("cat", "car"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("same", "same"), 0);
+    }
+
+    #[test]
+    fn test_detect_synonyms_lexicon() {
+        // Build paths with known abbreviations
+        let paths: Vec<String> = (0..50)
+            .map(|i| format!("ops/msn/flight_{:03}/data.csv", i))
+            .collect();
+
+        let synonyms = detect_synonyms(&paths, 30);
+
+        // Should find msn -> mission from lexicon
+        let msn_match = synonyms.iter()
+            .find(|s| s.short_form == "msn");
+        assert!(msn_match.is_some());
+        assert_eq!(msn_match.unwrap().canonical_form, "mission");
+        assert_eq!(msn_match.unwrap().confidence, SynonymConfidence::High);
+    }
+
+    #[test]
+    fn test_detect_synonyms_insufficient_data() {
+        // Less than min_sample_count
+        let paths: Vec<String> = (0..10)
+            .map(|i| format!("data/file_{}.csv", i))
+            .collect();
+
+        let synonyms = detect_synonyms(&paths, 30);
+        assert!(synonyms.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_paths_for_schema_ui() {
+        // Use filenames with variable parts (numeric suffixes) so naming_schemes is populated
+        let paths: Vec<String> = (0..100)
+            .map(|i| format!("ops/mission_{:03}/2024-01-{:02}/telemetry_{}.csv", i % 10, i % 28 + 1, i))
+            .collect();
+
+        let mut state = RuleBuilderState::default();
+        analyze_paths_for_schema_ui(&mut state, &paths, 8);
+
+        // Should populate all schema-first fields
+        assert!(!state.pattern_seeds.is_empty());
+        assert!(!state.path_archetypes.is_empty());
+        assert!(!state.naming_schemes.is_empty(), "naming_schemes should not be empty - paths have variable numeric parts in filenames");
+        // Synonyms may or may not be found depending on path content
     }
 }

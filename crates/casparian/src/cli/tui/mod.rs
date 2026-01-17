@@ -1,28 +1,15 @@
 //! Terminal User Interface for Casparian Flow
 //!
-//! Provides an interactive TUI with two main capabilities:
-//! - Chat: Converse with LLM to scan files, define schemas, and build pipelines
-//! - Monitor: Watch job status and pipeline health
-//!
-//! ## Chat View Features
-//!
-//! - **Multi-line input**: Use Shift+Enter to add newlines within your message
-//! - **Input history**: Use Up/Down arrows to recall previous messages
-//! - **Message scrolling**: Use Ctrl+Up/Down or PageUp/PageDown to scroll
-//! - **Timestamps**: Each message displays when it was sent
-//! - **Visual distinction**: Different colors for User, Assistant, System, Tool messages
+//! Provides an interactive TUI to scan sources, manage jobs, and build rules.
 
 pub mod app;
 pub mod event;
 pub mod extraction;
-pub mod llm;
+pub mod pattern_query;
 pub mod ui;
 
 #[cfg(feature = "profiling")]
 mod profiler_overlay;
-
-#[cfg(test)]
-pub mod test_harness;
 
 use anyhow::Result;
 use clap::Args;
@@ -40,17 +27,9 @@ use crate::cli::tui::event::{Event, EventHandler};
 /// TUI command arguments
 #[derive(Debug, Args)]
 pub struct TuiArgs {
-    /// Database path override (defaults to ~/.casparian_flow/casparian_flow.sqlite3)
+    /// Database path override (defaults to active backend path)
     #[arg(long)]
     pub database: Option<PathBuf>,
-
-    /// API key for LLM provider (defaults to ANTHROPIC_API_KEY env var)
-    #[arg(long, env = "ANTHROPIC_API_KEY")]
-    pub api_key: Option<String>,
-
-    /// LLM model to use
-    #[arg(long, default_value = "claude-sonnet-4-20250514")]
-    pub model: String,
 }
 
 /// Run the TUI
@@ -132,8 +111,6 @@ mod tests {
     fn test_app_starts_in_home_mode() {
         let args = TuiArgs {
             database: None,
-            api_key: None,
-            model: "test".into(),
         };
         let app = App::new(args);
         assert!(matches!(app.mode, app::TuiMode::Home));
@@ -147,8 +124,6 @@ mod tests {
 
         let args = TuiArgs {
             database: None,
-            api_key: None,
-            model: "test".into(),
         };
         let app = App::new(args);
 
@@ -160,51 +135,4 @@ mod tests {
         assert!(buffer.area.height == 24);
     }
 
-    #[test]
-    fn test_app_renders_with_multiline_input() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        let args = TuiArgs {
-            database: None,
-            api_key: None,
-            model: "test".into(),
-        };
-        let mut app = App::new(args);
-        app.chat.input = "line1\nline2\nline3".into();
-        app.chat.cursor = app.chat.input.len();
-
-        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
-
-        // Should render without panic
-        let buffer = terminal.backend().buffer();
-        assert!(buffer.area.width == 80);
-    }
-
-    #[test]
-    fn test_app_renders_with_long_messages() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        let args = TuiArgs {
-            database: None,
-            api_key: None,
-            model: "test".into(),
-        };
-        let mut app = App::new(args);
-
-        // Add many messages to test scrolling
-        for i in 0..20 {
-            app.chat.messages.push(app::Message::new(
-                app::MessageRole::User,
-                format!("Test message number {} with some long content that might wrap to multiple lines when rendered in the TUI", i),
-            ));
-        }
-
-        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
-
-        // Should render without panic
-        let buffer = terminal.backend().buffer();
-        assert!(buffer.area.width == 80);
-    }
 }

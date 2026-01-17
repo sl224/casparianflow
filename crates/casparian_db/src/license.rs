@@ -49,6 +49,9 @@ impl LicenseTier {
             #[cfg(feature = "sqlite")]
             DatabaseType::Sqlite => true, // Always allowed
 
+            #[cfg(feature = "duckdb")]
+            DatabaseType::DuckDb => true, // Always allowed (open source)
+
             #[cfg(feature = "postgres")]
             DatabaseType::Postgres => matches!(self, Self::Professional | Self::Enterprise),
         }
