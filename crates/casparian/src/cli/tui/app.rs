@@ -108,6 +108,14 @@ pub struct JobsState {
     pub jobs: Vec<JobInfo>,
     /// Currently selected job index (into filtered list)
     pub selected_index: usize,
+    /// Which list is focused in the Jobs view
+    pub section_focus: JobsListSection,
+    /// Remembered selection for actionable jobs
+    pub actionable_index: usize,
+    /// Remembered selection for ready jobs
+    pub ready_index: usize,
+    /// Pinned job for the details panel
+    pub pinned_job_id: Option<i64>,
     /// Filter: show only specific status
     pub status_filter: Option<JobStatus>,
     /// Filter: show only specific job type
@@ -156,16 +164,90 @@ impl JobsState {
         jobs
     }
 
-    /// Clamp selected_index to valid range for filtered list
-    pub fn clamp_selection(&mut self) {
-        let count = self.filtered_jobs().len();
-        if count == 0 {
-            self.selected_index = 0;
-        } else if self.selected_index >= count {
-            self.selected_index = count - 1;
+    fn job_matches_filters(&self, job: &JobInfo) -> bool {
+        let status_ok = match self.status_filter {
+            Some(status) => job.status == status,
+            None => true,
+        };
+        let type_ok = match self.type_filter {
+            Some(jtype) => job.job_type == jtype,
+            None => true,
+        };
+        status_ok && type_ok
+    }
+
+    pub fn actionable_jobs(&self) -> Vec<&JobInfo> {
+        let mut jobs: Vec<&JobInfo> = self.jobs
+            .iter()
+            .filter(|job| self.job_matches_filters(job))
+            .filter(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running | JobStatus::Failed | JobStatus::Cancelled))
+            .collect();
+
+        jobs.sort_by(|a, b| {
+            let rank = |status: JobStatus| match status {
+                JobStatus::Running => 0,
+                JobStatus::Pending => 1,
+                JobStatus::Failed => 2,
+                JobStatus::Cancelled => 3,
+                JobStatus::Completed => 4,
+            };
+            let status_cmp = rank(a.status).cmp(&rank(b.status));
+            if status_cmp == std::cmp::Ordering::Equal {
+                b.started_at.cmp(&a.started_at)
+            } else {
+                status_cmp
+            }
+        });
+
+        jobs
+    }
+
+    pub fn ready_jobs(&self) -> Vec<&JobInfo> {
+        let mut jobs: Vec<&JobInfo> = self.jobs
+            .iter()
+            .filter(|job| self.job_matches_filters(job))
+            .filter(|job| job.status == JobStatus::Completed)
+            .collect();
+
+        jobs.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+        jobs
+    }
+
+    pub fn focused_jobs(&self) -> Vec<&JobInfo> {
+        match self.section_focus {
+            JobsListSection::Actionable => self.actionable_jobs(),
+            JobsListSection::Ready => self.ready_jobs(),
         }
     }
 
+    /// Clamp selected_index to valid range for focused list
+    pub fn clamp_selection(&mut self) {
+        match self.section_focus {
+            JobsListSection::Actionable => self.actionable_index = self.selected_index,
+            JobsListSection::Ready => self.ready_index = self.selected_index,
+        }
+
+        let actionable_count = self.actionable_jobs().len();
+        let ready_count = self.ready_jobs().len();
+
+        Self::clamp_index(&mut self.actionable_index, actionable_count);
+        Self::clamp_index(&mut self.ready_index, ready_count);
+
+        self.selected_index = match self.section_focus {
+            JobsListSection::Actionable => self.actionable_index,
+            JobsListSection::Ready => self.ready_index,
+        };
+    }
+
+    fn clamp_index(index: &mut usize, count: usize) {
+        if count == 0 {
+            *index = 0;
+        } else if *index >= count {
+            *index = count - 1;
+        }
+    }
+
+    /// Clamp selected_index to valid range for filtered list
     /// Set status filter and clamp selection
     pub fn set_filter(&mut self, filter: Option<JobStatus>) {
         self.status_filter = filter;
@@ -189,7 +271,12 @@ impl JobsState {
 
     /// Get currently selected job
     pub fn selected_job(&self) -> Option<&JobInfo> {
-        self.filtered_jobs().get(self.selected_index).copied()
+        if let Some(pinned_id) = self.pinned_job_id {
+            if let Some(job) = self.jobs.iter().find(|job| job.id == pinned_id) {
+                return Some(job);
+            }
+        }
+        self.focused_jobs().get(self.selected_index).copied()
     }
 
     /// Calculate aggregate statistics for status bar
@@ -405,6 +492,14 @@ pub enum JobsViewState {
     LogViewer,
     FilterDialog,
     MonitoringPanel,
+}
+
+/// Focused list in Jobs mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobsListSection {
+    #[default]
+    Actionable,
+    Ready,
 }
 
 /// Monitoring panel state (per jobs_redesign.md spec Section 8.2)
@@ -706,6 +801,10 @@ fn handle_text_input(key: KeyEvent, input: &mut String) -> TextInputResult {
     match key.code {
         KeyCode::Enter => TextInputResult::Committed,
         KeyCode::Esc => TextInputResult::Cancelled,
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.clear();
+            TextInputResult::Continue
+        }
         KeyCode::Char(c) => {
             input.push(c);
             TextInputResult::Continue
@@ -749,11 +848,11 @@ impl std::fmt::Display for SourceId {
 }
 
 /// Strongly-typed rule ID (None = unsaved rule)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RuleId(pub Option<i64>);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RuleId(pub Option<String>);
 
 impl RuleId {
-    pub fn new(id: i64) -> Self {
+    pub fn new(id: String) -> Self {
         RuleId(Some(id))
     }
 
@@ -898,6 +997,19 @@ pub struct PendingRuleWrite {
     pub pattern: String,
     pub tag: String,
     pub source_id: SourceId,
+}
+
+/// Pending rule update for persistence (enabled toggle)
+#[derive(Debug, Clone)]
+pub struct PendingRuleUpdate {
+    pub id: String,
+    pub enabled: bool,
+}
+
+/// Pending rule delete for persistence
+#[derive(Debug, Clone)]
+pub struct PendingRuleDelete {
+    pub id: String,
 }
 
 // ============================================================================
@@ -1269,6 +1381,8 @@ pub struct DiscoverState {
     // --- Pending DB writes ---
     pub pending_tag_writes: Vec<PendingTagWrite>,
     pub pending_rule_writes: Vec<PendingRuleWrite>,
+    pub pending_rule_updates: Vec<PendingRuleUpdate>,
+    pub pending_rule_deletes: Vec<PendingRuleDelete>,
     /// Source ID to touch for MRU ordering (set on source selection)
     pub pending_source_touch: Option<String>,
 
@@ -1409,6 +1523,12 @@ pub struct App {
     /// Profiler for frame timing and zone breakdown (F12 toggle)
     #[cfg(feature = "profiling")]
     pub profiler: casparian_profiler::Profiler,
+    /// Database is in read-only mode due to failed health check
+    db_read_only: bool,
+    /// Health check already performed
+    db_health_checked: bool,
+    /// Health warning message (shown once in UI)
+    db_health_warning: Option<String>,
 }
 
 /// Cache load messages (simplified - no chunking needed)
@@ -1490,6 +1610,76 @@ struct RuleBuilderSearchResult {
 }
 
 impl App {
+    async fn check_db_health_once(&mut self) {
+        if self.db_health_checked {
+            return;
+        }
+        self.db_health_checked = true;
+
+        let (backend, path) = self.resolve_db_target();
+        if !path.exists() {
+            return;
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() == 0 {
+                return;
+            }
+        }
+
+        let conn = match App::open_db_readonly_with(backend, &path).await {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        let required_tables = [
+            "scout_sources",
+            "scout_files",
+            "scout_tagging_rules",
+            "scout_folders",
+            "scout_settings",
+            "schema_migrations",
+        ];
+
+        let existing_tables = match backend {
+            DbBackend::DuckDb => {
+                let rows = conn.query_all(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
+                    &[],
+                ).await.unwrap_or_default();
+                rows.into_iter()
+                    .filter_map(|row| row.get::<String>(0).ok())
+                    .map(|t| t.to_lowercase())
+                    .collect::<std::collections::HashSet<_>>()
+            }
+            DbBackend::Sqlite => {
+                let rows = conn.query_all(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                    &[],
+                ).await.unwrap_or_default();
+                rows.into_iter()
+                    .filter_map(|row| row.get::<String>(0).ok())
+                    .map(|t| t.to_lowercase())
+                    .collect::<std::collections::HashSet<_>>()
+            }
+        };
+
+        let missing: Vec<String> = required_tables
+            .iter()
+            .filter(|t| !existing_tables.contains(&t.to_lowercase()))
+            .map(|t| t.to_string())
+            .collect();
+
+        if !missing.is_empty() {
+            self.db_read_only = true;
+            let msg = format!(
+                "Database missing tables: {}. Read-only mode.",
+                missing.join(", ")
+            );
+            self.db_health_warning = Some(msg.clone());
+            self.discover.status_message = Some((msg, true));
+        }
+    }
+
     /// Create new app with given args
     pub fn new(args: TuiArgs) -> Self {
         Self {
@@ -1536,6 +1726,9 @@ impl App {
             last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250), // 250ms frame budget
+            db_read_only: false,
+            db_health_checked: false,
+            db_health_warning: None,
         }
     }
 
@@ -1579,6 +1772,9 @@ impl App {
     }
 
     async fn open_db_write(&self) -> Option<DbConnection> {
+        if self.db_read_only {
+            return None;
+        }
         let (backend, path) = self.resolve_db_target();
         Self::open_db_write_with(backend, &path).await
     }
@@ -1646,7 +1842,8 @@ impl App {
             // Discover Rule Builder shortcuts: [1]/[2] open local dropdowns
             KeyCode::Char('1') | KeyCode::Char('2')
                 if self.mode == TuiMode::Discover
-                    && self.discover.view_state == DiscoverViewState::RuleBuilder =>
+                    && self.discover.view_state == DiscoverViewState::RuleBuilder
+                    && !self.in_text_input_mode() =>
             {
                 match key.code {
                     KeyCode::Char('1') => {
@@ -1779,7 +1976,26 @@ impl App {
                     if self.mode != TuiMode::Jobs {
                         self.jobs_state.previous_mode = Some(self.mode);
                     }
-                    self.jobs_state.selected_index = self.jobs_drawer_selected;
+                    if let Some(job) = self.jobs_state.jobs.get(self.jobs_drawer_selected) {
+                        self.jobs_state.section_focus = match job.status {
+                            JobStatus::Completed => JobsListSection::Ready,
+                            JobStatus::Pending | JobStatus::Running | JobStatus::Failed | JobStatus::Cancelled => {
+                                JobsListSection::Actionable
+                            }
+                        };
+
+                        let target_list = match self.jobs_state.section_focus {
+                            JobsListSection::Actionable => self.jobs_state.actionable_jobs(),
+                            JobsListSection::Ready => self.jobs_state.ready_jobs(),
+                        };
+
+                        if let Some(index) = target_list.iter().position(|j| j.id == job.id) {
+                            self.jobs_state.selected_index = index;
+                        } else {
+                            self.jobs_state.selected_index = 0;
+                        }
+                        self.jobs_state.clamp_selection();
+                    }
                     self.mode = TuiMode::Jobs;
                     self.jobs_drawer_open = false;
                 }
@@ -1878,6 +2094,12 @@ impl App {
             // ?: Toggle help overlay (per spec Section 3.1)
             // Don't intercept when in text input mode
             KeyCode::Char('?') if !self.in_text_input_mode() => {
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    if builder.focus == super::extraction::RuleBuilderFocus::Suggestions {
+                        builder.suggestions_help_open = true;
+                        return;
+                    }
+                }
                 self.show_help = !self.show_help;
                 return;
             }
@@ -3318,18 +3540,41 @@ impl App {
             KeyCode::Char('d') => {
                 // Delete selected rule (TODO: add confirmation)
                 if !self.discover.rules.is_empty() {
+                    if self.db_read_only {
+                        self.discover.status_message = Some((
+                            "Database is read-only; cannot delete rules".to_string(),
+                            true,
+                        ));
+                        return;
+                    }
+                    if let Some(rule) = self.discover.rules.get(self.discover.selected_rule) {
+                        if let Some(id) = rule.id.0.clone() {
+                            self.discover.pending_rule_deletes.push(PendingRuleDelete { id });
+                        }
+                    }
                     self.discover.rules.remove(self.discover.selected_rule);
                     if self.discover.selected_rule >= self.discover.rules.len() && self.discover.selected_rule > 0 {
                         self.discover.selected_rule -= 1;
                     }
-                    // TODO: Delete from DB
                 }
             }
             KeyCode::Enter => {
                 // Toggle rule enabled/disabled
                 if let Some(rule) = self.discover.rules.get_mut(self.discover.selected_rule) {
+                    if self.db_read_only {
+                        self.discover.status_message = Some((
+                            "Database is read-only; cannot update rules".to_string(),
+                            true,
+                        ));
+                        return;
+                    }
                     rule.enabled = !rule.enabled;
-                    // TODO: Update in DB
+                    if let Some(id) = rule.id.0.clone() {
+                        self.discover.pending_rule_updates.push(PendingRuleUpdate {
+                            id,
+                            enabled: rule.enabled,
+                        });
+                    }
                 }
             }
             KeyCode::Esc => {
@@ -3469,9 +3714,10 @@ impl App {
 
     /// Handle keys in Rule Builder mode (specs/rule_builder.md)
     ///
-    /// Focus cycles: Pattern → Excludes → Tag → Extractions → Options → FileList
+    /// Focus cycles: Pattern → Excludes → Tag → Extractions → Options → Suggestions → FileList
     fn handle_rule_builder_key(&mut self, key: KeyEvent) {
         use super::extraction::RuleBuilderFocus;
+        use super::extraction::SuggestionSection;
 
         // Capture the current pattern before handling the key
         let pattern_before = self.discover.rule_builder.as_ref()
@@ -3487,6 +3733,58 @@ impl App {
             }
         };
         let mut refresh_needed = false;
+
+        if builder.suggestions_help_open || builder.suggestions_detail_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
+                    builder.suggestions_help_open = false;
+                    builder.suggestions_detail_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if builder.confirm_exit_open {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    builder.confirm_exit_open = false;
+                    builder.dirty = false;
+                    self.mode = TuiMode::Home;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    builder.confirm_exit_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if builder.manual_tag_confirm_open {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let (tag, paths) = {
+                        builder.manual_tag_confirm_open = false;
+                        (builder.tag.clone(), Self::rule_builder_preview_paths_from(builder, false))
+                    };
+                    if !tag.is_empty() && !paths.is_empty() {
+                        let tagged = self.apply_manual_tag_to_paths(&paths, &tag);
+                        self.discover.status_message = Some((
+                            format!("Tagged {} files with '{}'", tagged, tag),
+                            false,
+                        ));
+                        if let Some(builder) = self.discover.rule_builder.as_mut() {
+                            builder.selected_preview_files.clear();
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    builder.manual_tag_confirm_open = false;
+                }
+                _ => {}
+            }
+            return;
+        }
 
         if builder.source_id.is_none() {
             match key.code {
@@ -3524,7 +3822,8 @@ impl App {
                     RuleBuilderFocus::Tag => RuleBuilderFocus::Extractions,
                     RuleBuilderFocus::Extractions => RuleBuilderFocus::Options,
                     RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Options,
-                    RuleBuilderFocus::Options => RuleBuilderFocus::FileList,
+                    RuleBuilderFocus::Options => RuleBuilderFocus::Suggestions,
+                    RuleBuilderFocus::Suggestions => RuleBuilderFocus::FileList,
                     RuleBuilderFocus::FileList => RuleBuilderFocus::Pattern,
                     RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
                 };
@@ -3540,7 +3839,8 @@ impl App {
                     RuleBuilderFocus::Extractions => RuleBuilderFocus::Tag,
                     RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Extractions,
                     RuleBuilderFocus::Options => RuleBuilderFocus::Extractions,
-                    RuleBuilderFocus::FileList => RuleBuilderFocus::Options,
+                    RuleBuilderFocus::Suggestions => RuleBuilderFocus::Options,
+                    RuleBuilderFocus::FileList => RuleBuilderFocus::Suggestions,
                     RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
                 };
             }
@@ -3549,7 +3849,11 @@ impl App {
             KeyCode::Esc => {
                 match builder.focus {
                     RuleBuilderFocus::FileList => {
-                        self.mode = TuiMode::Home;
+                        if builder.dirty {
+                            builder.confirm_exit_open = true;
+                        } else {
+                            self.mode = TuiMode::Home;
+                        }
                         return;
                     }
                     RuleBuilderFocus::ExcludeInput => {
@@ -3561,6 +3865,9 @@ impl App {
                     }
                     RuleBuilderFocus::IgnorePicker => {
                         builder.ignore_options.clear();
+                        builder.focus = RuleBuilderFocus::FileList;
+                    }
+                    RuleBuilderFocus::Suggestions => {
                         builder.focus = RuleBuilderFocus::FileList;
                     }
                     RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag => {
@@ -3603,6 +3910,7 @@ impl App {
                         let pattern = builder.exclude_input.trim().to_string();
                         if !pattern.is_empty() {
                             builder.add_exclude(pattern);
+                            builder.dirty = true;
                             refresh_needed = true;
                         }
                         builder.exclude_input.clear();
@@ -3616,10 +3924,14 @@ impl App {
                         // Apply selected ignore option
                         if let Some(option) = builder.ignore_options.get(builder.ignore_selected) {
                             builder.add_exclude(option.pattern.clone());
+                            builder.dirty = true;
                             refresh_needed = true;
                         }
                         builder.ignore_options.clear();
                         builder.focus = RuleBuilderFocus::FileList;
+                    }
+                    RuleBuilderFocus::Suggestions => {
+                        builder.suggestions_detail_open = true;
                     }
                     _ => {}
                 }
@@ -3627,24 +3939,64 @@ impl App {
 
             // Ctrl+S: Save rule
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.db_read_only {
+                    self.discover.status_message = Some((
+                        "Database is read-only; cannot save rules".to_string(),
+                        true,
+                    ));
+                    return;
+                }
                 if builder.can_save() {
                     let _draft = builder.to_draft();
-                    // TODO: Save to database
-                    self.discover.status_message = Some((
-                        format!("Rule '{}' saved", builder.tag),
-                        false,
-                    ));
-                    // Stay in Rule Builder (it's the default view) - clear for next rule
-                    builder.pattern = "**/*".to_string();
-                    builder.tag.clear();
-                    builder.excludes.clear();
-                    builder.focus = RuleBuilderFocus::Pattern;
+                    if let Some(source_id) = builder.source_id.clone() {
+                        self.discover.pending_rule_writes.push(PendingRuleWrite {
+                            pattern: builder.pattern.clone(),
+                            tag: builder.tag.clone(),
+                            source_id: SourceId(source_id),
+                        });
+                        self.discover.status_message = Some((
+                            format!("Rule '{}' saved", builder.tag),
+                            false,
+                        ));
+                        builder.dirty = false;
+                        // Stay in Rule Builder (it's the default view) - clear for next rule
+                        builder.pattern = "**/*".to_string();
+                        builder.tag.clear();
+                        builder.excludes.clear();
+                        builder.focus = RuleBuilderFocus::Pattern;
+                    } else {
+                        self.discover.status_message = Some((
+                            "Cannot save: no source selected".to_string(),
+                            true,
+                        ));
+                    }
                 } else {
                     self.discover.status_message = Some((
                         "Cannot save: pattern and tag are required".to_string(),
                         true,
                     ));
                 }
+            }
+
+            // Ctrl+N: Clear form (new rule)
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                builder.pattern = "**/*".to_string();
+                builder.pattern_error = None;
+                builder.excludes.clear();
+                builder.exclude_input.clear();
+                builder.tag.clear();
+                builder.extractions.clear();
+                builder.editing_rule_id = None;
+                builder.selected_preview_files.clear();
+                builder.manual_tag_confirm_open = false;
+                builder.manual_tag_confirm_count = 0;
+                builder.dirty = false;
+                builder.focus = RuleBuilderFocus::Pattern;
+                refresh_needed = true;
+                self.discover.status_message = Some((
+                    "Cleared rule builder".to_string(),
+                    false,
+                ));
             }
 
             // Down arrow: navigate lists OR move to next field from text input
@@ -3678,13 +4030,21 @@ impl App {
                         }
                     }
                     RuleBuilderFocus::Excludes => {
-                        if !builder.excludes.is_empty() {
+                        if builder.excludes.is_empty() {
+                            builder.focus = RuleBuilderFocus::Tag;
+                        } else if builder.selected_exclude + 1 >= builder.excludes.len() {
+                            builder.focus = RuleBuilderFocus::Tag;
+                        } else {
                             builder.selected_exclude = (builder.selected_exclude + 1)
                                 .min(builder.excludes.len().saturating_sub(1));
                         }
                     }
                     RuleBuilderFocus::Extractions => {
-                        if !builder.extractions.is_empty() {
+                        if builder.extractions.is_empty() {
+                            builder.focus = RuleBuilderFocus::Options;
+                        } else if builder.selected_extraction + 1 >= builder.extractions.len() {
+                            builder.focus = RuleBuilderFocus::Options;
+                        } else {
                             builder.selected_extraction = (builder.selected_extraction + 1)
                                 .min(builder.extractions.len().saturating_sub(1));
                         }
@@ -3694,6 +4054,17 @@ impl App {
                             builder.ignore_selected = (builder.ignore_selected + 1)
                                 .min(builder.ignore_options.len().saturating_sub(1));
                         }
+                    }
+                    RuleBuilderFocus::Options => {
+                        builder.focus = RuleBuilderFocus::Suggestions;
+                    }
+                    RuleBuilderFocus::Suggestions => {
+                        builder.suggestions_section = match builder.suggestions_section {
+                            SuggestionSection::Patterns => SuggestionSection::Structures,
+                            SuggestionSection::Structures => SuggestionSection::Filenames,
+                            SuggestionSection::Filenames => SuggestionSection::Synonyms,
+                            SuggestionSection::Synonyms => SuggestionSection::Patterns,
+                        };
                     }
                     _ => {}
                 }
@@ -3729,6 +4100,17 @@ impl App {
                             builder.selected_extraction = builder.selected_extraction.saturating_sub(1);
                         }
                     }
+                    RuleBuilderFocus::Options => {
+                        builder.focus = RuleBuilderFocus::Extractions;
+                    }
+                    RuleBuilderFocus::Suggestions => {
+                        builder.suggestions_section = match builder.suggestions_section {
+                            SuggestionSection::Patterns => SuggestionSection::Synonyms,
+                            SuggestionSection::Structures => SuggestionSection::Patterns,
+                            SuggestionSection::Filenames => SuggestionSection::Structures,
+                            SuggestionSection::Synonyms => SuggestionSection::Filenames,
+                        };
+                    }
                     RuleBuilderFocus::IgnorePicker => {
                         builder.ignore_selected = builder.ignore_selected.saturating_sub(1);
                     }
@@ -3739,6 +4121,7 @@ impl App {
             // Delete exclude with 'd' or 'x'
             KeyCode::Char('d') | KeyCode::Char('x') if builder.focus == RuleBuilderFocus::Excludes => {
                 builder.remove_exclude(builder.selected_exclude);
+                builder.dirty = true;
                 refresh_needed = true;
             }
 
@@ -3762,8 +4145,54 @@ impl App {
                 }
             }
 
-            // 't' to run backtest (Phase 2 -> Phase 3) - only when not editing text
-            KeyCode::Char('t') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
+            // Suggestions list navigation
+            KeyCode::Char('j') if builder.focus == RuleBuilderFocus::Suggestions => {
+                match builder.suggestions_section {
+                    SuggestionSection::Patterns => {
+                        if !builder.pattern_seeds.is_empty() {
+                            builder.selected_pattern_seed = (builder.selected_pattern_seed + 1)
+                                .min(builder.pattern_seeds.len().saturating_sub(1));
+                        }
+                    }
+                    SuggestionSection::Structures => {
+                        if !builder.path_archetypes.is_empty() {
+                            builder.selected_archetype = (builder.selected_archetype + 1)
+                                .min(builder.path_archetypes.len().saturating_sub(1));
+                        }
+                    }
+                    SuggestionSection::Filenames => {
+                        if !builder.naming_schemes.is_empty() {
+                            builder.selected_naming_scheme = (builder.selected_naming_scheme + 1)
+                                .min(builder.naming_schemes.len().saturating_sub(1));
+                        }
+                    }
+                    SuggestionSection::Synonyms => {
+                        if !builder.synonym_suggestions.is_empty() {
+                            builder.selected_synonym = (builder.selected_synonym + 1)
+                                .min(builder.synonym_suggestions.len().saturating_sub(1));
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('k') if builder.focus == RuleBuilderFocus::Suggestions => {
+                match builder.suggestions_section {
+                    SuggestionSection::Patterns => {
+                        builder.selected_pattern_seed = builder.selected_pattern_seed.saturating_sub(1);
+                    }
+                    SuggestionSection::Structures => {
+                        builder.selected_archetype = builder.selected_archetype.saturating_sub(1);
+                    }
+                    SuggestionSection::Filenames => {
+                        builder.selected_naming_scheme = builder.selected_naming_scheme.saturating_sub(1);
+                    }
+                    SuggestionSection::Synonyms => {
+                        builder.selected_synonym = builder.selected_synonym.saturating_sub(1);
+                    }
+                }
+            }
+
+            // 'b' to run backtest (Phase 2 -> Phase 3) - only when not editing text
+            KeyCode::Char('b') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
                 if let super::extraction::FileResultsState::ExtractionPreview { preview_files } = &builder.file_results {
                     let matched_files: Vec<super::extraction::MatchedFile> = preview_files
                         .iter()
@@ -3776,6 +4205,7 @@ impl App {
                         .collect();
                     let visible_indices: Vec<usize> = (0..matched_files.len()).collect();
                     builder.selected_file = 0;
+                    builder.selected_preview_files.clear();
                     builder.file_results = super::extraction::FileResultsState::BacktestResults {
                         matched_files,
                         visible_indices,
@@ -3783,6 +4213,17 @@ impl App {
                         result_filter: super::extraction::ResultFilter::All,
                     };
                     // TODO: Actually run backtest async and update test_result
+                }
+            }
+
+            // Space toggles selection in preview/results list
+            KeyCode::Char(' ') if builder.focus == RuleBuilderFocus::FileList => {
+                if let Some(path) = Self::rule_builder_selected_rel_path_from(builder) {
+                    if builder.selected_preview_files.contains(&path) {
+                        builder.selected_preview_files.remove(&path);
+                    } else {
+                        builder.selected_preview_files.insert(path);
+                    }
                 }
             }
 
@@ -3798,6 +4239,65 @@ impl App {
                 if !matches!(builder.focus, RuleBuilderFocus::FileList | RuleBuilderFocus::IgnorePicker) {
                     // Move from left panel to FileList (right panel)
                     builder.focus = RuleBuilderFocus::FileList;
+                }
+            }
+            // Quick pane jump with [ and ]
+            KeyCode::Char('[') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
+                builder.focus = RuleBuilderFocus::Pattern;
+            }
+            KeyCode::Char(']') if !matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) => {
+                builder.focus = RuleBuilderFocus::FileList;
+            }
+
+            // Contextual help for suggestions section
+            KeyCode::Char('?') if builder.focus == RuleBuilderFocus::Suggestions => {
+                builder.suggestions_help_open = true;
+            }
+
+            // 't' applies manual tag to preview (selection-aware)
+            KeyCode::Char('t') if builder.focus == RuleBuilderFocus::FileList => {
+                if self.db_read_only {
+                    self.discover.status_message = Some((
+                        "Database is read-only; cannot apply tags".to_string(),
+                        true,
+                    ));
+                    return;
+                }
+                if builder.tag.trim().is_empty() {
+                    self.discover.status_message = Some((
+                        "Enter a tag before applying".to_string(),
+                        true,
+                    ));
+                    return;
+                }
+                let selected = Self::rule_builder_preview_paths_from(builder, true);
+                let total = if selected.is_empty() {
+                    Self::rule_builder_preview_paths_from(builder, false).len()
+                } else {
+                    0
+                };
+                let tag = builder.tag.clone();
+                if selected.is_empty() {
+                    if total == 0 {
+                        self.discover.status_message = Some((
+                            "No preview results to tag".to_string(),
+                            true,
+                        ));
+                        return;
+                    }
+                    if let Some(builder) = self.discover.rule_builder.as_mut() {
+                        builder.manual_tag_confirm_open = true;
+                        builder.manual_tag_confirm_count = total;
+                    }
+                    return;
+                }
+                let tagged = self.apply_manual_tag_to_paths(&selected, tag.as_str());
+                self.discover.status_message = Some((
+                    format!("Tagged {} files with '{}'", tagged, tag),
+                    false,
+                ));
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    builder.selected_preview_files.clear();
                 }
             }
 
@@ -3829,6 +4329,7 @@ impl App {
                 match builder.focus {
                     RuleBuilderFocus::Pattern => {
                         builder.pattern.push(c);
+                        builder.dirty = true;
                         builder.pattern_changed_at = Some(std::time::Instant::now());
                         // Validate pattern
                         match super::extraction::parse_custom_glob(&builder.pattern) {
@@ -3838,9 +4339,11 @@ impl App {
                     }
                     RuleBuilderFocus::Tag => {
                         builder.tag.push(c);
+                        builder.dirty = true;
                     }
                     RuleBuilderFocus::ExcludeInput => {
                         builder.exclude_input.push(c);
+                        builder.dirty = true;
                     }
                     _ => {}
                 }
@@ -3851,6 +4354,7 @@ impl App {
                 match builder.focus {
                     RuleBuilderFocus::Pattern => {
                         builder.pattern.pop();
+                        builder.dirty = true;
                         builder.pattern_changed_at = Some(std::time::Instant::now());
                         // Re-validate pattern
                         if builder.pattern.is_empty() {
@@ -3864,9 +4368,11 @@ impl App {
                     }
                     RuleBuilderFocus::Tag => {
                         builder.tag.pop();
+                        builder.dirty = true;
                     }
                     RuleBuilderFocus::ExcludeInput => {
                         builder.exclude_input.pop();
+                        builder.dirty = true;
                     }
                     _ => {}
                 }
@@ -3907,11 +4413,22 @@ impl App {
 
     /// Apply a tag to a file (stores in local state, async save happens on tick)
     fn apply_tag_to_file(&mut self, file_path: &str, tag: &str) {
+        if self.db_read_only {
+            self.discover.status_message = Some((
+                "Database is read-only; cannot apply tags".to_string(),
+                true,
+            ));
+            return;
+        }
         // Find the file in our list and add the tag locally
         for file in &mut self.discover.files {
-            if file.path == file_path {
+            if file.path == file_path || file.rel_path == file_path {
                 if !file.tags.contains(&tag.to_string()) {
                     file.tags.push(tag.to_string());
+                    self.discover.pending_tag_writes.push(PendingTagWrite {
+                        file_path: file.path.clone(),
+                        tag: tag.to_string(),
+                    });
                     self.discover.status_message = Some((
                         format!("Tagged '{}' with '{}'",
                             std::path::Path::new(file_path)
@@ -3938,6 +4455,65 @@ impl App {
 
         // Note: Actual DB persistence would be done async via tick() or a separate task
         // For now this updates local state immediately
+    }
+
+    /// Get the currently selected preview file relative path (if any)
+    fn rule_builder_selected_rel_path_from(
+        builder: &super::extraction::RuleBuilderState,
+    ) -> Option<String> {
+        match &builder.file_results {
+            super::extraction::FileResultsState::ExtractionPreview { preview_files } => {
+                preview_files.get(builder.selected_file).map(|f| f.relative_path.clone())
+            }
+            super::extraction::FileResultsState::BacktestResults { matched_files, visible_indices, .. } => {
+                visible_indices.get(builder.selected_file).and_then(|idx| matched_files.get(*idx)).map(|f| f.relative_path.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Get preview relative paths, optionally only selected
+    fn rule_builder_preview_paths_from(
+        builder: &super::extraction::RuleBuilderState,
+        only_selected: bool,
+    ) -> Vec<String> {
+        let selected = &builder.selected_preview_files;
+        let mut paths = Vec::new();
+
+        match &builder.file_results {
+            super::extraction::FileResultsState::ExtractionPreview { preview_files } => {
+                for file in preview_files {
+                    if !only_selected || selected.contains(&file.relative_path) {
+                        paths.push(file.relative_path.clone());
+                    }
+                }
+            }
+            super::extraction::FileResultsState::BacktestResults { matched_files, visible_indices, .. } => {
+                for idx in visible_indices {
+                    if let Some(file) = matched_files.get(*idx) {
+                        if !only_selected || selected.contains(&file.relative_path) {
+                            paths.push(file.relative_path.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        paths
+    }
+
+    /// Apply a manual tag to preview paths (returns count tagged)
+    fn apply_manual_tag_to_paths(&mut self, paths: &[String], tag: &str) -> usize {
+        let mut tagged = 0usize;
+        for rel_path in paths {
+            let before = self.discover.pending_tag_writes.len();
+            self.apply_tag_to_file(rel_path, tag);
+            if self.discover.pending_tag_writes.len() > before {
+                tagged += 1;
+            }
+        }
+        tagged
     }
 
     /// Open the rule creation dialog with context-aware prefilling
@@ -4006,6 +4582,9 @@ impl App {
             Some(b) => b,
             None => return,
         };
+        builder.selected_preview_files.clear();
+        builder.manual_tag_confirm_open = false;
+        builder.manual_tag_confirm_count = 0;
 
         if pattern.is_empty() {
             builder.match_count = 0;
@@ -4464,6 +5043,14 @@ impl App {
     fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> usize {
         use globset::GlobBuilder;
 
+        if self.db_read_only {
+            self.discover.status_message = Some((
+                "Database is read-only; cannot apply rules".to_string(),
+                true,
+            ));
+            return 0;
+        }
+
         // Build the glob matcher
         let glob_pattern = if pattern.contains('/') {
             pattern.to_string()
@@ -4593,6 +5180,10 @@ impl App {
                 // TODO: Reload jobs from database
                 // For now just reset the view
                 self.jobs_state.selected_index = 0;
+                self.jobs_state.section_focus = JobsListSection::Actionable;
+                self.jobs_state.actionable_index = 0;
+                self.jobs_state.ready_index = 0;
+                self.jobs_state.pinned_job_id = None;
             }
             TuiMode::Sources => {
                 // Mark sources as needing refresh - will trigger reload on next tick
@@ -5093,6 +5684,14 @@ impl App {
     fn scan_directory(&mut self, path: &str) {
         use std::path::Path;
 
+        if self.db_read_only {
+            self.discover.status_message = Some((
+                "Database is read-only due to schema health check".to_string(),
+                true,
+            ));
+            return;
+        }
+
         let path_input = Path::new(path);
 
         let expanded_path = scan_path::expand_scan_path(path_input);
@@ -5265,10 +5864,18 @@ impl App {
 
             match scan_result {
                 Ok(Ok(result)) => {
+                    let persisted = result.stats.files_persisted as usize;
+                    let discovered = result.stats.files_discovered as usize;
+                    if persisted == 0 && discovered > 0 {
+                        let _ = tui_tx.send(TuiScanResult::Error(
+                            "Scan completed but no files were persisted. Check database health or locks.".to_string(),
+                        )).await;
+                        return;
+                    }
                     // Scan complete - TUI will load files from DB
                     let _ = tui_tx.send(TuiScanResult::Complete {
                         source_path,
-                        files_persisted: result.stats.files_discovered as usize,
+                        files_persisted: persisted,
                     }).await;
                 }
                 Ok(Err(e)) => {
@@ -6363,9 +6970,14 @@ impl App {
 
     /// Persist pending tag and rule writes to the database
     async fn persist_pending_writes(&mut self) {
+        if self.db_read_only {
+            return;
+        }
         // Skip if nothing to persist
         if self.discover.pending_tag_writes.is_empty()
             && self.discover.pending_rule_writes.is_empty()
+            && self.discover.pending_rule_updates.is_empty()
+            && self.discover.pending_rule_deletes.is_empty()
             && self.discover.pending_source_touch.is_none() {
             return;
         }
@@ -6408,6 +7020,27 @@ impl App {
                     DbValue::Integer(now),
                     DbValue::Integer(now),
                 ],
+            ).await;
+        }
+
+        // Persist rule enabled toggles
+        let rule_updates = std::mem::take(&mut self.discover.pending_rule_updates);
+        for update in rule_updates {
+            let _ = conn.execute(
+                "UPDATE scout_tagging_rules SET enabled = ? WHERE id = ?",
+                &[
+                    DbValue::Integer(if update.enabled { 1 } else { 0 }),
+                    DbValue::Text(update.id),
+                ],
+            ).await;
+        }
+
+        // Persist rule deletes
+        let rule_deletes = std::mem::take(&mut self.discover.pending_rule_deletes);
+        for delete in rule_deletes {
+            let _ = conn.execute(
+                "DELETE FROM scout_tagging_rules WHERE id = ?",
+                &[DbValue::Text(delete.id)],
             ).await;
         }
 
@@ -6458,7 +7091,7 @@ impl App {
 
         let mut rules: Vec<RuleInfo> = Vec::with_capacity(rows.len());
         for row in rows {
-            let id: i64 = match row.get(0) {
+            let id: String = match row.get(0) {
                 Ok(v) => v,
                 Err(_) => return,
             };
@@ -6724,25 +7357,48 @@ impl App {
 
     /// Handle keys when in job list view
     fn handle_jobs_list_key(&mut self, key: KeyEvent) {
-        let filtered_count = self.jobs_state.filtered_jobs().len();
+        let focused_count = self.jobs_state.focused_jobs().len();
+
+        let sync_focus_index = |state: &mut JobsState| {
+            match state.section_focus {
+                JobsListSection::Actionable => state.actionable_index = state.selected_index,
+                JobsListSection::Ready => state.ready_index = state.selected_index,
+            }
+        };
 
         match key.code {
             // Job navigation (within filtered list)
             KeyCode::Down => {
-                if self.jobs_state.selected_index < filtered_count.saturating_sub(1) {
+                if self.jobs_state.selected_index < focused_count.saturating_sub(1) {
                     self.jobs_state.selected_index += 1;
+                    sync_focus_index(&mut self.jobs_state);
                 }
             }
             KeyCode::Up => {
                 if self.jobs_state.selected_index > 0 {
                     self.jobs_state.selected_index -= 1;
+                    sync_focus_index(&mut self.jobs_state);
                 }
             }
-            // Open detail panel for selected job
+            // Pin details panel to selected job
             KeyCode::Enter => {
-                if !self.jobs_state.filtered_jobs().is_empty() {
-                    self.jobs_state.transition_state(JobsViewState::DetailPanel);
+                let jobs = self.jobs_state.focused_jobs();
+                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
+                    if self.jobs_state.pinned_job_id == Some(job.id) {
+                        self.jobs_state.pinned_job_id = None;
+                    } else {
+                        self.jobs_state.pinned_job_id = Some(job.id);
+                    }
                 }
+            }
+            // Switch list focus
+            KeyCode::Tab => {
+                sync_focus_index(&mut self.jobs_state);
+                self.jobs_state.section_focus = match self.jobs_state.section_focus {
+                    JobsListSection::Actionable => JobsListSection::Ready,
+                    JobsListSection::Ready => JobsListSection::Actionable,
+                };
+                self.jobs_state.clamp_selection();
             }
             // Toggle pipeline summary
             KeyCode::Char('P') => {
@@ -6754,7 +7410,7 @@ impl App {
             }
             // Retry failed job
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                let jobs = self.jobs_state.filtered_jobs();
+                let jobs = self.jobs_state.focused_jobs();
                 if let Some(job) = jobs.get(self.jobs_state.selected_index) {
                     if job.status == JobStatus::Failed {
                         // TODO: Actually retry the job
@@ -6763,7 +7419,7 @@ impl App {
             }
             // Cancel running job
             KeyCode::Char('c') => {
-                let jobs = self.jobs_state.filtered_jobs();
+                let jobs = self.jobs_state.focused_jobs();
                 if let Some(job) = jobs.get(self.jobs_state.selected_index) {
                     if job.status == JobStatus::Running {
                         // TODO: Actually cancel the job
@@ -6781,14 +7437,16 @@ impl App {
             // Go to first job
             KeyCode::Char('g') => {
                 self.jobs_state.selected_index = 0;
+                sync_focus_index(&mut self.jobs_state);
             }
             // Go to last job
             KeyCode::Char('G') => {
-                self.jobs_state.selected_index = filtered_count.saturating_sub(1);
+                self.jobs_state.selected_index = focused_count.saturating_sub(1);
+                sync_focus_index(&mut self.jobs_state);
             }
             // Stop running backtest (requires confirmation)
             KeyCode::Char('S') => {
-                let jobs = self.jobs_state.filtered_jobs();
+                let jobs = self.jobs_state.focused_jobs();
                 if let Some(job) = jobs.get(self.jobs_state.selected_index) {
                     if job.status == JobStatus::Running && job.job_type == JobType::Backtest {
                         // TODO: Show confirmation dialog and stop backtest
@@ -6796,19 +7454,17 @@ impl App {
                 }
             }
             // Open output folder for completed jobs
-            KeyCode::Char('o') => {
-                let jobs = self.jobs_state.filtered_jobs();
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                let jobs = self.jobs_state.focused_jobs();
                 if let Some(job) = jobs.get(self.jobs_state.selected_index) {
-                    if job.status == JobStatus::Completed {
-                        if let Some(ref path) = job.output_path {
-                            // Try to open the folder in system file manager
-                            #[cfg(target_os = "macos")]
-                            let _ = std::process::Command::new("open").arg(path).spawn();
-                            #[cfg(target_os = "linux")]
-                            let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-                            #[cfg(target_os = "windows")]
-                            let _ = std::process::Command::new("explorer").arg(path).spawn();
-                        }
+                    if let Some(ref path) = job.output_path {
+                        // Try to open the folder in system file manager
+                        #[cfg(target_os = "macos")]
+                        let _ = std::process::Command::new("open").arg(path).spawn();
+                        #[cfg(target_os = "linux")]
+                        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+                        #[cfg(target_os = "windows")]
+                        let _ = std::process::Command::new("explorer").arg(path).spawn();
                     }
                 }
             }
@@ -6816,9 +7472,7 @@ impl App {
             KeyCode::Char('x') => {
                 self.jobs_state.jobs.retain(|j| j.status != JobStatus::Completed);
                 // Clamp selection to valid range
-                if self.jobs_state.selected_index >= self.jobs_state.filtered_jobs().len() {
-                    self.jobs_state.selected_index = self.jobs_state.filtered_jobs().len().saturating_sub(1);
-                }
+                self.jobs_state.clamp_selection();
             }
             // Show help overlay
             KeyCode::Char('?') => {
@@ -6826,13 +7480,13 @@ impl App {
             }
             // Open log viewer
             KeyCode::Char('L') => {
-                if !self.jobs_state.filtered_jobs().is_empty() {
+                if !self.jobs_state.focused_jobs().is_empty() {
                     self.jobs_state.transition_state(JobsViewState::LogViewer);
                 }
             }
             // Copy output path to clipboard
             KeyCode::Char('y') => {
-                let jobs = self.jobs_state.filtered_jobs();
+                let jobs = self.jobs_state.focused_jobs();
                 if let Some(job) = jobs.get(self.jobs_state.selected_index) {
                     if let Some(ref path) = job.output_path {
                         // TODO: Copy to clipboard (requires clipboard crate or platform-specific impl)
@@ -7066,6 +7720,8 @@ impl App {
     pub async fn tick(&mut self) {
         // Increment tick counter for animated UI elements
         self.tick_count = self.tick_count.wrapping_add(1);
+
+        self.check_db_health_once().await;
 
         // Preload sources on startup (any mode) so they're ready when user goes to Discover
         // This prevents "no sources" on first open
@@ -8227,6 +8883,8 @@ if __name__ == "__main__":
             KeyCode::Esc => {
                 if !self.parser_bench.filter.is_empty() {
                     self.parser_bench.filter.clear();
+                } else if self.parser_bench.test_result.is_some() {
+                    self.parser_bench.test_result = None;
                 } else {
                     self.mode = TuiMode::Home;
                 }
@@ -8240,14 +8898,6 @@ if __name__ == "__main__":
                         let _ = std::fs::remove_file(&parser.path);
                         self.parser_bench.parsers_loaded = false; // Trigger reload
                     }
-                }
-            }
-            // Clear test result / Back to home
-            KeyCode::Esc => {
-                if self.parser_bench.test_result.is_some() {
-                    self.parser_bench.test_result = None;
-                } else {
-                    self.mode = TuiMode::Home;
                 }
             }
             _ => {}
@@ -8531,8 +9181,8 @@ mod tests {
                     .await;
             }
         });
-        // Should stop at last valid index (3)
-        assert_eq!(app.jobs_state.selected_index, 3);
+        // Should stop at last valid index (2) for actionable list
+        assert_eq!(app.jobs_state.selected_index, 2);
 
         // Navigate up past beginning
         tokio::runtime::Runtime::new().unwrap().block_on(async {
