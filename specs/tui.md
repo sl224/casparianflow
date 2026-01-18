@@ -1,9 +1,9 @@
 # TUI Master Specification
 
 **Status:** READY FOR IMPLEMENTATION
-**Version:** 1.1
+**Version:** 1.2
 **Parent:** spec.md
-**Last Updated:** 2026-01-13
+**Last Updated:** 2026-01-18
 
 ---
 
@@ -180,45 +180,46 @@ to show the correct action for the current view.
 
 ## 4. Layout Patterns
 
-### 4.1 Standard Layout
+### 4.1 Standard Layout (Audit-First Shell)
 
 ```
-┌─ Header ─────────────────────────────────────────────────────────┐
-│ View Title                                    Status  [?] Help   │
-├─ Sidebar ──────────────┬─ Main Content ──────────────────────────┤
-│                        │                                         │
-│  Navigation            │  Primary content area                   │
-│  or filters            │                                         │
-│                        │                                         │
-│                        │                                         │
-│                        │                                         │
-├────────────────────────┴─────────────────────────────────────────┤
-│ Footer: Context-sensitive keybindings                            │
-└──────────────────────────────────────────────────────────────────┘
+┌─ Top Bar ─────────────────────────────────────────────────────────────────┐
+│ Casparian Flow  |  Mode: Dev  |  Contract: STRICT  |  Quarantine: 14      │
+├─ Rail ──────────┬─ Main Pane ───────────────────────┬─ Inspector ──────────┤
+│  [0] Home       │                                   │                      │
+│  [1] Discover   │  Primary list / table / editor    │  Selected item       │
+│  [2] Parsers    │                                   │  details, output,    │
+│  [3] Jobs       │                                   │  schema, errors      │
+│  [4] Sources    │                                   │                      │
+├─────────────────┴───────────────────────────────────┴──────────────────────┤
+│ Action Bar: 6-8 primary actions + status                                [?]│
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 4.2 Panel Ratios
 
-| Layout | Sidebar | Main | Use Case |
-|--------|---------|------|----------|
-| Default | 25% | 75% | Browse views |
-| Collapsed | 0% | 100% | Focus mode (`Ctrl+\`) |
-| Wide sidebar | 40% | 60% | Complex filters |
+| Layout | Rail | Main | Inspector | Use Case |
+|--------|------|------|-----------|----------|
+| Default | 18-22 chars | 55-65% | 30-35% | Normal operation |
+| Collapsed inspector | 18-22 chars | 75-82% | 0% | Focus mode (`I`) |
+| Wide inspector | 18-22 chars | 45-55% | 35-45% | Debugging/triage |
 
 ### 4.3 Focus Cycling
 
 `Tab` cycles through focusable areas:
 
 ```
-Header (if interactive)
+Top Bar (if interactive)
     ↓
-Sidebar
+Rail
     ↓
-Main Content
+Main Pane
     ↓
-Footer (if interactive)
+Inspector
     ↓
-(back to Header)
+Action Bar (if interactive)
+    ↓
+(back to Top Bar)
 ```
 
 ### 4.4 Dialog Pattern

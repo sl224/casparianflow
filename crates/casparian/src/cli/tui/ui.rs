@@ -9,7 +9,7 @@ use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
 use crate::cli::output::format_number;
 use ratatui::widgets::Clear;
 use chrono::{DateTime, Local};
-use super::app::{App, DiscoverFocus, DiscoverViewState, JobInfo, JobStatus, JobType, JobsListSection, JobsViewState, ParserHealth, ThroughputSample, TuiMode};
+use super::app::{App, DiscoverFocus, DiscoverViewState, JobInfo, JobStatus, JobsListSection, JobsViewState, ParserHealth, ThroughputSample, TuiMode};
 
 // ============================================================================
 // Shared UI Utilities
@@ -59,6 +59,273 @@ pub fn centered_scroll_offset(selected: usize, visible: usize, total: usize) -> 
     } else {
         selected.saturating_sub(visible / 2) // Center the selection
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShellAreas {
+    top: Rect,
+    rail: Rect,
+    main: Rect,
+    inspector: Rect,
+    bottom: Rect,
+}
+
+fn shell_layout(area: Rect, inspector_visible: bool) -> ShellAreas {
+    let top_height = 3u16.min(area.height);
+    let bottom_height = 3u16.min(area.height.saturating_sub(top_height));
+    let content_height = area.height.saturating_sub(top_height + bottom_height);
+
+    let rail_width = 20u16.min(area.width);
+    let mut inspector_width = if inspector_visible {
+        let pct = area.width.saturating_mul(30) / 100;
+        pct.max(24)
+    } else {
+        0
+    };
+
+    if rail_width + inspector_width >= area.width {
+        inspector_width = area.width.saturating_sub(rail_width).saturating_sub(1);
+    }
+
+    let main_width = area.width.saturating_sub(rail_width + inspector_width);
+
+    let top = Rect::new(area.x, area.y, area.width, top_height);
+    let bottom = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(bottom_height),
+        area.width,
+        bottom_height,
+    );
+    let content_y = area.y + top_height;
+
+    let rail = Rect::new(area.x, content_y, rail_width, content_height);
+    let main = Rect::new(area.x + rail_width, content_y, main_width, content_height);
+    let inspector = Rect::new(
+        area.x + rail_width + main_width,
+        content_y,
+        inspector_width,
+        content_height,
+    );
+
+    ShellAreas {
+        top,
+        rail,
+        main,
+        inspector,
+        bottom,
+    }
+}
+
+fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let (db_backend, _db_path) = if let Some(path) = app.config.database.as_ref() {
+        let backend = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("duckdb") => DbBackend::DuckDb,
+            _ => DbBackend::Sqlite,
+        };
+        (backend, path.clone())
+    } else {
+        (default_db_backend(), active_db_path())
+    };
+    let backend_label = match db_backend {
+        DbBackend::Sqlite => "sqlite",
+        DbBackend::DuckDb => "duckdb",
+    };
+
+    let running = app
+        .jobs_state
+        .jobs
+        .iter()
+        .filter(|j| j.status == JobStatus::Running)
+        .count();
+    let failed = app
+        .jobs_state
+        .jobs
+        .iter()
+        .filter(|j| j.status == JobStatus::Failed)
+        .count();
+    let quarantine_total: u64 = app
+        .jobs_state
+        .jobs
+        .iter()
+        .filter_map(|j| j.quarantine_rows)
+        .map(|rows| rows.max(0) as u64)
+        .sum();
+
+    let text = format!(
+        " Casparian Flow | View: {} | DB: {} | Run: {} | Fail: {} | Quarantine: {} ",
+        view_label, backend_label, running, failed, quarantine_total
+    );
+    let line = truncate_end(&text, area.width as usize);
+    let bar = Paragraph::new(line)
+        .style(Style::default().fg(Color::Cyan).bold())
+        .alignment(Alignment::Left)
+        .block(Block::default().borders(Borders::BOTTOM));
+    frame.render_widget(bar, area);
+}
+
+fn draw_shell_action_bar(frame: &mut Frame, text: &str, style: Style, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let line = truncate_end(text, area.width as usize);
+    let footer = Paragraph::new(line)
+        .style(style)
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::TOP));
+    frame.render_widget(footer, area);
+}
+
+fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let block = Block::default()
+        .title(" NAV ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Views",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let nav_items = [
+        ("0", "Home", TuiMode::Home),
+        ("1", "Discover", TuiMode::Discover),
+        ("2", "Parser Bench", TuiMode::ParserBench),
+        ("3", "Jobs", TuiMode::Jobs),
+        ("4", "Sources", TuiMode::Sources),
+        (",", "Settings", TuiMode::Settings),
+    ];
+
+    for (key, label, mode) in nav_items {
+        let is_active = app.mode == mode;
+        let style = if is_active {
+            Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let line = format!(" [{}] {}", key, label);
+        lines.push(Line::from(Span::styled(
+            truncate_end(&line, inner.width as usize),
+            style,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Context",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    match app.mode {
+        TuiMode::Discover => {
+            if let Some(source) = app.discover.selected_source() {
+                let line = format!(" Source: {}", source.name);
+                lines.push(Line::from(Span::styled(
+                    truncate_end(&line, inner.width as usize),
+                    Style::default().fg(Color::Gray),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    " Source: (none)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            let tag_label = app
+                .discover
+                .selected_tag
+                .and_then(|idx| app.discover.tags.get(idx))
+                .map(|t| t.name.as_str())
+                .unwrap_or("All");
+            let tag_line = format!(" Tag: {}", tag_label);
+            lines.push(Line::from(Span::styled(
+                truncate_end(&tag_line, inner.width as usize),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        TuiMode::ParserBench => {
+            let filter = if app.parser_bench.filter.is_empty() {
+                "(none)"
+            } else {
+                app.parser_bench.filter.as_str()
+            };
+            let line = format!(" Filter: {}", filter);
+            lines.push(Line::from(Span::styled(
+                truncate_end(&line, inner.width as usize),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        TuiMode::Jobs => {
+            let status = app
+                .jobs_state
+                .status_filter
+                .map(|s| s.as_str())
+                .unwrap_or("All");
+            let job_type = app
+                .jobs_state
+                .type_filter
+                .map(|t| t.as_str())
+                .unwrap_or("All");
+            lines.push(Line::from(Span::styled(
+                truncate_end(&format!(" Status: {}", status), inner.width as usize),
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(Span::styled(
+                truncate_end(&format!(" Type: {}", job_type), inner.width as usize),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        TuiMode::Sources => {
+            if let Some(source) = app.discover.sources.get(app.sources_state.selected_index) {
+                let line = format!(" Source: {}", source.name);
+                lines.push(Line::from(Span::styled(
+                    truncate_end(&line, inner.width as usize),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+        }
+        TuiMode::Settings => {
+            lines.push(Line::from(Span::styled(
+                truncate_end(
+                    &format!(" Category: {:?}", app.settings.category),
+                    inner.width as usize,
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        TuiMode::Home => {
+            let source_count = app.discover.sources.len();
+            lines.push(Line::from(Span::styled(
+                format!(" Sources: {}", source_count),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, inner);
+}
+
+fn draw_shell_inspector_block(frame: &mut Frame, title: &str, area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return area;
+    }
+    let block = Block::default()
+        .title(format!(" {} ", title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
 
 // ============================================================================
@@ -567,41 +834,27 @@ fn draw_sources_drawer(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the home hub screen (Quick Start + Status dashboard)
 fn draw_home_screen(frame: &mut Frame, app: &App, area: Rect) {
-    // Layout: title bar, main content (two panels), footer
-    let chunks = Layout::default()
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
+
+    draw_shell_top_bar(frame, app, "Home", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
+
+    let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Title bar
-            Constraint::Min(0),     // Main content
-            Constraint::Length(3),  // Footer/status
-        ])
-        .split(area);
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(shell.main);
 
-    // Title bar
-    let title = Paragraph::new(" Casparian Flow - Home ")
-        .style(Style::default().fg(Color::Cyan).bold())
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title, chunks[0]);
+    draw_home_sources_panel(frame, app, main_chunks[0]);
+    draw_home_readiness_panel(frame, app, main_chunks[1]);
 
-    // Split main content into two columns: Sources (left) and Activity (right)
-    let main_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        draw_home_inspector(frame, app, inner);
+    }
 
-    // Left panel: Quick Start - Scan a Source
-    draw_home_sources_panel(frame, app, main_cols[0]);
-
-    // Right panel: Recent Activity
-    draw_home_activity_panel(frame, app, main_cols[1]);
-
-    // Footer with shortcuts (updated for new keybindings)
-    let footer = Paragraph::new(" [↑↓] Navigate  [Enter] Scan  [/] Filter  [s] New Scan  [1] Discover  [2] Parser Bench  [3] Jobs  [4] Sources  [J] Jobs Drawer  [S] Sources Drawer  [?] Help ")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+    let footer_text = " [Enter] Open  [s] Scan  [/] Filter  [r] Refresh  [I] Inspector  [?] Help ";
+    draw_shell_action_bar(frame, footer_text, Style::default().fg(Color::DarkGray), shell.bottom);
 }
 
 /// Draw the Sources panel (left side of Home)
@@ -671,103 +924,162 @@ fn draw_home_sources_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, inner);
 }
 
-/// Draw the Activity panel (right side of Home)
-fn draw_home_activity_panel(frame: &mut Frame, app: &App, area: Rect) {
+/// Draw the Readiness panel (bottom of Home)
+fn draw_home_readiness_panel(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
-        .title(" Recent Activity ")
+        .title(" Readiness ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Show recent jobs summary
-    let mut lines = vec![];
+    let mut lines = Vec::new();
 
-    // Stats line
-    lines.push(ratatui::text::Line::from(format!(
-        "{} running, {} pending, {} failed",
-        app.home.stats.running_jobs,
-        app.home.stats.pending_jobs,
-        app.home.stats.failed_jobs
+    lines.push(Line::from(Span::styled(
+        format!(
+            "Running {}  Pending {}  Failed {}",
+            app.home.stats.running_jobs,
+            app.home.stats.pending_jobs,
+            app.home.stats.failed_jobs
+        ),
+        Style::default().fg(Color::DarkGray),
     )));
-    lines.push(ratatui::text::Line::from(""));
+    lines.push(Line::from(""));
 
-    // Recent jobs
-    for job in app.home.recent_jobs.iter().take(5) {
-        let status_style = match job.status {
-            super::app::JobStatus::Running => Style::default().fg(Color::Yellow),
-            super::app::JobStatus::Completed => Style::default().fg(Color::Green),
-            super::app::JobStatus::Failed => Style::default().fg(Color::Red),
-            super::app::JobStatus::Pending => Style::default().fg(Color::DarkGray),
-            super::app::JobStatus::Cancelled => Style::default().fg(Color::Magenta),
-        };
-        let status_text = match job.status {
-            super::app::JobStatus::Running => {
-                if let Some(pct) = job.progress_percent {
-                    format!("{}%", pct)
-                } else {
-                    "running".to_string()
-                }
-            }
-            super::app::JobStatus::Completed => "done".to_string(),
-            super::app::JobStatus::Failed => "failed".to_string(),
-            super::app::JobStatus::Pending => "pending".to_string(),
-            super::app::JobStatus::Cancelled => "cancelled".to_string(),
-        };
-        lines.push(ratatui::text::Line::from(vec![
-            ratatui::text::Span::raw(format!("[{}] {} ", job.job_type, job.description)),
-            ratatui::text::Span::styled(status_text, status_style),
-        ]));
+    let ready: Vec<_> = app
+        .home
+        .recent_jobs
+        .iter()
+        .filter(|j| j.status == super::app::JobStatus::Completed)
+        .collect();
+    let active: Vec<_> = app
+        .home
+        .recent_jobs
+        .iter()
+        .filter(|j| matches!(j.status, super::app::JobStatus::Running | super::app::JobStatus::Pending))
+        .collect();
+    let warnings: Vec<_> = app
+        .home
+        .recent_jobs
+        .iter()
+        .filter(|j| matches!(j.status, super::app::JobStatus::Failed | super::app::JobStatus::Cancelled))
+        .collect();
+
+    lines.push(Line::from(Span::styled(
+        "READY OUTPUTS",
+        Style::default().fg(Color::Green).bold(),
+    )));
+    if ready.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No ready outputs.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for job in ready.iter().take(3) {
+            lines.push(Line::from(Span::styled(
+                format!("  [READY] {} {}", job.job_type, job.description),
+                Style::default().fg(Color::Green),
+            )));
+        }
     }
 
-    if app.home.recent_jobs.is_empty() {
-        lines.push(ratatui::text::Line::from("No recent jobs."));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "ACTIVE RUNS",
+        Style::default().fg(Color::Yellow).bold(),
+    )));
+    if active.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No active runs.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for job in active.iter().take(3) {
+            let status = match job.status {
+                super::app::JobStatus::Running => job
+                    .progress_percent
+                    .map(|pct| format!("{}%", pct))
+                    .unwrap_or_else(|| "running".to_string()),
+                super::app::JobStatus::Pending => "queued".to_string(),
+                _ => "active".to_string(),
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  [RUN] {} {} {}", job.job_type, job.description, status),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
     }
 
-    // Last error
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "WARNINGS",
+        Style::default().fg(Color::Red).bold(),
+    )));
+    if warnings.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No warnings.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for job in warnings.iter().take(2) {
+            lines.push(Line::from(Span::styled(
+                format!("  [FAIL] {} {}", job.job_type, job.description),
+                Style::default().fg(Color::Red),
+            )));
+        }
+    }
+
     if let Some(ref err) = app.home.last_error {
-        lines.push(ratatui::text::Line::from(""));
-        lines.push(ratatui::text::Line::styled(
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
             format!("Last error: {}", err),
             Style::default().fg(Color::Red),
-        ));
+        )));
     }
-
-    // Tips
-    lines.push(ratatui::text::Line::from(""));
-    lines.push(ratatui::text::Line::styled(
-        "Tip: Press [J] to open Jobs drawer",
-        Style::default().fg(Color::DarkGray).italic(),
-    ));
 
     let para = Paragraph::new(lines).wrap(Wrap { trim: true });
     frame.render_widget(para, inner);
 }
 
+fn draw_home_inspector(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if let Some(source) = app.discover.sources.get(app.home.selected_source_index) {
+        lines.push(Line::from(Span::styled(
+            format!("Name: {}", source.name),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Path: {}", truncate_path_start(&source.path.display().to_string(), 30)),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Files: {}", source.file_count),
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Select a source to see details.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
 /// Draw the Sources view screen (key 4)
 fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Title bar
-            Constraint::Min(0),     // Sources list
-            Constraint::Length(3),  // Footer
-        ])
-        .split(area);
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
 
-    // Title bar
-    let title = Paragraph::new(" Sources Manager ")
-        .style(Style::default().fg(Color::Cyan).bold())
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title, chunks[0]);
+    draw_shell_top_bar(frame, app, "Sources", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
 
-    // Sources list
     let block = Block::default()
         .title(" Configured Sources ")
-        .borders(Borders::ALL);
-    let inner = block.inner(chunks[1]);
-    frame.render_widget(block, chunks[1]);
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(shell.main);
+    frame.render_widget(block, shell.main);
 
     if app.discover.sources.is_empty() {
         let msg = Paragraph::new("No sources configured.\n\nPress [n] to add a source or [1] Discover then [s] to scan.")
@@ -783,9 +1095,9 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
             .map(|(i, source)| {
                 let is_selected = i == app.sources_state.selected_index;
                 let style = if is_selected {
-                    Style::default().fg(Color::Cyan).bold()
+                    Style::default().fg(Color::White).bold().bg(Color::DarkGray)
                 } else {
-                    Style::default()
+                    Style::default().fg(Color::Gray)
                 };
                 let prefix = if is_selected { "► " } else { "  " };
                 let text = format!(
@@ -801,6 +1113,11 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
 
         let list = ratatui::widgets::List::new(items);
         frame.render_widget(list, inner);
+    }
+
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        draw_sources_inspector(frame, app, inner);
     }
 
     // Delete confirmation overlay
@@ -840,12 +1157,8 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(para, dialog_area);
     }
 
-    // Footer
-    let footer = Paragraph::new(" [↑↓] Navigate  [n] New  [e] Edit  [r] Rescan  [d] Delete  [Esc] Back  [0] Home  [?] Help ")
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+    let footer = " [↑/↓] Navigate  [n] New  [e] Edit  [r] Rescan  [d] Delete  [I] Inspector  [?] Help ";
+    draw_shell_action_bar(frame, footer, Style::default().fg(Color::DarkGray), shell.bottom);
 }
 
 /// Draw the Discover mode screen (File Explorer)
@@ -853,9 +1166,22 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
     #[cfg(feature = "profiling")]
     let _zone = app.profiler.zone("tui.discover");
 
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
+
+    draw_shell_top_bar(frame, app, "Discover", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
+
     // Rule Builder is the ONLY view in Discover mode (replaces old GlobExplorer)
-    // Always render Rule Builder as the base, then overlay dropdowns/dialogs
-    draw_rule_builder_screen(frame, app, area);
+    draw_rule_builder_screen(frame, app, shell.main);
+
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        draw_discover_inspector(frame, app, inner);
+    }
+
+    let (footer_text, footer_style) = discover_action_bar(app);
+    draw_shell_action_bar(frame, &footer_text, footer_style, shell.bottom);
 
     // Render dropdown/dialog overlays on top of Rule Builder
     match app.discover.view_state {
@@ -870,6 +1196,50 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         DiscoverViewState::EnteringPath => draw_add_source_dialog(frame, app, area),
         _ => {}
     }
+}
+
+fn discover_action_bar(app: &App) -> (String, Style) {
+    if let Some((ref msg, is_error)) = app.discover.status_message {
+        return (
+            format!(" {} ", msg),
+            if is_error {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::Green)
+            },
+        );
+    }
+
+    if let Some(ref progress) = app.cache_load_progress {
+        let spinner = spinner_char(app.tick_count);
+        return (
+            format!(" {} {} ", spinner, progress.status_line()),
+            Style::default().fg(Color::Yellow),
+        );
+    }
+
+    let scan_hint = if let Some(builder) = &app.discover.rule_builder {
+        use super::extraction::RuleBuilderFocus;
+        if matches!(
+            builder.focus,
+            RuleBuilderFocus::Pattern
+                | RuleBuilderFocus::Tag
+                | RuleBuilderFocus::ExcludeInput
+                | RuleBuilderFocus::ExtractionEdit(_)
+        ) {
+            "[Esc] Exit input then [s] Scan"
+        } else {
+            "[s] Scan"
+        }
+    } else {
+        "[s] Scan"
+    };
+
+    let text = format!(
+        " [e] Sample  [E] Full  [t] Apply Tag  [b] Backtest  {}  [Ctrl+S] Save  [Ctrl+N] Clear  [I] Inspector  [?] Help ",
+        scan_hint
+    );
+    (text, Style::default().fg(Color::DarkGray))
 }
 
 /// Draw the Sources dropdown as a proper overlay dialog
@@ -1623,64 +1993,37 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         None => return,
     };
 
-    // Main layout: Header (3) | Content (flex) | Footer (3)
+    // Main layout: Header (2) | Content (flex)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
+            Constraint::Length(2), // Header (step band)
             Constraint::Min(0),    // Content (split view)
-            Constraint::Length(3), // Footer
         ])
         .split(area);
 
-    // === HEADER ===
-    // Format: " Rule Builder - [1] Source: X ▾  [2] Tags: All ▾  [R] Rules ▾  | 247 files match | Scan: 12345 files "
-    let source_name = app.discover.selected_source()
+    let source_name = app
+        .discover
+        .selected_source()
         .map(|s| s.name.clone())
         .unwrap_or_else(|| "Select source".to_string());
     let match_count = builder.match_count;
-
-    // Scan snapshot info - show source file count if cache is loaded
-    let scan_info = if let Some(ref explorer) = app.discover.glob_explorer {
-        if explorer.cache_loaded {
-            // Get file count from selected source
-            let file_count = app.discover.selected_source()
-                .map(|s| s.file_count)
-                .unwrap_or(0);
-            if file_count > 0 {
-                format!(" | Scan: {} files", file_count)
-            } else {
-                " | Scan: empty".to_string()
-            }
-        } else if app.discover.scan_error.is_some() {
-            " | No scan [s]".to_string()
-        } else {
-            " | Loading...".to_string()
-        }
-    } else {
-        " | No scan [s]".to_string()
-    };
-
     let error_hint = app
         .discover
         .status_message
         .as_ref()
         .and_then(|(msg, is_error)| if *is_error { Some(msg.as_str()) } else { None });
-    let edit_hint = if builder.editing_rule_id.is_some() { "  Editing" } else { "" };
-    let dirty_hint = if builder.dirty { " *" } else { "" };
-    let header_text = if let Some(msg) = error_hint {
-        format!(
-            " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  [R] Rules ▾  │ {} files match{}  ⚠ {}{}{}",
-            source_name, match_count, scan_info, msg, edit_hint, dirty_hint
-        )
-    } else {
-        format!(
-            " Rule Builder - [1] Source: {} ▾  [2] Tags: All ▾  [R] Rules ▾  │ {} files match{}{}{}",
-            source_name, match_count, scan_info, edit_hint, dirty_hint
-        )
-    };
-    let header = Paragraph::new(header_text)
-        .style(Style::default().fg(Color::Green).bold())
+
+    let mut header_text = format!(
+        " [Scope] [Pattern] [Extract] [Validate]  |  Source: {}  |  Matches: {}",
+        source_name, match_count
+    );
+    if let Some(msg) = error_hint {
+        header_text.push_str(&format!("  |  ⚠ {}", msg));
+    }
+
+    let header = Paragraph::new(truncate_end(&header_text, chunks[0].width as usize))
+        .style(Style::default().fg(Color::Cyan).bold())
         .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, chunks[0]);
 
@@ -1699,35 +2042,6 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
     // Right panel: File results
     draw_rule_builder_right_panel(frame, builder, h_chunks[1], app.discover.scan_error.as_deref());
 
-    // === FOOTER ===
-    // Priority: status_message > cache loading progress > keybindings
-    let (footer_text, footer_style) = if let Some((ref msg, is_error)) = app.discover.status_message {
-        (format!(" {} ", msg), if is_error { Style::default().fg(Color::Red) } else { Style::default().fg(Color::Green) })
-    } else if let Some(ref progress) = app.cache_load_progress {
-        // Show spinner with source name and elapsed time
-        let spinner = spinner_char(app.tick_count);
-        let status = progress.status_line();
-        (format!(" {} {} ", spinner, status), Style::default().fg(Color::Yellow))
-    } else {
-        {
-            use super::extraction::RuleBuilderFocus;
-            let scan_hint = if matches!(builder.focus, RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag | RuleBuilderFocus::ExcludeInput | RuleBuilderFocus::ExtractionEdit(_)) {
-                "[Esc] Exit input then [s] Scan"
-            } else {
-                "[s] Scan"
-            };
-            (
-                format!(" [e] Sample  [E] Full  [t] Apply Tag  [b] Backtest  {}  [Tab] Nav  [Ctrl+S] Save  [Ctrl+N] Clear  [Esc] Back  [0] Home  [3] Files  [J] Jobs  [4] Sources  [?] Help ", scan_hint),
-                Style::default().fg(Color::DarkGray),
-            )
-        }
-    };
-    let footer = Paragraph::new(footer_text)
-        .style(footer_style)
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
-
     if builder.manual_tag_confirm_open {
         draw_rule_builder_manual_tag_confirm(
             frame,
@@ -1740,6 +2054,68 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
     if builder.confirm_exit_open {
         draw_rule_builder_confirm_exit(frame, area);
     }
+}
+
+fn draw_discover_inspector(frame: &mut Frame, app: &App, area: Rect) {
+    let builder = match &app.discover.rule_builder {
+        Some(b) => b,
+        None => {
+            let para = Paragraph::new("No rule builder state.")
+                .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(para, area);
+            return;
+        }
+    };
+
+    let source_name = app
+        .discover
+        .selected_source()
+        .map(|s| s.name.as_str())
+        .unwrap_or("(none)");
+    let tag_label = app
+        .discover
+        .selected_tag
+        .and_then(|idx| app.discover.tags.get(idx))
+        .map(|t| t.name.as_str())
+        .unwrap_or("All");
+    let dirty = if builder.dirty { "yes" } else { "no" };
+    let editing = if builder.editing_rule_id.is_some() {
+        "yes"
+    } else {
+        "no"
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("Source: {}", source_name),
+        Style::default().fg(Color::White),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Tag: {}", tag_label),
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Matches: {}", builder.match_count),
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Dirty: {}  Editing: {}", dirty, editing),
+        Style::default().fg(Color::Gray),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("Pattern: {}", truncate_end(&builder.pattern, 32)),
+        Style::default().fg(Color::Gray),
+    )));
+    if !builder.tag.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("Rule tag: {}", truncate_end(&builder.tag, 32)),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
 }
 
 /// Draw the left panel of Rule Builder (PATTERN, EXCLUDES, TAG, EXTRACTIONS, OPTIONS)
@@ -2509,6 +2885,32 @@ fn draw_rule_builder_manual_tag_confirm(frame: &mut Frame, area: Rect, count: us
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_sources_inspector(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if let Some(source) = app.discover.sources.get(app.sources_state.selected_index) {
+        lines.push(Line::from(Span::styled(
+            format!("Name: {}", source.name),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Path: {}", truncate_path_start(&source.path.display().to_string(), 32)),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Files: {}", source.file_count),
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Select a source to see details.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
 fn draw_rule_builder_confirm_exit(frame: &mut Frame, area: Rect) {
     let dialog_area = render_centered_dialog(frame, area, 58, 7);
     let title = " Discard Changes ";
@@ -2683,44 +3085,30 @@ fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Parser Bench screen - parser development workbench
 fn draw_parser_bench_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(0),     // Content
-            Constraint::Length(3),  // Footer
-        ])
-        .split(area);
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
 
-    // Title
-    let title = Paragraph::new(" Parser Bench ")
-        .style(Style::default().fg(Color::Cyan).bold())
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title, chunks[0]);
+    draw_shell_top_bar(frame, app, "Parser Bench", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
 
-    // Main content - two-panel layout
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(35), // Left panel: parser list
             Constraint::Percentage(65), // Right panel: details/results
         ])
-        .split(chunks[1]);
+        .split(shell.main);
 
-    // Left panel: Parser List
     draw_parser_list(frame, app, content_chunks[0]);
-
-    // Right panel: Details or results
     draw_parser_details(frame, app, content_chunks[1]);
 
-    // Footer with keybindings
-    let footer_text = " [↑/↓] Navigate  [t] Test  [n] Quick test  [/] Filter  [Esc] Back  [0] Home  [?] Help ";
-    let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        draw_parser_bench_inspector(frame, app, inner);
+    }
+
+    let footer_text = " [↑/↓] Navigate  [t] Test  [n] Quick test  [/] Filter  [I] Inspector  [?] Help ";
+    draw_shell_action_bar(frame, footer_text, Style::default().fg(Color::DarkGray), shell.bottom);
 }
 
 /// Draw the parser list panel (left side)
@@ -2873,6 +3261,45 @@ fn draw_parser_details(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         draw_parser_info(frame, parser, &app.parser_bench.bound_files, area);
     }
+}
+
+fn draw_parser_bench_inspector(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if app.parser_bench.parsers.is_empty() || app.filtered_parser_indices().is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Select a parser to see details.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let parser = &app.parser_bench.parsers[app.parser_bench.selected_parser];
+        let version = parser.version.as_deref().unwrap_or("—");
+        lines.push(Line::from(Span::styled(
+            format!("Name: {}", parser.name),
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Version: {}", version),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Health: {}", parser.health.symbol()),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Path: {}",
+                truncate_path_start(&parser.path.display().to_string(), 32)
+            ),
+            Style::default().fg(Color::Gray),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("Modified: {}", parser.modified.format("%Y-%m-%d %H:%M")),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
 }
 
 /// Draw parser info when no test result is showing
@@ -3032,11 +3459,17 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
+
+    draw_shell_top_bar(frame, app, "Jobs", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
+
     // Calculate layout based on whether pipeline is shown
     let (pipeline_height, _content_height) = if app.jobs_state.show_pipeline {
-        (8, area.height.saturating_sub(14)) // Pipeline + status bar + footer
+        (8, shell.main.height.saturating_sub(14)) // Pipeline + status bar + footer
     } else {
-        (0, area.height.saturating_sub(6)) // Just status bar + footer
+        (0, shell.main.height.saturating_sub(6)) // Just status bar + footer
     };
 
     let chunks = Layout::default()
@@ -3045,9 +3478,8 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(3),              // Status bar
             Constraint::Length(pipeline_height), // Pipeline (if shown)
             Constraint::Min(0),                 // Job list
-            Constraint::Length(3),              // Footer
         ])
-        .split(area);
+        .split(shell.main);
 
     // Status bar with aggregate stats (per spec Section 4.1)
     let ready = app.jobs_state.jobs.iter().filter(|j| j.status == JobStatus::Completed).count() as u32;
@@ -3081,25 +3513,14 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
         Rect::new(chunks[1].x, chunks[1].y, chunks[1].width, chunks[1].height + chunks[2].height)
     };
 
-    let detail_height = (job_list_area.height / 3).max(6).min(job_list_area.height.saturating_sub(4));
-    let content_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(detail_height)])
-        .split(job_list_area);
-    draw_jobs_list(frame, app, content_chunks[0]);
-    draw_job_detail(frame, app, content_chunks[1]);
+    draw_jobs_list(frame, app, job_list_area);
 
-    // Footer with shortcuts (context-sensitive per spec Section 7)
-    let footer_text = match app.jobs_state.view_state {
-        JobsViewState::MonitoringPanel => " [Esc] Back  [p] Pause  [r] Reset  [0] Home ",
-        _ => " [↑/↓] Select  [Tab] Actionable/Ready  [Enter] Pin  [f] Filter  [R] Retry  [c] Cancel  [L] Logs  [y] Copy path  [O] Open output  [Esc] Back  [0] Home ",
-    };
+    if inspector_visible {
+        draw_job_detail(frame, app, shell.inspector);
+    }
 
-    let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[3]);
+    let footer_text = " [↑/↓] Select  [Tab] Section  [Enter] Pin  [f] Filter  [R] Retry  [c] Cancel  [L] Logs  [O] Open  [y] Copy  [I] Inspector  [?] Help ";
+    draw_shell_action_bar(frame, footer_text, Style::default().fg(Color::DarkGray), shell.bottom);
 }
 
 /// Draw pipeline summary (per spec Section 3.2)
@@ -3146,8 +3567,8 @@ fn draw_pipeline_summary(frame: &mut Frame, app: &App, area: Rect) {
 /// Draw the jobs list (per spec Section 4)
 fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    let actionable_jobs = app.jobs_state.actionable_jobs();
     let ready_jobs = app.jobs_state.ready_jobs();
+    let actionable_jobs = app.jobs_state.actionable_jobs();
 
     if actionable_jobs.is_empty() && ready_jobs.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -3162,17 +3583,36 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
     } else {
-        let actionable_style = if app.jobs_state.section_focus == JobsListSection::Actionable {
-            Style::default().fg(Color::Cyan).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
         let ready_style = if app.jobs_state.section_focus == JobsListSection::Ready {
             Style::default().fg(Color::Green).bold()
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let actionable_style = if app.jobs_state.section_focus == JobsListSection::Actionable {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
 
+        lines.push(Line::from(Span::styled(
+            " READY OUTPUTS",
+            ready_style,
+        )));
+
+        if ready_jobs.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No ready outputs.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (i, job) in ready_jobs.iter().enumerate() {
+                let is_selected = app.jobs_state.section_focus == JobsListSection::Ready
+                    && i == app.jobs_state.selected_index;
+                render_ready_job_line(&mut lines, job, is_selected, area.width as usize);
+            }
+        }
+
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             " ACTIONABLE (running, queued, or failed)",
             actionable_style,
@@ -3187,26 +3627,7 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
             for (i, job) in actionable_jobs.iter().enumerate() {
                 let is_selected = app.jobs_state.section_focus == JobsListSection::Actionable
                     && i == app.jobs_state.selected_index;
-                render_job_line(&mut lines, job, is_selected, area.width as usize);
-            }
-        }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            " READY (outputs you can query now)",
-            ready_style,
-        )));
-
-        if ready_jobs.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  No ready outputs.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for (i, job) in ready_jobs.iter().enumerate() {
-                let is_selected = app.jobs_state.section_focus == JobsListSection::Ready
-                    && i == app.jobs_state.selected_index;
-                render_job_line(&mut lines, job, is_selected, area.width as usize);
+                render_actionable_job_line(&mut lines, job, is_selected, area.width as usize);
             }
         }
     }
@@ -3219,18 +3640,7 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render a single job (1-3 lines depending on type and status)
-/// Per spec Sections 4.1-4.9
-fn render_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, _width: usize) {
-    let status_symbol = job.status.symbol();
-    let status_color = match job.status {
-        JobStatus::Pending => Color::Yellow,
-        JobStatus::Running => Color::Blue,
-        JobStatus::Completed => Color::Green,
-        JobStatus::Failed => Color::Red,
-        JobStatus::Cancelled => Color::DarkGray,
-    };
-
+fn render_ready_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, width: usize) {
     let prefix = if is_selected { "▸ " } else { "  " };
     let name_style = if is_selected {
         Style::default().fg(Color::Cyan).bold()
@@ -3238,188 +3648,173 @@ fn render_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, _wid
         Style::default().fg(Color::White)
     };
 
-    // Line 1: Status, Type, Name, Version, Timestamp/Progress
     let version_str = job.version.as_deref().map(|v| format!(" v{}", v)).unwrap_or_default();
-    let time_str = format_relative_time(job.started_at);
+    let time_ref = job.completed_at.unwrap_or(job.started_at);
+    let time_str = format_relative_time(time_ref);
 
-    let progress_or_time = if job.status == JobStatus::Running {
-        // Show progress bar for running jobs
+    let name = truncate_end(&job.name, width.saturating_sub(28));
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default()),
+        Span::styled("[READY] ", Style::default().fg(Color::Green)),
+        Span::styled(format!("{} {}{}", job.job_type.as_str(), name, version_str), name_style),
+        Span::styled(format!("  {}", time_str), Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let path = job.output_path.as_deref().unwrap_or("-");
+    let size = job.output_size_bytes.map(format_size).unwrap_or_else(|| "-".to_string());
+    let quarantine = job
+        .quarantine_rows
+        .filter(|rows| *rows > 0)
+        .map(|rows| format!(" • quarantine {}", rows))
+        .unwrap_or_default();
+    let path_display = truncate_path_start(path, width.saturating_sub(18));
+    lines.push(Line::from(Span::styled(
+        format!("    Output: {} ({}){}", path_display, size, quarantine),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines.push(Line::from(""));
+}
+
+fn render_actionable_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, width: usize) {
+    let prefix = if is_selected { "▸ " } else { "  " };
+    let name_style = if is_selected {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let version_str = job.version.as_deref().map(|v| format!(" v{}", v)).unwrap_or_default();
+    let name = truncate_end(&job.name, width.saturating_sub(28));
+
+    let (label, label_style) = match job.status {
+        JobStatus::Running => ("[RUN] ", Style::default().fg(Color::Yellow)),
+        JobStatus::Pending => ("[QUEUE] ", Style::default().fg(Color::DarkGray)),
+        JobStatus::Failed => ("[FAIL] ", Style::default().fg(Color::Red)),
+        JobStatus::Cancelled => ("[CANCEL] ", Style::default().fg(Color::DarkGray)),
+        JobStatus::Completed => ("[READY] ", Style::default().fg(Color::Green)),
+    };
+
+    let trailing = if job.status == JobStatus::Running {
         let pct = if job.items_total > 0 {
             (job.items_processed as f64 / job.items_total as f64 * 100.0) as u8
-        } else { 0 };
-        format!("{}  {}%", render_progress_bar(pct, 12), pct)
+        } else {
+            0
+        };
+        format!("{} {}%", render_progress_bar(pct, 10), pct)
     } else if job.status == JobStatus::Pending {
         "queued".to_string()
     } else {
-        time_str
+        format_relative_time(job.started_at)
     };
-
-    // Add backtest iteration if applicable
-    let backtest_iter = if job.job_type == JobType::Backtest {
-        if let Some(ref bt) = job.backtest {
-            format!(" (iter {})", bt.iteration)
-        } else { String::new() }
-    } else { String::new() };
 
     lines.push(Line::from(vec![
         Span::styled(prefix, Style::default()),
-        Span::styled(status_symbol, Style::default().fg(status_color)),
-        Span::styled(format!(" {} ", job.job_type.as_str()), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{}{}{}", job.name, version_str, backtest_iter), name_style),
-        Span::styled(format!("  {}", progress_or_time), Style::default().fg(Color::DarkGray)),
+        Span::styled(label, label_style),
+        Span::styled(format!("{} {}{}", job.job_type.as_str(), name, version_str), name_style),
+        Span::styled(format!("  {}", trailing), Style::default().fg(Color::DarkGray)),
     ]));
 
-    // Line 2: Details (varies by job type and status)
-    let detail_line = match (job.job_type, job.status) {
-        (JobType::Scan, _) => {
-            format!("           {} files", job.items_processed)
-        }
-        (JobType::Parse, JobStatus::Failed) => {
-            let logical = job
-                .logical_date
-                .as_deref()
-                .map(|date| format!(" • {}", date))
-                .unwrap_or_default();
-            format!(
-                "           {} files failed • {}{}",
-                job.items_failed,
-                job.failures.first().map(|f| f.error.as_str()).unwrap_or("Unknown error"),
-                logical
-            )
-        }
-        (JobType::Parse, JobStatus::Completed) => {
-            let path = job.output_path.as_deref().unwrap_or("");
-            let size = job.output_size_bytes.map(format_size).unwrap_or_default();
-            let quarantine = job
-                .quarantine_rows
-                .filter(|rows| *rows > 0)
-                .map(|rows| format!(" • quarantine {}", rows))
-                .unwrap_or_default();
-            let logical = job
-                .logical_date
-                .as_deref()
-                .map(|date| format!(" • {}", date))
-                .unwrap_or_default();
-            format!(
-                "           {} files → {} ({}){}{}",
-                job.items_processed,
-                truncate_path(path, 40),
-                size,
-                quarantine,
-                logical
-            )
-        }
-        (JobType::Parse, JobStatus::Running) => {
+    let detail = match job.status {
+        JobStatus::Running => {
             let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
-            let logical = job
-                .logical_date
-                .as_deref()
-                .map(|date| format!(" • {}", date))
-                .unwrap_or_default();
             format!(
-                "           {}/{} files • ETA {}{}",
-                job.items_processed,
-                job.items_total,
-                eta,
-                logical
+                "    {}/{} files • ETA {}",
+                job.items_processed, job.items_total, eta
             )
         }
-        (JobType::Backtest, _) => {
-            if let Some(ref bt) = job.backtest {
-                let pct = (bt.pass_rate * 100.0) as u32;
-                let passed = (job.items_processed as f64 * bt.pass_rate) as u32;
-                format!("           Pass: {}/{} files ({})% • {} high-failure passed",
-                    passed, job.items_processed, pct, bt.high_failure_passed)
-            } else {
-                format!("           {} files tested", job.items_processed)
-            }
+        JobStatus::Failed => {
+            let err = job
+                .failures
+                .first()
+                .map(|f| f.error.as_str())
+                .unwrap_or("Unknown error");
+            format!("    Error: {}", truncate_end(err, width.saturating_sub(12)))
         }
-        (JobType::SchemaEval, _) => {
-            format!("           {} paths analyzed", job.items_processed)
-        }
-        _ => {
-            format!("           {} items", job.items_processed)
-        }
+        JobStatus::Pending => "    Queued".to_string(),
+        JobStatus::Cancelled => "    Cancelled".to_string(),
+        JobStatus::Completed => "    Ready".to_string(),
     };
+    lines.push(Line::from(Span::styled(
+        detail,
+        Style::default().fg(Color::DarkGray),
+    )));
 
-    lines.push(Line::from(Span::styled(detail_line, Style::default().fg(Color::DarkGray))));
-
-    // Line 3: First failure (for failed jobs only)
-    if job.status == JobStatus::Failed && !job.failures.is_empty() {
-        let first_failure = &job.failures[0];
-        let failure_hint = if first_failure.file_path.is_empty() {
-            first_failure.error.as_str()
-        } else {
-            &first_failure.file_path
-        };
-        lines.push(Line::from(Span::styled(
-            format!("           First failure: {}", truncate_path(failure_hint, 50)),
-            Style::default().fg(Color::Red),
-        )));
-    }
-
-    lines.push(Line::from("")); // Spacing between jobs
+    lines.push(Line::from(""));
 }
 
 /// Draw job detail panel (per spec Section 7)
 fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
     let content = if let Some(job) = app.jobs_state.selected_job() {
-        let mut detail = format!(
-            "Type:       {}\n\
-             Name:       {}{}\n\
-             Status:     {}\n\
-             Started:    {}\n\
-             Duration:   {}\n",
+        let mut detail = String::new();
+        detail.push_str(&format!(
+            "{} {}\n",
             job.job_type.as_str(),
-            job.name,
-            job.version.as_ref().map(|v| format!(" v{}", v)).unwrap_or_default(),
-            job.status.as_str(),
+            job.name
+        ));
+        detail.push_str(&format!("Status: {}\n", job.status.as_str()));
+
+        if let Some(ref path) = job.output_path {
+            detail.push_str("\nOUTPUT\n");
+            detail.push_str(&format!("{}\n", path));
+            if let Some(bytes) = job.output_size_bytes {
+                detail.push_str(&format!("{} files • {}\n", job.items_processed, format_size(bytes)));
+            }
+            if let Some(rows) = job.quarantine_rows {
+                if rows > 0 {
+                    detail.push_str(&format!("Quarantine: {} rows\n", rows));
+                }
+            }
+        }
+
+        if job.status == JobStatus::Running {
+            let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
+            detail.push_str(&format!(
+                "\nProgress: {}/{} files • ETA {}\n",
+                job.items_processed, job.items_total, eta
+            ));
+        } else if job.status == JobStatus::Pending {
+            detail.push_str("\nQueued\n");
+        }
+
+        detail.push_str(&format!(
+            "\nStarted:  {}\nDuration: {}\n",
             job.started_at.format("%H:%M:%S"),
             format_duration(job.started_at, job.completed_at)
-        );
+        ));
 
         if job.pipeline_run_id.is_some()
             || job.logical_date.is_some()
             || job.selection_snapshot_hash.is_some()
-            || job.quarantine_rows.is_some()
         {
             detail.push_str("\nPIPELINE\n");
             if let Some(ref run_id) = job.pipeline_run_id {
-                detail.push_str(&format!("Run:        {}\n", run_id));
+                detail.push_str(&format!("Run:      {}\n", run_id));
             }
             if let Some(ref logical_date) = job.logical_date {
-                detail.push_str(&format!("Logical:    {}\n", logical_date));
+                detail.push_str(&format!("Logical:  {}\n", logical_date));
             }
             if let Some(ref snapshot) = job.selection_snapshot_hash {
-                detail.push_str(&format!("Snapshot:   {}\n", snapshot));
-            }
-            if let Some(rows) = job.quarantine_rows {
-                detail.push_str(&format!("Quarantine: {} rows\n", rows));
-            }
-        }
-
-        if let Some(ref path) = job.output_path {
-            detail.push_str(&format!("\nOUTPUT\n{}\n", path));
-            if let Some(bytes) = job.output_size_bytes {
-                detail.push_str(&format!("{} files • {}\n", job.items_processed, format_size(bytes)));
+                detail.push_str(&format!("Snapshot: {}\n", snapshot));
             }
         }
 
         if !job.failures.is_empty() {
             detail.push_str(&format!("\nFAILURES ({})\n", job.failures.len()));
-            for failure in job.failures.iter().take(10) {
-                detail.push_str(&format!("{}\n  {}\n", truncate_path(&failure.file_path, 50), failure.error));
+            for failure in job.failures.iter().take(5) {
+                let hint = if failure.file_path.is_empty() {
+                    "unknown file"
+                } else {
+                    failure.file_path.as_str()
+                };
+                detail.push_str(&format!(
+                    "{}\n  {}\n",
+                    truncate_path_start(hint, 42),
+                    failure.error
+                ));
             }
-            if job.failures.len() > 10 {
-                detail.push_str(&format!("... ({} more)\n", job.failures.len() - 10));
+            if job.failures.len() > 5 {
+                detail.push_str(&format!("... ({} more)\n", job.failures.len() - 5));
             }
-        }
-
-        // Action hints
-        if job.status == JobStatus::Failed {
-            detail.push_str("\n[R] Retry all  [L] Logs");
-        } else if job.status == JobStatus::Running {
-            detail.push_str("\n[c] Cancel  [L] Logs");
         }
 
         detail
@@ -3444,29 +3839,19 @@ fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(paragraph, area);
 }
 
+
 /// Draw monitoring panel (per spec Section 5)
 fn draw_monitoring_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),   // Title
-            Constraint::Min(0),      // Content
-            Constraint::Length(3),   // Footer
-        ])
-        .split(area);
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
 
-    // Title
-    let title = Paragraph::new(" MONITORING ")
-        .style(Style::default().fg(Color::Cyan).bold())
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::BOTTOM));
-    frame.render_widget(title, chunks[0]);
+    draw_shell_top_bar(frame, app, "Jobs Monitor", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
 
-    // Content: Queue + Throughput on top, Sinks on bottom
     let content_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+        .split(shell.main);
 
     let top_row = Layout::default()
         .direction(Direction::Horizontal)
@@ -3532,13 +3917,20 @@ fn draw_monitoring_panel(frame: &mut Frame, app: &App, area: Rect) {
         .border_style(Style::default().fg(Color::DarkGray));
     frame.render_widget(Paragraph::new(sinks_content).block(sinks_block), content_chunks[1]);
 
-    // Footer
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        let text = if app.jobs_state.monitoring.paused {
+            "Updates paused."
+        } else {
+            "Live throughput metrics."
+        };
+        let para = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(para, inner);
+    }
+
     let paused_indicator = if app.jobs_state.monitoring.paused { " (PAUSED)" } else { "" };
-    let footer = Paragraph::new(format!(" [Esc] Back  [p] Pause updates  [r] Reset stats{} ", paused_indicator))
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, chunks[2]);
+    let footer = format!(" [Esc] Back  [p] Pause updates  [r] Reset stats{}  [I] Inspector ", paused_indicator);
+    draw_shell_action_bar(frame, &footer, Style::default().fg(Color::DarkGray), shell.bottom);
 }
 
 /// Render a progress bar
@@ -3643,15 +4035,6 @@ fn calculate_eta(processed: u32, total: u32, started: DateTime<Local>) -> String
     }
 }
 
-/// Truncate path from the left, keeping filename visible
-fn truncate_path(path: &str, max_len: usize) -> String {
-    if path.len() <= max_len {
-        return path.to_string();
-    }
-    format!("...{}", &path[path.len() - max_len + 3..])
-}
-
-
 /// Draw the help overlay (per spec Section 3.1)
 fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::Clear;
@@ -3701,6 +4084,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
                     "  /              Filter list             ──────",
                     "  ↑/↓           Navigate                 ?         This help",
                     "  Enter          Select item             r         Refresh view",
+                    "  I              Toggle inspector        q         Quit",
                     "  Esc            Close dropdown          q         Quit",
                     "",
                     "  Press ? or Esc to close",
@@ -3724,6 +4108,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
                     "  ↑/↓           Navigate",
                     "  Enter          Select",
                     "  Esc            Close",
+                    "  I              Toggle inspector",
                     "",
                     "  Press ? or Esc to close",
                 ]
@@ -3741,6 +4126,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             "                                         ──────",
             "                                         ?         This help",
             "                                         r         Refresh view",
+            "                                         I         Toggle inspector",
             "                                         q         Quit",
             "",
             "  Press ? or Esc to close",
@@ -3757,6 +4143,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             "                                         ──────",
             "                                         ?         This help",
             "                                         r         Refresh view",
+            "                                         I         Toggle inspector",
             "                                         q         Quit",
             "",
             "  Press ? or Esc to close",
@@ -3770,6 +4157,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             "  3              Jobs view               q         Quit",
             "  4              Sources view            P         Parser Bench",
             "  0 / H          Home                    S         Sources drawer",
+            "  I              Toggle inspector",
             "  Esc            Back / Close",
             "  ↑/↓/←/→       Navigate",
             "  Enter          Select",
@@ -3927,24 +4315,12 @@ fn draw_suggestions_detail_overlay(
 fn draw_settings_screen(frame: &mut Frame, app: &App, area: Rect) {
     use crate::cli::tui::app::SettingsCategory;
 
-    // Layout: title, content, footer
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(0),     // Content
-            Constraint::Length(3),  // Footer
-        ])
-        .split(area);
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
 
-    // Title
-    let title = Paragraph::new("Settings")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .alignment(ratatui::layout::Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-    frame.render_widget(title, chunks[0]);
+    draw_shell_top_bar(frame, app, "Settings", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
 
-    // Content - three category boxes
     let content_chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -3953,7 +4329,7 @@ fn draw_settings_screen(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(6),  // Display
             Constraint::Length(5),  // About
         ])
-        .split(chunks[1]);
+        .split(shell.main);
 
     // General section
     draw_settings_category(
@@ -4013,17 +4389,17 @@ fn draw_settings_screen(frame: &mut Frame, app: &App, area: Rect) {
     let about = Paragraph::new(about_lines).block(about_block);
     frame.render_widget(about, content_chunks[2]);
 
-    // Footer
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        draw_settings_inspector(frame, app, inner);
+    }
+
     let footer_text = if app.settings.editing {
-        "[Enter] Save  [Esc] Cancel"
+        " [Enter] Save  [Esc] Cancel  [I] Inspector "
     } else {
-        "[↑↓] Navigate  [Tab] Category  [Enter] Edit/Toggle "
+        " [↑/↓] Navigate  [Tab] Category  [Enter] Edit/Toggle  [I] Inspector "
     };
-    let footer = Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(ratatui::layout::Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
-    frame.render_widget(footer, chunks[2]);
+    draw_shell_action_bar(frame, footer_text, Style::default().fg(Color::DarkGray), shell.bottom);
 }
 
 /// Draw a settings category with its settings
@@ -4077,6 +4453,39 @@ fn draw_settings_category(
         let row_area = Rect::new(inner.x, y, inner.width, 1);
         frame.render_widget(Paragraph::new(span), row_area);
     }
+}
+
+fn draw_settings_inspector(frame: &mut Frame, app: &App, area: Rect) {
+    let (db_backend, db_path) = if let Some(path) = app.config.database.as_ref() {
+        let backend = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("duckdb") => DbBackend::DuckDb,
+            _ => DbBackend::Sqlite,
+        };
+        (backend, path.clone())
+    } else {
+        (default_db_backend(), active_db_path())
+    };
+    let backend_label = match db_backend {
+        DbBackend::Sqlite => "sqlite",
+        DbBackend::DuckDb => "duckdb",
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Version: {}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("Database: {} ({})", db_path.display(), backend_label),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "Config: ~/.casparian_flow/config.toml".to_string(),
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
 }
 
 #[cfg(test)]
@@ -4174,9 +4583,9 @@ mod tests {
             .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        // Home hub: Quick Start (Sources) + Recent Activity panels
+        // Home hub: Quick Start (Sources) + Readiness panel
         assert!(content.contains("Quick Start: Scan a Source"));
-        assert!(content.contains("Recent Activity"));
+        assert!(content.contains("Readiness"));
     }
 
     #[test]
@@ -4207,7 +4616,7 @@ mod tests {
             .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        assert!(content.contains("Rule Builder"));
+        assert!(content.contains("Scope"));
     }
 
 

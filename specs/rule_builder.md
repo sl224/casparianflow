@@ -1,10 +1,10 @@
 # Rule Builder - TUI Spec
 
-**Status:** Updated for current implementation
-**Version:** 4.1
+**Status:** Redesign proposal
+**Version:** 4.2
 **Date:** 2026-01-15
 **Related:** specs/extraction.md
-**Last Updated:** 2026-01-15
+**Last Updated:** 2026-01-18
 
 > **Note:** This is the canonical spec for Discover mode and Rule Builder.
 > Previous: `specs/views/discover.md` (archived as `archive/specs/views/discover_v3_archived.md`).
@@ -13,10 +13,12 @@
 
 ## 1. Overview
 
-The **Rule Builder** is the Discover mode UI for scanning sources, tagging files,
-and drafting rules. It uses a split layout with a left rule editor and a right
-file results panel.
-It subsumes the legacy Files view; preview and tagging live in the File Results panel.
+The **Rule Builder** is the Discover mode workbench for **Scope → Compose → Validate**.
+It uses the global **Audit-First Shell** and centers on a step band with a
+tabbed results panel and persistent inspector.
+
+It subsumes the legacy Files view; preview, backtest, and tagging live in the
+Validate panel.
 
 ### 1.1 Current Behavior Summary
 
@@ -31,17 +33,18 @@ It subsumes the legacy Files view; preview and tagging live in the File Results 
 ## 2. Layout
 
 ```
-┌ Rule Builder - [1] Source: <name> ▾  [2] Tags: All ▾  [R] Rules ▾ ─────────┐
-├─────────────────────────────────────────┬────────────────────────────────┤
-│ PATTERN                                 │ FILE RESULTS                   │
-│ EXCLUDES                                │                                │
-│ TAG                                     │                                │
-│ EXTRACTIONS                             │                                │
-│ OPTIONS                                 │                                │
-│ (schema suggestions)                    │                                │
-├─────────────────────────────────────────┴────────────────────────────────┤
-│ [e] Sample  [E] Full  [t] Apply Tag  [b] Backtest  [s] Scan                │
-│ [Tab] Nav  [Ctrl+S] Save  [Ctrl+N] Clear  [Esc] Back                        │
+┌─ Casparian Flow | Mode: Dev | Contract: DRAFT | Scan: 12,410 files ───────┐
+├─ Rail ───────────┬─ Rule Builder (Scope → Compose → Validate) ─┬─ Inspector┤
+│ [0] Home         │ [Scope] [Pattern] [Extract] [Validate]      │ Rule: fx   │
+│ [1] Discover     │                                            │ Source: ix │
+│ [2] Parser Bench │ PATTERN       EXCLUDES     TAG             │ Matches: 82│
+│ [3] Jobs         │ EXTRACTIONS   OPTIONS      SUGGESTIONS     │ Dirty: yes │
+│ [4] Sources      │                                            │            │
+│ Source: <name> ▾ │ VALIDATE: [Preview] [Backtest] [Coverage]   │            │
+│ Tags: All ▾      │ ▸ file/path/...  id=123  date=2026-01-12    │            │
+│ Rules: <rule> ▾  │   file/path/...  id=124  date=2026-01-12    │            │
+├──────────────────┴────────────────────────────────────────────┴───────────┤
+│ [s] Scan  [Ctrl+S] Save  [b] Backtest  [t] Tag  [Tab] Next  [I] Inspector │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,6 +65,7 @@ It subsumes the legacy Files view; preview and tagging live in the File Results 
 | `R` | Rules dropdown | Opens rules list overlay (CRUD) |
 | `s` | Scan new directory | Only when not in text input |
 | `Esc` | Back to Home | When focus is FileList |
+| `I` | Toggle inspector | Collapse/expand details |
 
 ### 3.2 Focus and Editing
 
@@ -149,7 +153,8 @@ filtered to that source only.
 ## 5. Notes / Planned
 
 - Rules are persisted to `scout_tagging_rules` with unique `id`.
-- Schema suggestions are present but not fully wired to backtest execution.
+- Validate tabs (Preview/Backtest/Coverage) are planned; Preview/Backtest are
+  already implemented, Coverage is a stub.
 
 ---
 
@@ -157,4 +162,5 @@ filtered to that source only.
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2026-01-18 | 4.2 | Redesign: audit-first shell + step band layout |
 | 2026-01-15 | 4.1 | Updated to match current Rule Builder implementation |
