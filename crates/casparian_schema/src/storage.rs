@@ -63,6 +63,7 @@ impl SchemaStorage {
                 contract_id TEXT PRIMARY KEY,
                 scope_id TEXT NOT NULL,
                 scope_description TEXT,
+                logic_hash TEXT,
                 approved_at TEXT NOT NULL,
                 approved_by TEXT NOT NULL,
                 version INTEGER NOT NULL DEFAULT 1,
@@ -74,6 +75,19 @@ impl SchemaStorage {
         )
         .execute(&self.pool)
         .await?;
+
+        let columns: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('schema_contracts')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let has_logic_hash = columns.iter().any(|(name,)| name == "logic_hash");
+        if !has_logic_hash {
+            sqlx::query("ALTER TABLE schema_contracts ADD COLUMN logic_hash TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             r#"
@@ -120,10 +134,11 @@ impl SchemaStorage {
         sqlx::query(
             r#"
             INSERT INTO schema_contracts
-                (contract_id, scope_id, scope_description, approved_at, approved_by, version, schemas_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                (contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ON CONFLICT(contract_id) DO UPDATE SET
                 scope_description = excluded.scope_description,
+                logic_hash = excluded.logic_hash,
                 approved_at = excluded.approved_at,
                 approved_by = excluded.approved_by,
                 version = excluded.version,
@@ -133,6 +148,7 @@ impl SchemaStorage {
         .bind(contract.contract_id.to_string())
         .bind(&contract.scope_id)
         .bind(&contract.scope_description)
+        .bind(&contract.logic_hash)
         .bind(contract.approved_at.to_rfc3339())
         .bind(&contract.approved_by)
         .bind(contract.version as i64)
@@ -147,7 +163,7 @@ impl SchemaStorage {
     pub async fn get_contract(&self, contract_id: &Uuid) -> Result<Option<SchemaContract>, StorageError> {
         let row: Option<ContractRow> = sqlx::query_as(
             r#"
-            SELECT contract_id, scope_id, scope_description, approved_at, approved_by, version, schemas_json
+            SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
             FROM schema_contracts
             WHERE contract_id = ?1
             "#,
@@ -163,7 +179,7 @@ impl SchemaStorage {
     pub async fn get_contract_for_scope(&self, scope_id: &str) -> Result<Option<SchemaContract>, StorageError> {
         let row: Option<ContractRow> = sqlx::query_as(
             r#"
-            SELECT contract_id, scope_id, scope_description, approved_at, approved_by, version, schemas_json
+            SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
             FROM schema_contracts
             WHERE scope_id = ?1
             ORDER BY version DESC
@@ -181,7 +197,7 @@ impl SchemaStorage {
     pub async fn get_contract_history(&self, scope_id: &str) -> Result<Vec<SchemaContract>, StorageError> {
         let rows: Vec<ContractRow> = sqlx::query_as(
             r#"
-            SELECT contract_id, scope_id, scope_description, approved_at, approved_by, version, schemas_json
+            SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
             FROM schema_contracts
             WHERE scope_id = ?1
             ORDER BY version DESC
@@ -211,7 +227,7 @@ impl SchemaStorage {
             Some(n) => {
                 sqlx::query_as(
                     r#"
-                    SELECT contract_id, scope_id, scope_description, approved_at, approved_by, version, schemas_json
+                    SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
                     FROM schema_contracts
                     ORDER BY approved_at DESC
                     LIMIT ?1
@@ -224,7 +240,7 @@ impl SchemaStorage {
             None => {
                 sqlx::query_as(
                     r#"
-                    SELECT contract_id, scope_id, scope_description, approved_at, approved_by, version, schemas_json
+                    SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
                     FROM schema_contracts
                     ORDER BY approved_at DESC
                     "#,
@@ -351,6 +367,7 @@ struct ContractRow {
     contract_id: String,
     scope_id: String,
     scope_description: Option<String>,
+    logic_hash: Option<String>,
     approved_at: String,
     approved_by: String,
     version: i64,
@@ -372,6 +389,7 @@ impl ContractRow {
             contract_id,
             scope_id: self.scope_id,
             scope_description: self.scope_description,
+            logic_hash: self.logic_hash,
             approved_at,
             approved_by: self.approved_by,
             schemas,
@@ -443,12 +461,14 @@ mod tests {
         let storage = SchemaStorage::in_memory().await.unwrap();
 
         let schema = create_test_schema();
-        let contract = SchemaContract::new("parser_abc", schema, "user_123");
+        let contract = SchemaContract::new("parser_abc", schema, "user_123")
+            .with_logic_hash(Some("logic-1".to_string()));
 
         storage.save_contract(&contract).await.unwrap();
 
         let loaded = storage.get_contract(&contract.contract_id).await.unwrap().unwrap();
         assert_eq!(loaded.scope_id, "parser_abc");
+        assert_eq!(loaded.logic_hash.as_deref(), Some("logic-1"));
         assert_eq!(loaded.approved_by, "user_123");
         assert_eq!(loaded.schemas.len(), 1);
         assert_eq!(loaded.schemas[0].name, "test_table");
