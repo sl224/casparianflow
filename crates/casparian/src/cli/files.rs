@@ -18,6 +18,7 @@ use crate::cli::output::{format_size, print_table_colored};
 use crate::scout::{Database, FileStatus, ScannedFile};
 use comfy_table::Color;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde::Serialize;
 use std::path::PathBuf;
 
 /// Arguments for the files command
@@ -31,6 +32,45 @@ pub struct FilesArgs {
     pub patterns: Vec<String>,
     pub tag: Option<String>,
     pub limit: usize,
+    pub json: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FilesOutput {
+    files: Vec<FileOutput>,
+    summary: FilesSummary,
+    filters: FilesFilters,
+}
+
+#[derive(Debug, Serialize)]
+struct FileOutput {
+    id: Option<i64>,
+    source_id: String,
+    path: String,
+    rel_path: String,
+    size: u64,
+    status: String,
+    tag: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilesSummary {
+    total: usize,
+    returned: usize,
+    limit: usize,
+    tagged: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilesFilters {
+    source: Option<String>,
+    all_sources: bool,
+    topic: Option<String>,
+    status: Option<String>,
+    untagged: bool,
+    patterns: Vec<String>,
+    tag: Option<String>,
 }
 
 /// Valid file statuses
@@ -147,11 +187,15 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
     let sources = db.list_sources().await
         .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
-    let (source_ids, source_context_msg): (Vec<String>, Option<String>) = if let Some(ref source_name) = args.source {
+    let (source_ids, source_context_name, source_context_msg): (Vec<String>, Option<String>, Option<String>) = if let Some(ref source_name) = args.source {
         // Explicit --source flag
         let source = sources.iter().find(|s| s.name == *source_name || s.id == *source_name);
         match source {
-            Some(s) => (vec![s.id.clone()], Some(format!("[{}]", s.name))),
+            Some(s) => (
+                vec![s.id.clone()],
+                Some(s.name.clone()),
+                Some(format!("[{}]", s.name)),
+            ),
             None => {
                 return Err(HelpfulError::new(format!("Source not found: {}", source_name))
                     .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
@@ -160,21 +204,25 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
         }
     } else if args.all {
         // --all flag: query all sources
-        (sources.iter().map(|s| s.id.clone()).collect(), None)
+        (sources.iter().map(|s| s.id.clone()).collect(), None, None)
     } else if let Some(default_source) = context::get_default_source() {
         // Use default context
         let source = sources.iter().find(|s| s.name == default_source || s.id == default_source);
         match source {
-            Some(s) => (vec![s.id.clone()], Some(format!("[{}]", s.name))),
+            Some(s) => (
+                vec![s.id.clone()],
+                Some(s.name.clone()),
+                Some(format!("[{}]", s.name)),
+            ),
             None => {
                 // Default source no longer exists - clear it and show all
                 let _ = context::clear_default_source();
-                (sources.iter().map(|s| s.id.clone()).collect(), None)
+                (sources.iter().map(|s| s.id.clone()).collect(), None, None)
             }
         }
     } else {
         // No context set - query all sources
-        (sources.iter().map(|s| s.id.clone()).collect(), None)
+        (sources.iter().map(|s| s.id.clone()).collect(), None, None)
     };
 
     // Query files based on filters, restricted to selected sources
@@ -212,21 +260,68 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
         all
     };
 
-    // Apply pattern filtering and limit in memory
-    let files: Vec<ScannedFile> = if args.patterns.is_empty() {
-        all_files.into_iter().take(args.limit).collect()
+    let all_files: Vec<ScannedFile> = all_files
+        .into_iter()
+        .filter(|f| {
+            if let Some(topic) = &args.topic {
+                if f.tag.as_deref() != Some(topic) {
+                    return false;
+                }
+            }
+            if let Some(status) = &validated_status {
+                if f.status != *status {
+                    return false;
+                }
+            }
+            if args.untagged && f.tag.is_some() {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    // Apply pattern filtering in memory (limit applied after)
+    let filtered_files: Vec<ScannedFile> = if args.patterns.is_empty() {
+        all_files
     } else {
         let (include_set, exclude_set) = build_glob_set(&args.patterns)?;
         let has_includes = args.patterns.iter().any(|p| !p.starts_with('!'));
         all_files
             .into_iter()
             .filter(|f| matches_patterns(&f.rel_path, &include_set, &exclude_set, has_includes))
-            .take(args.limit)
             .collect()
     };
+    let total_matching = filtered_files.len();
+    let files: Vec<ScannedFile> = filtered_files.into_iter().take(args.limit).collect();
+
+    let normalized_status = validated_status.as_ref().map(|status| status.as_str().to_string());
+    let all_sources = args.all || (args.source.is_none() && source_context_name.is_none());
 
     // Handle empty results
     if files.is_empty() {
+        if args.json {
+            let output = FilesOutput {
+                files: Vec::new(),
+                summary: FilesSummary {
+                    total: total_matching,
+                    returned: 0,
+                    limit: args.limit,
+                    tagged: args.tag.as_ref().map(|_| 0),
+                },
+                filters: FilesFilters {
+                    source: args.source.clone().or(source_context_name.clone()),
+                    all_sources,
+                    topic: args.topic.clone(),
+                    status: normalized_status.clone(),
+                    untagged: args.untagged,
+                    patterns: args.patterns.clone(),
+                    tag: args.tag.clone(),
+                },
+            };
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            return Ok(());
+        }
+
         if let Some(ref ctx) = source_context_msg {
             println!("{} No files found.", ctx);
         } else {
@@ -273,15 +368,56 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
         let ids: Vec<i64> = files.iter().filter_map(|f| f.id).collect();
         let tagged = db.tag_files(&ids, new_tag).await
             .map_err(|e| HelpfulError::new(format!("Failed to tag files: {}", e)))?;
-        println!(
-            "Tagged {} files with: \x1b[36m{}\x1b[0m",
-            tagged, new_tag
-        );
-        println!();
-        Some(tagged)
+        if !args.json {
+            println!(
+                "Tagged {} files with: \x1b[36m{}\x1b[0m",
+                tagged, new_tag
+            );
+            println!();
+        }
+        Some(tagged as usize)
     } else {
         None
     };
+
+    if args.json {
+        let files_output: Vec<FileOutput> = files
+            .iter()
+            .map(|f| FileOutput {
+                id: f.id,
+                source_id: f.source_id.as_ref().to_string(),
+                path: f.path.clone(),
+                rel_path: f.rel_path.clone(),
+                size: f.size,
+                status: f.status.as_str().to_string(),
+                tag: tagged_count
+                    .and_then(|_| args.tag.clone())
+                    .or_else(|| f.tag.clone()),
+                error: f.error.clone(),
+            })
+            .collect();
+
+        let output = FilesOutput {
+            files: files_output,
+            summary: FilesSummary {
+                total: total_matching,
+                returned: files.len(),
+                limit: args.limit,
+                tagged: tagged_count,
+            },
+            filters: FilesFilters {
+                source: args.source.clone().or(source_context_name.clone()),
+                all_sources,
+                topic: args.topic.clone(),
+                status: normalized_status.clone(),
+                untagged: args.untagged,
+                patterns: args.patterns.clone(),
+                tag: args.tag.clone(),
+            },
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
 
     // Print header with source context and filter summary
     if let Some(ref ctx) = source_context_msg {

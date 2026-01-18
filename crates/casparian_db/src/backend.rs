@@ -966,19 +966,21 @@ impl DbConnection {
                         }
                     }
                     _ => {
-                        let text_value: Option<Option<String>> = row.try_get(i).ok();
-                        if let Some(Some(text)) = text_value {
-                            DbValue::Text(text)
-                        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
-                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
-                        } else if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+                        if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
                             v.map(DbValue::Integer).unwrap_or(DbValue::Null)
                         } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
                             v.map(DbValue::Real).unwrap_or(DbValue::Null)
                         } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
                             v.map(DbValue::Boolean).unwrap_or(DbValue::Null)
+                        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
                         } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
                             v.map(DbValue::Blob).unwrap_or(DbValue::Null)
+                        } else if let Ok(v) = row.try_get::<Option<Option<String>>, _>(i) {
+                            match v {
+                                Some(Some(text)) => DbValue::Text(text),
+                                _ => DbValue::Null,
+                            }
                         } else {
                             DbValue::Null
                         }

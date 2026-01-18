@@ -502,8 +502,12 @@ async fn enqueue_jobs(
     ensure_queue_schema(conn).await?;
     for file_id in file_ids {
         conn.execute(
-            "INSERT INTO cf_processing_queue (file_id, pipeline_run_id, plugin_name, status, priority) VALUES (?, ?, 'QUEUED', 0)",
-            &[DbValue::from(*file_id), DbValue::from(run_id), DbValue::from(parser)],
+            "INSERT INTO cf_processing_queue (file_id, pipeline_run_id, plugin_name, status, priority) VALUES (?, ?, ?, 'QUEUED', 0)",
+            &[
+                DbValue::from(*file_id),
+                DbValue::from(run_id),
+                DbValue::from(parser),
+            ],
         )
         .await
         .context("Failed to enqueue job")?;
