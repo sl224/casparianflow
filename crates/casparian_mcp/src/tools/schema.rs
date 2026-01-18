@@ -925,7 +925,23 @@ impl Tool for ApproveSchemasTool {
             json!({
                 "scope_id": {
                     "type": "string",
-                    "description": "Scope ID to approve schemas for"
+                    "description": "Parser ID (legacy scope_id input; used if parser_id is omitted)"
+                },
+                "parser_id": {
+                    "type": "string",
+                    "description": "Parser identifier (defaults to scope_id if omitted)"
+                },
+                "parser_version": {
+                    "type": "string",
+                    "description": "Parser version string (defaults to 'unknown' if omitted)"
+                },
+                "logic_hash": {
+                    "type": "string",
+                    "description": "Advisory hash of parser logic/config"
+                },
+                "allow_nested_types": {
+                    "type": "boolean",
+                    "description": "Allow List/Struct types in approved schemas (default: false)"
                 },
                 "schemas": {
                     "type": "array",
@@ -964,10 +980,30 @@ impl Tool for ApproveSchemasTool {
 
     async fn execute(&self, args: Value) -> Result<ToolResult, ToolError> {
         // Extract parameters
-        let scope_id = args
+        let scope_id_input = args
             .get("scope_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("Missing required 'scope_id' parameter".into()))?;
+
+        let parser_id = args
+            .get("parser_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(scope_id_input);
+
+        let parser_version = args
+            .get("parser_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let logic_hash = args
+            .get("logic_hash")
+            .and_then(|v| v.as_str())
+            .map(|value| value.to_string());
+
+        let allow_nested_types = args
+            .get("allow_nested_types")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let schemas_value = args
             .get("schemas")
@@ -1029,8 +1065,18 @@ impl Tool for ApproveSchemasTool {
 
         // Create approval request
         let discovery_id = Uuid::new_v4();
-        let request = SchemaApprovalRequest::new(discovery_id, approved_by)
-            .with_schemas(approved_variants);
+        let mut request = SchemaApprovalRequest::new(
+            discovery_id,
+            parser_id,
+            parser_version,
+            approved_by,
+        )
+        .with_schemas(approved_variants)
+        .with_allow_nested_types(allow_nested_types);
+
+        if let Some(hash) = logic_hash {
+            request = request.with_logic_hash(hash);
+        }
 
         // Approve and create contract
         let approval_result = casparian_schema::approval::approve_schema(&storage, request).await
@@ -1046,7 +1092,7 @@ impl Tool for ApproveSchemasTool {
 
         let result = ApproveSchemaResultOutput {
             contract_id: approval_result.contract.contract_id.to_string(),
-            scope_id: scope_id.to_string(),
+            scope_id: approval_result.contract.scope_id.clone(),
             version: approval_result.contract.version,
             schemas_approved: approval_result.contract.schemas.len(),
             warnings,

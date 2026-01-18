@@ -18,6 +18,7 @@ use crate::{DataType, LockedColumn, LockedSchema, SchemaContract};
 use crate::storage::{SchemaStorage, StorageError};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -35,6 +36,9 @@ pub enum ApprovalError {
 
     #[error("No schemas approved")]
     NoSchemasApproved,
+
+    #[error("Multiple output tables are not supported in v1 scope_id derivation")]
+    MultipleOutputsNotSupported,
 
     #[error("Invalid column configuration: {0}")]
     InvalidColumn(String),
@@ -54,6 +58,18 @@ pub struct SchemaApprovalRequest {
     /// ID of the discovery result being approved
     pub discovery_id: Uuid,
 
+    /// Parser identifier (stable across versions)
+    pub parser_id: String,
+
+    /// Parser version for this approval
+    pub parser_version: String,
+
+    /// Advisory hash of parser logic/config (optional)
+    pub logic_hash: Option<String>,
+
+    /// Feature flag: allow List/Struct types in approved schemas
+    pub allow_nested_types: bool,
+
     /// The approved schema variants (user may have modified columns/types)
     pub approved_schemas: Vec<ApprovedSchemaVariant>,
 
@@ -72,9 +88,18 @@ pub struct SchemaApprovalRequest {
 
 impl SchemaApprovalRequest {
     /// Create a new approval request
-    pub fn new(discovery_id: Uuid, approved_by: impl Into<String>) -> Self {
+    pub fn new(
+        discovery_id: Uuid,
+        parser_id: impl Into<String>,
+        parser_version: impl Into<String>,
+        approved_by: impl Into<String>,
+    ) -> Self {
         Self {
             discovery_id,
+            parser_id: parser_id.into(),
+            parser_version: parser_version.into(),
+            logic_hash: None,
+            allow_nested_types: false,
             approved_schemas: Vec::new(),
             question_answers: Vec::new(),
             excluded_files: Vec::new(),
@@ -110,6 +135,18 @@ impl SchemaApprovalRequest {
     /// Add approval notes
     pub fn with_notes(mut self, notes: impl Into<String>) -> Self {
         self.approval_notes = Some(notes.into());
+        self
+    }
+
+    /// Set an advisory logic hash for the parser
+    pub fn with_logic_hash(mut self, logic_hash: impl Into<String>) -> Self {
+        self.logic_hash = Some(logic_hash.into());
+        self
+    }
+
+    /// Allow nested List/Struct types in approved schemas
+    pub fn with_allow_nested_types(mut self, allow: bool) -> Self {
+        self.allow_nested_types = allow;
         self
     }
 }
@@ -394,6 +431,14 @@ pub enum WarningType {
     FormatMayFail,
 }
 
+/// Derive a v1 scope_id from parser identity and output table name.
+pub fn derive_scope_id(parser_id: &str, parser_version: &str, output_table_name: &str) -> String {
+    let input = format!("{}:{}:{}", parser_id, parser_version, output_table_name);
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Approve a schema discovery and create a contract.
 ///
 /// This is the main entry point for schema approval. It:
@@ -412,7 +457,14 @@ pub async fn approve_schema(
 
     // Validate each schema variant
     for schema in &request.approved_schemas {
-        validate_approved_schema(schema)?;
+        validate_approved_schema(schema, request.allow_nested_types)?;
+    }
+
+    let output_table_name = request.approved_schemas[0].output_table_name.as_str();
+    if request.approved_schemas.iter().any(|schema| schema.output_table_name != output_table_name) {
+        // v1 scope_id derivation assumes a single output table name.
+        // If multiple outputs are present, reject rather than guess identity.
+        return Err(ApprovalError::MultipleOutputsNotSupported);
     }
 
     // Convert approved variants to locked schemas
@@ -426,12 +478,13 @@ pub async fn approve_schema(
     let warnings = generate_approval_warnings(&request);
 
     // Create the contract
-    let scope_id = request.discovery_id.to_string();
-    let contract = SchemaContract::with_schemas(
+    let scope_id = derive_scope_id(&request.parser_id, &request.parser_version, output_table_name);
+    let mut contract = SchemaContract::with_schemas(
         &scope_id,
         locked_schemas,
         &request.approved_by,
     );
+    contract.logic_hash = request.logic_hash.clone();
 
     // Save to storage
     storage.save_contract(&contract).await?;
@@ -445,7 +498,10 @@ pub async fn approve_schema(
 }
 
 /// Validate an approved schema variant.
-fn validate_approved_schema(schema: &ApprovedSchemaVariant) -> Result<(), ApprovalError> {
+fn validate_approved_schema(
+    schema: &ApprovedSchemaVariant,
+    allow_nested_types: bool,
+) -> Result<(), ApprovalError> {
     if schema.name.is_empty() {
         return Err(ApprovalError::InvalidColumn("Schema name cannot be empty".into()));
     }
@@ -464,6 +520,15 @@ fn validate_approved_schema(schema: &ApprovedSchemaVariant) -> Result<(), Approv
     for col in &schema.columns {
         if col.name.is_empty() {
             return Err(ApprovalError::InvalidColumn("Column name cannot be empty".into()));
+        }
+
+        if !allow_nested_types {
+            if matches!(col.data_type, DataType::List { .. } | DataType::Struct { .. }) {
+                return Err(ApprovalError::Validation(format!(
+                    "Nested List/Struct types require allow_nested_types: column '{}'",
+                    col.name
+                )));
+            }
         }
 
         // Check for duplicate column names (including renames)
@@ -561,9 +626,13 @@ mod tests {
         SchemaStorage::in_memory().await.unwrap()
     }
 
+    fn new_request(approved_by: &str) -> SchemaApprovalRequest {
+        SchemaApprovalRequest::new(Uuid::new_v4(), "parser-123", "1.0.0", approved_by)
+    }
+
     #[test]
     fn test_create_approval_request() {
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user123")
+        let request = new_request("user123")
             .with_schema(
                 ApprovedSchemaVariant::new("transactions", "transactions")
                     .with_columns(vec![
@@ -574,6 +643,8 @@ mod tests {
             .with_notes("Approved after review");
 
         assert_eq!(request.approved_by, "user123");
+        assert_eq!(request.parser_id, "parser-123");
+        assert_eq!(request.parser_version, "1.0.0");
         assert_eq!(request.approved_schemas.len(), 1);
         assert_eq!(request.approval_notes, Some("Approved after review".to_string()));
     }
@@ -597,7 +668,7 @@ mod tests {
     async fn test_approve_schema_success() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "approver")
+        let request = new_request("approver")
             .with_schema(
                 ApprovedSchemaVariant::new("test_schema", "test_output")
                     .with_columns(vec![
@@ -614,10 +685,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scope_id_and_logic_hash() {
+        let storage = create_test_storage().await;
+
+        let parser_id = "parser-alpha";
+        let parser_version = "2024.05";
+        let output_table_name = "events";
+        let logic_hash = "deadbeef";
+
+        let request = SchemaApprovalRequest::new(
+            Uuid::new_v4(),
+            parser_id,
+            parser_version,
+            "approver",
+        )
+        .with_logic_hash(logic_hash)
+        .with_schema(
+            ApprovedSchemaVariant::new("events", output_table_name)
+                .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)]),
+        );
+
+        let result = approve_schema(&storage, request).await.unwrap();
+        let expected_scope_id = derive_scope_id(parser_id, parser_version, output_table_name);
+        assert_eq!(result.contract.scope_id, expected_scope_id);
+        assert_eq!(result.contract.logic_hash.as_deref(), Some(logic_hash));
+    }
+
+    #[tokio::test]
     async fn test_approve_schema_no_schemas() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user");
+        let request = new_request("user");
 
         let err = approve_schema(&storage, request).await.unwrap_err();
         assert!(matches!(err, ApprovalError::NoSchemasApproved));
@@ -627,7 +725,7 @@ mod tests {
     async fn test_approve_schema_empty_name() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
+        let request = new_request("user")
             .with_schema(
                 ApprovedSchemaVariant::new("", "output")
                     .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
@@ -641,7 +739,7 @@ mod tests {
     async fn test_approve_schema_no_columns() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
+        let request = new_request("user")
             .with_schema(ApprovedSchemaVariant::new("test", "test_output"));
 
         let err = approve_schema(&storage, request).await.unwrap_err();
@@ -649,10 +747,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_nested_types_rejected_by_default() {
+        let storage = create_test_storage().await;
+
+        let request = new_request("user").with_schema(
+            ApprovedSchemaVariant::new("nested", "nested_output")
+                .with_columns(vec![ApprovedColumn::required(
+                    "items",
+                    DataType::List {
+                        item: Box::new(DataType::String),
+                    },
+                )]),
+        );
+
+        let err = approve_schema(&storage, request).await.unwrap_err();
+        assert!(matches!(err, ApprovalError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_nested_types_allowed_with_flag() {
+        let storage = create_test_storage().await;
+
+        let request = new_request("user")
+            .with_allow_nested_types(true)
+            .with_schema(
+                ApprovedSchemaVariant::new("nested", "nested_output")
+                    .with_columns(vec![ApprovedColumn::required(
+                        "items",
+                        DataType::List {
+                            item: Box::new(DataType::String),
+                        },
+                    )]),
+            );
+
+        let result = approve_schema(&storage, request).await.unwrap();
+        assert_eq!(result.contract.schemas.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_approval_warnings_for_exclusions() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
+        let request = new_request("user")
             .with_schema(
                 ApprovedSchemaVariant::new("test", "test_output")
                     .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
@@ -667,7 +803,7 @@ mod tests {
     async fn test_approval_warnings_for_rename() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
+        let request = new_request("user")
             .with_schema(
                 ApprovedSchemaVariant::new("test", "test_output")
                     .with_columns(vec![
@@ -695,10 +831,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_schemas_approval() {
+    async fn test_multiple_output_tables_rejected() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
+        let request = new_request("user")
             .with_schemas(vec![
                 ApprovedSchemaVariant::new("schema_a", "output_a")
                     .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
@@ -711,17 +847,15 @@ mod tests {
                     .with_source_pattern("*_b.csv"),
             ]);
 
-        let result = approve_schema(&storage, request).await.unwrap();
-        assert_eq!(result.contract.schemas.len(), 2);
-        assert_eq!(result.contract.schemas[0].name, "output_a");
-        assert_eq!(result.contract.schemas[1].name, "output_b");
+        let err = approve_schema(&storage, request).await.unwrap_err();
+        assert!(matches!(err, ApprovalError::MultipleOutputsNotSupported));
     }
 
     #[tokio::test]
     async fn test_duplicate_column_name_rejected() {
         let storage = create_test_storage().await;
 
-        let request = SchemaApprovalRequest::new(Uuid::new_v4(), "user")
+        let request = new_request("user")
             .with_schema(
                 ApprovedSchemaVariant::new("test", "test_output")
                     .with_columns(vec![

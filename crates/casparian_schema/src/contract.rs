@@ -22,6 +22,9 @@ pub struct SchemaContract {
     /// Human-readable description of the scope (e.g., "CSV files matching RFC_DB")
     pub scope_description: Option<String>,
 
+    /// Advisory hash of parser logic/config used when approving
+    pub logic_hash: Option<String>,
+
     /// When this contract was approved by the user
     pub approved_at: DateTime<Utc>,
 
@@ -42,6 +45,7 @@ impl SchemaContract {
             contract_id: Uuid::new_v4(),
             scope_id: scope_id.into(),
             scope_description: None,
+            logic_hash: None,
             approved_at: Utc::now(),
             approved_by: approved_by.into(),
             schemas: vec![schema],
@@ -59,6 +63,7 @@ impl SchemaContract {
             contract_id: Uuid::new_v4(),
             scope_id: scope_id.into(),
             scope_description: None,
+            logic_hash: None,
             approved_at: Utc::now(),
             approved_by: approved_by.into(),
             schemas,
@@ -69,6 +74,12 @@ impl SchemaContract {
     /// Add description to the contract
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.scope_description = Some(description.into());
+        self
+    }
+
+    /// Attach an advisory logic hash
+    pub fn with_logic_hash(mut self, logic_hash: Option<String>) -> Self {
+        self.logic_hash = logic_hash;
         self
     }
 }

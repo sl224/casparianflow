@@ -19,6 +19,18 @@ use casparian_schema::{
 };
 use uuid::Uuid;
 
+const TEST_PARSER_ID: &str = "parser-test";
+const TEST_PARSER_VERSION: &str = "1.0.0";
+
+fn new_approval_request(approved_by: &str) -> SchemaApprovalRequest {
+    SchemaApprovalRequest::new(
+        Uuid::new_v4(),
+        TEST_PARSER_ID,
+        TEST_PARSER_VERSION,
+        approved_by,
+    )
+}
+
 // =============================================================================
 // SCHEMA CONTRACT CREATION
 // =============================================================================
@@ -292,7 +304,7 @@ async fn test_storage_delete_contract() {
 async fn test_approval_basic() {
     let storage = SchemaStorage::in_memory().await.unwrap();
 
-    let request = SchemaApprovalRequest::new(Uuid::new_v4(), "approver")
+    let request = new_approval_request("approver")
         .with_schema(
             ApprovedSchemaVariant::new("sales", "sales_fact")
                 .with_columns(vec![
@@ -319,7 +331,7 @@ async fn test_approval_basic() {
 async fn test_approval_with_rename() {
     let storage = SchemaStorage::in_memory().await.unwrap();
 
-    let request = SchemaApprovalRequest::new(Uuid::new_v4(), "approver")
+    let request = new_approval_request("approver")
         .with_schema(
             ApprovedSchemaVariant::new("customers", "customers")
                 .with_columns(vec![
@@ -343,7 +355,7 @@ async fn test_approval_with_rename() {
 async fn test_approval_with_exclusions() {
     let storage = SchemaStorage::in_memory().await.unwrap();
 
-    let request = SchemaApprovalRequest::new(Uuid::new_v4(), "approver")
+    let request = new_approval_request("approver")
         .with_schema(
             ApprovedSchemaVariant::new("logs", "logs")
                 .with_columns(vec![
@@ -367,7 +379,7 @@ async fn test_approval_with_exclusions() {
 async fn test_approval_no_schemas() {
     let storage = SchemaStorage::in_memory().await.unwrap();
 
-    let request = SchemaApprovalRequest::new(Uuid::new_v4(), "approver");
+    let request = new_approval_request("approver");
 
     let result = approve_schema(&storage, request).await;
 
@@ -611,7 +623,7 @@ async fn test_full_schema_lifecycle() {
     let storage = SchemaStorage::in_memory().await.unwrap();
 
     // Step 1: Initial approval (simulating discovery result)
-    let initial_request = SchemaApprovalRequest::new(Uuid::new_v4(), "approver")
+    let initial_request = new_approval_request("approver")
         .with_schema(
             ApprovedSchemaVariant::new("transactions", "tx_fact")
                 .with_columns(vec![
