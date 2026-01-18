@@ -21,6 +21,7 @@ pub struct JobsArgs {
     pub done: bool,
     pub dead_letter: bool,
     pub limit: usize,
+    pub json: bool,
 }
 
 /// Get display color for a processing status
@@ -74,6 +75,22 @@ pub struct DeadLetterJobDisplay {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct JobsOutput {
+    stats: QueueStats,
+    filters: JobsFilters,
+    limit: usize,
+    jobs: Vec<Job>,
+    dead_letter: Vec<DeadLetterJobDisplay>,
+}
+
+#[derive(Debug, Serialize)]
+struct JobsFilters {
+    topic: Option<String>,
+    status: Vec<String>,
+    dead_letter: bool,
+}
+
 /// Execute the jobs command
 pub fn run(args: JobsArgs) -> anyhow::Result<()> {
     // Build database path
@@ -108,6 +125,36 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
     // Get queue statistics
     let stats = get_queue_stats(&conn).await?;
 
+    // Build filter based on flags
+    let status_filter = build_status_filter(&args);
+
+    if args.json {
+        let (jobs, dead_letter) = if args.dead_letter {
+            (Vec::new(), get_dead_letter_jobs(&conn, &args.topic, args.limit).await?)
+        } else {
+            (get_jobs(&conn, &args.topic, &status_filter, args.limit).await?, Vec::new())
+        };
+
+        let output = JobsOutput {
+            stats,
+            filters: JobsFilters {
+                topic: args.topic.clone(),
+                status: if args.dead_letter {
+                    Vec::new()
+                } else {
+                    status_filter.iter().map(|s| s.to_string()).collect()
+                },
+                dead_letter: args.dead_letter,
+            },
+            limit: args.limit,
+            jobs,
+            dead_letter,
+        };
+
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
     // Print status header
     print_queue_status(&stats);
     println!();
@@ -118,9 +165,6 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
         print_dead_letter_table(&dead_letter_jobs, args.limit);
         return Ok(());
     }
-
-    // Build filter based on flags
-    let status_filter = build_status_filter(&args);
 
     // Get jobs
     let jobs = get_jobs(&conn, &args.topic, &status_filter, args.limit).await?;
@@ -587,6 +631,7 @@ mod tests {
             done: false,
             limit: 50,
             dead_letter: false,
+            json: false,
         };
         let filter = build_status_filter(&args);
         assert!(filter.contains(&"QUEUED"));
@@ -604,6 +649,7 @@ mod tests {
             done: false,
             limit: 50,
             dead_letter: false,
+            json: false,
         };
         let filter = build_status_filter(&args);
         // Should include all statuses when none specified

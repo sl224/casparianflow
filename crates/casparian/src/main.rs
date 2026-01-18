@@ -178,6 +178,10 @@ enum Commands {
         /// Maximum files to display
         #[arg(long, default_value = "50")]
         limit: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     // === W3: Parser Commands (stubs) ===
@@ -222,6 +226,10 @@ enum Commands {
         /// Maximum jobs to display
         #[arg(long, default_value = "50")]
         limit: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Manage pipelines
@@ -582,6 +590,7 @@ fn main() -> Result<()> {
             patterns,
             tag,
             limit,
+            json,
         } => {
             let rt = Runtime::new().context("Failed to create runtime")?;
             rt.block_on(async {
@@ -594,6 +603,7 @@ fn main() -> Result<()> {
                     patterns,
                     tag,
                     limit,
+                    json,
                 }).await
             })
         }
@@ -615,6 +625,7 @@ fn main() -> Result<()> {
             done,
             dead_letter,
             limit,
+            json,
         } => cli::jobs::run(cli::jobs::JobsArgs {
             topic,
             pending,
@@ -623,6 +634,7 @@ fn main() -> Result<()> {
             done,
             dead_letter,
             limit,
+            json,
         }),
 
         Commands::Job { action } => cli::job::run(action),
