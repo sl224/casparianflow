@@ -27,7 +27,7 @@ set -e
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DB_PATH="${HOME}/.casparian_flow/casparian_flow.sqlite3"
+DB_PATH="${HOME}/.casparian_flow/casparian_flow.duckdb"
 BINARY="$PROJECT_ROOT/target/release/casparian"
 SESSION_PREFIX="tui-parallel"
 WIDTH=120
@@ -318,7 +318,7 @@ fi
 # Initialize coverage database tables if needed
 init_coverage_db() {
     log_info "Initializing coverage database..."
-    sqlite3 "$DB_PATH" <<'SQL'
+    duckdb "$DB_PATH" <<'SQL'
 CREATE TABLE IF NOT EXISTS tui_test_coverage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     test_path_id TEXT NOT NULL UNIQUE,
@@ -385,9 +385,9 @@ get_prioritized_paths() {
 
     # Get coverage data from DB (handle empty result)
     local coverage_data
-    coverage_data=$(sqlite3 -json "$DB_PATH" \
+    coverage_data=$(duckdb -json "$DB_PATH" \
         "SELECT test_path_id, last_tested_at, times_tested, last_result FROM tui_test_coverage" 2>/dev/null)
-    # sqlite3 -json returns empty string (not []) when no rows
+    # duckdb -json returns empty string (not []) when no rows
     if [[ -z "$coverage_data" ]]; then
         coverage_data="[]"
     fi
@@ -763,7 +763,7 @@ update_coverage() {
     local view
     view=$(define_test_paths | jq -r ".[] | select(.id == \"$path_id\") | .view")
 
-    sqlite3 "$DB_PATH" <<SQL
+    duckdb "$DB_PATH" <<SQL
 INSERT INTO tui_test_coverage (test_path_id, view, last_tested_at, times_tested, last_result, last_duration_ms, findings_count)
 VALUES ('$path_id', '$view', datetime('now'), 1, '$status', $duration, $findings_count)
 ON CONFLICT(test_path_id) DO UPDATE SET
@@ -1054,7 +1054,7 @@ EOF
     # Record run in database (escape JSON for SQL by doubling single quotes)
     local escaped_json
     escaped_json=$(cat "$results_dir/actionable_findings.json" | jq -c . | sed "s/'/''/g")
-    sqlite3 "$DB_PATH" <<SQL
+    duckdb "$DB_PATH" <<SQL
 INSERT INTO tui_test_runs (run_id, started_at, completed_at, parallel_count, paths_tested, paths_passed, paths_failed, total_duration_ms, coverage_percent, findings_json)
 VALUES ('$run_id', datetime('now', '-$((end_time - start_time)) seconds'), datetime('now'), $MAX_PARALLEL, $completed, $passed, $failed, $total_duration_ms, $coverage_percent, '$escaped_json');
 SQL

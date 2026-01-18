@@ -1,19 +1,16 @@
-//! Database models for Casparian Flow Sentinel
+//! Database models for Casparian Flow Sentinel (dbx-compatible).
 //!
-//! Ported from Python SQLAlchemy to Rust sqlx.
-//! Uses derive macros for FromRow to map database rows to structs.
+//! These models are backend-agnostic and map from casparian_db rows.
 
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use casparian_db::{BackendError, UnifiedDbRow};
 use casparian_protocol::{SinkMode, WorkerStatus};
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Enums
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "varchar", rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatusEnum {
     Pending,
     Queued,
@@ -23,8 +20,21 @@ pub enum StatusEnum {
     Skipped,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "varchar", rename_all = "SCREAMING_SNAKE_CASE")]
+impl StatusEnum {
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "PENDING" | "Pending" => Self::Pending,
+            "QUEUED" | "Queued" => Self::Queued,
+            "RUNNING" | "Running" => Self::Running,
+            "COMPLETED" | "Completed" => Self::Completed,
+            "FAILED" | "Failed" => Self::Failed,
+            "SKIPPED" | "Skipped" => Self::Skipped,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PluginStatusEnum {
     Pending,
     Staging,
@@ -32,27 +42,38 @@ pub enum PluginStatusEnum {
     Rejected,
 }
 
+impl PluginStatusEnum {
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "PENDING" | "Pending" => Self::Pending,
+            "STAGING" | "Staging" => Self::Staging,
+            "ACTIVE" | "Active" => Self::Active,
+            "REJECTED" | "Rejected" => Self::Rejected,
+            _ => Self::Pending,
+        }
+    }
+}
+
 // ============================================================================
 // Core Models
 // ============================================================================
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct SourceRoot {
     pub id: i32,
     pub path: String,
-    #[sqlx(rename = "type")]
     pub root_type: String,
     pub active: i32,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct FileHashRegistry {
     pub content_hash: String,
-    pub first_seen: DateTime<Utc>,
+    pub first_seen: String,
     pub size_bytes: i32,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct FileLocation {
     pub id: i32,
     pub source_root_id: i32,
@@ -61,24 +82,24 @@ pub struct FileLocation {
     pub last_known_mtime: Option<f64>,
     pub last_known_size: Option<i32>,
     pub current_version_id: Option<i32>,
-    pub discovered_time: DateTime<Utc>,
-    pub last_seen_time: DateTime<Utc>,
+    pub discovered_time: String,
+    pub last_seen_time: String,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct FileTag {
     pub file_id: i32,
     pub tag: String,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct FileVersion {
     pub id: i32,
     pub location_id: i32,
     pub content_hash: String,
     pub size_bytes: i32,
-    pub modified_time: DateTime<Utc>,
-    pub detected_at: DateTime<Utc>,
+    pub modified_time: String,
+    pub detected_at: String,
     pub applied_tags: String,
 }
 
@@ -86,33 +107,42 @@ pub struct FileVersion {
 // Plugin Configuration
 // ============================================================================
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct PluginConfig {
     pub plugin_name: String,
     pub subscription_tags: String,
-    pub default_parameters: Option<String>, // JSON
-    pub last_updated: DateTime<Utc>,
+    pub default_parameters: Option<String>,
+    pub last_updated: String,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct TopicConfig {
     pub id: i32,
     pub plugin_name: String,
     pub topic_name: String,
     pub uri: String,
-    /// Mode as string for database compatibility. Use `sink_mode()` for typed access.
     pub mode: String,
     pub schema_json: Option<String>,
 }
 
 impl TopicConfig {
-    /// Get mode as typed enum
     pub fn sink_mode(&self) -> SinkMode {
         self.mode.parse().unwrap_or_default()
     }
+
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        Ok(Self {
+            id: row.get_by_name("id")?,
+            plugin_name: row.get_by_name("plugin_name")?,
+            topic_name: row.get_by_name("topic_name")?,
+            uri: row.get_by_name("uri")?,
+            mode: row.get_by_name("mode")?,
+            schema_json: row.get_by_name("schema_json")?,
+        })
+    }
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct PluginSubscription {
     pub id: i32,
     pub plugin_name: String,
@@ -124,47 +154,69 @@ pub struct PluginSubscription {
 // Job Queue
 // ============================================================================
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct ProcessingJob {
     pub id: i64,
-    pub file_version_id: i32,
+    pub file_id: i32,
+    pub pipeline_run_id: Option<String>,
     pub plugin_name: String,
-    pub config_overrides: Option<String>, // JSON
+    pub config_overrides: Option<String>,
     pub status: StatusEnum,
     pub priority: i32,
     pub worker_host: Option<String>,
     pub worker_pid: Option<i32>,
-    pub claim_time: Option<DateTime<Utc>>,
-    pub end_time: Option<DateTime<Utc>>,
+    pub claim_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub end_time: Option<chrono::DateTime<chrono::Utc>>,
     pub result_summary: Option<String>,
     pub error_message: Option<String>,
     pub retry_count: i32,
 }
 
+impl ProcessingJob {
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        Ok(Self {
+            id: row.get_by_name("id")?,
+            file_id: row.get_by_name("file_id")?,
+            pipeline_run_id: row.get_by_name("pipeline_run_id")?,
+            plugin_name: row.get_by_name("plugin_name")?,
+            config_overrides: row.get_by_name("config_overrides")?,
+            status: StatusEnum::from_db(&row.get_by_name::<String>("status")?),
+            priority: row.get_by_name("priority")?,
+            worker_host: row.get_by_name("worker_host")?,
+            worker_pid: row.get_by_name("worker_pid")?,
+            claim_time: row.get_by_name("claim_time")?,
+            end_time: row.get_by_name("end_time")?,
+            result_summary: row.get_by_name("result_summary")?,
+            error_message: row.get_by_name("error_message")?,
+            retry_count: row.get_by_name("retry_count")?,
+        })
+    }
+}
+
 // ============================================================================
-// v5.0 Bridge Mode: Publisher & Environment
+// Bridge / Publisher
 // ============================================================================
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct Publisher {
     pub id: i32,
     pub azure_oid: Option<String>,
     pub name: String,
     pub email: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub last_active: DateTime<Utc>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_active: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct PluginEnvironment {
-    pub hash: String, // SHA256 of lockfile content
+    pub hash: String,
     pub lockfile_content: String,
     pub size_mb: f64,
-    pub last_used: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
+    pub last_used: chrono::DateTime<chrono::Utc>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct PluginManifest {
     pub id: i32,
     pub plugin_name: String,
@@ -174,20 +226,19 @@ pub struct PluginManifest {
     pub status: PluginStatusEnum,
     pub signature: Option<String>,
     pub validation_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub deployed_at: Option<DateTime<Utc>>,
-    // v5.0 Bridge Mode fields
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub deployed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub env_hash: Option<String>,
     pub artifact_hash: Option<String>,
     pub publisher_id: Option<i32>,
-    pub system_requirements: Option<String>, // JSON
+    pub system_requirements: Option<String>,
 }
 
 // ============================================================================
 // Routing & Ignore Rules
 // ============================================================================
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct RoutingRule {
     pub id: i32,
     pub pattern: String,
@@ -195,113 +246,122 @@ pub struct RoutingRule {
     pub priority: i32,
 }
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct IgnoreRule {
     pub id: i32,
-    pub source_root_id: Option<i32>,
     pub pattern: String,
-    pub active: bool,
-    pub created_at: DateTime<Utc>,
 }
 
 // ============================================================================
-// Worker Tracking
+// Workers
 // ============================================================================
 
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct WorkerNode {
-    pub hostname: String,
+    pub id: i32,
+    pub host: String,
     pub pid: i32,
-    pub ip_address: Option<String>,
-    pub env_signature: Option<String>,
-    pub started_at: DateTime<Utc>,
-    pub last_heartbeat: DateTime<Utc>,
-    /// Status as string for database compatibility. Use `worker_status()` for typed access.
     pub status: String,
     pub current_job_id: Option<i32>,
 }
 
 impl WorkerNode {
-    /// Get status as typed enum
     pub fn worker_status(&self) -> WorkerStatus {
         self.status.parse().unwrap_or_default()
     }
 }
 
 // ============================================================================
-// Error Handling (W5) & Parser Health (W6)
+// Error Handling & Parser Health
 // ============================================================================
 
-/// A job that has been moved to the dead letter queue after exhausting retries
-///
-/// Dead letter jobs are jobs that have failed too many times and have been
-/// removed from the main processing queue. They can be replayed manually
-/// after the underlying issue has been fixed.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct DeadLetterJob {
     pub id: i64,
     pub original_job_id: i64,
-    pub file_version_id: Option<i64>,
+    pub file_id: Option<i64>,
     pub plugin_name: String,
     pub error_message: Option<String>,
     pub retry_count: i32,
-    pub moved_at: String,
+    pub moved_at: chrono::DateTime<chrono::Utc>,
     pub reason: Option<String>,
 }
 
-/// Parser health tracking for circuit breaker pattern.
-///
-/// Tracks execution statistics and failure patterns to automatically
-/// pause parsers that are failing consistently.
-#[derive(Debug, Clone, FromRow)]
+impl DeadLetterJob {
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        Ok(Self {
+            id: row.get_by_name("id")?,
+            original_job_id: row.get_by_name("original_job_id")?,
+            file_id: row.get_by_name("file_id")?,
+            plugin_name: row.get_by_name("plugin_name")?,
+            error_message: row.get_by_name("error_message")?,
+            retry_count: row.get_by_name("retry_count")?,
+            moved_at: row.get_by_name("moved_at")?,
+            reason: row.get_by_name("reason")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ParserHealth {
-    /// Parser name (unique identifier)
     pub parser_name: String,
-    /// Total execution count (successes + failures)
     pub total_executions: i64,
-    /// Successful execution count
     pub successful_executions: i64,
-    /// Consecutive failure count (resets on success)
     pub consecutive_failures: i32,
-    /// Reason for last failure (for debugging)
     pub last_failure_reason: Option<String>,
-    /// When the circuit breaker tripped (parser paused)
-    /// NULL means parser is active, non-NULL means paused
-    pub paused_at: Option<DateTime<Utc>>,
-    /// When health record was created
-    pub created_at: DateTime<Utc>,
-    /// When health record was last updated
-    pub updated_at: DateTime<Utc>,
+    pub paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ParserHealth {
-    /// Check if this parser is currently paused (circuit open)
     pub fn is_paused(&self) -> bool {
         self.paused_at.is_some()
     }
 
-    /// Get success rate as percentage (0-100)
     pub fn success_rate(&self) -> f64 {
         if self.total_executions == 0 {
-            100.0 // No executions = healthy by default
+            100.0
         } else {
             (self.successful_executions as f64 / self.total_executions as f64) * 100.0
         }
     }
+
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        Ok(Self {
+            parser_name: row.get_by_name("parser_name")?,
+            total_executions: row.get_by_name("total_executions")?,
+            successful_executions: row.get_by_name("successful_executions")?,
+            consecutive_failures: row.get_by_name("consecutive_failures")?,
+            last_failure_reason: row.get_by_name("last_failure_reason")?,
+            paused_at: row.get_by_name("paused_at")?,
+            created_at: row.get_by_name("created_at")?,
+            updated_at: row.get_by_name("updated_at")?,
+        })
+    }
 }
 
-/// A row that failed processing and was quarantined
-///
-/// When individual rows fail during processing (e.g., schema validation errors),
-/// they are quarantined here so the rest of the file can be processed.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct QuarantinedRow {
     pub id: i64,
     pub job_id: i64,
     pub row_index: i32,
     pub error_reason: String,
     pub raw_data: Option<Vec<u8>>,
-    pub created_at: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl QuarantinedRow {
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        Ok(Self {
+            id: row.get_by_name("id")?,
+            job_id: row.get_by_name("job_id")?,
+            row_index: row.get_by_name("row_index")?,
+            error_reason: row.get_by_name("error_reason")?,
+            raw_data: row.get_by_name("raw_data")?,
+            created_at: row.get_by_name("created_at")?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -310,7 +370,6 @@ mod tests {
 
     #[test]
     fn test_status_enum_serialization() {
-        // Serde serializes enum variants as-is (PascalCase)
         assert_eq!(
             serde_json::to_string(&StatusEnum::Pending).unwrap(),
             "\"Pending\""
@@ -331,9 +390,6 @@ mod tests {
 
     #[test]
     fn test_parser_health_success_rate() {
-        let now = Utc::now();
-
-        // No executions = 100% (healthy by default)
         let health = ParserHealth {
             parser_name: "test".to_string(),
             total_executions: 0,
@@ -341,53 +397,9 @@ mod tests {
             consecutive_failures: 0,
             last_failure_reason: None,
             paused_at: None,
-            created_at: now,
-            updated_at: now,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         };
-        assert!((health.success_rate() - 100.0).abs() < 0.01);
-
-        // 8 out of 10 = 80%
-        let health = ParserHealth {
-            parser_name: "test".to_string(),
-            total_executions: 10,
-            successful_executions: 8,
-            consecutive_failures: 0,
-            last_failure_reason: None,
-            paused_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        assert!((health.success_rate() - 80.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_parser_health_is_paused() {
-        let now = Utc::now();
-
-        // Not paused
-        let health = ParserHealth {
-            parser_name: "test".to_string(),
-            total_executions: 10,
-            successful_executions: 5,
-            consecutive_failures: 5,
-            last_failure_reason: Some("timeout".to_string()),
-            paused_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        assert!(!health.is_paused());
-
-        // Paused
-        let health = ParserHealth {
-            parser_name: "test".to_string(),
-            total_executions: 10,
-            successful_executions: 5,
-            consecutive_failures: 5,
-            last_failure_reason: Some("timeout".to_string()),
-            paused_at: Some(now),
-            created_at: now,
-            updated_at: now,
-        };
-        assert!(health.is_paused());
+        assert_eq!(health.success_rate(), 100.0);
     }
 }

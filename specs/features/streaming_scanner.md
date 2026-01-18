@@ -759,7 +759,7 @@ async fn ensure_folder_data(
     let cache_path = get_cache_path(source_id);
     if cache_path.exists() {
         let folder_cache = FolderCache::load(&cache_path)?;
-        migrate_folder_cache_to_sqlite(db, source_id, &folder_cache).await?;
+        migrate_folder_cache_to_duckdb(db, source_id, &folder_cache).await?;
         std::fs::remove_file(&cache_path)?;
         return Ok(true);
     }
@@ -767,7 +767,7 @@ async fn ensure_folder_data(
     Ok(false)  // No data, needs rescan
 }
 
-async fn migrate_folder_cache_to_sqlite(
+async fn migrate_folder_cache_to_duckdb(
     db: &Database,
     source_id: &str,
     cache: &FolderCache,

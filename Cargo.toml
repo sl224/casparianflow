@@ -4,6 +4,7 @@ members = [
     "crates/casparian_protocol",
     "crates/casparian_worker",
     "crates/casparian_sentinel",
+    "crates/casparian_sinks",
     "crates/casparian",
     "crates/casparian_security",
     # "crates/casparian_scout",  # Inlined into casparian::scout module

@@ -23,8 +23,14 @@
 //! }
 //! ```
 
+mod duckdb;
 mod sqlite;
 mod traits;
 
+pub use duckdb::DuckDbPipelineStore;
 pub use sqlite::{SqliteJobStore, SqliteParserStore, SqliteQuarantineStore};
-pub use traits::{Job, JobStore, ParserBundle, ParserStore, QuarantinedRow, QuarantineStore};
+pub use traits::{
+    Job, JobStore, ParserBundle, ParserStore, Pipeline, PipelineRun, PipelineStore, QuarantinedRow,
+    QuarantineStore, SelectionFilters, SelectionResolution, SelectionSnapshot, SelectionSpec,
+    WatermarkField,
+};

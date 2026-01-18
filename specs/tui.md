@@ -74,6 +74,13 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
   Use `0`/`H` or `4` to navigate away. See `views/discover.md` Section 6.1.
 - Views may override keys when contextually appropriate; overrides are documented in view specs.
 
+### 2.4 Jobs View Signals
+Jobs view emphasizes batch throughput over topology:
+- Throughput, % complete, and ETA for active batches.
+- Stragglers and quarantine counts for wide fan-out parsing.
+- Schema contract status and logical execution date when available.
+See `specs/views/jobs.md`.
+
 ### 2.2 Navigation Stack
 
 Views maintain a navigation stack for `Esc` to go back:

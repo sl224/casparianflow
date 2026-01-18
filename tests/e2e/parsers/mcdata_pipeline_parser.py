@@ -61,7 +61,7 @@ def parse(input_path: str) -> "list[Output]":
         pl.col("column_7").alias("status"),
     ])
     if config_flts.height > 0:
-        outputs.append(Output("config_flts", config_flts, "sqlite", table="config_flts"))
+        outputs.append(Output("config_flts", config_flts, "duckdb", table="config_flts"))
 
     # ============================================================
     # RFC_DB: Readiness Fault Codes
@@ -89,7 +89,7 @@ def parse(input_path: str) -> "list[Output]":
         pl.col("column_21").alias("qualifier"),
     ])
     if rfc_db.height > 0:
-        outputs.append(Output("rfc_db", rfc_db, "sqlite", table="rfc_db"))
+        outputs.append(Output("rfc_db", rfc_db, "duckdb", table="rfc_db"))
 
     # ============================================================
     # PFC_DB: Published Fault Codes
@@ -112,7 +112,7 @@ def parse(input_path: str) -> "list[Output]":
         ], separator=",", ignore_nulls=True).alias("flags"),
     ])
     if pfc_db.height > 0:
-        outputs.append(Output("pfc_db", pfc_db, "sqlite", table="pfc_db"))
+        outputs.append(Output("pfc_db", pfc_db, "duckdb", table="pfc_db"))
 
     # ============================================================
     # NFS2_SYS: NFS2 System Status
@@ -146,7 +146,7 @@ def parse(input_path: str) -> "list[Output]":
         pl.col("column_30").alias("dip_value"),
     ])
     if nfs2_sys.height > 0:
-        outputs.append(Output("nfs2_sys", nfs2_sys, "sqlite", table="nfs2_sys"))
+        outputs.append(Output("nfs2_sys", nfs2_sys, "duckdb", table="nfs2_sys"))
 
     # ============================================================
     # NAV_DATA: Navigation Data
@@ -174,7 +174,7 @@ def parse(input_path: str) -> "list[Output]":
         pl.col("column_21").alias("flag3"),
     ])
     if nav_data.height > 0:
-        outputs.append(Output("nav_data", nav_data, "sqlite", table="nav_data"))
+        outputs.append(Output("nav_data", nav_data, "duckdb", table="nav_data"))
 
     # ============================================================
     # ROTOSCAN: Radar Rotation Data
@@ -188,7 +188,7 @@ def parse(input_path: str) -> "list[Output]":
         pl.col("column_8").alias("scan_value"),
     ])
     if rotoscan.height > 0:
-        outputs.append(Output("rotoscan", rotoscan, "sqlite", table="rotoscan"))
+        outputs.append(Output("rotoscan", rotoscan, "duckdb", table="rotoscan"))
 
     # ============================================================
     # LCS_TEMP: LCS Temperature Data
@@ -201,7 +201,7 @@ def parse(input_path: str) -> "list[Output]":
         pl.col("column_7").alias("state_time"),
     ])
     if lcs_temp.height > 0:
-        outputs.append(Output("lcs_temp", lcs_temp, "sqlite", table="lcs_temp"))
+        outputs.append(Output("lcs_temp", lcs_temp, "duckdb", table="lcs_temp"))
 
     # ============================================================
     # TIM_SRC: Time Source Data
@@ -214,7 +214,7 @@ def parse(input_path: str) -> "list[Output]":
         ], separator=",", ignore_nulls=True).alias("raw_data"),
     ])
     if tim_src.height > 0:
-        outputs.append(Output("tim_src", tim_src, "sqlite", table="tim_src"))
+        outputs.append(Output("tim_src", tim_src, "duckdb", table="tim_src"))
 
     # ============================================================
     # CAW_DB: Caution/Advisory/Warning Database
@@ -230,7 +230,7 @@ def parse(input_path: str) -> "list[Output]":
         pl.col("column_10").alias("indicator"),
     ])
     if caw_db.height > 0:
-        outputs.append(Output("caw_db", caw_db, "sqlite", table="caw_db"))
+        outputs.append(Output("caw_db", caw_db, "duckdb", table="caw_db"))
 
     # ============================================================
     # TEST_STATES_*: Test State Records
@@ -243,7 +243,7 @@ def parse(input_path: str) -> "list[Output]":
         ], separator=",", ignore_nulls=True).alias("raw_data"),
     ])
     if test_states.height > 0:
-        outputs.append(Output("test_states", test_states, "sqlite", table="test_states"))
+        outputs.append(Output("test_states", test_states, "duckdb", table="test_states"))
 
     # ============================================================
     # ACT_* : Activation/Configuration Records (catch-all for remaining)
@@ -259,7 +259,7 @@ def parse(input_path: str) -> "list[Output]":
         ], separator=",", ignore_nulls=True).alias("raw_data"),
     ])
     if act_records.height > 0:
-        outputs.append(Output("act_records", act_records, "sqlite", table="act_records"))
+        outputs.append(Output("act_records", act_records, "duckdb", table="act_records"))
 
     # ============================================================
     # OTHER: Catch-all for unmatched record types
@@ -281,7 +281,7 @@ def parse(input_path: str) -> "list[Output]":
         ], separator=",", ignore_nulls=True).alias("raw_data"),
     ])
     if other_records.height > 0:
-        outputs.append(Output("other_records", other_records, "sqlite", table="other_records"))
+        outputs.append(Output("other_records", other_records, "duckdb", table="other_records"))
 
     # If no outputs were created (shouldn't happen), return empty parquet
     if not outputs:

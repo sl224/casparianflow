@@ -18,6 +18,6 @@ pub struct SentinelArgs {
     pub bind: String,
 
     /// Database connection string
-    #[arg(long, default_value = "sqlite://casparian_flow.db")]
+    #[arg(long, default_value = "duckdb:casparian_flow.duckdb")]
     pub database: String,
 }

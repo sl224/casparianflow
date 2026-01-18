@@ -17,7 +17,7 @@ fn make_test_config(job_id: u64, python_code: &str) -> BridgeConfig {
         source_code: python_code.to_string(),
         file_path: "test.py".to_string(),
         job_id,
-        file_version_id: 1,
+        file_id: 1,
         shim_path,
     }
 }

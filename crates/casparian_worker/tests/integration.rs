@@ -20,7 +20,7 @@ fn test_protocol_message_roundtrip() {
             mode: types::SinkMode::Append,
             schema_def: None,
         }],
-        file_version_id: 1,
+        file_id: 1,
         env_hash: "abc123def456".to_string(),
         source_code: "# test plugin".to_string(),
         artifact_hash: None,

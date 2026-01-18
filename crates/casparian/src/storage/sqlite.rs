@@ -6,11 +6,16 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::QueryBuilder;
 use sqlx::Row;
 use std::path::Path;
 use std::time::Duration;
 
-use super::traits::{Job, JobStore, ParserBundle, ParserStore, QuarantinedRow, QuarantineStore};
+use super::traits::{
+    Job, JobStore, ParserBundle, ParserStore, PipelineStore, QuarantinedRow, QuarantineStore,
+    SelectionFilters, SelectionResolution, WatermarkField,
+};
+use uuid::Uuid;
 
 /// SQLite-backed job store implementation.
 pub struct SqliteJobStore {
@@ -43,7 +48,8 @@ impl SqliteJobStore {
             r#"
             CREATE TABLE IF NOT EXISTS cf_processing_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_version_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                pipeline_run_id TEXT,
                 plugin_name TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'QUEUED',
                 priority INTEGER NOT NULL DEFAULT 0,
@@ -73,6 +79,123 @@ impl SqliteJobStore {
         .await
         .context("Failed to create status index")?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_selection_specs (
+                id TEXT PRIMARY KEY,
+                spec_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create cf_selection_specs table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_selection_snapshots (
+                id TEXT PRIMARY KEY,
+                spec_id TEXT NOT NULL,
+                snapshot_hash TEXT NOT NULL,
+                logical_date TEXT NOT NULL,
+                watermark_value TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create cf_selection_snapshots table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_selection_snapshot_files (
+                snapshot_id TEXT NOT NULL,
+                file_id INTEGER NOT NULL,
+                PRIMARY KEY (snapshot_id, file_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create cf_selection_snapshot_files table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_snapshot_files_snapshot
+            ON cf_selection_snapshot_files(snapshot_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create snapshot_id index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_snapshot_files_file
+            ON cf_selection_snapshot_files(file_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create file_id index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_pipelines (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                config_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create cf_pipelines table")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_name_version
+            ON cf_pipelines(name, version)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create pipeline name/version index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cf_pipeline_runs (
+                id TEXT PRIMARY KEY,
+                pipeline_id TEXT NOT NULL,
+                selection_spec_id TEXT NOT NULL,
+                selection_snapshot_hash TEXT NOT NULL,
+                context_snapshot_hash TEXT,
+                logical_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create cf_pipeline_runs table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline
+            ON cf_pipeline_runs(pipeline_id, logical_date)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to create pipeline runs index")?;
+
         Ok(())
     }
 
@@ -83,7 +206,266 @@ impl SqliteJobStore {
 }
 
 #[async_trait]
+impl PipelineStore for SqliteJobStore {
+    async fn create_selection_spec(&self, spec_json: &str) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO cf_selection_specs (id, spec_json)
+            VALUES (?1, ?2)
+            "#,
+        )
+        .bind(&id)
+        .bind(spec_json)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert selection spec")?;
+        Ok(id)
+    }
+
+    async fn create_selection_snapshot(
+        &self,
+        spec_id: &str,
+        snapshot_hash: &str,
+        logical_date: &str,
+        watermark_value: Option<&str>,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO cf_selection_snapshots (
+                id, spec_id, snapshot_hash, logical_date, watermark_value
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+        )
+        .bind(&id)
+        .bind(spec_id)
+        .bind(snapshot_hash)
+        .bind(logical_date)
+        .bind(watermark_value)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert selection snapshot")?;
+        Ok(id)
+    }
+
+    async fn insert_snapshot_files(&self, snapshot_id: &str, file_ids: &[i64]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for file_id in file_ids {
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO cf_selection_snapshot_files (snapshot_id, file_id)
+                VALUES (?1, ?2)
+                "#,
+            )
+            .bind(snapshot_id)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn create_pipeline(&self, name: &str, version: i64, config_json: &str) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO cf_pipelines (id, name, version, config_json)
+            VALUES (?1, ?2, ?3, ?4)
+            "#,
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(version)
+        .bind(config_json)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert pipeline")?;
+        Ok(id)
+    }
+
+    async fn get_latest_pipeline(&self, name: &str) -> Result<Option<super::traits::Pipeline>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name, version, config_json, created_at
+            FROM cf_pipelines
+            WHERE name = ?1
+            ORDER BY version DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to fetch latest pipeline")?;
+
+        Ok(row.map(|row| super::traits::Pipeline {
+            id: row.get("id"),
+            name: row.get("name"),
+            version: row.get("version"),
+            config_json: row.get("config_json"),
+            created_at: row.get("created_at"),
+        }))
+    }
+
+    async fn create_pipeline_run(
+        &self,
+        pipeline_id: &str,
+        selection_spec_id: &str,
+        selection_snapshot_hash: &str,
+        context_snapshot_hash: Option<&str>,
+        logical_date: &str,
+        status: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO cf_pipeline_runs (
+                id,
+                pipeline_id,
+                selection_spec_id,
+                selection_snapshot_hash,
+                context_snapshot_hash,
+                logical_date,
+                status
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+        )
+        .bind(&id)
+        .bind(pipeline_id)
+        .bind(selection_spec_id)
+        .bind(selection_snapshot_hash)
+        .bind(context_snapshot_hash)
+        .bind(logical_date)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .context("Failed to insert pipeline run")?;
+        Ok(id)
+    }
+
+    async fn set_pipeline_run_status(&self, run_id: &str, status: &str) -> Result<()> {
+        let (set_started, set_completed) = match status {
+            "running" => (true, false),
+            "completed" | "failed" | "no_op" => (false, true),
+            _ => (false, false),
+        };
+
+        let mut query = String::from("UPDATE cf_pipeline_runs SET status = ?1");
+        if set_started {
+            query.push_str(", started_at = datetime('now')");
+        }
+        if set_completed {
+            query.push_str(", completed_at = datetime('now')");
+        }
+        query.push_str(" WHERE id = ?2");
+
+        sqlx::query(&query)
+            .bind(status)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update pipeline run status")?;
+        Ok(())
+    }
+
+    async fn pipeline_run_exists(&self, pipeline_id: &str, logical_date: &str) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            SELECT 1 FROM cf_pipeline_runs
+            WHERE pipeline_id = ?1 AND logical_date = ?2
+            LIMIT 1
+            "#,
+        )
+        .bind(pipeline_id)
+        .bind(logical_date)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to query pipeline runs")?;
+
+        Ok(row.is_some())
+    }
+
+    async fn resolve_selection_files(
+        &self,
+        filters: &SelectionFilters,
+        logical_date_ms: i64,
+    ) -> Result<SelectionResolution> {
+        let mut builder = QueryBuilder::new(
+            "SELECT id, mtime FROM scout_files WHERE status != 'deleted'",
+        );
+
+        if let Some(source_id) = &filters.source_id {
+            builder.push(" AND source_id = ");
+            builder.push_bind(source_id);
+        }
+        if let Some(tag) = &filters.tag {
+            builder.push(" AND tag = ");
+            builder.push_bind(tag);
+        }
+        if let Some(extension) = &filters.extension {
+            builder.push(" AND extension = ");
+            builder.push_bind(extension);
+        }
+        if let Some(since_ms) = filters.since_ms {
+            let start_ms = logical_date_ms.saturating_sub(since_ms);
+            builder.push(" AND mtime >= ");
+            builder.push_bind(start_ms);
+            builder.push(" AND mtime <= ");
+            builder.push_bind(logical_date_ms);
+        }
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .context("Failed to resolve selection files")?;
+
+        let mut file_ids = Vec::with_capacity(rows.len());
+        let mut watermark_max: Option<i64> = None;
+        for row in rows {
+            let id: i64 = row.get("id");
+            let mtime: i64 = row.get("mtime");
+            file_ids.push(id);
+            if matches!(filters.watermark, Some(WatermarkField::Mtime)) {
+                watermark_max = Some(match watermark_max {
+                    Some(current) => current.max(mtime),
+                    None => mtime,
+                });
+            }
+        }
+
+        let watermark_value = watermark_max.map(|value| value.to_string());
+        Ok(SelectionResolution {
+            file_ids,
+            watermark_value,
+        })
+    }
+}
+
+#[async_trait]
 impl JobStore for SqliteJobStore {
+    async fn enqueue_job(&self, file_id: i64, plugin_name: &str, priority: i32) -> Result<i64> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO cf_processing_queue (file_id, plugin_name, status, priority)
+            VALUES (?1, ?2, 'QUEUED', ?3)
+            RETURNING id
+            "#,
+        )
+        .bind(file_id)
+        .bind(plugin_name)
+        .bind(priority)
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to enqueue job")?;
+
+        Ok(row.get::<i64, _>("id"))
+    }
+
     async fn claim_next(&self, worker_id: &str) -> Result<Option<Job>> {
         // Use a single atomic UPDATE ... RETURNING to claim the job
         // This prevents race conditions between workers
@@ -100,7 +482,7 @@ impl JobStore for SqliteJobStore {
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
             )
-            RETURNING id, file_version_id, plugin_name, status, retry_count, error_message
+            RETURNING id, file_id, plugin_name, status, retry_count, error_message
             "#,
         )
         .bind(worker_id)
@@ -111,7 +493,7 @@ impl JobStore for SqliteJobStore {
         match row {
             Some(row) => Ok(Some(Job {
                 id: row.get("id"),
-                file_version_id: row.get("file_version_id"),
+                file_id: row.get("file_id"),
                 plugin_name: row.get("plugin_name"),
                 status: row.get("status"),
                 retry_count: row.get("retry_count"),
@@ -494,7 +876,7 @@ mod tests {
         // Insert a test job
         sqlx::query(
             r#"
-            INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority)
+            INSERT INTO cf_processing_queue (file_id, plugin_name, status, priority)
             VALUES (1, 'test_parser', 'QUEUED', 10)
             "#,
         )
@@ -536,7 +918,7 @@ mod tests {
         // Insert and claim a job
         sqlx::query(
             r#"
-            INSERT INTO cf_processing_queue (file_version_id, plugin_name, status)
+            INSERT INTO cf_processing_queue (file_id, plugin_name, status)
             VALUES (1, 'test_parser', 'QUEUED')
             "#,
         )
@@ -576,7 +958,7 @@ mod tests {
         // Insert and claim a job
         sqlx::query(
             r#"
-            INSERT INTO cf_processing_queue (file_version_id, plugin_name, status)
+            INSERT INTO cf_processing_queue (file_id, plugin_name, status)
             VALUES (1, 'test_parser', 'QUEUED')
             "#,
         )
@@ -611,7 +993,7 @@ mod tests {
         // Insert and claim a job
         sqlx::query(
             r#"
-            INSERT INTO cf_processing_queue (file_version_id, plugin_name, status)
+            INSERT INTO cf_processing_queue (file_id, plugin_name, status)
             VALUES (1, 'test_parser', 'QUEUED')
             "#,
         )

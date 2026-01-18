@@ -59,13 +59,14 @@ export CASPARIAN_DB="$DB_FILE"
 
 # Create database with required schema
 echo "Setting up test database..."
-sqlite3 "$DB_FILE" <<'EOF'
+duckdb "$DB_FILE" <<'EOF'
 -- Processing queue for jobs (schema matches jobs.rs expectations)
 CREATE TABLE IF NOT EXISTS cf_processing_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_name TEXT NOT NULL,
     input_file TEXT,
-    file_version_id INTEGER,
+    file_id INTEGER,
+    pipeline_run_id TEXT,
     status TEXT NOT NULL DEFAULT 'PENDING',
     priority INTEGER DEFAULT 0,
     created_at TEXT,
@@ -94,23 +95,8 @@ CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
     UNIQUE(plugin_name, version)
 );
 
--- File version tracking (minimal for test)
-CREATE TABLE IF NOT EXISTS cf_file_version (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    location_id INTEGER NOT NULL,
-    content_hash TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
--- File location (minimal for test)
-CREATE TABLE IF NOT EXISTS cf_file_location (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_root_id INTEGER NOT NULL,
-    rel_path TEXT NOT NULL
-);
-
--- Source root (minimal for test)
-CREATE TABLE IF NOT EXISTS cf_source_root (
+-- Scout files (minimal for test)
+CREATE TABLE IF NOT EXISTS scout_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     path TEXT NOT NULL
 );
@@ -250,14 +236,14 @@ echo
 # ================================================================
 echo "--- Test 5: Deploy parser to plugin manifest ---"
 PARSER_SOURCE=$(cat "$PARSER_FILE" | sed "s/'/''/g")  # Escape single quotes for SQL
-sqlite3 "$DB_FILE" <<EOF
+duckdb "$DB_FILE" <<EOF
 INSERT INTO cf_plugin_manifest (plugin_name, version, source_code, status)
 VALUES ('mcdata_pipeline', '1.0.0', '$PARSER_SOURCE', 'ACTIVE');
 EOF
 echo "Parser deployed to cf_plugin_manifest"
 
 # Verify deployment
-COUNT=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM cf_plugin_manifest WHERE plugin_name='mcdata_pipeline'")
+COUNT=$(duckdb "$DB_FILE" "SELECT COUNT(*) FROM cf_plugin_manifest WHERE plugin_name='mcdata_pipeline'")
 if [ "$COUNT" -eq "1" ]; then
     echo "PASS: Parser in plugin manifest"
 else
@@ -270,16 +256,16 @@ echo
 # TEST 6: Create job in processing queue
 # ================================================================
 echo "--- Test 6: Create job in processing queue ---"
-sqlite3 "$DB_FILE" <<EOF
+duckdb "$DB_FILE" <<EOF
 INSERT INTO cf_processing_queue (plugin_name, input_file, status, priority)
 VALUES ('mcdata_pipeline', '$INPUT_FILE', 'PENDING', 1);
 EOF
 
-JOB_ID=$(sqlite3 "$DB_FILE" "SELECT id FROM cf_processing_queue ORDER BY id DESC LIMIT 1")
+JOB_ID=$(duckdb "$DB_FILE" "SELECT id FROM cf_processing_queue ORDER BY id DESC LIMIT 1")
 echo "Created job ID: $JOB_ID"
 
 # Verify job
-STATUS=$(sqlite3 "$DB_FILE" "SELECT status FROM cf_processing_queue WHERE id=$JOB_ID")
+STATUS=$(duckdb "$DB_FILE" "SELECT status FROM cf_processing_queue WHERE id=$JOB_ID")
 if [ "$STATUS" = "PENDING" ]; then
     echo "PASS: Job created with PENDING status"
 else
@@ -308,7 +294,7 @@ else
 fi
 
 # Check job status
-STATUS=$(sqlite3 "$DB_FILE" "SELECT status FROM cf_processing_queue WHERE id=$JOB_ID")
+STATUS=$(duckdb "$DB_FILE" "SELECT status FROM cf_processing_queue WHERE id=$JOB_ID")
 echo "Job status after processing: $STATUS"
 
 JOB_PASSED=false
@@ -318,7 +304,7 @@ if [ "$STATUS" = "COMPLETED" ]; then
 elif [ "$STATUS" = "RUNNING" ]; then
     echo "INFO: Job still running (may need polars installed)"
 elif [ "$STATUS" = "FAILED" ]; then
-    ERROR_MSG=$(sqlite3 "$DB_FILE" "SELECT error_message FROM cf_processing_queue WHERE id=$JOB_ID")
+    ERROR_MSG=$(duckdb "$DB_FILE" "SELECT error_message FROM cf_processing_queue WHERE id=$JOB_ID")
     echo "Job failed with error: $ERROR_MSG"
     # Check if it's a missing dependency error (acceptable in CI)
     if echo "$ERROR_MSG" | grep -q "polars\|pandas\|pyarrow\|ModuleNotFoundError"; then
@@ -337,7 +323,7 @@ echo
 # ================================================================
 echo "--- Test 8: Verify output ---"
 if [ "$STATUS" = "COMPLETED" ]; then
-    RESULT_PATH=$(sqlite3 "$DB_FILE" "SELECT result_summary FROM cf_processing_queue WHERE id=$JOB_ID")
+    RESULT_PATH=$(duckdb "$DB_FILE" "SELECT result_summary FROM cf_processing_queue WHERE id=$JOB_ID")
     echo "Result path: $RESULT_PATH"
 
     if [ -f "$RESULT_PATH" ]; then

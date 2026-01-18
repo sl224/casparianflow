@@ -157,10 +157,14 @@ impl From<casparian_protocol::DataType> for DataType {
             casparian_protocol::DataType::Float64 => DataType::Float,
             casparian_protocol::DataType::Date => DataType::Date,
             casparian_protocol::DataType::Timestamp => DataType::DateTime,
+            casparian_protocol::DataType::TimestampTz { .. } => DataType::DateTime,
             casparian_protocol::DataType::Time => DataType::Time,
             casparian_protocol::DataType::Duration => DataType::Duration,
             casparian_protocol::DataType::String => DataType::String,
             casparian_protocol::DataType::Binary => DataType::String, // Fallback
+            casparian_protocol::DataType::Decimal { .. } => DataType::Float,
+            casparian_protocol::DataType::List { .. } => DataType::String,
+            casparian_protocol::DataType::Struct { .. } => DataType::String,
         }
     }
 }

@@ -24,9 +24,9 @@ echo
 # Setup test database
 echo "Setting up test database..."
 mkdir -p "$DB_DIR/.casparian_flow"
-DB_PATH="$DB_DIR/.casparian_flow/casparian_flow.sqlite3"
+DB_PATH="$DB_DIR/.casparian_flow/casparian_flow.duckdb"
 
-sqlite3 "$DB_PATH" <<'EOF'
+duckdb "$DB_PATH" <<'EOF'
 -- Create schema
 CREATE TABLE scout_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

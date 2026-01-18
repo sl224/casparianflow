@@ -9,10 +9,6 @@ use super::ParserLabError;
 /// Options for parser generation
 #[derive(Debug, Clone)]
 pub struct ParserOptions {
-    /// Sink type: parquet, sqlite, csv
-    pub sink_type: String,
-    /// Table name (for sqlite sink)
-    pub table_name: Option<String>,
     /// Include error handling
     pub include_error_handling: bool,
     /// Include validation
@@ -24,8 +20,6 @@ pub struct ParserOptions {
 impl Default for ParserOptions {
     fn default() -> Self {
         Self {
-            sink_type: "sqlite".to_string(),
-            table_name: None,
             include_error_handling: true,
             include_validation: true,
             version: "1.0.0".to_string(),
@@ -88,9 +82,6 @@ impl ParserGenerator {
 
         // Bridge Protocol constants
         code.push_str(&format!("TOPIC = \"{}\"\n", topic_name));
-        code.push_str(&format!("SINK = \"{}\"\n", options.sink_type));
-        code.push_str("\n");
-
         // Parser class
         code.push_str(&format!("class {}:\n", self.to_class_name(&parser_name)));
         code.push_str(&format!("{}\"\"\"Parser for {} files.\"\"\"\n\n", self.indent, analysis.format));

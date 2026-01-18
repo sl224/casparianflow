@@ -224,6 +224,12 @@ enum Commands {
         limit: usize,
     },
 
+    /// Manage pipelines
+    Pipeline {
+        #[command(subcommand)]
+        action: cli::pipeline::PipelineAction,
+    },
+
     /// Manage a specific job
     Job {
         #[command(subcommand)]
@@ -306,7 +312,7 @@ enum Commands {
         #[arg(long)]
         addr: Option<String>,
 
-        /// Database path (default: ~/.casparian_flow/casparian.db)
+        /// Database path (default: ~/.casparian_flow/casparian_flow.duckdb)
         #[arg(long)]
         database: Option<std::path::PathBuf>,
 
@@ -362,7 +368,7 @@ enum Commands {
         /// Job ID from cf_processing_queue
         job_id: i64,
 
-        /// Sentinel database path (casparian_flow.sqlite3)
+        /// Sentinel database path (casparian_flow.duckdb)
         #[arg(long)]
         db: std::path::PathBuf,
 
@@ -623,6 +629,8 @@ fn main() -> Result<()> {
 
         Commands::WorkerCli { action } => cli::worker::run(action),
 
+        Commands::Pipeline { action } => cli::pipeline::run(action),
+
         // === W5: Resource Commands (stubs) ===
         Commands::Source { action } => cli::source::run(action),
         Commands::Rule { action } => cli::rule::run(action),
@@ -765,7 +773,7 @@ fn run_unified(
 
     // Start Sentinel on Control Plane runtime (in its own thread)
     let sentinel_addr = addr.clone();
-    let sentinel_db = format!("sqlite:{}?mode=rwc", db_path.display());
+    let sentinel_db = format!("duckdb:{}", db_path.display());
     let sentinel_thread = std::thread::spawn(move || {
         control_rt.block_on(async move {
             let config = SentinelConfig {
@@ -920,9 +928,9 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
 
     rt.block_on(async move {
         // Resolve database URL: if it's the default, use config module resolution
-        let database_url = if args.database == "sqlite://casparian_flow.db" {
+        let database_url = if args.database == "duckdb:casparian_flow.duckdb" {
             let db_path = cli::config::active_db_path();
-            format!("sqlite:{}?mode=rwc", db_path.display())
+            format!("duckdb:{}", db_path.display())
         } else {
             args.database
         };
@@ -1160,7 +1168,7 @@ async fn run_publish(
 /// This is used by the Tauri UI to spawn a worker process for each job.
 /// The job runs the plugin via the bridge (Python subprocess).
 ///
-/// Uses casparian_sentinel::JobQueue (sqlx) for all database operations.
+/// Uses casparian_sentinel::JobQueue (DbConnection) for all database operations.
 fn process_single_job(
     job_id: i64,
     db_path: &std::path::Path,
@@ -1175,12 +1183,13 @@ fn process_single_job(
     let rt = tokio::runtime::Runtime::new()?;
 
     // Open database via JobQueue
-    let queue = rt.block_on(casparian_sentinel::JobQueue::open(db_path))
+    let db_url = format!("duckdb:{}", db_path.display());
+    let queue = rt.block_on(casparian_sentinel::JobQueue::open(&db_url))
         .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
     // Get job details
     let job_details = rt.block_on(queue.get_job_details(job_id))?
-        .ok_or_else(|| anyhow::anyhow!("Job {} not found (no file_version_id or input_file)", job_id))?;
+        .ok_or_else(|| anyhow::anyhow!("Job {} not found (no file_id or input_file)", job_id))?;
 
     let plugin_name = job_details.plugin_name;
     let file_path = job_details.file_path;
@@ -1287,7 +1296,7 @@ fn process_single_job(
         source_code: plugin_source,
         file_path: file_path.clone(),
         job_id: job_id as u64,
-        file_version_id: 0,
+        file_id: 0,
         shim_path,
     };
 
@@ -1377,67 +1386,26 @@ fn handle_bridge_outputs(
 ) -> Result<Vec<String>> {
     #[cfg(feature = "data-plane")]
     {
-        let mut output_paths: Vec<String> = vec![];
+        use casparian_sinks::{plan_outputs, write_output_plan, OutputDescriptor};
 
-        if bridge_result.output_info.is_empty() {
-            let output_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
-            if !bridge_result.batches.is_empty() {
-                let batch_refs: Vec<&arrow::array::RecordBatch> = bridge_result.batches.iter().collect();
-                write_parquet_output(&output_path, &batch_refs)?;
-                info!(output = %output_path.display(), batches = bridge_result.batches.len(), "Wrote parquet output");
-            }
-            output_paths.push(output_path.to_string_lossy().to_string());
-        } else {
-            let mut sqlite_outputs: Vec<(String, &arrow::array::RecordBatch)> = vec![];
-            let mut parquet_batches: Vec<&arrow::array::RecordBatch> = vec![];
+        let job_id_str = job_id.to_string();
+        let descriptors: Vec<OutputDescriptor> = bridge_result
+            .output_info
+            .iter()
+            .map(|info| OutputDescriptor {
+                name: info.name.clone(),
+                table: info.table.clone(),
+            })
+            .collect();
 
-            for (i, output_info) in bridge_result.output_info.iter().enumerate() {
-                if i >= bridge_result.batches.len() {
-                    warn!("Output info {} has no corresponding batch", output_info.name);
-                    continue;
-                }
+        let outputs = plan_outputs(&descriptors, &bridge_result.batches, plugin_name)?;
+        let sink_uri = format!("parquet://{}", output_dir.display());
+        let artifacts = write_output_plan(&sink_uri, &outputs, &job_id_str)?;
 
-                let batch = &bridge_result.batches[i];
-                let table_name = output_info.table.as_ref().unwrap_or(&output_info.name);
-
-                match output_info.sink.as_str() {
-                    "sqlite" => {
-                        sqlite_outputs.push((table_name.clone(), batch));
-                    }
-                    "parquet" => {
-                        parquet_batches.push(batch);
-                    }
-                    "csv" => {
-                        let csv_path = output_dir.join(format!("{}_{}.csv", table_name, job_id));
-                        write_csv_output(&csv_path, batch)?;
-                        info!(output = %csv_path.display(), table = %table_name, "Wrote CSV output");
-                        output_paths.push(csv_path.to_string_lossy().to_string());
-                    }
-                    other => {
-                        warn!("Unknown sink type '{}', defaulting to parquet", other);
-                        parquet_batches.push(batch);
-                    }
-                }
-            }
-
-            if !sqlite_outputs.is_empty() {
-                let sqlite_path = output_dir.join(format!("{}_{}.db", plugin_name, job_id));
-                write_sqlite_outputs(&sqlite_path, &sqlite_outputs)?;
-                let table_count = sqlite_outputs.len();
-                let row_count: usize = sqlite_outputs.iter().map(|(_, b)| b.num_rows()).sum();
-                info!(output = %sqlite_path.display(), tables = table_count, rows = row_count, "Wrote SQLite output");
-                output_paths.push(sqlite_path.to_string_lossy().to_string());
-            }
-
-            if !parquet_batches.is_empty() {
-                let parquet_path = output_dir.join(format!("{}_{}.parquet", plugin_name, job_id));
-                write_parquet_output(&parquet_path, &parquet_batches)?;
-                info!(output = %parquet_path.display(), batches = parquet_batches.len(), "Wrote parquet output");
-                output_paths.push(parquet_path.to_string_lossy().to_string());
-            }
-        }
-
-        Ok(output_paths)
+        Ok(artifacts
+            .into_iter()
+            .map(|artifact| artifact.uri.strip_prefix("file://").unwrap_or(&artifact.uri).to_string())
+            .collect())
     }
     #[cfg(not(feature = "data-plane"))]
     {
@@ -1447,135 +1415,6 @@ fn handle_bridge_outputs(
         let _ = job_id;
         anyhow::bail!("data outputs require the `data-plane` feature")
     }
-}
-
-#[cfg(feature = "data-plane")]
-fn write_parquet_output(
-    path: &std::path::Path,
-    batches: &[&arrow::array::RecordBatch],
-) -> Result<()> {
-    use parquet::arrow::ArrowWriter;
-    use parquet::file::properties::WriterProperties;
-
-    if batches.is_empty() {
-        return Ok(());
-    }
-
-    let file = std::fs::File::create(path)?;
-    let props = WriterProperties::builder().build();
-    let mut writer = ArrowWriter::try_new(file, batches[0].schema(), Some(props))?;
-
-    for batch in batches {
-        writer.write(batch)?;
-    }
-    writer.close()?;
-
-    Ok(())
-}
-
-/// Write Arrow batches to SQLite database tables
-#[cfg(feature = "data-plane")]
-fn write_sqlite_outputs(
-    path: &std::path::Path,
-    outputs: &[(String, &arrow::array::RecordBatch)],
-) -> Result<()> {
-    use arrow::array::{Array, AsArray};
-    use arrow::datatypes::DataType;
-
-    let conn = rusqlite::Connection::open(path)?;
-
-    for (table_name, batch) in outputs {
-        // Create table based on schema
-        let schema = batch.schema();
-        let columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| {
-                let sql_type = match f.data_type() {
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-                    | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "INTEGER",
-                    DataType::Float32 | DataType::Float64 => "REAL",
-                    DataType::Boolean => "INTEGER",
-                    _ => "TEXT",
-                };
-                format!("\"{}\" {}", f.name(), sql_type)
-            })
-            .collect();
-
-        let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
-            table_name,
-            columns.join(", ")
-        );
-        conn.execute(&create_sql, [])?;
-
-        // Insert data
-        let placeholders: Vec<&str> = schema.fields().iter().map(|_| "?").collect();
-        let insert_sql = format!(
-            "INSERT INTO \"{}\" VALUES ({})",
-            table_name,
-            placeholders.join(", ")
-        );
-
-        let mut stmt = conn.prepare(&insert_sql)?;
-
-        for row_idx in 0..batch.num_rows() {
-            let values: Vec<rusqlite::types::Value> = batch
-                .columns()
-                .iter()
-                .zip(schema.fields().iter())
-                .map(|(col, field)| {
-                    if col.is_null(row_idx) {
-                        return rusqlite::types::Value::Null;
-                    }
-                    match field.data_type() {
-                        DataType::Int64 => {
-                            rusqlite::types::Value::Integer(col.as_primitive::<arrow::datatypes::Int64Type>().value(row_idx))
-                        }
-                        DataType::Int32 => {
-                            rusqlite::types::Value::Integer(col.as_primitive::<arrow::datatypes::Int32Type>().value(row_idx) as i64)
-                        }
-                        DataType::Float64 => {
-                            rusqlite::types::Value::Real(col.as_primitive::<arrow::datatypes::Float64Type>().value(row_idx))
-                        }
-                        DataType::Float32 => {
-                            rusqlite::types::Value::Real(col.as_primitive::<arrow::datatypes::Float32Type>().value(row_idx) as f64)
-                        }
-                        DataType::Boolean => {
-                            rusqlite::types::Value::Integer(if col.as_boolean().value(row_idx) { 1 } else { 0 })
-                        }
-                        DataType::Utf8 => {
-                            rusqlite::types::Value::Text(col.as_string::<i32>().value(row_idx).to_string())
-                        }
-                        DataType::LargeUtf8 => {
-                            rusqlite::types::Value::Text(col.as_string::<i64>().value(row_idx).to_string())
-                        }
-                        _ => {
-                            // Fallback: convert to string representation
-                            let array_data = col.to_data();
-                            rusqlite::types::Value::Text(format!("{:?}", array_data))
-                        }
-                    }
-                })
-                .collect();
-
-            stmt.execute(rusqlite::params_from_iter(values))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Write Arrow batch to CSV file
-#[cfg(feature = "data-plane")]
-fn write_csv_output(path: &std::path::Path, batch: &arrow::array::RecordBatch) -> Result<()> {
-    use arrow::csv::WriterBuilder;
-
-    let file = std::fs::File::create(path)?;
-    let mut writer = WriterBuilder::new().with_header(true).build(file);
-    writer.write(batch)?;
-
-    Ok(())
 }
 
 #[cfg(test)]

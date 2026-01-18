@@ -3,7 +3,7 @@
 //! Control plane for job orchestration and worker management.
 //!
 //! Usage:
-//!     casparian-sentinel --bind tcp://127.0.0.1:5555 --database sqlite:///path/to/db.sqlite
+//!     casparian-sentinel --bind tcp://127.0.0.1:5555 --database duckdb:/path/to/db.duckdb
 
 use casparian_sentinel::{Sentinel, SentinelConfig};
 use clap::Parser;
@@ -17,8 +17,8 @@ struct Args {
     bind: String,
 
     /// Database connection string
-    #[arg(long, default_value = "sqlite://casparian_flow.db")]
-    database: String,
+    #[arg(long)]
+    database: Option<String>,
 }
 
 #[tokio::main]
@@ -36,11 +36,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Casparian Rust Sentinel");
     tracing::info!("  Bind: {}", args.bind);
-    tracing::info!("  Database: {}", args.database);
+    let database = args.database.unwrap_or_else(default_db_url);
+    tracing::info!("  Database: {}", database);
 
     let config = SentinelConfig {
         bind_addr: args.bind,
-        database_url: args.database,
+        database_url: database,
     };
 
     // Bind and run
@@ -48,4 +49,16 @@ async fn main() -> anyhow::Result<()> {
     sentinel.run().await?;
 
     Ok(())
+}
+
+fn default_db_url() -> String {
+    let home = std::env::var("CASPARIAN_HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".casparian_flow")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    format!(
+        "duckdb:{}",
+        home.join("casparian_flow.duckdb").display()
+    )
 }

@@ -1,5 +1,10 @@
 # DuckDB Migration Plan
 
+**Status Update (2026-01-18):** async-duckdb is no longer used. Casparian now
+owns the async boundary with a dedicated DuckDB actor thread and a synchronous
+`duckdb::Connection` on that thread. References to async-duckdb below are
+historical and should be treated as deprecated guidance.
+
 **Status:** Draft
 **Author:** AI Assistant
 **Date:** January 16, 2026

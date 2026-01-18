@@ -72,10 +72,10 @@ pub struct ParserOptions {
     /// Whether to include type validation
     #[serde(default = "default_true")]
     pub include_validation: bool,
-    /// Output sink type: parquet, sqlite, csv
+    /// Output sink type: parquet, duckdb, csv
     #[serde(default = "default_sink")]
     pub sink_type: String,
-    /// For sqlite: custom table name
+    /// For duckdb: custom table name
     pub table_name: Option<String>,
     /// Additional imports to include
     pub extra_imports: Option<Vec<String>>,
@@ -92,7 +92,7 @@ impl Default for ParserOptions {
             timestamp_format: None,
             include_error_handling: true,
             include_validation: true,
-            sink_type: "sqlite".to_string(),
+            sink_type: "duckdb".to_string(),
             table_name: None,
             extra_imports: None,
         }
@@ -100,7 +100,7 @@ impl Default for ParserOptions {
 }
 
 fn default_sink() -> String {
-    "sqlite".to_string()
+    "duckdb".to_string()
 }
 
 fn default_format() -> String {
@@ -573,13 +573,13 @@ impl Tool for GenerateParserTool {
                         },
                         "sink_type": {
                             "type": "string",
-                            "enum": ["parquet", "sqlite", "csv"],
+                            "enum": ["parquet", "duckdb", "csv"],
                             "default": "parquet",
                             "description": "Output sink type (Bridge Protocol SINK constant)"
                         },
                         "table_name": {
                             "type": "string",
-                            "description": "For sqlite sink: custom table name"
+                            "description": "For duckdb sink: custom table name"
                         },
                         "extra_imports": {
                             "type": "array",
@@ -1462,8 +1462,8 @@ mod tests {
             // Verify Bridge Protocol compliance
             assert!(gen_result.parser_code.contains("TOPIC = \"sample_data\""),
                 "Missing TOPIC constant. Code: {}", gen_result.parser_code);
-            assert!(gen_result.parser_code.contains("SINK = \"sqlite\""),
-                "Missing SINK constant (default sqlite). Code: {}", gen_result.parser_code);
+            assert!(gen_result.parser_code.contains("SINK = \"duckdb\""),
+                "Missing SINK constant (default duckdb). Code: {}", gen_result.parser_code);
             assert!(gen_result.parser_code.contains("def parse(file_path: str)"),
                 "Missing parse() function with correct signature");
 
@@ -1477,7 +1477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_parser_with_sqlite_sink() {
+    async fn test_generate_parser_with_duckdb_sink() {
         let tool = GenerateParserTool::new();
 
         let args = json!({
@@ -1489,7 +1489,7 @@ mod tests {
                 ]
             },
             "options": {
-                "sink_type": "sqlite"
+                "sink_type": "duckdb"
             }
         });
 
@@ -1497,8 +1497,8 @@ mod tests {
 
         if let Some(crate::types::ToolContent::Text { text }) = result.content.first() {
             let gen_result: GenerateParserResult = serde_json::from_str(text).unwrap();
-            assert!(gen_result.parser_code.contains("SINK = \"sqlite\""),
-                "Should use sqlite sink");
+            assert!(gen_result.parser_code.contains("SINK = \"duckdb\""),
+                "Should use duckdb sink");
             assert!(gen_result.parser_code.contains("TOPIC = \"transactions\""));
         }
     }
@@ -1609,7 +1609,7 @@ mod tests {
             let gen_result: GenerateParserResult = serde_json::from_str(text).unwrap();
             // Should still have Bridge Protocol constants
             assert!(gen_result.parser_code.contains("TOPIC = \"simple\""));
-            assert!(gen_result.parser_code.contains("SINK = \"sqlite\""));
+            assert!(gen_result.parser_code.contains("SINK = \"duckdb\""));
             assert!(gen_result.parser_code.contains("def parse(file_path: str)"));
         }
     }

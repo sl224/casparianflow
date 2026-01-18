@@ -23,7 +23,7 @@ It supports discovery, basic metadata display, and filtering. Test execution is 
 ├── parsers/                    # Parser plugins directory
 │   ├── sales_parser.py
 │   └── invoice_parser.py
-└── casparian_flow.sqlite3
+└── casparian_flow.duckdb
 ```
 
 **Rules (current):**

@@ -8,12 +8,12 @@
 
 ## 1. Executive Summary
 
-**Casparian Flow** is an AI-native data platform designed to transform "dark data" (unstructured, proprietary, or legacy files) into structured, queryable datasets (Parquet/SQL). It targets technical teams in regulated industries (Defense, Healthcare, Finance) who require air-gapped capability, strict governance, and reproducible data pipelines.
+**Casparian Flow** is a local-first data platform designed to transform "dark data" (unstructured, proprietary, or legacy files) into structured, queryable datasets (Parquet/SQL). It targets technical teams in regulated industries who require air-gapped capability, strict governance, and reproducible data pipelines. v1 focuses on finance trade support (FIX logs) as defined in `docs/v1_scope.md`.
 
 Unlike traditional ETL tools that assume standard API sources, Casparian Flow focuses on the **Bronze Layer** of data engineering: reliably parsing messy files from disk into typed Arrow batches using AI-generated, human-verified Python parsers running in sandboxed environments.
 
 ### 1.1 Core Philosophy
-1.  **AI Generates, Humans Approve**: AI is a proposal engine. It writes code; humans approve the *output* (schema contracts).
+1.  **Humans Approve, AI Optional**: Schema contracts are human-approved. AI can assist parser generation in Phase 2 but is not required for v1.
 2.  **Schema is Contract**: Once approved, a schema is immutable. Deviations result in hard failures or quarantined rows, never silent data corruption.
 3.  **Local-First & Air-Gapped**: The system runs entirely on the user's machine or on-prem server. No data leaves the perimeter.
 4.  **Modal Architecture**: Optimized for two distinct distinct modes: **Dev** (low friction, stateless) and **Prod** (high reliability, stateful, reproducible).
@@ -98,6 +98,10 @@ The system supports two execution modes sharing a single core executor.
 ---
 
 ## 4. Functional Specifications
+
+Job types and their semantics are defined in `specs/job_types.md`.
+SWE pipeline scheduling and selection semantics are defined in `specs/pipelines.md`.
+Database abstraction and job events are defined in `specs/db.md`.
 
 ### FS-1: Discovery (Scout)
 *   **Capability**: High-speed filesystem scanning using `ignore` and `glob` patterns.
@@ -563,7 +567,7 @@ The TUI operates as a hierarchical state machine with global navigation and mode
 
 ### 6.1 Database Schema (SQLite)
 
-All tables use single database: `~/.casparian_flow/casparian_flow.sqlite3`
+All tables use single database: `~/.casparian_flow/casparian_flow.duckdb`
 
 **Scout Tables (File Discovery):**
 *   **`scout_sources`**: Data sources (directories to watch). Columns: id, name, source_type, path, poll_interval_secs, enabled.
@@ -576,7 +580,7 @@ All tables use single database: `~/.casparian_flow/casparian_flow.sqlite3`
 *   **`cf_processing_history`**: Dedup tracking. Columns: input_hash, parser_name, parser_version, processed_at, job_id.
 
 **Sentinel Tables (Job Orchestration):**
-*   **`cf_processing_queue`**: Job queue. Columns: id, plugin_name, file_version_id, status (QUEUED/RUNNING/COMPLETED/FAILED), priority, retry_count.
+*   **`cf_processing_queue`**: Job queue. Columns: id, plugin_name, file_id, status (QUEUED/RUNNING/COMPLETED/FAILED), priority, retry_count.
 *   **`cf_dead_letter`**: Jobs that exhausted retries. Columns: original_job_id, plugin_name, error_message, retry_count, moved_at, reason.
 *   **`cf_parser_health`**: Circuit breaker state. Columns: parser_name, consecutive_failures, paused_at, last_failure_reason, total_executions.
 

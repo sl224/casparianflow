@@ -361,7 +361,7 @@ def infer_from_samples(paths: List[Path]) -> InferredRule:
 
 ### 5.4 AI-Assisted Inference (Optional)
 
-> **Full Specification:** See `specs/ai_wizards.md` Section 3.5 (Path Intelligence Engine)
+> **Full Specification:** See `archive/specs/ai_wizards.md` Section 3.5 (Path Intelligence Engine)
 
 When algorithmic inference has low confidence or files have inconsistent naming, the optional Path Intelligence Engine provides:
 

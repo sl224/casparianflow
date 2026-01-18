@@ -817,7 +817,7 @@ After alignment classification:
 
 ### Merges Requiring Decision
 
-#### MERGE-001: specs/pricing.md + specs/pricing_v2_refined.md
+#### MERGE-001: specs/pricing.md + docs/product/pricing_v2_refined.md
 - **Overlap:** 65%
 - **Agent recommendation:** Merge into specs/pricing.md
 - **Risk:** Some v2 content may be intentionally different
@@ -828,7 +828,7 @@ After alignment classification:
 
 ### Orphans Requiring Decision
 
-#### ORPHAN-001: specs/ai_wizards.md
+#### ORPHAN-001: archive/specs/ai_wizards.md
 - **No inbound references**
 - **Last modified:** 90 days ago
 - **Agent assessment:** Cannot determine relevance
@@ -915,7 +915,7 @@ When agent cannot determine classification:
 ```markdown
 ## Blocked Assessments
 
-### BLOCKED-001: specs/domain_intelligence.md
+### BLOCKED-001: docs/product/domain_intelligence.md
 **Reason:** USER_INPUT required
 **Blocking question:** Is domain intelligence feature still in roadmap?
 **Impact:** Cannot classify as ABANDONED vs SPEC_AHEAD
@@ -953,14 +953,14 @@ STRATEGY.md               # Master strategy document
 |------|--------|---------------|-----|------------|
 | specs/tui.md | ACTIVE | 2026-01-10 | 450 | 5 inbound, 3 outbound |
 | specs/extraction.md | ACTIVE | 2026-01-08 | 320 | 2 inbound, 4 outbound |
-| specs/hl7_parser.md | PLANNED | 2026-01-05 | 180 | 0 inbound, 1 outbound |
+| specs/parsers/hl7_parser.md | PLANNED | 2026-01-05 | 180 | 0 inbound, 1 outbound |
 | specs/old_feature.md | STALE? | 2025-11-02 | 95 | 0 inbound, 0 outbound |
 
 ## Strategy Inventory
 
 | File | Status | Last Modified | LOC | Related Spec |
 |------|--------|---------------|-----|--------------|
-| strategies/healthcare_hl7.md | ACTIVE | 2026-01-08 | 486 | specs/hl7_parser.md |
+| strategies/healthcare_hl7.md | ACTIVE | 2026-01-08 | 486 | specs/parsers/hl7_parser.md |
 | strategies/defense_tactical.md | ACTIVE | 2026-01-08 | 783 | (future) |
 | strategies/finance.md | ACTIVE | 2026-01-08 | 600 | (none yet) |
 ```
@@ -1061,7 +1061,7 @@ For each spec:
   - Recommendation: Update spec Section 3.2
 
 ### SPEC_AHEAD (2 specs)
-- **specs/hl7_parser.md** - HL7 parser not yet implemented
+- **specs/parsers/hl7_parser.md** - HL7 parser not yet implemented
   - Recommendation: Mark as PLANNED, no action needed
 
 ### ABANDONED (1 spec)
@@ -1187,7 +1187,7 @@ Adjust score based on context:
 
 ### MERGE_CANDIDATE (1 pair)
 
-#### OVERLAP-001: specs/pricing.md <-> specs/pricing_v2_refined.md
+#### OVERLAP-001: specs/pricing.md <-> docs/product/pricing_v2_refined.md
 
 **Overall Score:** 72%
 **Classification:** MERGE_CANDIDATE
@@ -1280,13 +1280,13 @@ Identify specs that should be merged:
 
 ### FRAG-001: Pricing specs
 - **specs/pricing.md** (180 lines)
-- **specs/pricing_v2_refined.md** (220 lines)
+- **docs/product/pricing_v2_refined.md** (220 lines)
 - **Overlap:** 60%
 - **Recommendation:** Merge into single pricing.md, archive v2_refined
 
 ### FRAG-002: View specs
 - **specs/views/discover.md** (400 lines)
-- **specs/views/extraction_rules.md** (350 lines)
+- **archive/specs/views/extraction_rules.md** (350 lines)
 - **specs/views/jobs.md** (280 lines)
 - **Recommendation:** Keep separate (distinct domains)
 ```
@@ -1362,8 +1362,8 @@ Check cross-references are valid:
 - specs/tui.md:120 → specs/views/parser_bench.md (file doesn't exist)
 
 ### Orphan Specs (no inbound references)
-- specs/ai_wizards.md - Not referenced from any other doc
-- specs/domain_intelligence.md - Not referenced from any other doc
+- archive/specs/ai_wizards.md - Not referenced from any other doc
+- docs/product/domain_intelligence.md - Not referenced from any other doc
 
 ### Missing References (should link but don't)
 - specs/extraction.md mentions "tagging rules" but doesn't link to specs/views/discover.md
@@ -1397,14 +1397,14 @@ Spec documents (for market-facing features):
 ## Cross-Reference Analysis
 
 ### Complete Bidirectional Links (OK)
-- strategies/healthcare_hl7.md <-> specs/hl7_parser.md
+- strategies/healthcare_hl7.md <-> specs/parsers/hl7_parser.md
 
 ### Strategies Without Specs
 - strategies/finance.md - No spec exists (GAP: needs specs/fix_parser.md)
 
 ### Specs Without Strategies (Review Needed)
 - specs/tui.md - Internal infrastructure (EXPECTED)
-- specs/domain_intelligence.md - Market-facing? (NEEDS REVIEW)
+- docs/product/domain_intelligence.md - Market-facing? (NEEDS REVIEW)
 ```
 
 ### 8.7 Reference Propagation
@@ -1516,7 +1516,7 @@ Related header: /^\*\*Related:\*\*\s*(.+)$/gm  # Then split on comma, strip anno
 
 The `**Related:**` header uses a comma-separated format with optional annotations:
 ```markdown
-**Related:** specs/extraction.md (Extraction API), specs/views/sources.md, specs/meta/sessions/ai_consolidation/design.md
+**Related:** specs/extraction.md (Extraction API), specs/views/sources.md, archive/specs/meta/sessions/ai_consolidation/design.md
 ```
 
 Parsing steps:
@@ -2113,7 +2113,7 @@ LOW: <30%
 
 | Current | Proposed | Inbound Refs | Files to Update |
 |---------|----------|--------------|-----------------|
-| specs/pricing_v2_refined.md | specs/pricing.md | 4 | CLAUDE.md, spec.md, strategies/finance.md |
+| docs/product/pricing_v2_refined.md | specs/pricing.md | 4 | CLAUDE.md, spec.md, strategies/finance.md |
 | specs/tui_v3.md | specs/tui.md | 8 | (see full list) |
 | docs/api_v2.md | docs/api.md | 2 | specs/integration.md |
 
@@ -2380,12 +2380,12 @@ Step 4: Validate Corpus
 - **Confidence:** HIGH
 - **Action:** Sync Section 3.2 with extraction/wizard.rs
 
-#### REC-002: Archive specs/pricing_v2_refined.md
+#### REC-002: Archive docs/product/pricing_v2_refined.md
 - **Type:** ARCHIVE
 - **Reason:** Superseded by specs/pricing.md
 - **Effort:** Trivial
 - **Confidence:** Requires confirmation
-- **Action:** mv specs/pricing_v2_refined.md archive/
+- **Action:** mv docs/product/pricing_v2_refined.md archive/
 
 #### REC-003: Write specs/scout.md
 - **Type:** WRITE
@@ -2477,7 +2477,7 @@ When a single file has multiple recommendations, apply these precedence rules:
 **Detection:** During Phase 4 (Recommendations), flag files with multiple recommendations:
 
 ```markdown
-### Conflict Detected: specs/pricing_v2_refined.md
+### Conflict Detected: docs/product/pricing_v2_refined.md
 
 Recommendations:
 - MERGE into specs/pricing.md (OVERLAP-001)
@@ -2571,8 +2571,8 @@ specs/meta/maintenance/
 
 ### Remaining Issues
 
-- specs/ai_wizards.md - Orphan, unclear if still relevant (needs user decision)
-- specs/hl7_parser.md - PLANNED, no implementation timeline
+- archive/specs/ai_wizards.md - Orphan, unclear if still relevant (needs user decision)
+- specs/parsers/hl7_parser.md - PLANNED, no implementation timeline
 
 ### Next Maintenance
 

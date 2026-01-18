@@ -154,7 +154,7 @@ Main tables (SQLite):
 
 ```bash
 # Start sentinel
-./target/release/casparian start --database sqlite://db.sqlite3
+./target/release/casparian start --database duckdb:db.duckdb
 
 # Worker mode
 ./target/release/casparian worker --connect tcp://localhost:5555

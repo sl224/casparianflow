@@ -9,7 +9,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY="$PROJECT_ROOT/target/debug/casparian"
 TEST_DIR=$(mktemp -d)
 DB_DIR=$(mktemp -d)
-DB_PATH="$DB_DIR/casparian_flow.sqlite3"
+DB_PATH="$DB_DIR/casparian_flow.duckdb"
 
 cleanup() {
     rm -rf "$TEST_DIR"
@@ -25,7 +25,7 @@ echo
 
 # Setup test database
 echo "Setting up test database..."
-sqlite3 "$DB_PATH" <<'EOF'
+duckdb "$DB_PATH" <<'EOF'
 -- Create schema
 CREATE TABLE scout_sources (
     id TEXT PRIMARY KEY,
@@ -100,8 +100,8 @@ echo
 # Override home dir for database lookup
 export HOME="$DB_DIR"
 mkdir -p "$HOME/.casparian_flow"
-mv "$DB_PATH" "$HOME/.casparian_flow/casparian_flow.sqlite3"
-DB_PATH="$HOME/.casparian_flow/casparian_flow.sqlite3"
+mv "$DB_PATH" "$HOME/.casparian_flow/casparian_flow.duckdb"
+DB_PATH="$HOME/.casparian_flow/casparian_flow.duckdb"
 
 # Test 1: Tag command with --dry-run
 echo "Test 1: Tag command with --dry-run"
@@ -128,7 +128,7 @@ fi
 echo
 
 # Verify no changes were made
-TAGGED_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM scout_files WHERE tag IS NOT NULL")
+TAGGED_COUNT=$(duckdb "$DB_PATH" "SELECT COUNT(*) FROM scout_files WHERE tag IS NOT NULL")
 if [ "$TAGGED_COUNT" = "0" ]; then
     echo "PASS: Dry run made no changes"
 else
@@ -150,7 +150,7 @@ fi
 echo
 
 # Verify files were tagged
-TAGGED_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM scout_files WHERE tag IS NOT NULL")
+TAGGED_COUNT=$(duckdb "$DB_PATH" "SELECT COUNT(*) FROM scout_files WHERE tag IS NOT NULL")
 if [ "$TAGGED_COUNT" = "3" ]; then
     echo "PASS: 3 files tagged (2 CSV + 1 JSON)"
 else
@@ -159,7 +159,7 @@ else
 fi
 
 # Verify correct tags
-CSV_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM scout_files WHERE tag = 'csv_data'")
+CSV_COUNT=$(duckdb "$DB_PATH" "SELECT COUNT(*) FROM scout_files WHERE tag = 'csv_data'")
 if [ "$CSV_COUNT" = "2" ]; then
     echo "PASS: 2 files tagged with csv_data"
 else
@@ -180,14 +180,14 @@ else
 fi
 
 # Verify manual tag
-MANUAL_TAG=$(sqlite3 "$DB_PATH" "SELECT tag FROM scout_files WHERE path = '/test/data/unknown.xyz'")
+MANUAL_TAG=$(duckdb "$DB_PATH" "SELECT tag FROM scout_files WHERE path = '/test/data/unknown.xyz'")
 if [ "$MANUAL_TAG" = "custom_tag" ]; then
     echo "PASS: Manual tag applied correctly"
 else
     echo "FAIL: Expected custom_tag, got $MANUAL_TAG"
     exit 1
 fi
-MANUAL_SOURCE=$(sqlite3 "$DB_PATH" "SELECT tag_source FROM scout_files WHERE path = '/test/data/unknown.xyz'")
+MANUAL_SOURCE=$(duckdb "$DB_PATH" "SELECT tag_source FROM scout_files WHERE path = '/test/data/unknown.xyz'")
 if [ "$MANUAL_SOURCE" = "manual" ]; then
     echo "PASS: Tag source set to manual"
 else
@@ -208,14 +208,14 @@ else
 fi
 
 # Verify tag removed
-UNTAGGED=$(sqlite3 "$DB_PATH" "SELECT COALESCE(tag, 'NULL') FROM scout_files WHERE path = '/test/data/unknown.xyz'")
+UNTAGGED=$(duckdb "$DB_PATH" "SELECT COALESCE(tag, 'NULL') FROM scout_files WHERE path = '/test/data/unknown.xyz'")
 if [ "$UNTAGGED" = "NULL" ]; then
     echo "PASS: Tag removed"
 else
     echo "FAIL: Expected NULL tag, got $UNTAGGED"
     exit 1
 fi
-UNTAGGED_STATUS=$(sqlite3 "$DB_PATH" "SELECT status FROM scout_files WHERE path = '/test/data/unknown.xyz'")
+UNTAGGED_STATUS=$(duckdb "$DB_PATH" "SELECT status FROM scout_files WHERE path = '/test/data/unknown.xyz'")
 if [ "$UNTAGGED_STATUS" = "pending" ]; then
     echo "PASS: Status reset to pending"
 else

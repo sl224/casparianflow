@@ -39,7 +39,7 @@ Usage (Environment Variables):
     BRIDGE_PLUGIN_CODE=<base64> \
     BRIDGE_FILE_PATH=/path/to/file.csv \
     BRIDGE_JOB_ID=123 \
-    BRIDGE_FILE_VERSION_ID=456 \
+    BRIDGE_FILE_ID=456 \
     python bridge_shim.py
 
 Usage (CLI Arguments - Dev Mode):
@@ -405,7 +405,7 @@ class BridgeContext:
 def execute_plugin(
     source_code: str,
     file_path: str,
-    file_version_id: int,
+    file_id: int,
     context: BridgeContext,
 ) -> dict:
     """
@@ -418,7 +418,7 @@ def execute_plugin(
     Args:
         source_code: Plugin source code
         file_path: Path to input file
-        file_version_id: File version ID for lineage tracking
+        file_id: File ID for lineage tracking
         context: BridgeContext for IPC communication
 
     Returns:
@@ -445,9 +445,8 @@ def execute_plugin(
     if "parse" in plugin_namespace and callable(plugin_namespace["parse"]):
         parse_fn = plugin_namespace["parse"]
 
-        # Get TOPIC and SINK constants for single-output wrapping
+        # Get TOPIC constant for single-output wrapping
         topic = plugin_namespace.get("TOPIC", "default")
-        sink = plugin_namespace.get("SINK", "parquet")
 
         # Call the parse function
         result = parse_fn(file_path)
@@ -463,18 +462,14 @@ def execute_plugin(
                 context.publish(1, out.data)
                 output_info.append({
                     "name": out.name,
-                    "sink": out.sink,
                     "table": out.table,
-                    "compression": out.compression,
                 })
         elif hasattr(result, "to_arrow") or hasattr(result, "to_pandas") or hasattr(result, "schema"):
             # Single output: bare DataFrame/Table - wrap with TOPIC/SINK constants
             context.publish(1, result)
             output_info.append({
                 "name": topic,
-                "sink": sink,
                 "table": None,
-                "compression": "snappy",
             })
         else:
             raise TypeError(
@@ -491,7 +486,7 @@ def execute_plugin(
             handler.configure(context, {})
 
         # Create file event with lineage tracking
-        file_event = type("FileEvent", (), {"path": file_path, "file_id": file_version_id})()
+        file_event = type("FileEvent", (), {"path": file_path, "file_id": file_id})()
 
         # Execute the plugin
         if hasattr(handler, "consume") and callable(handler.consume):
@@ -514,9 +509,7 @@ def execute_plugin(
                         context.publish(1, batch.data)
                         output_info.append({
                             "name": batch.name,
-                            "sink": batch.sink,
                             "table": batch.table,
-                            "compression": batch.compression,
                         })
                     else:
                         # Legacy: bare DataFrame/Table
@@ -545,7 +538,7 @@ def main():
     plugin_code_b64 = os.environ.get("BRIDGE_PLUGIN_CODE")
     file_path = os.environ.get("BRIDGE_FILE_PATH")
     job_id = int(os.environ.get("BRIDGE_JOB_ID", "0"))
-    file_version_id = int(os.environ.get("BRIDGE_FILE_VERSION_ID", "0"))
+    file_id = int(os.environ.get("BRIDGE_FILE_ID", "0"))
 
     # Handle different loader modes
     source_code = None
@@ -637,7 +630,7 @@ def main():
 
         try:
             # Execute plugin
-            metrics = execute_plugin(source_code, file_path, file_version_id, context)
+            metrics = execute_plugin(source_code, file_path, file_id, context)
 
             # Flush any remaining buffered output
             sys.stdout.flush()

@@ -43,7 +43,7 @@ We spawn a real instance of the Rust Sentinel for the duration of the test.
 
 **Setup**: Before tests start, `global-setup.ts` creates a temporary sandbox:
 - **Database**: A fresh `test.db` (SQLite) is created
-- **Process**: We spawn `./target/release/casparian start --database sqlite:///tmp/test_env/test.db`
+- **Process**: We spawn `./target/release/casparian start --database duckdb:/tmp/test_env/test.db`
 - **Transport**: The UI sends requests to a local Node.js Bridge, which forwards them over ZMQ to the Rust process
 
 **Why this matters**: If the Agent clicks "Delete Rule", the request goes to the real Rust Sentinel. If SQLite fails due to a foreign key constraint, the UI receives a real error, and the test fails.
@@ -97,15 +97,15 @@ The agent operates in cycles:
 ```typescript
 import { test, expect } from '@playwright/test';
 import { createAgent } from './blind-agent';
-import Database from 'better-sqlite3';
+import duckdb from 'duckdb';
 
 test.describe('Real Backend Integration', () => {
   let agent: BlindAgent;
-  let db: Database.Database;
+  let db: duckdb.Database;
 
   test.beforeAll(() => {
     // Connect to the ephemeral DB used by the Rust process
-    db = new Database('/tmp/test_env/casparian.db');
+    db = new duckdb.Database('/tmp/test_env/casparian.duckdb');
   });
 
   test('Create Rule and Verify Persistence', async ({ page }) => {

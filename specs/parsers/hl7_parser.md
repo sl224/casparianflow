@@ -104,7 +104,7 @@ Casparian ships with drop-in HL7 parsers that:
 │  │   ├── hl7_observations_{job_id}.parquet                             │
 │  │   └── hl7_messages_{job_id}.parquet   # Raw message metadata        │
 │  │                                                                      │
-│  └── casparian_flow.sqlite3                                            │
+│  └── casparian_flow.duckdb                                            │
 │      └── cf_quarantine (malformed messages)                            │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘

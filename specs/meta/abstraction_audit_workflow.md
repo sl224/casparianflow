@@ -43,12 +43,12 @@ These patterns are defined once and used by both:
 ABSTRACTION_PATTERNS = {
     # Database
     "DB_SQLITE_SPECIFIC": {
-        "pattern": r"(sqlx::Sqlite|SqlitePool|SqliteRow|sqlx::sqlite::)",
+        "pattern": r"(sqlx::Sqlite|SqlitePool|SqliteRow|sqlx::duckdb::)",
         "severity": "HIGH",
         "suggestion": "Use generic sqlx::Pool<DB> or Database trait"
     },
     "DB_SQLITE_SYNTAX": {
-        "pattern": r"(AUTOINCREMENT|INTEGER PRIMARY KEY|sqlite_sequence|pragma)",
+        "pattern": r"(AUTOINCREMENT|INTEGER PRIMARY KEY|duckdb_sequence|pragma)",
         "severity": "MEDIUM",
         "suggestion": "Use database-agnostic SQL or migration abstraction"
     },
@@ -883,7 +883,7 @@ Add to `workflow_manager.md` Section 3.2:
 
 ```
 ABSTRACTION_KEYWORDS = [
-    "abstraction", "platform", "portable", "database", "sqlite", "postgres",
+    "abstraction", "platform", "portable", "database", "duckdb", "postgres",
     "llm", "provider", "anthropic", "openai", "coupling", "modular"
 ]
 ```

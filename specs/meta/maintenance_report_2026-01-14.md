@@ -232,19 +232,19 @@ For approved recommendations, execute in this order:
 
 | ID | Action | File | Result |
 |----|--------|------|--------|
-| R-006 | Fix broken reference | specs/ai_wizards.md | Removed non-existent roadmap ref |
-| R-007 | Archive consolidated spec | specs/ai_wizards.md → archive/specs/ | Moved |
+| R-006 | Fix broken reference | archive/specs/ai_wizards.md | Removed non-existent roadmap ref |
+| R-007 | Archive consolidated spec | archive/specs/ai_wizards.md → archive/specs/ | Moved |
 | R-008 | Add headers | specs/views/home.md | Added Related, Last Updated |
 | R-001 | Decision doc | docs/decisions/ADR-017-tagging-vs-extraction-rules.md | Created |
-| R-002 | Schema sync | specs/views/extraction_rules.md | Added 4 missing tables, bumped to v1.1 |
+| R-002 | Schema sync | archive/specs/views/extraction_rules.md | Added 4 missing tables, bumped to v1.1 |
 
 ### Files Modified
 
 | File | Change |
 |------|--------|
-| `specs/ai_wizards.md` | Fixed Dependencies, added Archived date, moved to archive/ |
+| `archive/specs/ai_wizards.md` | Fixed Dependencies, added Archived date, moved to archive/ |
 | `specs/views/home.md` | Added Related and Last Updated fields |
-| `specs/views/extraction_rules.md` | Updated schema table (v1.1), added ADR-017 ref |
+| `archive/specs/views/extraction_rules.md` | Updated schema table (v1.1), added ADR-017 ref |
 | `docs/decisions/ADR-017-tagging-vs-extraction-rules.md` | NEW: Clarifies tagging vs extraction rules |
 
 ### Remaining (MEDIUM/LOW - Not Executed)

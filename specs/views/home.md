@@ -22,7 +22,7 @@ It is intentionally minimal: no modal popups on entry, and no tile-based navigat
 ### 1.1 Data Sources
 
 ```
-~/.casparian_flow/casparian_flow.sqlite3
+~/.casparian_flow/casparian_flow.duckdb
 
 Tables queried:
 ├── scout_sources        # Source list + file_count

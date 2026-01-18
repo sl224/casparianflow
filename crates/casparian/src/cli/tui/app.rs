@@ -379,13 +379,17 @@ pub enum SchemaEvalMode {
 #[derive(Debug, Clone)]
 pub struct JobInfo {
     pub id: i64,
-    pub file_version_id: Option<i64>,
+    pub file_id: Option<i64>,
     pub job_type: JobType,
     pub name: String,                     // parser/exporter/source name
     pub version: Option<String>,
     pub status: JobStatus,
     pub started_at: DateTime<Local>,
     pub completed_at: Option<DateTime<Local>>,
+    pub pipeline_run_id: Option<String>,
+    pub logical_date: Option<String>,
+    pub selection_snapshot_hash: Option<String>,
+    pub quarantine_rows: Option<i64>,
 
     // Progress
     pub items_total: u32,
@@ -407,13 +411,17 @@ impl Default for JobInfo {
     fn default() -> Self {
         Self {
             id: 0,
-            file_version_id: None,
+            file_id: None,
             job_type: JobType::Parse,
             name: String::new(),
             version: None,
             status: JobStatus::Pending,
             started_at: Local::now(),
             completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
             items_total: 0,
             items_processed: 0,
             items_failed: 0,
@@ -2408,7 +2416,7 @@ impl App {
                     KeyCode::Esc => {
                         // Update job status to Cancelled
                         if let Some(job_id) = self.current_scan_job_id {
-                            self.update_scan_job_status(job_id, JobStatus::Cancelled, None);
+                            self.update_scan_job_status(job_id, JobStatus::Cancelled, None, None, None);
                         }
 
                         self.pending_scan = None;
@@ -5367,13 +5375,17 @@ impl App {
 
         let job = JobInfo {
             id: job_id,
-            file_version_id: None,
+            file_id: None,
             job_type: JobType::Scan,
             name: "scan".to_string(),
             version: None,
             status: JobStatus::Running,
             started_at: chrono::Local::now(),
             completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
             items_total: 0,
             items_processed: 0,
             items_failed: 0,
@@ -5392,9 +5404,22 @@ impl App {
     /// Update the status of a scan job.
     ///
     /// Finds the job by ID and updates its status and error message.
-    fn update_scan_job_status(&mut self, job_id: i64, status: JobStatus, error: Option<String>) {
+    fn update_scan_job_status(
+        &mut self,
+        job_id: i64,
+        status: JobStatus,
+        error: Option<String>,
+        processed: Option<u32>,
+        total: Option<u32>,
+    ) {
         if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
             job.status = status;
+            if let Some(value) = processed {
+                job.items_processed = value;
+            }
+            if let Some(value) = total {
+                job.items_total = value;
+            }
             if status == JobStatus::Completed || status == JobStatus::Failed || status == JobStatus::Cancelled {
                 job.completed_at = Some(chrono::Local::now());
             }
@@ -5416,7 +5441,7 @@ impl App {
 
         let job = JobInfo {
             id: job_id,
-            file_version_id: None,
+            file_id: None,
             job_type: JobType::SchemaEval,
             name: match mode {
                 SchemaEvalMode::Sample => "schema-sample".to_string(),
@@ -5426,6 +5451,10 @@ impl App {
             status: JobStatus::Running,
             started_at: chrono::Local::now(),
             completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
             items_total: paths_total as u32,
             items_processed: 0,
             items_failed: 0,
@@ -6766,10 +6795,42 @@ impl App {
                 None => return,
             };
 
-            let query = r#"
+            let enriched_query = r#"
                 SELECT
                     q.id,
-                    q.file_version_id,
+                    q.file_id,
+                    q.plugin_name,
+                    q.status,
+                    q.claim_time,
+                    q.end_time,
+                    q.result_summary,
+                    q.error_message,
+                    q.pipeline_run_id,
+                    pr.logical_date,
+                    pr.selection_snapshot_hash,
+                    qc.quarantine_rows
+                FROM cf_processing_queue q
+                LEFT JOIN cf_pipeline_runs pr ON pr.id = q.pipeline_run_id
+                LEFT JOIN (
+                    SELECT job_id, COUNT(*) AS quarantine_rows
+                    FROM cf_quarantine
+                    GROUP BY job_id
+                ) qc ON qc.job_id = q.id
+                ORDER BY
+                    CASE q.status
+                        WHEN 'RUNNING' THEN 1
+                        WHEN 'QUEUED' THEN 2
+                        WHEN 'FAILED' THEN 3
+                        WHEN 'COMPLETED' THEN 4
+                    END,
+                    q.id DESC
+                LIMIT 100
+            "#;
+
+            let base_query = r#"
+                SELECT
+                    q.id,
+                    q.file_id,
                     q.plugin_name,
                     q.status,
                     q.claim_time,
@@ -6788,14 +6849,23 @@ impl App {
                 LIMIT 100
             "#;
 
-            if let Ok(rows) = conn.query_all(query, &[]).await {
+            let rows = match conn.query_all(enriched_query, &[]).await {
+                Ok(rows) => rows,
+                Err(_) => match conn.query_all(base_query, &[]).await {
+                    Ok(rows) => rows,
+                    Err(_) => return,
+                },
+            };
+
+            if !rows.is_empty() {
                 let mut jobs: Vec<JobInfo> = Vec::with_capacity(rows.len());
                 for row in rows {
+                    let column_count = row.len();
                     let id: i64 = match row.get(0) {
                         Ok(v) => v,
                         Err(_) => return,
                     };
-                    let file_version_id: Option<i64> = match row.get(1) {
+                    let file_id: Option<i64> = match row.get(1) {
                         Ok(v) => v,
                         Err(_) => return,
                     };
@@ -6822,6 +6892,26 @@ impl App {
                     let error_message: Option<String> = match row.get(7) {
                         Ok(v) => v,
                         Err(_) => return,
+                    };
+                    let pipeline_run_id: Option<String> = if column_count > 8 {
+                        row.get(8).ok()
+                    } else {
+                        None
+                    };
+                    let logical_date: Option<String> = if column_count > 9 {
+                        row.get(9).ok()
+                    } else {
+                        None
+                    };
+                    let selection_snapshot_hash: Option<String> = if column_count > 10 {
+                        row.get(10).ok()
+                    } else {
+                        None
+                    };
+                    let quarantine_rows: Option<i64> = if column_count > 11 {
+                        row.get(11).ok()
+                    } else {
+                        None
                     };
 
                     let status = match status_str.as_str() {
@@ -6853,13 +6943,17 @@ impl App {
 
                     jobs.push(JobInfo {
                         id,
-                        file_version_id,
+                        file_id,
                         job_type: JobType::Parse,
                         name: plugin_name,
                         version: None,
                         status,
                         started_at,
                         completed_at,
+                        pipeline_run_id,
+                        logical_date,
+                        selection_snapshot_hash,
+                        quarantine_rows,
                         items_total: 0,
                         items_processed: if result_summary.is_some() { 1 } else { 0 },
                         items_failed: if error_message.is_some() { 1 } else { 0 },
@@ -8284,7 +8378,8 @@ impl App {
 
         // Poll for pending scan results (non-blocking directory scan)
         // Process ALL available messages (progress updates + completion)
-        if let Some(ref mut rx) = self.pending_scan {
+        if self.pending_scan.is_some() {
+            let mut rx = self.pending_scan.take().unwrap();
             let mut scan_complete = false;
             // Drain all available messages
             loop {
@@ -8300,12 +8395,28 @@ impl App {
                             }
                             TuiScanResult::Progress(progress) => {
                                 // Update progress - UI will display this
+                                if let Some(job_id) = self.current_scan_job_id {
+                                    self.update_scan_job_status(
+                                        job_id,
+                                        JobStatus::Running,
+                                        None,
+                                        Some(progress.files_persisted as u32),
+                                        Some(progress.files_found as u32),
+                                    );
+                                }
                                 self.discover.scan_progress = Some(progress);
                             }
                             TuiScanResult::Complete { source_path, files_persisted } => {
                                 // Update job status to Completed
                                 if let Some(job_id) = self.current_scan_job_id {
-                                    self.update_scan_job_status(job_id, JobStatus::Completed, None);
+                                    let count = files_persisted as u32;
+                                    self.update_scan_job_status(
+                                        job_id,
+                                        JobStatus::Completed,
+                                        None,
+                                        Some(count),
+                                        Some(count),
+                                    );
                                 }
 
                                 // Scanner persisted to DB - reload sources and files
@@ -8372,7 +8483,13 @@ impl App {
                             TuiScanResult::Error(err) => {
                                 // Update job status to Failed
                                 if let Some(job_id) = self.current_scan_job_id {
-                                    self.update_scan_job_status(job_id, JobStatus::Failed, Some(err.clone()));
+                                    self.update_scan_job_status(
+                                        job_id,
+                                        JobStatus::Failed,
+                                        Some(err.clone()),
+                                        None,
+                                        None,
+                                    );
                                 }
 
                                 self.discover.scan_error = Some(err);
@@ -8393,6 +8510,8 @@ impl App {
                                 job_id,
                                 JobStatus::Failed,
                                 Some("Scan task ended unexpectedly".to_string()),
+                                None,
+                                None,
                             );
                         }
 
@@ -8407,8 +8526,9 @@ impl App {
                 }
             }
             if scan_complete {
-                self.pending_scan = None;
                 self.current_scan_job_id = None;
+            } else {
+                self.pending_scan = Some(rx);
             }
         }
 
@@ -9058,52 +9178,64 @@ mod tests {
         vec![
             JobInfo {
                 id: 1,
-                file_version_id: Some(101),
+                file_id: Some(101),
                 job_type: JobType::Parse,
                 name: "parser_a".into(),
-                version: Some("1.0.0".into()),
-                status: JobStatus::Pending,
-                started_at: Local::now(),
-                completed_at: None,
-                items_total: 100,
-                items_processed: 0,
-                items_failed: 0,
-                output_path: Some("/data/output/a.parquet".into()),
-                output_size_bytes: None,
+            version: Some("1.0.0".into()),
+            status: JobStatus::Pending,
+            started_at: Local::now(),
+            completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
+            items_total: 100,
+            items_processed: 0,
+            items_failed: 0,
+            output_path: Some("/data/output/a.parquet".into()),
+            output_size_bytes: None,
                 backtest: None,
                 failures: vec![],
             },
             JobInfo {
                 id: 2,
-                file_version_id: Some(102),
+                file_id: Some(102),
                 job_type: JobType::Parse,
                 name: "parser_b".into(),
-                version: Some("1.0.0".into()),
-                status: JobStatus::Running,
-                started_at: Local::now(),
-                completed_at: None,
-                items_total: 100,
-                items_processed: 50,
-                items_failed: 0,
-                output_path: Some("/data/output/b.parquet".into()),
-                output_size_bytes: None,
+            version: Some("1.0.0".into()),
+            status: JobStatus::Running,
+            started_at: Local::now(),
+            completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
+            items_total: 100,
+            items_processed: 50,
+            items_failed: 0,
+            output_path: Some("/data/output/b.parquet".into()),
+            output_size_bytes: None,
                 backtest: None,
                 failures: vec![],
             },
             JobInfo {
                 id: 3,
-                file_version_id: Some(103),
+                file_id: Some(103),
                 job_type: JobType::Parse,
                 name: "parser_c".into(),
-                version: Some("1.0.0".into()),
-                status: JobStatus::Failed,
-                started_at: Local::now(),
-                completed_at: Some(Local::now()),
-                items_total: 100,
-                items_processed: 30,
-                items_failed: 5,
-                output_path: Some("/data/output/c.parquet".into()),
-                output_size_bytes: None,
+            version: Some("1.0.0".into()),
+            status: JobStatus::Failed,
+            started_at: Local::now(),
+            completed_at: Some(Local::now()),
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
+            items_total: 100,
+            items_processed: 30,
+            items_failed: 5,
+            output_path: Some("/data/output/c.parquet".into()),
+            output_size_bytes: None,
                 backtest: None,
                 failures: vec![JobFailure {
                     file_path: "/data/c.csv".into(),
@@ -9113,18 +9245,22 @@ mod tests {
             },
             JobInfo {
                 id: 4,
-                file_version_id: Some(104),
+                file_id: Some(104),
                 job_type: JobType::Parse,
                 name: "parser_d".into(),
-                version: Some("1.0.0".into()),
-                status: JobStatus::Completed,
-                started_at: Local::now(),
-                completed_at: Some(Local::now()),
-                items_total: 100,
-                items_processed: 100,
-                items_failed: 0,
-                output_path: Some("/data/output/d.parquet".into()),
-                output_size_bytes: Some(1024 * 1024),
+            version: Some("1.0.0".into()),
+            status: JobStatus::Completed,
+            started_at: Local::now(),
+            completed_at: Some(Local::now()),
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
+            items_total: 100,
+            items_processed: 100,
+            items_failed: 0,
+            output_path: Some("/data/output/d.parquet".into()),
+            output_size_bytes: Some(1024 * 1024),
                 backtest: None,
                 failures: vec![],
             },
@@ -9323,7 +9459,7 @@ mod tests {
         app.jobs_state.jobs = (0..1000)
             .map(|i| JobInfo {
                 id: i,
-                file_version_id: Some(i * 100),
+                file_id: Some(i * 100),
                 job_type: JobType::Parse,
                 name: format!("test_parser_{}", i),
                 version: Some("1.0.0".into()),
@@ -9338,6 +9474,10 @@ mod tests {
                 },
                 started_at: chrono::Local::now(),
                 completed_at: None,
+                pipeline_run_id: None,
+                logical_date: None,
+                selection_snapshot_hash: None,
+                quarantine_rows: None,
                 items_total: 100,
                 items_processed: 50,
                 items_failed: 0,

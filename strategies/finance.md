@@ -535,7 +535,7 @@ ORDER BY last_update DESC;
 
 #### Pricing
 
-Pricing tiers and unit definitions are centralized in `specs/pricing_v2_refined.md`. Use the Finance mapping (Analyst → Team → Trading Desk → Enterprise) from the system-of-record and keep desk-level ROI framing from the value analysis above.
+Pricing tiers and unit definitions are centralized in `docs/product/pricing_v2_refined.md`. Use the Finance mapping (Analyst → Team → Trading Desk → Enterprise) from the system-of-record and keep desk-level ROI framing from the value analysis above.
 
 #### Revenue Modeling
 

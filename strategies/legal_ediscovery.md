@@ -500,7 +500,7 @@ Raw Data → [CASPARIAN] → Structured Data → [Relativity/Everlaw] → Review
 
 #### Pricing
 
-Pricing tiers and unit definitions are centralized in `specs/pricing_v2_refined.md`. Use the Legal mapping (Solo → Firm → Litigation Team → Enterprise) from the system-of-record and keep the vendor-cost comparison from the value analysis above.
+Pricing tiers and unit definitions are centralized in `docs/product/pricing_v2_refined.md`. Use the Legal mapping (Solo → Firm → Litigation Team → Enterprise) from the system-of-record and keep the vendor-cost comparison from the value analysis above.
 
 #### Revenue Modeling
 

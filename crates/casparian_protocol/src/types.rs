@@ -1,10 +1,13 @@
 //! Protocol payload types (Pydantic model equivalents)
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::de;
+use serde::ser::SerializeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::fmt;
 use std::str::FromStr;
+use url::form_urlencoded;
 
 // ============================================================================
 // Canonical Enums (used across all crates)
@@ -53,57 +56,6 @@ impl FromStr for SinkMode {
     }
 }
 
-/// Sink output type - where data is written.
-/// This is the CANONICAL definition - use this everywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum SinkType {
-    /// Apache Parquet columnar format (default)
-    #[default]
-    Parquet,
-    /// SQLite database
-    Sqlite,
-    /// CSV text files
-    Csv,
-}
-
-impl SinkType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SinkType::Parquet => "parquet",
-            SinkType::Sqlite => "sqlite",
-            SinkType::Csv => "csv",
-        }
-    }
-
-    /// Get file extension for this sink type
-    pub fn extension(&self) -> &'static str {
-        match self {
-            SinkType::Parquet => "parquet",
-            SinkType::Sqlite => "db",
-            SinkType::Csv => "csv",
-        }
-    }
-}
-
-impl fmt::Display for SinkType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl FromStr for SinkType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "parquet" => Ok(SinkType::Parquet),
-            "sqlite" | "db" => Ok(SinkType::Sqlite),
-            "csv" => Ok(SinkType::Csv),
-            _ => Err(format!("Invalid sink type: '{}'. Expected: parquet, sqlite, or csv", s)),
-        }
-    }
-}
 
 /// Processing job status - lifecycle of a job in the queue.
 /// This is the CANONICAL definition - use this everywhere for job queue status.
@@ -266,8 +218,7 @@ impl FromStr for WorkerStatus {
 /// # Arrow Mapping
 ///
 /// Each variant maps to an Arrow/Parquet type for output storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum DataType {
     /// Null/empty value (used during type inference)
     Null,
@@ -284,7 +235,7 @@ pub enum DataType {
     /// Date (no time component)
     Date,
 
-    /// Timestamp with timezone (datetime)
+    /// Timestamp without timezone (naive)
     Timestamp,
 
     /// Time only (no date component)
@@ -299,26 +250,135 @@ pub enum DataType {
 
     /// Binary data (raw bytes)
     Binary,
+
+    /// Decimal128 (precision <= 38)
+    Decimal { precision: u8, scale: u8 },
+
+    /// Timestamp with explicit timezone
+    TimestampTz { tz: String },
+
+    /// List/array of a single item type
+    List { item: Box<DataType> },
+
+    /// Struct with named fields
+    Struct { fields: Vec<StructField> },
+}
+
+/// A field within a Struct type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StructField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: DataType,
+    pub nullable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DataTypeRepr {
+    Legacy(String),
+    Modern(DataTypeObject),
+}
+
+#[derive(Debug, Deserialize)]
+struct DataTypeObject {
+    pub kind: String,
+    #[serde(default)]
+    pub precision: Option<u8>,
+    #[serde(default)]
+    pub scale: Option<u8>,
+    #[serde(default)]
+    pub tz: Option<String>,
+    #[serde(default)]
+    pub item: Option<Box<DataType>>,
+    #[serde(default)]
+    pub fields: Option<Vec<StructField>>,
+}
+
+impl Serialize for DataType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            DataType::Null => serializer.serialize_str("null"),
+            DataType::Boolean => serializer.serialize_str("boolean"),
+            DataType::Int64 => serializer.serialize_str("int64"),
+            DataType::Float64 => serializer.serialize_str("float64"),
+            DataType::Date => serializer.serialize_str("date"),
+            DataType::Timestamp => serializer.serialize_str("timestamp"),
+            DataType::Time => serializer.serialize_str("time"),
+            DataType::Duration => serializer.serialize_str("duration"),
+            DataType::String => serializer.serialize_str("string"),
+            DataType::Binary => serializer.serialize_str("binary"),
+            DataType::Decimal { precision, scale } => {
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("kind", "decimal")?;
+                map.serialize_entry("precision", precision)?;
+                map.serialize_entry("scale", scale)?;
+                map.end()
+            }
+            DataType::TimestampTz { tz } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "timestamp_tz")?;
+                map.serialize_entry("tz", tz)?;
+                map.end()
+            }
+            DataType::List { item } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "list")?;
+                map.serialize_entry("item", item)?;
+                map.end()
+            }
+            DataType::Struct { fields } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "struct")?;
+                map.serialize_entry("fields", fields)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DataType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let repr = DataTypeRepr::deserialize(deserializer)?;
+        match repr {
+            DataTypeRepr::Legacy(raw) => DataType::from_str(&raw).map_err(de::Error::custom),
+            DataTypeRepr::Modern(obj) => DataType::from_object(obj).map_err(de::Error::custom),
+        }
+    }
 }
 
 impl DataType {
-    /// Return the Arrow type name for this data type
-    pub fn arrow_type_name(&self) -> &'static str {
+    /// Return the Arrow type name for this data type.
+    pub fn arrow_type_name(&self) -> String {
         match self {
-            DataType::Null => "Null",
-            DataType::Boolean => "Boolean",
-            DataType::Int64 => "Int64",
-            DataType::Float64 => "Float64",
-            DataType::Date => "Date32",
-            DataType::Timestamp => "Timestamp(Microsecond, Some(\"UTC\"))",
-            DataType::Time => "Time64(Microsecond)",
-            DataType::Duration => "Duration(Microsecond)",
-            DataType::String => "Utf8",
-            DataType::Binary => "Binary",
+            DataType::Null => "Null".to_string(),
+            DataType::Boolean => "Boolean".to_string(),
+            DataType::Int64 => "Int64".to_string(),
+            DataType::Float64 => "Float64".to_string(),
+            DataType::Date => "Date32".to_string(),
+            DataType::Timestamp => "Timestamp(Microsecond, None)".to_string(),
+            DataType::TimestampTz { tz } => {
+                format!("Timestamp(Microsecond, Some(\"{}\"))", tz)
+            }
+            DataType::Time => "Time64(Microsecond)".to_string(),
+            DataType::Duration => "Duration(Microsecond)".to_string(),
+            DataType::String => "Utf8".to_string(),
+            DataType::Binary => "Binary".to_string(),
+            DataType::Decimal { precision, scale } => {
+                format!("Decimal128({}, {})", precision, scale)
+            }
+            DataType::List { .. } => "List".to_string(),
+            DataType::Struct { .. } => "Struct".to_string(),
         }
     }
 
-    /// Returns all possible data types
+    /// Returns all primitive data types.
     pub fn all() -> Vec<DataType> {
         vec![
             DataType::Null,
@@ -334,24 +394,34 @@ impl DataType {
         ]
     }
 
-    /// Returns numeric types
+    /// Returns primitive numeric types.
     pub fn numeric() -> Vec<DataType> {
         vec![DataType::Int64, DataType::Float64]
     }
 
-    /// Returns temporal types
+    /// Returns primitive temporal types.
     pub fn temporal() -> Vec<DataType> {
         vec![DataType::Date, DataType::Timestamp, DataType::Time, DataType::Duration]
     }
 
     /// Returns true if this type is numeric
     pub fn is_numeric(&self) -> bool {
-        matches!(self, DataType::Int64 | DataType::Float64)
+        matches!(
+            self,
+            DataType::Int64 | DataType::Float64 | DataType::Decimal { .. }
+        )
     }
 
     /// Returns true if this type is temporal
     pub fn is_temporal(&self) -> bool {
-        matches!(self, DataType::Date | DataType::Timestamp | DataType::Time | DataType::Duration)
+        matches!(
+            self,
+            DataType::Date
+                | DataType::Timestamp
+                | DataType::TimestampTz { .. }
+                | DataType::Time
+                | DataType::Duration
+        )
     }
 
     /// Check if a string value can be parsed as this type
@@ -378,6 +448,10 @@ impl DataType {
                 chrono::DateTime::parse_from_rfc3339(value).is_ok()
                     || chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").is_ok()
             }
+            DataType::TimestampTz { .. } => {
+                // TimestampTz requires an explicit timezone; RFC3339 enforces this.
+                chrono::DateTime::parse_from_rfc3339(value).is_ok()
+            }
             DataType::Time => {
                 chrono::NaiveTime::parse_from_str(value, "%H:%M:%S").is_ok()
                     || chrono::NaiveTime::parse_from_str(value, "%H:%M").is_ok()
@@ -388,6 +462,64 @@ impl DataType {
             }
             DataType::String => true,
             DataType::Binary => true, // Base64 or hex - assume valid
+            DataType::Decimal { precision, scale } => {
+                decimal_precision_scale(value)
+                    .map(|(digits, value_scale)| digits <= *precision as usize && value_scale <= *scale as usize)
+                    .unwrap_or(false)
+            }
+            DataType::List { .. } | DataType::Struct { .. } => false,
+        }
+    }
+
+    fn from_object(obj: DataTypeObject) -> Result<Self, String> {
+        match obj.kind.to_lowercase().as_str() {
+            "null" => Ok(DataType::Null),
+            "boolean" => Ok(DataType::Boolean),
+            "int64" => Ok(DataType::Int64),
+            "float64" => Ok(DataType::Float64),
+            "date" => Ok(DataType::Date),
+            "timestamp" => Ok(DataType::Timestamp),
+            "time" => Ok(DataType::Time),
+            "duration" => Ok(DataType::Duration),
+            "string" => Ok(DataType::String),
+            "binary" => Ok(DataType::Binary),
+            "decimal" => {
+                let precision = obj
+                    .precision
+                    .ok_or_else(|| "decimal.precision is required".to_string())?;
+                let scale = obj.scale.ok_or_else(|| "decimal.scale is required".to_string())?;
+                if precision == 0 || precision > 38 {
+                    return Err("decimal.precision must be between 1 and 38".to_string());
+                }
+                if scale > precision {
+                    return Err("decimal.scale must be <= precision".to_string());
+                }
+                Ok(DataType::Decimal { precision, scale })
+            }
+            "timestamp_tz" => {
+                let tz = obj.tz.ok_or_else(|| "timestamp_tz.tz is required".to_string())?;
+                if tz.is_empty() {
+                    return Err("timestamp_tz.tz must be non-empty".to_string());
+                }
+                if !is_valid_timezone(&tz) {
+                    return Err(format!(
+                        "timestamp_tz.tz '{}' is not a valid IANA timezone",
+                        tz
+                    ));
+                }
+                Ok(DataType::TimestampTz { tz })
+            }
+            "list" => {
+                let item = obj.item.ok_or_else(|| "list.item is required".to_string())?;
+                Ok(DataType::List { item })
+            }
+            "struct" => {
+                let fields = obj
+                    .fields
+                    .ok_or_else(|| "struct.fields is required".to_string())?;
+                Ok(DataType::Struct { fields })
+            }
+            other => Err(format!("Invalid data type kind: '{}'", other)),
         }
     }
 
@@ -407,6 +539,51 @@ impl DataType {
     }
 }
 
+fn decimal_precision_scale(value: &str) -> Option<(usize, usize)> {
+    let mut total_digits = 0usize;
+    let mut scale = 0usize;
+    let mut saw_dot = false;
+    let mut saw_digit = false;
+
+    for (idx, ch) in value.chars().enumerate() {
+        if ch == '+' || ch == '-' {
+            if idx != 0 {
+                return None;
+            }
+            continue;
+        }
+        if ch == '.' {
+            if saw_dot {
+                return None;
+            }
+            saw_dot = true;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            total_digits += 1;
+            if saw_dot {
+                scale += 1;
+            }
+            continue;
+        }
+        return None;
+    }
+
+    if !saw_digit {
+        None
+    } else {
+        Some((total_digits, scale))
+    }
+}
+
+fn is_valid_timezone(tz: &str) -> bool {
+    if tz.eq_ignore_ascii_case("utc") {
+        return true;
+    }
+    tz.parse::<chrono_tz::Tz>().is_ok()
+}
+
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -416,10 +593,26 @@ impl fmt::Display for DataType {
             DataType::Float64 => write!(f, "float64"),
             DataType::Date => write!(f, "date"),
             DataType::Timestamp => write!(f, "timestamp"),
+            DataType::TimestampTz { tz } => write!(f, "timestamp_tz({})", tz),
             DataType::Time => write!(f, "time"),
             DataType::Duration => write!(f, "duration"),
             DataType::String => write!(f, "string"),
             DataType::Binary => write!(f, "binary"),
+            DataType::Decimal { precision, scale } => write!(f, "decimal({},{})", precision, scale),
+            DataType::List { item } => write!(f, "list<{}>", item),
+            DataType::Struct { fields } => {
+                write!(f, "struct{{")?;
+                for (idx, field) in fields.iter().enumerate() {
+                    if idx > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}:{}", field.name, field.data_type)?;
+                    if field.nullable {
+                        write!(f, "?")?;
+                    }
+                }
+                write!(f, "}}")
+            }
         }
     }
 }
@@ -439,7 +632,10 @@ impl FromStr for DataType {
             "duration" | "interval" => Ok(DataType::Duration),
             "string" | "utf8" | "text" => Ok(DataType::String),
             "binary" | "bytes" => Ok(DataType::Binary),
-            _ => Err(format!("Invalid data type: '{}'. Expected: null, boolean, int64, float64, date, timestamp, time, duration, string, binary", s)),
+            _ => Err(format!(
+                "Invalid data type: '{}'. Expected: null, boolean, int64, float64, date, timestamp, time, duration, string, binary. Use object format for decimal, timestamp_tz, list, struct.",
+                s
+            )),
         }
     }
 }
@@ -460,6 +656,77 @@ pub struct SinkConfig {
     pub schema_def: Option<String>, // Renamed from schema_json to avoid conflicts
 }
 
+/// Supported sink URI schemes (job-level).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SinkScheme {
+    Parquet,
+    Csv,
+    Duckdb,
+    File,
+}
+
+impl SinkScheme {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SinkScheme::Parquet => "parquet",
+            SinkScheme::Csv => "csv",
+            SinkScheme::Duckdb => "duckdb",
+            SinkScheme::File => "file",
+        }
+    }
+}
+
+impl FromStr for SinkScheme {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "parquet" => Ok(SinkScheme::Parquet),
+            "csv" => Ok(SinkScheme::Csv),
+            "duckdb" => Ok(SinkScheme::Duckdb),
+            "file" => Ok(SinkScheme::File),
+            other => Err(format!("Unsupported sink scheme: '{}'", other)),
+        }
+    }
+}
+
+/// Parsed sink URI used for local validation and sink creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSinkUri {
+    pub scheme: SinkScheme,
+    pub path: PathBuf,
+    pub query: HashMap<String, String>,
+    pub original: String,
+}
+
+impl ParsedSinkUri {
+    pub fn parse(uri: &str) -> Result<Self, String> {
+        let (scheme_str, rest) = uri
+            .split_once("://")
+            .ok_or_else(|| format!("Sink URI '{}' is missing scheme delimiter", uri))?;
+        let scheme = SinkScheme::from_str(scheme_str)?;
+
+        let (path_part, query_part) = rest.split_once('?').unwrap_or((rest, ""));
+        if path_part.is_empty() {
+            return Err(format!("Sink URI '{}' is missing a path", uri));
+        }
+
+        let mut query = HashMap::new();
+        if !query_part.is_empty() {
+            for (k, v) in form_urlencoded::parse(query_part.as_bytes()) {
+                query.insert(k.into_owned(), v.into_owned());
+            }
+        }
+
+        Ok(Self {
+            scheme,
+            path: PathBuf::from(path_part),
+            query,
+            original: uri.to_string(),
+        })
+    }
+}
+
 // ============================================================================
 // OpCode.DISPATCH (Sentinel -> Worker)
 // ============================================================================
@@ -473,7 +740,7 @@ pub struct DispatchCommand {
     pub plugin_name: String,
     pub file_path: String,
     pub sinks: Vec<SinkConfig>,
-    pub file_version_id: i64, // Required for lineage restoration
+    pub file_id: i64, // Required for lineage restoration
 
     // Bridge Mode fields (now required)
     pub env_hash: String, // SHA256 of lockfile - links to PluginEnvironment
@@ -491,6 +758,7 @@ pub struct DispatchCommand {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JobStatus {
     Success,
+    CompletedWithWarnings,
     Failed,
     Rejected,  // Worker at capacity
     Aborted,   // Cancelled by sentinel
@@ -498,7 +766,7 @@ pub enum JobStatus {
 
 impl JobStatus {
     pub fn is_success(&self) -> bool {
-        matches!(self, JobStatus::Success)
+        matches!(self, JobStatus::Success | JobStatus::CompletedWithWarnings)
     }
 
     pub fn is_failure(&self) -> bool {
@@ -897,15 +1165,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sink_type_from_str() {
-        assert_eq!("parquet".parse::<SinkType>().unwrap(), SinkType::Parquet);
-        assert_eq!("SQLITE".parse::<SinkType>().unwrap(), SinkType::Sqlite);
-        assert_eq!("csv".parse::<SinkType>().unwrap(), SinkType::Csv);
-        assert_eq!("db".parse::<SinkType>().unwrap(), SinkType::Sqlite);
-        assert!("invalid".parse::<SinkType>().is_err());
-    }
-
-    #[test]
     fn test_worker_status_from_str() {
         assert_eq!("IDLE".parse::<WorkerStatus>().unwrap(), WorkerStatus::Idle);
         assert_eq!("busy".parse::<WorkerStatus>().unwrap(), WorkerStatus::Busy);
@@ -1004,6 +1263,10 @@ mod tests {
             "\"SUCCESS\""
         );
         assert_eq!(
+            serde_json::to_string(&JobStatus::CompletedWithWarnings).unwrap(),
+            "\"COMPLETED_WITH_WARNINGS\""
+        );
+        assert_eq!(
             serde_json::to_string(&JobStatus::Failed).unwrap(),
             "\"FAILED\""
         );
@@ -1022,6 +1285,10 @@ mod tests {
             JobStatus::Success
         );
         assert_eq!(
+            serde_json::from_str::<JobStatus>("\"COMPLETED_WITH_WARNINGS\"").unwrap(),
+            JobStatus::CompletedWithWarnings
+        );
+        assert_eq!(
             serde_json::from_str::<JobStatus>("\"FAILED\"").unwrap(),
             JobStatus::Failed
         );
@@ -1031,6 +1298,9 @@ mod tests {
     fn test_job_status_methods() {
         assert!(JobStatus::Success.is_success());
         assert!(!JobStatus::Success.is_failure());
+
+        assert!(JobStatus::CompletedWithWarnings.is_success());
+        assert!(!JobStatus::CompletedWithWarnings.is_failure());
 
         assert!(!JobStatus::Failed.is_success());
         assert!(JobStatus::Failed.is_failure());
@@ -1065,6 +1335,7 @@ mod tests {
     fn test_datatype_is_numeric() {
         assert!(DataType::Int64.is_numeric());
         assert!(DataType::Float64.is_numeric());
+        assert!(DataType::Decimal { precision: 8, scale: 2 }.is_numeric());
         assert!(!DataType::String.is_numeric());
         assert!(!DataType::Date.is_numeric());
         assert!(!DataType::Boolean.is_numeric());
@@ -1074,6 +1345,7 @@ mod tests {
     fn test_datatype_is_temporal() {
         assert!(DataType::Date.is_temporal());
         assert!(DataType::Timestamp.is_temporal());
+        assert!(DataType::TimestampTz { tz: "UTC".to_string() }.is_temporal());
         assert!(DataType::Time.is_temporal());
         assert!(DataType::Duration.is_temporal());
         assert!(!DataType::String.is_temporal());
@@ -1111,6 +1383,20 @@ mod tests {
         assert!(DataType::Timestamp.validate_string("2024-01-15T10:30:00Z"));
         assert!(DataType::Timestamp.validate_string("2024-01-15 10:30:00"));
 
+        // TimestampTz (requires explicit timezone)
+        assert!(DataType::TimestampTz { tz: "UTC".to_string() }
+            .validate_string("2024-01-15T10:30:00Z"));
+        assert!(!DataType::TimestampTz { tz: "UTC".to_string() }
+            .validate_string("2024-01-15 10:30:00"));
+
+        // Decimal
+        assert!(DataType::Decimal { precision: 5, scale: 2 }
+            .validate_string("123.45"));
+        assert!(!DataType::Decimal { precision: 5, scale: 2 }
+            .validate_string("1234.56"));
+        assert!(!DataType::Decimal { precision: 5, scale: 2 }
+            .validate_string("12.345"));
+
         // String always valid
         assert!(DataType::String.validate_string("anything"));
         assert!(DataType::String.validate_string(""));
@@ -1131,7 +1417,7 @@ mod tests {
 
     #[test]
     fn test_datatype_serialization() {
-        // Test that DataType serializes to snake_case
+        // Test that primitive DataType serializes to legacy strings
         assert_eq!(
             serde_json::to_string(&DataType::Int64).unwrap(),
             "\"int64\""
@@ -1154,6 +1440,50 @@ mod tests {
             serde_json::from_str::<DataType>("\"timestamp\"").unwrap(),
             DataType::Timestamp
         );
+
+        // Object format for primitives
+        assert_eq!(
+            serde_json::from_str::<DataType>("{\"kind\":\"string\"}").unwrap(),
+            DataType::String
+        );
+
+        // Extended types
+        assert_eq!(
+            serde_json::to_string(&DataType::Decimal { precision: 18, scale: 8 }).unwrap(),
+            "{\"kind\":\"decimal\",\"precision\":18,\"scale\":8}"
+        );
+        assert_eq!(
+            serde_json::to_string(&DataType::TimestampTz { tz: "UTC".to_string() }).unwrap(),
+            "{\"kind\":\"timestamp_tz\",\"tz\":\"UTC\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&DataType::List { item: Box::new(DataType::String) }).unwrap(),
+            "{\"kind\":\"list\",\"item\":\"string\"}"
+        );
+        assert_eq!(
+            serde_json::to_string(&DataType::Struct {
+                fields: vec![StructField {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }],
+            }).unwrap(),
+            "{\"kind\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"int64\",\"nullable\":false}]}"
+        );
+
+        assert_eq!(
+            serde_json::from_str::<DataType>("{\"kind\":\"decimal\",\"precision\":18,\"scale\":8}").unwrap(),
+            DataType::Decimal { precision: 18, scale: 8 }
+        );
+        assert_eq!(
+            serde_json::from_str::<DataType>("{\"kind\":\"timestamp_tz\",\"tz\":\"UTC\"}").unwrap(),
+            DataType::TimestampTz { tz: "UTC".to_string() }
+        );
+
+        assert!(serde_json::from_str::<DataType>(
+            "{\"kind\":\"timestamp_tz\",\"tz\":\"Not/AZone\"}"
+        )
+        .is_err());
     }
 
     #[test]
@@ -1163,7 +1493,7 @@ mod tests {
         assert!(all.contains(&DataType::String));
         assert!(all.contains(&DataType::Date));
         assert!(all.contains(&DataType::Binary));
-        assert_eq!(all.len(), 10); // All 10 variants
+        assert_eq!(all.len(), 10); // All 10 primitive variants
     }
 
     #[test]

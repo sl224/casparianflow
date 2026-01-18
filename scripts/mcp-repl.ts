@@ -228,7 +228,7 @@ const commands: Record<string, (client: McpClient, args: string[]) => Promise<vo
   fix                 - Get fix suggestions for failures
 
 \x1b[33mExecution Phase:\x1b[0m
-  execute [format]    - Execute pipeline (parquet|csv|sqlite)
+  execute [format]    - Execute pipeline (parquet|csv|duckdb)
   query <file>        - Query output file
 
 \x1b[33mUtility:\x1b[0m
@@ -413,7 +413,7 @@ const commands: Record<string, (client: McpClient, args: string[]) => Promise<vo
       topic_name: topicName,
       options: {
         file_format: 'csv',
-        sink_type: 'sqlite',        // default per user request
+        sink_type: 'duckdb',        // default per user request
         include_error_handling: true,
         include_validation: true,
       },

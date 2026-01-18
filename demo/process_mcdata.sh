@@ -62,7 +62,7 @@ echo
 # Step 5: Summary
 echo "Step 5: Summary"
 echo "=============================================="
-sqlite3 "$OUTPUT_DB" << 'EOF'
+duckdb "$OUTPUT_DB" << 'EOF'
 SELECT 'Total records: ' || COUNT(*) FROM mcdata;
 SELECT 'Event types: ' || COUNT(DISTINCT event_name) FROM mcdata;
 SELECT 'Subsystems: ' || COUNT(DISTINCT subsystem) FROM mcdata WHERE subsystem IS NOT NULL;
@@ -76,6 +76,6 @@ echo "=============================================="
 echo "Output database: $OUTPUT_DB"
 echo
 echo "Query examples:"
-echo "  sqlite3 $OUTPUT_DB \"SELECT * FROM mcdata LIMIT 10\""
-echo "  sqlite3 $OUTPUT_DB \"SELECT event_name, COUNT(*) FROM mcdata GROUP BY 1\""
+echo "  duckdb $OUTPUT_DB \"SELECT * FROM mcdata LIMIT 10\""
+echo "  duckdb $OUTPUT_DB \"SELECT event_name, COUNT(*) FROM mcdata GROUP BY 1\""
 echo "=============================================="

@@ -26,7 +26,7 @@ export CASPARIAN_DB_PATH="$DB_FILE"
 
 # Create a minimal SQLite database with the required schema
 echo "Setting up test database..."
-sqlite3 "$DB_FILE" <<'EOF'
+duckdb "$DB_FILE" <<'EOF'
 -- Parser Lab parsers table
 CREATE TABLE IF NOT EXISTS parser_lab_parsers (
     id TEXT PRIMARY KEY,
@@ -265,7 +265,7 @@ echo
 echo "Test 11: Add tagged files and backtest"
 # Insert test files into scout_files with the parser's topic
 NOW=$(date +%s)000
-sqlite3 "$DB_FILE" <<EOF
+duckdb "$DB_FILE" <<EOF
 INSERT INTO scout_files (source_id, path, rel_path, size, mtime, status, tag, first_seen_at, last_seen_at)
 VALUES ('test-source', '$TEST_DIR/data/sample.csv', 'sample.csv', 100, $NOW, 'tagged', 'test_topic', $NOW, $NOW);
 EOF

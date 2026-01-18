@@ -23,11 +23,12 @@ echo
 
 # Create test database with sample data
 echo "Setting up test database..."
-sqlite3 "$CASPARIAN_DB" <<EOF
+duckdb "$CASPARIAN_DB" <<EOF
 -- Create processing queue table
 CREATE TABLE cf_processing_queue (
     id INTEGER PRIMARY KEY,
-    file_version_id INTEGER NOT NULL,
+    file_id INTEGER NOT NULL,
+    pipeline_run_id TEXT,
     plugin_name TEXT NOT NULL,
     config_overrides TEXT,
     status TEXT NOT NULL DEFAULT 'QUEUED',
@@ -42,57 +43,25 @@ CREATE TABLE cf_processing_queue (
 );
 
 -- Create supporting tables
-CREATE TABLE cf_source_root (
+CREATE TABLE scout_files (
     id INTEGER PRIMARY KEY,
-    path TEXT NOT NULL,
-    type TEXT DEFAULT 'local',
-    active INTEGER DEFAULT 1
-);
-
-CREATE TABLE cf_file_location (
-    id INTEGER PRIMARY KEY,
-    source_root_id INTEGER NOT NULL,
-    rel_path TEXT NOT NULL,
-    filename TEXT NOT NULL,
-    last_known_mtime REAL,
-    last_known_size INTEGER,
-    current_version_id INTEGER,
-    discovered_time TEXT DEFAULT CURRENT_TIMESTAMP,
-    last_seen_time TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE cf_file_version (
-    id INTEGER PRIMARY KEY,
-    location_id INTEGER NOT NULL,
-    content_hash TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
-    modified_time TEXT NOT NULL,
-    detected_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    applied_tags TEXT DEFAULT ''
+    path TEXT NOT NULL
 );
 
 -- Insert test data
-INSERT INTO cf_source_root (id, path, type, active) VALUES (1, '/data/sales', 'local', 1);
-INSERT INTO cf_source_root (id, path, type, active) VALUES (2, '/data/invoices', 'local', 1);
-
-INSERT INTO cf_file_location (id, source_root_id, rel_path, filename) VALUES (1, 1, '2024_12.csv', '2024_12.csv');
-INSERT INTO cf_file_location (id, source_root_id, rel_path, filename) VALUES (2, 1, '2024_11.csv', '2024_11.csv');
-INSERT INTO cf_file_location (id, source_root_id, rel_path, filename) VALUES (3, 2, 'inv_003.json', 'inv_003.json');
-INSERT INTO cf_file_location (id, source_root_id, rel_path, filename) VALUES (4, 1, '2024_10.csv', '2024_10.csv');
-
-INSERT INTO cf_file_version (id, location_id, content_hash, size_bytes, modified_time) VALUES (1, 1, 'abc123', 1000, '2024-12-16T10:00:00Z');
-INSERT INTO cf_file_version (id, location_id, content_hash, size_bytes, modified_time) VALUES (2, 2, 'def456', 1500, '2024-12-15T10:00:00Z');
-INSERT INTO cf_file_version (id, location_id, content_hash, size_bytes, modified_time) VALUES (3, 3, 'ghi789', 800, '2024-12-14T10:00:00Z');
-INSERT INTO cf_file_version (id, location_id, content_hash, size_bytes, modified_time) VALUES (4, 4, 'jkl012', 1200, '2024-12-13T10:00:00Z');
+INSERT INTO scout_files (id, path) VALUES (1, '/data/sales/2024_12.csv');
+INSERT INTO scout_files (id, path) VALUES (2, '/data/sales/2024_11.csv');
+INSERT INTO scout_files (id, path) VALUES (3, '/data/invoices/inv_003.json');
+INSERT INTO scout_files (id, path) VALUES (4, '/data/sales/2024_10.csv');
 
 -- Insert jobs with various statuses
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority, claim_time, end_time, result_summary)
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
     VALUES (1, 1, 'sales', 'RUNNING', 0, '2024-12-16T10:30:05Z', NULL, NULL);
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority, claim_time, end_time, result_summary)
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
     VALUES (2, 2, 'sales', 'COMPLETED', 0, '2024-12-16T10:30:02Z', '2024-12-16T10:30:05Z', 'Processed 100 rows');
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority, claim_time, end_time, error_message)
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, error_message)
     VALUES (3, 3, 'invoice', 'FAILED', 0, '2024-12-16T10:29:58Z', '2024-12-16T10:29:59Z', 'Missing field customer_id');
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, priority)
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
     VALUES (4, 4, 'sales', 'QUEUED', 0);
 EOF
 
@@ -237,7 +206,7 @@ else
     exit 1
 fi
 # Verify status changed in DB
-STATUS=$(sqlite3 "$CASPARIAN_DB" "SELECT status FROM cf_processing_queue WHERE id = 3")
+STATUS=$(duckdb "$CASPARIAN_DB" "SELECT status FROM cf_processing_queue WHERE id = 3")
 if [ "$STATUS" = "QUEUED" ]; then
     echo "PASS: Database updated correctly"
 else
@@ -247,7 +216,7 @@ fi
 echo
 
 # Reset job 3 to FAILED for next tests
-sqlite3 "$CASPARIAN_DB" "UPDATE cf_processing_queue SET status = 'FAILED', error_message = 'Test error' WHERE id = 3"
+duckdb "$CASPARIAN_DB" "UPDATE cf_processing_queue SET status = 'FAILED', error_message = 'Test error' WHERE id = 3"
 
 # Test 12: Job retry on non-failed job
 echo "Test 12: Job retry on non-failed job"
@@ -263,7 +232,7 @@ echo
 # Test 13: Job retry-all command
 echo "Test 13: Job retry-all command"
 # First, add another failed job
-sqlite3 "$CASPARIAN_DB" "INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, error_message) VALUES (5, 4, 'sales', 'FAILED', 'Another error')"
+duckdb "$CASPARIAN_DB" "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, error_message) VALUES (5, 4, 'sales', 'FAILED', 'Another error')"
 OUTPUT=$($BINARY job retry-all 2>&1)
 if echo "$OUTPUT" | grep -q "job(s) reset to QUEUED\|No failed jobs"; then
     echo "PASS: Retry-all executed"
@@ -274,7 +243,7 @@ fi
 echo
 
 # Reset jobs for cancel test
-sqlite3 "$CASPARIAN_DB" "UPDATE cf_processing_queue SET status = 'RUNNING' WHERE id = 1"
+duckdb "$CASPARIAN_DB" "UPDATE cf_processing_queue SET status = 'RUNNING' WHERE id = 1"
 
 # Test 14: Job cancel command
 echo "Test 14: Job cancel command"
@@ -285,7 +254,7 @@ else
     echo "FAIL: Expected cancellation confirmation"
     exit 1
 fi
-STATUS=$(sqlite3 "$CASPARIAN_DB" "SELECT status FROM cf_processing_queue WHERE id = 1")
+STATUS=$(duckdb "$CASPARIAN_DB" "SELECT status FROM cf_processing_queue WHERE id = 1")
 if [ "$STATUS" = "FAILED" ]; then
     echo "PASS: Job status updated to FAILED"
 else

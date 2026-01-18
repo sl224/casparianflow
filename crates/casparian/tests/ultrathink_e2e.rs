@@ -464,10 +464,11 @@ def process(input_path: str) -> pd.DataFrame:
 
             CREATE TABLE IF NOT EXISTS cf_processing_queue (
                 id INTEGER PRIMARY KEY,
+                pipeline_run_id TEXT,
                 plugin_name TEXT NOT NULL,
                 input_file TEXT,
                 status TEXT DEFAULT 'PENDING',
-                file_version_id INTEGER,
+                file_id INTEGER,
                 claim_time TEXT,
                 end_time TEXT,
                 result_summary TEXT,

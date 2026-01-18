@@ -366,7 +366,7 @@ async function testParserGeneration(client: McpClient) {
           { name: 'price', data_type: 'float64' },
         ],
       },
-      options: { sink_type: 'sqlite' },
+      options: { sink_type: 'duckdb' },
     }) as any;
 
     const code = result.parser_code;
@@ -374,7 +374,7 @@ async function testParserGeneration(client: McpClient) {
 
     // Bridge Protocol requirements
     assertIncludes(code, 'TOPIC = "sales"', 'Missing TOPIC constant');
-    assertIncludes(code, 'SINK = "sqlite"', 'Missing SINK constant');
+    assertIncludes(code, 'SINK = "duckdb"', 'Missing SINK constant');
     assertIncludes(code, 'def parse(file_path: str)', 'Missing parse() function');
     assertIncludes(code, 'import polars', 'Missing polars import');
   });
@@ -617,7 +617,7 @@ async function testFullPipeline(client: McpClient) {
           nullable: c.nullable ?? true,
         })),
       },
-      options: { sink_type: 'sqlite' },
+      options: { sink_type: 'duckdb' },
     }) as any;
 
     assert(generated.parser_code, 'No parser code generated');

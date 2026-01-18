@@ -5,6 +5,7 @@
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_number_signed, print_table_colored};
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::ProcessingStatus;
 use comfy_table::Color;
 use serde::Serialize;
@@ -91,26 +92,21 @@ pub fn run(args: JobsArgs) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async {
-        run_async(args, &db_path).await
-    })
+    rt.block_on(async { run_async(args, &db_path).await })
 }
 
 async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
-    let db_url = format!("sqlite:{}", db_path.display());
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect(&db_url)
-        .await
-        .map_err(|e| {
-            HelpfulError::new("Failed to connect to database")
-                .with_context(format!("Database: {}", db_path.display()))
-                .with_suggestion(format!("Error: {}", e))
-                .with_suggestion("TRY: Check file permissions")
-                .with_suggestion("TRY: Ensure database is not locked by another process")
-        })?;
+    let db_url = db_url_for_path(db_path);
+    let conn = DbConnection::open_from_url(&db_url).await.map_err(|e| {
+        HelpfulError::new("Failed to connect to database")
+            .with_context(format!("Database: {}", db_path.display()))
+            .with_suggestion(format!("Error: {}", e))
+            .with_suggestion("TRY: Check file permissions")
+            .with_suggestion("TRY: Ensure database is not locked by another process")
+    })?;
 
     // Get queue statistics
-    let stats = get_queue_stats(&pool).await?;
+    let stats = get_queue_stats(&conn).await?;
 
     // Print status header
     print_queue_status(&stats);
@@ -118,7 +114,7 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
 
     // Handle dead letter mode separately
     if args.dead_letter {
-        let dead_letter_jobs = get_dead_letter_jobs(&pool, &args.topic, args.limit).await?;
+        let dead_letter_jobs = get_dead_letter_jobs(&conn, &args.topic, args.limit).await?;
         print_dead_letter_table(&dead_letter_jobs, args.limit);
         return Ok(());
     }
@@ -127,7 +123,7 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
     let status_filter = build_status_filter(&args);
 
     // Get jobs
-    let jobs = get_jobs(&pool, &args.topic, &status_filter, args.limit).await?;
+    let jobs = get_jobs(&conn, &args.topic, &status_filter, args.limit).await?;
 
     // Output
     print_jobs_table(&jobs, args.limit);
@@ -137,7 +133,7 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
 
 /// Get the database path
 pub fn get_db_path() -> anyhow::Result<PathBuf> {
-    Ok(config::default_db_path())
+    Ok(config::active_db_path())
 }
 
 /// Build status filter from command flags
@@ -167,138 +163,123 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
 }
 
 /// Get queue statistics
-async fn get_queue_stats(pool: &sqlx::SqlitePool) -> anyhow::Result<QueueStats> {
-    // Check if table exists first
-    let table_exists: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_processing_queue'"
-    )
-    .fetch_optional(pool)
-    .await?;
+fn db_url_for_path(db_path: &PathBuf) -> String {
+    match config::default_db_backend() {
+        config::DbBackend::DuckDb => format!("duckdb:{}", db_path.display()),
+        config::DbBackend::Sqlite => format!("sqlite:{}", db_path.display()),
+    }
+}
 
-    if table_exists.is_none() {
+async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
+    let (query, param) = match conn.backend_name() {
+        "DuckDB" => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
+        "SQLite" => ("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", DbValue::from(table)),
+        _ => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
+    };
+
+    Ok(conn.query_optional(query, &[param]).await?.is_some())
+}
+
+async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
+    if !table_exists(conn, "cf_processing_queue").await? {
         return Ok(QueueStats::default());
     }
 
-    let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let row = conn
+        .query_one(
         r#"
         SELECT
             COUNT(*) as total,
-            SUM(CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END) as queued,
-            SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) as running,
-            SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed,
-            SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed
+            COALESCE(SUM(CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END), 0) as queued,
+            COALESCE(SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END), 0) as running,
+            COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) as completed,
+            COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) as failed
         FROM cf_processing_queue
         "#,
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0, 0, 0, 0, 0));
+        &[],
+        )
+        .await?;
 
-    // Get dead letter count
-    let dead_letter_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM cf_dead_letter"
-    )
-    .fetch_optional(pool)
-    .await?
-    .unwrap_or(0);
+    let total: i64 = row.get(0)?;
+    let queued: i64 = row.get(1)?;
+    let running: i64 = row.get(2)?;
+    let completed: i64 = row.get(3)?;
+    let failed: i64 = row.get(4)?;
+
+    let dead_letter_count = if table_exists(conn, "cf_dead_letter").await? {
+        conn.query_scalar::<i64>("SELECT COUNT(*) FROM cf_dead_letter", &[])
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     Ok(QueueStats {
-        total: row.0,
-        queued: row.1,
-        running: row.2,
-        completed: row.3,
-        failed: row.4,
+        total,
+        queued,
+        running,
+        completed,
+        failed,
         dead_letter: dead_letter_count,
     })
 }
 
 /// Get dead letter jobs
 async fn get_dead_letter_jobs(
-    pool: &sqlx::SqlitePool,
+    conn: &DbConnection,
     topic: &Option<String>,
     limit: usize,
 ) -> anyhow::Result<Vec<DeadLetterJobDisplay>> {
-    // Check if table exists
-    let table_exists: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_dead_letter'"
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if table_exists.is_none() {
+    if !table_exists(conn, "cf_dead_letter").await? {
         return Ok(Vec::new());
     }
 
-    let jobs: Vec<DeadLetterJobDisplay> = if let Some(plugin_name) = topic {
-        let rows: Vec<(i64, i64, String, Option<String>, i32, String, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT id, original_job_id, plugin_name, error_message, retry_count, moved_at, reason
-            FROM cf_dead_letter
-            WHERE plugin_name = ?
-            ORDER BY moved_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(plugin_name)
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| DeadLetterJobDisplay {
-                id: row.0,
-                original_job_id: row.1,
-                plugin_name: row.2,
-                error_message: row.3,
-                retry_count: row.4,
-                moved_at: row.5,
-                reason: row.6,
-            })
-            .collect()
+    let mut params: Vec<DbValue> = Vec::new();
+    let query = if let Some(plugin_name) = topic {
+        params.push(DbValue::from(plugin_name.as_str()));
+        params.push(DbValue::from(limit as i64));
+        r#"
+        SELECT id, original_job_id, plugin_name, error_message, retry_count, moved_at, reason
+        FROM cf_dead_letter
+        WHERE plugin_name = ?
+        ORDER BY moved_at DESC
+        LIMIT ?
+        "#
     } else {
-        let rows: Vec<(i64, i64, String, Option<String>, i32, String, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT id, original_job_id, plugin_name, error_message, retry_count, moved_at, reason
-            FROM cf_dead_letter
-            ORDER BY moved_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| DeadLetterJobDisplay {
-                id: row.0,
-                original_job_id: row.1,
-                plugin_name: row.2,
-                error_message: row.3,
-                retry_count: row.4,
-                moved_at: row.5,
-                reason: row.6,
-            })
-            .collect()
+        params.push(DbValue::from(limit as i64));
+        r#"
+        SELECT id, original_job_id, plugin_name, error_message, retry_count, moved_at, reason
+        FROM cf_dead_letter
+        ORDER BY moved_at DESC
+        LIMIT ?
+        "#
     };
+
+    let rows = conn.query_all(query, &params).await?;
+    let jobs = rows
+        .into_iter()
+        .map(|row| DeadLetterJobDisplay {
+            id: row.get(0).unwrap_or_default(),
+            original_job_id: row.get(1).unwrap_or_default(),
+            plugin_name: row.get(2).unwrap_or_default(),
+            error_message: row.get(3).ok(),
+            retry_count: row.get(4).unwrap_or_default(),
+            moved_at: row.get(5).unwrap_or_default(),
+            reason: row.get(6).ok(),
+        })
+        .collect();
 
     Ok(jobs)
 }
 
 /// Get jobs matching filter criteria
 async fn get_jobs(
-    pool: &sqlx::SqlitePool,
+    conn: &DbConnection,
     topic: &Option<String>,
     statuses: &[&str],
     limit: usize,
 ) -> anyhow::Result<Vec<Job>> {
-    // Check if table exists
-    let table_exists: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_processing_queue'"
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if table_exists.is_none() {
+    if !table_exists(conn, "cf_processing_queue").await? {
         return Ok(Vec::new());
     }
 
@@ -310,7 +291,7 @@ async fn get_jobs(
             r#"
             SELECT
                 q.id,
-                COALESCE(sr.path || '/' || fl.rel_path, 'unknown') as file_path,
+                COALESCE(sf.path, 'unknown') as file_path,
                 q.plugin_name,
                 q.status,
                 q.priority,
@@ -320,9 +301,7 @@ async fn get_jobs(
                 q.result_summary,
                 q.retry_count
             FROM cf_processing_queue q
-            LEFT JOIN cf_file_version fv ON fv.id = q.file_version_id
-            LEFT JOIN cf_file_location fl ON fl.id = fv.location_id
-            LEFT JOIN cf_source_root sr ON sr.id = fl.source_root_id
+            LEFT JOIN scout_files sf ON sf.id = q.file_id
             WHERE q.status IN ({})
               AND q.plugin_name = ?
             ORDER BY q.id DESC
@@ -335,7 +314,7 @@ async fn get_jobs(
             r#"
             SELECT
                 q.id,
-                COALESCE(sr.path || '/' || fl.rel_path, 'unknown') as file_path,
+                COALESCE(sf.path, 'unknown') as file_path,
                 q.plugin_name,
                 q.status,
                 q.priority,
@@ -345,9 +324,7 @@ async fn get_jobs(
                 q.result_summary,
                 q.retry_count
             FROM cf_processing_queue q
-            LEFT JOIN cf_file_version fv ON fv.id = q.file_version_id
-            LEFT JOIN cf_file_location fl ON fl.id = fv.location_id
-            LEFT JOIN cf_source_root sr ON sr.id = fl.source_root_id
+            LEFT JOIN scout_files sf ON sf.id = q.file_id
             WHERE q.status IN ({})
             ORDER BY q.id DESC
             LIMIT ?
@@ -357,33 +334,30 @@ async fn get_jobs(
     };
 
     // Build and execute query
-    let mut query = sqlx::query_as::<_, (i64, String, String, String, i32, Option<String>, Option<String>, Option<String>, Option<String>, i32)>(&base_query);
-
+    let mut params: Vec<DbValue> = Vec::new();
     for status in statuses {
-        query = query.bind(*status);
+        params.push(DbValue::from(*status));
     }
-
     if let Some(t) = topic {
-        query = query.bind(t);
+        params.push(DbValue::from(t.as_str()));
     }
+    params.push(DbValue::from(limit as i64));
 
-    query = query.bind(limit as i64);
-
-    let rows = query.fetch_all(pool).await?;
+    let rows = conn.query_all(&base_query, &params).await?;
 
     let jobs: Vec<Job> = rows
         .into_iter()
         .map(|row| Job {
-            id: row.0,
-            file_path: row.1,
-            plugin_name: row.2,
-            status: row.3.parse().unwrap_or_default(),
-            priority: row.4,
-            claim_time: row.5,
-            end_time: row.6,
-            error_message: row.7,
-            result_summary: row.8,
-            retry_count: row.9,
+            id: row.get(0).unwrap_or_default(),
+            file_path: row.get(1).unwrap_or_default(),
+            plugin_name: row.get(2).unwrap_or_default(),
+            status: row.get::<String>(3).unwrap_or_default().parse().unwrap_or_default(),
+            priority: row.get(4).unwrap_or_default(),
+            claim_time: row.get(5).ok(),
+            end_time: row.get(6).ok(),
+            error_message: row.get(7).ok(),
+            result_summary: row.get(8).ok(),
+            retry_count: row.get(9).unwrap_or_default(),
         })
         .collect();
 

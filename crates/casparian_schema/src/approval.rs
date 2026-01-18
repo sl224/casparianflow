@@ -264,9 +264,9 @@ impl ApprovedColumn {
     pub fn to_locked_column(&self) -> LockedColumn {
         let name = self.rename_to.clone().unwrap_or_else(|| self.name.clone());
         let mut col = if self.nullable {
-            LockedColumn::optional(&name, self.data_type)
+            LockedColumn::optional(&name, self.data_type.clone())
         } else {
-            LockedColumn::required(&name, self.data_type)
+            LockedColumn::required(&name, self.data_type.clone())
         };
 
         if let Some(ref fmt) = self.format {

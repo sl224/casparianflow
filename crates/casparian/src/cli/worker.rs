@@ -3,9 +3,11 @@
 //! Commands for listing, showing, draining, and removing workers.
 //! Workers are tracked in cf_worker_node table and managed via Sentinel.
 
+use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::jobs::get_db_path;
 use crate::cli::output::print_table_colored;
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::WorkerStatus;
 use clap::Subcommand;
 use comfy_table::Color;
@@ -114,8 +116,8 @@ pub fn run(action: WorkerAction) -> anyhow::Result<()> {
 
 /// List all workers
 async fn run_list(db_path: &PathBuf, json: bool) -> anyhow::Result<()> {
-    let pool = connect_db(db_path).await?;
-    let workers = get_all_workers(&pool).await?;
+    let conn = connect_db(db_path).await?;
+    let workers = get_all_workers(&conn).await?;
 
     if json {
         let output = serde_json::to_string_pretty(&workers)?;
@@ -129,8 +131,8 @@ async fn run_list(db_path: &PathBuf, json: bool) -> anyhow::Result<()> {
 
 /// Show worker details
 async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()> {
-    let pool = connect_db(db_path).await?;
-    let worker = get_worker_by_id(&pool, id).await?;
+    let conn = connect_db(db_path).await?;
+    let worker = get_worker_by_id(&conn, id).await?;
 
     let Some(worker) = worker else {
         return Err(HelpfulError::new(format!("Worker '{}' not found", id))
@@ -150,10 +152,10 @@ async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()>
 
 /// Drain a worker (stop accepting new jobs)
 async fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
-    let pool = connect_db(db_path).await?;
+    let conn = connect_db(db_path).await?;
 
     // Check worker exists
-    let worker = get_worker_by_id(&pool, id).await?;
+    let worker = get_worker_by_id(&conn, id).await?;
     let Some(worker) = worker else {
         return Err(HelpfulError::new(format!("Worker '{}' not found", id))
             .with_suggestion("TRY: casparian worker-cli list   # List all workers")
@@ -168,15 +170,19 @@ async fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
     if worker.status == WorkerStatus::Offline {
         return Err(HelpfulError::new(format!("Worker '{}' is offline", id))
             .with_context("Cannot drain an offline worker")
-            .with_suggestion("TRY: casparian worker-cli remove {}   # Remove the worker", )
+            .with_suggestion(format!(
+                "TRY: casparian worker-cli remove {}   # Remove the worker",
+                id
+            ))
             .into());
     }
 
     // Update worker status to draining
-    sqlx::query("UPDATE cf_worker_node SET status = 'draining' WHERE hostname = ?")
-        .bind(&worker.hostname)
-        .execute(&pool)
-        .await?;
+    conn.execute(
+        "UPDATE cf_worker_node SET status = 'draining' WHERE hostname = ?",
+        &[DbValue::from(worker.hostname.as_str())],
+    )
+    .await?;
 
     println!("Worker '{}' set to DRAINING", id);
     println!();
@@ -194,10 +200,10 @@ async fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
 /// Remove a worker
 async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<()> {
-    let pool = connect_db(db_path).await?;
+    let conn = connect_db(db_path).await?;
 
     // Check worker exists
-    let worker = get_worker_by_id(&pool, id).await?;
+    let worker = get_worker_by_id(&conn, id).await?;
     let Some(worker) = worker else {
         return Err(HelpfulError::new(format!("Worker '{}' not found", id))
             .with_suggestion("TRY: casparian worker-cli list   # List all workers")
@@ -212,15 +218,21 @@ async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<
             worker.current_job_id.unwrap()
         ))
         .with_context("Cannot remove a worker with an active job")
-        .with_suggestion("TRY: casparian worker-cli drain {}   # Drain the worker first", )
-        .with_suggestion("TRY: casparian worker-cli remove {} --force   # Force removal", )
+        .with_suggestion(format!(
+            "TRY: casparian worker-cli drain {}   # Drain the worker first",
+            id
+        ))
+        .with_suggestion(format!(
+            "TRY: casparian worker-cli remove {} --force   # Force removal",
+            id
+        ))
         .into());
     }
 
     // If forcing and has active job, requeue it
     if worker.current_job_id.is_some() && force {
         let job_id = worker.current_job_id.unwrap();
-        sqlx::query(
+        conn.execute(
             r#"
             UPDATE cf_processing_queue
             SET status = 'QUEUED',
@@ -229,19 +241,19 @@ async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<
                 worker_pid = NULL
             WHERE id = ?
             "#,
+            &[DbValue::from(job_id)],
         )
-        .bind(job_id)
-        .execute(&pool)
         .await?;
 
         println!("Requeued job #{}", job_id);
     }
 
     // Remove worker
-    sqlx::query("DELETE FROM cf_worker_node WHERE hostname = ?")
-        .bind(&worker.hostname)
-        .execute(&pool)
-        .await?;
+    conn.execute(
+        "DELETE FROM cf_worker_node WHERE hostname = ?",
+        &[DbValue::from(worker.hostname.as_str())],
+    )
+    .await?;
 
     println!("Worker '{}' removed", id);
 
@@ -250,14 +262,14 @@ async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<
 
 /// Show worker status summary
 async fn run_status(db_path: &PathBuf) -> anyhow::Result<()> {
-    let pool = connect_db(db_path).await?;
+    let conn = connect_db(db_path).await?;
 
     // Get worker stats
-    let workers = get_all_workers(&pool).await?;
+    let workers = get_all_workers(&conn).await?;
     let stats = calculate_stats(&workers);
 
     // Get queue stats
-    let queue_stats = get_queue_stats(&pool).await?;
+    let queue_stats = get_queue_stats(&conn).await?;
 
     println!("WORKER STATUS");
     println!();
@@ -298,42 +310,31 @@ async fn run_status(db_path: &PathBuf) -> anyhow::Result<()> {
 }
 
 /// Connect to the database
-async fn connect_db(db_path: &PathBuf) -> anyhow::Result<sqlx::SqlitePool> {
-    let db_url = format!("sqlite:{}", db_path.display());
-    sqlx::sqlite::SqlitePoolOptions::new()
-        .connect(&db_url)
-        .await
-        .map_err(|e| {
-            HelpfulError::new("Failed to connect to database")
-                .with_context(format!("Database: {}", db_path.display()))
-                .with_suggestion(format!("Error: {}", e))
-        })
-        .map_err(Into::into)
+fn db_url_for_path(db_path: &PathBuf) -> String {
+    match config::default_db_backend() {
+        config::DbBackend::DuckDb => format!("duckdb:{}", db_path.display()),
+        config::DbBackend::Sqlite => format!("sqlite:{}", db_path.display()),
+    }
+}
+
+async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
+    let db_url = db_url_for_path(db_path);
+    DbConnection::open_from_url(&db_url).await.map_err(|e| {
+        HelpfulError::new("Failed to connect to database")
+            .with_context(format!("Database: {}", db_path.display()))
+            .with_suggestion(format!("Error: {}", e))
+            .into()
+    })
 }
 
 /// Get all workers from the database
-async fn get_all_workers(pool: &sqlx::SqlitePool) -> anyhow::Result<Vec<Worker>> {
-    // Check if table exists
-    let table_exists: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_worker_node'",
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if table_exists.is_none() {
+async fn get_all_workers(conn: &DbConnection) -> anyhow::Result<Vec<Worker>> {
+    if !table_exists(conn, "cf_worker_node").await? {
         return Ok(Vec::new());
     }
 
-    let rows: Vec<(
-        String,
-        i32,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-        String,
-        Option<i32>,
-    )> = sqlx::query_as(
+    let rows = conn
+        .query_all(
         r#"
         SELECT
             hostname,
@@ -347,21 +348,21 @@ async fn get_all_workers(pool: &sqlx::SqlitePool) -> anyhow::Result<Vec<Worker>>
         FROM cf_worker_node
         ORDER BY last_heartbeat DESC
         "#,
-    )
-    .fetch_all(pool)
-    .await?;
+        &[],
+        )
+        .await?;
 
     let workers: Vec<Worker> = rows
         .into_iter()
         .map(|row| Worker {
-            hostname: row.0,
-            pid: row.1,
-            ip_address: row.2,
-            env_signature: row.3,
-            started_at: row.4,
-            last_heartbeat: row.5,
-            status: parse_worker_status(&row.6),
-            current_job_id: row.7,
+            hostname: row.get(0).unwrap_or_default(),
+            pid: row.get(1).unwrap_or_default(),
+            ip_address: row.get(2).ok(),
+            env_signature: row.get(3).ok(),
+            started_at: row.get(4).unwrap_or_default(),
+            last_heartbeat: row.get(5).unwrap_or_default(),
+            status: parse_worker_status(&row.get::<String>(6).unwrap_or_default()),
+            current_job_id: row.get(7).ok(),
         })
         .collect();
 
@@ -369,28 +370,13 @@ async fn get_all_workers(pool: &sqlx::SqlitePool) -> anyhow::Result<Vec<Worker>>
 }
 
 /// Get a worker by hostname or worker_id
-async fn get_worker_by_id(pool: &sqlx::SqlitePool, id: &str) -> anyhow::Result<Option<Worker>> {
-    // Check if table exists
-    let table_exists: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_worker_node'",
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if table_exists.is_none() {
+async fn get_worker_by_id(conn: &DbConnection, id: &str) -> anyhow::Result<Option<Worker>> {
+    if !table_exists(conn, "cf_worker_node").await? {
         return Ok(None);
     }
 
-    let row: Option<(
-        String,
-        i32,
-        Option<String>,
-        Option<String>,
-        String,
-        String,
-        String,
-        Option<i32>,
-    )> = sqlx::query_as(
+    let row = conn
+        .query_optional(
         r#"
         SELECT
             hostname,
@@ -405,52 +391,58 @@ async fn get_worker_by_id(pool: &sqlx::SqlitePool, id: &str) -> anyhow::Result<O
         WHERE hostname = ? OR hostname LIKE ?
         LIMIT 1
         "#,
-    )
-    .bind(id)
-    .bind(format!("%{}%", id))
-    .fetch_optional(pool)
-    .await?;
+        &[DbValue::from(id), DbValue::from(format!("%{}%", id))],
+        )
+        .await?;
 
     Ok(row.map(|r| Worker {
-        hostname: r.0,
-        pid: r.1,
-        ip_address: r.2,
-        env_signature: r.3,
-        started_at: r.4,
-        last_heartbeat: r.5,
-        status: parse_worker_status(&r.6),
-        current_job_id: r.7,
+        hostname: r.get(0).unwrap_or_default(),
+        pid: r.get(1).unwrap_or_default(),
+        ip_address: r.get(2).ok(),
+        env_signature: r.get(3).ok(),
+        started_at: r.get(4).unwrap_or_default(),
+        last_heartbeat: r.get(5).unwrap_or_default(),
+        status: parse_worker_status(&r.get::<String>(6).unwrap_or_default()),
+        current_job_id: r.get(7).ok(),
     }))
 }
 
 /// Get queue statistics
-async fn get_queue_stats(pool: &sqlx::SqlitePool) -> anyhow::Result<(i64, i64, i64, i64)> {
-    // Check if table exists
-    let table_exists: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_processing_queue'",
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    if table_exists.is_none() {
+async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, i64)> {
+    if !table_exists(conn, "cf_processing_queue").await? {
         return Ok((0, 0, 0, 0));
     }
 
-    let row: (i64, i64, i64, i64) = sqlx::query_as(
+    let row = conn
+        .query_one(
         r#"
         SELECT
-            SUM(CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) as running,
-            SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed,
-            SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed
+            COALESCE(SUM(CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END), 0) as pending,
+            COALESCE(SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END), 0) as running,
+            COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) as completed,
+            COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) as failed
         FROM cf_processing_queue
         "#,
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0, 0, 0, 0));
+        &[],
+        )
+        .await?;
 
-    Ok(row)
+    Ok((
+        row.get(0).unwrap_or_default(),
+        row.get(1).unwrap_or_default(),
+        row.get(2).unwrap_or_default(),
+        row.get(3).unwrap_or_default(),
+    ))
+}
+
+async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
+    let (query, param) = match conn.backend_name() {
+        "DuckDB" => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
+        "SQLite" => ("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", DbValue::from(table)),
+        _ => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
+    };
+
+    Ok(conn.query_optional(query, &[param]).await?.is_some())
 }
 
 /// Calculate worker statistics

@@ -15,6 +15,7 @@
 //!   casparian backfill my_parser --limit 10   # Limit to 10 files
 
 use anyhow::{Context, Result};
+use casparian_db::{DbConnection, DbValue};
 
 /// Arguments for the backfill command
 #[derive(Debug, Clone)]
@@ -69,29 +70,35 @@ pub struct BackfillResult {
 
 /// Run the backfill command
 pub async fn run(args: BackfillArgs) -> Result<()> {
-    use super::config::default_db_path;
+    use super::config::active_db_path;
 
-    let db_path = default_db_path();
-    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let db_path = active_db_path();
+    let db_url = format!("duckdb:{}", db_path.display());
 
-    let pool = sqlx::SqlitePool::connect(&db_url)
+    let conn = DbConnection::open_from_url(&db_url)
         .await
         .with_context(|| format!("Failed to connect to database: {}", db_path.display()))?;
 
     // 1. Get the latest version of the parser
-    let parser_info: Option<(String, String, String)> = sqlx::query_as(
-        r#"
-        SELECT parser_id, name, version
-        FROM cf_parsers
-        WHERE name = ?
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(&args.parser_name)
-    .fetch_optional(&pool)
-    .await
-    .context("Failed to query cf_parsers")?;
+    let parser_row = conn
+        .query_optional(
+            r#"
+            SELECT parser_id, name, version
+            FROM cf_parsers
+            WHERE name = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            &[DbValue::from(args.parser_name.as_str())],
+        )
+        .await
+        .context("Failed to query cf_parsers")?;
+    let parser_info = parser_row.map(|row| {
+        let parser_id: String = row.get_by_name("parser_id")?;
+        let name: String = row.get_by_name("name")?;
+        let version: String = row.get_by_name("version")?;
+        Ok::<_, anyhow::Error>((parser_id, name, version))
+    }).transpose()?;
 
     let (parser_id, parser_name, parser_version) = match parser_info {
         Some(info) => info,
@@ -115,15 +122,17 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     };
 
     // 2. Get topics this parser subscribes to
-    let topics: Vec<(String,)> = sqlx::query_as(
-        "SELECT topic FROM cf_parser_topics WHERE parser_name = ?",
-    )
-    .bind(&parser_name)
-    .fetch_all(&pool)
-    .await
-    .context("Failed to query cf_parser_topics")?;
-
-    let topics: Vec<String> = topics.into_iter().map(|(t,)| t).collect();
+    let topic_rows = conn
+        .query_all(
+            "SELECT topic FROM cf_parser_topics WHERE parser_name = ?",
+            &[DbValue::from(parser_name.as_str())],
+        )
+        .await
+        .context("Failed to query cf_parser_topics")?;
+    let topics: Vec<String> = topic_rows
+        .into_iter()
+        .filter_map(|row| row.get_by_name("topic").ok())
+        .collect();
 
     if topics.is_empty() {
         if args.json {
@@ -180,28 +189,34 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let force_flag = if args.force { 1i32 } else { 0i32 };
 
     // Build query with bindings
-    let mut query_builder = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, Option<String>)>(&query);
-    query_builder = query_builder.bind(&parser_id);
+    let mut params = Vec::with_capacity(2 + topics.len());
+    params.push(DbValue::from(parser_id.as_str()));
     for topic in &topics {
-        query_builder = query_builder.bind(topic);
+        params.push(DbValue::from(topic.as_str()));
     }
-    query_builder = query_builder.bind(force_flag);
-    query_builder = query_builder.bind(limit);
+    params.push(DbValue::from(force_flag));
+    params.push(DbValue::from(limit));
 
-    let files_result = query_builder.fetch_all(&pool).await;
+    let files_result = conn.query_all(&query, &params).await;
 
     // Handle case where scout_files table doesn't exist
     let files: Vec<BackfillFile> = match files_result {
         Ok(rows) => rows
             .into_iter()
-            .map(|(path, source_hash, tag, _last_job, last_version)| BackfillFile {
-                path,
-                file_hash: source_hash.unwrap_or_default(),
-                last_version,
-                target_version: parser_version.clone(),
-                tag: tag.unwrap_or_default(),
+            .map(|row| {
+                let path: String = row.get_by_name("path")?;
+                let source_hash: Option<String> = row.get_by_name("source_hash").ok();
+                let tag: Option<String> = row.get_by_name("tag").ok();
+                let last_version: Option<String> = row.get_by_name("last_version").ok();
+                Ok(BackfillFile {
+                    path,
+                    file_hash: source_hash.unwrap_or_default(),
+                    last_version,
+                    target_version: parser_version.clone(),
+                    tag: tag.unwrap_or_default(),
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
         Err(e) => {
             // Table might not exist - check if it's a "no such table" error
             let err_str = e.to_string();
@@ -227,13 +242,13 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     };
 
     // 4. Count files already processed with current version
-    let current_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM cf_processing_history WHERE parser_id = ?",
-    )
-    .bind(&parser_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap_or((0,));
+    let current_count: i64 = conn
+        .query_scalar(
+            "SELECT COUNT(*) AS cnt FROM cf_processing_history WHERE parser_id = ?",
+            &[DbValue::from(parser_id.as_str())],
+        )
+        .await
+        .unwrap_or(0);
 
     // 5. Build result
     let mut result = BackfillResult {
@@ -241,7 +256,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         parser_version: parser_version.clone(),
         topics: topics.clone(),
         files_to_process: files.clone(),
-        files_current: current_count.0 as usize,
+        files_current: current_count as usize,
         files_processed: 0,
         files_failed: 0,
         preview_only: !args.execute,
@@ -250,13 +265,13 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     // 6. Execute backfill if requested
     if args.execute && !files.is_empty() {
         // Get parser source code to re-run
-        let parser_row: Option<(String,)> = sqlx::query_as(
-            "SELECT source_hash FROM cf_parsers WHERE parser_id = ?",
-        )
-        .bind(&parser_id)
-        .fetch_optional(&pool)
-        .await
-        .context("Failed to get parser source")?;
+        let parser_row = conn
+            .query_optional(
+                "SELECT source_hash FROM cf_parsers WHERE parser_id = ?",
+                &[DbValue::from(parser_id.as_str())],
+            )
+            .await
+            .context("Failed to get parser source")?;
 
         if parser_row.is_none() {
             anyhow::bail!("Parser '{}' not found in database", parser_name);

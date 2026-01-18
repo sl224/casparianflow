@@ -621,7 +621,7 @@ When Engineer/Reviewer find divergence during normal rounds:
 ### Codebase Analysis
 
 **DIVERGENCE FOUND:**
-- Gap assumes: Schema has `file_version_id` field
+- Gap assumes: Schema has `file_id` field
 - Code reality: Field doesn't exist (schema.sql:62)
 - Impact: Proposed solution won't work
 - Recommendation: Add DIVERGE-XXX to status.md, resolve before this gap
@@ -881,7 +881,7 @@ During multi-spec refinement sessions, track potential compression targets:
 ### Candidate: Dialog Layout Pattern
 **Instances:**
 - specs/views/sources.md:89 - Add source dialog
-- specs/views/extraction_rules.md:102 - Create rule dialog
+- archive/specs/views/extraction_rules.md:102 - Create rule dialog
 - specs/views/jobs.md:76 - Retry confirmation dialog
 
 **Similarity:** All use same 3-row layout (header, content, buttons)

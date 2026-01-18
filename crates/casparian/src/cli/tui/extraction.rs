@@ -736,7 +736,7 @@ impl PublishState {
 // - RuleCreation (rule editing)
 // - Pathfinder/Labeling/SemanticPath
 //
-// See: specs/views/discover.md v3.0, specs/meta/sessions/ai_consolidation/design.md
+// See: specs/views/discover.md v3.0, archive/specs/meta/sessions/ai_consolidation/design.md
 
 /// Filter for displaying test results in Rule Builder
 /// Cycles with a/p/f keys
@@ -1038,7 +1038,7 @@ fn format_with_commas(n: usize) -> String {
 // =============================================================================
 // Full state for the unified Rule Builder interface.
 // Layout: Left panel (40%) = rule config, Right panel (60%) = file results
-// See: specs/meta/sessions/ai_consolidation/design.md Section 2
+// See: archive/specs/meta/sessions/ai_consolidation/design.md Section 2
 
 /// Focus within Rule Builder left panel
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1057,11 +1057,21 @@ pub enum RuleBuilderFocus {
     ExtractionEdit(usize),
     /// Options section
     Options,
+    /// Suggestions section (schema hints)
+    Suggestions,
     /// Right panel: file list (default - allows shortcuts like 's' for scan to work)
     #[default]
     FileList,
     /// Ignore picker dialog
     IgnorePicker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestionSection {
+    Patterns,
+    Structures,
+    Filenames,
+    Synonyms,
 }
 
 /// Extraction field for Rule Builder (simplified from FieldDraft)
@@ -1149,6 +1159,30 @@ pub struct NamingScheme {
     pub example: String,
     /// Detected fields in the scheme
     pub fields: Vec<String>,
+}
+
+/// A grouped set of structural variants representing the same intent.
+#[derive(Debug, Clone)]
+pub struct VariantGroup {
+    /// Display label for the group
+    pub label: String,
+    /// Variants in this group
+    pub variants: Vec<VariantVariant>,
+}
+
+/// A single structural variant within a group.
+#[derive(Debug, Clone)]
+pub struct VariantVariant {
+    /// Normalized template (e.g., "mission_<n>/<date>/...")
+    pub template: String,
+    /// Number of files matching this variant
+    pub file_count: usize,
+    /// Sample path (full path)
+    pub sample_path: String,
+    /// File extension (lowercase, without dot)
+    pub extension: Option<String>,
+    /// Filename template class (extension excluded)
+    pub filename_template: String,
 }
 
 /// Confidence level for synonym suggestions
@@ -1255,6 +1289,24 @@ pub struct RuleBuilderState {
     pub eval_state: EvalState,
     /// Total match count
     pub match_count: usize,
+    /// Selected suggestions subsection
+    pub suggestions_section: SuggestionSection,
+    /// Whether suggestions help modal is open
+    pub suggestions_help_open: bool,
+    /// Whether suggestions detail modal is open
+    pub suggestions_detail_open: bool,
+    /// Variant groups for structural suggestions
+    pub variant_groups: Vec<VariantGroup>,
+    /// Selected preview files (by relative path)
+    pub selected_preview_files: HashSet<String>,
+    /// Manual tag confirmation state (tag all preview)
+    pub manual_tag_confirm_open: bool,
+    /// Cached preview count for manual tag confirmation
+    pub manual_tag_confirm_count: usize,
+    /// Confirm exit when unsaved changes exist
+    pub confirm_exit_open: bool,
+    /// Track unsaved edits in the builder
+    pub dirty: bool,
 
     // --- Selection & Navigation ---
     /// Selected index in right panel (folder or file depending on phase)
@@ -1322,6 +1374,15 @@ impl Default for RuleBuilderState {
             selected_synonym: 0,
             eval_state: EvalState::Idle,
             match_count: 0,
+            suggestions_section: SuggestionSection::Patterns,
+            suggestions_help_open: false,
+            suggestions_detail_open: false,
+            variant_groups: Vec::new(),
+            selected_preview_files: HashSet::new(),
+            manual_tag_confirm_open: false,
+            manual_tag_confirm_count: 0,
+            confirm_exit_open: false,
+            dirty: false,
 
             // Selection & Navigation
             selected_file: 0,
@@ -1555,6 +1616,7 @@ impl GlobParseError {
 ///
 /// # Examples
 /// ```
+/// use casparian::tui_extraction::parse_custom_glob;
 /// let result = parse_custom_glob("**/mission_<id>/<date>/*.csv").unwrap();
 /// assert_eq!(result.glob_pattern, "**/mission_*/*/*.csv");
 /// assert_eq!(result.placeholders.len(), 2);
@@ -1978,6 +2040,353 @@ pub fn normalize_path(path: &str) -> String {
         .join("/")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplateToken {
+    Literal(String),
+    Variable,
+}
+
+#[derive(Debug, Clone)]
+struct TemplateSignature {
+    depth: usize,
+    literal_segments: usize,
+    variable_mask: Vec<bool>,
+    literal_tokens_by_index: Vec<String>,
+    literal_token_set: std::collections::HashSet<String>,
+    filename_template: String,
+    extension: Option<String>,
+}
+
+fn template_token_kind(token: &str) -> TemplateToken {
+    if token.starts_with('<') && token.ends_with('>') {
+        return TemplateToken::Variable;
+    }
+    match normalize_token(token) {
+        NormalizedToken::Date | NormalizedToken::Uuid | NormalizedToken::Integer => TemplateToken::Variable,
+        NormalizedToken::Literal(lit) => TemplateToken::Literal(lit),
+    }
+}
+
+fn filename_template_class(filename: &str) -> (String, Option<String>) {
+    let (name, ext) = if let Some(dot_pos) = filename.rfind('.') {
+        (&filename[..dot_pos], Some(filename[dot_pos + 1..].to_lowercase()))
+    } else {
+        (filename, None)
+    };
+
+    let tokens = tokenize_segment(name);
+    let normalized: Vec<_> = tokens.iter().map(|t| normalize_token(t)).collect();
+    let mut template_parts: Vec<String> = Vec::new();
+    for norm in normalized {
+        match norm {
+            NormalizedToken::Date => template_parts.push("<date>".to_string()),
+            NormalizedToken::Uuid => template_parts.push("<uuid>".to_string()),
+            NormalizedToken::Integer => template_parts.push("<n>".to_string()),
+            NormalizedToken::Literal(s) => template_parts.push(s),
+        }
+    }
+    (template_parts.join("_"), ext)
+}
+
+fn build_signature(arch: &PathArchetype) -> TemplateSignature {
+    let template = arch.template.trim_end_matches("/...");
+    let segments: Vec<&str> = template.split('/').filter(|s| !s.is_empty()).collect();
+    let mut literal_segments = 0;
+    let mut variable_mask = Vec::new();
+    let mut literal_tokens_by_index = Vec::new();
+    let mut literal_token_set = std::collections::HashSet::new();
+
+    for segment in &segments {
+        let mut has_literal = false;
+        for token in tokenize_segment(segment) {
+            match template_token_kind(&token) {
+                TemplateToken::Literal(lit) => {
+                    has_literal = true;
+                    literal_tokens_by_index.push(lit.clone());
+                    literal_token_set.insert(lit);
+                    variable_mask.push(false);
+                }
+                TemplateToken::Variable => {
+                    variable_mask.push(true);
+                }
+            }
+        }
+        if has_literal {
+            literal_segments += 1;
+        }
+    }
+
+    let sample_path = arch.sample_paths.first().cloned().unwrap_or_default();
+    let filename = sample_path.rsplit('/').next().unwrap_or("");
+    let (filename_template, extension) = filename_template_class(filename);
+
+    TemplateSignature {
+        depth: segments.len(),
+        literal_segments,
+        variable_mask,
+        literal_tokens_by_index,
+        literal_token_set,
+        filename_template,
+        extension,
+    }
+}
+
+fn jaccard_index(a: &std::collections::HashSet<String>, b: &std::collections::HashSet<String>) -> f32 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let intersection = a.intersection(b).count() as f32;
+    let union = a.union(b).count() as f32;
+    if union == 0.0 { 0.0 } else { intersection / union }
+}
+
+fn fuzzy_literal_match(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let a_lower = a.to_lowercase();
+    let b_lower = b.to_lowercase();
+    if a_lower.chars().next() != b_lower.chars().next() {
+        return false;
+    }
+    let (short, long) = if a_lower.len() <= b_lower.len() {
+        (a_lower.as_str(), b_lower.as_str())
+    } else {
+        (b_lower.as_str(), a_lower.as_str())
+    };
+
+    if short.len() <= 3 {
+        let mut iter = long.chars();
+        let mut ok = true;
+        for ch in short.chars() {
+            if iter.find(|c| *c == ch).is_none() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+
+    if a_lower.len() > 6 || b_lower.len() > 6 {
+        return false;
+    }
+    let distance = edit_distance(&a_lower, &b_lower);
+    if short.len() <= 3 {
+        return distance <= 3;
+    }
+    distance <= 2
+}
+
+fn similarity_score(a: &TemplateSignature, b: &TemplateSignature, count_a: usize, count_b: usize) -> f32 {
+    let mut score = 1.0_f32;
+    let mut hard_mismatch = false;
+
+    if a.extension != b.extension {
+        score -= 0.2;
+    }
+
+    if a.variable_mask != b.variable_mask {
+        score -= 0.2;
+    } else {
+        score += 0.2;
+    }
+
+    if a.filename_template == b.filename_template {
+        score += 0.2;
+    }
+
+    let mut fuzzy_mismatch = false;
+    for (lit_a, lit_b) in a.literal_tokens_by_index.iter().zip(b.literal_tokens_by_index.iter()) {
+        if lit_a == lit_b {
+            continue;
+        }
+        if fuzzy_literal_match(lit_a, lit_b) {
+            fuzzy_mismatch = true;
+        } else {
+            hard_mismatch = true;
+            break;
+        }
+    }
+    if hard_mismatch {
+        score -= 0.6;
+    } else if fuzzy_mismatch {
+        score -= 0.1;
+    }
+
+    let ratio = if count_a == 0 || count_b == 0 {
+        10.0
+    } else {
+        let max = count_a.max(count_b) as f32;
+        let min = count_a.min(count_b) as f32;
+        max / min
+    };
+    if ratio >= 0.5 && ratio <= 2.0 {
+        score += 0.1;
+    }
+
+    let j = jaccard_index(&a.literal_token_set, &b.literal_token_set);
+    if j >= 0.6 {
+        score += 0.2;
+    } else if j >= 0.4 {
+        score += 0.1;
+    } else if j < 0.2 {
+        score -= 0.2;
+    }
+
+    if hard_mismatch {
+        score = score.min(0.6);
+    }
+
+    score
+}
+
+fn label_from_template(template: &str) -> String {
+    let generic = ["data", "files", "file", "archive", "logs", "log", "dataset", "sets", "set"];
+    for segment in template.split('/') {
+        for token in tokenize_segment(segment) {
+            if token.starts_with('<') && token.ends_with('>') {
+                continue;
+            }
+            let lower = token.to_lowercase();
+            if generic.contains(&lower.as_str()) {
+                continue;
+            }
+            let mut chars = lower.chars();
+            let label = match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => continue,
+            };
+            if label.to_lowercase().contains("data") || label.to_lowercase().contains("log") {
+                return label;
+            }
+            return format!("{} Data", label);
+        }
+    }
+    "Variant Group".to_string()
+}
+
+pub fn group_variant_archetypes(archetypes: &[PathArchetype]) -> Vec<VariantGroup> {
+    let mut signatures = Vec::new();
+    for arch in archetypes {
+        let signature = build_signature(arch);
+        signatures.push(signature);
+    }
+
+    let mut pair_scores: std::collections::HashMap<(usize, usize), f32> = std::collections::HashMap::new();
+    for i in 0..archetypes.len() {
+        for j in (i + 1)..archetypes.len() {
+            let a = &signatures[i];
+            let b = &signatures[j];
+
+            if a.depth != b.depth {
+                continue;
+            }
+            if a.filename_template != b.filename_template {
+                continue;
+            }
+            if a.literal_segments != b.literal_segments {
+                continue;
+            }
+
+            let score = similarity_score(a, b, archetypes[i].file_count, archetypes[j].file_count);
+            if score >= 0.7 {
+                pair_scores.insert((i, j), score);
+                pair_scores.insert((j, i), score);
+            }
+        }
+    }
+
+    let mut parent: Vec<usize> = (0..archetypes.len()).collect();
+    let find = |x: usize, parent: &mut Vec<usize>| -> usize {
+        let mut node = x;
+        while parent[node] != node {
+            node = parent[node];
+        }
+        let root = node;
+        let mut node = x;
+        while parent[node] != node {
+            let next = parent[node];
+            parent[node] = root;
+            node = next;
+        }
+        root
+    };
+    let union = |a: usize, b: usize, parent: &mut Vec<usize>| {
+        let ra = find(a, parent);
+        let rb = find(b, parent);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    };
+
+    for (&(i, j), _) in pair_scores.iter() {
+        union(i, j, &mut parent);
+    }
+
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for i in 0..archetypes.len() {
+        let root = find(i, &mut parent);
+        groups.entry(root).or_default().push(i);
+    }
+
+    let mut result = Vec::new();
+    for indices in groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+
+        let mut filtered = Vec::new();
+        for &idx in indices {
+            let mut total = 0.0_f32;
+            let mut count = 0;
+            for &other in indices {
+                if idx == other {
+                    continue;
+                }
+                if let Some(score) = pair_scores.get(&(idx, other)) {
+                    total += *score;
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let avg = total / count as f32;
+            if avg >= 0.7 {
+                filtered.push(idx);
+            }
+        }
+
+        if filtered.len() < 2 {
+            continue;
+        }
+
+        let mut variants: Vec<VariantVariant> = filtered
+            .iter()
+            .map(|&idx| {
+                let arch = &archetypes[idx];
+                let signature = &signatures[idx];
+                VariantVariant {
+                    template: arch.template.clone(),
+                    file_count: arch.file_count,
+                    sample_path: arch.sample_paths.first().cloned().unwrap_or_default(),
+                    extension: signature.extension.clone(),
+                    filename_template: signature.filename_template.clone(),
+                }
+            })
+            .collect();
+
+        variants.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+        let label = label_from_template(&variants[0].template);
+        result.push(VariantGroup { label, variants });
+    }
+
+    result.sort_by(|a, b| b.variants[0].file_count.cmp(&a.variants[0].file_count));
+    result
+}
+
 /// Extract path archetypes from a list of file paths.
 ///
 /// Groups paths by their normalized template and returns the top N archetypes.
@@ -2327,6 +2736,7 @@ pub fn analyze_paths_for_schema_ui(
     state.path_archetypes = extract_path_archetypes(paths, top_n);
     state.naming_schemes = extract_naming_schemes(paths, top_n);
     state.synonym_suggestions = detect_synonyms(paths, 30); // min 30 paths for synonym detection
+    state.variant_groups = group_variant_archetypes(&state.path_archetypes);
 }
 
 #[cfg(test)]
@@ -2363,6 +2773,61 @@ mod tests {
         let result = parse_custom_glob(r"**/\<notfield\>/*.csv").unwrap();
         assert_eq!(result.glob_pattern, "**/<notfield>/*.csv");
         assert!(result.placeholders.is_empty());
+    }
+
+    #[test]
+    fn test_variant_grouping_mission_msn() {
+        let paths = vec![
+            "/data/mission_001/2024/report.csv".to_string(),
+            "/data/mission_002/2024/report.csv".to_string(),
+            "/data/mission_003/2024/report.csv".to_string(),
+            "/data/msn_010/2024/report.csv".to_string(),
+            "/data/msn_011/2024/report.csv".to_string(),
+        ];
+
+        let archetypes = extract_path_archetypes(&paths, 10);
+        let groups = group_variant_archetypes(&archetypes);
+
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert!(group.label.to_lowercase().contains("mission"));
+        let templates: Vec<_> = group.variants.iter().map(|v| v.template.as_str()).collect();
+        assert!(templates.iter().any(|t| t.contains("mission")));
+        assert!(templates.iter().any(|t| t.contains("msn")));
+    }
+
+    #[test]
+    fn test_variant_grouping_allows_extension_mismatch() {
+        let paths = vec![
+            "/data/mission_001/2024/report.csv".to_string(),
+            "/data/mission_002/2024/report.csv".to_string(),
+            "/data/msn_010/2024/report.xlsx".to_string(),
+            "/data/msn_011/2024/report.xlsx".to_string(),
+        ];
+
+        let archetypes = extract_path_archetypes(&paths, 10);
+        let groups = group_variant_archetypes(&archetypes);
+
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        let extensions: Vec<_> = group.variants.iter().map(|v| v.extension.clone().unwrap_or_default()).collect();
+        assert!(extensions.contains(&"csv".to_string()));
+        assert!(extensions.contains(&"xlsx".to_string()));
+    }
+
+    #[test]
+    fn test_variant_grouping_rejects_literal_mismatch() {
+        let paths = vec![
+            "/data/mission_001/2024/report.csv".to_string(),
+            "/data/mission_002/2024/report.csv".to_string(),
+            "/data/finance_010/2024/report.csv".to_string(),
+            "/data/finance_011/2024/report.csv".to_string(),
+        ];
+
+        let archetypes = extract_path_archetypes(&paths, 10);
+        let groups = group_variant_archetypes(&archetypes);
+
+        assert!(groups.is_empty());
     }
 
     #[test]

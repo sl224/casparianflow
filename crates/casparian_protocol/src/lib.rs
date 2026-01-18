@@ -22,7 +22,7 @@ pub mod types;
 // Re-export types for convenience
 pub use types::{
     // Canonical enums (use these everywhere)
-    DataType, ProcessingStatus, SinkMode, SinkType, WorkerStatus,
+    DataType, ProcessingStatus, SinkMode, WorkerStatus,
     // Protocol types
     DeployCommand, DeployResponse, DispatchCommand, ErrorPayload, EnvReadyPayload,
     HeartbeatPayload, HeartbeatStatus, IdentifyPayload, JobReceipt, JobStatus,

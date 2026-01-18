@@ -11,7 +11,7 @@
 //!
 //! # With specific sink
 //! casparian run parser.py input.csv --sink parquet://./output/
-//! casparian run parser.py input.csv --sink sqlite:///data.db
+//! casparian run parser.py input.csv --sink duckdb:///data.db
 //!
 //! # Dry run
 //! casparian run parser.py input.csv --whatif
@@ -22,6 +22,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use crate::runner::{DevRunner, LogDestination, ParserRef, Runner};
+use casparian_sinks::{plan_outputs, write_output_plan, OutputDescriptor};
 
 /// Arguments for the `run` command
 #[derive(Debug, Args)]
@@ -96,14 +97,25 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
 
     // Print output info
     for info in &result.output_info {
-        println!("  Output '{}' -> {}", info.name, info.sink);
+        println!("  Output '{}'", info.name);
     }
 
-    // TODO: Write to sink based on args.sink
-    // For now, just print info about what would be written
     if !result.batches.is_empty() {
-        println!("\nNote: Sink writing not yet implemented in dev mode.");
-        println!("      Use `casparian process-job` for production execution.");
+        let descriptors: Vec<OutputDescriptor> = result
+            .output_info
+            .iter()
+            .map(|info| OutputDescriptor {
+                name: info.name.clone(),
+                table: info.table.clone(),
+            })
+            .collect();
+
+        let outputs = plan_outputs(&descriptors, &result.batches, "output")?;
+        let artifacts = write_output_plan(&args.sink, &outputs, "dev")?;
+
+        for artifact in artifacts {
+            println!("  Wrote {}", artifact.uri);
+        }
     }
 
     if !result.logs.is_empty() {

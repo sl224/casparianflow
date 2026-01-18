@@ -215,7 +215,7 @@ fn scan(source_id: String, status: String, config: HashMap<String, String>)
 | Compile-time checks | Query validation at compile time | Runtime errors |
 | Connection pooling | Built-in | Manual |
 
-All database operations go through the single database at `~/.casparian_flow/casparian_flow.sqlite3`.
+All database operations go through the single database at `~/.casparian_flow/casparian_flow.duckdb`.
 
 ### No Dead Code
 

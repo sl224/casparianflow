@@ -178,7 +178,7 @@ casparian export <exporter> --help
 
 | Flag | Description | Example |
 |------|-------------|---------|
-| `--input` | Input parquet/sqlite files (glob) | `./output/*.parquet` |
+| `--input` | Input parquet/duckdb files (glob) | `./output/*.parquet` |
 | `--output` | Output file or directory | `./export/` |
 | `--dry-run` | Validate without writing | |
 | `--force` | Overwrite existing output | |

@@ -278,7 +278,7 @@ impl Tool for ExecutePipelineTool {
                         },
                         "output_format": {
                             "type": "string",
-                            "enum": ["parquet", "csv", "sqlite", "duckdb"],
+                            "enum": ["parquet", "csv", "duckdb"],
                             "default": "parquet"
                         },
                         "output_dir": {
@@ -551,7 +551,7 @@ impl Tool for QueryOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Query processed output data. Execute SQL queries against processed parquet/csv/sqlite files."
+        "Query processed output data. Execute SQL queries against processed parquet/csv/duckdb files."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -621,12 +621,6 @@ impl Tool for QueryOutputTool {
                 // Would use polars to read parquet
                 return Err(ToolError::ExecutionFailed(
                     "Parquet query not yet implemented (requires polars)".into(),
-                ));
-            }
-            "db" | "sqlite" | "sqlite3" => {
-                // Would use rusqlite
-                return Err(ToolError::ExecutionFailed(
-                    "SQLite query not yet implemented".into(),
                 ));
             }
             "duckdb" => {

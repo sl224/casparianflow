@@ -1,17 +1,13 @@
-//! Job Queue implementation
+//! Job Queue implementation (dbx-compatible).
 //!
-//! Provides atomic job claiming via SQL UPDATE ... WHERE.
-//! Ported from Python queue.py with improved type safety.
+//! Uses DbConnection for all queries to keep DB backend swappable.
 
-use anyhow::Result;
-use casparian_db::{DbConfig, DbPool, create_pool};
-use chrono::Utc;
-use tracing::{info, warn};
+use anyhow::{Context, Result};
+use casparian_db::{DbConnection, DbValue};
 
 use super::models::{DeadLetterJob, ParserHealth, ProcessingJob, QuarantinedRow};
 
 /// Maximum number of retries before a job is marked as permanently failed
-/// This prevents infinite retry loops for jobs that consistently fail
 pub const MAX_RETRY_COUNT: i32 = 5;
 
 /// Job details needed for processing
@@ -32,911 +28,564 @@ pub struct PluginDetails {
 
 /// Job queue for managing processing jobs.
 pub struct JobQueue {
-    pool: DbPool,
+    conn: DbConnection,
+}
+
+fn now_ts() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
 }
 
 impl JobQueue {
-    /// Create a JobQueue from an existing pool.
-    pub fn new(pool: DbPool) -> Self {
-        Self { pool }
+    /// Create a JobQueue from an existing connection.
+    pub fn new(conn: DbConnection) -> Self {
+        Self { conn }
     }
 
-    /// Open a JobQueue from a database path (convenience constructor for CLI).
-    pub async fn open(db_path: &std::path::Path) -> Result<Self> {
-        let config = DbConfig::sqlite(&db_path.display().to_string());
-        let pool = create_pool(config).await?;
-        Ok(Self { pool })
+    /// Open a JobQueue from a database URL.
+    pub async fn open(db_url: &str) -> Result<Self> {
+        let conn = DbConnection::open_from_url(db_url).await?;
+        Ok(Self { conn })
     }
 
-    /// Get job details for processing
+    /// Get job details for processing.
     ///
-    /// Tries production path (JOIN through file_version_id) first,
+    /// Tries production path (JOIN through file_id) first,
     /// then falls back to input_file column for CLI/test jobs.
     pub async fn get_job_details(&self, job_id: i64) -> Result<Option<JobDetails>> {
-        // Try production path first
-        let result: Option<(String, String)> = sqlx::query_as(
-            r#"
-            SELECT
-                pq.plugin_name,
-                sr.path || '/' || fl.rel_path as full_path
-            FROM cf_processing_queue pq
-            JOIN cf_file_version fv ON pq.file_version_id = fv.id
-            JOIN cf_file_location fl ON fv.location_id = fl.id
-            JOIN cf_source_root sr ON fl.source_root_id = sr.id
-            WHERE pq.id = ?
-            "#,
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT
+                    pq.plugin_name,
+                    sf.path as full_path
+                FROM cf_processing_queue pq
+                JOIN scout_files sf ON pq.file_id = sf.id
+                WHERE pq.id = ?
+                "#,
+                &[DbValue::from(job_id)],
+            )
+            .await?;
 
-        if let Some((plugin_name, file_path)) = result {
+        if let Some(row) = row {
             return Ok(Some(JobDetails {
                 job_id,
-                plugin_name,
-                file_path,
+                plugin_name: row.get_by_name("plugin_name")?,
+                file_path: row.get_by_name("full_path")?,
                 input_file: None,
             }));
         }
 
-        // Fallback: use input_file directly (for test jobs or CLI-created jobs)
-        let result: Option<(String, String)> = sqlx::query_as(
-            r#"
-            SELECT plugin_name, input_file
-            FROM cf_processing_queue
-            WHERE id = ? AND input_file IS NOT NULL
-            "#,
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT plugin_name, input_file
+                FROM cf_processing_queue
+                WHERE id = ? AND input_file IS NOT NULL
+                "#,
+                &[DbValue::from(job_id)],
+            )
+            .await?;
 
-        Ok(result.map(|(plugin_name, input_file)| JobDetails {
-            job_id,
-            plugin_name,
-            file_path: input_file.clone(),
-            input_file: Some(input_file),
+        Ok(row.map(|row| {
+            let plugin_name: String = row.get_by_name("plugin_name").unwrap_or_default();
+            let input_file: String = row.get_by_name("input_file").unwrap_or_default();
+            JobDetails {
+                job_id,
+                plugin_name,
+                file_path: input_file.clone(),
+                input_file: Some(input_file),
+            }
         }))
     }
 
-    /// Claim a job by setting status to RUNNING
+    /// Claim a job by setting status to RUNNING.
     pub async fn claim_job(&self, job_id: i64) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE cf_processing_queue SET status = 'RUNNING', claim_time = ? WHERE id = ?",
-        )
-        .bind(&now)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
+        let now = now_ts();
+        self.conn
+            .execute(
+                "UPDATE cf_processing_queue SET status = 'RUNNING', claim_time = ? WHERE id = ?",
+                &[DbValue::from(now), DbValue::from(job_id)],
+            )
+            .await?;
         Ok(())
     }
 
-    /// Get plugin source code and env_hash from manifest
+    /// Get plugin source code and env_hash from manifest.
     pub async fn get_plugin_details(&self, plugin_name: &str) -> Result<Option<PluginDetails>> {
-        let result: Option<(String, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT source_code, env_hash
-            FROM cf_plugin_manifest
-            WHERE plugin_name = ? AND status IN ('ACTIVE', 'DEPLOYED')
-            ORDER BY deployed_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(plugin_name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT source_code, env_hash
+                FROM cf_plugin_manifest
+                WHERE plugin_name = ? AND status IN ('ACTIVE', 'DEPLOYED')
+                ORDER BY deployed_at DESC
+                LIMIT 1
+                "#,
+                &[DbValue::from(plugin_name)],
+            )
+            .await?;
 
-        Ok(result.map(|(source_code, env_hash)| PluginDetails {
-            source_code,
-            env_hash,
+        Ok(row.map(|row| PluginDetails {
+            source_code: row.get_by_name("source_code").unwrap_or_default(),
+            env_hash: row.get_by_name("env_hash").ok(),
         }))
     }
 
-    /// Get lockfile content from plugin environment
+    /// Get lockfile content from plugin environment.
     pub async fn get_lockfile(&self, env_hash: &str) -> Result<Option<String>> {
-        let result: Option<(String,)> = sqlx::query_as(
-            "SELECT lockfile_content FROM cf_plugin_environment WHERE hash = ?",
-        )
-        .bind(env_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(result.map(|(s,)| s))
+        let row = self
+            .conn
+            .query_optional(
+                "SELECT lockfile_content FROM cf_plugin_environment WHERE hash = ?",
+                &[DbValue::from(env_hash)],
+            )
+            .await?;
+        Ok(row.map(|row| row.get_by_name("lockfile_content").unwrap_or_default()))
     }
 
     /// Peek at the next job without claiming it.
-    /// Used to check if a capable worker exists before popping.
     pub async fn peek_job(&self) -> Result<Option<ProcessingJob>> {
-        let job: Option<ProcessingJob> = sqlx::query_as(
-            r#"
-            SELECT * FROM cf_processing_queue
-            WHERE status = 'QUEUED'
-            ORDER BY priority DESC, id ASC
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(job)
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT * FROM cf_processing_queue
+                WHERE status = 'QUEUED'
+                ORDER BY priority DESC, id ASC
+                LIMIT 1
+                "#,
+                &[],
+            )
+            .await?;
+        Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
 
-    /// Atomically pop a job from the queue (SQLite version)
-    ///
-    /// Uses UPDATE ... WHERE status = 'QUEUED' with ORDER BY priority DESC, id ASC
-    /// to claim the highest priority job atomically.
+    /// Atomically pop a job from the queue.
     pub async fn pop_job(&self) -> Result<Option<ProcessingJob>> {
-        let mut tx = self.pool.begin().await?;
+        let now = now_ts();
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                UPDATE cf_processing_queue
+                SET status = 'RUNNING', claim_time = ?
+                WHERE id = (
+                    SELECT id FROM cf_processing_queue
+                    WHERE status = 'QUEUED'
+                    ORDER BY priority DESC, id ASC
+                    LIMIT 1
+                )
+                RETURNING *
+                "#,
+                &[DbValue::from(now)],
+            )
+            .await?;
 
-        // Find the next job to claim
-        let job_id: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT id FROM cf_processing_queue
-            WHERE status = 'QUEUED'
-            ORDER BY priority DESC, id ASC
-            LIMIT 1
-            "#,
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(job_id) = job_id else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-
-        // Claim the job by updating status to RUNNING
-        let now = Utc::now().to_rfc3339();
-        let rows_affected = sqlx::query(
-            r#"
-            UPDATE cf_processing_queue
-            SET status = 'RUNNING',
-                claim_time = ?
-            WHERE id = ? AND status = 'QUEUED'
-            "#,
-        )
-        .bind(&now)
-        .bind(job_id)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-
-        if rows_affected == 0 {
-            // Job was claimed by another worker - race condition
-            tx.commit().await?;
-            return Ok(None);
-        }
-
-        // Fetch the claimed job
-        let job: ProcessingJob = sqlx::query_as(
-            r#"
-            SELECT * FROM cf_processing_queue WHERE id = ?
-            "#,
-        )
-        .bind(job_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        info!("Claimed job {}: {}", job.id, job.plugin_name);
-
-        Ok(Some(job))
+        Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
 
-    /// Mark a job as completed
+    /// Mark job as complete.
     pub async fn complete_job(&self, job_id: i64, summary: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE cf_processing_queue
-            SET status = 'COMPLETED',
-                end_time = ?,
-                result_summary = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&now)
-        .bind(summary)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
-
-        info!("Job {} completed: {}", job_id, summary);
+        let now = now_ts();
+        self.conn
+            .execute(
+                r#"
+                UPDATE cf_processing_queue
+                SET status = 'COMPLETED', end_time = ?, result_summary = ?
+                WHERE id = ?
+                "#,
+                &[DbValue::from(now), DbValue::from(summary), DbValue::from(job_id)],
+            )
+            .await?;
         Ok(())
     }
 
-    /// Mark a job as failed
+    /// Mark job as failed.
     pub async fn fail_job(&self, job_id: i64, error: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            r#"
-            UPDATE cf_processing_queue
-            SET status = 'FAILED',
-                end_time = ?,
-                error_message = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&now)
-        .bind(error)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
-
-        info!("Job {} failed: {}", job_id, error);
+        let now = now_ts();
+        self.conn
+            .execute(
+                r#"
+                UPDATE cf_processing_queue
+                SET status = 'FAILED', end_time = ?, error_message = ?
+                WHERE id = ?
+                "#,
+                &[DbValue::from(now), DbValue::from(error), DbValue::from(job_id)],
+            )
+            .await?;
         Ok(())
     }
 
-    /// Requeue a job (move from RUNNING back to QUEUED)
-    ///
-    /// If the job has exceeded MAX_RETRY_COUNT, it is marked as FAILED instead.
-    /// This prevents infinite retry loops for jobs that consistently fail.
+    /// Requeue a job.
     pub async fn requeue_job(&self, job_id: i64) -> Result<()> {
-        // First check the current retry count
-        let current_retry: Option<i32> = sqlx::query_scalar(
-            "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_optional(
+                "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
+                &[DbValue::from(job_id)],
+            )
+            .await?;
 
-        let Some(retry_count) = current_retry else {
-            warn!("Cannot requeue job {}: not found in queue", job_id);
-            return Ok(());
-        };
-
-        if retry_count >= MAX_RETRY_COUNT {
-            // Exceeded max retries - fail permanently
-            warn!(
-                "Job {} exceeded max retries ({}/{}), marking as FAILED",
-                job_id, retry_count, MAX_RETRY_COUNT
-            );
-            self.fail_job(
-                job_id,
-                &format!("Exceeded maximum retry count ({})", MAX_RETRY_COUNT),
-            ).await?;
-            return Ok(());
+        if let Some(row) = row {
+            let retry_count: i32 = row.get_by_name("retry_count")?;
+            if retry_count >= MAX_RETRY_COUNT {
+                let now = now_ts();
+                self.conn
+                    .execute(
+                        r#"
+                        UPDATE cf_processing_queue
+                        SET status = 'FAILED', end_time = ?, error_message = 'max_retries_exceeded'
+                        WHERE id = ?
+                        "#,
+                        &[DbValue::from(now), DbValue::from(job_id)],
+                    )
+                    .await?;
+                return Ok(());
+            }
         }
 
-        // Requeue with incremented retry count
-        sqlx::query(
-            r#"
-            UPDATE cf_processing_queue
-            SET status = 'QUEUED',
-                claim_time = NULL,
-                retry_count = retry_count + 1
-            WHERE id = ?
-            "#,
-        )
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
-
-        info!("Job {} requeued (retry {}/{})", job_id, retry_count + 1, MAX_RETRY_COUNT);
+        self.conn
+            .execute(
+                r#"
+                UPDATE cf_processing_queue
+                SET status = 'QUEUED', claim_time = NULL, retry_count = retry_count + 1
+                WHERE id = ?
+                "#,
+                &[DbValue::from(job_id)],
+            )
+            .await?;
         Ok(())
     }
 
-    /// Get queue statistics
+    /// Queue stats for monitoring.
     pub async fn stats(&self) -> Result<QueueStats> {
-        let stats: QueueStats = sqlx::query_as(
-            r#"
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'QUEUED') as queued,
-                COUNT(*) FILTER (WHERE status = 'RUNNING') as running,
-                COUNT(*) FILTER (WHERE status = 'COMPLETED') as completed,
-                COUNT(*) FILTER (WHERE status = 'FAILED') as failed
-            FROM cf_processing_queue
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_one(
+                r#"
+                SELECT
+                    SUM(CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END) AS queued,
+                    SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) AS running,
+                    SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed,
+                    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed
+                FROM cf_processing_queue
+                "#,
+                &[],
+            )
+            .await?;
 
-        Ok(stats)
+        Ok(QueueStats {
+            queued: row.get_by_name("queued")?,
+            running: row.get_by_name("running")?,
+            completed: row.get_by_name("completed")?,
+            failed: row.get_by_name("failed")?,
+        })
     }
 
-    // ========================================================================
-    // Error Handling Tables (W5)
-    // ========================================================================
-
-    /// Initialize error handling tables (dead letter queue, parser health, quarantine)
-    ///
-    /// These tables support:
-    /// - Dead Letter Queue: Jobs that have exhausted retries
-    /// - Parser Health: Circuit breaker state for parsers
-    /// - Quarantine: Row-level failures during processing
+    /// Initialize dead-letter, health, quarantine tables.
     pub async fn init_error_handling_schema(&self) -> Result<()> {
-        // Dead Letter Queue: Jobs that have exhausted retries
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cf_dead_letter (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                original_job_id INTEGER NOT NULL,
-                file_version_id INTEGER,
-                plugin_name TEXT NOT NULL,
-                error_message TEXT,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                moved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                reason TEXT
+        self.conn
+            .execute(
+                r#"
+                CREATE TABLE IF NOT EXISTS cf_dead_letter (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_job_id INTEGER NOT NULL,
+                    file_id INTEGER,
+                    plugin_name TEXT NOT NULL,
+                    error_message TEXT,
+                    retry_count INTEGER NOT NULL,
+                    moved_at TIMESTAMP NOT NULL,
+                    reason TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS cf_parser_health (
+                    parser_name TEXT PRIMARY KEY,
+                    total_executions INTEGER NOT NULL DEFAULT 0,
+                    successful_executions INTEGER NOT NULL DEFAULT 0,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    last_failure_reason TEXT,
+                    paused_at TIMESTAMP,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cf_quarantine (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL,
+                    row_index INTEGER NOT NULL,
+                    error_reason TEXT NOT NULL,
+                    raw_data BLOB,
+                    created_at TIMESTAMP NOT NULL
+                );
+                "#,
+                &[],
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Index for querying dead letter jobs by plugin
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS ix_dead_letter_plugin ON cf_dead_letter(plugin_name)"
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Index for querying dead letter jobs by time
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS ix_dead_letter_moved_at ON cf_dead_letter(moved_at)"
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Parser Health: Circuit breaker state for parsers
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cf_parser_health (
-                parser_name TEXT PRIMARY KEY,
-                consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                paused_at TEXT,
-                last_failure_reason TEXT,
-                total_executions INTEGER NOT NULL DEFAULT 0,
-                successful_executions INTEGER NOT NULL DEFAULT 0
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Quarantine: Row-level failures during processing
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS cf_quarantine (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id INTEGER NOT NULL,
-                row_index INTEGER NOT NULL,
-                error_reason TEXT NOT NULL,
-                raw_data BLOB,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Index for querying quarantined rows by job
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS ix_quarantine_job ON cf_quarantine(job_id)"
-        )
-        .execute(&self.pool)
-        .await?;
-
-        info!("Initialized error handling schema (dead_letter, parser_health, quarantine)");
+            .await
+            .context("Failed to initialize error handling schema")?;
         Ok(())
     }
 
-    // ========================================================================
-    // Dead Letter Queue Operations
-    // ========================================================================
-
-    /// Move a job to the dead letter queue
-    ///
-    /// This is called when a job has exhausted all retries and should be
-    /// permanently removed from the processing queue.
+    /// Move a job to dead letter.
     pub async fn move_to_dead_letter(&self, job_id: i64, error: &str, reason: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT file_id, plugin_name, retry_count
+                FROM cf_processing_queue
+                WHERE id = ?
+                "#,
+                &[DbValue::from(job_id)],
+            )
+            .await?;
 
-        // 1. Get job details
-        let job: Option<(i32, String, i32)> = sqlx::query_as(
-            "SELECT file_version_id, plugin_name, retry_count FROM cf_processing_queue WHERE id = ?"
-        )
-        .bind(job_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some((file_version_id, plugin_name, retry_count)) = job else {
-            warn!("Cannot move job {} to dead letter: not found", job_id);
+        let Some(row) = row else {
             return Ok(());
         };
 
-        let now = Utc::now().to_rfc3339();
+        let file_id: i32 = row.get_by_name("file_id")?;
+        let plugin_name: String = row.get_by_name("plugin_name")?;
+        let retry_count: i32 = row.get_by_name("retry_count")?;
 
-        // 2. Insert into cf_dead_letter
-        sqlx::query(
-            r#"
-            INSERT INTO cf_dead_letter (original_job_id, file_version_id, plugin_name, error_message, retry_count, moved_at, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(job_id)
-        .bind(file_version_id)
-        .bind(&plugin_name)
-        .bind(error)
-        .bind(retry_count)
-        .bind(&now)
-        .bind(reason)
-        .execute(&mut *tx)
-        .await?;
-
-        // 3. Delete from cf_processing_queue
-        sqlx::query("DELETE FROM cf_processing_queue WHERE id = ?")
-            .bind(job_id)
-            .execute(&mut *tx)
+        let now = now_ts();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_dead_letter (original_job_id, file_id, plugin_name, error_message, retry_count, moved_at, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+                &[
+                    DbValue::from(job_id),
+                    DbValue::from(file_id),
+                    DbValue::from(plugin_name),
+                    DbValue::from(error),
+                    DbValue::from(retry_count),
+                    DbValue::from(now),
+                    DbValue::from(reason),
+                ],
+            )
             .await?;
 
-        tx.commit().await?;
+        self.conn
+            .execute("DELETE FROM cf_processing_queue WHERE id = ?", &[DbValue::from(job_id)])
+            .await?;
 
-        info!(
-            "Moved job {} ({}) to dead letter queue: {}",
-            job_id, plugin_name, reason
-        );
         Ok(())
     }
 
-    /// Get all dead letter jobs (limited)
     pub async fn get_dead_letter_jobs(&self, limit: i64) -> Result<Vec<DeadLetterJob>> {
-        let jobs: Vec<DeadLetterJob> = sqlx::query_as(
-            "SELECT * FROM cf_dead_letter ORDER BY moved_at DESC LIMIT ?"
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(jobs)
+        let rows = self
+            .conn
+            .query_all(
+                "SELECT * FROM cf_dead_letter ORDER BY moved_at DESC LIMIT ?",
+                &[DbValue::from(limit)],
+            )
+            .await?;
+        rows.iter().map(DeadLetterJob::from_row).collect::<Result<_, _>>().map_err(Into::into)
     }
 
-    /// Get dead letter jobs filtered by plugin
-    pub async fn get_dead_letter_jobs_by_plugin(
-        &self,
-        plugin_name: &str,
-        limit: i64,
-    ) -> Result<Vec<DeadLetterJob>> {
-        let jobs: Vec<DeadLetterJob> = sqlx::query_as(
-            "SELECT * FROM cf_dead_letter WHERE plugin_name = ? ORDER BY moved_at DESC LIMIT ?"
-        )
-        .bind(plugin_name)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(jobs)
+    pub async fn get_dead_letter_jobs_by_plugin(&self, plugin: &str, limit: i64) -> Result<Vec<DeadLetterJob>> {
+        let rows = self
+            .conn
+            .query_all(
+                "SELECT * FROM cf_dead_letter WHERE plugin_name = ? ORDER BY moved_at DESC LIMIT ?",
+                &[DbValue::from(plugin), DbValue::from(limit)],
+            )
+            .await?;
+        rows.iter().map(DeadLetterJob::from_row).collect::<Result<_, _>>().map_err(Into::into)
     }
 
-    /// Replay a dead letter job (move back to queue)
-    ///
-    /// Returns the new job_id if successful.
     pub async fn replay_dead_letter(&self, dead_letter_id: i64) -> Result<i64> {
-        let mut tx = self.pool.begin().await?;
-
-        // 1. Get dead letter job details
-        let dlj: Option<DeadLetterJob> = sqlx::query_as(
-            "SELECT * FROM cf_dead_letter WHERE id = ?"
-        )
-        .bind(dead_letter_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(dead_letter) = dlj else {
-            anyhow::bail!("Dead letter job {} not found", dead_letter_id);
+        let row = self
+            .conn
+            .query_optional(
+                "SELECT original_job_id, file_id, plugin_name FROM cf_dead_letter WHERE id = ?",
+                &[DbValue::from(dead_letter_id)],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Ok(0);
         };
 
-        // 2. Create new job in cf_processing_queue
-        let result = sqlx::query(
-            r#"
-            INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, retry_count)
-            VALUES (?, ?, 'QUEUED', 0, 0)
-            "#,
-        )
-        .bind(dead_letter.file_version_id.unwrap_or(0))
-        .bind(&dead_letter.plugin_name)
-        .execute(&mut *tx)
-        .await?;
+        let file_id: Option<i64> = row.get_by_name("file_id")?;
+        let plugin_name: String = row.get_by_name("plugin_name")?;
 
-        let new_job_id = result.last_insert_rowid();
-
-        // 3. Delete from cf_dead_letter
-        sqlx::query("DELETE FROM cf_dead_letter WHERE id = ?")
-            .bind(dead_letter_id)
-            .execute(&mut *tx)
-            .await?;
-
-        tx.commit().await?;
-
-        info!(
-            "Replayed dead letter {} as new job {} ({})",
-            dead_letter_id, new_job_id, dead_letter.plugin_name
-        );
-        Ok(new_job_id)
-    }
-
-    /// Count dead letter jobs
-    pub async fn count_dead_letter_jobs(&self) -> Result<i64> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cf_dead_letter")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count.0)
-    }
-
-    // ========================================================================
-    // Parser Health Operations (Circuit Breaker)
-    // ========================================================================
-
-    /// Record a successful parser execution
-    pub async fn record_parser_success(&self, parser_name: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO cf_parser_health (parser_name, consecutive_failures, total_executions, successful_executions)
-            VALUES (?, 0, 1, 1)
-            ON CONFLICT(parser_name) DO UPDATE SET
-                consecutive_failures = 0,
-                paused_at = NULL,
-                total_executions = total_executions + 1,
-                successful_executions = successful_executions + 1
-            "#,
-        )
-        .bind(parser_name)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Record a parser failure
-    ///
-    /// Returns the new consecutive failure count.
-    pub async fn record_parser_failure(&self, parser_name: &str, reason: &str) -> Result<i32> {
-        sqlx::query(
-            r#"
-            INSERT INTO cf_parser_health (parser_name, consecutive_failures, last_failure_reason, total_executions)
-            VALUES (?, 1, ?, 1)
-            ON CONFLICT(parser_name) DO UPDATE SET
-                consecutive_failures = consecutive_failures + 1,
-                last_failure_reason = ?,
-                total_executions = total_executions + 1
-            "#,
-        )
-        .bind(parser_name)
-        .bind(reason)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
-
-        // Get the updated count
-        let health: Option<ParserHealth> = sqlx::query_as(
-            "SELECT * FROM cf_parser_health WHERE parser_name = ?"
-        )
-        .bind(parser_name)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(health.map(|h| h.consecutive_failures).unwrap_or(1))
-    }
-
-    /// Pause a parser (circuit breaker open)
-    pub async fn pause_parser(&self, parser_name: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE cf_parser_health SET paused_at = ? WHERE parser_name = ?"
-        )
-        .bind(&now)
-        .bind(parser_name)
-        .execute(&self.pool)
-        .await?;
-
-        warn!("Parser {} has been paused (circuit breaker open)", parser_name);
-        Ok(())
-    }
-
-    /// Resume a parser (circuit breaker closed)
-    pub async fn resume_parser(&self, parser_name: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0 WHERE parser_name = ?"
-        )
-        .bind(parser_name)
-        .execute(&self.pool)
-        .await?;
-
-        info!("Parser {} has been resumed (circuit breaker closed)", parser_name);
-        Ok(())
-    }
-
-    /// Check if a parser is paused
-    pub async fn is_parser_paused(&self, parser_name: &str) -> Result<bool> {
-        let health: Option<ParserHealth> = sqlx::query_as(
-            "SELECT * FROM cf_parser_health WHERE parser_name = ?"
-        )
-        .bind(parser_name)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(health.map(|h| h.paused_at.is_some()).unwrap_or(false))
-    }
-
-    /// Get parser health status
-    pub async fn get_parser_health(&self, parser_name: &str) -> Result<Option<ParserHealth>> {
-        let health: Option<ParserHealth> = sqlx::query_as(
-            "SELECT * FROM cf_parser_health WHERE parser_name = ?"
-        )
-        .bind(parser_name)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(health)
-    }
-
-    /// Get all parser health records
-    pub async fn get_all_parser_health(&self) -> Result<Vec<ParserHealth>> {
-        let health: Vec<ParserHealth> = sqlx::query_as(
-            "SELECT * FROM cf_parser_health ORDER BY parser_name"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(health)
-    }
-
-    // ========================================================================
-    // Quarantine Operations (Row-Level Failures)
-    // ========================================================================
-
-    /// Quarantine a row that failed processing
-    pub async fn quarantine_row(
-        &self,
-        job_id: i64,
-        row_index: i32,
-        error_reason: &str,
-        raw_data: Option<&[u8]>,
-    ) -> Result<i64> {
-        let now = Utc::now().to_rfc3339();
-        let result = sqlx::query(
-            r#"
-            INSERT INTO cf_quarantine (job_id, row_index, error_reason, raw_data, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(job_id)
-        .bind(row_index)
-        .bind(error_reason)
-        .bind(raw_data)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.last_insert_rowid())
-    }
-
-    /// Get quarantined rows for a job
-    pub async fn get_quarantined_rows(&self, job_id: i64) -> Result<Vec<QuarantinedRow>> {
-        let rows: Vec<QuarantinedRow> = sqlx::query_as(
-            "SELECT * FROM cf_quarantine WHERE job_id = ? ORDER BY row_index"
-        )
-        .bind(job_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows)
-    }
-
-    /// Count quarantined rows for a job
-    pub async fn count_quarantined_rows(&self, job_id: i64) -> Result<i64> {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM cf_quarantine WHERE job_id = ?"
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(count.0)
-    }
-
-    /// Delete quarantined rows for a job (e.g., after successful reprocessing)
-    pub async fn delete_quarantined_rows(&self, job_id: i64) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM cf_quarantine WHERE job_id = ?")
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(result.rows_affected())
-    }
-}
-
-#[derive(Debug, sqlx::FromRow)]
-pub struct QueueStats {
-    pub queued: i32,
-    pub running: i32,
-    pub completed: i32,
-    pub failed: i32,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    async fn setup_test_db() -> DbPool {
-        let pool = SqlitePoolOptions::new()
-            .connect(":memory:")
-            .await
-            .unwrap();
-
-        // Create test table
-        sqlx::query(
-            r#"
-            CREATE TABLE cf_processing_queue (
-                id INTEGER PRIMARY KEY,
-                file_version_id INTEGER NOT NULL,
-                plugin_name TEXT NOT NULL,
-                config_overrides TEXT,
-                status TEXT NOT NULL DEFAULT 'PENDING',
-                priority INTEGER DEFAULT 0,
-                worker_host TEXT,
-                worker_pid INTEGER,
-                claim_time TEXT,
-                end_time TEXT,
-                result_summary TEXT,
-                error_message TEXT,
-                retry_count INTEGER DEFAULT 0
+        let new_id = self
+            .conn
+            .query_one(
+                r#"
+                INSERT INTO cf_processing_queue (file_id, plugin_name, status)
+                VALUES (?, ?, 'QUEUED')
+                RETURNING id
+                "#,
+                &[DbValue::from(file_id.unwrap_or_default()), DbValue::from(plugin_name)],
             )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+            .await?
+            .get_by_name::<i64>("id")?;
 
-        pool
+        self.conn
+            .execute("DELETE FROM cf_dead_letter WHERE id = ?", &[DbValue::from(dead_letter_id)])
+            .await?;
+
+        Ok(new_id)
     }
 
-    #[tokio::test]
-    async fn test_pop_job_empty_queue() {
-        let pool = setup_test_db().await;
-        let queue = JobQueue::new(pool);
-
-        let job = queue.pop_job().await.unwrap();
-        assert!(job.is_none());
+    pub async fn count_dead_letter_jobs(&self) -> Result<i64> {
+        let row = self.conn.query_one("SELECT COUNT(*) AS cnt FROM cf_dead_letter", &[]).await?;
+        Ok(row.get_by_name("cnt")?)
     }
 
-    #[tokio::test]
-    async fn test_pop_job_priority_order() {
-        let pool = setup_test_db().await;
-
-        // Insert jobs with different priorities
-        sqlx::query(
-            r#"
-            INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority)
-            VALUES (1, 'low', 'QUEUED', 0), (2, 'high', 'QUEUED', 10), (3, 'medium', 'QUEUED', 5)
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let queue = JobQueue::new(pool);
-
-        // Should pop highest priority first
-        let job = queue.pop_job().await.unwrap().unwrap();
-        assert_eq!(job.plugin_name, "high");
-        assert_eq!(job.priority, 10);
+    pub async fn record_parser_success(&self, parser_name: &str) -> Result<()> {
+        let now = now_ts();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, created_at, updated_at)
+                VALUES (?, 1, 1, 0, ?, ?)
+                ON CONFLICT(parser_name) DO UPDATE SET
+                    total_executions = total_executions + 1,
+                    successful_executions = successful_executions + 1,
+                    consecutive_failures = 0,
+                    updated_at = ?
+                "#,
+                &[DbValue::from(parser_name), DbValue::from(now), DbValue::from(now), DbValue::from(now)],
+            )
+            .await?;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_complete_job() {
-        use crate::db::models::StatusEnum;
+    pub async fn record_parser_failure(&self, parser_name: &str, reason: &str) -> Result<i32> {
+        let now = now_ts();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, last_failure_reason, created_at, updated_at)
+                VALUES (?, 1, 0, 1, ?, ?, ?)
+                ON CONFLICT(parser_name) DO UPDATE SET
+                    total_executions = total_executions + 1,
+                    consecutive_failures = consecutive_failures + 1,
+                    last_failure_reason = ?,
+                    updated_at = ?
+                "#,
+                &[
+                    DbValue::from(parser_name),
+                    DbValue::from(reason),
+                    DbValue::from(now),
+                    DbValue::from(now),
+                    DbValue::from(reason),
+                    DbValue::from(now),
+                ],
+            )
+            .await?;
 
-        let pool = setup_test_db().await;
-
-        sqlx::query(
-            r#"
-            INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status)
-            VALUES (1, 1, 'test', 'RUNNING')
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let queue = JobQueue::new(pool.clone());
-        queue.complete_job(1, "Success").await.unwrap();
-
-        let job: ProcessingJob = sqlx::query_as("SELECT * FROM cf_processing_queue WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        assert_eq!(job.status, StatusEnum::Completed);
-        assert_eq!(job.result_summary, Some("Success".to_string()));
+        let health = self.get_parser_health(parser_name).await?;
+        Ok(health.map(|h| h.consecutive_failures).unwrap_or(0))
     }
 
-    #[tokio::test]
-    async fn test_fail_job() {
-        use crate::db::models::StatusEnum;
-
-        let pool = setup_test_db().await;
-
-        sqlx::query(
-            r#"
-            INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status)
-            VALUES (1, 1, 'test', 'RUNNING')
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let queue = JobQueue::new(pool.clone());
-        queue.fail_job(1, "Connection timeout").await.unwrap();
-
-        let job: ProcessingJob = sqlx::query_as("SELECT * FROM cf_processing_queue WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        assert_eq!(job.status, StatusEnum::Failed);
-        assert_eq!(job.error_message, Some("Connection timeout".to_string()));
-        assert!(job.end_time.is_some());
+    pub async fn pause_parser(&self, parser_name: &str) -> Result<()> {
+        let now = now_ts();
+        self.conn
+            .execute(
+                "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
+                &[DbValue::from(now), DbValue::from(now), DbValue::from(parser_name)],
+            )
+            .await?;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_requeue_job() {
-        use crate::db::models::StatusEnum;
-
-        let pool = setup_test_db().await;
-
-        sqlx::query(
-            r#"
-            INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, retry_count)
-            VALUES (1, 1, 'test', 'RUNNING', 0)
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let queue = JobQueue::new(pool.clone());
-        queue.requeue_job(1).await.unwrap();
-
-        let job: ProcessingJob = sqlx::query_as("SELECT * FROM cf_processing_queue WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        assert_eq!(job.status, StatusEnum::Queued);
-        assert_eq!(job.retry_count, 1);
-        assert!(job.claim_time.is_none());
+    pub async fn resume_parser(&self, parser_name: &str) -> Result<()> {
+        let now = now_ts();
+        self.conn
+            .execute(
+                "UPDATE cf_parser_health SET paused_at = NULL, updated_at = ? WHERE parser_name = ?",
+                &[DbValue::from(now), DbValue::from(parser_name)],
+            )
+            .await?;
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn test_requeue_exceeds_max_retries() {
-        use crate::db::models::StatusEnum;
-
-        let pool = setup_test_db().await;
-
-        // Insert job that has already been retried MAX_RETRY_COUNT times
-        sqlx::query(
-            r#"
-            INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status, retry_count)
-            VALUES (1, 1, 'test', 'RUNNING', 5)
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let queue = JobQueue::new(pool.clone());
-        queue.requeue_job(1).await.unwrap();
-
-        // Job should be marked as FAILED, not requeued
-        let job: ProcessingJob = sqlx::query_as("SELECT * FROM cf_processing_queue WHERE id = 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        assert_eq!(job.status, StatusEnum::Failed);
-        assert!(job.error_message.unwrap().contains("maximum retry count"));
+    pub async fn is_parser_paused(&self, parser_name: &str) -> Result<bool> {
+        let row = self
+            .conn
+            .query_optional(
+                "SELECT paused_at FROM cf_parser_health WHERE parser_name = ?",
+                &[DbValue::from(parser_name)],
+            )
+            .await?;
+        Ok(row
+            .and_then(|r| r.get_by_name::<Option<chrono::DateTime<chrono::Utc>>>("paused_at").ok())
+            .flatten()
+            .is_some())
     }
+
+    pub async fn get_parser_health(&self, parser_name: &str) -> Result<Option<ParserHealth>> {
+        let row = self
+            .conn
+            .query_optional(
+                "SELECT * FROM cf_parser_health WHERE parser_name = ?",
+                &[DbValue::from(parser_name)],
+            )
+            .await?;
+        Ok(row.map(|row| ParserHealth::from_row(&row)).transpose()?)
+    }
+
+    pub async fn get_all_parser_health(&self) -> Result<Vec<ParserHealth>> {
+        let rows = self.conn.query_all("SELECT * FROM cf_parser_health", &[]).await?;
+        rows.iter().map(ParserHealth::from_row).collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    pub async fn quarantine_row(&self, job_id: i64, row_index: i32, error: &str, raw: Option<&[u8]>) -> Result<()> {
+        let now = now_ts();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_quarantine (job_id, row_index, error_reason, raw_data, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+                &[
+                    DbValue::from(job_id),
+                    DbValue::from(row_index),
+                    DbValue::from(error),
+                    DbValue::from(raw.map(|v| v.to_vec())),
+                    DbValue::from(now),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_quarantined_rows(&self, job_id: i64) -> Result<Vec<QuarantinedRow>> {
+        let rows = self
+            .conn
+            .query_all("SELECT * FROM cf_quarantine WHERE job_id = ? ORDER BY row_index", &[DbValue::from(job_id)])
+            .await?;
+        rows.iter().map(QuarantinedRow::from_row).collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    pub async fn count_quarantined_rows(&self, job_id: i64) -> Result<i64> {
+        let row = self
+            .conn
+            .query_one("SELECT COUNT(*) AS cnt FROM cf_quarantine WHERE job_id = ?", &[DbValue::from(job_id)])
+            .await?;
+        Ok(row.get_by_name("cnt")?)
+    }
+
+    pub async fn delete_quarantined_rows(&self, job_id: i64) -> Result<u64> {
+        let affected = self
+            .conn
+            .execute("DELETE FROM cf_quarantine WHERE job_id = ?", &[DbValue::from(job_id)])
+            .await?;
+        Ok(affected)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueueStats {
+    pub queued: i64,
+    pub running: i64,
+    pub completed: i64,
+    pub failed: i64,
 }

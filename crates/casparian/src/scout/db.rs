@@ -6,12 +6,12 @@
 //! - Tagging Rules: pattern → tag mappings
 //! - Files: discovered files with their tags and status
 
-use super::error::Result;
+use super::error::{Result, ScoutError};
 use super::types::{
     BatchUpsertResult, DbStats, ExtractionLogStatus, ExtractionStatus, Extractor, FileStatus,
     ScannedFile, Source, SourceType, TaggingRule, UpsertResult,
 };
-use casparian_db::{BackendError, DbConnection, DbValue};
+use casparian_db::{DbConnection, DbValue};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 
@@ -506,37 +506,8 @@ impl Database {
         };
 
         let schema_sql = schema_sql(conn.backend_name() == "DuckDB");
-        if conn.backend_name() == "DuckDB" {
-            // Alpha-mode reset: drop all tables for a clean schema each run.
-            let reset_sql = r#"
-DROP TABLE IF EXISTS cf_ai_training_examples;
-DROP TABLE IF EXISTS cf_signature_groups;
-DROP TABLE IF EXISTS cf_ai_audit_log;
-DROP TABLE IF EXISTS cf_ai_drafts;
-DROP TABLE IF EXISTS extraction_tag_conditions;
-DROP TABLE IF EXISTS extraction_fields;
-DROP TABLE IF EXISTS extraction_rules;
-DROP TABLE IF EXISTS parser_lab_test_files;
-DROP TABLE IF EXISTS parser_lab_parsers;
-DROP TABLE IF EXISTS scout_extraction_log;
-DROP TABLE IF EXISTS scout_extractors;
-DROP TABLE IF EXISTS scout_folders;
-DROP TABLE IF EXISTS scout_files;
-DROP TABLE IF EXISTS schema_migrations;
-DROP TABLE IF EXISTS scout_settings;
-DROP TABLE IF EXISTS scout_tagging_rules;
-DROP TABLE IF EXISTS scout_sources;
-DROP SEQUENCE IF EXISTS seq_schema_migrations;
-DROP SEQUENCE IF EXISTS seq_scout_files;
-DROP SEQUENCE IF EXISTS seq_scout_folders;
-DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
-"#;
-            conn.execute_batch(reset_sql).await?;
-            conn.execute_batch(&schema_sql).await?;
-        } else {
-            conn.execute_batch(&schema_sql).await?;
-            Self::run_migrations(&conn).await?;
-        }
+        conn.execute_batch(&schema_sql).await?;
+        Self::run_migrations(&conn).await?;
 
         Ok(Self { conn })
     }
@@ -608,14 +579,6 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
     /// Get the underlying connection (for sharing with other code).
     pub fn conn(&self) -> &DbConnection {
         &self.conn
-    }
-
-    fn sqlite_pool(&self) -> Result<&sqlx::SqlitePool> {
-        self.conn.as_sqlite_pool().ok_or_else(|| {
-            super::error::ScoutError::Config(
-                "SQLite backend required for this operation".to_string(),
-            )
-        })
     }
 
     // ========================================================================
@@ -1233,68 +1196,70 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
             return self.batch_upsert_files_duckdb(files, tag).await;
         }
 
-        let pool = self.sqlite_pool()?;
-        let mut tx = pool.begin().await?;
         let now = now_millis();
-        let mut stats = BatchUpsertResult::default();
+        let files = files.to_vec();
+        let tag = tag.map(|value| value.to_string());
+        let source_id = files[0].source_id.as_ref().to_string();
 
-        // Get source_id from first file (all files in batch have same source)
-        let source_id = files[0].source_id.as_ref();
+        self.conn
+            .transaction(move |tx| {
+                let mut stats = BatchUpsertResult::default();
 
-        // Query existing files to determine new vs changed vs unchanged
-        // Note: This SELECT also needs chunking for large batches
-        let existing = Self::query_existing_files(&mut tx, source_id, files).await?;
+                // Query existing files to determine new vs changed vs unchanged
+                // Note: This SELECT also needs chunking for large batches
+                let existing = Self::query_existing_files_tx(tx, &source_id, &files)?;
 
-        // Chunk size for bulk inserts. Modern SQLite supports 32766 params (since 3.32.0).
-        // 100 rows per chunk is a good balance between fewer round-trips and memory usage.
-        const CHUNK_SIZE: usize = 100;
+                // Chunk size for bulk inserts. Modern SQLite supports 32766 params (since 3.32.0).
+                // 100 rows per chunk is a good balance between fewer round-trips and memory usage.
+                const CHUNK_SIZE: usize = 100;
 
-        for chunk in files.chunks(CHUNK_SIZE) {
-            // Pre-compute stats for this chunk (assuming all succeed)
-            let mut chunk_new = 0u64;
-            let mut chunk_changed = 0u64;
-            let mut chunk_unchanged = 0u64;
+                for chunk in files.chunks(CHUNK_SIZE) {
+                    // Pre-compute stats for this chunk (assuming all succeed)
+                    let mut chunk_new = 0u64;
+                    let mut chunk_changed = 0u64;
+                    let mut chunk_unchanged = 0u64;
 
-            for file in chunk {
-                let is_new = !existing.contains_key(&file.path);
-                let is_changed = existing
-                    .get(&file.path)
-                    .is_some_and(|(size, mtime)| *size != file.size as i64 || *mtime != file.mtime);
+                    for file in chunk {
+                        let is_new = !existing.contains_key(&file.path);
+                        let is_changed = existing
+                            .get(&file.path)
+                            .is_some_and(|(size, mtime)| *size != file.size as i64 || *mtime != file.mtime);
 
-                if is_new {
-                    chunk_new += 1;
-                } else if is_changed {
-                    chunk_changed += 1;
-                } else {
-                    chunk_unchanged += 1;
+                        if is_new {
+                            chunk_new += 1;
+                        } else if is_changed {
+                            chunk_changed += 1;
+                        } else {
+                            chunk_unchanged += 1;
+                        }
+                    }
+
+                    // Try bulk insert
+                    match Self::bulk_insert_chunk_tx(tx, chunk, tag.as_deref(), now) {
+                        Ok(()) => {
+                            stats.new += chunk_new;
+                            stats.changed += chunk_changed;
+                            stats.unchanged += chunk_unchanged;
+                        }
+                        Err(e) => {
+                            // Bulk failed - fall back to row-by-row to isolate bad row
+                            tracing::debug!(error = %e, "Bulk insert failed, falling back to row-by-row");
+                            Self::insert_rows_individually_tx(
+                                tx,
+                                chunk,
+                                tag.as_deref(),
+                                now,
+                                &existing,
+                                &mut stats,
+                            );
+                        }
+                    }
                 }
-            }
 
-            // Try bulk insert
-            match Self::bulk_insert_chunk(&mut tx, chunk, tag, now).await {
-                Ok(()) => {
-                    stats.new += chunk_new;
-                    stats.changed += chunk_changed;
-                    stats.unchanged += chunk_unchanged;
-                }
-                Err(e) => {
-                    // Bulk failed - fall back to row-by-row to isolate bad row
-                    tracing::debug!(error = %e, "Bulk insert failed, falling back to row-by-row");
-                    Self::insert_rows_individually(
-                        &mut tx,
-                        chunk,
-                        tag,
-                        now,
-                        &existing,
-                        &mut stats,
-                    )
-                    .await;
-                }
-            }
-        }
-
-        tx.commit().await?;
-        Ok(stats)
+                Ok(stats)
+            })
+            .await
+            .map_err(ScoutError::from)
     }
 
     async fn batch_upsert_files_duckdb(
@@ -1304,11 +1269,6 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
     ) -> Result<BatchUpsertResult> {
         #[cfg(feature = "duckdb")]
         {
-            let client = self
-                .conn
-                .as_duckdb_client()
-                .ok_or_else(|| super::error::ScoutError::Config("DuckDB backend not available".to_string()))?;
-
             let now = now_millis();
             let mut stats = BatchUpsertResult::default();
             let existing = Self::query_existing_files_conn(&self.conn, files).await?;
@@ -1331,8 +1291,8 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
             let tag_override = tag.map(|t| t.to_string());
             let files_vec = files.to_vec();
 
-            client
-                .conn(move |conn| {
+            self.conn
+                .execute_duckdb_op(move |conn| {
                     conn.execute_batch(
                         "CREATE TEMP TABLE IF NOT EXISTS staging_scout_files (
                             source_id TEXT NOT NULL,
@@ -1435,8 +1395,7 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
                     conn.execute_batch("DELETE FROM staging_scout_files;")?;
                     Ok(())
                 })
-                .await
-                .map_err(BackendError::from)?;
+                .await?;
 
             Ok(stats)
         }
@@ -1489,11 +1448,11 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
     }
 
     /// Query existing files for a batch (chunked to avoid parameter limit)
-    async fn query_existing_files(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    fn query_existing_files_tx(
+        tx: &mut casparian_db::DbTransaction<'_>,
         source_id: &str,
         files: &[ScannedFile],
-    ) -> Result<std::collections::HashMap<String, (i64, i64)>> {
+    ) -> std::result::Result<std::collections::HashMap<String, (i64, i64)>, casparian_db::BackendError> {
         let mut existing = std::collections::HashMap::with_capacity(files.len());
 
         // Chunk the SELECT query too (999 params, 1 for source_id + N for paths)
@@ -1506,13 +1465,17 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
                 placeholders
             );
 
-            let mut q = sqlx::query_as::<_, (String, i64, i64)>(&query).bind(source_id);
+            let mut params = Vec::with_capacity(chunk.len() + 1);
+            params.push(DbValue::from(source_id));
             for file in chunk {
-                q = q.bind(&file.path);
+                params.push(file.path.as_str().into());
             }
 
-            let rows = q.fetch_all(&mut **tx).await?;
-            for (path, size, mtime) in rows {
+            let rows = tx.query_all(&query, &params)?;
+            for row in rows {
+                let path: String = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                let mtime: i64 = row.get(2)?;
                 existing.insert(path, (size, mtime));
             }
         }
@@ -1521,12 +1484,12 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
     }
 
     /// Bulk insert a chunk of files using multi-row VALUES
-    async fn bulk_insert_chunk(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    fn bulk_insert_chunk_tx(
+        tx: &mut casparian_db::DbTransaction<'_>,
         files: &[ScannedFile],
         tag: Option<&str>,
         now: i64,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), casparian_db::BackendError> {
         if files.is_empty() {
             return Ok(());
         }
@@ -1585,32 +1548,30 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
             )
         };
 
-        let mut query = sqlx::query(&sql);
-
+        let mut params = Vec::with_capacity(files.len() * 12);
         for file in files {
             let file_tag = tag.or(file.tag.as_deref());
-            query = query
-                .bind(file.source_id.as_ref())
-                .bind(&file.path)
-                .bind(&file.rel_path)
-                .bind(&file.parent_path)
-                .bind(&file.name)
-                .bind(&file.extension)
-                .bind(file.size as i64)
-                .bind(file.mtime)
-                .bind(&file.content_hash)
-                .bind(file_tag)
-                .bind(now)
-                .bind(now);
+            params.push(file.source_id.as_ref().into());
+            params.push(file.path.as_str().into());
+            params.push(file.rel_path.as_str().into());
+            params.push(file.parent_path.as_str().into());
+            params.push(file.name.as_str().into());
+            params.push(file.extension.clone().into());
+            params.push((file.size as i64).into());
+            params.push(file.mtime.into());
+            params.push(file.content_hash.clone().into());
+            params.push(file_tag.map(|value| value.to_string()).into());
+            params.push(now.into());
+            params.push(now.into());
         }
 
-        query.execute(&mut **tx).await?;
+        tx.execute(&sql, &params)?;
         Ok(())
     }
 
     /// Fallback: insert rows one at a time when bulk insert fails
-    async fn insert_rows_individually(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    fn insert_rows_individually_tx(
+        tx: &mut casparian_db::DbTransaction<'_>,
         files: &[ScannedFile],
         tag: Option<&str>,
         now: i64,
@@ -1624,7 +1585,24 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
                 .is_some_and(|(size, mtime)| *size != file.size as i64 || *mtime != file.mtime);
 
             let file_tag = tag.or(file.tag.as_deref());
-            let result = sqlx::query(
+            let params = [
+                DbValue::from(file.source_id.as_ref()),
+                file.path.as_str().into(),
+                file.rel_path.as_str().into(),
+                file.parent_path.as_str().into(),
+                file.name.as_str().into(),
+                file.extension.clone().into(),
+                (file.size as i64).into(),
+                file.mtime.into(),
+                file.content_hash.clone().into(),
+                file_tag.map(|value| value.to_string()).into(),
+                now.into(),
+                now.into(),
+                tag.map(|value| value.to_string()).into(),
+                tag.map(|value| value.to_string()).into(),
+            ];
+
+            let result = tx.execute(
                 r#"INSERT INTO scout_files
                    (source_id, path, rel_path, parent_path, name, extension, size, mtime, content_hash, status, tag, first_seen_at, last_seen_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
@@ -1642,23 +1620,8 @@ DROP SEQUENCE IF EXISTS seq_scout_extraction_log;
                        END,
                        tag = CASE WHEN ? IS NOT NULL THEN ? ELSE scout_files.tag END,
                        last_seen_at = excluded.last_seen_at"#,
-            )
-            .bind(file.source_id.as_ref())
-            .bind(&file.path)
-            .bind(&file.rel_path)
-            .bind(&file.parent_path)
-            .bind(&file.name)
-            .bind(&file.extension)
-            .bind(file.size as i64)
-            .bind(file.mtime)
-            .bind(&file.content_hash)
-            .bind(file_tag)
-            .bind(now)
-            .bind(now)
-            .bind(tag)
-            .bind(tag)
-            .execute(&mut **tx)
-            .await;
+                &params,
+            );
 
             match result {
                 Ok(_) => {

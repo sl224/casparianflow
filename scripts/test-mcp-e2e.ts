@@ -260,7 +260,7 @@ async function runTests() {
         topic_name: 'sales_topic',
         options: {
           file_format: 'csv',
-          sink_type: 'sqlite',
+          sink_type: 'duckdb',
         },
       },
     });
@@ -274,8 +274,8 @@ async function runTests() {
     if (!code.includes('TOPIC = "sales_data"')) {  // topic defaults to schema name
       throw new Error('Missing TOPIC constant');
     }
-    if (!code.includes('SINK = "sqlite"')) {
-      throw new Error('Missing SINK constant (should be sqlite)');
+    if (!code.includes('SINK = "duckdb"')) {
+      throw new Error('Missing SINK constant (should be duckdb)');
     }
     if (!code.includes('def parse(file_path: str)')) {
       throw new Error('Missing parse() function');

@@ -5,7 +5,7 @@ This parser handles the headerless CSV format used in MCData files,
 extracting configuration and fault data into queryable records.
 """
 import csv
-import sqlite3
+import duckdb
 from datetime import datetime
 from pathlib import Path
 
@@ -60,15 +60,14 @@ def parse_timestamp(ts_str):
         return ts_str  # Return original if can't parse
 
 
-def to_sqlite(records, db_path, table_name="mcdata"):
-    """Write records to SQLite database."""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+def to_duckdb(records, db_path, table_name="mcdata"):
+    """Write records to DuckDB database."""
+    conn = duckdb.connect(db_path)
 
     # Create table
-    cursor.execute(f"""
+    conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGINT PRIMARY KEY,
             row_number INTEGER,
             record_type TEXT,
             event_name TEXT,
@@ -77,17 +76,14 @@ def to_sqlite(records, db_path, table_name="mcdata"):
             component_type TEXT,
             status TEXT,
             raw_data TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     # Insert records
-    for record in records:
-        cursor.execute(f"""
-            INSERT INTO {table_name}
-            (row_number, record_type, event_name, timestamp, subsystem, component_type, status, raw_data)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+    rows = [
+        (
+            i + 1,
             record["row_number"],
             record["record_type"],
             record["event_name"],
@@ -96,18 +92,24 @@ def to_sqlite(records, db_path, table_name="mcdata"):
             record["component_type"],
             record["status"],
             record["raw_data"],
-        ))
-
-    conn.commit()
+        )
+        for i, record in enumerate(records)
+    ]
+    conn.executemany(
+        f"""
+        INSERT INTO {table_name}
+        (id, row_number, record_type, event_name, timestamp, subsystem, component_type, status, raw_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
     print(f"Inserted {len(records)} records into {db_path}:{table_name}")
 
     # Show sample
-    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-    count = cursor.fetchone()[0]
+    count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
     print(f"Total records in table: {count}")
 
-    cursor.execute(f"SELECT DISTINCT event_name FROM {table_name} LIMIT 10")
-    events = [r[0] for r in cursor.fetchall()]
+    events = [r[0] for r in conn.execute(f"SELECT DISTINCT event_name FROM {table_name} LIMIT 10").fetchall()]
     print(f"Sample event types: {events}")
 
     conn.close()
@@ -136,5 +138,5 @@ if __name__ == "__main__":
     records = parse_mcdata(input_file)
     print(f"Parsed {len(records)} records")
 
-    to_sqlite(records, output_db)
+    to_duckdb(records, output_db)
     print(f"Output: {output_db}")

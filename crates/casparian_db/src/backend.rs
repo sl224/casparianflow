@@ -1,16 +1,25 @@
 //! Database backend abstraction layer.
 //!
 //! Provides a unified interface for different database backends:
-//! - SQLite (via sqlx) - row-oriented, OLTP
-//! - DuckDB (via async-duckdb) - columnar, OLAP
+//! - SQLite (via sqlx) - row-oriented, OLTP (actor boundary)
+//! - DuckDB (via duckdb) - columnar, OLAP (single-actor async boundary)
 //! - PostgreSQL (via sqlx) - enterprise
 
 use std::path::Path;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+use std::thread;
 use thiserror::Error;
 use tracing::info;
 
+#[cfg(feature = "sqlite")]
+use sqlx::Connection;
 #[cfg(feature = "duckdb")]
 use std::sync::Arc;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "sqlite")]
+use tokio::runtime::Builder as RuntimeBuilder;
+use std::any::Any;
 
 /// Errors from database backend operations.
 #[derive(Debug, Error)]
@@ -52,12 +61,6 @@ impl From<duckdb::Error> for BackendError {
     }
 }
 
-#[cfg(feature = "duckdb")]
-impl From<async_duckdb::Error> for BackendError {
-    fn from(e: async_duckdb::Error) -> Self {
-        BackendError::DuckDb(e.to_string())
-    }
-}
 
 /// Database access mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +80,7 @@ pub enum DbValue {
     Text(String),
     Blob(Vec<u8>),
     Boolean(bool),
+    Timestamp(chrono::DateTime<chrono::Utc>),
 }
 
 impl From<i32> for DbValue {
@@ -112,6 +116,12 @@ impl From<&str> for DbValue {
 impl From<bool> for DbValue {
     fn from(v: bool) -> Self {
         DbValue::Boolean(v)
+    }
+}
+
+impl From<chrono::DateTime<chrono::Utc>> for DbValue {
+    fn from(v: chrono::DateTime<chrono::Utc>) -> Self {
+        DbValue::Timestamp(v)
     }
 }
 
@@ -172,6 +182,117 @@ impl DbRow {
     }
 }
 
+#[cfg(feature = "duckdb")]
+const DUCKDB_ACTOR_QUEUE: usize = 1024;
+
+#[cfg(feature = "sqlite")]
+const SQLITE_ACTOR_QUEUE: usize = 1024;
+
+#[cfg(feature = "duckdb")]
+#[derive(Clone)]
+struct DuckDbActorHandle {
+    sender: mpsc::Sender<DuckDbRequest>,
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Clone)]
+struct SqliteActorHandle {
+    sender: mpsc::Sender<SqliteRequest>,
+}
+
+#[cfg(feature = "duckdb")]
+enum DuckDbRequest {
+    Execute {
+        sql: String,
+        params: Vec<DbValue>,
+        resp: oneshot::Sender<Result<u64, BackendError>>,
+    },
+    ExecuteBatch {
+        sql: String,
+        resp: oneshot::Sender<Result<(), BackendError>>,
+    },
+    QueryAll {
+        sql: String,
+        params: Vec<DbValue>,
+        resp: oneshot::Sender<Result<Vec<DbRow>, BackendError>>,
+    },
+    Op {
+        op: Box<dyn DuckDbOp>,
+        resp: oneshot::Sender<Result<(), BackendError>>,
+    },
+    Transaction {
+        op: Box<dyn DuckDbTxOp>,
+        resp: oneshot::Sender<Result<Box<dyn Any + Send>, BackendError>>,
+    },
+}
+
+#[cfg(feature = "sqlite")]
+enum SqliteRequest {
+    Execute {
+        sql: String,
+        params: Vec<DbValue>,
+        resp: oneshot::Sender<Result<u64, BackendError>>,
+    },
+    ExecuteBatch {
+        sql: String,
+        resp: oneshot::Sender<Result<(), BackendError>>,
+    },
+    QueryAll {
+        sql: String,
+        params: Vec<DbValue>,
+        resp: oneshot::Sender<Result<Vec<DbRow>, BackendError>>,
+    },
+    Transaction {
+        op: Box<dyn SqliteTxOp>,
+        resp: oneshot::Sender<Result<Box<dyn Any + Send>, BackendError>>,
+    },
+}
+
+#[cfg(feature = "duckdb")]
+trait DuckDbOp: Send {
+    fn run(self: Box<Self>, conn: &duckdb::Connection) -> Result<(), BackendError>;
+}
+
+#[cfg(feature = "duckdb")]
+impl<F> DuckDbOp for F
+where
+    F: FnOnce(&duckdb::Connection) -> Result<(), BackendError> + Send + 'static,
+{
+    fn run(self: Box<Self>, conn: &duckdb::Connection) -> Result<(), BackendError> {
+        (*self)(conn)
+    }
+}
+
+trait DuckDbTxOp: Send {
+    fn run<'a>(self: Box<Self>, tx: &'a mut DbTransaction<'a>) -> Result<Box<dyn Any + Send>, BackendError>;
+}
+
+impl<F, T> DuckDbTxOp for F
+where
+    F: for<'a> FnOnce(&'a mut DbTransaction<'a>) -> Result<T, BackendError> + Send + 'static,
+    T: Send + 'static,
+{
+    fn run<'a>(self: Box<Self>, tx: &'a mut DbTransaction<'a>) -> Result<Box<dyn Any + Send>, BackendError> {
+        (*self)(tx).map(|value| Box::new(value) as Box<dyn Any + Send>)
+    }
+}
+
+#[cfg(feature = "sqlite")]
+trait SqliteTxOp: Send {
+    fn run<'a>(self: Box<Self>, tx: &'a mut DbTransaction<'a>) -> Result<Box<dyn Any + Send>, BackendError>;
+}
+
+#[cfg(feature = "sqlite")]
+impl<F, T> SqliteTxOp for F
+where
+    F: for<'a> FnOnce(&'a mut DbTransaction<'a>) -> Result<T, BackendError> + Send + 'static,
+    T: Send + 'static,
+{
+    fn run<'a>(self: Box<Self>, tx: &'a mut DbTransaction<'a>) -> Result<Box<dyn Any + Send>, BackendError> {
+        (*self)(tx).map(|value| Box::new(value) as Box<dyn Any + Send>)
+    }
+}
+
 /// Trait for converting from DbValue.
 pub trait FromDbValue: Sized {
     fn from_db_value(value: &DbValue) -> Result<Self, BackendError>;
@@ -204,6 +325,18 @@ impl FromDbValue for f64 {
             DbValue::Integer(v) => Ok(*v as f64),
             DbValue::Null => Ok(0.0),
             _ => Err(BackendError::TypeConversion("Expected real".to_string())),
+        }
+    }
+}
+
+impl FromDbValue for chrono::DateTime<chrono::Utc> {
+    fn from_db_value(value: &DbValue) -> Result<Self, BackendError> {
+        match value {
+            DbValue::Timestamp(v) => Ok(v.clone()),
+            DbValue::Text(v) => chrono::DateTime::parse_from_rfc3339(v)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| BackendError::TypeConversion(format!("Invalid timestamp: {}", e))),
+            _ => Err(BackendError::TypeConversion("Expected timestamp".to_string())),
         }
     }
 }
@@ -262,10 +395,10 @@ pub struct DbConnection {
 #[derive(Clone)]
 enum DbConnectionInner {
     #[cfg(feature = "sqlite")]
-    Sqlite(sqlx::SqlitePool),
+    Sqlite(SqliteActorHandle),
 
     #[cfg(feature = "duckdb")]
-    DuckDb(Arc<async_duckdb::Client>),
+    DuckDb(DuckDbActorHandle),
 
     #[cfg(feature = "postgres")]
     Postgres(sqlx::PgPool),
@@ -289,26 +422,38 @@ impl std::fmt::Debug for DbConnection {
 }
 
 impl DbConnection {
+    /// Open a database connection from a URL string.
+    ///
+    /// Supported schemes: sqlite:, duckdb:, postgres://, postgresql://
+    pub async fn open_from_url(url: &str) -> Result<Self, BackendError> {
+        let db_type = crate::DatabaseType::from_url(url)
+            .ok_or_else(|| BackendError::Database(format!("Unsupported database URL: {}", url)))?;
+
+        match db_type {
+            #[cfg(feature = "sqlite")]
+            crate::DatabaseType::Sqlite => {
+                let path = strip_url_prefix(url, "sqlite:")
+                    .ok_or_else(|| BackendError::Database(format!("Invalid sqlite URL: {}", url)))?;
+                Self::open_sqlite(Path::new(&path)).await
+            }
+            #[cfg(feature = "duckdb")]
+            crate::DatabaseType::DuckDb => {
+                let path = strip_url_prefix(url, "duckdb:")
+                    .ok_or_else(|| BackendError::Database(format!("Invalid duckdb URL: {}", url)))?;
+                Self::open_duckdb(Path::new(&path)).await
+            }
+            #[cfg(feature = "postgres")]
+            crate::DatabaseType::Postgres => Self::open_postgres(url).await,
+        }
+    }
     /// Open a SQLite database.
     #[cfg(feature = "sqlite")]
     pub async fn open_sqlite(path: &Path) -> Result<Self, BackendError> {
         let url = format!("sqlite:{}?mode=rwc", path.display());
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&url)
-            .await?;
-
-        // Apply optimizations
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA synchronous=NORMAL")
-            .execute(&pool)
-            .await?;
-
+        let actor = Self::spawn_sqlite_actor(url).await?;
         info!("Opened SQLite database: {}", path.display());
         Ok(Self {
-            inner: DbConnectionInner::Sqlite(pool),
+            inner: DbConnectionInner::Sqlite(actor),
             access_mode: AccessMode::ReadWrite,
             #[cfg(feature = "duckdb")]
             _lock_guard: None,
@@ -318,14 +463,10 @@ impl DbConnection {
     /// Open an in-memory SQLite database (for testing).
     #[cfg(feature = "sqlite")]
     pub async fn open_sqlite_memory() -> Result<Self, BackendError> {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await?;
-
+        let actor = Self::spawn_sqlite_actor("sqlite::memory:".to_string()).await?;
         info!("Opened in-memory SQLite database");
         Ok(Self {
-            inner: DbConnectionInner::Sqlite(pool),
+            inner: DbConnectionInner::Sqlite(actor),
             access_mode: AccessMode::ReadWrite,
             #[cfg(feature = "duckdb")]
             _lock_guard: None,
@@ -350,15 +491,15 @@ impl DbConnection {
             LockError::AcquireFailed(io) => BackendError::Database(format!("Lock acquire error: {}", io)),
         })?;
 
-        let path_str = path.to_string_lossy().to_string();
-        let client = async_duckdb::ClientBuilder::new()
-            .path(&path_str)
-            .open()
-            .await?;
+        let path_buf = path.to_path_buf();
+        let actor = Self::spawn_duckdb_actor(move || {
+            duckdb::Connection::open(path_buf).map_err(BackendError::from)
+        })
+        .await?;
 
         info!("Opened DuckDB database with exclusive lock: {}", path.display());
         Ok(Self {
-            inner: DbConnectionInner::DuckDb(Arc::new(client)),
+            inner: DbConnectionInner::DuckDb(actor),
             access_mode: AccessMode::ReadWrite,
             _lock_guard: Some(Arc::new(lock_guard)),
         })
@@ -372,16 +513,18 @@ impl DbConnection {
     pub async fn open_duckdb_readonly(path: &Path) -> Result<Self, BackendError> {
         use duckdb::{AccessMode as DuckAccessMode, Config};
 
-        let path_str = path.to_string_lossy().to_string();
-        let client = async_duckdb::ClientBuilder::new()
-            .path(&path_str)
-            .flagsfn(|| Config::default().access_mode(DuckAccessMode::ReadOnly))
-            .open()
-            .await?;
+        let path_buf = path.to_path_buf();
+        let actor = Self::spawn_duckdb_actor(move || {
+            let config = Config::default()
+                .access_mode(DuckAccessMode::ReadOnly)
+                .map_err(BackendError::from)?;
+            duckdb::Connection::open_with_flags(path_buf, config).map_err(BackendError::from)
+        })
+        .await?;
 
         info!("Opened DuckDB database (read-only): {}", path.display());
         Ok(Self {
-            inner: DbConnectionInner::DuckDb(Arc::new(client)),
+            inner: DbConnectionInner::DuckDb(actor),
             access_mode: AccessMode::ReadOnly,
             _lock_guard: None, // No lock needed for read-only
         })
@@ -392,13 +535,14 @@ impl DbConnection {
     /// In-memory databases don't require locking since they're process-local.
     #[cfg(feature = "duckdb")]
     pub async fn open_duckdb_memory() -> Result<Self, BackendError> {
-        let client = async_duckdb::ClientBuilder::new()
-            .open()
-            .await?;
+        let actor = Self::spawn_duckdb_actor(|| {
+            duckdb::Connection::open_in_memory().map_err(BackendError::from)
+        })
+        .await?;
 
         info!("Opened in-memory DuckDB database");
         Ok(Self {
-            inner: DbConnectionInner::DuckDb(Arc::new(client)),
+            inner: DbConnectionInner::DuckDb(actor),
             access_mode: AccessMode::ReadWrite,
             _lock_guard: None, // No lock needed for in-memory
         })
@@ -454,12 +598,12 @@ impl DbConnection {
 
         match &self.inner {
             #[cfg(feature = "sqlite")]
-            DbConnectionInner::Sqlite(pool) => {
-                self.execute_sqlite(pool, sql, params).await
+            DbConnectionInner::Sqlite(handle) => {
+                self.execute_sqlite(handle, sql, params).await
             }
             #[cfg(feature = "duckdb")]
-            DbConnectionInner::DuckDb(client) => {
-                self.execute_duckdb(client, sql, params).await
+            DbConnectionInner::DuckDb(handle) => {
+                self.execute_duckdb(handle, sql, params).await
             }
             #[cfg(feature = "postgres")]
             DbConnectionInner::Postgres(pool) => {
@@ -482,21 +626,12 @@ impl DbConnection {
 
         match &self.inner {
             #[cfg(feature = "sqlite")]
-            DbConnectionInner::Sqlite(pool) => {
-                // Split by semicolon and execute each
-                // WARNING: This breaks SQL with semicolons in string literals
-                for stmt in sql.split(';').filter(|s| !s.trim().is_empty()) {
-                    sqlx::query(stmt).execute(pool).await?;
-                }
-                Ok(())
+            DbConnectionInner::Sqlite(handle) => {
+                self.execute_sqlite_batch(handle, sql).await
             }
             #[cfg(feature = "duckdb")]
-            DbConnectionInner::DuckDb(client) => {
-                let sql = sql.to_string();
-                client.conn(move |conn| {
-                    conn.execute_batch(&sql)?;
-                    Ok(())
-                }).await.map_err(BackendError::from)
+            DbConnectionInner::DuckDb(handle) => {
+                self.execute_duckdb_batch(handle, sql).await
             }
             #[cfg(feature = "postgres")]
             DbConnectionInner::Postgres(pool) => {
@@ -513,12 +648,12 @@ impl DbConnection {
     pub async fn query_all(&self, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
         match &self.inner {
             #[cfg(feature = "sqlite")]
-            DbConnectionInner::Sqlite(pool) => {
-                self.query_sqlite(pool, sql, params).await
+            DbConnectionInner::Sqlite(handle) => {
+                self.query_sqlite(handle, sql, params).await
             }
             #[cfg(feature = "duckdb")]
-            DbConnectionInner::DuckDb(client) => {
-                self.query_duckdb(client, sql, params).await
+            DbConnectionInner::DuckDb(handle) => {
+                self.query_duckdb(handle, sql, params).await
             }
             #[cfg(feature = "postgres")]
             DbConnectionInner::Postgres(pool) => {
@@ -546,9 +681,205 @@ impl DbConnection {
         row.get(0)
     }
 
+    /// Execute a DuckDB-specific operation on the actor thread.
+    #[cfg(feature = "duckdb")]
+    pub async fn execute_duckdb_op<F>(&self, op: F) -> Result<(), BackendError>
+    where
+        F: FnOnce(&duckdb::Connection) -> Result<(), BackendError> + Send + 'static,
+    {
+        let handle = match &self.inner {
+            DbConnectionInner::DuckDb(handle) => handle.clone(),
+            #[cfg(any(feature = "sqlite", feature = "postgres"))]
+            _ => {
+                return Err(BackendError::NotAvailable(
+                    "DuckDB backend not available".to_string(),
+                ));
+            }
+        };
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = DuckDbRequest::Op {
+            op: Box::new(op),
+            resp: resp_tx,
+        };
+
+        handle
+            .sender
+            .send(request)
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor closed".to_string()))?;
+
+        resp_rx
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor dropped response".to_string()))?
+    }
+
     // SQLite implementation
     #[cfg(feature = "sqlite")]
-    async fn execute_sqlite(&self, pool: &sqlx::SqlitePool, sql: &str, params: &[DbValue]) -> Result<u64, BackendError> {
+    async fn execute_sqlite(&self, handle: &SqliteActorHandle, sql: &str, params: &[DbValue]) -> Result<u64, BackendError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = SqliteRequest::Execute {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            resp: resp_tx,
+        };
+
+        handle
+            .sender
+            .send(request)
+            .await
+            .map_err(|_| BackendError::Database("SQLite actor closed".to_string()))?;
+
+        resp_rx
+            .await
+            .map_err(|_| BackendError::Database("SQLite actor dropped response".to_string()))?
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn execute_sqlite_batch(&self, handle: &SqliteActorHandle, sql: &str) -> Result<(), BackendError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = SqliteRequest::ExecuteBatch {
+            sql: sql.to_string(),
+            resp: resp_tx,
+        };
+
+        handle
+            .sender
+            .send(request)
+            .await
+            .map_err(|_| BackendError::Database("SQLite actor closed".to_string()))?;
+
+        resp_rx
+            .await
+            .map_err(|_| BackendError::Database("SQLite actor dropped response".to_string()))?
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn query_sqlite(&self, handle: &SqliteActorHandle, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = SqliteRequest::QueryAll {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            resp: resp_tx,
+        };
+
+        handle
+            .sender
+            .send(request)
+            .await
+            .map_err(|_| BackendError::Database("SQLite actor closed".to_string()))?;
+
+        resp_rx
+            .await
+            .map_err(|_| BackendError::Database("SQLite actor dropped response".to_string()))?
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn spawn_sqlite_actor(url: String) -> Result<SqliteActorHandle, BackendError> {
+        let (sender, receiver) = mpsc::channel(SQLITE_ACTOR_QUEUE);
+        let (init_tx, init_rx) = oneshot::channel();
+
+        thread::spawn(move || {
+            let runtime = match RuntimeBuilder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = init_tx.send(Err(BackendError::Database(format!(
+                        "SQLite runtime init failed: {}",
+                        err
+                    ))));
+                    return;
+                }
+            };
+
+            let mut conn = match runtime.block_on(sqlx::SqliteConnection::connect(&url)) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    let _ = init_tx.send(Err(BackendError::from(err)));
+                    return;
+                }
+            };
+
+            if let Err(err) = runtime.block_on(Self::apply_sqlite_optimizations_on_conn(&mut conn)) {
+                let _ = init_tx.send(Err(err));
+                return;
+            }
+
+            let _ = init_tx.send(Ok(()));
+            Self::run_sqlite_actor(conn, runtime, receiver);
+        });
+
+        match init_rx.await {
+            Ok(Ok(())) => Ok(SqliteActorHandle { sender }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(BackendError::Database(
+                "SQLite actor failed to start".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn run_sqlite_actor(
+        mut conn: sqlx::SqliteConnection,
+        runtime: tokio::runtime::Runtime,
+        mut receiver: mpsc::Receiver<SqliteRequest>,
+    ) {
+        while let Some(request) = receiver.blocking_recv() {
+            match request {
+                SqliteRequest::Execute { sql, params, resp } => {
+                    let result = runtime.block_on(Self::execute_sqlite_on_conn(&mut conn, &sql, &params));
+                    let _ = resp.send(result);
+                }
+                SqliteRequest::ExecuteBatch { sql, resp } => {
+                    let result = runtime.block_on(Self::execute_sqlite_batch_on_conn(&mut conn, &sql));
+                    let _ = resp.send(result);
+                }
+                SqliteRequest::QueryAll { sql, params, resp } => {
+                    let result = runtime.block_on(Self::query_sqlite_on_conn(&mut conn, &sql, &params));
+                    let _ = resp.send(result);
+                }
+                SqliteRequest::Transaction { op, resp } => {
+                    let result = Self::run_sqlite_transaction(&mut conn, &runtime, op);
+                    let _ = resp.send(result);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn run_sqlite_transaction(
+        conn: &mut sqlx::SqliteConnection,
+        runtime: &tokio::runtime::Runtime,
+        op: Box<dyn SqliteTxOp>,
+    ) -> Result<Box<dyn Any + Send>, BackendError> {
+        runtime.block_on(async {
+            sqlx::query("BEGIN").execute(&mut *conn).await?;
+            Ok::<(), BackendError>(())
+        })?;
+
+        let mut tx = DbTransaction::sqlite(conn, runtime);
+        let result = op.run(&mut tx);
+
+        match result {
+            Ok(value) => {
+                runtime.block_on(async {
+                    sqlx::query("COMMIT").execute(conn).await?;
+                    Ok::<(), BackendError>(())
+                })?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = runtime.block_on(async { sqlx::query("ROLLBACK").execute(conn).await });
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn execute_sqlite_on_conn(
+        conn: &mut sqlx::SqliteConnection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<u64, BackendError> {
         let mut query = sqlx::query(sql);
         for param in params {
             query = match param {
@@ -558,14 +889,31 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
+                DbValue::Timestamp(v) => query.bind(v.clone()),
             };
         }
-        let result = query.execute(pool).await?;
+        let result = query.execute(conn).await?;
         Ok(result.rows_affected())
     }
 
     #[cfg(feature = "sqlite")]
-    async fn query_sqlite(&self, pool: &sqlx::SqlitePool, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
+    async fn execute_sqlite_batch_on_conn(
+        conn: &mut sqlx::SqliteConnection,
+        sql: &str,
+    ) -> Result<(), BackendError> {
+        // WARNING: This breaks SQL with semicolons in string literals
+        for stmt in sql.split(';').filter(|s| !s.trim().is_empty()) {
+            sqlx::query(stmt).execute(&mut *conn).await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    async fn query_sqlite_on_conn(
+        conn: &mut sqlx::SqliteConnection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<DbRow>, BackendError> {
         use sqlx::{Column, Row};
 
         let mut query = sqlx::query(sql);
@@ -577,10 +925,11 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
+                DbValue::Timestamp(v) => query.bind(v.clone()),
             };
         }
 
-        let rows = query.fetch_all(pool).await?;
+        let rows = query.fetch_all(conn).await?;
         let mut result = Vec::with_capacity(rows.len());
 
         for row in rows {
@@ -605,6 +954,10 @@ impl DbConnection {
                         let v: Option<bool> = row.try_get(i).ok();
                         v.map(DbValue::Boolean).unwrap_or(DbValue::Null)
                     }
+                    "DATETIME" | "TIMESTAMP" => {
+                        let v: Option<chrono::DateTime<chrono::Utc>> = row.try_get(i).ok();
+                        v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
+                    }
                     "TEXT" | "VARCHAR" | "CHAR" => {
                         let v: Option<Option<String>> = row.try_get(i).ok();
                         match v {
@@ -616,6 +969,8 @@ impl DbConnection {
                         let text_value: Option<Option<String>> = row.try_get(i).ok();
                         if let Some(Some(text)) = text_value {
                             DbValue::Text(text)
+                        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
                         } else if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
                             v.map(DbValue::Integer).unwrap_or(DbValue::Null)
                         } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
@@ -638,63 +993,224 @@ impl DbConnection {
         Ok(result)
     }
 
-    // DuckDB implementation
-    #[cfg(feature = "duckdb")]
-    async fn execute_duckdb(&self, client: &async_duckdb::Client, sql: &str, params: &[DbValue]) -> Result<u64, BackendError> {
-        let sql = sql.to_string();
-        let params = params.to_vec();
+    #[cfg(feature = "sqlite")]
+    async fn apply_sqlite_optimizations_on_conn(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<(), BackendError> {
+        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *conn).await?;
+        sqlx::query("PRAGMA synchronous=NORMAL").execute(&mut *conn).await?;
+        Ok(())
+    }
 
-        client.conn(move |conn| {
-            let mut stmt = conn.prepare(&sql)?;
-            let duckdb_params = Self::to_duckdb_params(&params);
-            let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params.iter()
-                .map(|v| v as &dyn duckdb::ToSql)
-                .collect();
-            let rows = stmt.execute(param_refs.as_slice())?;
-            Ok(rows as u64)
-        }).await.map_err(BackendError::from)
+    // DuckDB implementation (actor boundary)
+    #[cfg(feature = "duckdb")]
+    async fn execute_duckdb(&self, handle: &DuckDbActorHandle, sql: &str, params: &[DbValue]) -> Result<u64, BackendError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = DuckDbRequest::Execute {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            resp: resp_tx,
+        };
+
+        handle
+            .sender
+            .send(request)
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor closed".to_string()))?;
+
+        resp_rx
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor dropped response".to_string()))?
     }
 
     #[cfg(feature = "duckdb")]
-    async fn query_duckdb(&self, client: &async_duckdb::Client, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
-        let sql = sql.to_string();
-        let params = params.to_vec();
+    async fn execute_duckdb_batch(&self, handle: &DuckDbActorHandle, sql: &str) -> Result<(), BackendError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = DuckDbRequest::ExecuteBatch {
+            sql: sql.to_string(),
+            resp: resp_tx,
+        };
 
-        client.conn(move |conn| {
-            let mut stmt = conn.prepare(&sql)?;
-            let duckdb_params = Self::to_duckdb_params(&params);
-            let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params.iter()
-                .map(|v| v as &dyn duckdb::ToSql)
-                .collect();
+        handle
+            .sender
+            .send(request)
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor closed".to_string()))?;
 
-            // Execute query first - column metadata requires query execution in DuckDB
-            let mut rows_iter = stmt.query(param_refs.as_slice())?;
+        resp_rx
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor dropped response".to_string()))?
+    }
 
-            // Get column info from the Rows via as_ref() to the underlying Statement
-            let (column_count, columns) = if let Some(stmt_ref) = rows_iter.as_ref() {
-                let count = stmt_ref.column_count();
-                let cols: Vec<String> = (0..count)
-                    .map(|i| stmt_ref.column_name(i).map(|s| s.to_string()).unwrap_or_else(|_| format!("col{}", i)))
-                    .collect();
-                (count, cols)
-            } else {
-                // No statement reference available - return empty result
-                return Ok(Vec::new());
-            };
+    #[cfg(feature = "duckdb")]
+    async fn query_duckdb(&self, handle: &DuckDbActorHandle, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let request = DuckDbRequest::QueryAll {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            resp: resp_tx,
+        };
 
-            let mut result = Vec::new();
+        handle
+            .sender
+            .send(request)
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor closed".to_string()))?;
 
-            while let Some(row) = rows_iter.next()? {
-                let mut values = Vec::with_capacity(column_count);
-                for i in 0..column_count {
-                    let value = Self::duckdb_value_to_db_value(&row, i)?;
-                    values.push(value);
+        resp_rx
+            .await
+            .map_err(|_| BackendError::Database("DuckDB actor dropped response".to_string()))?
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn spawn_duckdb_actor<F>(open_fn: F) -> Result<DuckDbActorHandle, BackendError>
+    where
+        F: FnOnce() -> Result<duckdb::Connection, BackendError> + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::channel(DUCKDB_ACTOR_QUEUE);
+        let (init_tx, init_rx) = oneshot::channel();
+
+        thread::spawn(move || {
+            let conn = open_fn();
+            match conn {
+                Ok(conn) => {
+                    let _ = init_tx.send(Ok(()));
+                    Self::run_duckdb_actor(conn, receiver);
                 }
-                result.push(DbRow::new(columns.clone(), values));
+                Err(err) => {
+                    let _ = init_tx.send(Err(err));
+                }
             }
+        });
 
-            Ok(result)
-        }).await.map_err(BackendError::from)
+        match init_rx.await {
+            Ok(Ok(())) => Ok(DuckDbActorHandle { sender }),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(BackendError::Database(
+                "DuckDB actor failed to start".to_string(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn run_duckdb_actor(conn: duckdb::Connection, mut receiver: mpsc::Receiver<DuckDbRequest>) {
+        while let Some(request) = receiver.blocking_recv() {
+            match request {
+                DuckDbRequest::Execute { sql, params, resp } => {
+                    let result = Self::execute_duckdb_on_conn(&conn, &sql, &params);
+                    let _ = resp.send(result);
+                }
+                DuckDbRequest::ExecuteBatch { sql, resp } => {
+                    let result = Self::execute_duckdb_batch_on_conn(&conn, &sql);
+                    let _ = resp.send(result);
+                }
+                DuckDbRequest::QueryAll { sql, params, resp } => {
+                    let result = Self::query_duckdb_on_conn(&conn, &sql, &params);
+                    let _ = resp.send(result);
+                }
+                DuckDbRequest::Op { op, resp } => {
+                    let result = op.run(&conn);
+                    let _ = resp.send(result);
+                }
+                DuckDbRequest::Transaction { op, resp } => {
+                    let result = Self::run_duckdb_transaction(&conn, op);
+                    let _ = resp.send(result);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn run_duckdb_transaction(
+        conn: &duckdb::Connection,
+        op: Box<dyn DuckDbTxOp>,
+    ) -> Result<Box<dyn Any + Send>, BackendError> {
+        conn.execute_batch("BEGIN")?;
+        let mut tx = DbTransaction::duckdb(conn);
+        let result = op.run(&mut tx);
+
+        match result {
+            Ok(value) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn execute_duckdb_on_conn(
+        conn: &duckdb::Connection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<u64, BackendError> {
+        let mut stmt = conn.prepare(sql)?;
+        let duckdb_params = Self::to_duckdb_params(params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params
+            .iter()
+            .map(|v| v as &dyn duckdb::ToSql)
+            .collect();
+        let rows = stmt.execute(param_refs.as_slice())?;
+        Ok(rows as u64)
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn execute_duckdb_batch_on_conn(
+        conn: &duckdb::Connection,
+        sql: &str,
+    ) -> Result<(), BackendError> {
+        conn.execute_batch(sql)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "duckdb")]
+    fn query_duckdb_on_conn(
+        conn: &duckdb::Connection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<DbRow>, BackendError> {
+        let mut stmt = conn.prepare(sql)?;
+        let duckdb_params = Self::to_duckdb_params(params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params
+            .iter()
+            .map(|v| v as &dyn duckdb::ToSql)
+            .collect();
+
+        // Execute query first - column metadata requires query execution in DuckDB
+        let mut rows_iter = stmt.query(param_refs.as_slice())?;
+
+        // Get column info from the Rows via as_ref() to the underlying Statement
+        let (column_count, columns) = if let Some(stmt_ref) = rows_iter.as_ref() {
+            let count = stmt_ref.column_count();
+            let cols: Vec<String> = (0..count)
+                .map(|i| {
+                    stmt_ref
+                        .column_name(i)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| format!("col{}", i))
+                })
+                .collect();
+            (count, cols)
+        } else {
+            // No statement reference available - return empty result
+            return Ok(Vec::new());
+        };
+
+        let mut result = Vec::new();
+
+        while let Some(row) = rows_iter.next()? {
+            let mut values = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let value = Self::duckdb_value_to_db_value(&row, i)?;
+                values.push(value);
+            }
+            result.push(DbRow::new(columns.clone(), values));
+        }
+
+        Ok(result)
     }
 
     #[cfg(feature = "duckdb")]
@@ -706,6 +1222,10 @@ impl DbConnection {
             DbValue::Text(v) => duckdb::types::Value::Text(v.clone()),
             DbValue::Blob(v) => duckdb::types::Value::Blob(v.clone()),
             DbValue::Boolean(v) => duckdb::types::Value::Boolean(*v),
+            DbValue::Timestamp(v) => {
+                let micros = v.timestamp_micros();
+                duckdb::types::Value::Timestamp(duckdb::types::TimeUnit::Microsecond, micros)
+            }
         }).collect()
     }
 
@@ -732,22 +1252,20 @@ impl DbConnection {
             // Text and binary
             ValueRef::Text(v) => Ok(DbValue::Text(String::from_utf8_lossy(v).to_string())),
             ValueRef::Blob(v) => Ok(DbValue::Blob(v.to_vec())),
-            // Temporal types - convert to ISO 8601 strings for portability
+            // Temporal types
             ValueRef::Timestamp(unit, v) => {
-                // Convert to ISO 8601 timestamp string
                 let micros = match unit {
                     duckdb::types::TimeUnit::Second => v * 1_000_000,
                     duckdb::types::TimeUnit::Millisecond => v * 1_000,
                     duckdb::types::TimeUnit::Microsecond => v,
                     duckdb::types::TimeUnit::Nanosecond => v / 1_000,
                 };
-                // Convert to seconds and format
                 let secs = micros / 1_000_000;
                 let nanos = ((micros % 1_000_000) * 1_000) as u32;
                 if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                    Ok(DbValue::Text(dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()))
+                    Ok(DbValue::Timestamp(dt))
                 } else {
-                    Ok(DbValue::Integer(micros)) // Fallback to raw micros
+                    Ok(DbValue::Integer(micros))
                 }
             }
             ValueRef::Date32(days) => {
@@ -815,6 +1333,7 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
+                DbValue::Timestamp(v) => query.bind(v.clone()),
             };
         }
         let result = query.execute(pool).await?;
@@ -834,6 +1353,7 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
+                DbValue::Timestamp(v) => query.bind(v.clone()),
             };
         }
 
@@ -854,6 +1374,8 @@ impl DbConnection {
                     DbValue::Boolean(v)
                 } else if let Ok(v) = row.try_get::<Vec<u8>, _>(i) {
                     DbValue::Blob(v)
+                } else if let Ok(v) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(i) {
+                    DbValue::Timestamp(v)
                 } else if let Ok(v) = row.try_get::<String, _>(i) {
                     DbValue::Text(v)
                 } else {
@@ -869,33 +1391,173 @@ impl DbConnection {
     }
 
     /// Get the underlying SQLite pool (for legacy code during migration).
-    #[cfg(feature = "sqlite")]
-    pub fn as_sqlite_pool(&self) -> Option<&sqlx::SqlitePool> {
+    pub async fn transaction<T, F>(&self, op: F) -> Result<T, BackendError>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(&'a mut DbTransaction<'a>) -> Result<T, BackendError> + Send + 'static,
+    {
+        let mut op = Some(op);
         match &self.inner {
-            DbConnectionInner::Sqlite(pool) => Some(pool),
+            #[cfg(feature = "sqlite")]
+            DbConnectionInner::Sqlite(handle) => {
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let request = SqliteRequest::Transaction {
+                    op: Box::new(op.take().expect("transaction op missing")),
+                    resp: resp_tx,
+                };
+
+                handle
+                    .sender
+                    .send(request)
+                    .await
+                    .map_err(|_| BackendError::Database("SQLite actor closed".to_string()))?;
+
+                let boxed = resp_rx
+                    .await
+                    .map_err(|_| BackendError::Database("SQLite actor dropped response".to_string()))??;
+
+                boxed
+                    .downcast::<T>()
+                    .map(|value| *value)
+                    .map_err(|_| BackendError::TypeConversion("SQLite transaction result type mismatch".to_string()))
+            }
             #[cfg(feature = "duckdb")]
-            _ => None,
+            DbConnectionInner::DuckDb(handle) => {
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let request = DuckDbRequest::Transaction {
+                    op: Box::new(op.take().expect("transaction op missing")),
+                    resp: resp_tx,
+                };
+
+                handle
+                    .sender
+                    .send(request)
+                    .await
+                    .map_err(|_| BackendError::Database("DuckDB actor closed".to_string()))?;
+
+                let boxed = resp_rx
+                    .await
+                    .map_err(|_| BackendError::Database("DuckDB actor dropped response".to_string()))??;
+
+                boxed
+                    .downcast::<T>()
+                    .map(|value| *value)
+                    .map_err(|_| BackendError::TypeConversion("DuckDB transaction result type mismatch".to_string()))
+            }
             #[cfg(feature = "postgres")]
-            _ => None,
+            DbConnectionInner::Postgres(_) => Err(BackendError::NotAvailable(
+                "Postgres transactions via DbConnection are not supported yet".to_string(),
+            )),
+        }
+    }
+}
+
+/// Transaction wrapper executed within the actor thread.
+pub struct DbTransaction<'a> {
+    inner: DbTransactionInner<'a>,
+}
+
+enum DbTransactionInner<'a> {
+    #[cfg(feature = "sqlite")]
+    Sqlite {
+        conn: &'a mut sqlx::SqliteConnection,
+        runtime: &'a tokio::runtime::Runtime,
+    },
+    #[cfg(feature = "duckdb")]
+    DuckDb {
+        conn: &'a duckdb::Connection,
+    },
+}
+
+impl<'a> DbTransaction<'a> {
+    #[cfg(feature = "sqlite")]
+    fn sqlite(conn: &'a mut sqlx::SqliteConnection, runtime: &'a tokio::runtime::Runtime) -> Self {
+        Self {
+            inner: DbTransactionInner::Sqlite { conn, runtime },
         }
     }
 
-    /// Get the underlying DuckDB client (for advanced queries).
     #[cfg(feature = "duckdb")]
-    pub fn as_duckdb_client(&self) -> Option<&async_duckdb::Client> {
-        match &self.inner {
-            DbConnectionInner::DuckDb(client) => Some(client),
-            #[cfg(feature = "sqlite")]
-            _ => None,
-            #[cfg(feature = "postgres")]
-            _ => None,
+    fn duckdb(conn: &'a duckdb::Connection) -> Self {
+        Self {
+            inner: DbTransactionInner::DuckDb { conn },
         }
     }
+
+    pub fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64, BackendError> {
+        match &mut self.inner {
+            #[cfg(feature = "sqlite")]
+            DbTransactionInner::Sqlite { conn, runtime } => {
+                runtime.block_on(DbConnection::execute_sqlite_on_conn(conn, sql, params))
+            }
+            #[cfg(feature = "duckdb")]
+            DbTransactionInner::DuckDb { conn } => {
+                DbConnection::execute_duckdb_on_conn(conn, sql, params)
+            }
+        }
+    }
+
+    pub fn execute_batch(&mut self, sql: &str) -> Result<(), BackendError> {
+        match &mut self.inner {
+            #[cfg(feature = "sqlite")]
+            DbTransactionInner::Sqlite { conn, runtime } => {
+                runtime.block_on(DbConnection::execute_sqlite_batch_on_conn(conn, sql))
+            }
+            #[cfg(feature = "duckdb")]
+            DbTransactionInner::DuckDb { conn } => {
+                DbConnection::execute_duckdb_batch_on_conn(conn, sql)
+            }
+        }
+    }
+
+    pub fn query_all(&mut self, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
+        match &mut self.inner {
+            #[cfg(feature = "sqlite")]
+            DbTransactionInner::Sqlite { conn, runtime } => {
+                runtime.block_on(DbConnection::query_sqlite_on_conn(conn, sql, params))
+            }
+            #[cfg(feature = "duckdb")]
+            DbTransactionInner::DuckDb { conn } => {
+                DbConnection::query_duckdb_on_conn(conn, sql, params)
+            }
+        }
+    }
+
+    pub fn query_optional(&mut self, sql: &str, params: &[DbValue]) -> Result<Option<DbRow>, BackendError> {
+        let rows = self.query_all(sql, params)?;
+        Ok(rows.into_iter().next())
+    }
+
+    pub fn query_one(&mut self, sql: &str, params: &[DbValue]) -> Result<DbRow, BackendError> {
+        self.query_optional(sql, params)?
+            .ok_or_else(|| BackendError::Query("Expected one row, got none".to_string()))
+    }
+
+    pub fn query_scalar<T: FromDbValue>(&mut self, sql: &str, params: &[DbValue]) -> Result<T, BackendError> {
+        let row = self.query_one(sql, params)?;
+        row.get(0)
+    }
+}
+
+fn strip_url_prefix(url: &str, prefix: &str) -> Option<String> {
+    if !url.starts_with(prefix) {
+        return None;
+    }
+    let mut path = &url[prefix.len()..];
+    if path.starts_with("//") {
+        path = &path[2..];
+    }
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
 
     #[tokio::test]
     #[cfg(feature = "sqlite")]
@@ -912,6 +1574,64 @@ mod tests {
         assert_eq!(rows[0].get::<String>(1).unwrap(), "Alice");
         assert_eq!(rows[1].get::<i64>(0).unwrap(), 2);
         assert_eq!(rows[1].get::<String>(1).unwrap(), "Bob");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "sqlite")]
+    async fn test_sqlite_actor_backpressure_on_full_queue() {
+        let handle = DbConnection::spawn_sqlite_actor("sqlite::memory:".to_string())
+            .await
+            .unwrap();
+
+        struct SleepTx {
+            started: Option<oneshot::Sender<()>>,
+        }
+
+        impl SqliteTxOp for SleepTx {
+            fn run<'a>(
+                self: Box<Self>,
+                _tx: &'a mut DbTransaction<'a>,
+            ) -> Result<Box<dyn Any + Send>, BackendError> {
+                if let Some(started) = self.started {
+                    let _ = started.send(());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(Box::new(()))
+            }
+        }
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (resp_tx, _resp_rx) = oneshot::channel();
+        let request = SqliteRequest::Transaction {
+            op: Box::new(SleepTx {
+                started: Some(started_tx),
+            }),
+            resp: resp_tx,
+        };
+
+        handle.sender.send(request).await.unwrap();
+        let _ = started_rx.await;
+
+        let mut blocked = false;
+        for _ in 0..(SQLITE_ACTOR_QUEUE + 10) {
+            let (resp_tx, _resp_rx) = oneshot::channel();
+            let request = SqliteRequest::Execute {
+                sql: "SELECT 1".to_string(),
+                params: Vec::new(),
+                resp: resp_tx,
+            };
+
+            let send = handle.sender.send(request);
+            if tokio::time::timeout(Duration::from_millis(10), send)
+                .await
+                .is_err()
+            {
+                blocked = true;
+                break;
+            }
+        }
+
+        assert!(blocked, "expected backpressure when queue is full");
     }
 
     #[tokio::test]
@@ -961,5 +1681,84 @@ mod tests {
         let conn = DbConnection::open_duckdb_readonly(&db_path).await.unwrap();
         let result = conn.execute("INSERT INTO test (id) VALUES (?)", &[1.into()]).await;
         assert!(matches!(result, Err(BackendError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_duckdb_actor_concurrent_writes() {
+        let conn = DbConnection::open_duckdb_memory().await.unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER)").await.unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..50i64 {
+            let conn = conn.clone();
+            tasks.push(tokio::spawn(async move {
+                conn.execute("INSERT INTO test (id) VALUES (?)", &[i.into()])
+                    .await
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        let count: i64 = conn
+            .query_scalar("SELECT COUNT(*) FROM test", &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 50);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_duckdb_actor_op_allows_advanced_usage() {
+        let conn = DbConnection::open_duckdb_memory().await.unwrap();
+
+        conn.execute_duckdb_op(|db| {
+            db.execute_batch("CREATE TABLE test (id INTEGER)")?;
+            let mut appender = db.appender("test")?;
+            appender.append_row(duckdb::params![1])?;
+            appender.flush()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let count: i64 = conn
+            .query_scalar("SELECT COUNT(*) FROM test", &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "duckdb")]
+    async fn test_duckdb_actor_dropped_response_does_not_kill_actor() {
+        let conn = DbConnection::open_duckdb_memory().await.unwrap();
+        conn.execute_batch("CREATE TABLE test (id INTEGER)").await.unwrap();
+
+        let (start_tx, start_rx) = oneshot::channel();
+        let conn_clone = conn.clone();
+
+        let handle = tokio::spawn(async move {
+            conn_clone
+                .execute_duckdb_op(move |_| {
+                    let _ = start_tx.send(());
+                    std::thread::sleep(Duration::from_millis(100));
+                    Ok(())
+                })
+                .await
+                .ok();
+        });
+
+        let _ = start_rx.await;
+        handle.abort();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let count: i64 = conn
+            .query_scalar("SELECT COUNT(*) FROM test", &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

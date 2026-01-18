@@ -23,7 +23,7 @@ echo
 
 # Create test database with sample data
 echo "Setting up test database..."
-sqlite3 "$CASPARIAN_DB" <<EOF
+duckdb "$CASPARIAN_DB" <<EOF
 -- Create worker node table
 CREATE TABLE cf_worker_node (
     hostname TEXT PRIMARY KEY,
@@ -39,7 +39,8 @@ CREATE TABLE cf_worker_node (
 -- Create processing queue table for queue stats
 CREATE TABLE cf_processing_queue (
     id INTEGER PRIMARY KEY,
-    file_version_id INTEGER NOT NULL,
+    file_id INTEGER NOT NULL,
+    pipeline_run_id TEXT,
     plugin_name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'QUEUED',
     priority INTEGER DEFAULT 0,
@@ -61,10 +62,10 @@ INSERT INTO cf_worker_node (hostname, pid, ip_address, started_at, last_heartbea
     VALUES ('worker-3', 12347, '192.168.1.12', '2024-12-16T08:00:00Z', '2024-12-16T09:00:00Z', 'draining', NULL);
 
 -- Insert test jobs
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status) VALUES (42, 1, 'test', 'RUNNING');
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status) VALUES (43, 2, 'test', 'QUEUED');
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status) VALUES (44, 3, 'test', 'COMPLETED');
-INSERT INTO cf_processing_queue (id, file_version_id, plugin_name, status) VALUES (45, 4, 'test', 'FAILED');
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (42, 1, 'test', 'RUNNING');
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (43, 2, 'test', 'QUEUED');
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (44, 3, 'test', 'COMPLETED');
+INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (45, 4, 'test', 'FAILED');
 EOF
 
 echo "Test database created."
@@ -182,7 +183,7 @@ else
     echo "FAIL: Expected draining confirmation"
     exit 1
 fi
-STATUS=$(sqlite3 "$CASPARIAN_DB" "SELECT status FROM cf_worker_node WHERE hostname = 'worker-2'")
+STATUS=$(duckdb "$CASPARIAN_DB" "SELECT status FROM cf_worker_node WHERE hostname = 'worker-2'")
 if [ "$STATUS" = "draining" ]; then
     echo "PASS: Database updated correctly"
 else
@@ -204,7 +205,7 @@ echo
 # Test 9: Worker remove on idle worker
 echo "Test 9: Worker remove on idle/draining worker"
 # First update worker-2 back to idle
-sqlite3 "$CASPARIAN_DB" "UPDATE cf_worker_node SET status = 'idle', current_job_id = NULL WHERE hostname = 'worker-2'"
+duckdb "$CASPARIAN_DB" "UPDATE cf_worker_node SET status = 'idle', current_job_id = NULL WHERE hostname = 'worker-2'"
 OUTPUT=$($BINARY worker-cli remove worker-2 2>&1)
 if echo "$OUTPUT" | grep -q "removed"; then
     echo "PASS: Worker removed"
@@ -212,7 +213,7 @@ else
     echo "FAIL: Expected removal confirmation"
     exit 1
 fi
-COUNT=$(sqlite3 "$CASPARIAN_DB" "SELECT COUNT(*) FROM cf_worker_node WHERE hostname = 'worker-2'")
+COUNT=$(duckdb "$CASPARIAN_DB" "SELECT COUNT(*) FROM cf_worker_node WHERE hostname = 'worker-2'")
 if [ "$COUNT" = "0" ]; then
     echo "PASS: Worker removed from database"
 else
@@ -241,7 +242,7 @@ else
     echo "FAIL: Expected removal confirmation"
     exit 1
 fi
-COUNT=$(sqlite3 "$CASPARIAN_DB" "SELECT COUNT(*) FROM cf_worker_node WHERE hostname = 'worker-1'")
+COUNT=$(duckdb "$CASPARIAN_DB" "SELECT COUNT(*) FROM cf_worker_node WHERE hostname = 'worker-1'")
 if [ "$COUNT" = "0" ]; then
     echo "PASS: Worker removed from database"
 else
@@ -249,7 +250,7 @@ else
     exit 1
 fi
 # Check that job was requeued
-STATUS=$(sqlite3 "$CASPARIAN_DB" "SELECT status FROM cf_processing_queue WHERE id = 42")
+STATUS=$(duckdb "$CASPARIAN_DB" "SELECT status FROM cf_processing_queue WHERE id = 42")
 if [ "$STATUS" = "QUEUED" ]; then
     echo "PASS: Job was requeued"
 else
@@ -260,7 +261,7 @@ echo
 
 # Test 12: Worker status with no workers
 echo "Test 12: Worker status with no workers"
-sqlite3 "$CASPARIAN_DB" "DELETE FROM cf_worker_node"
+duckdb "$CASPARIAN_DB" "DELETE FROM cf_worker_node"
 OUTPUT=$($BINARY worker-cli status 2>&1)
 if echo "$OUTPUT" | grep -q "No workers\|Total:.*0"; then
     echo "PASS: Empty workers message shown"

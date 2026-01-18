@@ -12,6 +12,7 @@ casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
 casparian_mcp = { path = "../casparian_mcp" }
 casparian_protocol = { path = "../casparian_protocol" }
+casparian_sinks = { path = "../casparian_sinks" }
 casparian_security = { path = "../casparian_security" }
 casparian_db = { path = "../casparian_db", default-features = false, features = ["sqlite"] }
 
@@ -35,6 +36,7 @@ zeromq.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.8"
+serde_yaml = "0.9"
 
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
@@ -108,3 +110,8 @@ ureq = "2"
 futures = "0.3"
 portable-pty = "0.8"
 filetime = "0.2"
+criterion = "0.5"
+
+[[bench]]
+name = "scanner_perf"
+harness = false

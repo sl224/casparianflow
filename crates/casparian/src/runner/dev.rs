@@ -57,7 +57,7 @@ impl Runner for DevRunner {
             source_code: source,
             file_path: input.to_string_lossy().to_string(),
             job_id: 0, // Dev mode uses job_id 0
-            file_version_id: 0,
+            file_id: 0,
             shim_path,
         };
 

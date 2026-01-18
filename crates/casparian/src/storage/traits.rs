@@ -13,8 +13,8 @@ use std::time::Duration;
 pub struct Job {
     /// Unique job identifier.
     pub id: i64,
-    /// Reference to the file version being processed.
-    pub file_version_id: i64,
+    /// Reference to the file being processed.
+    pub file_id: i64,
     /// Name of the plugin/parser to execute.
     pub plugin_name: String,
     /// Current job status (QUEUED, RUNNING, COMPLETE, FAILED).
@@ -57,11 +57,79 @@ pub struct QuarantinedRow {
     pub raw_data: Vec<u8>,
 }
 
+/// A selection specification defining how files are chosen.
+#[derive(Debug, Clone)]
+pub struct SelectionSpec {
+    pub id: String,
+    pub spec_json: String,
+    pub created_at: String,
+}
+
+/// A resolved snapshot of files for a logical execution date.
+#[derive(Debug, Clone)]
+pub struct SelectionSnapshot {
+    pub id: String,
+    pub spec_id: String,
+    pub snapshot_hash: String,
+    pub logical_date: String,
+    pub watermark_value: Option<String>,
+    pub created_at: String,
+}
+
+/// Optional watermark field used for incremental selections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatermarkField {
+    Mtime,
+}
+
+/// Structured filters for selecting files from the catalog.
+#[derive(Debug, Clone, Default)]
+pub struct SelectionFilters {
+    pub source_id: Option<String>,
+    pub tag: Option<String>,
+    pub extension: Option<String>,
+    pub since_ms: Option<i64>,
+    pub watermark: Option<WatermarkField>,
+}
+
+/// Result of resolving a selection against a logical execution time.
+#[derive(Debug, Clone)]
+pub struct SelectionResolution {
+    pub file_ids: Vec<i64>,
+    pub watermark_value: Option<String>,
+}
+
+/// A pipeline configuration with versioning.
+#[derive(Debug, Clone)]
+pub struct Pipeline {
+    pub id: String,
+    pub name: String,
+    pub version: i64,
+    pub config_json: String,
+    pub created_at: String,
+}
+
+/// A single pipeline run for a logical execution date.
+#[derive(Debug, Clone)]
+pub struct PipelineRun {
+    pub id: String,
+    pub pipeline_id: String,
+    pub selection_spec_id: String,
+    pub selection_snapshot_hash: String,
+    pub context_snapshot_hash: Option<String>,
+    pub logical_date: String,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
 /// Job store trait for managing the processing queue.
 ///
 /// Handles job lifecycle: claim, heartbeat, complete, fail, and stale recovery.
 #[async_trait]
 pub trait JobStore: Send + Sync {
+    /// Enqueue a new job for processing.
+    async fn enqueue_job(&self, file_id: i64, plugin_name: &str, priority: i32) -> Result<i64>;
     /// Claim the next available job for processing.
     ///
     /// Returns `None` if no jobs are available.
@@ -122,4 +190,36 @@ pub trait QuarantineStore: Send + Sync {
 
     /// Get all quarantined rows for a job.
     async fn get_quarantined(&self, job_id: i64) -> Result<Vec<QuarantinedRow>>;
+}
+
+/// Pipeline store trait for selection specs, snapshots, and pipeline runs.
+#[async_trait]
+pub trait PipelineStore: Send + Sync {
+    async fn create_selection_spec(&self, spec_json: &str) -> Result<String>;
+    async fn create_selection_snapshot(
+        &self,
+        spec_id: &str,
+        snapshot_hash: &str,
+        logical_date: &str,
+        watermark_value: Option<&str>,
+    ) -> Result<String>;
+    async fn insert_snapshot_files(&self, snapshot_id: &str, file_ids: &[i64]) -> Result<()>;
+    async fn create_pipeline(&self, name: &str, version: i64, config_json: &str) -> Result<String>;
+    async fn get_latest_pipeline(&self, name: &str) -> Result<Option<Pipeline>>;
+    async fn create_pipeline_run(
+        &self,
+        pipeline_id: &str,
+        selection_spec_id: &str,
+        selection_snapshot_hash: &str,
+        context_snapshot_hash: Option<&str>,
+        logical_date: &str,
+        status: &str,
+    ) -> Result<String>;
+    async fn set_pipeline_run_status(&self, run_id: &str, status: &str) -> Result<()>;
+    async fn pipeline_run_exists(&self, pipeline_id: &str, logical_date: &str) -> Result<bool>;
+    async fn resolve_selection_files(
+        &self,
+        filters: &SelectionFilters,
+        logical_date_ms: i64,
+    ) -> Result<SelectionResolution>;
 }

@@ -3275,17 +3275,54 @@ fn render_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, _wid
             format!("           {} files", job.items_processed)
         }
         (JobType::Parse, JobStatus::Failed) => {
-            format!("           {} files failed • {}", job.items_failed,
-                job.failures.first().map(|f| f.error.as_str()).unwrap_or("Unknown error"))
+            let logical = job
+                .logical_date
+                .as_deref()
+                .map(|date| format!(" • {}", date))
+                .unwrap_or_default();
+            format!(
+                "           {} files failed • {}{}",
+                job.items_failed,
+                job.failures.first().map(|f| f.error.as_str()).unwrap_or("Unknown error"),
+                logical
+            )
         }
         (JobType::Parse, JobStatus::Completed) => {
             let path = job.output_path.as_deref().unwrap_or("");
             let size = job.output_size_bytes.map(format_size).unwrap_or_default();
-            format!("           {} files → {} ({})", job.items_processed, truncate_path(path, 40), size)
+            let quarantine = job
+                .quarantine_rows
+                .filter(|rows| *rows > 0)
+                .map(|rows| format!(" • quarantine {}", rows))
+                .unwrap_or_default();
+            let logical = job
+                .logical_date
+                .as_deref()
+                .map(|date| format!(" • {}", date))
+                .unwrap_or_default();
+            format!(
+                "           {} files → {} ({}){}{}",
+                job.items_processed,
+                truncate_path(path, 40),
+                size,
+                quarantine,
+                logical
+            )
         }
         (JobType::Parse, JobStatus::Running) => {
             let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
-            format!("           {}/{} files • ETA {}", job.items_processed, job.items_total, eta)
+            let logical = job
+                .logical_date
+                .as_deref()
+                .map(|date| format!(" • {}", date))
+                .unwrap_or_default();
+            format!(
+                "           {}/{} files • ETA {}{}",
+                job.items_processed,
+                job.items_total,
+                eta,
+                logical
+            )
         }
         (JobType::Backtest, _) => {
             if let Some(ref bt) = job.backtest {
@@ -3340,6 +3377,26 @@ fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
             job.started_at.format("%H:%M:%S"),
             format_duration(job.started_at, job.completed_at)
         );
+
+        if job.pipeline_run_id.is_some()
+            || job.logical_date.is_some()
+            || job.selection_snapshot_hash.is_some()
+            || job.quarantine_rows.is_some()
+        {
+            detail.push_str("\nPIPELINE\n");
+            if let Some(ref run_id) = job.pipeline_run_id {
+                detail.push_str(&format!("Run:        {}\n", run_id));
+            }
+            if let Some(ref logical_date) = job.logical_date {
+                detail.push_str(&format!("Logical:    {}\n", logical_date));
+            }
+            if let Some(ref snapshot) = job.selection_snapshot_hash {
+                detail.push_str(&format!("Snapshot:   {}\n", snapshot));
+            }
+            if let Some(rows) = job.quarantine_rows {
+                detail.push_str(&format!("Quarantine: {} rows\n", rows));
+            }
+        }
 
         if let Some(ref path) = job.output_path {
             detail.push_str(&format!("\nOUTPUT\n{}\n", path));
@@ -4042,13 +4099,17 @@ mod tests {
     fn create_test_job(id: i64, name: &str, status: JobStatus) -> JobInfo {
         JobInfo {
             id,
-            file_version_id: Some(id * 100),
+            file_id: Some(id * 100),
             job_type: JobType::Parse,
             name: name.to_string(),
             version: Some("1.0.0".to_string()),
             status,
             started_at: Local::now(),
             completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
             items_total: 100,
             items_processed: 50,
             items_failed: 0,

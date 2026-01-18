@@ -7,15 +7,11 @@
 //! - Jobs tracked with JoinHandles for cancellation and bounded concurrency
 //! - Graceful shutdown via shutdown channel
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use thiserror::Error;
-use arrow::array::RecordBatch;
 use casparian_protocol::types::{self, DispatchCommand, HeartbeatStatus, JobStatus, PrepareEnvCommand};
 use casparian_protocol::{Message, OpCode};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +22,10 @@ use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::bridge::{self, BridgeConfig};
 use crate::venv_manager::VenvManager;
+use arrow::array::{Array, ArrayRef, BooleanArray, LargeStringArray, StringArray};
+use arrow::compute::filter_record_batch;
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 
 // ============================================================================
 // Error Types
@@ -525,12 +525,19 @@ async fn execute_job(
     shim_path: PathBuf,
 ) -> types::JobReceipt {
     match execute_job_inner(job_id, &cmd, &venv_manager, &parquet_root, &shim_path).await {
-        Ok((rows, artifacts)) => {
+        Ok((rows, quarantine_rows, artifacts)) => {
             let mut metrics = HashMap::new();
             metrics.insert("rows".to_string(), rows as i64);
+            if quarantine_rows > 0 {
+                metrics.insert("quarantine_rows".to_string(), quarantine_rows as i64);
+            }
 
             types::JobReceipt {
-                status: JobStatus::Success,
+                status: if quarantine_rows > 0 {
+                    JobStatus::CompletedWithWarnings
+                } else {
+                    JobStatus::Success
+                },
                 metrics,
                 artifacts,
                 error_message: None,
@@ -567,7 +574,7 @@ async fn execute_job_inner(
     venv_manager: &VenvManager,
     parquet_root: &std::path::Path,
     shim_path: &std::path::Path,
-) -> std::result::Result<(usize, Vec<HashMap<String, String>>), WorkerError> {
+) -> std::result::Result<(usize, usize, Vec<HashMap<String, String>>), WorkerError> {
     // Determine interpreter path
     let interpreter = if cmd.env_hash == "system" {
         // Use system Python for legacy plugins without lockfile
@@ -604,7 +611,7 @@ async fn execute_job_inner(
         source_code: cmd.source_code.clone(),
         file_path: cmd.file_path.clone(),
         job_id,
-        file_version_id: cmd.file_version_id,
+        file_id: cmd.file_id,
         shim_path: shim_path.to_path_buf(),
     };
 
@@ -654,29 +661,181 @@ async fn execute_job_inner(
         debug!("Job {} logs ({} bytes):\n{}", job_id, bridge_result.logs.len(), bridge_result.logs);
     }
 
-    // Write to Parquet - I/O errors are transient
+    let default_sink = format!("parquet://{}", parquet_root.display());
+    let sink_uri = cmd
+        .sinks
+        .first()
+        .map(|s| s.uri.as_str())
+        .unwrap_or(default_sink.as_str());
+
+    let descriptors: Vec<casparian_sinks::OutputDescriptor> = bridge_result
+        .output_info
+        .iter()
+        .map(|info| casparian_sinks::OutputDescriptor {
+            name: info.name.clone(),
+            table: info.table.clone(),
+        })
+        .collect();
+
+    let outputs = casparian_sinks::plan_outputs(&descriptors, &batches, "output")
+        .map_err(|e| WorkerError::Permanent { message: e.to_string() })?;
+
+    let job_id_str = job_id.to_string();
+
     let mut total_rows = 0;
+    let mut quarantine_rows = 0;
     let mut artifacts = Vec::new();
 
-    for sink_config in &cmd.sinks {
-        let output_path = write_parquet(parquet_root, job_id, &sink_config.topic, &batches)
-            .map_err(|e| WorkerError::Transient {
-                message: format!("Failed to write parquet: {}", e),
-            })?;
+    let mut valid_owned = Vec::new();
+    let mut quarantine_owned = Vec::new();
 
-        total_rows = batches.iter().map(|b| b.num_rows()).sum();
+    for output in outputs {
+        let (valid_batches, quarantine_batches, quarantined) =
+            split_output_batches(&output.batches)
+                .map_err(|e| WorkerError::Permanent { message: e.to_string() })?;
+        quarantine_rows += quarantined;
 
-        let mut artifact = HashMap::new();
-        artifact.insert("topic".to_string(), sink_config.topic.clone());
-        artifact.insert(
-            "uri".to_string(),
-            format!("file://{}", output_path.display()),
-        );
-        artifacts.push(artifact);
+        if !valid_batches.is_empty() {
+            valid_owned.push(OwnedOutput {
+                name: output.name.clone(),
+                table: output.table.clone(),
+                batches: valid_batches,
+            });
+        }
+        if !quarantine_batches.is_empty() {
+            let quarantine_name = format!("{}_quarantine", output.name);
+            let quarantine_table = output
+                .table
+                .as_ref()
+                .map(|t| format!("{}_quarantine", t));
+            quarantine_owned.push(OwnedOutput {
+                name: quarantine_name,
+                table: quarantine_table,
+                batches: quarantine_batches,
+            });
+        }
     }
 
-    info!("Job {} complete: {} rows", job_id, total_rows);
-    Ok((total_rows, artifacts))
+    if !valid_owned.is_empty() {
+        let plans = to_output_plans(&valid_owned);
+        let written = casparian_sinks::write_output_plan(sink_uri, &plans, &job_id_str)
+            .map_err(|e| WorkerError::Transient { message: e.to_string() })?;
+        for output in written {
+            total_rows += output.rows as usize;
+            let mut artifact = HashMap::new();
+            artifact.insert("topic".to_string(), output.name);
+            artifact.insert("uri".to_string(), output.uri);
+            artifacts.push(artifact);
+        }
+    }
+
+    if !quarantine_owned.is_empty() {
+        let plans = to_output_plans(&quarantine_owned);
+        let written = casparian_sinks::write_output_plan(sink_uri, &plans, &job_id_str)
+            .map_err(|e| WorkerError::Transient { message: e.to_string() })?;
+        for output in written {
+            let mut artifact = HashMap::new();
+            artifact.insert("topic".to_string(), output.name);
+            artifact.insert("uri".to_string(), output.uri);
+            artifacts.push(artifact);
+        }
+    }
+
+    info!(
+        "Job {} complete: {} rows ({} quarantined)",
+        job_id, total_rows, quarantine_rows
+    );
+    Ok((total_rows, quarantine_rows, artifacts))
+}
+
+struct OwnedOutput {
+    name: String,
+    table: Option<String>,
+    batches: Vec<RecordBatch>,
+}
+
+fn to_output_plans<'a>(outputs: &'a [OwnedOutput]) -> Vec<casparian_sinks::OutputPlan<'a>> {
+    outputs
+        .iter()
+        .map(|output| casparian_sinks::OutputPlan {
+            name: output.name.clone(),
+            table: output.table.clone(),
+            batches: output.batches.iter().collect(),
+        })
+        .collect()
+}
+
+fn split_output_batches(
+    batches: &[&RecordBatch],
+) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>, usize)> {
+    let mut valid_batches = Vec::new();
+    let mut quarantine_batches = Vec::new();
+    let mut quarantined = 0;
+
+    for batch in batches {
+        let Some(error_idx) = batch.schema().index_of("_cf_row_error").ok() else {
+            valid_batches.push((*batch).clone());
+            continue;
+        };
+
+        let error_col = batch.column(error_idx).clone();
+        let (valid_mask, invalid_mask) = build_quarantine_masks(&error_col)?;
+
+        let valid_batch = filter_record_batch(batch, &valid_mask)?;
+        if valid_batch.num_rows() > 0 {
+            valid_batches.push(valid_batch);
+        }
+
+        let quarantine_batch = filter_record_batch(batch, &invalid_mask)?;
+        if quarantine_batch.num_rows() > 0 {
+            quarantined += quarantine_batch.num_rows();
+            quarantine_batches.push(quarantine_batch);
+        }
+    }
+
+    Ok((valid_batches, quarantine_batches, quarantined))
+}
+
+fn build_quarantine_masks(error_col: &ArrayRef) -> Result<(BooleanArray, BooleanArray)> {
+    let mut valid_flags = Vec::with_capacity(error_col.len());
+    let mut invalid_flags = Vec::with_capacity(error_col.len());
+
+    match error_col.data_type() {
+        DataType::Utf8 => {
+            let arr = error_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("_cf_row_error column is not Utf8"))?;
+            for i in 0..arr.len() {
+                let is_valid = arr.is_null(i) || arr.value(i).is_empty();
+                valid_flags.push(is_valid);
+                invalid_flags.push(!is_valid);
+            }
+        }
+        DataType::LargeUtf8 => {
+            let arr = error_col
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| anyhow::anyhow!("_cf_row_error column is not LargeUtf8"))?;
+            for i in 0..arr.len() {
+                let is_valid = arr.is_null(i) || arr.value(i).is_empty();
+                valid_flags.push(is_valid);
+                invalid_flags.push(!is_valid);
+            }
+        }
+        _ => {
+            for i in 0..error_col.len() {
+                let is_valid = error_col.is_null(i);
+                valid_flags.push(is_valid);
+                invalid_flags.push(!is_valid);
+            }
+        }
+    }
+
+    Ok((
+        BooleanArray::from(valid_flags),
+        BooleanArray::from(invalid_flags),
+    ))
 }
 
 /// Send a protocol message as multipart (header + body in one ZMQ message)
@@ -698,80 +857,12 @@ async fn send_message<T: serde::Serialize>(
     Ok(())
 }
 
-/// Write Arrow batches to Parquet with collision protection
-///
-/// Uses job_id + timestamp in filename to prevent overwrites if job is rerun.
-/// Format: {job_id}_{topic}_{timestamp}.parquet
-fn write_parquet(
-    root: &std::path::Path,
-    job_id: u64,
-    topic: &str,
-    batches: &[RecordBatch],
-) -> Result<PathBuf> {
-    if batches.is_empty() {
-        anyhow::bail!("[Job {}] No batches to write for topic '{}'", job_id, topic);
-    }
-
-    std::fs::create_dir_all(root)
-        .with_context(|| format!("[Job {}] Failed to create output directory: {}", job_id, root.display()))?;
-
-    // Include timestamp to prevent overwrites on job rerun
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let filename = format!("{}_{}_{}.parquet", job_id, topic, timestamp);
-    let path = root.join(&filename);
-
-    // Double-check we're not overwriting (should never happen with timestamp)
-    if path.exists() {
-        warn!(
-            "[Job {}] Parquet file already exists (unlikely with timestamp): {}",
-            job_id,
-            path.display()
-        );
-    }
-
-    let file = File::create(&path)
-        .with_context(|| format!("[Job {}] Failed to create parquet file: {}", job_id, path.display()))?;
-
-    let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let schema = batches[0].schema();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
-        .with_context(|| format!(
-            "[Job {}] Failed to create Arrow writer for schema {:?}",
-            job_id, schema
-        ))?;
-
-    let mut total_rows = 0;
-    for batch in batches {
-        writer.write(batch)
-            .with_context(|| format!(
-                "[Job {}] Failed to write batch ({} rows) to parquet",
-                job_id, batch.num_rows()
-            ))?;
-        total_rows += batch.num_rows();
-    }
-
-    writer.close()
-        .with_context(|| format!("[Job {}] Failed to close parquet writer", job_id))?;
-
-    info!(
-        "[Job {}] Wrote {} rows to parquet: {}",
-        job_id,
-        total_rows,
-        path.display()
-    );
-
-    Ok(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     #[test]
     fn test_worker_config() {
@@ -887,5 +978,43 @@ mod tests {
         assert!(!permanent.is_transient());
         assert!(transient.is_transient());
         assert!(!transient.is_permanent());
+    }
+
+    #[test]
+    fn test_split_output_batches_quarantine() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_cf_row_error", DataType::Utf8, true),
+        ]));
+
+        let ids = Int64Array::from(vec![1, 2, 3]);
+        let errors = StringArray::from(vec![None, Some("bad"), Some("")]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids) as ArrayRef, Arc::new(errors) as ArrayRef],
+        )
+        .unwrap();
+
+        let (valid, quarantine, quarantined) = split_output_batches(&[&batch]).unwrap();
+        let valid_rows: usize = valid.iter().map(|b| b.num_rows()).sum();
+        let quarantine_rows: usize = quarantine.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(quarantined, 1);
+        assert_eq!(valid_rows, 2);
+        assert_eq!(quarantine_rows, 1);
+    }
+
+    #[test]
+    fn test_split_output_batches_no_error_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ids = Int64Array::from(vec![10, 20, 30]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids) as ArrayRef]).unwrap();
+
+        let (valid, quarantine, quarantined) = split_output_batches(&[&batch]).unwrap();
+        let valid_rows: usize = valid.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(quarantined, 0);
+        assert_eq!(valid_rows, 3);
+        assert!(quarantine.is_empty());
     }
 }

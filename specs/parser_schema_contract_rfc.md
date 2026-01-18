@@ -1,5 +1,7 @@
 # RFC: Parser Schema Contract System
 
+**Deprecation Notice:** Superseded by `docs/schema_rfc.md` (implementation-ready). This file is retained for historical review.
+
 **Status:** Draft (Revised after external review)
 **Version:** 0.2
 **Date:** 2026-01-16

@@ -298,7 +298,7 @@ mod tests {
 import polars as pl
 
 TOPIC = "test"
-SINK = "sqlite"
+SINK = "duckdb"
 
 class TestParser:
     name = "test"
@@ -339,7 +339,7 @@ import polars as pl
 import subprocess
 
 TOPIC = "test"
-SINK = "sqlite"
+SINK = "duckdb"
 
 def parse(ctx):
     pass
@@ -356,7 +356,7 @@ def parse(ctx):
 
         let code = r#"
 TOPIC = "test"
-SINK = "sqlite"
+SINK = "duckdb"
 
 def parse(ctx):
     pass

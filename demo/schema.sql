@@ -1,42 +1,14 @@
 -- Demo Database Schema (SQLite)
 -- For E2E UI Demo with slow_processor plugin
 
-CREATE TABLE IF NOT EXISTS cf_source_root (
+CREATE TABLE IF NOT EXISTS scout_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    path TEXT NOT NULL UNIQUE,
-    type TEXT DEFAULT 'local',
-    active INTEGER DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS cf_file_location (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_root_id INTEGER NOT NULL,
-    rel_path TEXT NOT NULL,
-    filename TEXT NOT NULL,
-    last_known_mtime REAL,
-    last_known_size INTEGER,
-    current_version_id INTEGER,
-    discovered_time TEXT DEFAULT CURRENT_TIMESTAMP,
-    last_seen_time TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (source_root_id) REFERENCES cf_source_root(id)
-);
-
-CREATE TABLE IF NOT EXISTS cf_file_hash_registry (
-    content_hash TEXT PRIMARY KEY,
-    first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-    size_bytes INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS cf_file_version (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    location_id INTEGER NOT NULL,
-    content_hash TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
-    modified_time TEXT NOT NULL,
-    detected_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    applied_tags TEXT DEFAULT '',
-    FOREIGN KEY (location_id) REFERENCES cf_file_location(id),
-    FOREIGN KEY (content_hash) REFERENCES cf_file_hash_registry(content_hash)
+    path TEXT NOT NULL,
+    rel_path TEXT,
+    size INTEGER,
+    mtime INTEGER,
+    status TEXT DEFAULT 'pending',
+    tag TEXT
 );
 
 CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
@@ -58,7 +30,8 @@ CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
 
 CREATE TABLE IF NOT EXISTS cf_processing_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_version_id INTEGER NOT NULL,
+    file_id INTEGER NOT NULL,
+    pipeline_run_id TEXT,
     plugin_name TEXT NOT NULL,
     config_overrides TEXT,
     status TEXT NOT NULL DEFAULT 'PENDING',
@@ -70,7 +43,7 @@ CREATE TABLE IF NOT EXISTS cf_processing_queue (
     result_summary TEXT,
     error_message TEXT,
     retry_count INTEGER DEFAULT 0,
-    FOREIGN KEY (file_version_id) REFERENCES cf_file_version(id)
+    FOREIGN KEY (file_id) REFERENCES scout_files(id)
 );
 
 CREATE INDEX IF NOT EXISTS ix_queue_pop ON cf_processing_queue(status, priority, id);
@@ -133,21 +106,9 @@ CREATE INDEX IF NOT EXISTS ix_routing_priority ON cf_routing_rules(priority DESC
 -- Demo Data - Slow Processor Plugin
 -- ============================================================================
 
--- Source root (demo data directory)
-INSERT INTO cf_source_root (id, path, type, active)
-VALUES (1, 'DEMO_DIR/data', 'local', 1);
-
--- File hash registry
-INSERT INTO cf_file_hash_registry (content_hash, size_bytes)
-VALUES ('demo_sample_data_hash', 750);
-
--- File location
-INSERT INTO cf_file_location (id, source_root_id, rel_path, filename)
-VALUES (1, 1, 'sample_data.csv', 'sample_data.csv');
-
--- File version
-INSERT INTO cf_file_version (id, location_id, content_hash, size_bytes, modified_time)
-VALUES (1, 1, 'demo_sample_data_hash', 750, datetime('now'));
+-- Scout file (demo data directory)
+INSERT INTO scout_files (id, path, rel_path, size, mtime, status, tag)
+VALUES (1, 'DEMO_DIR/data/sample_data.csv', 'sample_data.csv', 750, strftime('%s','now') * 1000, 'pending', 'demo');
 
 -- Plugin manifest (ACTIVE status) - The slow processor
 INSERT INTO cf_plugin_manifest (plugin_name, version, source_code, source_hash, status, env_hash)
@@ -207,7 +168,7 @@ VALUES
 
 -- Pre-completed jobs with output files (for immediate Data tab testing)
 -- These get IDs 1-4 automatically
-INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, end_time, result_summary)
+INSERT INTO cf_processing_queue (file_id, plugin_name, status, priority, end_time, result_summary)
 VALUES
     (1, 'slow_processor', 'COMPLETED', 0, datetime('now', '-5 minutes'), 'DEMO_DIR/output/processed_output.parquet'),
     (1, 'data_validator', 'COMPLETED', 0, datetime('now', '-3 minutes'), 'DEMO_DIR/output/validated.parquet'),
@@ -215,12 +176,12 @@ VALUES
     (1, 'simple_transform', 'COMPLETED', 0, datetime('now', '-1 minutes'), 'DEMO_DIR/output/mixed_types.parquet');
 
 -- Pre-failed job for testing error display (ID 5)
-INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority, end_time, error_message)
+INSERT INTO cf_processing_queue (file_id, plugin_name, status, priority, end_time, error_message)
 VALUES
     (1, 'broken_plugin', 'FAILED', 0, datetime('now', '-30 seconds'), 'ModuleNotFoundError: No module named ''pandas''');
 
 -- Queue jobs for processing (IDs 6, 7, 8 - will be processed by the worker)
-INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority)
+INSERT INTO cf_processing_queue (file_id, plugin_name, status, priority)
 VALUES
     (1, 'slow_processor', 'QUEUED', 10),
     (1, 'slow_processor', 'QUEUED', 5),

@@ -147,7 +147,7 @@ The workflow has 6 phases, each with specific tools and approval gates.
 **Bridge Protocol format:**
 ```python
 TOPIC = "schema_name"
-SINK = "parquet"  # or "csv", "sqlite"
+SINK = "parquet"  # or "csv", "duckdb"
 
 def parse(file_path: str) -> pl.DataFrame:
     # Read file

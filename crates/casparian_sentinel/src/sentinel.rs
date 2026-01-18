@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend};
 
 use crate::db::{models::*, JobQueue};
+use casparian_db::{DbConnection, DbValue, UnifiedDbRow};
 use crate::metrics::METRICS;
 
 /// Workers are considered stale after this many seconds without heartbeat
@@ -20,6 +21,13 @@ const WORKER_TIMEOUT_SECS: f64 = 60.0;
 
 /// How often to run cleanup (seconds)
 const CLEANUP_INTERVAL_SECS: f64 = 10.0;
+
+/// Dispatch backoff base (ms) when queue is empty or blocked
+const DISPATCH_BACKOFF_BASE_MS: u64 = 50;
+/// Dispatch backoff max (ms)
+const DISPATCH_BACKOFF_MAX_MS: u64 = 1_000;
+/// Dispatch backoff jitter cap (ms)
+const DISPATCH_BACKOFF_JITTER_MS: u64 = 50;
 
 // ============================================================================
 // Circuit Breaker & Retry Constants
@@ -36,12 +44,23 @@ const BACKOFF_BASE_SECS: u64 = 4;
 const CIRCUIT_BREAKER_THRESHOLD: i32 = 5;
 
 /// Result of the combined dispatch query (file path + manifest data)
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 struct DispatchQueryResult {
     file_path: String,
     source_code: String,
     env_hash: Option<String>,
     artifact_hash: Option<String>,
+}
+
+impl DispatchQueryResult {
+    fn from_row(row: &UnifiedDbRow) -> Result<Self> {
+        Ok(Self {
+            file_path: row.get_by_name("file_path")?,
+            source_code: row.get_by_name("source_code")?,
+            env_hash: row.get_by_name("env_hash")?,
+            artifact_hash: row.get_by_name("artifact_hash")?,
+        })
+    }
 }
 
 /// Connected worker state (kept in memory, not persisted)
@@ -114,30 +133,29 @@ pub struct Sentinel {
     socket: RouterSocket,
     workers: HashMap<Vec<u8>, ConnectedWorker>,
     queue: JobQueue,
-    pool: casparian_db::DbPool,  // Database pool for queries
+    conn: DbConnection,  // Database connection for queries
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     running: bool,
     last_cleanup: f64, // Last time we ran stale worker cleanup
     /// Jobs orphaned by stale workers - need to be failed asynchronously
     orphaned_jobs: Vec<i64>,
+    dispatch_backoff_ms: u64,
+    dispatch_cooldown_until: Option<Instant>,
 }
 
 impl Sentinel {
     /// Create and bind Sentinel
     pub async fn bind(config: SentinelConfig) -> Result<Self> {
-        // Connect to database using casparian_db
-        let db_config = casparian_db::DbConfig::from_url(&config.database_url, casparian_db::License::community())
-            .context("Invalid database URL")?;
-        let pool = casparian_db::create_pool(db_config)
+        let conn = DbConnection::open_from_url(&config.database_url)
             .await
             .context("Failed to connect to database")?;
 
-        // Load topic configs into memory (before moving pool)
-        let topic_map = Self::load_topic_configs(&pool).await?;
+        // Load topic configs into memory (before moving conn)
+        let topic_map = Self::load_topic_configs(&conn).await?;
         info!("Loaded {} plugin topic configs", topic_map.len());
 
-        // Clone pool only once for the queue
-        let queue = JobQueue::new(pool.clone());
+        // Clone connection only once for the queue
+        let queue = JobQueue::new(conn.clone());
 
         // Destructive Initialization for IPC sockets (Unix only)
         // Unlink stale socket files to prevent "Address in use" errors
@@ -165,21 +183,25 @@ impl Sentinel {
             socket,
             workers: HashMap::new(),
             queue,
-            pool,
+            conn,
             topic_map,
             running: false,
             last_cleanup: current_time(),
             orphaned_jobs: Vec::new(),
+            dispatch_backoff_ms: 0,
+            dispatch_cooldown_until: None,
         })
     }
 
     /// Load topic configurations from database into memory (non-blocking cache)
     async fn load_topic_configs(
-        pool: &casparian_db::DbPool,
+        conn: &DbConnection,
     ) -> Result<HashMap<String, Vec<SinkConfig>>> {
-        let configs: Vec<TopicConfig> = sqlx::query_as("SELECT * FROM cf_topic_config")
-            .fetch_all(pool)
-            .await?;
+        let rows = conn.query_all("SELECT * FROM cf_topic_config", &[]).await?;
+        let mut configs = Vec::with_capacity(rows.len());
+        for row in rows {
+            configs.push(TopicConfig::from_row(&row)?);
+        }
 
         let mut map: HashMap<String, Vec<SinkConfig>> = HashMap::new();
 
@@ -465,13 +487,18 @@ impl Sentinel {
 
         let conclude_start = Instant::now();
         match receipt.status {
-            JobStatus::Success => {
+            JobStatus::Success | JobStatus::CompletedWithWarnings => {
                 info!(
                     "Job {} completed: {} artifacts",
                     job_id,
                     receipt.artifacts.len()
                 );
-                self.queue.complete_job(job_id, "Success").await?;
+                let summary = if receipt.status == JobStatus::CompletedWithWarnings {
+                    "Completed with warnings"
+                } else {
+                    "Success"
+                };
+                self.queue.complete_job(job_id, summary).await?;
                 METRICS.inc_jobs_completed();
 
                 // Record success for circuit breaker
@@ -518,6 +545,9 @@ impl Sentinel {
         }
 
         METRICS.record_conclude_time(conclude_start);
+        if let Err(err) = self.update_pipeline_run_status_for_job(job_id).await {
+            warn!("Failed to update pipeline run status for job {}: {}", job_id, err);
+        }
         Ok(())
     }
 
@@ -550,11 +580,20 @@ impl Sentinel {
         })?;
 
         self.queue.fail_job(job_id, &err.message).await?;
+        if let Err(err) = self.update_pipeline_run_status_for_job(job_id).await {
+            warn!("Failed to update pipeline run status for job {}: {}", job_id, err);
+        }
         Ok(())
     }
 
     /// Dispatch loop: assign jobs to ALL idle workers (not just one per iteration)
     async fn dispatch_loop(&mut self) -> Result<()> {
+        if let Some(cooldown_until) = self.dispatch_cooldown_until {
+            if Instant::now() < cooldown_until {
+                return Ok(());
+            }
+        }
+
         // Collect idle worker identities first (to avoid borrow issues)
         let idle_identities: Vec<Vec<u8>> = self
             .workers
@@ -568,11 +607,13 @@ impl Sentinel {
         }
 
         let mut remaining_workers = idle_identities;
+        let mut dispatched_any = false;
 
         // Dispatch jobs to ALL idle workers (batch dispatch)
         while !remaining_workers.is_empty() {
             // Peek at next job without popping
             let Some(job) = self.queue.peek_job().await? else {
+                self.schedule_dispatch_backoff();
                 break; // No more jobs
             };
 
@@ -593,18 +634,151 @@ impl Sentinel {
                         debug!("Job claimed by another sentinel between peek and pop - continuing");
                         continue;
                     };
+                    if let Some(run_id) = job.pipeline_run_id.as_deref() {
+                        if let Err(err) = self.set_pipeline_run_running(run_id).await {
+                            warn!("Failed to set pipeline run {} running: {}", run_id, err);
+                        }
+                    }
                     let identity = remaining_workers.remove(idx);
                     self.assign_job(identity, job).await?;
+                    dispatched_any = true;
                 }
                 None => {
                     // No capable worker for this job - leave it in queue, stop dispatching
                     // Job stays queued for when a capable worker becomes available
+                    self.schedule_dispatch_backoff();
                     break;
                 }
             }
         }
 
+        if dispatched_any {
+            self.dispatch_backoff_ms = 0;
+            self.dispatch_cooldown_until = None;
+        }
+
         Ok(())
+    }
+
+    fn schedule_dispatch_backoff(&mut self) {
+        let next = if self.dispatch_backoff_ms == 0 {
+            DISPATCH_BACKOFF_BASE_MS
+        } else {
+            (self.dispatch_backoff_ms * 2).min(DISPATCH_BACKOFF_MAX_MS)
+        };
+        self.dispatch_backoff_ms = next;
+
+        let jitter_ms = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 % DISPATCH_BACKOFF_JITTER_MS)
+            .unwrap_or(0));
+        self.dispatch_cooldown_until = Some(Instant::now() + Duration::from_millis(next + jitter_ms));
+    }
+
+    async fn update_pipeline_run_status_for_job(&self, job_id: i64) -> Result<()> {
+        let run_id = self
+            .conn
+            .query_optional(
+                "SELECT pipeline_run_id FROM cf_processing_queue WHERE id = ?",
+                &[DbValue::from(job_id)],
+            )
+            .await?
+            .and_then(|row| row.get_by_name::<String>("pipeline_run_id").ok());
+        let Some(run_id) = run_id else {
+            return Ok(());
+        };
+        self.update_pipeline_run_status(&run_id).await
+    }
+
+    async fn set_pipeline_run_running(&self, run_id: &str) -> Result<()> {
+        if !self.table_exists("cf_pipeline_runs").await? {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                r#"
+                UPDATE cf_pipeline_runs
+                SET status = 'running',
+                    started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
+                WHERE id = ?
+                "#,
+                &[DbValue::from(run_id)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn update_pipeline_run_status(&self, run_id: &str) -> Result<()> {
+        if !self.table_exists("cf_pipeline_runs").await? {
+            return Ok(());
+        }
+
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT
+                    SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN status IN ('QUEUED', 'RUNNING') THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed
+                FROM cf_processing_queue
+                WHERE pipeline_run_id = ?
+                "#,
+                &[DbValue::from(run_id)],
+            )
+            .await?;
+
+        let Some(row) = row else {
+            return Ok(());
+        };
+
+        let failed: i64 = row.get_by_name("failed").unwrap_or(0);
+        let active: i64 = row.get_by_name("active").unwrap_or(0);
+        let completed: i64 = row.get_by_name("completed").unwrap_or(0);
+
+        if failed > 0 {
+            self.conn
+                .execute(
+                    "UPDATE cf_pipeline_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    &[DbValue::from(run_id)],
+                )
+                .await?;
+            return Ok(());
+        }
+
+        if active > 0 {
+            self.set_pipeline_run_running(run_id).await?;
+            return Ok(());
+        }
+
+        if completed > 0 {
+            self.conn
+                .execute(
+                    "UPDATE cf_pipeline_runs SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    &[DbValue::from(run_id)],
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn table_exists(&self, table: &str) -> Result<bool> {
+        let (query, param) = match self.conn.backend_name() {
+            "DuckDB" => (
+                "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+                DbValue::from(table),
+            ),
+            "SQLite" => (
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+                DbValue::from(table),
+            ),
+            _ => (
+                "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+                DbValue::from(table),
+            ),
+        };
+        Ok(self.conn.query_optional(query, &[param]).await?.is_some())
     }
 
     /// Assign a job to a worker
@@ -623,41 +797,52 @@ impl Sentinel {
 
         info!("Assigning job {} to worker", job.id);
 
-        // Get sink configs from cache
+        // Get sink configs from cache (v1: single job-level sink)
         let mut sinks = self.topic_map.get(&job.plugin_name).cloned().unwrap_or_default();
 
-        // Add default output sink if none configured
-        if !sinks.iter().any(|s| s.topic == "output") {
+        if sinks.is_empty() {
             sinks.push(SinkConfig {
                 topic: "output".to_string(),
-                uri: format!("parquet://{}_output.parquet", job.plugin_name),
+                uri: "parquet://./output".to_string(),
                 mode: SinkMode::Append,
                 schema_def: None,
             });
+        } else if sinks.len() > 1 {
+            warn!(
+                "Multiple sink configs found for plugin '{}'; v1 uses the first entry only",
+                job.plugin_name
+            );
+            sinks.truncate(1);
+        }
+
+        // Normalize to a single job-level sink
+        if let Some(first) = sinks.first_mut() {
+            first.topic = "output".to_string();
         }
 
         // Load file path and manifest in single query (was 4 queries, now 1)
-        let dispatch_data: DispatchQueryResult = sqlx::query_as(
-            r#"
-            SELECT
-                sr.path || '/' || fl.rel_path as file_path,
-                pm.source_code,
-                pm.env_hash,
-                pm.artifact_hash
-            FROM cf_file_version fv
-            JOIN cf_file_location fl ON fl.id = fv.location_id
-            JOIN cf_source_root sr ON sr.id = fl.source_root_id
-            JOIN cf_plugin_manifest pm ON pm.plugin_name = ? AND pm.status = 'ACTIVE'
-            WHERE fv.id = ?
-            ORDER BY pm.created_at DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(&job.plugin_name)
-        .bind(job.file_version_id)
-        .fetch_one(&self.pool)
-        .await
-        .context("Failed to load dispatch data")?;
+        let dispatch_row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT
+                    sf.path as file_path,
+                    pm.source_code,
+                    pm.env_hash,
+                    pm.artifact_hash
+                FROM scout_files sf
+                JOIN cf_plugin_manifest pm ON pm.plugin_name = ? AND pm.status = 'ACTIVE'
+                WHERE sf.id = ?
+                ORDER BY pm.created_at DESC
+                LIMIT 1
+                "#,
+                &[DbValue::from(job.plugin_name.as_str()), DbValue::from(job.file_id)],
+            )
+            .await
+            .context("Failed to load dispatch data")?;
+
+        let dispatch_row = dispatch_row.ok_or_else(|| anyhow::anyhow!("Dispatch data missing"))?;
+        let dispatch_data = DispatchQueryResult::from_row(&dispatch_row)?;
 
         let env_hash = dispatch_data.env_hash.clone().unwrap_or_else(|| "system".to_string());
 
@@ -670,7 +855,7 @@ impl Sentinel {
             plugin_name: job.plugin_name.clone(),
             file_path: dispatch_data.file_path,
             sinks,
-            file_version_id: job.file_version_id as i64,
+            file_id: job.file_id as i64,
             env_hash,
             source_code: dispatch_data.source_code,
             artifact_hash: dispatch_data.artifact_hash,
@@ -725,57 +910,86 @@ impl Sentinel {
         let source_hash = compute_sha256(&cmd.source_code);
 
         // 3. Execute all DB operations in a transaction
-        let mut tx = self.pool.begin().await?;
+        self.conn.execute("BEGIN TRANSACTION", &[]).await?;
+        let now = chrono::Utc::now();
 
         // 3a. Upsert the plugin environment (lockfile)
         if !cmd.lockfile_content.is_empty() {
-            sqlx::query(
-                r#"
-                INSERT INTO cf_plugin_environment (hash, lockfile_content, size_mb, last_used, created_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT(hash) DO UPDATE SET last_used = CURRENT_TIMESTAMP
-                "#,
-            )
-            .bind(&cmd.env_hash)
-            .bind(&cmd.lockfile_content)
-            .bind(cmd.lockfile_content.len() as f64 / 1_000_000.0)
-            .execute(&mut *tx)
-            .await?;
+            if let Err(e) = self
+                .conn
+                .execute(
+                    r#"
+                    INSERT INTO cf_plugin_environment (hash, lockfile_content, size_mb, last_used, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(hash) DO UPDATE SET last_used = ?
+                    "#,
+                    &[
+                        DbValue::from(cmd.env_hash.as_str()),
+                        DbValue::from(cmd.lockfile_content.as_str()),
+                        DbValue::from(cmd.lockfile_content.len() as f64 / 1_000_000.0),
+                        DbValue::from(now),
+                        DbValue::from(now),
+                        DbValue::from(now),
+                    ],
+                )
+                .await
+            {
+                let _ = self.conn.execute("ROLLBACK", &[]).await;
+                return Err(e.into());
+            }
         }
 
         // 3b. Insert the plugin manifest
-        sqlx::query(
-            r#"
-            INSERT INTO cf_plugin_manifest
-            (plugin_name, version, source_code, source_hash, status,
-             env_hash, artifact_hash, created_at)
-            VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, CURRENT_TIMESTAMP)
-            "#,
-        )
-        .bind(&cmd.plugin_name)
-        .bind(&cmd.version)
-        .bind(&cmd.source_code)
-        .bind(&source_hash)
-        .bind(&cmd.env_hash)
-        .bind(&cmd.artifact_hash)
-        .execute(&mut *tx)
-        .await?;
+        if let Err(e) = self
+            .conn
+            .execute(
+                r#"
+                INSERT INTO cf_plugin_manifest
+                (plugin_name, version, source_code, source_hash, status,
+                 env_hash, artifact_hash, created_at)
+                VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+                "#,
+                &[
+                    DbValue::from(cmd.plugin_name.as_str()),
+                    DbValue::from(cmd.version.as_str()),
+                    DbValue::from(cmd.source_code.as_str()),
+                    DbValue::from(source_hash.as_str()),
+                    DbValue::from(cmd.env_hash.as_str()),
+                    DbValue::from(cmd.artifact_hash.as_str()),
+                    DbValue::from(now),
+                ],
+            )
+            .await
+        {
+            let _ = self.conn.execute("ROLLBACK", &[]).await;
+            return Err(e.into());
+        }
 
         // 3c. Deactivate previous versions
-        sqlx::query(
-            r#"
-            UPDATE cf_plugin_manifest
-            SET status = 'SUPERSEDED'
-            WHERE plugin_name = ? AND version != ? AND status = 'ACTIVE'
-            "#,
-        )
-        .bind(&cmd.plugin_name)
-        .bind(&cmd.version)
-        .execute(&mut *tx)
-        .await?;
+        if let Err(e) = self
+            .conn
+            .execute(
+                r#"
+                UPDATE cf_plugin_manifest
+                SET status = 'SUPERSEDED'
+                WHERE plugin_name = ? AND version != ? AND status = 'ACTIVE'
+                "#,
+                &[
+                    DbValue::from(cmd.plugin_name.as_str()),
+                    DbValue::from(cmd.version.as_str()),
+                ],
+            )
+            .await
+        {
+            let _ = self.conn.execute("ROLLBACK", &[]).await;
+            return Err(e.into());
+        }
 
         // 4. Commit transaction
-        tx.commit().await?;
+        if let Err(e) = self.conn.execute("COMMIT", &[]).await {
+            let _ = self.conn.execute("ROLLBACK", &[]).await;
+            return Err(e.into());
+        }
 
         info!(
             "Deployed {} v{} (env: {}, artifact: {})",
@@ -787,7 +1001,7 @@ impl Sentinel {
 
         // 5. Refresh topic_map cache (new plugins may have topic configs)
         // This ensures newly deployed plugins get their sink configs immediately
-        match Self::load_topic_configs(&self.pool).await {
+        match Self::load_topic_configs(&self.conn).await {
             Ok(new_map) => {
                 let old_count = self.topic_map.len();
                 self.topic_map = new_map;
@@ -885,21 +1099,23 @@ impl Sentinel {
             );
 
             // Update job with incremented retry_count and scheduled_at in future
-            sqlx::query(
-                r#"
-                UPDATE cf_processing_queue SET
-                    status = 'QUEUED',
-                    retry_count = ?,
-                    claim_time = NULL,
-                    error_message = ?
-                WHERE id = ?
-                "#
-            )
-            .bind(retry_count + 1)
-            .bind(error)
-            .bind(job_id)
-            .execute(&self.pool)
-            .await?;
+            self.conn
+                .execute(
+                    r#"
+                    UPDATE cf_processing_queue SET
+                        status = 'QUEUED',
+                        retry_count = ?,
+                        claim_time = NULL,
+                        error_message = ?
+                    WHERE id = ?
+                    "#,
+                    &[
+                        DbValue::from(retry_count + 1),
+                        DbValue::from(error),
+                        DbValue::from(job_id),
+                    ],
+                )
+                .await?;
 
             // Note: In a production system, you'd want to use a scheduled_at column
             // and have the dispatch loop check `scheduled_at <= now()`. For simplicity,
@@ -931,19 +1147,22 @@ impl Sentinel {
     async fn move_to_dead_letter(&self, job_id: i64, error: &str, reason: &str) -> Result<()> {
         // Update job to FAILED status with reason
         let full_error = format!("{}: {}", reason, error);
-        sqlx::query(
-            r#"
-            UPDATE cf_processing_queue SET
-                status = 'FAILED',
-                end_time = datetime('now'),
-                error_message = ?
-            WHERE id = ?
-            "#
-        )
-        .bind(&full_error)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                r#"
+                UPDATE cf_processing_queue SET
+                    status = 'FAILED',
+                    end_time = ?,
+                    error_message = ?
+                WHERE id = ?
+                "#,
+                &[
+                    DbValue::from(chrono::Utc::now()),
+                    DbValue::from(full_error.as_str()),
+                    DbValue::from(job_id),
+                ],
+            )
+            .await?;
 
         error!("Job {} moved to dead letter queue: {}", job_id, reason);
         Ok(())
@@ -953,12 +1172,14 @@ impl Sentinel {
     ///
     /// Returns true if parser can accept jobs, false if paused.
     pub async fn check_circuit_breaker(&self, parser_name: &str) -> Result<bool> {
-        let health: Option<ParserHealth> = sqlx::query_as(
-            "SELECT * FROM cf_parser_health WHERE parser_name = ?"
-        )
-        .bind(parser_name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let health = self
+            .conn
+            .query_optional(
+                "SELECT * FROM cf_parser_health WHERE parser_name = ?",
+                &[DbValue::from(parser_name)],
+            )
+            .await?;
+        let health = health.map(|row| ParserHealth::from_row(&row)).transpose()?;
 
         if let Some(h) = health {
             // Already paused
@@ -970,12 +1191,17 @@ impl Sentinel {
             // Check threshold
             if h.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
                 // Trip the circuit breaker
-                sqlx::query(
-                    "UPDATE cf_parser_health SET paused_at = datetime('now'), updated_at = datetime('now') WHERE parser_name = ?"
-                )
-                .bind(parser_name)
-                .execute(&self.pool)
-                .await?;
+                let now = chrono::Utc::now();
+                self.conn
+                    .execute(
+                        "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
+                        &[
+                            DbValue::from(now),
+                            DbValue::from(now),
+                            DbValue::from(parser_name),
+                        ],
+                    )
+                    .await?;
 
                 warn!(
                     parser = parser_name,
@@ -991,18 +1217,26 @@ impl Sentinel {
 
     /// Record successful execution (resets consecutive failures).
     async fn record_success(&self, parser_name: &str) -> Result<()> {
-        sqlx::query(r#"
-            INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, created_at, updated_at)
-            VALUES (?, 1, 1, 0, datetime('now'), datetime('now'))
-            ON CONFLICT(parser_name) DO UPDATE SET
-                total_executions = total_executions + 1,
-                successful_executions = successful_executions + 1,
-                consecutive_failures = 0,
-                updated_at = datetime('now')
-        "#)
-        .bind(parser_name)
-        .execute(&self.pool)
-        .await?;
+        let now = chrono::Utc::now();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, created_at, updated_at)
+                VALUES (?, 1, 1, 0, ?, ?)
+                ON CONFLICT(parser_name) DO UPDATE SET
+                    total_executions = total_executions + 1,
+                    successful_executions = successful_executions + 1,
+                    consecutive_failures = 0,
+                    updated_at = ?
+                "#,
+                &[
+                    DbValue::from(parser_name),
+                    DbValue::from(now),
+                    DbValue::from(now),
+                    DbValue::from(now),
+                ],
+            )
+            .await?;
 
         debug!(parser = parser_name, "Recorded success, reset consecutive_failures");
         Ok(())
@@ -1010,20 +1244,28 @@ impl Sentinel {
 
     /// Record failed execution (increments consecutive failures).
     async fn record_failure(&self, parser_name: &str, reason: &str) -> Result<()> {
-        sqlx::query(r#"
-            INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, last_failure_reason, created_at, updated_at)
-            VALUES (?, 1, 0, 1, ?, datetime('now'), datetime('now'))
-            ON CONFLICT(parser_name) DO UPDATE SET
-                total_executions = total_executions + 1,
-                consecutive_failures = consecutive_failures + 1,
-                last_failure_reason = ?,
-                updated_at = datetime('now')
-        "#)
-        .bind(parser_name)
-        .bind(reason)
-        .bind(reason)
-        .execute(&self.pool)
-        .await?;
+        let now = chrono::Utc::now();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, last_failure_reason, created_at, updated_at)
+                VALUES (?, 1, 0, 1, ?, ?, ?)
+                ON CONFLICT(parser_name) DO UPDATE SET
+                    total_executions = total_executions + 1,
+                    consecutive_failures = consecutive_failures + 1,
+                    last_failure_reason = ?,
+                    updated_at = ?
+                "#,
+                &[
+                    DbValue::from(parser_name),
+                    DbValue::from(reason),
+                    DbValue::from(now),
+                    DbValue::from(now),
+                    DbValue::from(reason),
+                    DbValue::from(now),
+                ],
+            )
+            .await?;
 
         debug!(parser = parser_name, reason = reason, "Recorded failure");
         Ok(())
@@ -1031,30 +1273,32 @@ impl Sentinel {
 
     /// Get plugin name for a job (for health tracking).
     async fn get_job_plugin_name(&self, job_id: i64) -> Option<String> {
-        let result: Option<(String,)> = sqlx::query_as(
-            "SELECT plugin_name FROM cf_processing_queue WHERE id = ?"
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
+        let result = self
+            .conn
+            .query_optional(
+                "SELECT plugin_name FROM cf_processing_queue WHERE id = ?",
+                &[DbValue::from(job_id)],
+            )
+            .await
+            .ok()
+            .flatten();
 
-        result.map(|(name,)| name)
+        result.and_then(|row| row.get_by_name("plugin_name").ok())
     }
 
     /// Get retry count for a job.
     async fn get_job_retry_count(&self, job_id: i64) -> Option<i32> {
-        let result: Option<(i32,)> = sqlx::query_as(
-            "SELECT retry_count FROM cf_processing_queue WHERE id = ?"
-        )
-        .bind(job_id)
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
+        let result = self
+            .conn
+            .query_optional(
+                "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
+                &[DbValue::from(job_id)],
+            )
+            .await
+            .ok()
+            .flatten();
 
-        result.map(|(count,)| count)
+        result.and_then(|row| row.get_by_name("retry_count").ok())
     }
 }
 

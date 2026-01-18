@@ -164,7 +164,7 @@ pub struct BridgeConfig {
     pub source_code: String,
     pub file_path: String,
     pub job_id: u64,
-    pub file_version_id: i64,
+    pub file_id: i64,
     pub shim_path: PathBuf,
 }
 
@@ -173,12 +173,8 @@ pub struct BridgeConfig {
 pub struct OutputInfo {
     /// Output identifier (topic name)
     pub name: String,
-    /// Destination type: "parquet", "sqlite", or "csv"
-    pub sink: String,
-    /// For sqlite sink: custom table name (defaults to output name)
+    /// Optional table name override (defaults to output name)
     pub table: Option<String>,
-    /// For parquet sink: compression algorithm
-    pub compression: Option<String>,
 }
 
 /// Result of bridge execution including data and logs
@@ -189,7 +185,7 @@ pub struct BridgeResult {
     /// Captured logs from the plugin (stdout, stderr, logging)
     /// This is O(1) memory during execution but loaded at end (capped at 10MB)
     pub logs: String,
-    /// Output metadata from the parser (sink routing info)
+    /// Output metadata from the parser
     pub output_info: Vec<OutputInfo>,
 }
 
@@ -502,7 +498,7 @@ fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
         .env("BRIDGE_PLUGIN_CODE", source_b64)
         .env("BRIDGE_FILE_PATH", &config.file_path)
         .env("BRIDGE_JOB_ID", config.job_id.to_string())
-        .env("BRIDGE_FILE_VERSION_ID", config.file_version_id.to_string())
+        .env("BRIDGE_FILE_ID", config.file_id.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

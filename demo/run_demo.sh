@@ -79,7 +79,7 @@ rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
 # Update the schema with actual paths
-sed "s|DEMO_DIR|$DEMO_DIR|g" "$DEMO_DIR/schema.sql" | sqlite3 "$DB_PATH"
+sed "s|DEMO_DIR|$DEMO_DIR|g" "$DEMO_DIR/schema.sql" | duckdb "$DB_PATH"
 echo -e "${GREEN}  ✓ Database created at $DB_PATH${NC}"
 echo -e "  ✓ 3 jobs queued for processing"
 echo -e "  ✓ 4 pre-completed jobs for Data tab\n"
@@ -112,7 +112,7 @@ if [ "$USE_UI" = true ]; then
 
     # Set environment for Tauri app
     export CASPARIAN_BIND="$BIND_ADDR"
-    export CASPARIAN_DATABASE="sqlite://$DB_PATH"
+    export CASPARIAN_DATABASE="duckdb:$DB_PATH"
 
     # Start Tauri app in background (it embeds the Sentinel)
     cd "$PROJECT_ROOT/ui"
@@ -138,7 +138,7 @@ else
     # CLI mode - use standalone sentinel
     "$PROJECT_ROOT/target/release/casparian" sentinel \
         --bind "$BIND_ADDR" \
-        --database "sqlite://$DB_PATH" \
+        --database "duckdb:$DB_PATH" \
         > "$DEMO_DIR/sentinel.log" 2>&1 &
     SENTINEL_PID=$!
 
@@ -181,7 +181,7 @@ echo ""
 LAST_COMPLETED=0
 while true; do
     # Get job stats
-    STATS=$(sqlite3 "$DB_PATH" "
+    STATS=$(duckdb "$DB_PATH" "
         SELECT
             COUNT(*) FILTER (WHERE status = 'QUEUED'),
             COUNT(*) FILTER (WHERE status = 'RUNNING'),
@@ -229,7 +229,7 @@ echo "╚═══════════════════════�
 echo -e "${NC}"
 
 echo -e "${CYAN}Results:${NC}"
-sqlite3 -header -column "$DB_PATH" "
+duckdb -header -column "$DB_PATH" "
     SELECT id, plugin_name, status,
            CASE WHEN end_time IS NOT NULL
                 THEN round((julianday(end_time) - julianday(claim_time)) * 86400, 1) || 's'

@@ -77,7 +77,7 @@ For consistent testing, start with a clean database state:
 
 ```bash
 # Reset to clean state (WARNING: deletes all data)
-rm -f ~/.casparian_flow/casparian_flow.sqlite3
+rm -f ~/.casparian_flow/casparian_flow.duckdb
 ```
 
 ### Sample Data Setup
@@ -184,7 +184,7 @@ For each dialog (Rule Creation, Sources Manager, etc.):
 5. **Verify data persistence**
    ```bash
    # After creating a rule, verify in database
-   sqlite3 ~/.casparian_flow/casparian_flow.sqlite3 \
+   duckdb ~/.casparian_flow/casparian_flow.duckdb \
      "SELECT * FROM scout_tagging_rules ORDER BY created_at DESC LIMIT 1"
    ```
 

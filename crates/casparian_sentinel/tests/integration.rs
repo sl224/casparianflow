@@ -4,8 +4,67 @@
 
 use casparian_protocol::types::{IdentifyPayload, JobReceipt, JobStatus};
 use casparian_protocol::{Message, OpCode};
+use casparian_db::{DbConnection, DbValue};
 use std::time::Duration;
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend};
+
+async fn setup_queue_db() -> DbConnection {
+    let conn = DbConnection::open_duckdb_memory().await.unwrap();
+    conn.execute(
+        r#"
+        CREATE TABLE cf_processing_queue (
+            id INTEGER PRIMARY KEY,
+            file_id INTEGER NOT NULL,
+            pipeline_run_id TEXT,
+            plugin_name TEXT NOT NULL,
+            config_overrides TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            priority INTEGER DEFAULT 0,
+            worker_host TEXT,
+            worker_pid INTEGER,
+            claim_time TIMESTAMP,
+            end_time TIMESTAMP,
+            result_summary TEXT,
+            error_message TEXT,
+            retry_count INTEGER DEFAULT 0
+        )
+        "#,
+        &[],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        r#"
+        CREATE TABLE cf_pipeline_runs (
+            id TEXT PRIMARY KEY,
+            pipeline_id TEXT NOT NULL,
+            selection_spec_id TEXT NOT NULL,
+            selection_snapshot_hash TEXT NOT NULL,
+            context_snapshot_hash TEXT,
+            logical_date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        "#,
+        &[],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        r#"
+        CREATE TABLE scout_files (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL
+        )
+        "#,
+        &[],
+    )
+    .await
+    .unwrap();
+    conn
+}
 
 /// Test protocol message roundtrip
 #[test]
@@ -129,48 +188,18 @@ async fn test_worker_sentinel_exchange() {
 #[tokio::test]
 async fn test_job_queue_operations() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    // Create in-memory database
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    // Create test table
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let queue = JobQueue::new(pool.clone());
+    let conn = setup_queue_db().await;
+    let queue = JobQueue::new(conn.clone());
 
     // Insert test job
-    sqlx::query(
+    conn.execute(
         r#"
-        INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority)
-        VALUES (1, 'test_plugin', 'QUEUED', 10)
+        INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
+        VALUES (1, 1, 'test_plugin', 'QUEUED', 10)
         "#,
+        &[],
     )
-    .execute(&pool)
     .await
     .unwrap();
 
@@ -186,66 +215,153 @@ async fn test_job_queue_operations() {
     queue.complete_job(job.id, "Success").await.unwrap();
 
     // Verify completed
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM cf_processing_queue WHERE id = ?",
+    let row = conn
+        .query_optional(
+            "SELECT status FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job.id)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let status: String = row.get_by_name("status").unwrap();
+
+    assert_eq!(status, "COMPLETED");
+}
+
+/// Test job details lookup via scout_files
+#[tokio::test]
+async fn test_job_details_uses_scout_files() {
+    use casparian_sentinel::db::queue::JobQueue;
+
+    let conn = setup_queue_db().await;
+    let queue = JobQueue::new(conn.clone());
+
+    conn.execute(
+        "INSERT INTO scout_files (id, path) VALUES (1, '/data/demo/sample.csv')",
+        &[],
     )
-    .bind(job.id)
-    .fetch_one(&pool)
     .await
     .unwrap();
 
-    assert_eq!(status, "COMPLETED");
+    conn.execute(
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'demo', 'QUEUED')",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let details = queue.get_job_details(1).await.unwrap().unwrap();
+    assert_eq!(details.plugin_name, "demo");
+    assert_eq!(details.file_path, "/data/demo/sample.csv");
+}
+
+/// Test pipeline run status transitions based on job status changes.
+#[tokio::test]
+async fn test_pipeline_run_status_updates() {
+    use casparian_sentinel::db::queue::JobQueue;
+
+    let conn = setup_queue_db().await;
+    let queue = JobQueue::new(conn.clone());
+
+    conn.execute(
+        "INSERT INTO cf_pipeline_runs (id, pipeline_id, selection_spec_id, selection_snapshot_hash, logical_date, status) VALUES ('run-1', 'pipe-1', 'spec-1', 'hash-1', '2025-01-01', 'queued')",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO scout_files (id, path) VALUES (1, '/data/demo/a.csv')",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    conn.execute(
+        r#"
+        INSERT INTO cf_processing_queue (id, file_id, pipeline_run_id, plugin_name, status, priority)
+        VALUES (1, 1, 'run-1', 'demo', 'QUEUED', 0)
+        "#,
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let job = queue.pop_job().await.unwrap().unwrap();
+    assert_eq!(job.pipeline_run_id.as_deref(), Some("run-1"));
+
+    conn.execute(
+        "UPDATE cf_pipeline_runs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
+        &[],
+    )
+    .await
+    .unwrap();
+
+    queue.complete_job(job.id, "Success").await.unwrap();
+
+    let row = conn
+        .query_one(
+            "SELECT SUM(CASE WHEN status IN ('QUEUED', 'RUNNING') THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed FROM cf_processing_queue WHERE pipeline_run_id = ?",
+            &[DbValue::from("run-1")],
+        )
+        .await
+        .unwrap();
+    let active: i64 = row.get_by_name("active").unwrap_or(0);
+    let failed: i64 = row.get_by_name("failed").unwrap_or(0);
+    let completed: i64 = row.get_by_name("completed").unwrap_or(0);
+
+    if failed > 0 {
+        conn.execute(
+            "UPDATE cf_pipeline_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+    } else if active > 0 {
+        conn.execute(
+            "UPDATE cf_pipeline_runs SET status = 'running' WHERE id = 'run-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+    } else if completed > 0 {
+        conn.execute(
+            "UPDATE cf_pipeline_runs SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    let status_row = conn
+        .query_one("SELECT status FROM cf_pipeline_runs WHERE id = 'run-1'", &[])
+        .await
+        .unwrap();
+    let status: String = status_row.get_by_name("status").unwrap();
+    assert_eq!(status, "completed");
 }
 
 /// Test job priority ordering
 #[tokio::test]
 async fn test_job_priority_ordering() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let conn = setup_queue_db().await;
 
     // Insert jobs with different priorities
-    sqlx::query(
+    conn.execute(
         r#"
-        INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, priority)
+        INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
         VALUES
-            (1, 'low', 'QUEUED', 0),
-            (2, 'high', 'QUEUED', 100),
-            (3, 'medium', 'QUEUED', 50)
+            (1, 1, 'low', 'QUEUED', 0),
+            (2, 2, 'high', 'QUEUED', 100),
+            (3, 3, 'medium', 'QUEUED', 50)
         "#,
+        &[],
     )
-    .execute(&pool)
     .await
     .unwrap();
 
-    let queue = JobQueue::new(pool);
+    let queue = JobQueue::new(conn);
 
     // Should pop highest priority first
     let job1 = queue.pop_job().await.unwrap().unwrap();
@@ -273,58 +389,33 @@ async fn test_job_priority_ordering() {
 #[tokio::test]
 async fn test_job_failure_marks_status_and_error() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let conn = setup_queue_db().await;
 
     // Insert a job
-    sqlx::query(
-        "INSERT INTO cf_processing_queue (file_version_id, plugin_name, status) VALUES (1, 'test', 'QUEUED')",
+    conn.execute(
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'test', 'QUEUED')",
+        &[],
     )
-    .execute(&pool)
     .await
     .unwrap();
 
-    let queue = JobQueue::new(pool.clone());
+    let queue = JobQueue::new(conn.clone());
     let job = queue.pop_job().await.unwrap().unwrap();
 
     // Fail the job with an error message
     queue.fail_job(job.id, "Parser crashed: division by zero").await.unwrap();
 
     // Verify status and error message
-    let (status, error): (String, Option<String>) = sqlx::query_as(
-        "SELECT status, error_message FROM cf_processing_queue WHERE id = ?",
-    )
-    .bind(job.id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row = conn
+        .query_optional(
+            "SELECT status, error_message FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job.id)],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let status: String = row.get_by_name("status").unwrap();
+    let error: Option<String> = row.get_by_name("error_message").ok();
 
     assert_eq!(status, "FAILED");
     assert_eq!(error, Some("Parser crashed: division by zero".to_string()));
@@ -334,57 +425,31 @@ async fn test_job_failure_marks_status_and_error() {
 #[tokio::test]
 async fn test_job_requeue_increments_retry_count() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
+    let conn = setup_queue_db().await;
 
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
+    conn.execute(
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', 'QUEUED', 0)",
+        &[],
     )
-    .execute(&pool)
     .await
     .unwrap();
 
-    sqlx::query(
-        "INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, retry_count) VALUES (1, 'test', 'QUEUED', 0)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let queue = JobQueue::new(pool.clone());
+    let queue = JobQueue::new(conn.clone());
 
     // Pop and requeue 3 times
     for expected_retry in 1..=3 {
         let job = queue.pop_job().await.unwrap().unwrap();
         queue.requeue_job(job.id).await.unwrap();
 
-        let retry_count: i32 = sqlx::query_scalar(
-            "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
-        )
-        .bind(job.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let row = conn
+            .query_optional(
+                "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
+                &[DbValue::from(job.id)],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_count: i32 = row.get_by_name("retry_count").unwrap();
 
         assert_eq!(retry_count, expected_retry, "Retry count should be {}", expected_retry);
     }
@@ -394,56 +459,31 @@ async fn test_job_requeue_increments_retry_count() {
 #[tokio::test]
 async fn test_job_exceeds_max_retries_marked_failed() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let conn = setup_queue_db().await;
 
     // Insert job that's already at max retries (5 = MAX_RETRY_COUNT)
-    sqlx::query(
-        "INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, retry_count) VALUES (1, 'test', 'RUNNING', 5)",
+    conn.execute(
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', 'RUNNING', 5)",
+        &[],
     )
-    .execute(&pool)
     .await
     .unwrap();
 
-    let queue = JobQueue::new(pool.clone());
+    let queue = JobQueue::new(conn.clone());
 
     // This should fail the job permanently, not requeue
     let _result = queue.requeue_job(1).await;
 
     // Check that job is now FAILED, not QUEUED
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM cf_processing_queue WHERE id = 1",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row = conn
+        .query_optional(
+            "SELECT status FROM cf_processing_queue WHERE id = 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let status: String = row.get_by_name("status").unwrap();
 
     assert_eq!(status, "FAILED", "Job exceeding max retries should be marked FAILED");
 }
@@ -459,45 +499,17 @@ async fn test_job_exceeds_max_retries_marked_failed() {
 #[tokio::test]
 async fn test_concurrent_job_claim_only_one_wins() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let conn = setup_queue_db().await;
 
     // Insert exactly ONE job
-    sqlx::query(
-        "INSERT INTO cf_processing_queue (file_version_id, plugin_name, status) VALUES (1, 'contested_job', 'QUEUED')",
+    conn.execute(
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'contested_job', 'QUEUED')",
+        &[],
     )
-    .execute(&pool)
     .await
     .unwrap();
 
-    let queue = JobQueue::new(pool);
+    let queue = JobQueue::new(conn);
 
     // First pop should succeed
     let first = queue.pop_job().await.unwrap();
@@ -516,49 +528,20 @@ async fn test_concurrent_job_claim_only_one_wins() {
 #[tokio::test]
 async fn test_multiple_jobs_claimed_sequentially() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
     use std::collections::HashSet;
-
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let conn = setup_queue_db().await;
 
     // Insert 10 jobs
     for i in 1..=10 {
-        sqlx::query(
-            "INSERT INTO cf_processing_queue (file_version_id, plugin_name, status) VALUES (?, 'job', 'QUEUED')",
+        conn.execute(
+            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (?, ?, 'job', 'QUEUED')",
+            &[DbValue::from(i), DbValue::from(i)],
         )
-        .bind(i)
-        .execute(&pool)
         .await
         .unwrap();
     }
 
-    let queue = JobQueue::new(pool);
+    let queue = JobQueue::new(conn);
 
     // Claim all 10 jobs sequentially
     let mut claimed_ids: Vec<i64> = vec![];
@@ -587,76 +570,55 @@ async fn test_multiple_jobs_claimed_sequentially() {
 /// Test that running jobs from disconnected workers can be recovered
 #[tokio::test]
 async fn test_stale_running_jobs_can_be_recovered() {
-    use sqlx::sqlite::SqlitePoolOptions;
-
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let conn = setup_queue_db().await;
 
     // Insert a job that's been "running" for a long time (stale)
     // claim_time is 1 hour ago
     let stale_time = chrono::Utc::now() - chrono::Duration::hours(1);
-    sqlx::query(
-        "INSERT INTO cf_processing_queue (file_version_id, plugin_name, status, claim_time, worker_host) VALUES (1, 'stale_job', 'RUNNING', ?, 'dead-worker')",
+    conn.execute(
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, claim_time, worker_host) VALUES (1, 1, 'stale_job', 'RUNNING', ?, 'dead-worker')",
+        &[DbValue::from(stale_time.to_rfc3339())],
     )
-    .bind(stale_time.to_rfc3339())
-    .execute(&pool)
     .await
     .unwrap();
 
     // Query for stale jobs (running for more than 10 minutes with no heartbeat)
     let stale_threshold = chrono::Utc::now() - chrono::Duration::minutes(10);
-    let stale_jobs: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, plugin_name FROM cf_processing_queue WHERE status = 'RUNNING' AND claim_time < ?",
-    )
-    .bind(stale_threshold.to_rfc3339())
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let stale_rows = conn
+        .query_all(
+            "SELECT id, plugin_name FROM cf_processing_queue WHERE status = 'RUNNING' AND claim_time < ?",
+            &[DbValue::from(stale_threshold.to_rfc3339())],
+        )
+        .await
+        .unwrap();
+    let mut stale_jobs = Vec::new();
+    for row in stale_rows {
+        let id: i64 = row.get_by_name("id").unwrap();
+        let plugin_name: String = row.get_by_name("plugin_name").unwrap();
+        stale_jobs.push((id, plugin_name));
+    }
 
     assert_eq!(stale_jobs.len(), 1, "Should detect one stale job");
     assert_eq!(stale_jobs[0].1, "stale_job");
 
     // Requeue the stale job
-    sqlx::query(
+    conn.execute(
         "UPDATE cf_processing_queue SET status = 'QUEUED', claim_time = NULL, worker_host = NULL, retry_count = retry_count + 1 WHERE id = ?",
+        &[DbValue::from(stale_jobs[0].0)],
     )
-    .bind(stale_jobs[0].0)
-    .execute(&pool)
     .await
     .unwrap();
 
     // Verify it's now available
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM cf_processing_queue WHERE id = 1",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let row = conn
+        .query_optional(
+            "SELECT status FROM cf_processing_queue WHERE id = 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let status: String = row.get_by_name("status").unwrap();
 
     assert_eq!(status, "QUEUED", "Stale job should be requeued");
 }
@@ -669,37 +631,9 @@ async fn test_stale_running_jobs_can_be_recovered() {
 #[tokio::test]
 async fn test_empty_queue_returns_none_not_error() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let queue = JobQueue::new(pool);
+    let conn = setup_queue_db().await;
+    let queue = JobQueue::new(conn);
 
     // Empty queue should return Ok(None), not an error
     let result = queue.pop_job().await;
@@ -718,52 +652,25 @@ async fn test_empty_queue_returns_none_not_error() {
 #[tokio::test]
 async fn test_only_queued_jobs_are_dispatched() {
     use casparian_sentinel::db::queue::JobQueue;
-    use sqlx::sqlite::SqlitePoolOptions;
 
-    let pool = SqlitePoolOptions::new()
-        .connect(":memory:")
-        .await
-        .unwrap();
-
-    sqlx::query(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_version_id INTEGER NOT NULL,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let conn = setup_queue_db().await;
 
     // Insert jobs in various states
-    sqlx::query(
+    conn.execute(
         r#"
-        INSERT INTO cf_processing_queue (file_version_id, plugin_name, status) VALUES
-            (1, 'pending_job', 'PENDING'),
-            (2, 'running_job', 'RUNNING'),
-            (3, 'completed_job', 'COMPLETED'),
-            (4, 'failed_job', 'FAILED'),
-            (5, 'queued_job', 'QUEUED')
+        INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES
+            (1, 1, 'pending_job', 'PENDING'),
+            (2, 2, 'running_job', 'RUNNING'),
+            (3, 3, 'completed_job', 'COMPLETED'),
+            (4, 4, 'failed_job', 'FAILED'),
+            (5, 5, 'queued_job', 'QUEUED')
         "#,
+        &[],
     )
-    .execute(&pool)
     .await
     .unwrap();
 
-    let queue = JobQueue::new(pool);
+    let queue = JobQueue::new(conn);
 
     // Should only get the QUEUED job
     let job = queue.pop_job().await.unwrap();
@@ -829,7 +736,7 @@ async fn test_full_worker_lifecycle_message_flow() {
             mode: SinkMode::Append,
             schema_def: None,
         }],
-        file_version_id: 1,
+        file_id: 1,
         env_hash: "abc123".to_string(),
         source_code: "# parser code".to_string(),
         artifact_hash: None,

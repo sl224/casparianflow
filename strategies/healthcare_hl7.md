@@ -2,7 +2,7 @@
 
 **Status:** Draft
 **Parent:** STRATEGY.md Section 2 (Target Market → Healthcare IT)
-**Related Spec:** [specs/hl7_parser.md](../specs/hl7_parser.md)
+**Related Spec:** [specs/parsers/hl7_parser.md](../specs/parsers/hl7_parser.md)
 **Version:** 0.3
 **Date:** January 14, 2026
 
@@ -391,7 +391,7 @@ async fn handle_mllp_connection(stream: TcpStream, output_dir: PathBuf) {
 
 #### Pricing
 
-Pricing tiers and unit definitions are centralized in `specs/pricing_v2_refined.md`. Use the Healthcare mapping (Clinic → Department → Hospital → Health System) from the system-of-record and keep the compliance and backlog framing from the value analysis above.
+Pricing tiers and unit definitions are centralized in `docs/product/pricing_v2_refined.md`. Use the Healthcare mapping (Clinic → Department → Hospital → Health System) from the system-of-record and keep the compliance and backlog framing from the value analysis above.
 
 **Note:** Healthcare vertical has longer sales cycles. Budget for 12-18 months to close Hospital/Health System deals.
 
@@ -456,7 +456,7 @@ Note: Year 1 assumes Phase 4 timing (starts Month 12+). Revenue projections begi
 
 ## 12. References
 
-- [HL7 Parser Technical Spec](../specs/hl7_parser.md)
+- [HL7 Parser Technical Spec](../specs/parsers/hl7_parser.md)
 - [Mirth Connect Pricing](https://www.nextgen.com/products-and-services/mirth-connect)
 - [Healthcare IT Market Research](https://www.grandviewresearch.com/industry-analysis/healthcare-it-market)
 

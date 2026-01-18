@@ -7,7 +7,7 @@
 **Last Updated:** 2026-01-15
 
 > **Note:** This is the canonical spec for Discover mode and Rule Builder.
-> Previous: `specs/views/discover.md` (archived as `discover_v3_archived.md`).
+> Previous: `specs/views/discover.md` (archived as `archive/specs/views/discover_v3_archived.md`).
 
 ---
 
@@ -16,6 +16,7 @@
 The **Rule Builder** is the Discover mode UI for scanning sources, tagging files,
 and drafting rules. It uses a split layout with a left rule editor and a right
 file results panel.
+It subsumes the legacy Files view; preview and tagging live in the File Results panel.
 
 ### 1.1 Current Behavior Summary
 
@@ -23,14 +24,14 @@ file results panel.
 - No source is required to enter Rule Builder; it prompts on actions instead.
 - Source dropdown opens with `[1]` and applies selection on `Enter` (no live reload).
 - Tags dropdown opens with `[2]` and previews tags while open.
-- Rule saving (`Ctrl+S`) is a stub and does not persist to DB.
+- Rule saving (`Ctrl+S`) persists to DB (scoped to selected source).
 
 ---
 
 ## 2. Layout
 
 ```
-┌ Rule Builder - [1] Source: <name> ▾  [2] Tags: All ▾ ─────────────────────┐
+┌ Rule Builder - [1] Source: <name> ▾  [2] Tags: All ▾  [R] Rules ▾ ─────────┐
 ├─────────────────────────────────────────┬────────────────────────────────┤
 │ PATTERN                                 │ FILE RESULTS                   │
 │ EXCLUDES                                │                                │
@@ -39,7 +40,8 @@ file results panel.
 │ OPTIONS                                 │                                │
 │ (schema suggestions)                    │                                │
 ├─────────────────────────────────────────┴────────────────────────────────┤
-│ [e] Sample  [E] Full  [s] Scan  [Tab] Nav  [Ctrl+S] Save  [Esc] Back       │
+│ [e] Sample  [E] Full  [t] Apply Tag  [b] Backtest  [s] Scan                │
+│ [Tab] Nav  [Ctrl+S] Save  [Ctrl+N] Clear  [Esc] Back                        │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,7 +59,7 @@ file results panel.
 | `2` | Open Tags dropdown | Previews tags while open |
 | `3` | Focus Files panel | Rule Builder only |
 | `M` | Sources Manager dialog | From Rule Builder |
-| `R` | Rules Manager dialog | From Rule Builder |
+| `R` | Rules dropdown | Opens rules list overlay (CRUD) |
 | `s` | Scan new directory | Only when not in text input |
 | `Esc` | Back to Home | When focus is FileList |
 
@@ -66,8 +68,13 @@ file results panel.
 | Key | Action | Notes |
 |-----|--------|-------|
 | `Tab` / `Shift+Tab` | Cycle focus | Pattern -> Excludes -> Tag -> Extractions -> Options -> FileList |
+| `[` / `]` | Jump focus | Left panel / FileList |
 | `Enter` | Contextual | Expand folder in FileList, accept exclude input, etc. |
-| `Ctrl+S` | Save rule | Stub only (no persistence) |
+| `Space` | Toggle selection | FileList only (preview/results) |
+| `t` | Apply tag | Selection-aware; prompts if none selected |
+| `b` | Backtest | From preview to results |
+| `Ctrl+S` | Save rule | Persists to DB |
+| `Ctrl+N` | Clear form | Resets to new rule |
 
 ### 3.3 Dropdowns
 
@@ -98,11 +105,50 @@ file results panel.
 - Sources dropdown does **not** live preview file results.
 - Selection is applied only on `Enter`.
 
+### 4.4 Rules CRUD (Interaction Spec)
+
+**Scope:** Rules are scoped to the currently selected source. The rules list is
+filtered to that source only.
+
+**Entry Points:**
+- `R` opens the Rules dropdown overlay from Rule Builder.
+- Rules are also accessible from Files view via `R` (same overlay).
+
+**Rules Dropdown (Overlay)**
+- List shows: pattern, tag, enabled state, priority (compact), and last updated.
+- `/` starts filter mode (searches pattern + tag + name).
+- `Enter` opens the selected rule in Rule Builder (edit mode).
+- `d` prompts delete confirmation for the selected rule.
+- `Space` toggles enabled/disabled.
+- `Esc` closes overlay.
+
+**Edit Flow**
+- Selecting a rule loads it into Rule Builder with `editing_rule_id` set.
+- Saving (`Ctrl+S`) updates the existing rule row instead of creating a new one.
+- Rule Builder header shows an inline "Editing: <rule name>" hint while active.
+
+**Delete Flow**
+- `d` opens a confirm dialog: "Delete rule '<name>'? [y/N]".
+- On confirm, rule is removed from DB and from the overlay list.
+
+**Create Flow (Existing)**
+- Build a rule in Rule Builder and `Ctrl+S` to persist.
+- New rule appears at top of the Rules dropdown (sorted by priority, then name).
+
+**Non-Goals (V1)**
+- No global rule list across sources.
+- No bulk edit or priority reordering in the overlay (future enhancement).
+
+### 4.5 Manual Tagging (Non-Persistent)
+
+- `t` applies the current tag to the selected preview results (or prompts to apply to all).
+- This action does **not** create or update a rule; it only tags the current files.
+
 ---
 
 ## 5. Notes / Planned
 
-- Persisting rules to the database is not implemented.
+- Rules are persisted to `scout_tagging_rules` with unique `id`.
 - Schema suggestions are present but not fully wired to backtest execution.
 
 ---

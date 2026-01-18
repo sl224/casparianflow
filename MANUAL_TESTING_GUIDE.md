@@ -310,7 +310,7 @@ for f in files:
 print('\n=== QUEUED JOBS ===')
 jobs = db.query(ProcessingJob).all()
 for j in jobs:
-    print(f'Job {j.id}: {j.plugin_name} (Status: {j.status.value}, File: {j.file_version_id})')
+    print(f'Job {j.id}: {j.plugin_name} (Status: {j.status.value}, File: {j.file_id})')
 
 db.close()
 "

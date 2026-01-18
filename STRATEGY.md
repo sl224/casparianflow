@@ -14,6 +14,8 @@ Casparian Flow is a **local-first data platform** that transforms industry-speci
 3. **Schema contracts** - governance and audit trails for compliance
 4. **AI-assisted development** (Phase 2) - Claude helps build custom parsers
 
+V1 scope and success metrics are defined in `docs/v1_scope.md`.
+
 ---
 
 ## Vision
@@ -534,7 +536,7 @@ Per Marc Andreessen's framework:
 
 ### Pricing Strategy (System of Record)
 
-Pricing tiers, units, and vertical mappings live in `specs/pricing_v2_refined.md`. Strategy docs should not restate tier tables. Use the universal ladder plus the vertical mapping in that doc, with Defense as the only pricing-unit exception.
+Pricing tiers, units, and vertical mappings live in `docs/product/pricing_v2_refined.md`. Strategy docs should not restate tier tables. Use the universal ladder plus the vertical mapping in that doc, with Defense as the only pricing-unit exception.
 
 ### Pricing Implementation Roadmap
 
@@ -565,7 +567,7 @@ Even at ~$96K/year (Enterprise tier), Casparian is **the cheap option** compared
 
 ### Revenue Modeling
 
-Revenue scenarios depend on the pricing ladder in `specs/pricing_v2_refined.md` and should live in a dedicated financial model to avoid drift. Keep narrative strategy here; maintain numbers in the model.
+Revenue scenarios depend on the pricing ladder in `docs/product/pricing_v2_refined.md` and should live in a dedicated financial model to avoid drift. Keep narrative strategy here; maintain numbers in the model.
 
 ### Non-Dilutive Funding: Open Core Strategy
 

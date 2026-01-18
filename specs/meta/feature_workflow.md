@@ -187,7 +187,7 @@ KEYWORD_MAPPING = {
     ["parser", "bench", "test"]: ["specs/views/parser_bench.md"],
     ["source", "directory"]: ["specs/views/sources.md"],
     ["extract", "rule", "pattern"]: ["specs/extraction.md"],
-    ["export", "parquet", "csv", "sink"]: ["specs/export.md"],
+    ["export", "parquet", "csv", "sink"]: ["specs/features/export.md"],
 
     # Backend systems
     ["memory", "allocat", "clone", "arena"]: ["specs/meta/memory_audit_workflow.md"],
@@ -952,7 +952,7 @@ HOT_PATH_PATTERNS = [
 User: "Add --dry-run flag to the export command"
 
 Phase 1 (Design):
-  Context loaded: CLAUDE.md, specs/export.md
+  Context loaded: CLAUDE.md, specs/features/export.md
   Inline spec created (not escalated)
 
 Phase 2 (Implement):

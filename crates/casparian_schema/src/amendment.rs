@@ -771,8 +771,8 @@ fn compute_schema_changes(from: &LockedSchema, to: &LockedSchema) -> Vec<SchemaC
             if from_col.data_type != to_col.data_type {
                 changes.push(SchemaChange::ChangeType {
                     column_name: (*name).to_string(),
-                    from: from_col.data_type,
-                    to: to_col.data_type,
+                    from: from_col.data_type.clone(),
+                    to: to_col.data_type.clone(),
                 });
             }
 
@@ -823,7 +823,7 @@ fn apply_schema_changes(
             SchemaChange::ChangeType { column_name, to, .. } => {
                 for col in &mut columns {
                     if col.name == *column_name {
-                        col.data_type = *to;
+                        col.data_type = to.clone();
                         break;
                     }
                 }

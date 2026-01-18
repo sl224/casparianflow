@@ -18,15 +18,32 @@ fn random_test_port() -> u16 {
     ((seed ^ pid) % 10000 + 50000) as u16 // Ports 50000-59999
 }
 
+async fn bind_router() -> Result<(RouterSocket, String)> {
+    let mut last_err = None;
+    for _ in 0..25 {
+        let mut sentinel = RouterSocket::new();
+        let port = random_test_port();
+        let bound_addr = format!("tcp://127.0.0.1:{}", port);
+        match sentinel.bind(&bound_addr).await {
+            Ok(_) => return Ok((sentinel, bound_addr)),
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to bind mock sentinel after multiple attempts: {:?}",
+        last_err
+    ))
+}
+
 /// Test that worker responds to heartbeat messages promptly.
 /// This validates the worker's event loop is non-blocking.
 #[tokio::test]
 async fn test_worker_heartbeat_responsiveness() -> Result<()> {
     // 1. Setup Mock Sentinel (Router) with random port
-    let mut sentinel = RouterSocket::new();
-    let port = random_test_port();
-    let bound_addr = format!("tcp://127.0.0.1:{}", port);
-    sentinel.bind(&bound_addr).await?;
+    let (mut sentinel, bound_addr) = bind_router().await?;
     println!("Mock Sentinel bound to {}", bound_addr);
 
     // 2. Setup Worker with isolated temp directory
@@ -123,10 +140,7 @@ async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     use std::sync::Arc;
 
     // 1. Setup Mock Sentinel
-    let mut sentinel = RouterSocket::new();
-    let port = random_test_port();
-    let bound_addr = format!("tcp://127.0.0.1:{}", port);
-    sentinel.bind(&bound_addr).await?;
+    let (mut sentinel, bound_addr) = bind_router().await?;
 
     // 2. Setup Worker with test venv
     let tmp = tempfile::tempdir()?;
@@ -187,7 +201,7 @@ async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
         plugin_name: "test_plugin".to_string(),
         file_path: "/tmp/test.csv".to_string(),
         sinks: vec![],
-        file_version_id: 1,
+        file_id: 1,
         env_hash: env_hash.to_string(),
         source_code: "# test".to_string(),
         artifact_hash: None,

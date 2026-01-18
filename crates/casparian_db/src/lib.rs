@@ -1,8 +1,8 @@
 //! Database abstraction layer for Casparian Flow.
 //!
 //! Provides feature-gated database support:
-//! - `sqlite` (default): SQLite file-based database (open source)
-//! - `duckdb`: DuckDB columnar OLAP database (open source)
+//! - `duckdb` (default): DuckDB columnar OLAP database (open source)
+//! - `sqlite`: SQLite file-based database (open source)
 //! - `postgres`: PostgreSQL server database (enterprise license required)
 //! - `mssql`: Microsoft SQL Server (enterprise license required, future)
 //!
@@ -44,13 +44,15 @@
 pub mod backend;
 mod license;
 pub mod lock;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod pool;
 
-pub use backend::{AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbValue, FromDbValue};
+pub use backend::{AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbTransaction, DbValue, FromDbValue};
 pub use license::{License, LicenseError, LicenseTier};
 pub use lock::{lock_path_for, DbLockGuard, LockError};
 #[cfg(feature = "duckdb")]
 pub use lock::{is_locked, lock_exclusive, try_lock_exclusive, try_lock_shared};
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub use pool::{create_pool, DbConfig, DbError, DbPool, DbRow};
 
 /// Database backend type.

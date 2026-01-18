@@ -12,6 +12,8 @@ serde_json.workspace = true
 byteorder.workspace = true
 thiserror.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+url = "2.5"
 
 [dev-dependencies]
 anyhow.workspace = true

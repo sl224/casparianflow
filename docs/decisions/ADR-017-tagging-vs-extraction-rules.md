@@ -38,7 +38,7 @@ CREATE TABLE scout_tagging_rules (
 **Table:** `extraction_rules` + `extraction_fields` + `extraction_tag_conditions`
 **Purpose:** Extract structured metadata from file paths with conditional tagging
 **Created via:** CLI or Extraction Rules TUI view
-**Spec:** `specs/extraction.md` (API), `specs/views/extraction_rules.md` (TUI)
+**Spec:** `specs/extraction.md` (API), `archive/specs/views/extraction_rules.md` (TUI)
 
 ```sql
 CREATE TABLE extraction_rules (
@@ -125,5 +125,5 @@ This would simplify the codebase to one rule system. However, the simple tagging
 
 - `specs/views/discover.md` - Tagging rules UI
 - `specs/extraction.md` - Extraction rules API
-- `specs/views/extraction_rules.md` - Extraction rules UI
+- `archive/specs/views/extraction_rules.md` - Extraction rules UI
 - `crates/casparian/src/scout/db.rs` - Both table definitions

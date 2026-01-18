@@ -7,7 +7,7 @@
 //! # Feature Priority
 //!
 //! - `postgres` feature: Uses `PgPool` (enterprise)
-//! - `sqlite` feature (default): Uses `SqlitePool` (community)
+//! - `sqlite` feature: Uses `SqlitePool` (community)
 //!
 //! If both features are enabled, `postgres` takes priority (enterprise build).
 
@@ -38,7 +38,7 @@ pub enum DbError {
 /// This allows full support for `#[derive(FromRow)]` with custom types.
 ///
 /// - With `postgres` feature: `PgPool`
-/// - With `sqlite` feature (default): `SqlitePool`
+/// - With `sqlite` feature: `SqlitePool`
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
 pub type DbPool = sqlx::PgPool;
 

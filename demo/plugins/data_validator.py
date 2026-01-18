@@ -44,7 +44,7 @@ def parse(file_path: str) -> list[Output]:
 
     if len(error_df) > 0:
         error_df["_error_reason"] = "null_values"
-        outputs.append(Output("validation_errors", pa.Table.from_pandas(error_df), "sqlite"))
+        outputs.append(Output("validation_errors", pa.Table.from_pandas(error_df), "duckdb"))
 
     print("[data_validator] Complete!")
     return outputs

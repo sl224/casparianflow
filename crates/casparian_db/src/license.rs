@@ -202,5 +202,6 @@ mod tests {
         let license = License::parse(json).unwrap();
         assert_eq!(license.organization, "Acme Corp");
         assert_eq!(license.tier, LicenseTier::Professional);
+        assert_eq!(license.license_id, "lic_test");
     }
 }

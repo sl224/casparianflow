@@ -208,7 +208,7 @@ When you change parser code:
 
 **Supported sinks:**
 - `parquet://./output/` - Parquet files (default)
-- `sqlite:///data.db` - SQLite database
+- `duckdb:///data.db` - DuckDB database
 - `csv://./output/` - CSV files
 
 ---
@@ -223,8 +223,10 @@ casparian-flow/
 ├── spec.md                   # MASTER: Product specification
 ├── specs/                    # SUBSPECS: Feature implementation details
 │   ├── rule_builder.md       # Discover mode + Rule Builder TUI spec (canonical)
-│   ├── parser_bench.md       # Parser Bench mode TUI spec
-│   └── hl7_parser.md         # HL7 v2.x parser technical spec
+│   ├── views/                # Per-view TUI specs
+│   │   └── parser_bench.md   # Parser Bench mode TUI spec
+│   └── parsers/
+│       └── hl7_parser.md     # HL7 v2.x parser technical spec
 │
 ├── STRATEGY.md               # MASTER: Business strategy (platform-level)
 ├── strategies/               # SUBSTRATEGIES: Vertical-specific GTM
@@ -340,7 +342,7 @@ STRATEGY.md                           strategies/healthcare_hl7.md
 ───────────                           ────────────────────────────
 | Healthcare IT | ... |               # Healthcare HL7 Market Strategy
 [→ Deep Dive](strategies/...)   ◄────► Parent: STRATEGY.md Section 2
-                                       Related Spec: specs/hl7_parser.md
+                                       Related Spec: specs/parsers/hl7_parser.md
 ```
 
 **Substrategy Structure:**
@@ -365,7 +367,7 @@ STRATEGY.md                           strategies/healthcare_hl7.md
 
 **Linking Specs and Strategies:**
 Technical specs and market strategies are **related but separate**:
-- `specs/hl7_parser.md` → How to build the HL7 parser (technical)
+- `specs/parsers/hl7_parser.md` → How to build the HL7 parser (technical)
 - `strategies/healthcare_hl7.md` → How to win the healthcare market (business)
 
 Both should cross-reference each other in their headers.
@@ -438,7 +440,7 @@ cargo test --package casparian_mcp --test e2e_tools
 # Run a parser against an input file
 ./target/release/casparian run parser.py input.csv
 ./target/release/casparian run parser.py input.csv --sink parquet://./output/
-./target/release/casparian run parser.py input.csv --sink sqlite:///data.db
+./target/release/casparian run parser.py input.csv --sink duckdb:///data.db
 ./target/release/casparian run parser.py input.csv --force  # Skip dedup check
 ./target/release/casparian run parser.py input.csv --whatif # Dry run
 
@@ -470,7 +472,7 @@ The `casparian_db` crate provides feature-gated, license-controlled database sup
 
 | Feature | License Tier | Status |
 |---------|--------------|--------|
-| `sqlite` | Community (free) | ✓ Default |
+| `duckdb` | Community (free) | ✓ Default |
 | `postgres` | Professional | ✓ Available |
 | `mssql` | Enterprise | Planned |
 
@@ -483,7 +485,7 @@ The `casparian_db` crate provides feature-gated, license-controlled database sup
 use casparian_db::{DbConfig, create_pool, load_license};
 
 // SQLite (always works)
-let pool = create_pool(DbConfig::sqlite("./data.db")).await?;
+let pool = create_pool(DbConfig::duckdb("./data.duckdb")).await?;
 
 // PostgreSQL (requires Professional license)
 let license = load_license();
@@ -492,11 +494,11 @@ let pool = create_pool(DbConfig::postgres("postgres://...", license)).await?;
 
 ### Single Database Rule
 
-**Everything uses ONE database: `~/.casparian_flow/casparian_flow.sqlite3`**
+**Everything uses ONE database: `~/.casparian_flow/casparian_flow.duckdb`**
 
 ```
 ~/.casparian_flow/
-├── casparian_flow.sqlite3    # THE ONLY DATABASE
+├── casparian_flow.duckdb    # THE ONLY DATABASE
 ├── license.json              # Enterprise license (optional)
 ├── venvs/                    # Content-addressable venv cache
 ├── parsers/                  # Deployed parser .py files
@@ -629,7 +631,7 @@ This project has meta-workflows for maintaining specs, code quality, and data mo
 | `spec_maintenance_workflow` | "audit specs", "check all specs", "spec alignment" | Corpus-level spec health check |
 | `memory_audit_workflow` | "memory audit", "allocation", "performance" | Find memory optimization opportunities |
 | `data_model_maintenance_workflow` | "dead types", "data model", "type cleanup" | Audit Rust structs/enums for health |
-| `abstraction_audit_workflow` | "abstraction", "platform", "sqlite coupling", "llm provider" | Find platform-specific coupling for remediation |
+| `abstraction_audit_workflow` | "abstraction", "platform", "db coupling", "llm provider" | Find platform-specific coupling for remediation |
 | `tui_testing_workflow` | "test TUI", "TUI validation" | tmux-based TUI testing |
 | `tui_parallel_coverage_workflow` | "parallel TUI test", "maximize coverage", "TUI coverage" | Parallel test execution for coverage |
 
@@ -732,7 +734,7 @@ When workflows produce actionable findings and user says "implement":
 |---------|--------|--------|
 | Terminal (human) | Pretty tables | Readable, truncated, colored |
 | `-o file.parquet` | Parquet | Compressed columnar storage |
-| `-o file.sqlite` | SQLite | Ad-hoc SQL queries |
+| `-o file.duckdb` | DuckDB | Ad-hoc SQL queries |
 | `--sink` override | Per command | Flexible output destination |
 
 ---

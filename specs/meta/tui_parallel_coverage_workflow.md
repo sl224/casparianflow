@@ -20,6 +20,7 @@ This workflow maximizes TUI test coverage over time by running parallel tests an
 3. **Parallel Execution**: Multiple tmux sessions run simultaneously, each testing different state paths.
 4. **Intelligent Prioritization**: Test paths selected based on staleness, risk, and coverage gaps.
 5. **Session Isolation**: Each test uses isolated state to avoid cross-contamination.
+6. **User Value Focus**: Findings must flag UI output that hides or collapses critical information (e.g., suffix truncation, ambiguous list items).
 
 ### What This Workflow Does
 
@@ -30,6 +31,7 @@ This workflow maximizes TUI test coverage over time by running parallel tests an
 | Record keystroke sequences | ✓ Yes |
 | Identify spec-code divergences | ✓ Yes |
 | Aggregate findings with fix context | ✓ Yes |
+| Detect low-information UI output (truncation/ambiguity) | ✓ Yes |
 | Modify any code or specs | ✗ **NO** |
 | Auto-fix detected issues | ✗ **NO** |
 
@@ -136,6 +138,59 @@ Each parallel session:
 
 **Isolation Rationale**: Many TUI paths create or mutate state (rules, sources, filters). Running those in parallel against a shared database creates false positives, UI flakes, and non-reproducible results. Isolated homes allow safe, parallel mutation while preserving true user flows.
 
+### Exploratory Parallel Mode (Best Use of Workers)
+
+Parallel workers should **partition the action space**, not just replay fixed paths. The goal is to maximize unique UI coverage and catch high-value UX issues (confusing output, ambiguous lists, broken recovery).
+
+#### Worker Partition Strategy
+
+Assign each worker a distinct exploration focus and key bias:
+
+| Worker | Focus | Key Bias | Primary Targets |
+|--------|-------|----------|------------------|
+| A | Navigation + view switching | `1 2 3 4 0 Esc Tab ?` | View transitions, help, back |
+| B | Input + error recovery | `a-z 0-9 / Enter Backspace` | Inputs, invalid entries, clearing |
+| C | Dialogs + modals | `n R M s g` | Rule builder, managers, scan |
+| D | Lists + suggestions | `j k Up Down / f` | Lists, filters, truncation |
+
+Each worker also gets a unique RNG seed (`seed = run_id_hash + worker_id * 1000`) to reduce overlap.
+
+#### Coverage-Aware Exploration
+
+Workers share a lightweight coverage map based on **screen signatures**:
+- Signature = first header line + view title + top-left panel title
+- If a signature is already covered N times, workers bias away from it
+- Coverage map is updated after each step (best-effort, not blocking)
+
+#### Stop Conditions
+
+- Per worker: max actions or time budget (e.g., 150 actions or 90s)
+- Global: stop when coverage target or diminishing returns reached
+
+#### Exploration Output Requirements
+
+For each finding, include:
+- Key sequence + step index
+- Screen capture
+- A brief “user value” note (why this is confusing or blocks progress)
+- Any detected ambiguity in lists/suggestions
+
+### Parallel Prompt Template (Exploration)
+
+```
+Worker {id}
+Focus: {focus_area}
+Key bias: {key_bias}
+Seed: {seed}
+Goal: explore unique screens, avoid repeated signatures.
+Stop: {max_actions} actions or {time_budget}s.
+
+Must report:
+- Confusing or low-information output (truncation hides suffix, duplicate items)
+- Broken navigation or modal exits
+- Input error handling and recovery issues
+```
+
 ---
 
 ## Test Path Prioritization
@@ -187,9 +242,36 @@ test_paths:
       - { keys: "g", expect: "Glob" }       # Open explorer
       - { keys: "Escape", expect: "Files" } # Close explorer
     exit: ["Escape"]
+
+  - id: "rule-builder-suggestions-clarity"
+    view: "RuleBuilder"
+    entry: ["Alt+d", "n"]  # Example navigation into rule builder flow
+    actions:
+      - { keys: "s", expect: "SUGGESTIONS", expect_rules: ["must_show_suffix", "must_differentiate"] }
+    exit: ["Escape"]
 ```
 
 Test paths focus on **user-visible behavior** (what text appears), not internal state names. The `expect` field uses simple substring matching against the captured screen.
+
+Optional `expect_rules` allow UI quality checks (e.g., ensuring suffix visibility or avoiding ambiguous truncation).
+
+### Display Quality Checks (Value to User)
+
+Some failures are not state-machine failures. They are UI output failures where the user cannot extract meaning.
+
+Heuristics:
+- Truncation hides the *suffix* (filename, last 2–3 segments).
+- Two or more suggestions render identically after truncation.
+- Visible text drops critical tokens (date, extension, ID).
+- List items are indistinguishable without extra context.
+
+These must be emitted as findings even if the expected substring is present.
+
+New finding types for UX clarity:
+- `low_info_density`: suggestions panel is present but mostly empty, repetitive, or unhelpfully sparse.
+- `ambiguous_suggestion`: multiple suggestions render identically or are indistinguishable.
+
+Implementation note: use a small helper (e.g., `scripts/tui-visibility-check.sh`) to parse rendered lines and flag ambiguous or low-information items.
 
 ---
 
@@ -243,7 +325,7 @@ CREATE TABLE IF NOT EXISTS tui_test_runs (
 run_root="/tmp/casparian-tui-$RUN_ID"
 
 # Load coverage data
-coverage_data=$(sqlite3 ~/.casparian_flow/casparian_flow.sqlite3 \
+coverage_data=$(duckdb ~/.casparian_flow/casparian_flow.duckdb \
   "SELECT test_path_id, last_tested_at, times_tested, last_result
    FROM tui_test_coverage")
 
@@ -257,7 +339,7 @@ current_code_hash=$(find crates/casparian/src -name "*.rs" -exec md5sum {} \; | 
 # Generate prioritized test list
 # Output: test_paths_prioritized.json
 ./scripts/tui-parallel-prioritize.sh \
-  --coverage-db ~/.casparian_flow/casparian_flow.sqlite3 \
+  --coverage-db ~/.casparian_flow/casparian_flow.duckdb \
   --spec-dir specs/views/ \
   --code-hash "$current_code_hash" \
   --output test_paths_prioritized.json
@@ -453,7 +535,10 @@ The findings format includes rich context so another LLM can understand and fix 
           "actual_screen": "┌─ Discover ────────────────────────────┐\n│ Source: [All Sources ▼]              │\n│ Tag:    [All Tags ▼]                 │\n├───────────────────────────────────────┤\n│ > file1.csv                           │\n│   file2.json                          │\n└───────────────────────────────────────┘",
           "keys_sent": "g",
           "full_key_sequence": ["1", "Enter", "3", "j", "g"],
-          "step_index": 4
+          "step_index": 4,
+          "visibility_assertions": [],
+          "quality_signals": [],
+          "example_items": []
         }
       ],
       "context": {
@@ -498,12 +583,15 @@ The findings format includes rich context so another LLM can understand and fix 
 
 | Field | Purpose | Used By Fixing LLM |
 |-------|---------|-------------------|
-| `type` | Category of failure | Understand failure type |
+| `type` | Category of failure (e.g., `low_info_density`, `ambiguous_suggestion`) | Understand failure type |
 | `expected` | What text should appear | Know the goal |
 | `actual_screen` | Captured TUI output | See exact state |
 | `keys_sent` | Key that triggered failure | Reproduce mentally |
 | `full_key_sequence` | All keys from start | Understand navigation path |
 | `step_index` | Which step failed | Locate in test path |
+| `visibility_assertions` | UI quality rules evaluated | Explain non-state failures |
+| `quality_signals` | Flags like `suffix_hidden`, `ambiguous_duplicates` | Fast triage |
+| `example_items` | Rendered strings that triggered the issue | See ambiguity |
 | `context.spec_reference` | Link to spec | Check requirements |
 | `context.relevant_files` | Files to examine | Narrow search |
 | `context.key_handler_location` | Where key is handled | Start point for fix |
@@ -611,15 +699,16 @@ done
 while IFS= read -r action; do
     keys=$(echo "$action" | jq -r '.keys')
     expect=$(echo "$action" | jq -r '.expect // empty')
+    expect_rules=$(echo "$action" | jq -c '.expect_rules // []')
 
     ./scripts/tui-send.sh "$keys"
     key_sequence+=("$keys")
     sleep 0.3
 
-    if [[ -n "$expect" ]]; then
+    if [[ -n "$expect" || "$expect_rules" != "[]" ]]; then
         # Capture screen output
         output=$(./scripts/tui-capture-stable.sh)
-        if ! echo "$output" | grep -q "$expect"; then
+        if [[ -n "$expect" ]] && ! echo "$output" | grep -q "$expect"; then
             status="fail"
             # Capture RICH CONTEXT for fixing LLM
             escaped_output=$(echo "$output" | jq -Rs .)
@@ -631,11 +720,43 @@ while IFS= read -r action; do
   "actual_screen": $escaped_output,
   "keys_sent": "$keys",
   "full_key_sequence": $key_seq_json,
-  "step_index": $step_index
+  "step_index": $step_index,
+  "visibility_assertions": [],
+  "quality_signals": [],
+  "example_items": []
 }
 FINDING
 )
             findings_json=$(echo "$findings_json" | jq ". + [$finding]")
+        fi
+
+        # Optional UI quality checks (suffix visibility, ambiguity, etc.)
+        if [[ "$expect_rules" != "[]" ]]; then
+            # Expected output: {"passed":true/false,"quality_signals":["..."],"example_items":["..."]}
+            visibility_result=$(./scripts/tui-visibility-check.sh "$expect_rules" "$output")
+            passed=$(echo "$visibility_result" | jq -r '.passed')
+            if [[ "$passed" != "true" ]]; then
+                status="fail"
+                escaped_output=$(echo "$output" | jq -Rs .)
+                key_seq_json=$(printf '%s\n' "${key_sequence[@]}" | jq -R . | jq -s .)
+                quality_signals=$(echo "$visibility_result" | jq -c '.quality_signals')
+                example_items=$(echo "$visibility_result" | jq -c '.example_items')
+                finding=$(cat <<FINDING
+{
+  "type": "low_information_value",
+  "expected": "$expect",
+  "actual_screen": $escaped_output,
+  "keys_sent": "$keys",
+  "full_key_sequence": $key_seq_json,
+  "step_index": $step_index,
+  "visibility_assertions": $expect_rules,
+  "quality_signals": $quality_signals,
+  "example_items": $example_items
+}
+FINDING
+)
+                findings_json=$(echo "$findings_json" | jq ". + [$finding]")
+            fi
         fi
     fi
     step_index=$((step_index + 1))

@@ -127,7 +127,7 @@ scan_source()
     │                       (ZMQ)               │
     │                            │              ▼
     │                       UPDATE          write outputs
-    │                       job_status      (parquet/sqlite)
+    │                       job_status      (parquet/duckdb)
 ```
 
 ---
