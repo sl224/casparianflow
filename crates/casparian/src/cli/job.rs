@@ -4,7 +4,8 @@
 
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
-use crate::cli::jobs::{get_db_path, Job};
+use crate::cli::jobs::{get_db_path, table_exists, Job};
+use crate::cli::output::format_number_signed;
 use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::ProcessingStatus;
 use clap::Subcommand;
@@ -362,8 +363,24 @@ async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
 
 /// Get a single job by ID
 async fn get_job_by_id(conn: &DbConnection, job_id: i64) -> anyhow::Result<Option<Job>> {
-    let row = conn
-        .query_optional(
+    let has_quarantine = table_exists(conn, "cf_quarantine").await?;
+    let quarantine_select = if has_quarantine {
+        ", COALESCE(qc.quarantine_rows, 0) as quarantine_rows"
+    } else {
+        ", NULL as quarantine_rows"
+    };
+    let quarantine_join = if has_quarantine {
+        r#"
+        LEFT JOIN (
+            SELECT job_id, COUNT(*) AS quarantine_rows
+            FROM cf_quarantine
+            GROUP BY job_id
+        ) qc ON qc.job_id = q.id
+        "#
+    } else {
+        ""
+    };
+    let query = format!(
         r#"
         SELECT
             q.id,
@@ -375,13 +392,18 @@ async fn get_job_by_id(conn: &DbConnection, job_id: i64) -> anyhow::Result<Optio
             q.end_time,
             q.error_message,
             q.result_summary,
-            q.retry_count
+            q.retry_count{quarantine_select}
         FROM cf_processing_queue q
         LEFT JOIN scout_files sf ON sf.id = q.file_id
+        {quarantine_join}
         WHERE q.id = ?
         "#,
-        &[DbValue::from(job_id)],
-        )
+        quarantine_select = quarantine_select,
+        quarantine_join = quarantine_join
+    );
+
+    let row = conn
+        .query_optional(&query, &[DbValue::from(job_id)])
         .await?;
 
     Ok(row.map(|r| Job {
@@ -395,6 +417,7 @@ async fn get_job_by_id(conn: &DbConnection, job_id: i64) -> anyhow::Result<Optio
         error_message: r.get(7).ok(),
         result_summary: r.get(8).ok(),
         retry_count: r.get(9).unwrap_or_default(),
+        quarantine_rows: r.get(10).ok(),
     }))
 }
 
@@ -478,6 +501,9 @@ fn print_job_details(job: &Job, failure: &Option<JobFailure>, timeline: &JobTime
     println!("STATUS:    {}", job.status.as_str());
     println!("PRIORITY:  {}", job.priority);
     println!("RETRIES:   {}", job.retry_count);
+    if let Some(rows) = job.quarantine_rows {
+        println!("QUARANTINE: {} rows", format_number_signed(rows));
+    }
 
     println!();
     println!("TIMELINE:");
@@ -589,6 +615,7 @@ mod tests {
             error_message: None,
             result_summary: None,
             retry_count: 0,
+            quarantine_rows: None,
         };
 
         let timeline = build_timeline(&job);
