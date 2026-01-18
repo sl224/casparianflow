@@ -471,6 +471,29 @@ impl DataType {
         }
     }
 
+    /// Check if a string value can be parsed as this type using an optional format string.
+    pub fn validate_string_with_format(&self, value: &str, format: Option<&str>) -> bool {
+        if value.is_empty() {
+            return true; // Empty handled by nullable check
+        }
+
+        let Some(format) = format else {
+            return self.validate_string(value);
+        };
+
+        match self {
+            DataType::Date => chrono::NaiveDate::parse_from_str(value, format).is_ok(),
+            DataType::Time => chrono::NaiveTime::parse_from_str(value, format).is_ok(),
+            DataType::Timestamp => {
+                chrono::NaiveDateTime::parse_from_str(value, format).is_ok()
+            }
+            DataType::TimestampTz { .. } => {
+                chrono::DateTime::parse_from_str(value, format).is_ok()
+            }
+            _ => self.validate_string(value),
+        }
+    }
+
     fn from_object(obj: DataTypeObject) -> Result<Self, String> {
         match obj.kind.to_lowercase().as_str() {
             "null" => Ok(DataType::Null),
@@ -1420,6 +1443,19 @@ mod tests {
 
         // Empty is valid for all types (nullability check elsewhere)
         assert!(DataType::Int64.validate_string(""));
+    }
+
+    #[test]
+    fn test_datatype_validate_string_with_format() {
+        let date_format = "%Y-%m-%d";
+        assert!(DataType::Date.validate_string_with_format("2024-01-15", Some(date_format)));
+        assert!(!DataType::Date.validate_string_with_format("01/15/2024", Some(date_format)));
+        assert!(DataType::Date.validate_string_with_format("01/15/2024", None));
+
+        let ts_format = "%Y-%m-%dT%H:%M:%S%:z";
+        let ts_tz = DataType::TimestampTz { tz: "UTC".to_string() };
+        assert!(ts_tz.validate_string_with_format("2024-01-15T10:30:00+00:00", Some(ts_format)));
+        assert!(!ts_tz.validate_string_with_format("2024-01-15T10:30:00", Some(ts_format)));
     }
 
     #[test]
