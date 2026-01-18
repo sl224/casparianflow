@@ -34,6 +34,14 @@ pub enum TuiMode {
     Settings,    // Application settings
 }
 
+/// Focus area for global shell navigation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellFocus {
+    #[default]
+    Main,
+    Rail,
+}
+
 /// Statistics shown on home hub cards
 #[derive(Debug, Clone, Default)]
 pub struct HomeStats {
@@ -189,7 +197,8 @@ impl JobsState {
                 JobStatus::Pending => 1,
                 JobStatus::Failed => 2,
                 JobStatus::Cancelled => 3,
-                JobStatus::Completed => 4,
+                JobStatus::PartialSuccess => 4,
+                JobStatus::Completed => 5,
             };
             let status_cmp = rank(a.status).cmp(&rank(b.status));
             if status_cmp == std::cmp::Ordering::Equal {
@@ -206,7 +215,7 @@ impl JobsState {
         let mut jobs: Vec<&JobInfo> = self.jobs
             .iter()
             .filter(|job| self.job_matches_filters(job))
-            .filter(|job| job.status == JobStatus::Completed)
+            .filter(|job| matches!(job.status, JobStatus::Completed | JobStatus::PartialSuccess))
             .collect();
 
         jobs.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
@@ -290,7 +299,7 @@ impl JobsState {
         for job in &self.jobs {
             match job.status {
                 JobStatus::Running => running += 1,
-                JobStatus::Completed => done += 1,
+                JobStatus::Completed | JobStatus::PartialSuccess => done += 1,
                 JobStatus::Failed => failed += 1,
                 _ => {}
             }
@@ -331,7 +340,7 @@ impl JobsState {
                     if removed >= to_remove {
                         return true;
                     }
-                    if matches!(j.status, JobStatus::Completed | JobStatus::Failed) {
+                    if matches!(j.status, JobStatus::Completed | JobStatus::PartialSuccess | JobStatus::Failed) {
                         removed += 1;
                         false
                     } else {
@@ -456,6 +465,7 @@ pub enum JobStatus {
     Pending,
     Running,
     Completed,
+    PartialSuccess,
     Failed,
     /// Job was cancelled by user
     Cancelled,
@@ -470,6 +480,7 @@ impl JobStatus {
             JobStatus::Pending => "○",
             JobStatus::Running => "↻",
             JobStatus::Completed => "✓",
+            JobStatus::PartialSuccess => "⚠",
             JobStatus::Failed => "✗",
             JobStatus::Cancelled => "⊘",
         }
@@ -481,6 +492,7 @@ impl JobStatus {
             JobStatus::Pending => "Pending",
             JobStatus::Running => "Running",
             JobStatus::Completed => "Completed",
+            JobStatus::PartialSuccess => "Partial",
             JobStatus::Failed => "Failed",
             JobStatus::Cancelled => "Cancelled",
         }
@@ -949,6 +961,20 @@ pub struct PendingTagWrite {
     pub tag: String,
 }
 
+/// Pending source update (name/path changes)
+#[derive(Debug, Clone)]
+pub struct PendingSourceUpdate {
+    pub id: String,
+    pub name: Option<String>,
+    pub path: Option<String>,
+}
+
+/// Pending source delete
+#[derive(Debug, Clone)]
+pub struct PendingSourceDelete {
+    pub id: String,
+}
+
 /// Result from background directory scan
 #[derive(Debug)]
 pub enum TuiScanResult {
@@ -1391,6 +1417,9 @@ pub struct DiscoverState {
     pub pending_rule_writes: Vec<PendingRuleWrite>,
     pub pending_rule_updates: Vec<PendingRuleUpdate>,
     pub pending_rule_deletes: Vec<PendingRuleDelete>,
+    pub pending_source_creates: Vec<Source>,
+    pub pending_source_updates: Vec<PendingSourceUpdate>,
+    pub pending_source_deletes: Vec<PendingSourceDelete>,
     /// Source ID to touch for MRU ordering (set on source selection)
     pub pending_source_touch: Option<String>,
 
@@ -1468,6 +1497,10 @@ pub struct App {
     pub show_help: bool,
     /// Whether the right-side inspector panel is collapsed
     pub inspector_collapsed: bool,
+    /// Global shell focus (rail vs main)
+    pub shell_focus: ShellFocus,
+    /// Selected nav index when rail is focused
+    pub nav_selected: usize,
     /// Home hub state
     pub home: HomeState,
     /// Discover mode state
@@ -1690,6 +1723,65 @@ impl App {
         }
     }
 
+    fn nav_index_for_mode(mode: TuiMode) -> usize {
+        match mode {
+            TuiMode::Home => 0,
+            TuiMode::Discover => 1,
+            TuiMode::ParserBench => 2,
+            TuiMode::Jobs => 3,
+            TuiMode::Sources => 4,
+            TuiMode::Settings => 5,
+        }
+    }
+
+    fn nav_mode_for_index(index: usize) -> TuiMode {
+        match index {
+            0 => TuiMode::Home,
+            1 => TuiMode::Discover,
+            2 => TuiMode::ParserBench,
+            3 => TuiMode::Jobs,
+            4 => TuiMode::Sources,
+            5 => TuiMode::Settings,
+            _ => TuiMode::Home,
+        }
+    }
+
+    fn set_mode(&mut self, mode: TuiMode) {
+        self.mode = mode;
+        self.nav_selected = Self::nav_index_for_mode(mode);
+    }
+
+    fn navigate_to_mode(&mut self, mode: TuiMode) {
+        match mode {
+            TuiMode::Discover => self.enter_discover_mode(),
+            TuiMode::ParserBench => {
+                self.set_mode(TuiMode::ParserBench);
+                self.parser_bench.parsers_loaded = false;
+                self.load_parsers();
+            }
+            TuiMode::Jobs => {
+                if self.mode != TuiMode::Jobs {
+                    self.jobs_state.previous_mode = Some(self.mode);
+                }
+                self.set_mode(TuiMode::Jobs);
+            }
+            TuiMode::Sources => {
+                self.set_mode(TuiMode::Sources);
+            }
+            TuiMode::Settings => {
+                if self.mode != TuiMode::Settings {
+                    self.settings.previous_mode = Some(self.mode);
+                }
+                self.set_mode(TuiMode::Settings);
+            }
+            TuiMode::Home => {
+                self.set_mode(TuiMode::Home);
+            }
+        }
+
+        self.shell_focus = ShellFocus::Main;
+    }
+
     /// Create new app with given args
     pub fn new(args: TuiArgs) -> Self {
         Self {
@@ -1697,6 +1789,8 @@ impl App {
             mode: TuiMode::Home,
             show_help: false,
             inspector_collapsed: false,
+            shell_focus: ShellFocus::Main,
+            nav_selected: Self::nav_index_for_mode(TuiMode::Home),
             home: HomeState::default(),
             discover: DiscoverState::default(),
             parser_bench: ParserBenchState::default(),
@@ -1747,7 +1841,7 @@ impl App {
     /// This ensures the Rule Builder UI appears instantly (no loading delay).
     /// Files will populate asynchronously as the cache loads.
     pub fn enter_discover_mode(&mut self) {
-        self.mode = TuiMode::Discover;
+        self.set_mode(TuiMode::Discover);
 
         // Initialize Rule Builder immediately if not already present
         if self.discover.rule_builder.is_none() {
@@ -1788,6 +1882,17 @@ impl App {
         }
         let (backend, path) = self.resolve_db_target();
         Self::open_db_write_with(backend, &path).await
+    }
+
+    async fn open_scout_db_for_writes(&self) -> Option<ScoutDatabase> {
+        if self.db_read_only {
+            return None;
+        }
+        let (_backend, path) = self.resolve_db_target();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        ScoutDatabase::open(&path).await.ok()
     }
 
     async fn open_db_readonly_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
@@ -1915,34 +2020,27 @@ impl App {
 
             // 1: Discover
             KeyCode::Char('1') if !self.in_text_input_mode() => {
-                self.enter_discover_mode();
+                self.navigate_to_mode(TuiMode::Discover);
                 return;
             }
             // 2: Parser Bench
             KeyCode::Char('2') if !self.in_text_input_mode() => {
-                self.mode = TuiMode::ParserBench;
-                self.parser_bench.parsers_loaded = false;
-                self.load_parsers();
+                self.navigate_to_mode(TuiMode::ParserBench);
                 return;
             }
             // 3: Jobs
             KeyCode::Char('3') if !self.in_text_input_mode() => {
-                if self.mode != TuiMode::Jobs {
-                    self.jobs_state.previous_mode = Some(self.mode);
-                }
-                self.mode = TuiMode::Jobs;
+                self.navigate_to_mode(TuiMode::Jobs);
                 return;
             }
             // 4: Sources
             KeyCode::Char('4') if !self.in_text_input_mode() => {
-                self.mode = TuiMode::Sources;
+                self.navigate_to_mode(TuiMode::Sources);
                 return;
             }
             // P: Parser Bench (separate from 1-4 navigation)
             KeyCode::Char('P') if !self.in_text_input_mode() => {
-                self.mode = TuiMode::ParserBench;
-                self.parser_bench.parsers_loaded = false;
-                self.load_parsers();
+                self.navigate_to_mode(TuiMode::ParserBench);
                 return;
             }
             // I: Toggle Inspector panel
@@ -1994,7 +2092,7 @@ impl App {
                     }
                     if let Some(job) = self.jobs_state.jobs.get(self.jobs_drawer_selected) {
                         self.jobs_state.section_focus = match job.status {
-                            JobStatus::Completed => JobsListSection::Ready,
+                            JobStatus::Completed | JobStatus::PartialSuccess => JobsListSection::Ready,
                             JobStatus::Pending | JobStatus::Running | JobStatus::Failed | JobStatus::Cancelled => {
                                 JobsListSection::Actionable
                             }
@@ -2007,12 +2105,12 @@ impl App {
 
                         if let Some(index) = target_list.iter().position(|j| j.id == job.id) {
                             self.jobs_state.selected_index = index;
-                        } else {
-                            self.jobs_state.selected_index = 0;
-                        }
-                        self.jobs_state.clamp_selection();
+                    } else {
+                        self.jobs_state.selected_index = 0;
                     }
-                    self.mode = TuiMode::Jobs;
+                    self.jobs_state.clamp_selection();
+                }
+                    self.set_mode(TuiMode::Jobs);
                     self.jobs_drawer_open = false;
                 }
                 return;
@@ -2038,7 +2136,7 @@ impl App {
             KeyCode::Enter if self.sources_drawer_open => {
                 if let Some(source) = self.sources_drawer_selected_source() {
                     self.sources_state.selected_index = source;
-                    self.mode = TuiMode::Sources;
+                    self.set_mode(TuiMode::Sources);
                     self.sources_drawer_open = false;
                 }
                 return;
@@ -2058,7 +2156,7 @@ impl App {
                     self.sources_state.selected_index = source_idx;
                     self.sources_state.editing = true;
                     self.sources_state.edit_value = source.path.display().to_string();
-                    self.mode = TuiMode::Sources;
+                    self.set_mode(TuiMode::Sources);
                     self.sources_drawer_open = false;
                 }
                 return;
@@ -2067,7 +2165,7 @@ impl App {
                 if let Some(source_idx) = self.sources_drawer_selected_source() {
                     self.sources_state.selected_index = source_idx;
                     self.sources_state.confirm_delete = true;
-                    self.mode = TuiMode::Sources;
+                    self.set_mode(TuiMode::Sources);
                     self.sources_drawer_open = false;
                 }
                 return;
@@ -2087,11 +2185,11 @@ impl App {
             }
             // 0 or H: Return to Home (from any view)
             KeyCode::Char('0') => {
-                self.mode = TuiMode::Home;
+                self.set_mode(TuiMode::Home);
                 return;
             }
             KeyCode::Char('H') => {
-                self.mode = TuiMode::Home;
+                self.set_mode(TuiMode::Home);
                 return;
             }
             // q: Quit application (per spec Section 3.1)
@@ -2122,10 +2220,7 @@ impl App {
             // ,: Open Settings (per specs/views/settings.md Section 4)
             // Don't intercept when in text input mode
             KeyCode::Char(',') if !self.in_text_input_mode() => {
-                if self.mode != TuiMode::Settings {
-                    self.settings.previous_mode = Some(self.mode);
-                    self.mode = TuiMode::Settings;
-                }
+                self.navigate_to_mode(TuiMode::Settings);
                 return;
             }
             // Esc: Close help overlay first, then handle other escapes
@@ -2134,6 +2229,45 @@ impl App {
                 return;
             }
             _ => {}
+        }
+
+        if !self.in_text_input_mode() {
+            if self.shell_focus == ShellFocus::Rail {
+                let max_index = Self::nav_index_for_mode(TuiMode::Settings);
+                match key.code {
+                    KeyCode::Up => {
+                        if self.nav_selected > 0 {
+                            self.nav_selected -= 1;
+                        }
+                        return;
+                    }
+                    KeyCode::Down => {
+                        if self.nav_selected < max_index {
+                            self.nav_selected += 1;
+                        }
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        let target = Self::nav_mode_for_index(self.nav_selected);
+                        self.navigate_to_mode(target);
+                        return;
+                    }
+                    KeyCode::Right | KeyCode::Esc => {
+                        self.shell_focus = ShellFocus::Main;
+                        return;
+                    }
+                    _ => {
+                        // Ignore other keys while rail is focused
+                        return;
+                    }
+                }
+            }
+
+            if key.code == KeyCode::Left && self.mode != TuiMode::Discover {
+                self.shell_focus = ShellFocus::Rail;
+                self.nav_selected = Self::nav_index_for_mode(self.mode);
+                return;
+            }
         }
 
         // Mode-specific keys (Main Focus)
@@ -2439,14 +2573,14 @@ impl App {
                     KeyCode::Char('0') => {
                         // Don't cancel - scan continues, just switch view
                         self.discover.view_state = DiscoverViewState::Files;
-                        self.mode = TuiMode::Home;
+                        self.set_mode(TuiMode::Home);
                         self.discover.status_message = Some(("Scan running in background...".to_string(), false));
                     }
                     // Navigate to Jobs while scan continues in background
                     KeyCode::Char('4') => {
                         // Don't cancel - scan continues, just switch view
                         self.discover.view_state = DiscoverViewState::Files;
-                        self.mode = TuiMode::Jobs;
+                        self.set_mode(TuiMode::Jobs);
                         self.discover.status_message = Some(("Scan running in background...".to_string(), false));
                     }
                     // All other keys are ignored during scanning
@@ -2496,7 +2630,7 @@ impl App {
                         self.discover.selected = 0;
                     }
                     KeyCode::Esc => {
-                        self.mode = TuiMode::Home;
+                        self.set_mode(TuiMode::Home);
                     }
                     _ => match self.discover.focus {
                         DiscoverFocus::Files => self.handle_discover_files_key(key),
@@ -3662,17 +3796,7 @@ impl App {
                 let new_name = self.discover.source_edit_input.trim().to_string();
                 if !new_name.is_empty() {
                     if let Some(source_id) = &self.discover.editing_source {
-                        // Update source name in local state
-                        if let Some(source) = self.discover.sources.iter_mut()
-                            .find(|s| &s.id == source_id)
-                        {
-                            source.name = new_name.clone();
-                            self.discover.status_message = Some((
-                                format!("Renamed source to '{}'", new_name),
-                                false,
-                            ));
-                            // TODO: Persist to DB
-                        }
+                        self.update_source_name(source_id, &new_name);
                     }
                 }
                 self.discover.editing_source = None;
@@ -3698,17 +3822,7 @@ impl App {
                         .find(|s| s.id == source_id)
                         .map(|s| s.name.clone());
 
-                    self.discover.sources.retain(|s| s.id != source_id);
-
-                    // Adjust selection if needed
-                    if self.discover.sources_manager_selected >= self.discover.sources.len()
-                        && self.discover.sources_manager_selected > 0
-                    {
-                        self.discover.sources_manager_selected -= 1;
-                    }
-
-                    // Validate main selection after deletion
-                    self.discover.validate_source_selection();
+                    self.delete_source(&source_id);
 
                     if let Some(name) = source_name {
                         self.discover.status_message = Some((
@@ -3716,7 +3830,6 @@ impl App {
                             false,
                         ));
                     }
-                    // TODO: Delete from DB (cascade delete files)
                 }
                 self.transition_discover_state(DiscoverViewState::SourcesManager);
             }
@@ -3766,7 +3879,7 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     builder.confirm_exit_open = false;
                     builder.dirty = false;
-                    self.mode = TuiMode::Home;
+                    self.set_mode(TuiMode::Home);
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     builder.confirm_exit_open = false;
@@ -3805,7 +3918,7 @@ impl App {
         if builder.source_id.is_none() {
             match key.code {
                 KeyCode::Esc => {
-                    self.mode = TuiMode::Home;
+                    self.set_mode(TuiMode::Home);
                 }
                 KeyCode::Char('1') => {
                     self.transition_discover_state(DiscoverViewState::SourcesDropdown);
@@ -3868,7 +3981,7 @@ impl App {
                         if builder.dirty {
                             builder.confirm_exit_open = true;
                         } else {
-                            self.mode = TuiMode::Home;
+                            self.set_mode(TuiMode::Home);
                         }
                         return;
                     }
@@ -4414,17 +4527,206 @@ impl App {
 
     /// Create a source from a directory path
     fn create_source(&mut self, path: &str, name: &str) {
-        // Note: Actual DB persistence would be done async via tick() or a separate task
-        // For now, just show a success message
+        if self.db_read_only {
+            self.discover.status_message = Some((
+                "Database is read-only; cannot create sources".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let raw_name = name.trim();
+        let source_name = if raw_name.is_empty() {
+            std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string())
+        } else {
+            raw_name.to_string()
+        };
+
+        if self.discover.sources.iter().any(|s| s.name == source_name) {
+            self.discover.status_message = Some((
+                format!("Source name '{}' already exists", source_name),
+                true,
+            ));
+            return;
+        }
+
+        let expanded_path = scan_path::expand_scan_path(std::path::Path::new(path));
+        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+            self.discover.status_message = Some((err.to_string(), true));
+            return;
+        }
+
+        let new_canon = scan_path::canonicalize_scan_path(&expanded_path);
+        for source in &self.discover.sources {
+            let existing_canon = scan_path::canonicalize_scan_path(&source.path);
+            if new_canon.starts_with(&existing_canon) || existing_canon.starts_with(&new_canon) {
+                self.discover.status_message = Some((
+                    format!("Source path overlaps with '{}'", source.name),
+                    true,
+                ));
+                return;
+            }
+        }
+
+        let source_path = expanded_path.display().to_string();
+        let source_id = format!("local:{}", source_path.replace(['/', '\\'], "_"));
+
+        let new_source = Source {
+            id: source_id.clone(),
+            name: source_name.clone(),
+            source_type: SourceType::Local,
+            path: source_path.clone(),
+            poll_interval_secs: 0,
+            enabled: true,
+        };
+
+        self.discover.pending_source_creates.push(new_source);
+        self.discover.sources.push(SourceInfo {
+            id: SourceId::from(source_id.clone()),
+            name: source_name.clone(),
+            path: std::path::PathBuf::from(&source_path),
+            file_count: 0,
+        });
+
+        self.discover.selected_source_id = Some(SourceId::from(source_id));
+        self.sources_state.selected_index = self.discover.sources.len().saturating_sub(1);
+
         self.discover.status_message = Some((
-            format!("Created source '{}' from {}", name,
-                std::path::Path::new(path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.to_string())
-            ),
+            format!("Created source '{}'", source_name),
             false,
         ));
+    }
+
+    fn update_source_name(&mut self, source_id: &SourceId, new_name: &str) {
+        if self.db_read_only {
+            self.discover.status_message = Some((
+                "Database is read-only; cannot rename sources".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        if self
+            .discover
+            .sources
+            .iter()
+            .any(|s| s.name == trimmed && s.id.as_str() != source_id.as_str())
+        {
+            self.discover.status_message = Some((
+                format!("Source name '{}' already exists", trimmed),
+                true,
+            ));
+            return;
+        }
+
+        if let Some(source) = self
+            .discover
+            .sources
+            .iter_mut()
+            .find(|s| s.id.as_str() == source_id.as_str())
+        {
+            source.name = trimmed.to_string();
+        }
+
+        self.discover.pending_source_updates.push(PendingSourceUpdate {
+            id: source_id.as_str().to_string(),
+            name: Some(trimmed.to_string()),
+            path: None,
+        });
+
+        self.discover.status_message = Some((
+            format!("Renamed source to '{}'", trimmed),
+            false,
+        ));
+    }
+
+    fn update_source_path(&mut self, source_id: &SourceId, new_path: &str) {
+        if self.db_read_only {
+            self.discover.status_message = Some((
+                "Database is read-only; cannot edit sources".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let expanded_path = scan_path::expand_scan_path(std::path::Path::new(new_path));
+        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+            self.discover.status_message = Some((err.to_string(), true));
+            return;
+        }
+
+        let new_canon = scan_path::canonicalize_scan_path(&expanded_path);
+        for source in &self.discover.sources {
+            if source.id.as_str() == source_id.as_str() {
+                continue;
+            }
+            let existing_canon = scan_path::canonicalize_scan_path(&source.path);
+            if new_canon.starts_with(&existing_canon) || existing_canon.starts_with(&new_canon) {
+                self.discover.status_message = Some((
+                    format!("Source path overlaps with '{}'", source.name),
+                    true,
+                ));
+                return;
+            }
+        }
+
+        let source_path = expanded_path.display().to_string();
+        if let Some(source) = self
+            .discover
+            .sources
+            .iter_mut()
+            .find(|s| s.id.as_str() == source_id.as_str())
+        {
+            source.path = std::path::PathBuf::from(&source_path);
+        }
+
+        self.discover.pending_source_updates.push(PendingSourceUpdate {
+            id: source_id.as_str().to_string(),
+            name: None,
+            path: Some(source_path),
+        });
+
+        self.discover.status_message = Some((
+            "Updated source path".to_string(),
+            false,
+        ));
+    }
+
+    fn delete_source(&mut self, source_id: &SourceId) {
+        if self.db_read_only {
+            self.discover.status_message = Some((
+                "Database is read-only; cannot delete sources".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        self.discover.pending_source_deletes.push(PendingSourceDelete {
+            id: source_id.as_str().to_string(),
+        });
+        self.discover
+            .sources
+            .retain(|s| s.id.as_str() != source_id.as_str());
+        self.discover.validate_source_selection();
+
+        if self.sources_state.selected_index >= self.discover.sources.len()
+            && self.sources_state.selected_index > 0
+        {
+            self.sources_state.selected_index = self.discover.sources.len().saturating_sub(1);
+        }
+        if self.discover.sources_manager_selected >= self.discover.sources.len()
+            && self.discover.sources_manager_selected > 0
+        {
+            self.discover.sources_manager_selected = self.discover.sources.len().saturating_sub(1);
+        }
     }
 
     /// Apply a tag to a file (stores in local state, async save happens on tick)
@@ -5428,7 +5730,7 @@ impl App {
             if let Some(value) = total {
                 job.items_total = value;
             }
-            if status == JobStatus::Completed || status == JobStatus::Failed || status == JobStatus::Cancelled {
+            if matches!(status, JobStatus::Completed | JobStatus::PartialSuccess | JobStatus::Failed | JobStatus::Cancelled) {
                 job.completed_at = Some(chrono::Local::now());
             }
             if let Some(err) = error {
@@ -5481,7 +5783,7 @@ impl App {
         if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
             job.status = status;
             job.items_processed = processed;
-            if status == JobStatus::Completed || status == JobStatus::Failed || status == JobStatus::Cancelled {
+            if matches!(status, JobStatus::Completed | JobStatus::PartialSuccess | JobStatus::Failed | JobStatus::Cancelled) {
                 job.completed_at = Some(chrono::Local::now());
             }
             if let Some(err) = error {
@@ -6829,7 +7131,12 @@ impl App {
                         WHEN 'RUNNING' THEN 1
                         WHEN 'QUEUED' THEN 2
                         WHEN 'FAILED' THEN 3
-                        WHEN 'COMPLETED' THEN 4
+                        WHEN 'CANCELLED' THEN 4
+                        WHEN 'ABORTED' THEN 4
+                        WHEN 'PARTIAL_SUCCESS' THEN 5
+                        WHEN 'COMPLETED_WITH_WARNINGS' THEN 5
+                        WHEN 'SUCCESS' THEN 6
+                        WHEN 'COMPLETED' THEN 6
                     END,
                     q.id DESC
                 LIMIT 100
@@ -6851,7 +7158,12 @@ impl App {
                         WHEN 'RUNNING' THEN 1
                         WHEN 'QUEUED' THEN 2
                         WHEN 'FAILED' THEN 3
-                        WHEN 'COMPLETED' THEN 4
+                        WHEN 'CANCELLED' THEN 4
+                        WHEN 'ABORTED' THEN 4
+                        WHEN 'PARTIAL_SUCCESS' THEN 5
+                        WHEN 'COMPLETED_WITH_WARNINGS' THEN 5
+                        WHEN 'SUCCESS' THEN 6
+                        WHEN 'COMPLETED' THEN 6
                     END,
                     q.id DESC
                 LIMIT 100
@@ -6924,9 +7236,11 @@ impl App {
 
                     let status = match status_str.as_str() {
                         "RUNNING" => JobStatus::Running,
-                        "QUEUED" => JobStatus::Pending,
-                        "COMPLETED" => JobStatus::Completed,
+                        "QUEUED" | "PENDING" => JobStatus::Pending,
+                        "COMPLETED" | "SUCCESS" => JobStatus::Completed,
+                        "PARTIAL_SUCCESS" | "COMPLETED_WITH_WARNINGS" => JobStatus::PartialSuccess,
                         "FAILED" => JobStatus::Failed,
+                        "CANCELLED" | "ABORTED" => JobStatus::Cancelled,
                         _ => JobStatus::Pending,
                     };
 
@@ -7070,7 +7384,7 @@ impl App {
         });
     }
 
-    /// Persist pending tag and rule writes to the database
+    /// Persist pending writes to the database
     async fn persist_pending_writes(&mut self) {
         if self.db_read_only {
             return;
@@ -7080,14 +7394,18 @@ impl App {
             && self.discover.pending_rule_writes.is_empty()
             && self.discover.pending_rule_updates.is_empty()
             && self.discover.pending_rule_deletes.is_empty()
+            && self.discover.pending_source_creates.is_empty()
+            && self.discover.pending_source_updates.is_empty()
+            && self.discover.pending_source_deletes.is_empty()
             && self.discover.pending_source_touch.is_none() {
             return;
         }
 
-        let conn = match self.open_db_write().await {
-            Some(conn) => conn,
+        let db = match self.open_scout_db_for_writes().await {
+            Some(db) => db,
             None => return,
         };
+        let conn = db.conn();
 
         // Persist tag updates to scout_files
         let tag_writes = std::mem::take(&mut self.discover.pending_tag_writes);
@@ -7146,6 +7464,40 @@ impl App {
             ).await;
         }
 
+        let mut sources_changed = false;
+
+        // Persist source creates
+        let source_creates = std::mem::take(&mut self.discover.pending_source_creates);
+        for source in source_creates {
+            if db.upsert_source(&source).await.is_ok() {
+                sources_changed = true;
+            }
+        }
+
+        // Persist source updates
+        let source_updates = std::mem::take(&mut self.discover.pending_source_updates);
+        for update in source_updates {
+            if let Ok(Some(mut source)) = db.get_source(&update.id).await {
+                if let Some(name) = update.name {
+                    source.name = name;
+                }
+                if let Some(path) = update.path {
+                    source.path = path;
+                }
+                if db.upsert_source(&source).await.is_ok() {
+                    sources_changed = true;
+                }
+            }
+        }
+
+        // Persist source deletes
+        let source_deletes = std::mem::take(&mut self.discover.pending_source_deletes);
+        for delete in source_deletes {
+            if db.delete_source(&delete.id).await.unwrap_or(false) {
+                sources_changed = true;
+            }
+        }
+
         // Touch source for MRU ordering (updates updated_at timestamp)
         if let Some(source_id) = std::mem::take(&mut self.discover.pending_source_touch) {
             let now = chrono::Utc::now().timestamp_millis();
@@ -7160,6 +7512,13 @@ impl App {
             if result.is_ok() {
                 self.discover.sources_loaded = false;
             }
+        }
+
+        if sources_changed {
+            self.discover.sources_loaded = false;
+            self.pending_sources_load = None;
+            self.home.stats_loaded = false;
+            self.pending_stats_load = None;
         }
     }
 
@@ -7356,7 +7715,9 @@ impl App {
         if self.sources_state.confirm_delete {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    // TODO: Actually delete the source
+                    if let Some(source) = self.discover.sources.get(self.sources_state.selected_index) {
+                        self.delete_source(&source.id);
+                    }
                     self.sources_state.confirm_delete = false;
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
@@ -7376,7 +7737,14 @@ impl App {
                     self.sources_state.edit_value.clear();
                 }
                 KeyCode::Enter => {
-                    // TODO: Save the edited source
+                    let value = self.sources_state.edit_value.trim().to_string();
+                    if !value.is_empty() {
+                        if self.sources_state.creating {
+                            self.create_source(&value, "");
+                        } else if let Some(source) = self.discover.sources.get(self.sources_state.selected_index) {
+                            self.update_source_path(&source.id, &value);
+                        }
+                    }
                     self.sources_state.editing = false;
                     self.sources_state.creating = false;
                     self.sources_state.edit_value.clear();
@@ -7436,9 +7804,9 @@ impl App {
             }
             KeyCode::Esc => {
                 if let Some(prev_mode) = self.jobs_state.previous_mode.take() {
-                    self.mode = prev_mode;
+                    self.set_mode(prev_mode);
                 } else {
-                    self.mode = TuiMode::Home;
+                    self.set_mode(TuiMode::Home);
                 }
             }
             _ => {}
@@ -7572,7 +7940,7 @@ impl App {
             }
             // Clear completed jobs from the list
             KeyCode::Char('x') => {
-                self.jobs_state.jobs.retain(|j| j.status != JobStatus::Completed);
+                self.jobs_state.jobs.retain(|j| !matches!(j.status, JobStatus::Completed | JobStatus::PartialSuccess));
                 // Clamp selection to valid range
                 self.jobs_state.clamp_selection();
             }
@@ -7597,7 +7965,7 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                self.mode = TuiMode::Home;
+                self.set_mode(TuiMode::Home);
             }
             _ => {}
         }
@@ -7824,6 +8192,9 @@ impl App {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         self.check_db_health_once().await;
+
+        // Persist any queued writes regardless of current view.
+        self.persist_pending_writes().await;
 
         // Preload sources on startup (any mode) so they're ready when user goes to Discover
         // This prevents "no sources" on first open
@@ -8315,9 +8686,6 @@ impl App {
 
         // Load Scout data if in Discover mode (but NOT while scanning - don't block progress updates)
         if self.mode == TuiMode::Discover && self.discover.view_state != DiscoverViewState::Scanning {
-            // Process pending DB writes FIRST (before any reloads)
-            self.persist_pending_writes().await;
-
             // Load files for selected source (also reloads tags when source changes)
             // Cache loading is non-blocking to avoid freezing UI on large sources
             if !self.discover.data_loaded {
@@ -9014,7 +9382,7 @@ if __name__ == "__main__":
                 } else if self.parser_bench.test_result.is_some() {
                     self.parser_bench.test_result = None;
                 } else {
-                    self.mode = TuiMode::Home;
+                    self.set_mode(TuiMode::Home);
                 }
             }
             // Delete broken symlink
@@ -9576,6 +9944,7 @@ mod tests {
         assert_eq!(JobStatus::Pending.symbol(), "○");
         assert_eq!(JobStatus::Running.symbol(), "↻");
         assert_eq!(JobStatus::Completed.symbol(), "✓");
+        assert_eq!(JobStatus::PartialSuccess.symbol(), "⚠");
         assert_eq!(JobStatus::Failed.symbol(), "✗");
     }
 
@@ -9584,6 +9953,7 @@ mod tests {
         assert_eq!(JobStatus::Pending.as_str(), "Pending");
         assert_eq!(JobStatus::Running.as_str(), "Running");
         assert_eq!(JobStatus::Completed.as_str(), "Completed");
+        assert_eq!(JobStatus::PartialSuccess.as_str(), "Partial");
         assert_eq!(JobStatus::Failed.as_str(), "Failed");
     }
 

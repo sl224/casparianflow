@@ -184,7 +184,7 @@ to show the correct action for the current view.
 
 ```
 ┌─ Top Bar ─────────────────────────────────────────────────────────────────┐
-│ Casparian Flow  |  Mode: Dev  |  Contract: STRICT  |  Quarantine: 14      │
+│ Casparian Flow | View: Home | DB: DuckDB | Run: 2 | Fail: 1 | Quarantine: 14 │
 ├─ Rail ──────────┬─ Main Pane ───────────────────────┬─ Inspector ──────────┤
 │  [0] Home       │                                   │                      │
 │  [1] Discover   │  Primary list / table / editor    │  Selected item       │
@@ -195,6 +195,9 @@ to show the correct action for the current view.
 │ Action Bar: 6-8 primary actions + status                                [?]│
 └────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Top bar alignment:** Current UI shows View/DB/Run/Fail/Quarantine totals. Add Mode/Contract
+once contract enforcement is user-visible, without dropping operational totals.
 
 ### 4.2 Panel Ratios
 
@@ -221,6 +224,10 @@ Action Bar (if interactive)
     ↓
 (back to Top Bar)
 ```
+
+**Rail shortcuts (non-text input):**
+- `←` moves focus to the Rail (disabled in Discover to avoid editor conflicts).
+- While Rail focused: `↑/↓` navigates, `Enter` selects, `→` or `Esc` returns to Main.
 
 ### 4.4 Dialog Pattern
 

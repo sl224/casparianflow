@@ -38,7 +38,7 @@ Table queried:
 ## 2. Layout (Proposed)
 
 ```
-┌─ Casparian Flow | Mode: Prod | Contract: STRICT | Quarantine: 14 ───────────────┐
+┌─ Casparian Flow | View: Jobs | DB: DuckDB | Run: 2 | Fail: 1 | Quarantine: 14 ─┐
 ├─ Rail ───────────┬─ Jobs (Output-First) ───────────────┬─ Inspector ────────────┤
 │ [0] Home         │ READY OUTPUTS                      │ Job #1842  [FAIL]       │
 │ [1] Discover     │ ▸ [READY] hl7_oru_obs 1.2M rows     │ Parser: finance_ap v2.1│
@@ -78,13 +78,15 @@ Table queried:
 ## 4. Notes / Planned
 
 - READY/ACTIONABLE are derived from `JobStatus`:
-  - READY: `Completed`, `CompletedWithWarnings`
+  - READY: `Completed`, `PartialSuccess` (`CompletedWithWarnings` compat alias)
   - ACTIONABLE: `Pending`, `Running`, `Failed`, `Cancelled`
 - Inspector is always visible unless toggled with `I`.
 - Schema contract status, quarantine count, and logical date are shown when
   available from job metadata (may be blank for V1).
 - Offline indicator is shown when network access is unavailable or disabled.
 - Phase line uses fixed topology: Context → Parse → Export (no DAG graph).
+- **Top bar alignment:** Current UI shows View/DB/Run/Fail/Quarantine totals. If Mode/Contract
+  should be surfaced, add them without dropping operational totals.
 
 ---
 

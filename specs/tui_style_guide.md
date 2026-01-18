@@ -156,8 +156,12 @@ Block::default().borders(Borders::LEFT)
 | Pending | `○` | Yellow |
 | Running | `↻` | Blue |
 | Completed | `✓` | Green |
+| Partial Success / CompletedWithWarnings | `⚠` | Yellow |
 | Failed | `✗` | Red |
 | Cancelled | `⊘` | DarkGray |
+
+**Implementation note:** `JobStatus` now includes `PartialSuccess` / `CompletedWithWarnings` and READY grouping
+should include partial-success jobs alongside fully completed outputs.
 
 ### 5.2 Parser Health
 
@@ -342,7 +346,7 @@ frame.render_widget(Clear, dialog_area);
 ### 8.1 Top Bar
 
 ```rust
-let title = Paragraph::new(" Casparian Flow  |  Mode: Dev  |  Contract: STRICT ")
+let title = Paragraph::new(" Casparian Flow | View: Home | DB: DuckDB | Run: 2 | Fail: 1 | Quarantine: 14 ")
     .style(Style::default().fg(Color::Cyan).bold())
     .alignment(Alignment::Left)
     .block(Block::default().borders(Borders::BOTTOM));
@@ -386,7 +390,7 @@ let block = Block::default()
 ### 8.5 Status Chips (ASCII-Safe)
 
 ```text
-[READY] [RUN] [FAIL] [QUAR] [PAUSED]
+[READY] [WARN] [RUN] [FAIL] [QUAR] [PAUSED]
 ```
 
 ### 8.6 Dropdown (Collapsed)

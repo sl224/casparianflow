@@ -46,7 +46,7 @@ Tables queried:
 ## 2. Layout
 
 ```
-┌─ Casparian Flow | Mode: Dev | Contract: STRICT | Quarantine: 14 ─────────┐
+┌─ Casparian Flow | View: Home | DB: DuckDB | Run: 2 | Fail: 1 | Quarantine: 14 ─┐
 ├─ Rail ───────────┬─ Readiness Board ─────────────────┬─ Inspector ───────┤
 │ [0] Home         │ READY OUTPUTS                     │ Output: hl7_oru    │
 │ [1] Discover     │ ▸ [READY] hl7_oru_obs  1.2M rows  │ Path: /data/...    │
@@ -98,6 +98,8 @@ Tables queried:
 - Ready Outputs uses `cf_processing_queue` (Completed/Warnings) and output metadata.
 - Active Runs shows ETA + straggler when available.
 - Warnings section surfaces quarantine counts and last failure per output.
+- Top bar currently shows View/DB/Run/Fail/Quarantine totals; add Mode/Contract
+  when contract enforcement is user-visible.
 
 ---
 

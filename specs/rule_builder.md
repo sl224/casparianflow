@@ -143,10 +143,11 @@ filtered to that source only.
 - No global rule list across sources.
 - No bulk edit or priority reordering in the overlay (future enhancement).
 
-### 4.5 Manual Tagging (Non-Persistent)
+### 4.5 Manual Tagging (Persistent)
 
 - `t` applies the current tag to the selected preview results (or prompts to apply to all).
-- This action does **not** create or update a rule; it only tags the current files.
+- Tags are persisted to `scout_files.tag` on the next tick.
+- This action does **not** create or update a rule; it only tags the selected files.
 
 ---
 
@@ -155,6 +156,8 @@ filtered to that source only.
 - Rules are persisted to `scout_tagging_rules` with unique `id`.
 - Validate tabs (Preview/Backtest/Coverage) are planned; Preview/Backtest are
   already implemented, Coverage is a stub.
+- **Implementation gap:** Glob Explorer publish flow does not persist extraction rules
+  or enqueue jobs yet; it transitions directly to a Published screen.
 
 ---
 

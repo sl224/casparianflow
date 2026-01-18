@@ -9,7 +9,7 @@ use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
 use crate::cli::output::format_number;
 use ratatui::widgets::Clear;
 use chrono::{DateTime, Local};
-use super::app::{App, DiscoverFocus, DiscoverViewState, JobInfo, JobStatus, JobsListSection, JobsViewState, ParserHealth, ThroughputSample, TuiMode};
+use super::app::{App, DiscoverFocus, DiscoverViewState, JobInfo, JobStatus, JobsListSection, JobsViewState, ParserHealth, ShellFocus, ThroughputSample, TuiMode};
 
 // ============================================================================
 // Shared UI Utilities
@@ -184,17 +184,25 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let is_focused = app.shell_focus == ShellFocus::Rail;
+    let (border_style, border_type) = if is_focused {
+        (Style::default().fg(Color::Cyan), BorderType::Double)
+    } else {
+        (Style::default().fg(Color::DarkGray), BorderType::Rounded)
+    };
+
     let block = Block::default()
         .title(" NAV ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(border_style)
+        .border_type(border_type);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         " Views",
-        Style::default().fg(Color::DarkGray),
+        if is_focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) },
     )));
 
     let nav_items = [
@@ -206,10 +214,17 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
         (",", "Settings", TuiMode::Settings),
     ];
 
-    for (key, label, mode) in nav_items {
-        let is_active = app.mode == mode;
-        let style = if is_active {
+    for (idx, (key, label, mode)) in nav_items.iter().enumerate() {
+        let is_active = app.mode == *mode;
+        let is_selected = is_focused && app.nav_selected == idx;
+        let style = if is_selected {
             Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+        } else if is_active {
+            if is_focused {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+            }
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -635,7 +650,9 @@ fn draw_jobs_drawer(frame: &mut Frame, app: &App, area: Rect) {
     let running = app.jobs_state.jobs.iter().filter(|j| j.status == super::app::JobStatus::Running).count();
     let pending = app.jobs_state.jobs.iter().filter(|j| j.status == super::app::JobStatus::Pending).count();
     let failed = app.jobs_state.jobs.iter().filter(|j| j.status == super::app::JobStatus::Failed).count();
-    let completed = app.jobs_state.jobs.iter().filter(|j| j.status == super::app::JobStatus::Completed).count();
+    let completed = app.jobs_state.jobs.iter()
+        .filter(|j| matches!(j.status, super::app::JobStatus::Completed | super::app::JobStatus::PartialSuccess))
+        .count();
 
     let status_line = ratatui::text::Line::from(vec![
         ratatui::text::Span::styled(format!("Running {} ", running), Style::default().fg(Color::Yellow)),
@@ -666,6 +683,7 @@ fn draw_jobs_drawer(frame: &mut Frame, app: &App, area: Rect) {
                 let status_style = match job.status {
                     super::app::JobStatus::Running => Style::default().fg(Color::Yellow),
                     super::app::JobStatus::Completed => Style::default().fg(Color::Green),
+                    super::app::JobStatus::PartialSuccess => Style::default().fg(Color::Yellow),
                     super::app::JobStatus::Failed => Style::default().fg(Color::Red),
                     super::app::JobStatus::Pending => Style::default().fg(Color::DarkGray),
                     super::app::JobStatus::Cancelled => Style::default().fg(Color::Magenta),
@@ -687,6 +705,7 @@ fn draw_jobs_drawer(frame: &mut Frame, app: &App, area: Rect) {
                         }
                     }
                     super::app::JobStatus::Completed => "✓".to_string(),
+                    super::app::JobStatus::PartialSuccess => "⚠".to_string(),
                     super::app::JobStatus::Failed => "✗".to_string(),
                     super::app::JobStatus::Pending => "○".to_string(),
                     super::app::JobStatus::Cancelled => "⊘".to_string(),
@@ -950,7 +969,7 @@ fn draw_home_readiness_panel(frame: &mut Frame, app: &App, area: Rect) {
         .home
         .recent_jobs
         .iter()
-        .filter(|j| j.status == super::app::JobStatus::Completed)
+        .filter(|j| matches!(j.status, super::app::JobStatus::Completed | super::app::JobStatus::PartialSuccess))
         .collect();
     let active: Vec<_> = app
         .home
@@ -976,9 +995,13 @@ fn draw_home_readiness_panel(frame: &mut Frame, app: &App, area: Rect) {
         )));
     } else {
         for job in ready.iter().take(3) {
+            let (label, style) = match job.status {
+                super::app::JobStatus::PartialSuccess => ("[WARN]", Style::default().fg(Color::Yellow)),
+                _ => ("[READY]", Style::default().fg(Color::Green)),
+            };
             lines.push(Line::from(Span::styled(
-                format!("  [READY] {} {}", job.job_type, job.description),
-                Style::default().fg(Color::Green),
+                format!("  {} {} {}", label, job.job_type, job.description),
+                style,
             )));
         }
     }
@@ -3482,7 +3505,9 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
         .split(shell.main);
 
     // Status bar with aggregate stats (per spec Section 4.1)
-    let ready = app.jobs_state.jobs.iter().filter(|j| j.status == JobStatus::Completed).count() as u32;
+    let ready = app.jobs_state.jobs.iter()
+        .filter(|j| matches!(j.status, JobStatus::Completed | JobStatus::PartialSuccess))
+        .count() as u32;
     let active = app.jobs_state.jobs.iter().filter(|j| matches!(j.status, JobStatus::Pending | JobStatus::Running)).count() as u32;
     let failed = app.jobs_state.jobs.iter().filter(|j| matches!(j.status, JobStatus::Failed | JobStatus::Cancelled)).count() as u32;
     let queue = app.jobs_state.jobs.iter().filter(|j| j.status == JobStatus::Pending).count() as u32;
@@ -3653,9 +3678,13 @@ fn render_ready_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool
     let time_str = format_relative_time(time_ref);
 
     let name = truncate_end(&job.name, width.saturating_sub(28));
+    let (label, label_style) = match job.status {
+        JobStatus::PartialSuccess => ("[WARN] ", Style::default().fg(Color::Yellow)),
+        _ => ("[READY] ", Style::default().fg(Color::Green)),
+    };
     lines.push(Line::from(vec![
         Span::styled(prefix, Style::default()),
-        Span::styled("[READY] ", Style::default().fg(Color::Green)),
+        Span::styled(label, label_style),
         Span::styled(format!("{} {}{}", job.job_type.as_str(), name, version_str), name_style),
         Span::styled(format!("  {}", time_str), Style::default().fg(Color::DarkGray)),
     ]));
@@ -3692,6 +3721,7 @@ fn render_actionable_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected:
         JobStatus::Failed => ("[FAIL] ", Style::default().fg(Color::Red)),
         JobStatus::Cancelled => ("[CANCEL] ", Style::default().fg(Color::DarkGray)),
         JobStatus::Completed => ("[READY] ", Style::default().fg(Color::Green)),
+        JobStatus::PartialSuccess => ("[WARN] ", Style::default().fg(Color::Yellow)),
     };
 
     let trailing = if job.status == JobStatus::Running {
@@ -3733,6 +3763,7 @@ fn render_actionable_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected:
         JobStatus::Pending => "    Queued".to_string(),
         JobStatus::Cancelled => "    Cancelled".to_string(),
         JobStatus::Completed => "    Ready".to_string(),
+        JobStatus::PartialSuccess => "    Ready (warn)".to_string(),
     };
     lines.push(Line::from(Span::styled(
         detail,
