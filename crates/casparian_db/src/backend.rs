@@ -914,7 +914,7 @@ impl DbConnection {
         sql: &str,
         params: &[DbValue],
     ) -> Result<Vec<DbRow>, BackendError> {
-        use sqlx::{Column, Row};
+        use sqlx::{Column, Row, ValueRef};
 
         let mut query = sqlx::query(sql);
         for param in params {
@@ -937,7 +937,9 @@ impl DbConnection {
             let mut values = Vec::with_capacity(columns.len());
 
             for (i, col) in row.columns().iter().enumerate() {
-                let value = match col.type_info().to_string().as_str() {
+                let type_info = col.type_info().to_string();
+                let type_upper = type_info.to_ascii_uppercase();
+                let value = match type_upper.as_str() {
                     "INTEGER" | "INT" | "BIGINT" | "INT64" => {
                         let v: Option<i64> = row.try_get(i).ok();
                         v.map(DbValue::Integer).unwrap_or(DbValue::Null)
@@ -965,22 +967,80 @@ impl DbConnection {
                             _ => DbValue::Null,
                         }
                     }
+                    other if other.contains("TEXT")
+                        || other.contains("CHAR")
+                        || other.contains("CLOB") =>
+                    {
+                        let v: Option<Option<String>> = row.try_get(i).ok();
+                        match v {
+                            Some(Some(text)) => DbValue::Text(text),
+                            _ => DbValue::Null,
+                        }
+                    }
                     _ => {
-                        if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
-                            v.map(DbValue::Integer).unwrap_or(DbValue::Null)
-                        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
-                            v.map(DbValue::Real).unwrap_or(DbValue::Null)
-                        } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
-                            v.map(DbValue::Boolean).unwrap_or(DbValue::Null)
-                        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
-                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
-                        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
-                            v.map(DbValue::Blob).unwrap_or(DbValue::Null)
+                        if let Ok(raw) = row.try_get_raw(i) {
+                            if raw.is_null() {
+                                DbValue::Null
+                            } else {
+                                let raw_type = raw.type_info().to_string();
+                                let raw_upper = raw_type.to_ascii_uppercase();
+                                match raw_upper.as_str() {
+                                    "INTEGER" => {
+                                        let v: Option<i64> = row.try_get(i).ok();
+                                        v.map(DbValue::Integer).unwrap_or(DbValue::Null)
+                                    }
+                                    "REAL" => {
+                                        let v: Option<f64> = row.try_get(i).ok();
+                                        v.map(DbValue::Real).unwrap_or(DbValue::Null)
+                                    }
+                                    "BLOB" => {
+                                        let v: Option<Vec<u8>> = row.try_get(i).ok();
+                                        v.map(DbValue::Blob).unwrap_or(DbValue::Null)
+                                    }
+                                    "TEXT" => {
+                                        let v: Option<Option<String>> = row.try_get(i).ok();
+                                        match v {
+                                            Some(Some(text)) => DbValue::Text(text),
+                                            _ => DbValue::Null,
+                                        }
+                                    }
+                                    _ => {
+                                        if let Ok(v) = row.try_get::<Option<Option<String>>, _>(i) {
+                                            match v {
+                                                Some(Some(text)) => DbValue::Text(text),
+                                                _ => DbValue::Null,
+                                            }
+                                        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+                                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
+                                        } else if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+                                            v.map(DbValue::Integer).unwrap_or(DbValue::Null)
+                                        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+                                            v.map(DbValue::Real).unwrap_or(DbValue::Null)
+                                        } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+                                            v.map(DbValue::Boolean).unwrap_or(DbValue::Null)
+                                        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+                                            v.map(DbValue::Blob).unwrap_or(DbValue::Null)
+                                        } else {
+                                            DbValue::Null
+                                        }
+                                    }
+                                }
+                            }
                         } else if let Ok(v) = row.try_get::<Option<Option<String>>, _>(i) {
                             match v {
                                 Some(Some(text)) => DbValue::Text(text),
                                 _ => DbValue::Null,
                             }
+                        } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
+                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
+                        } else if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
+                            v.map(DbValue::Integer).unwrap_or(DbValue::Null)
+                        } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
+                            v.map(DbValue::Real).unwrap_or(DbValue::Null)
+                        } else if let Ok(v) = row.try_get::<Option<bool>, _>(i) {
+                            v.map(DbValue::Boolean).unwrap_or(DbValue::Null)
+                        } else if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+                            v.map(DbValue::Blob).unwrap_or(DbValue::Null)
                         } else {
                             DbValue::Null
                         }
