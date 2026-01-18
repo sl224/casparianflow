@@ -59,15 +59,18 @@ pub struct SchemaApprovalRequest {
     pub discovery_id: Uuid,
 
     /// Parser identifier (stable across versions)
+    #[serde(default)]
     pub parser_id: String,
 
     /// Parser version for this approval
+    #[serde(default)]
     pub parser_version: String,
 
     /// Advisory hash of parser logic/config (optional)
     pub logic_hash: Option<String>,
 
     /// Feature flag: allow List/Struct types in approved schemas
+    #[serde(default)]
     pub allow_nested_types: bool,
 
     /// The approved schema variants (user may have modified columns/types)
@@ -455,6 +458,13 @@ pub async fn approve_schema(
         return Err(ApprovalError::NoSchemasApproved);
     }
 
+    if request.parser_id.trim().is_empty() {
+        return Err(ApprovalError::Validation("parser_id is required".into()));
+    }
+    if request.parser_version.trim().is_empty() {
+        return Err(ApprovalError::Validation("parser_version is required".into()));
+    }
+
     // Validate each schema variant
     for schema in &request.approved_schemas {
         validate_approved_schema(schema, request.allow_nested_types)?;
@@ -601,6 +611,7 @@ fn generate_approval_warnings(request: &SchemaApprovalRequest) -> Vec<ApprovalWa
 /// 1. Retrieves the discovery result
 /// 2. Creates an approval request with the proposed schemas as-is
 /// 3. Approves and creates the contract
+#[deprecated(note = "Use approve_schema with SchemaApprovalRequest to derive scope_id and enforce validation")]
 pub async fn approve_discovery_directly(
     storage: &SchemaStorage,
     discovery_id: &str,

@@ -974,7 +974,11 @@ impl Tool for ApproveSchemasTool {
                     "description": "User who is approving (default: 'claude-code')"
                 }
             }),
-            vec!["scope_id".to_string(), "schemas".to_string()],
+            vec![
+                "scope_id".to_string(),
+                "parser_version".to_string(),
+                "schemas".to_string(),
+            ],
         )
     }
 
@@ -993,7 +997,9 @@ impl Tool for ApproveSchemasTool {
         let parser_version = args
             .get("parser_version")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ToolError::InvalidParams("Missing required 'parser_version' parameter".into()))?;
 
         let logic_hash = args
             .get("logic_hash")

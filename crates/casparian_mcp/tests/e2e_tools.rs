@@ -306,6 +306,7 @@ async fn test_approve_schemas_creates_contract() {
 
     let params = json!({
         "scope_id": "test-scope-1",
+        "parser_version": "1.0.0",
         "schemas": [{
             "discovery_id": "disc-1",
             "name": "transactions",
@@ -340,6 +341,7 @@ async fn test_approve_schemas_validation() {
     // Empty schemas should fail
     let params = json!({
         "scope_id": "test-scope-2",
+        "parser_version": "1.0.0",
         "schemas": []
     });
 

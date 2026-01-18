@@ -304,6 +304,7 @@ impl SchemaStorage {
     }
 
     /// Approve a discovery result and create a contract.
+    #[deprecated(note = "Use approval::approve_schema with SchemaApprovalRequest to derive scope_id and enforce validation")]
     pub async fn approve_discovery(
         &self,
         discovery_id: &str,
@@ -520,6 +521,7 @@ mod tests {
         assert_eq!(history[1].version, 1);
     }
 
+    #[allow(deprecated)]
     #[tokio::test]
     async fn test_discovery_workflow() {
         let storage = SchemaStorage::in_memory().await.unwrap();

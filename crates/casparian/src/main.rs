@@ -490,7 +490,68 @@ fn command_wants_json(command: &Commands) -> bool {
     match command {
         Commands::Scan { json, .. } => *json,
         Commands::Preview { json, .. } => *json,
+        Commands::Files { json, .. } => *json,
+        Commands::Jobs { json, .. } => *json,
+        Commands::Backfill { json, .. } => *json,
+        Commands::Config { json } => *json,
         Commands::Run(args) => args.json,
+        Commands::Parser { action } => parser_action_wants_json(action),
+        Commands::Rule { action } => rule_action_wants_json(action),
+        Commands::Topic { action } => topic_action_wants_json(action),
+        Commands::Source { action } => source_action_wants_json(action),
+        Commands::WorkerCli { action } => worker_action_wants_json(action),
+        Commands::Job { action } => job_action_wants_json(action),
+        _ => false,
+    }
+}
+
+fn parser_action_wants_json(action: &cli::parser::ParserAction) -> bool {
+    match action {
+        cli::parser::ParserAction::List { json } => *json,
+        cli::parser::ParserAction::Show { json, .. } => *json,
+        cli::parser::ParserAction::Test { json, .. } => *json,
+        cli::parser::ParserAction::Backtest { json, .. } => *json,
+        cli::parser::ParserAction::Register { json, .. } => *json,
+        cli::parser::ParserAction::Health { json, .. } => *json,
+        _ => false,
+    }
+}
+
+fn rule_action_wants_json(action: &cli::rule::RuleAction) -> bool {
+    match action {
+        cli::rule::RuleAction::List { json } => *json,
+        cli::rule::RuleAction::Show { json, .. } => *json,
+        _ => false,
+    }
+}
+
+fn topic_action_wants_json(action: &cli::topic::TopicAction) -> bool {
+    match action {
+        cli::topic::TopicAction::List { json } => *json,
+        cli::topic::TopicAction::Show { json, .. } => *json,
+        _ => false,
+    }
+}
+
+fn source_action_wants_json(action: &cli::source::SourceAction) -> bool {
+    match action {
+        cli::source::SourceAction::List { json } => *json,
+        cli::source::SourceAction::Show { json, .. } => *json,
+        _ => false,
+    }
+}
+
+fn worker_action_wants_json(action: &cli::worker::WorkerAction) -> bool {
+    match action {
+        cli::worker::WorkerAction::List { json } => *json,
+        cli::worker::WorkerAction::Show { json, .. } => *json,
+        _ => false,
+    }
+}
+
+fn job_action_wants_json(action: &cli::job::JobAction) -> bool {
+    match action {
+        cli::job::JobAction::Show { json, .. } => *json,
         _ => false,
     }
 }

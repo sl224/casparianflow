@@ -487,11 +487,34 @@ impl DataType {
             DataType::Timestamp => {
                 chrono::NaiveDateTime::parse_from_str(value, format).is_ok()
             }
-            DataType::TimestampTz { .. } => {
-                chrono::DateTime::parse_from_str(value, format).is_ok()
+            DataType::TimestampTz { tz } => {
+                chrono::DateTime::parse_from_str(value, format)
+                    .map(|parsed| Self::timestamp_tz_matches(&parsed, tz))
+                    .unwrap_or(false)
             }
             _ => self.validate_string(value),
         }
+    }
+
+    fn timestamp_tz_matches(parsed: &chrono::DateTime<chrono::FixedOffset>, tz: &str) -> bool {
+        let tz = tz.trim();
+        if tz.is_empty() {
+            return true;
+        }
+
+        let tz_lower = tz.to_ascii_lowercase();
+        if matches!(tz_lower.as_str(), "utc" | "etc/utc" | "gmt" | "etc/gmt") {
+            return parsed.offset().local_minus_utc() == 0;
+        }
+
+        if let Ok(zone) = tz.parse::<chrono_tz::Tz>() {
+            let utc = parsed.with_timezone(&chrono::Utc);
+            let zoned = utc.with_timezone(&zone);
+            let expected = chrono::offset::Offset::fix(zoned.offset());
+            return expected == *parsed.offset();
+        }
+
+        false
     }
 
     fn from_object(obj: DataTypeObject) -> Result<Self, String> {
@@ -1456,6 +1479,11 @@ mod tests {
         let ts_tz = DataType::TimestampTz { tz: "UTC".to_string() };
         assert!(ts_tz.validate_string_with_format("2024-01-15T10:30:00+00:00", Some(ts_format)));
         assert!(!ts_tz.validate_string_with_format("2024-01-15T10:30:00", Some(ts_format)));
+        assert!(!ts_tz.validate_string_with_format("2024-01-15T10:30:00+01:00", Some(ts_format)));
+
+        let ny_tz = DataType::TimestampTz { tz: "America/New_York".to_string() };
+        assert!(ny_tz.validate_string_with_format("2024-01-15T10:30:00-05:00", Some(ts_format)));
+        assert!(!ny_tz.validate_string_with_format("2024-01-15T10:30:00+00:00", Some(ts_format)));
     }
 
     #[test]
