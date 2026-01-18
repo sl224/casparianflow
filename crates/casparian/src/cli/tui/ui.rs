@@ -3784,17 +3784,22 @@ fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
         ));
         detail.push_str(&format!("Status: {}\n", job.status.as_str()));
 
+        let quarantine_rows = job.quarantine_rows.filter(|rows| *rows > 0);
         if let Some(ref path) = job.output_path {
             detail.push_str("\nOUTPUT\n");
             detail.push_str(&format!("{}\n", path));
             if let Some(bytes) = job.output_size_bytes {
                 detail.push_str(&format!("{} files • {}\n", job.items_processed, format_size(bytes)));
             }
-            if let Some(rows) = job.quarantine_rows {
-                if rows > 0 {
-                    detail.push_str(&format!("Quarantine: {} rows\n", rows));
-                }
+            if let Some(rows) = quarantine_rows {
+                detail.push_str(&format!(
+                    "Quarantine: {} rows\n",
+                    format_number(rows as u64)
+                ));
             }
+        } else if let Some(rows) = quarantine_rows {
+            detail.push_str("\nQUARANTINE\n");
+            detail.push_str(&format!("{} rows\n", format_number(rows as u64)));
         }
 
         if job.status == JobStatus::Running {

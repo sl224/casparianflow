@@ -50,6 +50,7 @@ pub struct Job {
     pub error_message: Option<String>,
     pub result_summary: Option<String>,
     pub retry_count: i32,
+    pub quarantine_rows: Option<i64>,
 }
 
 /// Queue statistics
@@ -214,7 +215,7 @@ fn db_url_for_path(db_path: &PathBuf) -> String {
     }
 }
 
-async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
+pub(crate) async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
     let (query, param) = match conn.backend_name() {
         "DuckDB" => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
         "SQLite" => ("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", DbValue::from(table)),
@@ -327,6 +328,24 @@ async fn get_jobs(
         return Ok(Vec::new());
     }
 
+    let has_quarantine = table_exists(conn, "cf_quarantine").await?;
+    let quarantine_select = if has_quarantine {
+        ", COALESCE(qc.quarantine_rows, 0) as quarantine_rows"
+    } else {
+        ", NULL as quarantine_rows"
+    };
+    let quarantine_join = if has_quarantine {
+        r#"
+            LEFT JOIN (
+                SELECT job_id, COUNT(*) AS quarantine_rows
+                FROM cf_quarantine
+                GROUP BY job_id
+            ) qc ON qc.job_id = q.id
+        "#
+    } else {
+        ""
+    };
+
     // Build query dynamically based on filters
     let status_placeholders: String = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
 
@@ -343,15 +362,18 @@ async fn get_jobs(
                 q.end_time,
                 q.error_message,
                 q.result_summary,
-                q.retry_count
+                q.retry_count{quarantine_select}
             FROM cf_processing_queue q
             LEFT JOIN scout_files sf ON sf.id = q.file_id
+            {quarantine_join}
             WHERE q.status IN ({})
               AND q.plugin_name = ?
             ORDER BY q.id DESC
             LIMIT ?
             "#,
-            status_placeholders
+            status_placeholders,
+            quarantine_select = quarantine_select,
+            quarantine_join = quarantine_join
         )
     } else {
         format!(
@@ -366,14 +388,17 @@ async fn get_jobs(
                 q.end_time,
                 q.error_message,
                 q.result_summary,
-                q.retry_count
+                q.retry_count{quarantine_select}
             FROM cf_processing_queue q
             LEFT JOIN scout_files sf ON sf.id = q.file_id
+            {quarantine_join}
             WHERE q.status IN ({})
             ORDER BY q.id DESC
             LIMIT ?
             "#,
-            status_placeholders
+            status_placeholders,
+            quarantine_select = quarantine_select,
+            quarantine_join = quarantine_join
         )
     };
 
@@ -402,6 +427,7 @@ async fn get_jobs(
             error_message: row.get(7).ok(),
             result_summary: row.get(8).ok(),
             retry_count: row.get(9).unwrap_or_default(),
+            quarantine_rows: row.get(10).ok(),
         })
         .collect();
 
@@ -430,7 +456,7 @@ fn print_jobs_table(jobs: &[Job], limit: usize) {
 
     println!("JOBS (last {})", limit.min(jobs.len()));
 
-    let headers = &["ID", "FILE", "TOPIC", "STATUS", "STARTED", "DURATION"];
+    let headers = &["ID", "FILE", "TOPIC", "STATUS", "QUAR", "STARTED", "DURATION"];
 
     let rows: Vec<Vec<(String, Option<Color>)>> = jobs
         .iter()
@@ -445,12 +471,21 @@ fn print_jobs_table(jobs: &[Job], limit: usize) {
             let started = job.claim_time.as_ref()
                 .map(|t| format_datetime(t))
                 .unwrap_or_else(|| "-".to_string());
+            let quarantine_display = job
+                .quarantine_rows
+                .map(format_number_signed)
+                .unwrap_or_else(|| "-".to_string());
+            let quarantine_color = match job.quarantine_rows {
+                Some(rows) if rows > 0 => Some(Color::Yellow),
+                _ => None,
+            };
 
             vec![
                 (job.id.to_string(), None),
                 (file_display, None),
                 (job.plugin_name.clone(), None),
                 (job.status.as_str().to_string(), Some(status_color(job.status))),
+                (quarantine_display, quarantine_color),
                 (started, None),
                 (duration, None),
             ]

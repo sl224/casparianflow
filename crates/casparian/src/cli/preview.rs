@@ -89,8 +89,48 @@ pub struct PreviewResult {
     pub headers: Vec<String>,
 }
 
+fn validate_output_flags(args: &PreviewArgs) -> anyhow::Result<()> {
+    if args.raw && args.head.is_some() {
+        return Err(HelpfulError::new("Cannot combine --raw and --head")
+            .with_context("Preview supports one output mode at a time")
+            .with_suggestions([
+                "TRY: Use --raw for hex output".to_string(),
+                "TRY: Use --head N for first lines".to_string(),
+            ])
+            .into());
+    }
+
+    if args.raw && args.schema {
+        return Err(HelpfulError::new("Cannot combine --raw and --schema")
+            .with_context("Raw output does not include schema information")
+            .with_suggestion("TRY: Remove --raw to view schema".to_string())
+            .into());
+    }
+
+    if args.head.is_some() && args.schema {
+        return Err(HelpfulError::new("Cannot combine --head and --schema")
+            .with_context("Head output does not include schema information")
+            .with_suggestion("TRY: Remove --head to view schema".to_string())
+            .into());
+    }
+
+    if args.json && (args.raw || args.head.is_some()) {
+        return Err(HelpfulError::new("JSON output is not supported with --raw or --head")
+            .with_context("Raw/head modes emit plain text")
+            .with_suggestions([
+                "TRY: Remove --raw or --head to use --json".to_string(),
+                "TRY: Remove --json for text output".to_string(),
+            ])
+            .into());
+    }
+
+    Ok(())
+}
+
 /// Execute the preview command
 pub fn run(args: PreviewArgs) -> anyhow::Result<()> {
+    validate_output_flags(&args)?;
+
     // Validate file exists
     if !args.file.exists() {
         return Err(HelpfulError::file_not_found(&args.file).into());

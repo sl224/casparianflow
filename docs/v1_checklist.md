@@ -22,15 +22,15 @@ Status key:
 - [ ] [P1] 3 pilots identified with clear success criteria and access to logs. Status: UNKNOWN (not tracked).
 
 ## Type System + Schema Contracts
-- [ ] [P0] Canonical DataType supports primitives + Decimal + timestamp_tz. Status: GAP. Refs: `crates/casparian_protocol/src/types.rs:219`
-- [ ] [P0] timestamp_tz requires explicit timezone; no silent UTC default. Status: GAP. Refs: `crates/casparian_protocol/src/types.rs:237`
-- [ ] [P0] tzdb dependency pinned for deterministic parsing. Status: GAP. Refs: `crates/casparian_worker/Cargo.toml:47`
-- [ ] [P0] DataType serde backward-compatible (string + object formats). Status: GAP. Refs: `crates/casparian_protocol/src/types.rs:219`
-- [ ] [P0] Contract approvals reject List/Struct unless feature-flagged. Status: PARTIAL (blocked by missing types, no explicit gate). Refs: `crates/casparian_schema/src/approval.rs:418`
+- [ ] [P0] Canonical DataType supports primitives + Decimal + timestamp_tz. Status: DONE. Refs: `crates/casparian_protocol/src/types.rs:219`
+- [ ] [P0] timestamp_tz requires explicit timezone; no silent UTC default. Status: DONE. Refs: `crates/casparian_protocol/src/types.rs:399`
+- [ ] [P0] tzdb dependency pinned for deterministic parsing. Status: DONE. Refs: `crates/casparian_protocol/Cargo.toml`
+- [ ] [P0] DataType serde backward-compatible (string + object formats). Status: DONE. Refs: `crates/casparian_protocol/src/types.rs:253`
+- [ ] [P0] Contract approvals reject List/Struct unless feature-flagged. Status: GAP (types exist; explicit gate missing). Refs: `crates/casparian_schema/src/approval.rs:418`
 - [ ] [P1] Schema modes implemented: strict, allow_extra, allow_missing_optional. Status: GAP. Refs: `crates/casparian_schema/src/contract.rs:133`
 
 ## Validation + Quarantine
-- [ ] [P0] Rust-side validation authoritative (types, nullability, tz, format). Status: PARTIAL (format not enforced; string-to-typed hardfails). Refs: `crates/casparian_worker/src/schema_validation.rs:1`, `crates/casparian_worker/src/worker.rs:1038`
+- [ ] [P0] Rust-side validation authoritative (types, nullability, tz, format). Status: PARTIAL (format not enforced; schema formats parsed but not validated). Refs: `crates/casparian_worker/src/schema_validation.rs:1`, `crates/casparian_worker/src/worker.rs:1038`
 - [ ] [P0] Quarantine policy implemented: allow_quarantine + thresholds. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:793`
 - [ ] [P0] Quarantine schema includes _error_msg, _violation_type, _cf_job_id, and one of _source_row/_output_row_index. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:1201`
 - [ ] [P1] Optional raw row data capture (configurable, default off in prod). Status: PARTIAL (storage has raw_data, not wired). Refs: `crates/casparian/src/storage/sqlite.rs:777`
@@ -63,14 +63,14 @@ Status key:
 - [ ] [P1] Multi-output handling applies per-output status rules. Status: GAP. Refs: `crates/casparian_worker/src/worker.rs:528`
 
 ## Storage + Sinks
-- [ ] [P0] Parquet output stable and validated for Decimal/timestamp_tz. Status: GAP. Refs: `crates/casparian_protocol/src/types.rs:219`
-- [ ] [P0] DuckDB sink supported for queryable outputs. Status: PARTIAL (type coverage incomplete). Refs: `crates/casparian_sinks/src/lib.rs:608`
+- [ ] [P0] Parquet output stable and validated for Decimal/timestamp_tz. Status: PARTIAL (basic Parquet sink works; Decimal/timestamp_tz not validated). Refs: `crates/casparian_sinks/src/lib.rs:192`
+- [ ] [P0] DuckDB sink supported for queryable outputs. Status: DONE (v1 types covered). Refs: `crates/casparian_sinks/src/lib.rs:620`, `crates/casparian_sinks/src/lib.rs:1224`
 - [ ] [P1] Quarantine table naming: {output}_quarantine for DB sinks. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:1080`
 
 ## CLI/TUI
 - [ ] [P0] CLI run/preview/scan workflows stable. Status: PARTIAL (implemented, dev-mode). Refs: `crates/casparian/src/cli/run.rs:1`, `crates/casparian/src/cli/preview.rs:82`, `crates/casparian/src/cli/scan.rs:136`
 - [ ] [P0] Quarantine summary visible in CLI/TUI. Status: GAP.
-- [ ] [P1] Jobs view shows status + lineage. Status: GAP.
+- [ ] [P1] Jobs view shows status + lineage. Status: PARTIAL (status shown; lineage not yet visible).
 
 ## Testing + QA
 - [ ] [P0] Unit tests: timestamp_tz validation + Decimal coercion rules. Status: GAP.

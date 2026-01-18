@@ -11,6 +11,7 @@ use casparian_sentinel::{Sentinel, SentinelArgs, SentinelConfig};
 use casparian_worker::{bridge, Worker, WorkerArgs, WorkerConfig};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -194,7 +195,7 @@ enum Commands {
 
     // === W4: Job Commands (stubs) ===
 
-    /// Execute a parser against an input file (dev mode)
+    /// Execute a parser against an input file
     Run(cli::run::RunArgs),
 
     /// List processing jobs
@@ -485,34 +486,16 @@ impl UnifiedWorkerHandle {
     }
 }
 
-fn main() -> Result<()> {
-    // Parse CLI first to check if we're in TUI mode
-    let cli = Cli::parse();
-
-    // Initialize logging - suppress stdout logs in TUI mode to avoid corrupting display
-    let is_tui_mode = matches!(cli.command, Commands::Tui { .. });
-
-    if is_tui_mode {
-        // TUI mode: only log errors to stderr, suppress info/debug
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "error".into()),
-            )
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-            .init();
-    } else {
-        // Normal mode: full logging to stdout
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    "casparian=info,casparian_sentinel=info,casparian_worker=info".into()
-                }),
-            )
-            .with(tracing_subscriber::fmt::layer())
-            .init();
+fn command_wants_json(command: &Commands) -> bool {
+    match command {
+        Commands::Scan { json, .. } => *json,
+        Commands::Preview { json, .. } => *json,
+        Commands::Run(args) => args.json,
+        _ => false,
     }
+}
 
+fn run_command(cli: Cli) -> Result<()> {
     match cli.command {
         // === W1: Core Standalone Commands ===
         Commands::Scan {
@@ -544,7 +527,8 @@ fn main() -> Result<()> {
                     quiet,
                     interactive,
                     tag,
-                }).await
+                })
+                .await
             })
         }
 
@@ -604,7 +588,8 @@ fn main() -> Result<()> {
                     tag,
                     limit,
                     json,
-                }).await
+                })
+                .await
             })
         }
 
@@ -672,9 +657,7 @@ fn main() -> Result<()> {
         // === W7: MCP Server ===
         Commands::McpServer { addr } => {
             let rt = Runtime::new().context("Failed to create runtime")?;
-            rt.block_on(async {
-                cli::mcp::run(cli::mcp::McpArgs { addr }).await
-            })
+            rt.block_on(async { cli::mcp::run(cli::mcp::McpArgs { addr }).await })
         }
 
         // === Existing Server Commands ===
@@ -707,13 +690,65 @@ fn main() -> Result<()> {
                 run_publish(file, version, addr, publisher, email).await
             })
         }
-        Commands::ProcessJob { job_id, db, output } => {
-            process_single_job(job_id, &db, &output)
-        }
+        Commands::ProcessJob { job_id, db, output } => process_single_job(job_id, &db, &output),
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
         Commands::Tui { args } => {
             let rt = Runtime::new().context("Failed to create runtime")?;
             rt.block_on(async { cli::tui::run(args).await })
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    // Parse CLI first to check if we're in TUI mode
+    let cli = Cli::parse();
+
+    // Initialize logging - suppress stdout logs in TUI mode to avoid corrupting display
+    let is_tui_mode = matches!(cli.command, Commands::Tui { .. });
+    let json_mode = command_wants_json(&cli.command);
+
+    if is_tui_mode {
+        // TUI mode: only log errors to stderr, suppress info/debug
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "error".into()),
+            )
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+    } else if json_mode {
+        // JSON mode: log to stderr to keep stdout machine-readable
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "casparian=info,casparian_sentinel=info,casparian_worker=info".into()
+                }),
+            )
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init();
+    } else {
+        // Normal mode: full logging to stdout
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "casparian=info,casparian_sentinel=info,casparian_worker=info".into()
+                }),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
+
+    let result = run_command(cli);
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            if json_mode {
+                cli::error::print_json_error(&err);
+            } else {
+                eprintln!("{:?}", err);
+            }
+            ExitCode::from(1)
         }
     }
 }

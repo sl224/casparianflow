@@ -44,6 +44,7 @@ struct JobOutput {
     error_message: Option<String>,
     result_summary: Option<String>,
     retry_count: i32,
+    quarantine_rows: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

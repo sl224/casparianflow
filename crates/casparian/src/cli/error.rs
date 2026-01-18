@@ -5,6 +5,8 @@
 //! - Context about the situation
 //! - Suggestions for how to fix it
 
+use anyhow::Error;
+use serde::Serialize;
 use std::fmt;
 use std::path::Path;
 
@@ -149,6 +151,51 @@ impl HelpfulError {
                 "TRY: Verify this is a valid Parquet file".to_string(),
                 "TRY: Check if the file was fully written (not truncated)".to_string(),
             ])
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonErrorInfo {
+    pub message: String,
+    pub context: Option<String>,
+    pub suggestions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonErrorOutput {
+    pub error: JsonErrorInfo,
+}
+
+impl JsonErrorOutput {
+    pub fn from_anyhow(err: &Error) -> Self {
+        let helpful = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<HelpfulError>());
+
+        match helpful {
+            Some(helpful) => Self {
+                error: JsonErrorInfo {
+                    message: helpful.message.clone(),
+                    context: helpful.context.clone(),
+                    suggestions: helpful.suggestions.clone(),
+                },
+            },
+            None => Self {
+                error: JsonErrorInfo {
+                    message: err.to_string(),
+                    context: None,
+                    suggestions: Vec::new(),
+                },
+            },
+        }
+    }
+}
+
+pub fn print_json_error(err: &Error) {
+    let payload = JsonErrorOutput::from_anyhow(err);
+    match serde_json::to_string_pretty(&payload) {
+        Ok(json) => println!("{}", json),
+        Err(_) => eprintln!("{:?}", err),
     }
 }
 

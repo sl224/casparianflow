@@ -19,6 +19,29 @@ fn run_cli(args: &[String], envs: &[(&str, &str)]) -> Output {
     cmd.output().expect("failed to execute casparian CLI")
 }
 
+fn parse_json_output(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json_start = stdout
+        .find(|c| c == '{' || c == '[')
+        .unwrap_or_else(|| {
+            panic!(
+                "no JSON payload found in output\nstdout:\n{}\nstderr:\n{}",
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    let json_text = &stdout[json_start..];
+    let mut deserializer = serde_json::Deserializer::from_str(json_text);
+    serde_json::Value::deserialize(&mut deserializer).unwrap_or_else(|err| {
+        panic!(
+            "failed to parse JSON output: {}\nstdout:\n{}\nstderr:\n{}",
+            err,
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
 fn run_cli_json<T: DeserializeOwned>(args: &[String], envs: &[(&str, &str)]) -> T {
     let output = run_cli(args, envs);
     assert!(
@@ -28,26 +51,27 @@ fn run_cli_json<T: DeserializeOwned>(args: &[String], envs: &[(&str, &str)]) -> 
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json_start = stdout
-        .find('{')
-        .unwrap_or_else(|| {
-            panic!(
-                "no JSON object found in output\nstdout:\n{}\nstderr:\n{}",
-                stdout,
-                String::from_utf8_lossy(&output.stderr)
-            )
-        });
-    let json_text = &stdout[json_start..];
-    let mut deserializer = serde_json::Deserializer::from_str(json_text);
-    T::deserialize(&mut deserializer).unwrap_or_else(|err| {
+    let value = parse_json_output(&output);
+    serde_json::from_value(value).unwrap_or_else(|err| {
         panic!(
-            "failed to parse JSON output: {}\nstdout:\n{}\nstderr:\n{}",
+            "failed to deserialize JSON output: {}\nstdout:\n{}\nstderr:\n{}",
             err,
-            stdout,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn run_cli_json_error(args: &[String], envs: &[(&str, &str)]) -> serde_json::Value {
+    let output = run_cli(args, envs);
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded: {}\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_json_output(&output)
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +154,31 @@ fn test_scan_json_filters() {
         .files
         .iter()
         .all(|f| !path_ends_with(&f.path, "deep.csv")));
+}
+
+#[test]
+fn test_scan_json_error_invalid_path() {
+    let home_dir = TempDir::new().expect("create temp home");
+    let missing_path = home_dir.path().join("missing");
+    let home_str = home_dir.path().to_string_lossy().to_string();
+    let envs = [
+        ("CASPARIAN_HOME", home_str.as_str()),
+        ("CASPARIAN_DB_BACKEND", "sqlite"),
+        ("RUST_LOG", "error"),
+    ];
+
+    let args = vec![
+        "scan".to_string(),
+        missing_path.to_string_lossy().to_string(),
+        "--json".to_string(),
+    ];
+    let value = run_cli_json_error(&args, &envs);
+    let message = value["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Path not found"),
+        "unexpected error message: {}",
+        message
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +272,46 @@ fn test_preview_json_outputs() {
     let ndjson_result: PreviewResult = run_cli_json(&ndjson_args, &[]);
     assert_eq!(ndjson_result.file_type, "NdJson");
     assert_eq!(ndjson_result.row_count, 3);
+}
+
+#[test]
+fn test_preview_json_error_missing_file() {
+    let data_dir = TempDir::new().expect("create preview dir");
+    let missing_path = data_dir.path().join("missing.csv");
+    let args = vec![
+        "preview".to_string(),
+        missing_path.to_string_lossy().to_string(),
+        "--json".to_string(),
+    ];
+    let value = run_cli_json_error(&args, &[]);
+    let message = value["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("File not found"),
+        "unexpected error message: {}",
+        message
+    );
+}
+
+#[test]
+fn test_run_json_error_missing_parser() {
+    let data_dir = TempDir::new().expect("create run dir");
+    let input_path = data_dir.path().join("input.csv");
+    fs::write(&input_path, "id,name\n1,A\n").unwrap();
+    let parser_path = data_dir.path().join("missing_parser.py");
+
+    let args = vec![
+        "run".to_string(),
+        parser_path.to_string_lossy().to_string(),
+        input_path.to_string_lossy().to_string(),
+        "--json".to_string(),
+    ];
+    let value = run_cli_json_error(&args, &[]);
+    let message = value["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Parser not found"),
+        "unexpected error message: {}",
+        message
+    );
 }
 
 fn path_ends_with(path: &Path, tail: &str) -> bool {

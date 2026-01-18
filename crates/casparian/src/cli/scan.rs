@@ -138,6 +138,13 @@ fn matches_patterns(
 /// Uses the consolidated Scanner for file discovery, storage, and cache building.
 /// CLI-specific filters are applied post-scan for display and tagging.
 pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
+    if args.json && args.interactive {
+        return Err(HelpfulError::new("Cannot combine --json and --interactive")
+            .with_context("Interactive mode renders a TUI, not JSON output")
+            .with_suggestion("TRY: Remove --interactive to use --json".to_string())
+            .into());
+    }
+
     let expanded_path = scan_path::expand_scan_path(&args.path);
     if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
         return Err(match err {
