@@ -1466,6 +1466,8 @@ pub struct App {
     pub mode: TuiMode,
     /// Whether the help overlay is visible (per spec Section 3.1)
     pub show_help: bool,
+    /// Whether the right-side inspector panel is collapsed
+    pub inspector_collapsed: bool,
     /// Home hub state
     pub home: HomeState,
     /// Discover mode state
@@ -1694,6 +1696,7 @@ impl App {
             running: true,
             mode: TuiMode::Home,
             show_help: false,
+            inspector_collapsed: false,
             home: HomeState::default(),
             discover: DiscoverState::default(),
             parser_bench: ParserBenchState::default(),
@@ -1940,6 +1943,11 @@ impl App {
                 self.mode = TuiMode::ParserBench;
                 self.parser_bench.parsers_loaded = false;
                 self.load_parsers();
+                return;
+            }
+            // I: Toggle Inspector panel
+            KeyCode::Char('I') if !self.in_text_input_mode() => {
+                self.inspector_collapsed = !self.inspector_collapsed;
                 return;
             }
             // J: Toggle Jobs Drawer (global overlay)

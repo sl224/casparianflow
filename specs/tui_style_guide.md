@@ -2,8 +2,8 @@
 
 **Status:** Active
 **Parent:** spec.md
-**Version:** 1.0
-**Date:** January 14, 2026
+**Version:** 1.4
+**Date:** January 18, 2026
 
 ---
 
@@ -298,40 +298,26 @@ let style = if is_selected && is_focused {
 
 ## 7. Layout Patterns
 
-### 7.1 Standard Screen Structure
+### 7.1 Standard Screen Structure (Audit-First Shell)
 
 ```
-┌─────────────────────────────────────────────────┐
-│ TITLE BAR                            [3 lines]  │ <- Cyan text, BOTTOM border
-├─────────────────────────────────────────────────┤
-│                                                 │
-│ MAIN CONTENT                         [Min(0)]  │ <- Flexible height
-│                                                 │
-├─────────────────────────────────────────────────┤
-│ FOOTER / STATUS BAR                  [3 lines]  │ <- DarkGray text, TOP border
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ TOP BAR                                                         [3 lines]│
+├──────────────────────────────────────────────────────────────────────────┤
+│ RAIL (fixed) │ MAIN PANE (flex)               │ INSPECTOR (fixed)         │
+│             │                               │                            │
+├──────────────────────────────────────────────────────────────────────────┤
+│ ACTION BAR / STATUS                                     [3 lines]          │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 Two-Panel Layout
+### 7.2 Rail + Inspector Pattern
 
 ```
-┌────────────────┬────────────────────────────────┐
-│                │                                │
-│  LEFT PANEL    │       RIGHT PANEL              │
-│  (35% or Min)  │       (65% or rest)            │
-│                │                                │
-└────────────────┴────────────────────────────────┘
-```
-
-### 7.3 Sidebar Pattern
-
-```
-┌─────────────────────────────────────┬───────────┐
-│                                     │           │
-│  MAIN CONTENT (70%)                 │  SIDEBAR  │
-│                                     │  (30%)    │
-│                                     │           │
-└─────────────────────────────────────┴───────────┘
+┌──────────────┬────────────────────────────────┬──────────────────────────┐
+│  Rail        │  Main list / editor            │  Inspector               │
+│  (18-22ch)   │                                │  (30-35% width)          │
+└──────────────┴────────────────────────────────┴──────────────────────────┘
 ```
 
 ### 7.4 Dialog/Modal Pattern
@@ -353,20 +339,20 @@ frame.render_widget(Clear, dialog_area);
 
 ## 8. Component Styles
 
-### 8.1 Title Bar
+### 8.1 Top Bar
 
 ```rust
-let title = Paragraph::new(" Screen Name ")
+let title = Paragraph::new(" Casparian Flow  |  Mode: Dev  |  Contract: STRICT ")
     .style(Style::default().fg(Color::Cyan).bold())
-    .alignment(Alignment::Center)
+    .alignment(Alignment::Left)
     .block(Block::default().borders(Borders::BOTTOM));
 ```
 
-### 8.2 Footer/Status Bar
+### 8.2 Action Bar / Status Bar
 
 ```rust
 // Normal hints
-let footer = Paragraph::new(" [key] Action  [key] Action ")
+let footer = Paragraph::new(" [Enter] Open  [r] Refresh  [/] Filter  [?] Help ")
     .style(Style::default().fg(Color::DarkGray))
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::TOP));
@@ -378,7 +364,32 @@ Style::default().fg(Color::Green)
 Style::default().fg(Color::Red)
 ```
 
-### 8.3 Dropdown (Collapsed)
+### 8.3 Rail Item Style
+
+```rust
+// Selected rail item
+Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+
+// Inactive rail item
+Style::default().fg(Color::Gray)
+```
+
+### 8.4 Inspector Block
+
+```rust
+let block = Block::default()
+    .title(" INSPECTOR ")
+    .borders(Borders::ALL)
+    .border_style(Style::default().fg(Color::DarkGray));
+```
+
+### 8.5 Status Chips (ASCII-Safe)
+
+```text
+[READY] [RUN] [FAIL] [QUAR] [PAUSED]
+```
+
+### 8.6 Dropdown (Collapsed)
 
 ```rust
 // Format: "[N] name ▾ count"
@@ -390,7 +401,7 @@ Line::from(vec![
 ])
 ```
 
-### 8.4 Dropdown (Expanded)
+### 8.7 Dropdown (Expanded)
 
 ```rust
 // Double borders when focused and open
@@ -401,7 +412,7 @@ let block = Block::default()
     .title(Span::styled(" [1] Source ▲ ", Style::default().fg(Color::Cyan).bold()));
 ```
 
-### 8.5 Input Field
+### 8.8 Input Field
 
 ```rust
 // Active input with cursor (glob pattern style)
@@ -1041,6 +1052,7 @@ TOOL:       Color::Magenta
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2026-01-18 | 1.4 | Redesign: audit-first shell layout + rail/inspector patterns |
 | 2026-01-14 | 1.0 | Initial specification from codebase analysis |
 | 2026-01-14 | 1.1 | Added Section 5.5 Animation Timing (GAP-TIMING-001) |
 | 2026-01-14 | 1.2 | Added Sections 8.8-8.13 (List patterns, Scrollbars), Section 13.4 (Unicode fallback) |
