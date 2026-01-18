@@ -883,7 +883,9 @@ fn arrow_value_to_duckdb(array: &ArrayRef, row: usize) -> duckdb::types::Value {
             if *scale < 0 {
                 Value::Text(format!("{:?}", array.slice(row, 1)))
             } else {
-                Value::Decimal(Decimal::from_i128_with_scale(value, *scale as u32))
+                // DuckDB rust bindings don't support Decimal bindings yet, so pass as text for casting.
+                let decimal = Decimal::from_i128_with_scale(value, *scale as u32);
+                Value::Text(decimal.to_string())
             }
         }
         DataType::Decimal256(_, _) => Value::Text(format!("{:?}", array.slice(row, 1))),
@@ -1111,8 +1113,17 @@ pub fn create_sink_from_uri(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Decimal128Builder, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{
+        Array,
+        Decimal128Array,
+        Decimal128Builder,
+        Int64Array,
+        StringArray,
+        TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{Field, TimeUnit};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
     use tempfile::tempdir;
 
     fn create_test_batch() -> RecordBatch {
@@ -1151,6 +1162,86 @@ mod tests {
         // Verify temp file was cleaned up
         let temp_path = dir.path().join(".test_12345678.parquet.tmp");
         assert!(!temp_path.exists());
+    }
+
+    #[test]
+    fn test_parquet_sink_decimal_timestamp_tz_roundtrip() {
+        let dir = tempdir().unwrap();
+        let job_id = "12345678-abcd-1234-abcd-123456789abc";
+        let mut sink = ParquetSink::new(dir.path().to_path_buf(), "test_decimal_tz", job_id).unwrap();
+
+        let mut dec_builder =
+            Decimal128Builder::with_capacity(3).with_data_type(DataType::Decimal128(10, 2));
+        dec_builder.append_value(12_345);
+        dec_builder.append_null();
+        dec_builder.append_value(-6_789);
+        let dec_array = dec_builder.finish();
+
+        let ts_array = TimestampMicrosecondArray::from(vec![
+            Some(1_700_000_000_000_000),
+            None,
+            Some(1_700_000_100_000_000),
+        ])
+        .with_timezone("UTC");
+
+        let schema = Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(dec_array), Arc::new(ts_array)],
+        )
+        .unwrap();
+
+        sink.init(batch.schema().as_ref()).unwrap();
+        let rows = sink.write_batch(&batch).unwrap();
+        assert_eq!(rows, 3);
+
+        Box::new(sink).finish().unwrap();
+
+        let output_path = dir.path().join("test_decimal_tz_12345678.parquet");
+        assert!(output_path.exists());
+
+        let file = File::open(&output_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let arrow_schema = builder.schema().clone();
+
+        assert_eq!(arrow_schema.field(0).name(), "amount");
+        assert_eq!(
+            arrow_schema.field(0).data_type(),
+            &DataType::Decimal128(10, 2)
+        );
+        assert_eq!(arrow_schema.field(1).name(), "event_time");
+        assert_eq!(
+            arrow_schema.field(1).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+
+        let mut reader = builder.with_batch_size(10).build().unwrap();
+        let read_batch = reader.next().unwrap().unwrap();
+
+        let dec_read = read_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(dec_read.value(0), 12_345);
+        assert!(dec_read.is_null(1));
+        assert_eq!(dec_read.value(2), -6_789);
+
+        let ts_read = read_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts_read.value(0), 1_700_000_000_000_000);
+        assert!(ts_read.is_null(1));
+        assert_eq!(ts_read.value(2), 1_700_000_100_000_000);
     }
 
     #[test]
