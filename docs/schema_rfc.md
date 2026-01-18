@@ -932,14 +932,14 @@ pub struct SchemaViolation {
 }
 
 pub enum ViolationType {
-    ColumnMissing,
-    ColumnExtra,
-    TypeMismatch,
-    NullNotAllowed,
-    PrecisionExceeded,
-    FormatInvalid,
-    TimezoneRequired,
-    ContractNotFound,
+    ColumnMissing,
+    ColumnExtra,
+    TypeMismatch,
+    NullNotAllowed,
+    PrecisionExceeded,
+    FormatInvalid,
+    TimezoneRequired,
+    ContractNotFound,
     LineageUnavailable,
 }
 
@@ -955,6 +955,7 @@ pub struct ViolationProvenance {
 
 **Policy note (NEW):**
 - Violations are either quarantined or hard-fail depending on resolved `QuarantineConfig`
+- v1 quarantine output uses a coarse mapping of violation types (`schema`, `null_not_allowed`, `parser`, `unknown`) derived from `_cf_row_error`; richer ViolationType wiring is deferred.
 ```
 
 ### 6.7 Quarantine Pattern (NEW)
@@ -1035,13 +1036,14 @@ CREATE TABLE trades (...);
 
 -- Quarantine table (same database)
 CREATE TABLE trades_quarantine (
-    _source_row INTEGER,
-    _error_msg TEXT,
-    _violation_type TEXT,
-    _raw_data TEXT,
-    _cf_job_id TEXT,
-    -- All original columns as TEXT
-    ...
+    _source_row INTEGER, -- present when lineage is available
+    _output_row_index INTEGER, -- present when lineage is unavailable
+    _error_msg TEXT,
+    _violation_type TEXT,
+    _raw_data TEXT,
+    _cf_job_id TEXT,
+    -- All original columns as TEXT
+    ...
 );
 ```
 
@@ -1049,22 +1051,22 @@ CREATE TABLE trades_quarantine (
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `_source_row` | Int64 | Original row number in source file |
-| `_output_row_index` | Int64 | Row index in parser output (when source lineage unavailable) |
-| `_error_msg` | String | Detailed violation message |
-| `_violation_type` | String | Enum: `null_not_allowed`, `type_mismatch`, `precision_exceeded`, etc. |
+| `_source_row` | Int64 | Original row number in source file (present when lineage is available) |
+| `_output_row_index` | Int64 | Row index in parser output (present when source lineage unavailable) |
+| `_error_msg` | String | Detailed violation message (copied from `_cf_row_error` in v1) |
+| `_violation_type` | String | Enum (v1): `schema`, `null_not_allowed`, `parser`, `unknown` |
 | `_raw_data` | String | JSON-serialized original row data (optional) |
 | `_cf_job_id` | String | Job ID for lineage |
 | `_cf_source_hash` | String | Source file hash |
 | `_cf_processed_at` | Timestamp | When processing occurred |
 | `*` (all columns) | String | Original columns coerced to String |
 
-**v1 minimum:** `_error_msg`, `_violation_type`, `_cf_job_id`, and either `_source_row` or `_output_row_index` are required. Other fields are optional until v1.1.
+**v1 minimum:** `_error_msg`, `_violation_type`, `_cf_job_id`, and either `_source_row` or `_output_row_index` are required. In v1, the worker emits exactly one of `_source_row` or `_output_row_index` based on lineage availability; the other may be omitted. Other fields are optional until v1.1.
 
 **Lineage requirement (NEW):**
-- `_source_row` MUST be provided by the parser when source-row lineage is required.
-- If the parser cannot provide source-row lineage (e.g., aggregation/reordering), quarantine records must use `_output_row_index` instead and set `_source_row` to null.
-- Missing lineage is a `LineageUnavailable` violation (policy-controlled).
+- Parsers SHOULD provide `__cf_row_id` when source-row lineage is required.
+- If the parser cannot provide source-row lineage (e.g., aggregation/reordering), quarantine records must use `_output_row_index`.
+- Missing/invalid lineage is logged as a warning and recorded in `lineage_unavailable_rows` metrics (policy enforcement deferred).
 
 **FIX-specific provenance (NEW):**
 - For FIX logs, prefer capturing `MsgSeqNum (34)`, `ClOrdID (11)`, `ExecID (17)`, and `SendingTime (52)` in quarantine metadata or provenance fields.
@@ -1074,8 +1076,8 @@ CREATE TABLE trades_quarantine (
 - Parsers MAY emit a reserved column `__cf_row_id` to preserve source row lineage.
 - If present, Rust uses `__cf_row_id` for `_source_row` in quarantine output.
 - `__cf_row_id` MUST be an integer type (`Int64` or `UInt64`).
-- If `__cf_row_id` has an invalid type, Rust ignores it, uses batch index, and emits a lineage warning.
-- If absent, Rust uses batch index and marks lineage as `LineageUnavailable`.
+- If `__cf_row_id` has an invalid type, Rust ignores it, uses batch index, emits a lineage warning, and increments `lineage_unavailable_rows` metrics.
+- If absent, Rust uses batch index and increments `lineage_unavailable_rows` metrics.
 
 **Privacy & retention (NEW):**
 - Quarantine files may contain raw PII/PHI; define retention and encryption-at-rest requirements

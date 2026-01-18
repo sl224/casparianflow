@@ -13,6 +13,7 @@ fn test_protocol_message_roundtrip() {
     // Create a DISPATCH command
     let cmd = types::DispatchCommand {
         plugin_name: "test_plugin".to_string(),
+        parser_version: Some("1.0.0".to_string()),
         file_path: "/data/input.csv".to_string(),
         sinks: vec![types::SinkConfig {
             topic: "output".to_string(),

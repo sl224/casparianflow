@@ -48,6 +48,7 @@ const CIRCUIT_BREAKER_THRESHOLD: i32 = 5;
 struct DispatchQueryResult {
     file_path: String,
     source_code: String,
+    parser_version: String,
     env_hash: Option<String>,
     artifact_hash: Option<String>,
 }
@@ -57,6 +58,7 @@ impl DispatchQueryResult {
         Ok(Self {
             file_path: row.get_by_name("file_path")?,
             source_code: row.get_by_name("source_code")?,
+            parser_version: row.get_by_name("parser_version")?,
             env_hash: row.get_by_name("env_hash")?,
             artifact_hash: row.get_by_name("artifact_hash")?,
         })
@@ -487,16 +489,16 @@ impl Sentinel {
 
         let conclude_start = Instant::now();
         match receipt.status {
-            JobStatus::Success | JobStatus::CompletedWithWarnings => {
+            JobStatus::Success | JobStatus::PartialSuccess | JobStatus::CompletedWithWarnings => {
                 info!(
                     "Job {} completed: {} artifacts",
                     job_id,
                     receipt.artifacts.len()
                 );
-                let summary = if receipt.status == JobStatus::CompletedWithWarnings {
-                    "Completed with warnings"
-                } else {
+                let summary = if receipt.status == JobStatus::Success {
                     "Success"
+                } else {
+                    "Partial success"
                 };
                 self.queue.complete_job(job_id, summary).await?;
                 METRICS.inc_jobs_completed();
@@ -828,6 +830,7 @@ impl Sentinel {
                 SELECT
                     sf.path as file_path,
                     pm.source_code,
+                    pm.version as parser_version,
                     pm.env_hash,
                     pm.artifact_hash
                 FROM scout_files sf
@@ -853,6 +856,7 @@ impl Sentinel {
 
         let cmd = DispatchCommand {
             plugin_name: job.plugin_name.clone(),
+            parser_version: Some(dispatch_data.parser_version),
             file_path: dispatch_data.file_path,
             sinks,
             file_id: job.file_id as i64,
@@ -1330,6 +1334,7 @@ fn compute_artifact_hash(source_code: &str, lockfile_content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use casparian_db::{DbConnection, DbValue};
 
     #[test]
     fn test_connected_worker() {
@@ -1390,6 +1395,49 @@ mod tests {
         worker.add_env("def456".to_string());
         assert!(worker.has_env("def456"));
         assert_eq!(worker.ready_envs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_load_topic_configs_with_schema_def() {
+        let conn = DbConnection::open_duckdb_memory().await.unwrap();
+        conn.execute(
+            r#"
+            CREATE TABLE cf_topic_config (
+                id INTEGER PRIMARY KEY,
+                plugin_name TEXT NOT NULL,
+                topic_name TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                mode TEXT DEFAULT 'append',
+                schema_json TEXT
+            )
+            "#,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let schema_json = r#"[{"name":"id","data_type":"int64","nullable":false}]"#;
+        conn.execute(
+            r#"
+            INSERT INTO cf_topic_config (id, plugin_name, topic_name, uri, mode, schema_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+            &[
+                DbValue::from(1),
+                DbValue::from("test_plugin"),
+                DbValue::from("output"),
+                DbValue::from("parquet:///tmp/out"),
+                DbValue::from("append"),
+                DbValue::from(schema_json),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let configs = Sentinel::load_topic_configs(&conn).await.unwrap();
+        let sinks = configs.get("test_plugin").unwrap();
+        assert_eq!(sinks.len(), 1);
+        assert_eq!(sinks[0].schema_def.as_deref(), Some(schema_json));
     }
 
     #[test]

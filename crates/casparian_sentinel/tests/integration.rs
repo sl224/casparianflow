@@ -729,6 +729,7 @@ async fn test_full_worker_lifecycle_message_flow() {
     // Step 2: Sentinel sends DISPATCH
     let dispatch = DispatchCommand {
         plugin_name: "test_parser".to_string(),
+        parser_version: Some("1.0.0".to_string()),
         file_path: "/data/test.csv".to_string(),
         sinks: vec![SinkConfig {
             topic: "output".to_string(),

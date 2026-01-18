@@ -30,21 +30,21 @@ Status key:
 - [ ] [P1] Schema modes implemented: strict, allow_extra, allow_missing_optional. Status: GAP. Refs: `crates/casparian_schema/src/contract.rs:133`
 
 ## Validation + Quarantine
-- [ ] [P0] Rust-side validation authoritative (types, nullability, tz, format). Status: GAP. Refs: `crates/casparian_worker/src/worker.rs:768`
-- [ ] [P0] Quarantine policy implemented: allow_quarantine + thresholds. Status: GAP. Refs: `crates/casparian_worker/src/worker.rs:531`
-- [ ] [P0] Quarantine schema includes _error_msg, _violation_type, _cf_job_id, and one of _source_row/_output_row_index. Status: GAP. Refs: `crates/casparian_worker/src/worker.rs:768`
+- [ ] [P0] Rust-side validation authoritative (types, nullability, tz, format). Status: PARTIAL (format not enforced; string-to-typed hardfails). Refs: `crates/casparian_worker/src/schema_validation.rs:1`, `crates/casparian_worker/src/worker.rs:1038`
+- [ ] [P0] Quarantine policy implemented: allow_quarantine + thresholds. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:793`
+- [ ] [P0] Quarantine schema includes _error_msg, _violation_type, _cf_job_id, and one of _source_row/_output_row_index. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:1201`
 - [ ] [P1] Optional raw row data capture (configurable, default off in prod). Status: PARTIAL (storage has raw_data, not wired). Refs: `crates/casparian/src/storage/sqlite.rs:777`
 - [ ] [P1] Quarantine config cascade (system -> global -> contract -> CLI). Status: GAP.
 
 ## Lineage
-- [ ] [P0] Inject lineage columns: _cf_job_id, _cf_source_hash, _cf_processed_at, _cf_parser_version. Status: PARTIAL (function exists, not wired). Refs: `crates/casparian_sinks/src/lib.rs:1011`, `crates/casparian_worker/src/worker.rs:719`
-- [ ] [P0] Support __cf_row_id if present for quarantine source row mapping. Status: GAP.
-- [ ] [P1] Lineage warnings emitted when unavailable. Status: GAP.
+- [ ] [P0] Inject lineage columns: _cf_job_id, _cf_source_hash, _cf_processed_at, _cf_parser_version. Status: DONE. Refs: `crates/casparian_sinks/src/lib.rs:1028`, `crates/casparian_worker/src/worker.rs:1168`
+- [ ] [P0] Support __cf_row_id if present for quarantine source row mapping. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:1401`
+- [ ] [P1] Lineage warnings emitted when unavailable. Status: DONE (logs + metrics). Refs: `crates/casparian_worker/src/worker.rs:1252`, `crates/casparian_worker/src/worker.rs:605`
 
 ## Job Status + Output Semantics
-- [ ] [P0] JobStatus supports PartialSuccess with per-output status tracking. Status: GAP. Refs: `crates/casparian_protocol/src/types.rs:510`
-- [ ] [P0] CompletedWithWarnings mapped to PartialSuccess for compatibility. Status: GAP. Refs: `crates/casparian_protocol/src/types.rs:510`
-- [ ] [P1] Per-output quarantine metrics exposed in job receipt. Status: PARTIAL (total only). Refs: `crates/casparian_worker/src/worker.rs:531`
+- [ ] [P0] JobStatus supports PartialSuccess with per-output status tracking. Status: DONE (per-output metrics). Refs: `crates/casparian_protocol/src/types.rs:761`, `crates/casparian_worker/src/worker.rs:866`
+- [ ] [P0] CompletedWithWarnings mapped to PartialSuccess for compatibility. Status: DONE. Refs: `crates/casparian_sentinel/src/sentinel.rs:490`, `crates/casparian_protocol/src/types.rs:761`
+- [ ] [P1] Per-output quarantine metrics exposed in job receipt. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:602`
 
 ## Contract Identity + Storage
 - [ ] [P0] scope_id derived from parser_id + parser_version + output_name. Status: GAP. Refs: `crates/casparian_schema/src/approval.rs:429`
@@ -58,14 +58,14 @@ Status key:
 - [ ] [P1] Approval flow writes versioned contracts. Status: PARTIAL (versioning exists, scope_id derivation is wrong). Refs: `crates/casparian_schema/src/storage.rs:310`, `crates/casparian_schema/src/approval.rs:429`
 
 ## Execution Pipeline
-- [ ] [P0] Worker splits valid vs quarantine based on Rust validation (not just _cf_row_error). Status: GAP. Refs: `crates/casparian_worker/src/worker.rs:768`
-- [ ] [P0] Quarantine outputs written alongside main output (file or table). Status: PARTIAL (parser-driven quarantine only). Refs: `crates/casparian_worker/src/worker.rs:692`
+- [ ] [P0] Worker splits valid vs quarantine based on Rust validation (not just _cf_row_error). Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:1050`
+- [ ] [P0] Quarantine outputs written alongside main output (file or table). Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:1080`
 - [ ] [P1] Multi-output handling applies per-output status rules. Status: GAP. Refs: `crates/casparian_worker/src/worker.rs:528`
 
 ## Storage + Sinks
 - [ ] [P0] Parquet output stable and validated for Decimal/timestamp_tz. Status: GAP. Refs: `crates/casparian_protocol/src/types.rs:219`
 - [ ] [P0] DuckDB sink supported for queryable outputs. Status: PARTIAL (type coverage incomplete). Refs: `crates/casparian_sinks/src/lib.rs:608`
-- [ ] [P1] Quarantine table naming: {output}_quarantine for DB sinks. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:705`
+- [ ] [P1] Quarantine table naming: {output}_quarantine for DB sinks. Status: DONE. Refs: `crates/casparian_worker/src/worker.rs:1080`
 
 ## CLI/TUI
 - [ ] [P0] CLI run/preview/scan workflows stable. Status: PARTIAL (implemented, dev-mode). Refs: `crates/casparian/src/cli/run.rs:1`, `crates/casparian/src/cli/preview.rs:82`, `crates/casparian/src/cli/scan.rs:136`

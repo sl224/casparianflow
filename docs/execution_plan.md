@@ -17,7 +17,8 @@ Constraints:
 Current status snapshot (from checklist + recent code work):
 - DataType extended (Decimal, timestamp_tz, list/struct) with backward-compatible serde; tzdb validation added.
 - DuckDB sink supports DECIMAL + TIMESTAMPTZ.
-- Worker validation/quarantine policy, scope_id derivation, and job status semantics are still gaps.
+- Worker validation/quarantine policy + quarantine schema metadata are implemented; lineage injection + fallback warnings/metrics are implemented.
+- JobStatus PartialSuccess wired; scope_id derivation remains a gap.
 - CLI preview exists; Parser Bench and Jobs view need alignment with v1 semantics.
 
 ## Parallel Tracks (v1)

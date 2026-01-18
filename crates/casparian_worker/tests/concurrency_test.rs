@@ -199,6 +199,7 @@ async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     // 6. Dispatch a job (it will fail because our fake interpreter doesn't work, but that's OK)
     let dispatch_cmd = types::DispatchCommand {
         plugin_name: "test_plugin".to_string(),
+        parser_version: Some("1.0.0".to_string()),
         file_path: "/tmp/test.csv".to_string(),
         sinks: vec![],
         file_id: 1,

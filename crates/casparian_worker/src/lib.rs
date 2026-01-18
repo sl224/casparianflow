@@ -1,6 +1,7 @@
 pub mod analyzer;
 pub mod bridge;
 pub mod metrics;
+mod schema_validation;
 pub mod shredder;
 pub mod type_inference;
 pub mod venv_manager;

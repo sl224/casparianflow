@@ -738,6 +738,8 @@ impl ParsedSinkUri {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DispatchCommand {
     pub plugin_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parser_version: Option<String>,
     pub file_path: String,
     pub sinks: Vec<SinkConfig>,
     pub file_id: i64, // Required for lineage restoration
@@ -758,6 +760,7 @@ pub struct DispatchCommand {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum JobStatus {
     Success,
+    PartialSuccess,
     CompletedWithWarnings,
     Failed,
     Rejected,  // Worker at capacity
@@ -766,7 +769,10 @@ pub enum JobStatus {
 
 impl JobStatus {
     pub fn is_success(&self) -> bool {
-        matches!(self, JobStatus::Success | JobStatus::CompletedWithWarnings)
+        matches!(
+            self,
+            JobStatus::Success | JobStatus::PartialSuccess | JobStatus::CompletedWithWarnings
+        )
     }
 
     pub fn is_failure(&self) -> bool {
@@ -1267,6 +1273,10 @@ mod tests {
             "\"COMPLETED_WITH_WARNINGS\""
         );
         assert_eq!(
+            serde_json::to_string(&JobStatus::PartialSuccess).unwrap(),
+            "\"PARTIAL_SUCCESS\""
+        );
+        assert_eq!(
             serde_json::to_string(&JobStatus::Failed).unwrap(),
             "\"FAILED\""
         );
@@ -1289,6 +1299,10 @@ mod tests {
             JobStatus::CompletedWithWarnings
         );
         assert_eq!(
+            serde_json::from_str::<JobStatus>("\"PARTIAL_SUCCESS\"").unwrap(),
+            JobStatus::PartialSuccess
+        );
+        assert_eq!(
             serde_json::from_str::<JobStatus>("\"FAILED\"").unwrap(),
             JobStatus::Failed
         );
@@ -1301,6 +1315,9 @@ mod tests {
 
         assert!(JobStatus::CompletedWithWarnings.is_success());
         assert!(!JobStatus::CompletedWithWarnings.is_failure());
+
+        assert!(JobStatus::PartialSuccess.is_success());
+        assert!(!JobStatus::PartialSuccess.is_failure());
 
         assert!(!JobStatus::Failed.is_success());
         assert!(JobStatus::Failed.is_failure());
