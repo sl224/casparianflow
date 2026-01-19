@@ -6,7 +6,7 @@ use crate::cli::config::active_db_path;
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table};
-use crate::scout::{Database, Scanner, Source, SourceType};
+use casparian::scout::{Database, Scanner, Source, SourceType};
 use clap::Subcommand;
 use std::path::PathBuf;
 
@@ -504,7 +504,7 @@ async fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::ScannedFile;
+    use casparian::scout::ScannedFile;
     use std::fs;
     use tempfile::TempDir;
 

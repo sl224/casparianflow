@@ -134,7 +134,6 @@ At least one domain must be selected:
 ## Priority Overrides (OPTIONAL)
 # Override auto-detected priority for specific paths
 - crates/casparian_worker/: CRITICAL  # Will need Postgres support
-- crates/casparian_mcp/: HIGH         # LLM abstraction needed
 
 ## Severity Filter (OPTIONAL)
 # Only report findings at or above this severity
@@ -374,7 +373,6 @@ When Validator marks a finding as EXEMPT:
 **Phase 2 (LLM Abstraction):**
 - [ ] Define LlmProvider trait
 - [ ] Implement for Anthropic
-- [ ] Update casparian_mcp
 
 ### actionable_findings.json Generated
 Location: {session}/actionable_findings.json

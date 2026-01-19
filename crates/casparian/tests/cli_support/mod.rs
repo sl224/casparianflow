@@ -1,8 +1,12 @@
+#![allow(dead_code)]
+
 use casparian::scout::Database;
+use casparian_db::DbConnection;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::future::Future;
 
 pub fn casparian_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_casparian"))
@@ -64,4 +68,22 @@ pub fn init_scout_schema(db_path: &Path) {
     rt.block_on(async {
         let _db = Database::open(db_path).await.expect("initialize scout schema");
     });
+}
+
+pub fn with_duckdb<F, Fut, T>(db_path: &Path, f: F) -> T
+where
+    F: FnOnce(DbConnection) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime");
+    rt.block_on(async {
+        let url = format!("duckdb:{}", db_path.display());
+        let conn = DbConnection::open_from_url(&url)
+            .await
+            .expect("open duckdb connection");
+        f(conn).await
+    })
 }

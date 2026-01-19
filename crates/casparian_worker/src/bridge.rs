@@ -46,6 +46,9 @@ const HEADER_SIZE: usize = 4;
 const END_OF_STREAM: u32 = 0;
 const ERROR_SIGNAL: u32 = 0xFFFF_FFFF;
 const LOG_SIGNAL: u32 = 0xFFFF_FFFE;  // Sideband logging signal
+const OUTPUT_START_SIGNAL: u32 = 0xFFFF_FFFD;
+const OUTPUT_END_SIGNAL: u32 = 0xFFFF_FFFC;
+const METRICS_SIGNAL: u32 = 0xFFFF_FFFB;
 
 /// Log levels (must match Python bridge_shim.py)
 #[allow(dead_code)]
@@ -61,6 +64,7 @@ mod log_level {
 /// Maximum size for error messages from guest (1 MB)
 /// Prevents OOM from malicious or buggy guest processes
 const MAX_ERROR_MESSAGE_SIZE: u32 = 1024 * 1024;
+const MAX_METRICS_MESSAGE_SIZE: u32 = 1024 * 1024;
 
 /// Maximum log file size (10 MB) - prevents disk exhaustion
 const MAX_LOG_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -201,6 +205,7 @@ pub struct BridgeConfig {
     pub job_id: u64,
     pub file_id: i64,
     pub shim_path: PathBuf,
+    pub inherit_stdio: bool,
 }
 
 /// Metadata about a single output from a parser
@@ -215,13 +220,18 @@ pub struct OutputInfo {
 /// Result of bridge execution including data and logs
 #[derive(Debug)]
 pub struct BridgeResult {
-    /// Arrow record batches produced by the plugin
-    pub batches: Vec<OutputBatch>,
+    /// Arrow record batches grouped by output (per publish call)
+    pub output_batches: Vec<Vec<OutputBatch>>,
     /// Captured logs from the plugin (stdout, stderr, logging)
     /// This is O(1) memory during execution but loaded at end (capped at 10MB)
     pub logs: String,
     /// Output metadata from the parser
     pub output_info: Vec<OutputInfo>,
+}
+
+struct StreamResult {
+    output_batches: Vec<Vec<RecordBatch>>,
+    metrics_json: Option<String>,
 }
 
 /// Execute a bridge job. This is the only public entry point.
@@ -287,8 +297,8 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     }
 
     // Read all batches (log_writer receives sideband log messages)
-    let batches = match read_arrow_batches(&mut stream, job_id, &mut log_writer) {
-        Ok(batches) => batches,
+    let stream_result = match read_arrow_batches(&mut stream, job_id, &mut log_writer) {
+        Ok(result) => result,
         Err(e) => {
             let stderr_output = collect_stderr(&mut process);
             cleanup_process(&mut process);
@@ -333,30 +343,22 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
         log_writer.write_log(log_level::STDERR, &stderr_output);
     }
 
-    // Capture stdout (contains JSON metrics with output_info)
+    let output_batches = stream_result.output_batches;
+    let metrics_json = stream_result.metrics_json;
+
+    // Capture stdout (legacy metrics fallback)
     let stdout_output = collect_stdout(&mut process);
 
     // Parse output_info from JSON metrics
-    let output_info = if !stdout_output.is_empty() {
-        match serde_json::from_str::<serde_json::Value>(&stdout_output) {
-            Ok(json) => {
-                if let Some(info_array) = json.get("output_info").and_then(|v| v.as_array()) {
-                    info_array
-                        .iter()
-                        .filter_map(|v| serde_json::from_value::<OutputInfo>(v.clone()).ok())
-                        .collect()
-                } else {
-                    debug!("[Job {}] No output_info in metrics JSON", job_id);
-                    vec![]
-                }
-            }
-            Err(e) => {
-                warn!("[Job {}] Failed to parse metrics JSON: {} (stdout: {})", job_id, e, stdout_output);
-                vec![]
+    let output_info = match metrics_json {
+        Some(json) => parse_output_info(job_id, "socket", &json),
+        None => {
+            if stdout_output.is_empty() {
+                Vec::new()
+            } else {
+                parse_output_info(job_id, "stdout", &stdout_output)
             }
         }
-    } else {
-        vec![]
     };
 
     // TCP socket cleanup is automatic when listener goes out of scope
@@ -365,15 +367,40 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     let logs = log_writer.read_and_cleanup()
         .with_context(|| format!("[Job {}] Failed to read logs", job_id))?;
 
-    info!("[Job {}] Bridge execution complete: {} batches, {} bytes logs, {} outputs",
-          job_id, batches.len(), logs.len(), output_info.len());
+    if !output_info.is_empty() && output_info.len() != output_batches.len() {
+        warn!(
+            "[Job {}] Output info count ({}) does not match output batches ({})",
+            job_id,
+            output_info.len(),
+            output_batches.len()
+        );
+    }
 
-    let batches = batches
+    let total_batches: usize = output_batches.iter().map(|batches| batches.len()).sum();
+    info!(
+        "[Job {}] Bridge execution complete: {} batches, {} outputs, {} bytes logs, {} output_info",
+        job_id,
+        total_batches,
+        output_batches.len(),
+        logs.len(),
+        output_info.len()
+    );
+
+    let output_batches = output_batches
         .into_iter()
-        .map(OutputBatch::from_record_batch)
+        .map(|batches| {
+            batches
+                .into_iter()
+                .map(OutputBatch::from_record_batch)
+                .collect()
+        })
         .collect();
 
-    Ok(BridgeResult { batches, logs, output_info })
+    Ok(BridgeResult {
+        output_batches,
+        logs,
+        output_info,
+    })
 }
 
 /// Accept a TCP connection with timeout, checking if process is still alive
@@ -506,6 +533,31 @@ fn collect_stdout(process: &mut Child) -> String {
     }
 }
 
+fn parse_output_info(job_id: u64, source: &str, json_text: &str) -> Vec<OutputInfo> {
+    match serde_json::from_str::<serde_json::Value>(json_text) {
+        Ok(json) => {
+            if let Some(info_array) = json.get("output_info").and_then(|v| v.as_array()) {
+                info_array
+                    .iter()
+                    .filter_map(|v| serde_json::from_value::<OutputInfo>(v.clone()).ok())
+                    .collect()
+            } else {
+                debug!("[Job {}] No output_info in metrics JSON ({})", job_id, source);
+                vec![]
+            }
+        }
+        Err(e) => {
+            warn!(
+                "[Job {}] Failed to parse metrics JSON ({}): {}",
+                job_id,
+                source,
+                e
+            );
+            vec![]
+        }
+    }
+}
+
 /// Kill process (TCP socket cleanup is automatic)
 fn cleanup_process(process: &mut Child) {
     let _ = process.kill();
@@ -543,8 +595,16 @@ fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
         .env("BRIDGE_FILE_PATH", &config.file_path)
         .env("BRIDGE_JOB_ID", config.job_id.to_string())
         .env("BRIDGE_FILE_ID", config.file_id.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env(
+            "BRIDGE_STDIO_MODE",
+            if config.inherit_stdio { "inherit" } else { "piped" },
+        );
+
+    if config.inherit_stdio {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
 
     // NOTE: uv sets VIRTUAL_ENV automatically, no need to do it ourselves
 
@@ -573,8 +633,10 @@ fn read_arrow_batches(
     stream: &mut TcpStream,
     job_id: u64,
     log_writer: &mut JobLogWriter,
-) -> Result<Vec<RecordBatch>> {
-    let mut batches = Vec::new();
+) -> Result<StreamResult> {
+    let mut outputs: Vec<Vec<RecordBatch>> = Vec::new();
+    let mut metrics_json: Option<String> = None;
+    let mut current_output: Option<Vec<RecordBatch>> = None;
     let mut batch_count = 0u32;
     let mut log_count = 0u32;
 
@@ -613,8 +675,13 @@ fn read_arrow_batches(
 
         // End of stream signal
         if length == END_OF_STREAM {
-            debug!("[Job {}] Received end-of-stream signal after {} batches, {} logs",
-                   job_id, batch_count, log_count);
+            debug!(
+                "[Job {}] Received end-of-stream signal after {} batches, {} logs, {} outputs",
+                job_id,
+                batch_count,
+                log_count,
+                outputs.len()
+            );
             break;
         }
 
@@ -629,6 +696,50 @@ fn read_arrow_batches(
             read_and_write_log(stream, job_id, log_writer)?;
             log_count += 1;
             continue;  // Don't treat as data batch
+        }
+
+        if length == METRICS_SIGNAL {
+            let metrics_payload = read_metrics_payload(stream, job_id)?;
+            if metrics_json.is_some() {
+                warn!("[Job {}] Received duplicate metrics payload", job_id);
+            }
+            metrics_json = Some(metrics_payload);
+            continue;
+        }
+
+        if length == OUTPUT_START_SIGNAL {
+            let mut index_buf = [0u8; HEADER_SIZE];
+            stream.read_exact(&mut index_buf)
+                .with_context(|| format!("[Job {}] Failed to read output start index", job_id))?;
+            let output_index = u32::from_be_bytes(index_buf);
+            if current_output.is_some() {
+                anyhow::bail!(
+                    "[Job {}] Received OUTPUT_START for output {} while another output is open",
+                    job_id,
+                    output_index
+                );
+            }
+            current_output = Some(Vec::new());
+            debug!("[Job {}] Output {} started", job_id, output_index);
+            continue;
+        }
+
+        if length == OUTPUT_END_SIGNAL {
+            let mut index_buf = [0u8; HEADER_SIZE];
+            stream.read_exact(&mut index_buf)
+                .with_context(|| format!("[Job {}] Failed to read output end index", job_id))?;
+            let output_index = u32::from_be_bytes(index_buf);
+            if let Some(output_batches) = current_output.take() {
+                outputs.push(output_batches);
+                debug!("[Job {}] Output {} ended", job_id, output_index);
+            } else {
+                anyhow::bail!(
+                    "[Job {}] Received OUTPUT_END for output {} without active output",
+                    job_id,
+                    output_index
+                );
+            }
+            continue;
         }
 
         // Sanity check on payload size (max 100MB per batch to prevent OOM)
@@ -653,8 +764,7 @@ fn read_arrow_batches(
 
         debug!("[Job {}] Received {} bytes of Arrow IPC data", job_id, length);
 
-        // Parse Arrow IPC stream - each IPC message is ONE output
-        // Multiple internal batches are concatenated into a single batch
+        // Parse Arrow IPC stream
         let cursor = std::io::Cursor::new(ipc_buf);
         let reader = StreamReader::try_new(cursor, None)
             .with_context(|| format!(
@@ -662,7 +772,6 @@ fn read_arrow_batches(
                 job_id, batch_count
             ))?;
 
-        // Collect all batches from this IPC message
         let mut ipc_batches: Vec<RecordBatch> = Vec::new();
         for batch_result in reader {
             let batch = batch_result
@@ -673,24 +782,28 @@ fn read_arrow_batches(
             ipc_batches.push(batch);
         }
 
-        // Concatenate all batches from this IPC message into one
-        // This preserves the 1:1 mapping between outputs and batches
-        if !ipc_batches.is_empty() {
-            let schema = ipc_batches[0].schema();
-            let combined = arrow::compute::concat_batches(&schema, &ipc_batches)
-                .with_context(|| format!(
-                    "[Job {}] Failed to concatenate batches for output {}",
-                    job_id, batch_count
-                ))?;
-            debug!("[Job {}] Output {}: {} rows (from {} internal batches)",
-                   job_id, batch_count, combined.num_rows(), ipc_batches.len());
-            batches.push(combined);
+        if let Some(output_batches) = current_output.as_mut() {
+            output_batches.extend(ipc_batches);
+        } else if !ipc_batches.is_empty() {
+            // Legacy mode: no output boundaries, treat each IPC message as a single output
+            outputs.push(ipc_batches);
         }
 
         batch_count += 1;
     }
 
-    Ok(batches)
+    if let Some(output_batches) = current_output.take() {
+        warn!(
+            "[Job {}] Output stream ended without OUTPUT_END; closing open output",
+            job_id
+        );
+        outputs.push(output_batches);
+    }
+
+    Ok(StreamResult {
+        output_batches: outputs,
+        metrics_json,
+    })
 }
 
 /// Read a log message from the TCP stream and write to the log file.
@@ -765,6 +878,34 @@ fn read_error_message(
         ))?;
 
     Ok(String::from_utf8_lossy(&error_buf).to_string())
+}
+
+/// Read metrics JSON after METRICS_SIGNAL with size limit
+fn read_metrics_payload(stream: &mut TcpStream, job_id: u64) -> Result<String> {
+    let mut len_buf = [0u8; HEADER_SIZE];
+    stream.read_exact(&mut len_buf)
+        .with_context(|| format!("[Job {}] Failed to read metrics length", job_id))?;
+
+    let msg_len = u32::from_be_bytes(len_buf);
+    if msg_len > MAX_METRICS_MESSAGE_SIZE {
+        anyhow::bail!(
+            "[Job {}] Metrics payload size {} exceeds maximum {} bytes",
+            job_id,
+            msg_len,
+            MAX_METRICS_MESSAGE_SIZE
+        );
+    }
+
+    let mut msg_buf = vec![0u8; msg_len as usize];
+    stream.read_exact(&mut msg_buf)
+        .with_context(|| format!(
+            "[Job {}] Failed to read metrics payload ({} bytes)",
+            job_id,
+            msg_len
+        ))?;
+
+    String::from_utf8(msg_buf)
+        .with_context(|| format!("[Job {}] Metrics payload is not valid UTF-8", job_id))
 }
 
 /// Materialize the embedded bridge shim and casparian_types to the filesystem.
@@ -954,10 +1095,14 @@ mod tests {
     fn test_protocol_constants() {
         assert_eq!(ERROR_SIGNAL, 0xFFFFFFFF);
         assert_eq!(LOG_SIGNAL, 0xFFFFFFFE);
+        assert_eq!(OUTPUT_START_SIGNAL, 0xFFFFFFFD);
+        assert_eq!(OUTPUT_END_SIGNAL, 0xFFFFFFFC);
         assert_eq!(END_OF_STREAM, 0);
         // LOG_SIGNAL must be distinct from ERROR_SIGNAL and valid data lengths
         assert_ne!(LOG_SIGNAL, ERROR_SIGNAL);
         assert!(LOG_SIGNAL > 100 * 1024 * 1024); // Greater than max batch size
+        assert!(OUTPUT_START_SIGNAL > 100 * 1024 * 1024);
+        assert!(OUTPUT_END_SIGNAL > 100 * 1024 * 1024);
     }
 
     #[test]

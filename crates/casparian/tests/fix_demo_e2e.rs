@@ -6,30 +6,8 @@ fn casparian_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_casparian"))
 }
 
-fn python_supports_fix_demo() -> bool {
-    let check = r#"
-import importlib.util
-import sys
-
-has_pandas = importlib.util.find_spec("pandas") is not None
-has_pyarrow = importlib.util.find_spec("pyarrow") is not None
-sys.exit(0 if (has_pandas or has_pyarrow) else 1)
-"#;
-    Command::new("python3")
-        .arg("-c")
-        .arg(check)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn test_fix_demo_lifecycle_query_by_cl_ord_id() {
-    if !python_supports_fix_demo() {
-        println!("SKIP: python3 with pandas or pyarrow is required for FIX demo parser");
-        return;
-    }
-
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = crate_dir
         .parent()

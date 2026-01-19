@@ -248,23 +248,12 @@ Cold Data (historical) → [CASPARIAN] → Local SQL/Parquet
 
 | Component | Purpose | Status |
 |-----------|---------|--------|
-| **MCP Tools** | Claude Code integration for custom parser development | Future |
+| **AI Integration (TBD)** | AI-assisted parser development workflows | Future |
 | **Parser Lab** | AI-assisted parser generation | Future |
 | **`discover_schemas`** | AI proposes schema from sample data | Future |
 | **`fix_parser`** | AI suggests fixes for failing parsers | Future |
 
 **Key Principle:** AI helps BUILD parsers, but execution is deterministic. No AI in the production data path.
-
-### MCP Tools (Phase 2)
-
-When AI features ship, 9 MCP tools will enable Claude Code integration:
-
-| Category | Tools | Human Approval Required |
-|----------|-------|-------------------------|
-| **Discovery** | `quick_scan`, `apply_scope` | No |
-| **Schema** | `discover_schemas`, `approve_schemas`, `propose_amendment` | **Yes** |
-| **Validation** | `run_backtest`, `fix_parser` | No (3 iteration limit) |
-| **Execution** | `execute_pipeline`, `query_output` | No |
 
 ### Key Design Decisions
 
@@ -356,7 +345,7 @@ Generic comparisons (Fivetran, Airbyte) are misleading. A Trade Support Engineer
 | Local-first + governance | High | Rare combination |
 | Schema contract system | Medium | Architecture is novel |
 | Parser IP accumulation | High | Switching cost increases over time |
-| (Phase 2) MCP integration | Medium | 12-18 months to replicate |
+| (Phase 2) AI integration | Medium | 12-18 months to replicate |
 
 ---
 
@@ -499,7 +488,7 @@ Users provide their own LLM API keys (Anthropic, OpenAI, local models). Casparia
 |-------------|---------|
 | No API costs for Casparian | Pure SaaS margin (~80-90%) |
 | Users control LLM spend | No surprise bills from us |
-| Not locked to single provider | Works with any MCP-compatible LLM |
+| Not locked to single provider | Works with any LLM API or local model |
 | Air-gapped compatible | Local models (Ollama, vLLM) work |
 
 ---
@@ -604,7 +593,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 | **WAU** | Weekly active users | 500 |
 | **Parsers created** | Total parsers in production | 1,000 |
 | **Files processed** | Files through Sentinel | 100K/month |
-| **MCP tool calls** | Claude → Casparian interactions | 10K/month |
+| **Backtests run** | Parser validation runs | 5K/month |
 
 ### Business Metrics
 
@@ -632,7 +621,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| MCP protocol changes | Medium | Abstract MCP layer; track Anthropic roadmap |
+| LLM API churn | Medium | Keep provider adapters thin; AI remains optional |
 | Claude improves, needs fewer tools | Medium | Tools provide state/persistence Claude lacks |
 | Performance at scale | Low | Rust/Arrow architecture is sound |
 
@@ -640,7 +629,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| MCP adoption is slow | High | Standalone CLI/TUI value; hedge bet |
+| AI adoption is slow | High | Standalone CLI/TUI value; hedge bet |
 | Anthropic builds this | Medium | First-mover advantage; deeper integration |
 | Enterprise sales is hard | High | MSP channel as alternative; shorter sales cycle |
 | Target market is smaller than expected | Medium | MSP channel expands reach to SMBs indirectly |
@@ -651,7 +640,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | Too complex for users | Medium | AI handles complexity; better onboarding |
-| Distribution is unclear | High | Claude Code community; direct outreach |
+| Distribution is unclear | High | Developer/data ops community; direct outreach |
 | Pricing wrong | Medium | Start low; increase with value proof |
 
 ---
@@ -671,7 +660,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 ### Business Questions
 1. **Pricing model?** Per-seat? Per-file? Per-parser? Per-client (for MSPs)?
 2. **Sales motion?** Self-serve? Inside sales? MSP partner program? Enterprise sales?
-3. **Partnership with Anthropic?** MCP directory listing? Co-marketing?
+3. **Partnership with Anthropic?** Co-marketing?
 
 ### MSP Channel Questions
 1. **Which MSP verticals first?** Healthcare MSPs? Accounting MSPs? Generalist?
@@ -688,7 +677,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 
 | Milestone | Target | Status |
 |-----------|--------|--------|
-| Demo video live | 2-minute Claude + Casparian | Not started |
+| Demo video live | 2-minute CLI/TUI walkthrough | Not started |
 | 10 design partners | Active weekly users | Not started |
 | **5 MSP pilots** | Processing client data | Not started |
 | 100 free users | WAU on free tier | Not started |
@@ -707,7 +696,7 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 | 1,000 WAU | Weekly active users | Not started |
 | 3 enterprise contracts | >$20K/year each | Not started |
 | SOC2 certification | Security compliance | Not started |
-| MCP directory listing | Anthropic ecosystem | Not started |
+| AI ecosystem listing | Anthropic/OpenAI communities | Not started |
 | **Multi-tenant dashboard** | MSP requirement | Not started |
 
 ---

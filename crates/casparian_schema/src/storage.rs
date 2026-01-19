@@ -50,75 +50,59 @@ impl SchemaStorage {
         Ok(storage)
     }
 
-    /// Open a SchemaStorage from a file path (SQLite).
+    /// Open a SchemaStorage from a file path (DuckDB).
     pub async fn open(path: &str) -> Result<Self, StorageError> {
-        let conn = DbConnection::open_sqlite(Path::new(path)).await?;
+        let conn = DbConnection::open_duckdb(Path::new(path)).await?;
         Self::new(conn).await
     }
 
     /// Create an in-memory SchemaStorage (for testing).
     pub async fn in_memory() -> Result<Self, StorageError> {
-        let conn = DbConnection::open_sqlite_memory().await?;
+        let conn = DbConnection::open_duckdb_memory().await?;
         Self::new(conn).await
     }
 
     /// Initialize the database tables.
     async fn init_tables(&self) -> Result<(), StorageError> {
-        // Schema contracts table
+        let create_sql = r#"
+            CREATE TABLE IF NOT EXISTS schema_contracts (
+                contract_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                scope_description TEXT,
+                logic_hash TEXT,
+                approved_at TEXT NOT NULL,
+                approved_by TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                schemas_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(scope_id, version)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_schema_contracts_scope
+                ON schema_contracts(scope_id);
+
+            CREATE TABLE IF NOT EXISTS schema_discovery_results (
+                discovery_id TEXT PRIMARY KEY,
+                scope_id TEXT NOT NULL,
+                discovered_at TEXT NOT NULL,
+                source_file TEXT,
+                proposed_schemas_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                CHECK(status IN ('pending', 'approved', 'rejected'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_schema_discovery_scope
+                ON schema_discovery_results(scope_id);
+        "#;
+
+        self.conn.execute_batch(create_sql).await?;
+
         self.conn
-            .execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS schema_contracts (
-                    contract_id TEXT PRIMARY KEY,
-                    scope_id TEXT NOT NULL,
-                    scope_description TEXT,
-                    logic_hash TEXT,
-                    approved_at TEXT NOT NULL,
-                    approved_by TEXT NOT NULL,
-                    version INTEGER NOT NULL DEFAULT 1,
-                    schemas_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    UNIQUE(scope_id, version)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_schema_contracts_scope
-                    ON schema_contracts(scope_id);
-
-                CREATE TABLE IF NOT EXISTS schema_discovery_results (
-                    discovery_id TEXT PRIMARY KEY,
-                    scope_id TEXT NOT NULL,
-                    discovered_at TEXT NOT NULL,
-                    source_file TEXT,
-                    proposed_schemas_json TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    CHECK(status IN ('pending', 'approved', 'rejected'))
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_schema_discovery_scope
-                    ON schema_discovery_results(scope_id);
-                "#,
+            .execute(
+                "ALTER TABLE schema_contracts ADD COLUMN IF NOT EXISTS logic_hash TEXT",
+                &[],
             )
             .await?;
-
-        let columns = self
-            .conn
-            .query_all("SELECT name FROM pragma_table_info('schema_contracts')", &[])
-            .await?;
-
-        let mut has_logic_hash = false;
-        for row in columns {
-            let name: String = row.get_by_name("name")?;
-            if name == "logic_hash" {
-                has_logic_hash = true;
-                break;
-            }
-        }
-
-        if !has_logic_hash {
-            self.conn
-                .execute("ALTER TABLE schema_contracts ADD COLUMN logic_hash TEXT", &[])
-                .await?;
-        }
 
         Ok(())
     }
@@ -208,7 +192,9 @@ impl SchemaStorage {
             )
             .await?;
 
-        rows.into_iter().map(row_to_contract).collect()
+        rows.into_iter()
+            .map(row_to_contract)
+            .collect()
     }
 
     /// Delete a contract by its ID.
@@ -253,7 +239,9 @@ impl SchemaStorage {
             }
         };
 
-        rows.into_iter().map(row_to_contract).collect()
+        rows.into_iter()
+            .map(row_to_contract)
+            .collect()
     }
 
     // === Discovery Results ===
@@ -304,7 +292,9 @@ impl SchemaStorage {
             )
             .await?;
 
-        rows.into_iter().map(row_to_discovery).collect()
+        rows.into_iter()
+            .map(row_to_discovery)
+            .collect()
     }
 
     /// Approve a discovery result and create a contract.
@@ -314,6 +304,7 @@ impl SchemaStorage {
         discovery_id: &DiscoveryId,
         approved_by: &str,
     ) -> Result<SchemaContract, StorageError> {
+        // Get the discovery result
         let row = self
             .conn
             .query_optional(
@@ -326,24 +317,29 @@ impl SchemaStorage {
             )
             .await?;
 
-        let Some(row) = row else {
-            return Err(StorageError::NotFound(format!(
-                "Discovery {} not found",
-                discovery_id
-            )));
-        };
-
+        let row = row.ok_or_else(|| StorageError::NotFound(discovery_id.to_string()))?;
         let scope_id: String = row.get_by_name("scope_id")?;
         let schemas_json: String = row.get_by_name("proposed_schemas_json")?;
+
         let schemas: Vec<LockedSchema> = serde_json::from_str(&schemas_json)?;
 
-        if schemas.is_empty() {
-            return Err(StorageError::Parse("No schemas in discovery result".to_string()));
-        }
+        // Get next version for this scope
+        let version: i64 = self
+            .conn
+            .query_scalar(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM schema_contracts WHERE scope_id = ?",
+                &[DbValue::from(scope_id.as_str())],
+            )
+            .await?;
 
-        let contract = SchemaContract::with_schemas(scope_id, schemas, approved_by);
+        // Create the contract
+        let mut contract = SchemaContract::with_schemas(scope_id, schemas, approved_by);
+        contract.version = version as u32;
+
+        // Save the contract
         self.save_contract(&contract).await?;
 
+        // Mark discovery as approved
         self.conn
             .execute(
                 "UPDATE schema_discovery_results SET status = 'approved' WHERE discovery_id = ?",
@@ -354,7 +350,7 @@ impl SchemaStorage {
         Ok(contract)
     }
 
-    /// Reject a discovery result (no contract created).
+    /// Reject a discovery result.
     pub async fn reject_discovery(&self, discovery_id: &DiscoveryId) -> Result<bool, StorageError> {
         let result = self
             .conn
@@ -510,47 +506,68 @@ mod tests {
         assert_eq!(history[1].version, 1);
     }
 
+    #[allow(deprecated)]
     #[tokio::test]
-    async fn test_list_contracts() {
+    async fn test_discovery_workflow() {
         let storage = SchemaStorage::in_memory().await.unwrap();
 
-        for i in 0..3 {
-            let schema = LockedSchema::new(
-                format!("schema_{}", i),
-                vec![LockedColumn::required("id", DataType::Int64)],
-            );
-            let contract = SchemaContract::new(format!("scope_{}", i), schema, "user");
-            storage.save_contract(&contract).await.unwrap();
-        }
-
-        let all = storage.list_contracts(None).await.unwrap();
-        assert_eq!(all.len(), 3);
-
-        let limited = storage.list_contracts(Some(2)).await.unwrap();
-        assert_eq!(limited.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_discovery_result_flow() {
-        let storage = SchemaStorage::in_memory().await.unwrap();
-
+        // Save a discovery result
         let proposed = vec![create_test_schema()];
         let discovery_id = storage
             .save_discovery_result("scope_xyz", Some("data.csv"), &proposed)
             .await
             .unwrap();
 
+        // Get pending discoveries
         let pending = storage.get_pending_discoveries("scope_xyz").await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].discovery_id, discovery_id);
+        assert_eq!(pending[0].status, "pending");
 
-        let contract = storage
-            .approve_discovery(&discovery_id, "user_abc")
-            .await
-            .unwrap();
+        // Approve it
+        let contract = storage.approve_discovery(&discovery_id, "approver").await.unwrap();
         assert_eq!(contract.scope_id, "scope_xyz");
+        assert_eq!(contract.approved_by, "approver");
+        assert_eq!(contract.version, 1);
 
-        let pending_after = storage.get_pending_discoveries("scope_xyz").await.unwrap();
-        assert!(pending_after.is_empty());
+        // Pending should be empty now
+        let pending = storage.get_pending_discoveries("scope_xyz").await.unwrap();
+        assert_eq!(pending.len(), 0);
+
+        // Contract should exist
+        let loaded = storage.get_contract_for_scope("scope_xyz").await.unwrap().unwrap();
+        assert_eq!(loaded.contract_id, contract.contract_id);
+    }
+
+    #[tokio::test]
+    async fn test_delete_contract() {
+        let storage = SchemaStorage::in_memory().await.unwrap();
+
+        let schema = create_test_schema();
+        let contract = SchemaContract::new("to_delete", schema, "user");
+        storage.save_contract(&contract).await.unwrap();
+
+        assert!(storage.get_contract(&contract.contract_id).await.unwrap().is_some());
+
+        let deleted = storage.delete_contract(&contract.contract_id).await.unwrap();
+        assert!(deleted);
+
+        assert!(storage.get_contract(&contract.contract_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_contracts() {
+        let storage = SchemaStorage::in_memory().await.unwrap();
+
+        for i in 0..5 {
+            let schema = LockedSchema::new(format!("schema_{}", i), vec![]);
+            let contract = SchemaContract::new(format!("scope_{}", i), schema, "user");
+            storage.save_contract(&contract).await.unwrap();
+        }
+
+        let all = storage.list_contracts(None).await.unwrap();
+        assert_eq!(all.len(), 5);
+
+        let limited = storage.list_contracts(Some(3)).await.unwrap();
+        assert_eq!(limited.len(), 3);
     }
 }

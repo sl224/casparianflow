@@ -47,6 +47,89 @@ impl JobQueue {
         Ok(Self { conn })
     }
 
+    /// Initialize the processing queue schema (DuckDB v1).
+    pub async fn init_queue_schema(&self) -> Result<()> {
+        let create_sql = r#"
+            CREATE SEQUENCE IF NOT EXISTS seq_cf_processing_queue;
+            CREATE TABLE IF NOT EXISTS cf_processing_queue (
+                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_processing_queue'),
+                file_id BIGINT NOT NULL,
+                pipeline_run_id TEXT,
+                plugin_name TEXT NOT NULL,
+                input_file TEXT,
+                config_overrides TEXT,
+                status TEXT NOT NULL DEFAULT 'QUEUED',
+                priority INTEGER DEFAULT 0,
+                worker_host TEXT,
+                worker_pid INTEGER,
+                claim_time TIMESTAMP,
+                end_time TIMESTAMP,
+                result_summary TEXT,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                quarantine_rows BIGINT DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS ix_queue_pop ON cf_processing_queue(status, priority, id);
+        "#;
+
+        self.conn
+            .execute_batch(create_sql)
+            .await
+            .context("Failed to initialize cf_processing_queue schema")?;
+        Ok(())
+    }
+
+    /// Initialize plugin registry and topic configuration tables.
+    pub async fn init_registry_schema(&self) -> Result<()> {
+        let create_sql = r#"
+            CREATE SEQUENCE IF NOT EXISTS seq_cf_plugin_manifest;
+            CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
+                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_plugin_manifest'),
+                plugin_name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                source_code TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                validation_error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deployed_at TIMESTAMP,
+                env_hash TEXT,
+                artifact_hash TEXT,
+                publisher_name TEXT,
+                publisher_email TEXT,
+                azure_oid TEXT,
+                system_requirements TEXT,
+                UNIQUE(plugin_name, version),
+                UNIQUE(source_hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS cf_plugin_environment (
+                hash TEXT PRIMARY KEY,
+                lockfile_content TEXT NOT NULL,
+                size_mb DOUBLE,
+                last_used TIMESTAMP,
+                created_at TIMESTAMP
+            );
+
+            CREATE SEQUENCE IF NOT EXISTS seq_cf_topic_config;
+            CREATE TABLE IF NOT EXISTS cf_topic_config (
+                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_topic_config'),
+                plugin_name TEXT NOT NULL,
+                topic_name TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                mode TEXT DEFAULT 'append',
+                schema_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_topic_lookup ON cf_topic_config(plugin_name, topic_name);
+        "#;
+
+        self.conn
+            .execute_batch(create_sql)
+            .await
+            .context("Failed to initialize registry schema")?;
+        Ok(())
+    }
+
     /// Get job details for processing.
     ///
     /// Tries production path (JOIN through file_id) first,
@@ -187,19 +270,89 @@ impl JobQueue {
         Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
 
+    async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let (query, params) = match self.conn.backend_name() {
+            "DuckDB" => (
+                "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?"
+                    .to_string(),
+                vec![DbValue::from(table), DbValue::from(column)],
+            ),
+            "SQLite" => (
+                format!(
+                    "SELECT 1 FROM pragma_table_info('{}') WHERE name = ?",
+                    table.replace('\'', "''")
+                ),
+                vec![DbValue::from(column)],
+            ),
+            _ => (
+                "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?"
+                    .to_string(),
+                vec![DbValue::from(table), DbValue::from(column)],
+            ),
+        };
+
+        Ok(self.conn.query_optional(&query, &params).await?.is_some())
+    }
+
+    async fn ensure_quarantine_rows_column(&self) -> Result<()> {
+        if self
+            .column_exists("cf_processing_queue", "quarantine_rows")
+            .await?
+        {
+            return Ok(());
+        }
+
+        let alter_sql = match self.conn.backend_name() {
+            "DuckDB" => {
+                "ALTER TABLE cf_processing_queue ADD COLUMN quarantine_rows BIGINT DEFAULT 0"
+            }
+            "SQLite" => {
+                "ALTER TABLE cf_processing_queue ADD COLUMN quarantine_rows INTEGER DEFAULT 0"
+            }
+            _ => "ALTER TABLE cf_processing_queue ADD COLUMN quarantine_rows BIGINT DEFAULT 0",
+        };
+
+        self.conn.execute(alter_sql, &[]).await?;
+        Ok(())
+    }
+
     /// Mark job as complete.
-    pub async fn complete_job(&self, job_id: i64, summary: &str) -> Result<()> {
+    pub async fn complete_job(
+        &self,
+        job_id: i64,
+        summary: &str,
+        quarantine_rows: Option<i64>,
+    ) -> Result<()> {
         let now = now_ts();
-        self.conn
-            .execute(
-                r#"
-                UPDATE cf_processing_queue
-                SET status = 'COMPLETED', end_time = ?, result_summary = ?
-                WHERE id = ?
-                "#,
-                &[DbValue::from(now), DbValue::from(summary), DbValue::from(job_id)],
-            )
-            .await?;
+        if let Some(rows) = quarantine_rows {
+            self.ensure_quarantine_rows_column().await?;
+            self.conn
+                .execute(
+                    r#"
+                    UPDATE cf_processing_queue
+                    SET status = 'COMPLETED', end_time = ?, result_summary = ?, quarantine_rows = ?
+                    WHERE id = ?
+                    "#,
+                    &[
+                        DbValue::from(now),
+                        DbValue::from(summary),
+                        DbValue::from(rows),
+                        DbValue::from(job_id),
+                    ],
+                )
+                .await?;
+        } else {
+            self.conn
+                .execute(
+                    r#"
+                    UPDATE cf_processing_queue
+                    SET status = 'COMPLETED', end_time = ?, result_summary = ?
+                    WHERE id = ?
+                    "#,
+                    &[DbValue::from(now), DbValue::from(summary), DbValue::from(job_id)],
+                )
+                .await?;
+        }
         Ok(())
     }
 

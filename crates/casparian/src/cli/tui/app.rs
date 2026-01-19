@@ -7,17 +7,14 @@
 #![allow(dead_code)]
 
 use casparian_db::{DbConnection, DbValue};
-use casparian_mcp::tools::{create_default_registry, ToolRegistry};
-use casparian_mcp::types::ToolResult;
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use serde_json::Value;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use super::TuiArgs;
 use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
-use crate::scout::{
+use casparian::scout::{
     scan_path, Database as ScoutDatabase,
     ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source, SourceType,
 };
@@ -1521,8 +1518,6 @@ pub struct App {
     pub sources_drawer_open: bool,
     /// Selected source in the drawer (for Enter navigation)
     pub sources_drawer_selected: usize,
-    /// Tool registry for executing MCP tools
-    pub tools: ToolRegistry,
     /// Configuration
     #[allow(dead_code)]
     pub config: TuiArgs,
@@ -1683,28 +1678,17 @@ impl App {
             "schema_migrations",
         ];
 
-        let existing_tables = match backend {
-            DbBackend::DuckDb => {
-                let rows = conn.query_all(
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
-                    &[],
-                ).await.unwrap_or_default();
-                rows.into_iter()
-                    .filter_map(|row| row.get::<String>(0).ok())
-                    .map(|t| t.to_lowercase())
-                    .collect::<std::collections::HashSet<_>>()
-            }
-            DbBackend::Sqlite => {
-                let rows = conn.query_all(
-                    "SELECT name FROM sqlite_master WHERE type='table'",
-                    &[],
-                ).await.unwrap_or_default();
-                rows.into_iter()
-                    .filter_map(|row| row.get::<String>(0).ok())
-                    .map(|t| t.to_lowercase())
-                    .collect::<std::collections::HashSet<_>>()
-            }
-        };
+        let existing_tables = conn
+            .query_all(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
+                &[],
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.get::<String>(0).ok())
+            .map(|t| t.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
 
         let missing: Vec<String> = required_tables
             .iter()
@@ -1809,7 +1793,6 @@ impl App {
                 show_hidden_files: false,
                 ..Default::default()
             },
-            tools: create_default_registry(),
             config: args,
             error: None,
             pending_scan: None,
@@ -1861,11 +1844,7 @@ impl App {
 
     fn resolve_db_target(&self) -> (DbBackend, std::path::PathBuf) {
         if let Some(ref path) = self.config.database {
-            let backend = match path.extension().and_then(|ext| ext.to_str()) {
-                Some("duckdb") => DbBackend::DuckDb,
-                _ => DbBackend::Sqlite,
-            };
-            (backend, path.clone())
+            (DbBackend::DuckDb, path.clone())
         } else {
             (default_db_backend(), active_db_path())
         }
@@ -1900,18 +1879,14 @@ impl App {
             return None;
         }
 
-        match backend {
-            DbBackend::Sqlite => DbConnection::open_sqlite(path).await.ok(),
-            DbBackend::DuckDb => {
-                #[cfg(feature = "duckdb")]
-                {
-                    DbConnection::open_duckdb_readonly(path).await.ok()
-                }
-                #[cfg(not(feature = "duckdb"))]
-                {
-                    None
-                }
-            }
+        let _ = backend;
+        #[cfg(feature = "duckdb")]
+        {
+            DbConnection::open_duckdb_readonly(path).await.ok()
+        }
+        #[cfg(not(feature = "duckdb"))]
+        {
+            None
         }
     }
 
@@ -1920,19 +1895,38 @@ impl App {
             return None;
         }
 
-        match backend {
-            DbBackend::Sqlite => DbConnection::open_sqlite(path).await.ok(),
-            DbBackend::DuckDb => {
-                #[cfg(feature = "duckdb")]
-                {
-                    DbConnection::open_duckdb(path).await.ok()
-                }
-                #[cfg(not(feature = "duckdb"))]
-                {
-                    None
-                }
-            }
+        let _ = backend;
+        #[cfg(feature = "duckdb")]
+        {
+            DbConnection::open_duckdb(path).await.ok()
         }
+        #[cfg(not(feature = "duckdb"))]
+        {
+            None
+        }
+    }
+
+    async fn table_exists(conn: &DbConnection, table: &str) -> bool {
+        let query =
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?"
+                .to_string();
+        let params = vec![DbValue::from(table)];
+
+        conn.query_optional(&query, &params)
+            .await
+            .map(|row| row.is_some())
+            .unwrap_or(false)
+    }
+
+    async fn column_exists(conn: &DbConnection, table: &str, column: &str) -> bool {
+        let query = "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?"
+            .to_string();
+        let params = vec![DbValue::from(table), DbValue::from(column)];
+
+        conn.query_optional(&query, &params)
+            .await
+            .map(|row| row.is_some())
+            .unwrap_or(false)
     }
 
     /// Handle key event
@@ -6121,13 +6115,13 @@ impl App {
                 // This prevents duplicate file tracking and conflicting tags
                 if let Err(e) = db.check_source_overlap(std::path::Path::new(&source_path)).await {
                     let suggestion = match &e {
-                        crate::scout::error::ScoutError::SourceIsChildOfExisting { existing_name, .. } => {
+                        casparian::scout::error::ScoutError::SourceIsChildOfExisting { existing_name, .. } => {
                             format!(
                                 "Either delete source '{}' first, or use tagging rules to organize files within that source.",
                                 existing_name
                             )
                         }
-                        crate::scout::error::ScoutError::SourceIsParentOfExisting { existing_name, .. } => {
+                        casparian::scout::error::ScoutError::SourceIsParentOfExisting { existing_name, .. } => {
                             format!(
                                 "Either delete source '{}' first, or scan a non-overlapping directory.",
                                 existing_name
@@ -7105,7 +7099,31 @@ impl App {
                 None => return,
             };
 
-            let enriched_query = r#"
+            let has_pipeline_runs = App::table_exists(&conn, "cf_pipeline_runs").await;
+            let has_quarantine_column =
+                App::column_exists(&conn, "cf_processing_queue", "quarantine_rows").await;
+            let has_quarantine_table = App::table_exists(&conn, "cf_quarantine").await;
+
+            let (quarantine_select, quarantine_join) = if has_quarantine_column {
+                ("q.quarantine_rows", "")
+            } else if has_quarantine_table {
+                (
+                    "qc.quarantine_rows",
+                    r#"
+                LEFT JOIN (
+                    SELECT job_id, COUNT(*) AS quarantine_rows
+                    FROM cf_quarantine
+                    GROUP BY job_id
+                ) qc ON qc.job_id = q.id
+                "#,
+                )
+            } else {
+                ("NULL as quarantine_rows", "")
+            };
+
+            let query = if has_pipeline_runs {
+                format!(
+                    r#"
                 SELECT
                     q.id,
                     q.file_id,
@@ -7118,14 +7136,10 @@ impl App {
                     q.pipeline_run_id,
                     pr.logical_date,
                     pr.selection_snapshot_hash,
-                    qc.quarantine_rows
+                    {quarantine_select}
                 FROM cf_processing_queue q
                 LEFT JOIN cf_pipeline_runs pr ON pr.id = q.pipeline_run_id
-                LEFT JOIN (
-                    SELECT job_id, COUNT(*) AS quarantine_rows
-                    FROM cf_quarantine
-                    GROUP BY job_id
-                ) qc ON qc.job_id = q.id
+                {quarantine_join}
                 ORDER BY
                     CASE q.status
                         WHEN 'RUNNING' THEN 1
@@ -7140,9 +7154,13 @@ impl App {
                     END,
                     q.id DESC
                 LIMIT 100
-            "#;
-
-            let base_query = r#"
+                "#,
+                    quarantine_select = quarantine_select,
+                    quarantine_join = quarantine_join
+                )
+            } else {
+                format!(
+                    r#"
                 SELECT
                     q.id,
                     q.file_id,
@@ -7151,8 +7169,10 @@ impl App {
                     q.claim_time,
                     q.end_time,
                     q.result_summary,
-                    q.error_message
+                    q.error_message,
+                    {quarantine_select}
                 FROM cf_processing_queue q
+                {quarantine_join}
                 ORDER BY
                     CASE q.status
                         WHEN 'RUNNING' THEN 1
@@ -7167,20 +7187,20 @@ impl App {
                     END,
                     q.id DESC
                 LIMIT 100
-            "#;
+                "#,
+                    quarantine_select = quarantine_select,
+                    quarantine_join = quarantine_join
+                )
+            };
 
-            let rows = match conn.query_all(enriched_query, &[]).await {
+            let rows = match conn.query_all(&query, &[]).await {
                 Ok(rows) => rows,
-                Err(_) => match conn.query_all(base_query, &[]).await {
-                    Ok(rows) => rows,
-                    Err(_) => return,
-                },
+                Err(_) => return,
             };
 
             if !rows.is_empty() {
                 let mut jobs: Vec<JobInfo> = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let column_count = row.len();
                     let id: i64 = match row.get(0) {
                         Ok(v) => v,
                         Err(_) => return,
@@ -7213,26 +7233,17 @@ impl App {
                         Ok(v) => v,
                         Err(_) => return,
                     };
-                    let pipeline_run_id: Option<String> = if column_count > 8 {
-                        row.get(8).ok()
-                    } else {
-                        None
-                    };
-                    let logical_date: Option<String> = if column_count > 9 {
-                        row.get(9).ok()
-                    } else {
-                        None
-                    };
-                    let selection_snapshot_hash: Option<String> = if column_count > 10 {
-                        row.get(10).ok()
-                    } else {
-                        None
-                    };
-                    let quarantine_rows: Option<i64> = if column_count > 11 {
-                        row.get(11).ok()
-                    } else {
-                        None
-                    };
+                    let (pipeline_run_id, logical_date, selection_snapshot_hash, quarantine_rows) =
+                        if has_pipeline_runs {
+                            (
+                                row.get(8).ok(),
+                                row.get(9).ok(),
+                                row.get(10).ok(),
+                                row.get(11).ok(),
+                            )
+                        } else {
+                            (None, None, None, row.get(8).ok())
+                        };
 
                     let status = match status_str.as_str() {
                         "RUNNING" => JobStatus::Running,
@@ -7376,7 +7387,10 @@ impl App {
                 }
             }
 
-            if let Ok(count) = conn.query_scalar::<i64>("SELECT COUNT(*) FROM cf_parsers", &[]).await {
+            if let Ok(count) = conn.query_scalar::<i64>(
+                "SELECT COUNT(*) FROM cf_plugin_manifest",
+                &[],
+            ).await {
                 stats.parser_count = count as usize;
             }
 
@@ -7715,12 +7729,12 @@ impl App {
         if self.sources_state.confirm_delete {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    let source_id = self
+                    if let Some(source_id) = self
                         .discover
                         .sources
                         .get(self.sources_state.selected_index)
-                        .map(|source| source.id.clone());
-                    if let Some(source_id) = source_id {
+                        .map(|s| s.id.clone())
+                    {
                         self.delete_source(&source_id);
                     }
                     self.sources_state.confirm_delete = false;
@@ -7746,15 +7760,13 @@ impl App {
                     if !value.is_empty() {
                         if self.sources_state.creating {
                             self.create_source(&value, "");
-                        } else {
-                            let source_id = self
-                                .discover
-                                .sources
-                                .get(self.sources_state.selected_index)
-                                .map(|source| source.id.clone());
-                            if let Some(source_id) = source_id {
-                                self.update_source_path(&source_id, &value);
-                            }
+                        } else if let Some(source_id) = self
+                            .discover
+                            .sources
+                            .get(self.sources_state.selected_index)
+                            .map(|s| s.id.clone())
+                        {
+                            self.update_source_path(&source_id, &value);
                         }
                     }
                     self.sources_state.editing = false;
@@ -8185,17 +8197,6 @@ impl App {
             _ => {}
         }
         // TODO: Persist to config.toml
-    }
-
-    /// Execute a tool directly
-    #[allow(dead_code)]
-    pub async fn execute_tool(&self, name: &str, args: Value) -> Result<ToolResult, String> {
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| format!("Tool '{}' not found", name))?;
-
-        tool.execute(args).await.map_err(|e| e.to_string())
     }
 
     /// Periodic tick for updates
@@ -8932,76 +8933,6 @@ impl App {
     // Parser Bench Methods
     // =========================================================================
 
-    /// Python script for extracting parser metadata via AST (no execution).
-    /// This is embedded as a const to avoid external file dependencies.
-    /// Supports batch mode: reads JSON array of paths from stdin, outputs JSON object keyed by path.
-    const METADATA_EXTRACTOR_SCRIPT: &'static str = r#"
-import ast
-import json
-import sys
-import os
-
-def extract_metadata(path):
-    """Extract parser metadata via AST parsing (no execution)."""
-    try:
-        source = open(path).read()
-        tree = ast.parse(source)
-    except SyntaxError as e:
-        return {"error": f"Syntax error: {e}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-    result = {
-        "name": None,
-        "version": None,
-        "topics": [],
-        "has_transform": False,
-        "has_parse": False,
-    }
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                # Class attributes (name = 'value')
-                if isinstance(item, ast.Assign):
-                    for target in item.targets:
-                        if isinstance(target, ast.Name):
-                            try:
-                                value = ast.literal_eval(item.value)
-                                if target.id == "name":
-                                    result["name"] = value
-                                elif target.id == "version":
-                                    result["version"] = value
-                                elif target.id == "topics":
-                                    result["topics"] = value if isinstance(value, list) else [value]
-                            except:
-                                pass
-                # Methods
-                elif isinstance(item, ast.FunctionDef):
-                    if item.name == "transform":
-                        result["has_transform"] = True
-                    elif item.name == "parse":
-                        result["has_parse"] = True
-
-        # Also check for module-level parse() function
-        elif isinstance(node, ast.FunctionDef) and node.name == "parse":
-            result["has_parse"] = True
-
-    # Fallback: use filename if no name attribute
-    if result["name"] is None:
-        result["name"] = os.path.splitext(os.path.basename(path))[0]
-
-    return result
-
-if __name__ == "__main__":
-    # Batch mode: read JSON array of paths from stdin
-    paths = json.load(sys.stdin)
-    results = {}
-    for path in paths:
-        results[path] = extract_metadata(path)
-    print(json.dumps(results))
-"#;
-
     /// Maximum number of parser files to process in a single Python subprocess.
     /// Prevents command line overflow and keeps memory usage reasonable.
     const METADATA_BATCH_SIZE: usize = 50;
@@ -9012,171 +8943,10 @@ if __name__ == "__main__":
     fn extract_parser_metadata_batch(
         paths: &[std::path::PathBuf],
     ) -> std::collections::HashMap<String, (String, Option<String>, Vec<String>)> {
-        use std::collections::HashMap;
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        let mut results = HashMap::new();
-
-        if paths.is_empty() {
-            return results;
-        }
-
-        // Convert paths to strings for JSON
-        let path_strings: Vec<String> = paths
-            .iter()
-            .filter_map(|p| p.to_str().map(|s| s.to_string()))
-            .collect();
-
-        let json_input = match serde_json::to_string(&path_strings) {
-            Ok(j) => j,
-            Err(_) => {
-                // Fallback: return defaults for all paths
-                for path in paths {
-                    let fallback_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    if let Some(path_str) = path.to_str() {
-                        results.insert(path_str.to_string(), (fallback_name, None, vec![]));
-                    }
-                }
-                return results;
-            }
-        };
-
-        // Try python3, then python
-        let mut child = Command::new("python3")
-            .arg("-c")
-            .arg(Self::METADATA_EXTRACTOR_SCRIPT)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
-
-        if child.is_err() {
-            child = Command::new("python")
-                .arg("-c")
-                .arg(Self::METADATA_EXTRACTOR_SCRIPT)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
-        }
-
-        let mut child = match child {
-            Ok(c) => c,
-            Err(_) => {
-                // Python not available, return defaults
-                for path in paths {
-                    let fallback_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    if let Some(path_str) = path.to_str() {
-                        results.insert(path_str.to_string(), (fallback_name, None, vec![]));
-                    }
-                }
-                return results;
-            }
-        };
-
-        // Write JSON input to stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(json_input.as_bytes());
-        }
-
-        // Read output
-        let output = match child.wait_with_output() {
-            Ok(o) => o,
-            Err(_) => {
-                for path in paths {
-                    let fallback_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    if let Some(path_str) = path.to_str() {
-                        results.insert(path_str.to_string(), (fallback_name, None, vec![]));
-                    }
-                }
-                return results;
-            }
-        };
-
-        if !output.status.success() {
-            for path in paths {
-                let fallback_name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                if let Some(path_str) = path.to_str() {
-                    results.insert(path_str.to_string(), (fallback_name, None, vec![]));
-                }
-            }
-            return results;
-        }
-
-        // Parse JSON output: {"path": {"name": ..., "version": ..., "topics": [...]}, ...}
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&stdout);
-
-        match parsed {
-            Ok(json) => {
-                if let Some(obj) = json.as_object() {
-                    for (path_str, metadata) in obj {
-                        let fallback_name = std::path::Path::new(path_str)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-
-                        let name = metadata
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| fallback_name.clone());
-
-                        let version = metadata
-                            .get("version")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-
-                        let topics = metadata
-                            .get("topics")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        results.insert(path_str.clone(), (name, version, topics));
-                    }
-                }
-            }
-            Err(_) => {}
-        }
-
-        // Fill in any missing paths with defaults
-        for path in paths {
-            if let Some(path_str) = path.to_str() {
-                results.entry(path_str.to_string()).or_insert_with(|| {
-                    let fallback_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    (fallback_name, None, vec![])
-                });
-            }
-        }
-
-        results
+        casparian::parser_metadata::extract_metadata_batch(paths)
+            .into_iter()
+            .map(|(path, meta)| (path, (meta.name, meta.version, meta.topics)))
+            .collect()
     }
 
     /// Load parsers from the parsers directory
@@ -9420,7 +9190,7 @@ mod tests {
     fn test_args() -> TuiArgs {
         TuiArgs {
             database: Some(std::env::temp_dir().join(format!(
-                "casparian_test_{}.sqlite3",
+                "casparian_test_{}.duckdb",
                 uuid::Uuid::new_v4()
             ))),
         }
@@ -9507,27 +9277,6 @@ mod tests {
                 .await;
         });
         assert_eq!(app.home.selected_source_index, 0);
-    }
-
-    #[tokio::test]
-    async fn test_execute_tool() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        std::fs::write(temp_dir.path().join("test.csv"), "id,name\n1,Alice").unwrap();
-
-        let app = App::new(test_args());
-
-        let result = app
-            .execute_tool(
-                "quick_scan",
-                serde_json::json!({ "path": temp_dir.path() }),
-            )
-            .await;
-
-        assert!(result.is_ok());
-        let tool_result = result.unwrap();
-        assert!(!tool_result.is_error);
     }
 
     #[test]

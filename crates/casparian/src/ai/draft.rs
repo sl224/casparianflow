@@ -4,8 +4,8 @@
 //! committed to the runtime configuration.
 
 use super::types::{Draft, DraftContext, DraftId, DraftStatus, DraftType};
+use casparian_db::{BackendError, DbConnection, DbValue, UnifiedDbRow};
 use chrono::{Duration, Utc};
-use sqlx::{Row, SqlitePool};
 use std::path::{Path, PathBuf};
 
 /// Default draft expiry time (24 hours)
@@ -24,7 +24,7 @@ pub enum DraftError {
     NotPending(String),
 
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] BackendError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -39,14 +39,14 @@ pub type Result<T> = std::result::Result<T, DraftError>;
 /// Manages draft artifacts for AI Wizards
 #[derive(Clone)]
 pub struct DraftManager {
-    pool: SqlitePool,
+    conn: DbConnection,
     drafts_dir: PathBuf,
 }
 
 impl DraftManager {
     /// Create a new draft manager
-    pub fn new(pool: SqlitePool, drafts_dir: PathBuf) -> Self {
-        Self { pool, drafts_dir }
+    pub fn new(conn: DbConnection, drafts_dir: PathBuf) -> Self {
+        Self { conn, drafts_dir }
     }
 
     /// Get the drafts directory path
@@ -97,25 +97,28 @@ impl DraftManager {
         let context_json = serde_json::to_string(&context)?;
 
         // Insert into database
-        sqlx::query(
-            r#"
-            INSERT INTO cf_ai_drafts (
-                id, draft_type, file_path, status, source_context_json,
-                model_name, created_at, expires_at
+        let file_path_str = file_path.to_string_lossy().to_string();
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_ai_drafts (
+                    id, draft_type, file_path, status, source_context_json,
+                    model_name, created_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+                &[
+                    DbValue::from(id.as_str()),
+                    DbValue::from(draft_type.as_str()),
+                    DbValue::from(file_path_str),
+                    DbValue::from(DraftStatus::Pending.as_str()),
+                    DbValue::from(context_json),
+                    DbValue::from(model_name),
+                    DbValue::from(now.timestamp_millis()),
+                    DbValue::from(expires_at.timestamp_millis()),
+                ],
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(id.as_str())
-        .bind(draft_type.as_str())
-        .bind(file_path.to_string_lossy().as_ref())
-        .bind(DraftStatus::Pending.as_str())
-        .bind(&context_json)
-        .bind(model_name)
-        .bind(now.timestamp_millis())
-        .bind(expires_at.timestamp_millis())
-        .execute(&self.pool)
-        .await?;
+            .await?;
 
         Ok(Draft {
             id,
@@ -133,17 +136,18 @@ impl DraftManager {
 
     /// Get a draft by ID
     pub async fn get_draft(&self, id: &DraftId) -> Result<Option<Draft>> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, draft_type, file_path, status, source_context_json,
-                   model_name, created_at, expires_at, approved_at, approved_by
-            FROM cf_ai_drafts
-            WHERE id = ?
-            "#,
-        )
-        .bind(id.as_str())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT id, draft_type, file_path, status, source_context_json,
+                       model_name, created_at, expires_at, approved_at, approved_by
+                FROM cf_ai_drafts
+                WHERE id = ?
+                "#,
+                &[DbValue::from(id.as_str())],
+            )
+            .await?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_draft(&row)?)),
@@ -155,18 +159,19 @@ impl DraftManager {
     pub async fn list_pending(&self) -> Result<Vec<Draft>> {
         let now_millis = Utc::now().timestamp_millis();
 
-        let rows = sqlx::query(
-            r#"
-            SELECT id, draft_type, file_path, status, source_context_json,
-                   model_name, created_at, expires_at, approved_at, approved_by
-            FROM cf_ai_drafts
-            WHERE status = 'pending' AND expires_at > ?
-            ORDER BY created_at DESC
-            "#,
-        )
-        .bind(now_millis)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT id, draft_type, file_path, status, source_context_json,
+                       model_name, created_at, expires_at, approved_at, approved_by
+                FROM cf_ai_drafts
+                WHERE status = 'pending' AND expires_at > ?
+                ORDER BY created_at DESC
+                "#,
+                &[DbValue::from(now_millis)],
+            )
+            .await?;
 
         let mut drafts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -177,18 +182,19 @@ impl DraftManager {
 
     /// List drafts by type
     pub async fn list_by_type(&self, draft_type: DraftType) -> Result<Vec<Draft>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, draft_type, file_path, status, source_context_json,
-                   model_name, created_at, expires_at, approved_at, approved_by
-            FROM cf_ai_drafts
-            WHERE draft_type = ?
-            ORDER BY created_at DESC
-            "#,
-        )
-        .bind(draft_type.as_str())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT id, draft_type, file_path, status, source_context_json,
+                       model_name, created_at, expires_at, approved_at, approved_by
+                FROM cf_ai_drafts
+                WHERE draft_type = ?
+                ORDER BY created_at DESC
+                "#,
+                &[DbValue::from(draft_type.as_str())],
+            )
+            .await?;
 
         let mut drafts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -218,19 +224,21 @@ impl DraftManager {
         let now = Utc::now();
         let now_millis = now.timestamp_millis();
 
-        sqlx::query(
-            r#"
-            UPDATE cf_ai_drafts
-            SET status = ?, approved_at = ?, approved_by = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(DraftStatus::Approved.as_str())
-        .bind(now_millis)
-        .bind(approved_by)
-        .bind(id.as_str())
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                r#"
+                UPDATE cf_ai_drafts
+                SET status = ?, approved_at = ?, approved_by = ?
+                WHERE id = ?
+                "#,
+                &[
+                    DbValue::from(DraftStatus::Approved.as_str()),
+                    DbValue::from(now_millis),
+                    DbValue::from(approved_by),
+                    DbValue::from(id.as_str()),
+                ],
+            )
+            .await?;
 
         Ok(Draft {
             status: DraftStatus::Approved,
@@ -251,17 +259,19 @@ impl DraftManager {
             return Err(DraftError::NotPending(draft.status.to_string()));
         }
 
-        sqlx::query(
-            r#"
-            UPDATE cf_ai_drafts
-            SET status = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(DraftStatus::Rejected.as_str())
-        .bind(id.as_str())
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                r#"
+                UPDATE cf_ai_drafts
+                SET status = ?
+                WHERE id = ?
+                "#,
+                &[
+                    DbValue::from(DraftStatus::Rejected.as_str()),
+                    DbValue::from(id.as_str()),
+                ],
+            )
+            .await?;
 
         // Optionally delete the file
         if draft.file_path.exists() {
@@ -278,19 +288,20 @@ impl DraftManager {
         let now_millis = Utc::now().timestamp_millis();
 
         // Get expired drafts to delete their files
-        let expired_rows = sqlx::query(
-            r#"
-            SELECT file_path FROM cf_ai_drafts
-            WHERE status = 'pending' AND expires_at <= ?
-            "#,
-        )
-        .bind(now_millis)
-        .fetch_all(&self.pool)
-        .await?;
+        let expired_rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT file_path FROM cf_ai_drafts
+                WHERE status = 'pending' AND expires_at <= ?
+                "#,
+                &[DbValue::from(now_millis)],
+            )
+            .await?;
 
         // Delete files
         for row in &expired_rows {
-            let file_path: String = row.get("file_path");
+            let file_path: String = row.get_by_name("file_path")?;
             let path = PathBuf::from(&file_path);
             if path.exists() {
                 let _ = std::fs::remove_file(&path);
@@ -298,52 +309,57 @@ impl DraftManager {
         }
 
         // Update status in database
-        let result = sqlx::query(
-            r#"
-            UPDATE cf_ai_drafts
-            SET status = ?
-            WHERE status = 'pending' AND expires_at <= ?
-            "#,
-        )
-        .bind(DraftStatus::Expired.as_str())
-        .bind(now_millis)
-        .execute(&self.pool)
-        .await?;
+        let result = self
+            .conn
+            .execute(
+                r#"
+                UPDATE cf_ai_drafts
+                SET status = ?
+                WHERE status = 'pending' AND expires_at <= ?
+                "#,
+                &[
+                    DbValue::from(DraftStatus::Expired.as_str()),
+                    DbValue::from(now_millis),
+                ],
+            )
+            .await?;
 
-        Ok(result.rows_affected() as usize)
+        Ok(result as usize)
     }
 
     /// Delete all drafts (for testing)
     #[cfg(test)]
     pub async fn delete_all(&self) -> Result<()> {
-        sqlx::query("DELETE FROM cf_ai_drafts")
-            .execute(&self.pool)
-            .await?;
+        self.conn.execute("DELETE FROM cf_ai_drafts", &[]).await?;
         Ok(())
     }
 
     /// Convert a database row to a Draft
-    fn row_to_draft(&self, row: &sqlx::sqlite::SqliteRow) -> Result<Draft> {
-        let id: String = row.get("id");
-        let draft_type_str: String = row.get("draft_type");
-        let file_path: String = row.get("file_path");
-        let status_str: String = row.get("status");
-        let context_json: Option<String> = row.get("source_context_json");
-        let model_name: Option<String> = row.get("model_name");
-        let created_at_millis: i64 = row.get("created_at");
-        let expires_at_millis: i64 = row.get("expires_at");
-        let approved_at_millis: Option<i64> = row.get("approved_at");
-        let approved_by: Option<String> = row.get("approved_by");
+    fn row_to_draft(&self, row: &UnifiedDbRow) -> Result<Draft> {
+        let id: String = row.get_by_name("id")?;
+        let draft_type_str: String = row.get_by_name("draft_type")?;
+        let file_path: String = row.get_by_name("file_path")?;
+        let status_str: String = row.get_by_name("status")?;
+        let context_json: Option<String> = row.get_by_name("source_context_json")?;
+        let model_name: Option<String> = row.get_by_name("model_name")?;
+        let created_at_millis: i64 = row.get_by_name("created_at")?;
+        let expires_at_millis: i64 = row.get_by_name("expires_at")?;
+        let approved_at_millis: Option<i64> = row.get_by_name("approved_at")?;
+        let approved_by: Option<String> = row.get_by_name("approved_by")?;
 
-        let draft_type = DraftType::from_str(&draft_type_str)
-            .ok_or_else(|| DraftError::Database(sqlx::Error::Decode(
-                format!("Invalid draft_type: {}", draft_type_str).into()
-            )))?;
+        let draft_type = DraftType::from_str(&draft_type_str).ok_or_else(|| {
+            DraftError::Database(BackendError::TypeConversion(format!(
+                "Invalid draft_type: {}",
+                draft_type_str
+            )))
+        })?;
 
-        let status = DraftStatus::from_str(&status_str)
-            .ok_or_else(|| DraftError::Database(sqlx::Error::Decode(
-                format!("Invalid status: {}", status_str).into()
-            )))?;
+        let status = DraftStatus::from_str(&status_str).ok_or_else(|| {
+            DraftError::Database(BackendError::TypeConversion(format!(
+                "Invalid status: {}",
+                status_str
+            )))
+        })?;
 
         let source_context: DraftContext = context_json
             .map(|json| serde_json::from_str(&json))
@@ -375,18 +391,17 @@ impl DraftManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use casparian_db::DbConnection;
     use tempfile::TempDir;
 
     async fn setup() -> (DraftManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
+        let db_path = temp_dir.path().join("test.duckdb");
 
-        // Create database with schema
-        let url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = SqlitePool::connect(&url).await.unwrap();
+        let conn = DbConnection::open_duckdb(&db_path).await.unwrap();
 
         // Create the drafts table
-        sqlx::query(
+        conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS cf_ai_drafts (
                 id TEXT PRIMARY KEY,
@@ -402,12 +417,11 @@ mod tests {
             )
             "#,
         )
-        .execute(&pool)
         .await
         .unwrap();
 
         let drafts_dir = temp_dir.path().join("drafts");
-        let manager = DraftManager::new(pool, drafts_dir);
+        let manager = DraftManager::new(conn, drafts_dir);
         (manager, temp_dir)
     }
 

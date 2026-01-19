@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json};
-use rusqlite::{params, Connection};
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
+use casparian_db::{DbConnection, DbValue};
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -26,29 +26,30 @@ struct RuleShow {
 #[test]
 fn test_rule_json_and_lifecycle() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.sqlite3");
+    let db_path = home_dir.path().join("casparian_flow.duckdb");
     init_scout_schema(&db_path);
 
     let now = 1_737_187_200_000i64;
-    let conn = Connection::open(&db_path).expect("open sqlite db");
-    insert_source(&conn, "src-1", "test_source", "/data", now);
-    insert_file(
-        &conn,
-        1,
-        "src-1",
-        "/data/sample.csv",
-        "sample.csv",
-        100,
-        "pending",
-        None,
-        None,
-        now,
-    );
+    with_duckdb(&db_path, |conn| async move {
+        insert_source(&conn, "src-1", "test_source", "/data", now).await;
+        insert_file(
+            &conn,
+            1,
+            "src-1",
+            "/data/sample.csv",
+            "sample.csv",
+            100,
+            "pending",
+            None,
+            None,
+            now,
+        )
+        .await;
+    });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 
@@ -84,7 +85,10 @@ fn test_rule_json_and_lifecycle() {
         "--json".to_string(),
     ];
     let details: RuleShow = run_cli_json(&show_args, &envs);
+    assert_eq!(details.pattern, "*.csv");
     assert_eq!(details.topic, "sales");
+    assert_eq!(details.priority, 10);
+    assert!(details.enabled);
     assert_eq!(details.matched, 1);
 
     let remove_args = vec![
@@ -97,18 +101,26 @@ fn test_rule_json_and_lifecycle() {
     assert_eq!(rule_count(&db_path), 0);
 }
 
-fn insert_source(conn: &Connection, id: &str, name: &str, path: &str, now: i64) {
+async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, now: i64) {
     let source_type = serde_json::json!({ "type": "local" }).to_string();
     conn.execute(
         "INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 30, 1, ?5, ?6)",
-        params![id, name, source_type, path, now, now],
+         VALUES (?, ?, ?, ?, 30, 1, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(name),
+            DbValue::from(source_type),
+            DbValue::from(path),
+            DbValue::from(now),
+            DbValue::from(now),
+        ],
     )
+    .await
     .expect("insert source");
 }
 
-fn insert_file(
-    conn: &Connection,
+async fn insert_file(
+    conn: &DbConnection,
     id: i64,
     source_id: &str,
     path: &str,
@@ -126,24 +138,25 @@ fn insert_file(
         .map(|ext| ext.to_lowercase());
     conn.execute(
         "INSERT INTO scout_files (id, source_id, path, rel_path, parent_path, name, extension, size, mtime, status, tag, error, first_seen_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            id,
-            source_id,
-            path,
-            rel_path,
-            parent_path,
-            name,
-            extension,
-            size,
-            now,
-            status,
-            tag,
-            error,
-            now,
-            now
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(source_id),
+            DbValue::from(path),
+            DbValue::from(rel_path),
+            DbValue::from(parent_path),
+            DbValue::from(name),
+            DbValue::from(extension),
+            DbValue::from(size),
+            DbValue::from(now),
+            DbValue::from(status),
+            DbValue::from(tag),
+            DbValue::from(error),
+            DbValue::from(now),
+            DbValue::from(now),
         ],
     )
+    .await
     .expect("insert file");
 }
 
@@ -158,7 +171,9 @@ fn split_rel_path(rel_path: &str) -> (String, String) {
 }
 
 fn rule_count(db_path: &Path) -> i64 {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    conn.query_row("SELECT COUNT(*) FROM scout_tagging_rules", [], |row| row.get(0))
-        .expect("count rules")
+    with_duckdb(db_path, |conn| async move {
+        conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_tagging_rules", &[])
+            .await
+            .expect("count rules")
+    })
 }

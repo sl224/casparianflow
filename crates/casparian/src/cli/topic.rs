@@ -5,7 +5,7 @@
 use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table};
-use crate::scout::{Database, FileStatus};
+use casparian::scout::{Database, FileStatus};
 use clap::Subcommand;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -220,22 +220,7 @@ async fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()>
     // Get files with this topic
     let files = db.list_files_by_tag(name, 1000).await.unwrap_or_default();
 
-    // Get parser subscribed to this topic (from parser_lab_parsers)
-    let parser = match db
-        .conn()
-        .query_optional(
-            "SELECT name, published_at FROM parser_lab_parsers WHERE file_pattern = ? LIMIT 1",
-            &[name.into()],
-        )
-        .await
-    {
-        Ok(Some(row)) => {
-            let parser_name: Option<String> = row.get(0).ok();
-            let published_at: Option<Option<i64>> = row.get(1).ok();
-            parser_name.map(|name| (name, published_at.unwrap_or(None)))
-        }
-        _ => None,
-    };
+    let parser: Option<(String, Option<i64>)> = None;
 
     // Get recent failures
     let failed_files: Vec<_> = files
@@ -291,22 +276,9 @@ async fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()>
     println!();
 
     // Parser section
-    let has_parser = parser.is_some();
     println!("PARSER");
-    if let Some((parser_name, published_at)) = parser {
-        println!("  {}", parser_name);
-        if let Some(ts) = published_at {
-            let dt = chrono::DateTime::from_timestamp_millis(ts)
-                .map(|d| d.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            println!("  Published {}", dt);
-        } else {
-            println!("  (not published)");
-        }
-    } else {
-        println!("  (no parser subscribed)");
-        println!("  TRY: Create a parser in Parser Lab with pattern '{}'", name);
-    }
+    println!("  (parser subscriptions are not tracked in v1)");
+    println!("  TRY: casparian publish <file.py> --version <v>");
     println!();
 
     // Files section
@@ -371,10 +343,6 @@ async fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()>
     if stats.failed > 0 {
         println!("  casparian files --topic {} --failed # List failures", name);
     }
-    if has_parser {
-        println!("  casparian parser backtest {}        # Test parser", name);
-    }
-
     Ok(())
 }
 
@@ -462,7 +430,7 @@ async fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::{ScannedFile, Source, SourceType, TaggingRule};
+    use casparian::scout::{ScannedFile, Source, SourceType, TaggingRule};
 
     #[tokio::test]
     async fn test_get_topic_stats() {

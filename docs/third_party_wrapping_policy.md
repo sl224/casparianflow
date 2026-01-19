@@ -34,7 +34,7 @@ Adopt a selective rule:
 
 1. Wrap at public boundaries that must be stable
    - Public crate APIs (types exposed in `pub` structs/enums/traits).
-   - External protocols and config contracts (MCP, CLI config files).
+   - External protocols and config contracts (CLI config files, API schemas).
    - Storage boundaries that must survive dependency changes (DB backends).
 
 2. Allow third-party types internally
@@ -52,7 +52,7 @@ High-ROI boundaries in this codebase:
 - Database backend abstraction (DbConnection/DbTransaction wrapper).
 - Public error types (avoid embedding third-party error enums directly).
 - Public ID/timestamp types used in contracts (stable across crates).
-- MCP tool result and input schema types (public API to clients).
+- Tool result and input schema types exposed to clients.
 
 Likely OK to keep third-party types internal:
 - Arrow RecordBatch in internal runner implementations.

@@ -18,13 +18,10 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 mod cli;
-
-// Use scout and runner from library (lib.rs) so they're testable
-use casparian::runner;
-use casparian::scout;
 
 /// Shutdown timeout in seconds
 const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
@@ -32,6 +29,10 @@ const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 #[derive(Parser, Debug)]
 #[command(name = "casparian", about = "Unified Launcher for Casparian Flow")]
 struct Cli {
+    /// Enable verbose logging (info/debug to stderr)
+    #[arg(short = 'v', long, global = true)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -304,15 +305,6 @@ enum Commands {
         force: bool,
     },
 
-    // === W7: MCP Server ===
-
-    /// Start MCP server for Claude Code integration
-    McpServer {
-        /// Bind address (default: stdio for MCP)
-        #[arg(long)]
-        addr: Option<String>,
-    },
-
     // === Existing Server Commands ===
 
     /// Start both Sentinel and Worker in one process (Split-Runtime)
@@ -371,19 +363,6 @@ enum Commands {
         /// Publisher email (optional)
         #[arg(long)]
         email: Option<String>,
-    },
-    /// Process a single job from the queue (for UI-spawned processing)
-    ProcessJob {
-        /// Job ID from cf_processing_queue
-        job_id: i64,
-
-        /// Sentinel database path (casparian_flow.duckdb)
-        #[arg(long)]
-        db: std::path::PathBuf,
-
-        /// Output directory for processed files
-        #[arg(long, default_value = "output")]
-        output: std::path::PathBuf,
     },
 
     /// Show current configuration and paths
@@ -715,12 +694,6 @@ fn run_command(cli: Cli) -> Result<()> {
             })
         }
 
-        // === W7: MCP Server ===
-        Commands::McpServer { addr } => {
-            let rt = Runtime::new().context("Failed to create runtime")?;
-            rt.block_on(async { cli::mcp::run(cli::mcp::McpArgs { addr }).await })
-        }
-
         // === Existing Server Commands ===
         Commands::Start {
             addr,
@@ -751,7 +724,6 @@ fn run_command(cli: Cli) -> Result<()> {
                 run_publish(file, version, addr, publisher, email).await
             })
         }
-        Commands::ProcessJob { job_id, db, output } => process_single_job(job_id, &db, &output),
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
         Commands::Tui { args } => {
             let rt = Runtime::new().context("Failed to create runtime")?;
@@ -1272,260 +1244,6 @@ async fn run_publish(
             "Unexpected response opcode: {:?}",
             response_msg.header.opcode
         ),
-    }
-}
-
-/// Process a single job from cf_processing_queue
-///
-/// This is used by the Tauri UI to spawn a worker process for each job.
-/// The job runs the plugin via the bridge (Python subprocess).
-///
-/// Uses casparian_sentinel::JobQueue (DbConnection) for all database operations.
-fn process_single_job(
-    job_id: i64,
-    db_path: &std::path::Path,
-    output_dir: &std::path::Path,
-) -> Result<()> {
-    use casparian_worker::bridge::{self, BridgeConfig};
-    use std::time::Instant;
-
-    info!(job_id, db = %db_path.display(), "Processing job");
-
-    // Create runtime for async operations
-    let rt = tokio::runtime::Runtime::new()?;
-
-    // Open database via JobQueue
-    let db_url = format!("duckdb:{}", db_path.display());
-    let queue = rt.block_on(casparian_sentinel::JobQueue::open(&db_url))
-        .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
-
-    // Get job details
-    let job_details = rt.block_on(queue.get_job_details(job_id))?
-        .ok_or_else(|| anyhow::anyhow!("Job {} not found (no file_id or input_file)", job_id))?;
-
-    let plugin_name = job_details.plugin_name;
-    let file_path = job_details.file_path;
-
-    info!(plugin = %plugin_name, file = %file_path, "Starting job");
-
-    // Claim the job (status = RUNNING)
-    rt.block_on(queue.claim_job(job_id))?;
-
-    // Get plugin source code and env_hash
-    let plugin_details = rt.block_on(queue.get_plugin_details(&plugin_name))?
-        .ok_or_else(|| anyhow::anyhow!("Plugin '{}' not found or not deployed", plugin_name))?;
-
-    let plugin_source = plugin_details.source_code;
-    let env_hash_opt = plugin_details.env_hash;
-
-    // Execute plugin via bridge
-    let start = Instant::now();
-
-    // Try to get lockfile from cf_plugin_environment (proper deployment path)
-    let lockfile_content: Option<String> = if let Some(ref hash) = env_hash_opt {
-        rt.block_on(queue.get_lockfile(hash))?
-    } else {
-        None
-    };
-
-    // Determine venv setup strategy
-    let (env_hash, interpreter) = if let (Some(hash), Some(lockfile)) = (&env_hash_opt, &lockfile_content) {
-        // PROPER PATH: Use VenvManager with lockfile
-        info!(env_hash = %hash, "Using pre-computed environment from deployment");
-
-        let venv_manager = casparian_worker::venv_manager::VenvManager::new()
-            .context("Failed to initialize VenvManager")?;
-
-        let interp = venv_manager.get_or_create(hash, lockfile, None)
-            .context("Failed to get or create venv")?;
-
-        (hash.clone(), interp)
-    } else {
-        // ADHOC PATH: Generate minimal lockfile with plugin deps + bridge deps
-        use casparian_security::signing::sha256;
-
-        let deps = parse_plugin_dependencies(&plugin_source);
-        info!(deps = ?deps, "Detected plugin dependencies (adhoc mode)");
-
-        // Bridge runtime deps - ALWAYS needed for IPC serialization
-        let mut all_deps = vec!["pyarrow".to_string(), "pandas".to_string()];
-        all_deps.extend(deps);
-        all_deps.sort();
-        all_deps.dedup();
-
-        // Generate deterministic hash from deps
-        let deps_str = all_deps.join(",");
-        let hash = sha256(deps_str.as_bytes());
-        let short_hash = &hash[..16];
-
-        info!(deps = ?all_deps, env_hash = %short_hash, "Using adhoc environment");
-
-        let venv_path = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".casparian_flow")
-            .join("venvs")
-            .join(short_hash);
-
-        // Create venv if needed
-        if !venv_path.join("bin").join("python").exists() {
-            std::fs::create_dir_all(&venv_path)?;
-
-            let output = std::process::Command::new("uv")
-                .args(["venv", venv_path.to_str().unwrap()])
-                .output()
-                .context("Failed to create venv with uv")?;
-
-            if !output.status.success() {
-                anyhow::bail!("uv venv failed: {}", String::from_utf8_lossy(&output.stderr));
-            }
-
-            // Install ALL dependencies (including bridge deps)
-            if !all_deps.is_empty() {
-                let mut cmd = std::process::Command::new("uv");
-                cmd.arg("pip").arg("install");
-                for dep in &all_deps {
-                    cmd.arg(dep);
-                }
-                cmd.env("VIRTUAL_ENV", &venv_path);
-
-                let output = cmd.output().context("Failed to install dependencies")?;
-                if !output.status.success() {
-                    anyhow::bail!("uv pip install failed: {}", String::from_utf8_lossy(&output.stderr));
-                }
-            }
-        }
-
-        (short_hash.to_string(), venv_path.join("bin").join("python"))
-    };
-    info!(interpreter = %interpreter.display(), env_hash = %env_hash, "Using Python interpreter");
-
-    // Materialize shim
-    let shim_path = bridge::materialize_bridge_shim()?;
-
-    // Configure bridge
-    let config = BridgeConfig {
-        interpreter_path: interpreter,
-        source_code: plugin_source,
-        file_path: file_path.clone(),
-        job_id: job_id as u64,
-        file_id: 0,
-        shim_path,
-    };
-
-    // Execute via bridge
-    let result = rt.block_on(bridge::execute_bridge(config));
-    let elapsed = start.elapsed();
-
-    match result {
-        Ok(bridge_result) => {
-            std::fs::create_dir_all(output_dir)?;
-            let output_paths = handle_bridge_outputs(&bridge_result, output_dir, &plugin_name, job_id)?;
-
-            let result_summary = output_paths.join(";");
-            info!(job_id, elapsed_ms = elapsed.as_millis(), outputs = %result_summary, "Job completed");
-
-            rt.block_on(queue.complete_job(job_id, &result_summary))?;
-
-            // Log plugin output
-            if !bridge_result.logs.is_empty() {
-                info!(logs = %bridge_result.logs, "Plugin logs");
-            }
-
-            Ok(())
-        }
-        Err(e) => {
-            error!(job_id, error = %e, elapsed_ms = elapsed.as_millis(), "Job failed");
-            rt.block_on(queue.fail_job(job_id, &e.to_string()))?;
-            Err(anyhow::anyhow!(e))
-        }
-    }
-}
-
-/// Parse plugin dependencies from source code
-///
-/// Looks for patterns like:
-/// - `import pandas` -> "pandas"
-/// - `import pyarrow` -> "pyarrow"
-fn parse_plugin_dependencies(source: &str) -> Vec<String> {
-    let mut deps = vec![];
-
-    for line in source.lines() {
-        let line = line.trim();
-
-        // import X or import X as Y
-        if let Some(rest) = line.strip_prefix("import ") {
-            let module = rest.split_whitespace().next().unwrap_or("");
-            let module = module.split('.').next().unwrap_or("");
-            if !module.is_empty() && !is_stdlib_module(module) {
-                deps.push(module.to_string());
-            }
-        }
-        // from X import Y
-        else if let Some(rest) = line.strip_prefix("from ") {
-            let module = rest.split_whitespace().next().unwrap_or("");
-            let module = module.split('.').next().unwrap_or("");
-            if !module.is_empty() && !is_stdlib_module(module) {
-                deps.push(module.to_string());
-            }
-        }
-    }
-
-    // Deduplicate
-    deps.sort();
-    deps.dedup();
-    deps
-}
-
-/// Check if a module is in the Python standard library
-fn is_stdlib_module(module: &str) -> bool {
-    matches!(
-        module,
-        "os" | "sys" | "re" | "json" | "math" | "time" | "datetime"
-            | "collections" | "itertools" | "functools" | "typing"
-            | "pathlib" | "io" | "csv" | "tempfile" | "shutil"
-            | "subprocess" | "threading" | "multiprocessing"
-            | "hashlib" | "uuid" | "random" | "string" | "struct"
-            | "copy" | "enum" | "dataclasses" | "abc" | "contextlib"
-    )
-}
-
-/// Write Arrow batches to a Parquet file
-fn handle_bridge_outputs(
-    bridge_result: &bridge::BridgeResult,
-    output_dir: &std::path::Path,
-    plugin_name: &str,
-    job_id: i64,
-) -> Result<Vec<String>> {
-    #[cfg(feature = "data-plane")]
-    {
-        use casparian_sinks::{plan_outputs, write_output_plan, OutputDescriptor};
-
-        let job_id_str = job_id.to_string();
-        let descriptors: Vec<OutputDescriptor> = bridge_result
-            .output_info
-            .iter()
-            .map(|info| OutputDescriptor {
-                name: info.name.clone(),
-                table: info.table.clone(),
-            })
-            .collect();
-
-        let outputs = plan_outputs(&descriptors, &bridge_result.batches, plugin_name)?;
-        let sink_uri = format!("parquet://{}", output_dir.display());
-        let artifacts = write_output_plan(&sink_uri, &outputs, &job_id_str)?;
-
-        Ok(artifacts
-            .into_iter()
-            .map(|artifact| artifact.uri.strip_prefix("file://").unwrap_or(&artifact.uri).to_string())
-            .collect())
-    }
-    #[cfg(not(feature = "data-plane"))]
-    {
-        let _ = bridge_result;
-        let _ = output_dir;
-        let _ = plugin_name;
-        let _ = job_id;
-        anyhow::bail!("data outputs require the `data-plane` feature")
     }
 }
 

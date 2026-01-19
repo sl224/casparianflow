@@ -46,7 +46,7 @@ This document evaluates streaming infrastructure options for Casparian Flow, wit
 │                          ▼                                         │
 │              ┌─────────────────────────┐                           │
 │              │   Agentic Data Plane    │                           │
-│              │   - MCP Server          │                           │
+│              │   - Agent Tool Server   │                           │
 │              │   - Oxla SQL Engine     │                           │
 │              │   - Agent governance    │                           │
 │              └─────────────────────────┘                           │
@@ -65,7 +65,7 @@ Redpanda acquired Oxla (distributed SQL engine) and launched ADP to target enter
 | **SQL query engine** | Unified interface for streams + Iceberg tables | Beta 2026 |
 | **300+ connectors** | Pull context from enterprise systems | GA |
 | **Governance** | Agent access control, intent logging, audit | Early 2026 |
-| **MCP-aware** | Native Model Context Protocol support | GA |
+| **Agent-protocol aware** | Native agent tool protocol support | GA |
 
 **Key capabilities:**
 - Full observability (every agent interaction logged, replayable)
@@ -144,7 +144,7 @@ scan_source()
 | **Type inference** | None | **Constraint-based inference** |
 | **Output sinks** | Kafka, Iceberg, DBs, APIs | Parquet, SQLite, CSV |
 | **Development UX** | YAML config | **Backtest, fail-fast, TUI** |
-| **MCP server** | Exposes pipelines as tools | Exposes workflows as tools |
+| **Agent tool server** | Exposes pipelines as tools | Exposes workflows as tools |
 | **Governance** | ADP (agent tokens, audit) | Schema contracts only |
 | **Deployment** | Cloud/BYOC/self-managed | **Local-first, air-gapped** |
 
@@ -164,14 +164,14 @@ scan_source()
 ```
         Redpanda                    Overlap                 Casparian
         ────────                    ───────                 ─────────
-   300+ API connectors          MCP server for         Premade file parsers
+   300+ API connectors          Agent tool server      Premade file parsers
    Stream processing            AI integration         Schema contracts
    Kafka ecosystem              SQL query output       Backtest workflow
    Cloud-native                 Data transformation    Local-first
    Enterprise governance        Lineage tracking       Air-gapped deployment
 ```
 
-**Core insight:** The overlap (MCP + SQL + transformation) is small. The differentiation is large.
+**Core insight:** The overlap (agent tooling + SQL + transformation) is small. The differentiation is large.
 
 ---
 
@@ -535,7 +535,7 @@ rdkafka = { version = "0.36", features = ["cmake-build"] }
 | Redpanda builds file transformation | Low | High | Schema contracts moat |
 | ADP becomes dominant | Medium | Medium | Complement, don't compete |
 | Redpanda acquires similar tool | Low | High | Differentiate on local-first |
-| MCP standardization benefits Redpanda | Medium | Low | Both benefit from MCP growth |
+| Agent protocol standardization benefits Redpanda | Medium | Low | Both benefit from agent tooling growth |
 
 ### 10.3 Partnership Opportunity
 
@@ -604,7 +604,7 @@ rdkafka = { version = "0.36", features = ["cmake-build"] }
 
 - [Redpanda Agentic Data Plane](https://www.redpanda.com/agentic-data-plane)
 - [Redpanda Oxla Acquisition](https://www.redpanda.com/press/redpanda-acquires-oxla-launches-new-agentic-data-plane-for-enterprise-data)
-- [Redpanda MCP Server Docs](https://docs.redpanda.com/home/mcp-setup/)
+- [Redpanda ADP Docs](https://docs.redpanda.com/)
 - [Redpanda Connect GitHub](https://github.com/redpanda-data/connect)
 - [Iceberg Topics Integration](https://docs.redpanda.com/current/manage/iceberg/)
 - [Redpanda vs Kafka Benchmarks](https://jack-vanlightly.com/blog/2023/5/15/kafka-vs-redpanda-performance-do-the-claims-add-up)
@@ -618,4 +618,3 @@ rdkafka = { version = "0.36", features = ["cmake-build"] }
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-01-14 | 1.0 | Initial draft: Redpanda evaluation, strategic options, phased roadmap |
-

@@ -4,10 +4,7 @@ use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use anyhow::{Context, Result};
 use casparian_db::{DbConnection, DbValue};
-use casparian::storage::{
-    DuckDbPipelineStore, Pipeline, SelectionFilters, SelectionResolution, SqliteJobStore,
-    WatermarkField,
-};
+use casparian::storage::{DuckDbPipelineStore, Pipeline, SelectionFilters, SelectionResolution, WatermarkField};
 use casparian::PipelineStore;
 use clap::Subcommand;
 use chrono::TimeZone;
@@ -133,31 +130,19 @@ struct ExportConfig {
     output: Option<String>,
 }
 
-enum PipelineStoreHandle {
-    Sqlite(SqliteJobStore),
-    DuckDb(DuckDbPipelineStore),
+struct PipelineStoreHandle {
+    store: DuckDbPipelineStore,
 }
 
 impl PipelineStoreHandle {
     async fn open() -> Result<Self> {
         let db_path = config::active_db_path();
-        match config::default_db_backend() {
-            config::DbBackend::Sqlite => {
-                let store = SqliteJobStore::new(&db_path).await?;
-                Ok(Self::Sqlite(store))
-            }
-            config::DbBackend::DuckDb => {
-                let store = DuckDbPipelineStore::open(&db_path).await?;
-                Ok(Self::DuckDb(store))
-            }
-        }
+        let store = DuckDbPipelineStore::open(&db_path).await?;
+        Ok(Self { store })
     }
 
     async fn create_selection_spec(&self, spec_json: &str) -> Result<String> {
-        match self {
-            Self::Sqlite(store) => store.create_selection_spec(spec_json).await,
-            Self::DuckDb(store) => store.create_selection_spec(spec_json).await,
-        }
+        self.store.create_selection_spec(spec_json).await
     }
 
     async fn create_selection_snapshot(
@@ -167,39 +152,21 @@ impl PipelineStoreHandle {
         logical_date: &str,
         watermark_value: Option<&str>,
     ) -> Result<String> {
-        match self {
-            Self::Sqlite(store) => {
-                store
-                    .create_selection_snapshot(spec_id, snapshot_hash, logical_date, watermark_value)
-                    .await
-            }
-            Self::DuckDb(store) => {
-                store
-                    .create_selection_snapshot(spec_id, snapshot_hash, logical_date, watermark_value)
-                    .await
-            }
-        }
+        self.store
+            .create_selection_snapshot(spec_id, snapshot_hash, logical_date, watermark_value)
+            .await
     }
 
     async fn insert_snapshot_files(&self, snapshot_id: &str, file_ids: &[i64]) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.insert_snapshot_files(snapshot_id, file_ids).await,
-            Self::DuckDb(store) => store.insert_snapshot_files(snapshot_id, file_ids).await,
-        }
+        self.store.insert_snapshot_files(snapshot_id, file_ids).await
     }
 
     async fn create_pipeline(&self, name: &str, version: i64, config_json: &str) -> Result<String> {
-        match self {
-            Self::Sqlite(store) => store.create_pipeline(name, version, config_json).await,
-            Self::DuckDb(store) => store.create_pipeline(name, version, config_json).await,
-        }
+        self.store.create_pipeline(name, version, config_json).await
     }
 
     async fn get_latest_pipeline(&self, name: &str) -> Result<Option<Pipeline>> {
-        match self {
-            Self::Sqlite(store) => store.get_latest_pipeline(name).await,
-            Self::DuckDb(store) => store.get_latest_pipeline(name).await,
-        }
+        self.store.get_latest_pipeline(name).await
     }
 
     async fn create_pipeline_run(
@@ -211,46 +178,24 @@ impl PipelineStoreHandle {
         logical_date: &str,
         status: &str,
     ) -> Result<String> {
-        match self {
-            Self::Sqlite(store) => {
-                store
-                    .create_pipeline_run(
-                        pipeline_id,
-                        selection_spec_id,
-                        selection_snapshot_hash,
-                        context_snapshot_hash,
-                        logical_date,
-                        status,
-                    )
-                    .await
-            }
-            Self::DuckDb(store) => {
-                store
-                    .create_pipeline_run(
-                        pipeline_id,
-                        selection_spec_id,
-                        selection_snapshot_hash,
-                        context_snapshot_hash,
-                        logical_date,
-                        status,
-                    )
-                    .await
-            }
-        }
+        self.store
+            .create_pipeline_run(
+                pipeline_id,
+                selection_spec_id,
+                selection_snapshot_hash,
+                context_snapshot_hash,
+                logical_date,
+                status,
+            )
+            .await
     }
 
     async fn set_pipeline_run_status(&self, run_id: &str, status: &str) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.set_pipeline_run_status(run_id, status).await,
-            Self::DuckDb(store) => store.set_pipeline_run_status(run_id, status).await,
-        }
+        self.store.set_pipeline_run_status(run_id, status).await
     }
 
     async fn pipeline_run_exists(&self, pipeline_id: &str, logical_date: &str) -> Result<bool> {
-        match self {
-            Self::Sqlite(store) => store.pipeline_run_exists(pipeline_id, logical_date).await,
-            Self::DuckDb(store) => store.pipeline_run_exists(pipeline_id, logical_date).await,
-        }
+        self.store.pipeline_run_exists(pipeline_id, logical_date).await
     }
 
     async fn resolve_selection_files(
@@ -258,10 +203,9 @@ impl PipelineStoreHandle {
         filters: &SelectionFilters,
         logical_date_ms: i64,
     ) -> Result<SelectionResolution> {
-        match self {
-            Self::Sqlite(store) => store.resolve_selection_files(filters, logical_date_ms).await,
-            Self::DuckDb(store) => store.resolve_selection_files(filters, logical_date_ms).await,
-        }
+        self.store
+            .resolve_selection_files(filters, logical_date_ms)
+            .await
     }
 }
 
@@ -477,16 +421,7 @@ fn snapshot_hash(spec_id: &str, logical_date: &str, file_ids: &[i64]) -> String 
 
 impl PipelineStoreHandle {
     async fn open_db_connection(&self) -> Result<DbConnection> {
-        match self {
-            PipelineStoreHandle::DuckDb(store) => Ok(store.connection()),
-            PipelineStoreHandle::Sqlite(_) => {
-                let db_path = config::active_db_path();
-                let db_url = format!("sqlite:{}", db_path.display());
-                DbConnection::open_from_url(&db_url)
-                    .await
-                    .context("Failed to open database connection")
-            }
-        }
+        Ok(self.store.connection())
     }
 }
 
@@ -515,91 +450,8 @@ async fn enqueue_jobs(
     Ok(())
 }
 
-async fn table_exists(conn: &DbConnection, table: &str) -> Result<bool> {
-    let (query, param) = match conn.backend_name() {
-        "DuckDB" => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
-        "SQLite" => ("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", DbValue::from(table)),
-        _ => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
-    };
-    Ok(conn.query_optional(query, &[param]).await?.is_some())
-}
-
 async fn ensure_queue_schema(conn: &DbConnection) -> Result<()> {
-    if table_exists(conn, "cf_processing_queue").await? {
-        return Ok(());
-    }
-
-    let create_sql = match conn.backend_name() {
-        "DuckDB" => {
-            r#"
-            CREATE SEQUENCE IF NOT EXISTS seq_cf_processing_queue;
-            CREATE TABLE IF NOT EXISTS cf_processing_queue (
-                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_processing_queue'),
-                file_id BIGINT NOT NULL,
-                pipeline_run_id TEXT,
-                plugin_name TEXT NOT NULL,
-                input_file TEXT,
-                config_overrides TEXT,
-                status TEXT NOT NULL DEFAULT 'QUEUED',
-                priority INTEGER DEFAULT 0,
-                worker_host TEXT,
-                worker_pid INTEGER,
-                claim_time TIMESTAMP,
-                end_time TIMESTAMP,
-                result_summary TEXT,
-                error_message TEXT,
-                retry_count INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS ix_queue_pop ON cf_processing_queue(status, priority, id);
-            "#
-        }
-        "SQLite" => {
-            r#"
-            CREATE TABLE IF NOT EXISTS cf_processing_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id INTEGER NOT NULL,
-                pipeline_run_id TEXT,
-                plugin_name TEXT NOT NULL,
-                input_file TEXT,
-                config_overrides TEXT,
-                status TEXT NOT NULL DEFAULT 'QUEUED',
-                priority INTEGER DEFAULT 0,
-                worker_host TEXT,
-                worker_pid INTEGER,
-                claim_time TEXT,
-                end_time TEXT,
-                result_summary TEXT,
-                error_message TEXT,
-                retry_count INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS ix_queue_pop ON cf_processing_queue(status, priority, id);
-            "#
-        }
-        _ => {
-            r#"
-            CREATE TABLE IF NOT EXISTS cf_processing_queue (
-                id BIGINT PRIMARY KEY,
-                file_id BIGINT NOT NULL,
-                pipeline_run_id TEXT,
-                plugin_name TEXT NOT NULL,
-                input_file TEXT,
-                config_overrides TEXT,
-                status TEXT NOT NULL DEFAULT 'QUEUED',
-                priority INTEGER DEFAULT 0,
-                worker_host TEXT,
-                worker_pid INTEGER,
-                claim_time TIMESTAMP,
-                end_time TIMESTAMP,
-                result_summary TEXT,
-                error_message TEXT,
-                retry_count INTEGER DEFAULT 0
-            );
-            "#
-        }
-    };
-
-    conn.execute_batch(create_sql)
-        .await
-        .context("Failed to create cf_processing_queue")?;
+    let queue = casparian_sentinel::JobQueue::new(conn.clone());
+    queue.init_queue_schema().await?;
     Ok(())
 }

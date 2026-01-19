@@ -7,27 +7,26 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use casparian::storage::{SqliteJobStore, JobStore};
+//! use casparian::storage::{DuckDbPipelineStore, PipelineStore};
 //! use std::path::Path;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     let store = SqliteJobStore::new(Path::new("./data.db")).await?;
+//!     let store = DuckDbPipelineStore::open(Path::new("./data.duckdb")).await?;
 //!
-//!     if let Some(job) = store.claim_next("worker-1").await? {
-//!         println!("Claimed job: {} for plugin {}", job.id, job.plugin_name);
-//!         // Process the job...
-//!         store.complete(job.id, "/output/result.parquet").await?;
-//!     }
+//!     let pipeline = store.get_latest_pipeline("daily_report").await?;
+//!     println!("Latest pipeline: {:?}", pipeline);
 //!     Ok(())
 //! }
 //! ```
 
 mod duckdb;
+#[cfg(feature = "sqlite")]
 mod sqlite;
 mod traits;
 
 pub use duckdb::DuckDbPipelineStore;
+#[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteJobStore, SqliteParserStore, SqliteQuarantineStore};
 pub use traits::{
     Job, JobStore, ParserBundle, ParserStore, Pipeline, PipelineRun, PipelineStore, QuarantinedRow,

@@ -158,6 +158,9 @@ impl Sentinel {
 
         // Clone connection only once for the queue
         let queue = JobQueue::new(conn.clone());
+        queue.init_queue_schema().await?;
+        queue.init_registry_schema().await?;
+        queue.init_error_handling_schema().await?;
 
         // Destructive Initialization for IPC sockets (Unix only)
         // Unlink stale socket files to prevent "Address in use" errors
@@ -500,7 +503,10 @@ impl Sentinel {
                 } else {
                     "Partial success"
                 };
-                self.queue.complete_job(job_id, summary).await?;
+                let quarantine_rows = receipt.metrics.get("quarantine_rows").copied();
+                self.queue
+                    .complete_job(job_id, summary, quarantine_rows)
+                    .await?;
                 METRICS.inc_jobs_completed();
 
                 // Record success for circuit breaker
@@ -670,10 +676,10 @@ impl Sentinel {
         };
         self.dispatch_backoff_ms = next;
 
-        let jitter_ms = (SystemTime::now()
+        let jitter_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64 % DISPATCH_BACKOFF_JITTER_MS)
-            .unwrap_or(0));
+            .unwrap_or(0);
         self.dispatch_cooldown_until = Some(Instant::now() + Duration::from_millis(next + jitter_ms));
     }
 
@@ -944,14 +950,32 @@ impl Sentinel {
         }
 
         // 3b. Insert the plugin manifest
+        let publisher_email = cmd
+            .publisher_email
+            .as_deref()
+            .map(DbValue::from)
+            .unwrap_or(DbValue::Null);
+        let azure_oid = cmd
+            .azure_oid
+            .as_deref()
+            .map(DbValue::from)
+            .unwrap_or(DbValue::Null);
+        let system_requirements = cmd
+            .system_requirements
+            .as_ref()
+            .map(|reqs| serde_json::to_string(reqs).unwrap_or_default())
+            .map(DbValue::from)
+            .unwrap_or(DbValue::Null);
+
         if let Err(e) = self
             .conn
             .execute(
                 r#"
                 INSERT INTO cf_plugin_manifest
                 (plugin_name, version, source_code, source_hash, status,
-                 env_hash, artifact_hash, created_at)
-                VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?)
+                 env_hash, artifact_hash, created_at, deployed_at,
+                 publisher_name, publisher_email, azure_oid, system_requirements)
+                VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 &[
                     DbValue::from(cmd.plugin_name.as_str()),
@@ -961,6 +985,11 @@ impl Sentinel {
                     DbValue::from(cmd.env_hash.as_str()),
                     DbValue::from(cmd.artifact_hash.as_str()),
                     DbValue::from(now.clone()),
+                    DbValue::from(now.clone()),
+                    DbValue::from(cmd.publisher_name.as_str()),
+                    publisher_email,
+                    azure_oid,
+                    system_requirements,
                 ],
             )
             .await

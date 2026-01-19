@@ -261,7 +261,7 @@ Post-November 2025, MX messages dominate:
 | **Custom Parsing** | Limited | **Unlimited (Python)** |
 | **Audit Trail** | None | **Full lineage** |
 | **Deployment** | Cloud/Desktop | **Local-first** |
-| **AI Integration** | Limited | **Full MCP** |
+| **AI Integration** | Limited | **Optional AI (future)** |
 
 **Positioning:** "Bloomberg is the data. Casparian is the plumbing."
 

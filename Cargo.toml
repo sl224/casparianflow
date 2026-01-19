@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/casparian_protocol",
+    "crates/casparian_logging",
     "crates/casparian_worker",
     "crates/casparian_sentinel",
     "crates/casparian_sinks",
@@ -11,7 +12,6 @@ members = [
     "crates/casparian_ids",
     "crates/casparian_schema",
     "crates/casparian_backtest",
-    "crates/casparian_mcp",
     "crates/casparian_test_utils",
     "crates/casparian_profiler",
     "crates/casparian_db",

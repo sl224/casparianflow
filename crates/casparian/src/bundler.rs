@@ -19,7 +19,7 @@
 
 use anyhow::{bail, Context, Result};
 use blake3::Hasher;
-use regex::Regex;
+use crate::parser_metadata::extract_metadata_batch;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -185,29 +185,39 @@ fn is_excluded(path: &Path) -> bool {
 fn extract_parser_metadata(dir: &Path) -> Result<(String, String)> {
     // Look for parser.py first, then any .py file with name/version attributes
     let parser_py = dir.join("parser.py");
+    let mut candidates = Vec::new();
     if parser_py.exists() {
-        if let Ok(content) = fs::read_to_string(&parser_py) {
-            if let (Some(name), Some(version)) = (
-                extract_attribute(&content, "name"),
-                extract_attribute(&content, "version"),
-            ) {
-                return Ok((name, version));
-            }
-        }
+        candidates.push(parser_py.clone());
     }
 
     // Fall back to scanning all .py files
     for entry in fs::read_dir(dir).context("Failed to read parser directory")? {
         let entry = entry.context("Failed to read directory entry")?;
         let path = entry.path();
-        if path.extension().map(|e| e == "py").unwrap_or(false) {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let (Some(name), Some(version)) = (
-                    extract_attribute(&content, "name"),
-                    extract_attribute(&content, "version"),
-                ) {
-                    return Ok((name, version));
-                }
+        if path.extension().map(|e| e == "py").unwrap_or(false) && path != parser_py {
+            candidates.push(path);
+        }
+    }
+
+    if candidates.is_empty() {
+        bail!("No parser .py files found for metadata extraction");
+    }
+
+    let metadata = extract_metadata_batch(&candidates);
+    let lookup = |path: &Path| metadata.get(&path.to_string_lossy().to_string());
+
+    if parser_py.exists() {
+        if let Some(meta) = lookup(&parser_py) {
+            if let Some(version) = &meta.version {
+                return Ok((meta.name.clone(), version.clone()));
+            }
+        }
+    }
+
+    for path in &candidates {
+        if let Some(meta) = lookup(path) {
+            if let Some(version) = &meta.version {
+                return Ok((meta.name.clone(), version.clone()));
             }
         }
     }
@@ -220,20 +230,6 @@ fn extract_parser_metadata(dir: &Path) -> Result<(String, String)> {
              version = '1.0.0'\n\
              ..."
     )
-}
-
-/// Extract a string attribute from Python source code
-///
-/// Matches patterns like:
-/// - `name = "invoice_parser"`
-/// - `name = 'invoice_parser'`
-/// - `name="invoice_parser"`
-fn extract_attribute(content: &str, attr: &str) -> Option<String> {
-    // Match patterns like: name = "invoice_parser" or name = 'invoice_parser'
-    let pattern = format!(r#"(?m)^\s*{}\s*=\s*['"]([^'"]+)['"]"#, attr);
-    let re = Regex::new(&pattern).ok()?;
-    re.captures(content)
-        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
 }
 
 #[cfg(test)]

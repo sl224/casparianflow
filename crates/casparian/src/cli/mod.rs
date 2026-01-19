@@ -77,10 +77,7 @@ pub mod source;
 pub mod rule;
 pub mod topic;
 
-// W7: MCP Server
-pub mod mcp;
-
-// W8: TUI with LLM Integration
+// W8: TUI
 pub mod tui;
 
 // Configuration and context
@@ -92,5 +89,3 @@ pub mod context;
 pub use error::HelpfulError;
 #[allow(unused_imports)]
 pub use output::{format_number, format_number_signed, format_size, format_time, print_table};
-#[allow(unused_imports)]
-pub use config::default_db_path;

@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS cf_processing_queue (
     result_summary TEXT,
     error_message TEXT,
     retry_count INTEGER DEFAULT 0,
+    quarantine_rows INTEGER DEFAULT 0,
     FOREIGN KEY (file_id) REFERENCES scout_files(id)
 );
 

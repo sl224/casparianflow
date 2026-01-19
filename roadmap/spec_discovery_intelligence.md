@@ -559,9 +559,11 @@ Return: { encoding, confidence, invalid_byte_count }
 
 ---
 
-## 8. API Specifications
+## 8. API Specifications (Archived)
 
-### 8.1 MCP Tools
+### 8.1 Tool API (Pre-v1)
+
+Note: This section is historical; tool-based APIs were removed from v1.
 
 #### `fingerprint_file`
 

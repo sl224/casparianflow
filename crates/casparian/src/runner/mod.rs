@@ -17,8 +17,8 @@ pub enum LogDestination {
 
 /// Result of parser execution
 pub struct ExecutionResult {
-    /// Arrow record batches produced by the parser
-    pub batches: Vec<OutputBatch>,
+    /// Arrow record batches grouped by output (per publish call)
+    pub output_batches: Vec<Vec<OutputBatch>>,
     /// Captured logs from the parser (stdout, stderr, logging)
     pub logs: String,
     /// Output metadata from the parser (sink routing info)

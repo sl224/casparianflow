@@ -85,7 +85,7 @@ This is the **Open Core** model used by GitLab, Redis, and others.
 **Why Casparian Fits:**
 - Local-first data processing (user control)
 - Schema contracts (data governance)
-- MCP integration (open AI protocols)
+- AI integration (open agent protocols)
 
 **The Pitch:**
 > "Casparian enables citizens and organizations to structure their own data locally, without uploading to centralized cloud platforms. This restores data sovereignty to individuals."
@@ -98,7 +98,7 @@ This is the **Open Core** model used by GitLab, Redis, and others.
 **Application Focus:**
 - Data sovereignty angle
 - Local-first architecture
-- Open standards (MCP, Parquet)
+- Open standards (Parquet, SQL)
 
 ---
 
@@ -189,7 +189,7 @@ This is the **Open Core** model used by GitLab, Redis, and others.
 
 **Why Casparian Fits:**
 - Local-first (no cloud data upload)
-- MCP integration (open AI protocol)
+- AI integration (open agent protocols)
 - Schema contracts (AI accountability)
 
 **The "Local AI" Pitch:**
@@ -215,16 +215,15 @@ This is the **Open Core** model used by GitLab, Redis, and others.
 | **Members** | Anthropic, OpenAI, Block, Google, Microsoft, AWS |
 | **URL** | [linuxfoundation.org](https://www.linuxfoundation.org/) |
 
-**CORRECTION:** The original analysis incorrectly described AAIF as a grant source. It is a **standards governance body** for agentic AI protocols (MCP, Goose, AGENTS.md).
+**CORRECTION:** The original analysis incorrectly described AAIF as a grant source. It is a **standards governance body** for agentic AI protocols (Goose, AGENTS.md, etc.).
 
 **Why Casparian Should Engage:**
-- `casparian_mcp` implements MCP protocol
-- Could contribute to MCP specification
+- Could contribute to agent protocol specifications
 - Visibility among major AI players
 
 **How to Engage:**
-- Contribute to MCP working groups
-- Publish MCP server implementations
+- Contribute to agent protocol working groups
+- Publish reference implementations
 - NOT a funding source
 
 ---
@@ -284,17 +283,17 @@ This is the **Open Core** model used by GitLab, Redis, and others.
 |--------|--------|--------|
 | Prepare NIH SBIR | April 5 deadline | High |
 | Watch Mozilla calls | Incubator opens 2026 | Low |
-| Engage AAIF | MCP working groups | Low |
+| Engage AAIF | Agent protocol working groups | Low |
 
 ### Narrative Mapping
 
 | Funder | Narrative | Lead Parser |
 |--------|-----------|-------------|
 | STF | "Rust Infrastructure" | `casparian_worker`, `casparian_protocol` |
-| NLNet | "Data Sovereignty" | Schema contracts, MCP integration |
+| NLNet | "Data Sovereignty" | Schema contracts, AI integration (future) |
 | OTF | "Journalism Shield" | `pst_parser.py`, air-gap mode |
 | NIH | "Health Interoperability" | `hl7_parser.py` |
-| Mozilla | "Local AI" | MCP integration, BYOK |
+| Mozilla | "Local AI" | AI integration (future), BYOK |
 
 ---
 
@@ -390,4 +389,3 @@ This is the **Open Core** model used by GitLab, Redis, and others.
 | Date | Version | Changes |
 |------|---------|---------|
 | 2026-01-08 | 1.0 | Initial document; vetted external analysis; verified all funding sources; corrected AAIF description; excluded military options per user preference |
-

@@ -4,6 +4,7 @@
 
 pub mod ai;
 pub mod bundler;
+pub mod parser_metadata;
 pub mod publish;
 pub mod runner;
 pub mod scout;
@@ -18,5 +19,7 @@ pub use publish::{analyze_plugin, prepare_publish, PluginAnalysis, PreparedArtif
 pub use storage::{
     Job, JobStore, ParserStore, Pipeline, PipelineRun, PipelineStore, QuarantinedRow,
     QuarantineStore, SelectionFilters, SelectionResolution, SelectionSnapshot, SelectionSpec,
-    SqliteJobStore, SqliteParserStore, SqliteQuarantineStore, WatermarkField,
+    WatermarkField,
 };
+#[cfg(feature = "sqlite")]
+pub use storage::{SqliteJobStore, SqliteParserStore, SqliteQuarantineStore};

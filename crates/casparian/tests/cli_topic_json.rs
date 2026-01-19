@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{init_scout_schema, run_cli_json};
-use rusqlite::{params, Connection};
+use cli_support::{init_scout_schema, run_cli_json, with_duckdb};
+use casparian_db::{DbConnection, DbValue};
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -35,39 +35,40 @@ struct TopicFailure {
 #[test]
 fn test_topic_json_outputs() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.sqlite3");
+    let db_path = home_dir.path().join("casparian_flow.duckdb");
     init_scout_schema(&db_path);
 
     let now = 1_737_187_200_000i64;
-    let conn = Connection::open(&db_path).expect("open sqlite db");
-    insert_source(&conn, "src-1", "test_source", "/data", now);
+    with_duckdb(&db_path, |conn| async move {
+        insert_source(&conn, "src-1", "test_source", "/data", now).await;
 
-    let files = [
-        (1, "/data/sales/a.csv", "sales/a.csv", 100, "processed", Some("sales"), None),
-        (2, "/data/sales/b.csv", "sales/b.csv", 120, "failed", Some("sales"), Some("bad row")),
-        (3, "/data/invoices/one.json", "invoices/one.json", 90, "pending", Some("invoices"), None),
-        (4, "/data/invoices/two.json", "invoices/two.json", 95, "processed", Some("invoices"), None),
-        (5, "/data/logs/untagged.log", "logs/untagged.log", 80, "pending", None, None),
-    ];
-    for (id, path, rel_path, size, status, tag, error) in files {
-        insert_file(
-            &conn,
-            id,
-            "src-1",
-            path,
-            rel_path,
-            size,
-            status,
-            tag,
-            error,
-            now,
-        );
-    }
+        let files = [
+            (1, "/data/sales/a.csv", "sales/a.csv", 100, "processed", Some("sales"), None),
+            (2, "/data/sales/b.csv", "sales/b.csv", 120, "failed", Some("sales"), Some("bad row")),
+            (3, "/data/invoices/one.json", "invoices/one.json", 90, "pending", Some("invoices"), None),
+            (4, "/data/invoices/two.json", "invoices/two.json", 95, "processed", Some("invoices"), None),
+            (5, "/data/logs/untagged.log", "logs/untagged.log", 80, "pending", None, None),
+        ];
+        for (id, path, rel_path, size, status, tag, error) in files {
+            insert_file(
+                &conn,
+                id,
+                "src-1",
+                path,
+                rel_path,
+                size,
+                status,
+                tag,
+                error,
+                now,
+            )
+            .await;
+        }
+    });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 
@@ -103,18 +104,26 @@ fn test_topic_json_outputs() {
         .any(|f| f.path.ends_with("b.csv") && f.error.as_deref() == Some("bad row")));
 }
 
-fn insert_source(conn: &Connection, id: &str, name: &str, path: &str, now: i64) {
+async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, now: i64) {
     let source_type = serde_json::json!({ "type": "local" }).to_string();
     conn.execute(
         "INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 30, 1, ?5, ?6)",
-        params![id, name, source_type, path, now, now],
+         VALUES (?, ?, ?, ?, 30, 1, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(name),
+            DbValue::from(source_type),
+            DbValue::from(path),
+            DbValue::from(now),
+            DbValue::from(now),
+        ],
     )
+    .await
     .expect("insert source");
 }
 
-fn insert_file(
-    conn: &Connection,
+async fn insert_file(
+    conn: &DbConnection,
     id: i64,
     source_id: &str,
     path: &str,
@@ -132,24 +141,25 @@ fn insert_file(
         .map(|ext| ext.to_lowercase());
     conn.execute(
         "INSERT INTO scout_files (id, source_id, path, rel_path, parent_path, name, extension, size, mtime, status, tag, error, first_seen_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            id,
-            source_id,
-            path,
-            rel_path,
-            parent_path,
-            name,
-            extension,
-            size,
-            now,
-            status,
-            tag,
-            error,
-            now,
-            now
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(source_id),
+            DbValue::from(path),
+            DbValue::from(rel_path),
+            DbValue::from(parent_path),
+            DbValue::from(name),
+            DbValue::from(extension),
+            DbValue::from(size),
+            DbValue::from(now),
+            DbValue::from(status),
+            DbValue::from(tag),
+            DbValue::from(error),
+            DbValue::from(now),
+            DbValue::from(now),
         ],
     )
+    .await
     .expect("insert file");
 }
 

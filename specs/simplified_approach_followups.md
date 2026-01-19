@@ -23,9 +23,9 @@ across the codebase, so we can address it after the DB actor work lands.
 - Keep one concrete DB implementation until Postgres is real.
 - Avoid adapter layers that mirror hypothetical backends.
 
-4) MCP tool wiring
-- Ensure tools are thin wrappers over concrete services.
-- Avoid generalized "tool registries" unless we need dynamic loading.
+4) AI assistance wiring (future)
+- Ensure assistive features are thin wrappers over concrete services.
+- Avoid generalized registries unless we need dynamic loading.
 
 ## Evaluation Checklist
 - Is there more than one real backend today?

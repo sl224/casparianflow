@@ -12,7 +12,7 @@ Casparian Flow is a data processing platform that:
 4. **Executes** pipelines in isolated environments
 5. **Outputs** clean, queryable datasets (Parquet, SQLite, CSV)
 
-The system integrates with Claude Code via MCP (Model Context Protocol), enabling AI-assisted data processing workflows.
+AI assistance is optional and out of the critical execution path for v1.
 
 ## Quick Start
 
@@ -58,18 +58,19 @@ Plugins run in isolated subprocesses. Host has credentials. Guest has only code.
 ## Architecture
 
 ```
-Claude Code ──MCP──> Casparian MCP Server
-                           │
-         ┌─────────────────┼─────────────────┐
-         ▼                 ▼                 ▼
-    Schema Contracts   Backtest Engine   Type Inference
-         │                 │                 │
-         └─────────────────┼─────────────────┘
-                           ▼
-                   Worker (Bridge Mode)
-                           │
-                           ▼
-                     Output Sinks
+Casparian CLI / TUI
+        │
+        ▼
+  Schema Contracts
+        │
+        ▼
+ Sentinel / Job Queue
+        │
+        ▼
+ Worker (Bridge Mode)
+        │
+        ▼
+  Output Sinks
 ```
 
 ### Crates
@@ -77,27 +78,12 @@ Claude Code ──MCP──> Casparian MCP Server
 | Crate | Purpose |
 |-------|---------|
 | `casparian` | Unified CLI binary |
-| `casparian_mcp` | MCP server (9 tools) |
 | `casparian_schema` | Schema contracts |
 | `casparian_backtest` | Multi-file validation |
 | `casparian_worker` | Type inference + execution |
 | `casparian_scout` | File discovery |
 | `cf_security` | Auth + signing |
 | `cf_protocol` | Binary protocol |
-
-## MCP Tools
-
-| Tool | Purpose |
-|------|---------|
-| `quick_scan` | Fast file metadata scan |
-| `apply_scope` | Group files for processing |
-| `discover_schemas` | Infer schema from files |
-| `approve_schemas` | Create locked contracts |
-| `propose_amendment` | Modify contracts |
-| `run_backtest` | Validate parser |
-| `fix_parser` | Generate fixes |
-| `execute_pipeline` | Run processing |
-| `query_output` | Query results |
 
 ## Development
 
@@ -112,8 +98,6 @@ cargo build --release
 cargo test --package casparian_worker --test e2e_type_inference
 cargo test --package casparian_schema --test e2e_contracts
 cargo test --package casparian_backtest --test e2e_backtest
-cargo test --package casparian_mcp --test e2e_tools
-
 # E2E test script
 ./tests/e2e/run_e2e_test.sh
 ```

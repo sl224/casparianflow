@@ -214,7 +214,7 @@ Payroll exports:
 | **Custom Formats** | Limited | **Unlimited (Python)** |
 | **Data Residency** | Cloud | **Local-first** |
 | **Technical Skill** | Data engineering | **Analyst-friendly** |
-| **AI Integration** | None | **Full MCP** |
+| **AI Integration** | None | **Optional AI (future)** |
 
 **Positioning:** "Fivetran for the 95% without data engineers."
 

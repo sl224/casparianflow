@@ -3,12 +3,12 @@
 //! Scans a directory for files matching specified criteria and stores
 //! file metadata in the database for later filtering and tagging.
 //!
-//! Uses crate::scout::Database as the single source of truth.
+//! Uses casparian::scout::Database as the single source of truth.
 
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{color_for_extension, format_size, format_time, print_table_colored};
-use crate::scout::scan_path;
-use crate::scout::{Database, ScannedFile, Scanner, Source, SourceType};
+use casparian::scout::scan_path;
+use casparian::scout::{Database, ScannedFile, Scanner, Source, SourceType};
 use comfy_table::Color;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -840,7 +840,6 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
         _temp_dir: TempDir,
         prev_home: Option<String>,
-        prev_backend: Option<String>,
     }
 
     impl TestEnv {
@@ -848,16 +847,13 @@ mod tests {
             let lock = TEST_ENV_LOCK.lock().expect("test env lock");
             let temp_dir = TempDir::new().unwrap();
             let prev_home = std::env::var("CASPARIAN_HOME").ok();
-            let prev_backend = std::env::var("CASPARIAN_DB_BACKEND").ok();
 
             std::env::set_var("CASPARIAN_HOME", temp_dir.path());
-            std::env::set_var("CASPARIAN_DB_BACKEND", "sqlite");
 
             Self {
                 _lock: lock,
                 _temp_dir: temp_dir,
                 prev_home,
-                prev_backend,
             }
         }
     }
@@ -868,12 +864,6 @@ mod tests {
                 std::env::set_var("CASPARIAN_HOME", home);
             } else {
                 std::env::remove_var("CASPARIAN_HOME");
-            }
-
-            if let Some(backend) = self.prev_backend.take() {
-                std::env::set_var("CASPARIAN_DB_BACKEND", backend);
-            } else {
-                std::env::remove_var("CASPARIAN_DB_BACKEND");
             }
         }
     }

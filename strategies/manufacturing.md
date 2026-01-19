@@ -221,7 +221,7 @@ Quality data:
 | **Data Collection** | Direct OPC-UA/DA connection | **Works with exports** |
 | **Deployment** | Complex server infrastructure | **Single binary, local** |
 | **Query Language** | PI AF SQL, proprietary | **Standard SQL** |
-| **AI Integration** | Limited, add-on | **Full MCP** |
+| **AI Integration** | Limited, add-on | **Optional AI (future)** |
 | **Air-Gap Support** | Yes | **Yes** |
 
 **Positioning:** "PI collects. Casparian analyzes."

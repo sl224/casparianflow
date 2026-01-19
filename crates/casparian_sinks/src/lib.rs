@@ -7,7 +7,7 @@
 //! - Batch writing
 //! - Lineage column injection
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
@@ -151,30 +151,34 @@ pub struct OutputArtifact {
 
 pub fn plan_outputs(
     descriptors: &[OutputDescriptor],
-    batches: &[OutputBatch],
+    output_batches: &[Vec<OutputBatch>],
     default_name: &str,
 ) -> SinkResult<Vec<OutputPlan>> {
     if descriptors.is_empty() {
+        let batches: Vec<OutputBatch> = output_batches
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
         return Ok(vec![OutputPlan::new(
             default_name,
             None,
-            batches.to_vec(),
+            batches,
         )]);
     }
 
-    if descriptors.len() != batches.len() {
+    if descriptors.len() != output_batches.len() {
         return Err(SinkError::message(format!(
-            "Output metadata count ({}) does not match batch count ({})",
+            "Output metadata count ({}) does not match output count ({})",
             descriptors.len(),
-            batches.len()
+            output_batches.len()
         )));
     }
 
     Ok(descriptors
         .iter()
-        .zip(batches.iter())
-        .map(|(info, batch)| {
-            OutputPlan::new(info.name.clone(), info.table.clone(), vec![batch.clone()])
+        .zip(output_batches.iter())
+        .map(|(info, batches)| {
+            OutputPlan::new(info.name.clone(), info.table.clone(), batches.clone())
         })
         .collect())
 }

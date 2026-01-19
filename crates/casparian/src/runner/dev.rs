@@ -11,7 +11,7 @@ use std::path::Path;
 /// Development mode runner that executes parsers without database integration.
 ///
 /// Features:
-/// - Logs go to terminal (visible during `pdb` debugging)
+/// - Logs go to terminal when stdio is inherited for debugging
 /// - No database writes
 /// - Uses job_id 0
 /// - Resolves Python interpreter from $VIRTUAL_ENV or falls back to system python3
@@ -52,6 +52,7 @@ impl Runner for DevRunner {
             .context("Failed to materialize bridge shim")?;
 
         // Create bridge config
+        let inherit_stdio = bridge_inherit_stdio();
         let config = casparian_worker::bridge::BridgeConfig {
             interpreter_path: self.python_path.clone(),
             source_code: source,
@@ -59,13 +60,14 @@ impl Runner for DevRunner {
             job_id: 0, // Dev mode uses job_id 0
             file_id: 0,
             shim_path,
+            inherit_stdio,
         };
 
         // Execute with terminal output (logs captured by bridge)
         let result = casparian_worker::bridge::execute_bridge(config).await?;
 
         Ok(ExecutionResult {
-            batches: result.batches,
+            output_batches: result.output_batches,
             logs: result.logs,
             output_info: result.output_info,
         })
@@ -88,4 +90,14 @@ fn resolve_python() -> Result<std::path::PathBuf> {
 
     // Fall back to system python3
     Ok(std::path::PathBuf::from("python3"))
+}
+
+fn bridge_inherit_stdio() -> bool {
+    matches!(
+        std::env::var("CASPARIAN_BRIDGE_STDIO")
+            .unwrap_or_else(|_| "piped".to_string())
+            .to_lowercase()
+            .as_str(),
+        "inherit" | "tty"
+    )
 }

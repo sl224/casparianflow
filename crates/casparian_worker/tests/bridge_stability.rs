@@ -19,6 +19,7 @@ fn make_test_config(job_id: u64, python_code: &str) -> BridgeConfig {
         job_id,
         file_id: 1,
         shim_path,
+        inherit_stdio: false,
     }
 }
 
@@ -55,10 +56,12 @@ class Handler:
     assert!(result.is_ok(), "Multi-batch should succeed: {:?}", result.err());
 
     let bridge_result = result.unwrap();
-    assert_eq!(bridge_result.batches.len(), 5, "Should have 5 batches");
+    assert_eq!(bridge_result.output_batches.len(), 5, "Should have 5 outputs");
 
     // Verify batches arrived in order with correct data
-    for (i, batch) in bridge_result.batches.iter().enumerate() {
+    for (i, output) in bridge_result.output_batches.iter().enumerate() {
+        assert_eq!(output.len(), 1, "Each output should have one batch");
+        let batch = &output[0];
         assert_eq!(batch.num_rows(), 1);
 
         let batch_id_col = batch.column(0);
@@ -102,9 +105,10 @@ class Handler:
     assert!(result.is_ok(), "Data integrity test should succeed: {:?}", result.err());
 
     let bridge_result = result.unwrap();
-    assert_eq!(bridge_result.batches.len(), 1);
+    assert_eq!(bridge_result.output_batches.len(), 1);
+    assert_eq!(bridge_result.output_batches[0].len(), 1);
 
-    let batch = &bridge_result.batches[0];
+    let batch = &bridge_result.output_batches[0][0];
     assert_eq!(batch.num_rows(), 4);
     assert_eq!(batch.num_columns(), 4);
 
@@ -156,8 +160,9 @@ class Handler:
     assert!(result.is_ok(), "Large batch should succeed: {:?}", result.err());
 
     let bridge_result = result.unwrap();
-    assert_eq!(bridge_result.batches.len(), 1);
-    assert_eq!(bridge_result.batches[0].num_rows(), 10000);
+    assert_eq!(bridge_result.output_batches.len(), 1);
+    assert_eq!(bridge_result.output_batches[0].len(), 1);
+    assert_eq!(bridge_result.output_batches[0][0].num_rows(), 10000);
 }
 
 /// Test empty result - handler that processes but produces no output.
@@ -176,7 +181,7 @@ class Handler:
     let result = execute_bridge(config).await;
 
     assert!(result.is_ok(), "Empty result should succeed");
-    assert!(result.unwrap().batches.is_empty());
+    assert!(result.unwrap().output_batches.is_empty());
 }
 
 /// Test concurrent execution - multiple jobs don't interfere.
@@ -220,13 +225,13 @@ class Handler:
     let result2 = result2.expect("job 2 timed out").expect("job 2 failed");
 
     // Verify each job got its own data
-    let job1_col = result1.batches[0].column(0)
+    let job1_col = result1.output_batches[0][0].column(0)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
     assert_eq!(job1_col.value(0), 1);
 
-    let job2_col = result2.batches[0].column(0)
+    let job2_col = result2.output_batches[0][0].column(0)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();

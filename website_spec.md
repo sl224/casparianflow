@@ -18,7 +18,7 @@ Single-page marketing site for Casparian Flow - an AI-native CLI tool that trans
 
 **The Problem**: Data engineers spend weeks writing custom parsers for proprietary file formats. When formats change, parsers break. No governance trail.
 
-**The Solution**: Claude Code generates parsers via MCP. Humans approve schemas as immutable contracts. Everything runs locally - no cloud, no data leaving your machine.
+**The Solution**: Optional AI assistance (future) helps draft parsers. Humans approve schemas as immutable contracts. Everything runs locally - no cloud, no data leaving your machine.
 
 ---
 
@@ -57,11 +57,11 @@ Single-page marketing site for Casparian Flow - an AI-native CLI tool that trans
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                                                                 │
-│  1. Discover        2. Generate         3. Execute              │
+│  1. Discover        2. Develop          3. Execute              │
 │                                                                 │
-│  Point at your      Claude Code         Run locally.            │
-│  messy files.       writes the          Output to Parquet,      │
-│  CSVs, JSON,        parser. You         SQLite, or CSV.         │
+│  Point at your      Draft a parser      Run locally.            │
+│  messy files.       (AI assist is       Output to Parquet,      │
+│  CSVs, JSON,        optional). You      SQLite, or CSV.         │
 │  logs, custom       review and          Full lineage.           │
 │  formats.           approve.            Air-gapped.             │
 │                                                                 │
@@ -75,7 +75,7 @@ Single-page marketing site for Casparian Flow - an AI-native CLI tool that trans
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                                                                 │
-│  ✓ AI-Native: Claude Code integration via MCP                   │
+│  ✓ AI-Assist (Future): Optional parser drafting                │
 │  ✓ Schema Contracts: Approved = immutable. No silent coercion.  │
 │  ✓ Local-First: Your data never leaves your machine             │
 │  ✓ BYOK: Bring your own Anthropic API key                       │

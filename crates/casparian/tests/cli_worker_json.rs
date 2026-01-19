@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, run_cli, run_cli_json};
-use rusqlite::{params, Connection};
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
+use casparian_db::DbValue;
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -16,62 +16,100 @@ struct WorkerOutput {
 #[test]
 fn test_worker_json_and_state_changes() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.sqlite3");
-    let conn = Connection::open(&db_path).expect("open sqlite db");
+    let db_path = home_dir.path().join("casparian_flow.duckdb");
+    init_scout_schema(&db_path);
+    with_duckdb(&db_path, |conn| async move {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE cf_worker_node (
+                hostname TEXT PRIMARY KEY,
+                pid INTEGER,
+                ip_address TEXT,
+                env_signature TEXT,
+                started_at TIMESTAMP,
+                last_heartbeat TIMESTAMP,
+                status TEXT,
+                current_job_id INTEGER
+            );
 
-    conn.execute_batch(
-        r#"
-        CREATE TABLE cf_worker_node (
-            hostname TEXT PRIMARY KEY,
-            pid INTEGER,
-            ip_address TEXT,
-            env_signature TEXT,
-            started_at TEXT,
-            last_heartbeat TEXT,
-            status TEXT,
-            current_job_id INTEGER
-        );
+            CREATE TABLE cf_processing_queue (
+                id BIGINT PRIMARY KEY,
+                status TEXT,
+                claim_time TIMESTAMP,
+                worker_host TEXT,
+                worker_pid INTEGER
+            );
+            "#,
+        )
+        .await
+        .expect("create worker tables");
 
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            status TEXT,
-            claim_time TEXT,
-            worker_host TEXT,
-            worker_pid INTEGER
-        );
-        "#,
-    )
-    .expect("create worker tables");
-
-    conn.execute(
-        "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
-         VALUES ('worker-1', 12345, '192.168.1.10', NULL, '2024-12-16T08:00:00Z', '2024-12-16T10:30:00Z', 'busy', 42)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
-         VALUES ('worker-2', 12346, '192.168.1.11', NULL, '2024-12-16T08:00:00Z', '2024-12-16T10:30:00Z', 'idle', NULL)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
-         VALUES ('worker-3', 12347, '192.168.1.12', NULL, '2024-12-16T08:00:00Z', '2024-12-16T09:00:00Z', 'draining', NULL)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO cf_processing_queue (id, status, claim_time, worker_host, worker_pid)
-         VALUES (42, 'RUNNING', '2024-12-16T10:30:05Z', 'worker-1', 12345)",
-        [],
-    )
-    .unwrap();
+        conn.execute(
+            "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                DbValue::from("worker-1"),
+                DbValue::from(12345i32),
+                DbValue::from("192.168.1.10"),
+                DbValue::Null,
+                DbValue::from("2024-12-16T08:00:00Z"),
+                DbValue::from("2024-12-16T10:30:00Z"),
+                DbValue::from("busy"),
+                DbValue::from(42i32),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                DbValue::from("worker-2"),
+                DbValue::from(12346i32),
+                DbValue::from("192.168.1.11"),
+                DbValue::Null,
+                DbValue::from("2024-12-16T08:00:00Z"),
+                DbValue::from("2024-12-16T10:30:00Z"),
+                DbValue::from("idle"),
+                DbValue::Null,
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                DbValue::from("worker-3"),
+                DbValue::from(12347i32),
+                DbValue::from("192.168.1.12"),
+                DbValue::Null,
+                DbValue::from("2024-12-16T08:00:00Z"),
+                DbValue::from("2024-12-16T09:00:00Z"),
+                DbValue::from("draining"),
+                DbValue::Null,
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cf_processing_queue (id, status, claim_time, worker_host, worker_pid)
+             VALUES (?, ?, ?, ?, ?)",
+            &[
+                DbValue::from(42i64),
+                DbValue::from("RUNNING"),
+                DbValue::from("2024-12-16T10:30:05Z"),
+                DbValue::from("worker-1"),
+                DbValue::from(12345i32),
+            ],
+        )
+        .await
+        .unwrap();
+    });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 
@@ -115,33 +153,43 @@ fn test_worker_json_and_state_changes() {
 }
 
 fn worker_status(db_path: &Path, hostname: &str) -> Option<String> {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    conn.query_row(
-        "SELECT status FROM cf_worker_node WHERE hostname = ?1",
-        params![hostname],
-        |row| row.get(0),
-    )
-    .ok()
+    with_duckdb(db_path, |conn| async move {
+        conn.query_optional(
+            "SELECT status FROM cf_worker_node WHERE hostname = ?",
+            &[DbValue::from(hostname)],
+        )
+        .await
+        .ok()
+        .and_then(|row| row.and_then(|r| r.get_by_name::<String>("status").ok()))
+    })
 }
 
 fn job_status(db_path: &Path, job_id: i64) -> Option<String> {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    conn.query_row(
-        "SELECT status FROM cf_processing_queue WHERE id = ?1",
-        params![job_id],
-        |row| row.get(0),
-    )
-    .ok()
+    with_duckdb(db_path, |conn| async move {
+        conn.query_optional(
+            "SELECT status FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job_id)],
+        )
+        .await
+        .ok()
+        .and_then(|row| row.and_then(|r| r.get_by_name::<String>("status").ok()))
+    })
 }
 
 fn job_worker_cleared(db_path: &Path, job_id: i64) -> bool {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    let (host, pid): (Option<String>, Option<i32>) = conn
-        .query_row(
-            "SELECT worker_host, worker_pid FROM cf_processing_queue WHERE id = ?1",
-            params![job_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query job worker");
-    host.is_none() && pid.is_none()
+    with_duckdb(db_path, |conn| async move {
+        let row = conn
+            .query_optional(
+                "SELECT worker_host, worker_pid FROM cf_processing_queue WHERE id = ?",
+                &[DbValue::from(job_id)],
+            )
+            .await
+            .expect("query job worker");
+        row.and_then(|r| {
+            let host: Option<String> = r.get_by_name::<Option<String>>("worker_host").ok().flatten();
+            let pid: Option<i32> = r.get_by_name::<Option<i32>>("worker_pid").ok().flatten();
+            Some(host.is_none() && pid.is_none())
+        })
+        .unwrap_or(false)
+    })
 }

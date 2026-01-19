@@ -3,14 +3,14 @@
 //! Every LLM interaction is logged for debugging, compliance, and training data collection.
 
 use super::types::{AuditStatus, WizardType};
+use casparian_db::{BackendError, DbConnection, DbValue, UnifiedDbRow};
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool};
 
 /// Error type for audit operations
 #[derive(Debug, thiserror::Error)]
 pub enum AuditError {
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] BackendError),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -129,67 +129,70 @@ impl AuditEntry {
 /// Audit logger for AI wizard operations
 #[derive(Clone)]
 pub struct AuditLogger {
-    pool: SqlitePool,
+    conn: DbConnection,
 }
 
 impl AuditLogger {
     /// Create a new audit logger
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(conn: DbConnection) -> Self {
+        Self { conn }
     }
 
     /// Log an audit entry
     pub async fn log(&self, entry: &AuditEntry) -> Result<()> {
         let redactions_json = serde_json::to_string(&entry.redactions)?;
 
-        sqlx::query(
-            r#"
-            INSERT INTO cf_ai_audit_log (
-                id, wizard_type, model_name, input_type, input_hash,
-                input_preview, redactions_json, output_type, output_hash,
-                output_file, duration_ms, status, error_message,
-                attempt_number, created_at
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO cf_ai_audit_log (
+                    id, wizard_type, model_name, input_type, input_hash,
+                    input_preview, redactions_json, output_type, output_hash,
+                    output_file, duration_ms, status, error_message,
+                    attempt_number, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+                &[
+                    DbValue::from(entry.id.as_str()),
+                    DbValue::from(entry.wizard_type.as_str()),
+                    DbValue::from(entry.model_name.as_str()),
+                    DbValue::from(entry.input_type.as_str()),
+                    DbValue::from(entry.input_hash.as_str()),
+                    DbValue::from(entry.input_preview.clone()),
+                    DbValue::from(redactions_json),
+                    DbValue::from(entry.output_type.clone()),
+                    DbValue::from(entry.output_hash.clone()),
+                    DbValue::from(entry.output_file.clone()),
+                    DbValue::from(entry.duration_ms),
+                    DbValue::from(entry.status.as_str()),
+                    DbValue::from(entry.error_message.clone()),
+                    DbValue::from(entry.attempt_number as i64),
+                    DbValue::from(entry.created_at.timestamp_millis()),
+                ],
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(&entry.id)
-        .bind(entry.wizard_type.as_str())
-        .bind(&entry.model_name)
-        .bind(&entry.input_type)
-        .bind(&entry.input_hash)
-        .bind(&entry.input_preview)
-        .bind(&redactions_json)
-        .bind(&entry.output_type)
-        .bind(&entry.output_hash)
-        .bind(&entry.output_file)
-        .bind(entry.duration_ms)
-        .bind(entry.status.as_str())
-        .bind(&entry.error_message)
-        .bind(entry.attempt_number as i64)
-        .bind(entry.created_at.timestamp_millis())
-        .execute(&self.pool)
-        .await?;
+            .await?;
 
         Ok(())
     }
 
     /// Query recent audit entries
     pub async fn query_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, wizard_type, model_name, input_type, input_hash,
-                   input_preview, redactions_json, output_type, output_hash,
-                   output_file, duration_ms, status, error_message,
-                   attempt_number, created_at
-            FROM cf_ai_audit_log
-            ORDER BY created_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT id, wizard_type, model_name, input_type, input_hash,
+                       input_preview, redactions_json, output_type, output_hash,
+                       output_file, duration_ms, status, error_message,
+                       attempt_number, created_at
+                FROM cf_ai_audit_log
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+                &[DbValue::from(limit as i64)],
+            )
+            .await?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -200,22 +203,25 @@ impl AuditLogger {
 
     /// Query entries by wizard type
     pub async fn query_by_wizard(&self, wizard_type: WizardType, limit: usize) -> Result<Vec<AuditEntry>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, wizard_type, model_name, input_type, input_hash,
-                   input_preview, redactions_json, output_type, output_hash,
-                   output_file, duration_ms, status, error_message,
-                   attempt_number, created_at
-            FROM cf_ai_audit_log
-            WHERE wizard_type = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(wizard_type.as_str())
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT id, wizard_type, model_name, input_type, input_hash,
+                       input_preview, redactions_json, output_type, output_hash,
+                       output_file, duration_ms, status, error_message,
+                       attempt_number, created_at
+                FROM cf_ai_audit_log
+                WHERE wizard_type = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+                &[
+                    DbValue::from(wizard_type.as_str()),
+                    DbValue::from(limit as i64),
+                ],
+            )
+            .await?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -226,22 +232,22 @@ impl AuditLogger {
 
     /// Query entries by status
     pub async fn query_by_status(&self, status: AuditStatus, limit: usize) -> Result<Vec<AuditEntry>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, wizard_type, model_name, input_type, input_hash,
-                   input_preview, redactions_json, output_type, output_hash,
-                   output_file, duration_ms, status, error_message,
-                   attempt_number, created_at
-            FROM cf_ai_audit_log
-            WHERE status = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-            "#,
-        )
-        .bind(status.as_str())
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT id, wizard_type, model_name, input_type, input_hash,
+                       input_preview, redactions_json, output_type, output_hash,
+                       output_file, duration_ms, status, error_message,
+                       attempt_number, created_at
+                FROM cf_ai_audit_log
+                WHERE status = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                "#,
+                &[DbValue::from(status.as_str()), DbValue::from(limit as i64)],
+            )
+            .await?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -252,20 +258,22 @@ impl AuditLogger {
 
     /// Count entries by status
     pub async fn count_by_status(&self) -> Result<Vec<(AuditStatus, i64)>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT status, COUNT(*) as count
-            FROM cf_ai_audit_log
-            GROUP BY status
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT status, COUNT(*) as count
+                FROM cf_ai_audit_log
+                GROUP BY status
+                "#,
+                &[],
+            )
+            .await?;
 
         let mut counts = Vec::new();
         for row in rows {
-            let status_str: String = row.get("status");
-            let count: i64 = row.get("count");
+            let status_str: String = row.get_by_name("status")?;
+            let count: i64 = row.get_by_name("count")?;
             if let Some(status) = AuditStatus::from_str(&status_str) {
                 counts.push((status, count));
             }
@@ -283,47 +291,49 @@ impl AuditLogger {
         let error_cutoff = (now - chrono::Duration::days(retention_days as i64 * 2)).timestamp_millis();
 
         // Delete old success entries
-        let result1 = sqlx::query(
-            r#"
-            DELETE FROM cf_ai_audit_log
-            WHERE status = 'success' AND created_at < ?
-            "#,
-        )
-        .bind(success_cutoff)
-        .execute(&self.pool)
-        .await?;
+        let result1 = self
+            .conn
+            .execute(
+                r#"
+                DELETE FROM cf_ai_audit_log
+                WHERE status = 'success' AND created_at < ?
+                "#,
+                &[DbValue::from(success_cutoff)],
+            )
+            .await?;
 
         // Delete old error entries (longer retention)
-        let result2 = sqlx::query(
-            r#"
-            DELETE FROM cf_ai_audit_log
-            WHERE status IN ('error', 'timeout') AND created_at < ?
-            "#,
-        )
-        .bind(error_cutoff)
-        .execute(&self.pool)
-        .await?;
+        let result2 = self
+            .conn
+            .execute(
+                r#"
+                DELETE FROM cf_ai_audit_log
+                WHERE status IN ('error', 'timeout') AND created_at < ?
+                "#,
+                &[DbValue::from(error_cutoff)],
+            )
+            .await?;
 
-        Ok((result1.rows_affected() + result2.rows_affected()) as usize)
+        Ok((result1 + result2) as usize)
     }
 
     /// Convert a database row to an AuditEntry
-    fn row_to_entry(&self, row: &sqlx::sqlite::SqliteRow) -> Result<AuditEntry> {
-        let id: String = row.get("id");
-        let wizard_type_str: String = row.get("wizard_type");
-        let model_name: String = row.get("model_name");
-        let input_type: String = row.get("input_type");
-        let input_hash: String = row.get("input_hash");
-        let input_preview: Option<String> = row.get("input_preview");
-        let redactions_json: Option<String> = row.get("redactions_json");
-        let output_type: Option<String> = row.get("output_type");
-        let output_hash: Option<String> = row.get("output_hash");
-        let output_file: Option<String> = row.get("output_file");
-        let duration_ms: Option<i64> = row.get("duration_ms");
-        let status_str: String = row.get("status");
-        let error_message: Option<String> = row.get("error_message");
-        let attempt_number: i64 = row.get("attempt_number");
-        let created_at_millis: i64 = row.get("created_at");
+    fn row_to_entry(&self, row: &UnifiedDbRow) -> Result<AuditEntry> {
+        let id: String = row.get_by_name("id")?;
+        let wizard_type_str: String = row.get_by_name("wizard_type")?;
+        let model_name: String = row.get_by_name("model_name")?;
+        let input_type: String = row.get_by_name("input_type")?;
+        let input_hash: String = row.get_by_name("input_hash")?;
+        let input_preview: Option<String> = row.get_by_name("input_preview")?;
+        let redactions_json: Option<String> = row.get_by_name("redactions_json")?;
+        let output_type: Option<String> = row.get_by_name("output_type")?;
+        let output_hash: Option<String> = row.get_by_name("output_hash")?;
+        let output_file: Option<String> = row.get_by_name("output_file")?;
+        let duration_ms: Option<i64> = row.get_by_name("duration_ms")?;
+        let status_str: String = row.get_by_name("status")?;
+        let error_message: Option<String> = row.get_by_name("error_message")?;
+        let attempt_number: i64 = row.get_by_name("attempt_number")?;
+        let created_at_millis: i64 = row.get_by_name("created_at")?;
 
         let wizard_type = WizardType::from_str(&wizard_type_str)
             .unwrap_or(WizardType::Pathfinder); // Fallback
@@ -362,12 +372,16 @@ impl AuditLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use casparian_db::DbConnection;
+    use tempfile::TempDir;
 
-    async fn setup() -> AuditLogger {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    async fn setup() -> (AuditLogger, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("audit.duckdb");
+        let conn = DbConnection::open_duckdb(&db_path).await.unwrap();
 
         // Create the audit table
-        sqlx::query(
+        conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS cf_ai_audit_log (
                 id TEXT PRIMARY KEY,
@@ -388,16 +402,15 @@ mod tests {
             )
             "#,
         )
-        .execute(&pool)
         .await
         .unwrap();
 
-        AuditLogger::new(pool)
+        (AuditLogger::new(conn), temp_dir)
     }
 
     #[tokio::test]
     async fn test_log_and_query() {
-        let logger = setup().await;
+        let (logger, _temp) = setup().await;
 
         let entry = AuditEntry::new(
             WizardType::Pathfinder,

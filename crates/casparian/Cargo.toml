@@ -10,11 +10,11 @@ license.workspace = true
 # NOTE: casparian_scout has been inlined into crate::scout module
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
-casparian_mcp = { path = "../casparian_mcp" }
 casparian_protocol = { path = "../casparian_protocol" }
 casparian_sinks = { path = "../casparian_sinks" }
 casparian_security = { path = "../casparian_security" }
-casparian_db = { path = "../casparian_db", default-features = false, features = ["sqlite"] }
+casparian_logging = { path = "../casparian_logging" }
+casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
 
 # Async runtime
 tokio.workspace = true
@@ -41,9 +41,9 @@ serde_yaml = "0.9"
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
 blake3 = "1"
+tempfile = "3.14"
 
 # Database
-sqlx = { workspace = true, default-features = false, features = ["runtime-tokio", "sqlite", "chrono"] }
 duckdb = { version = "1.4", optional = true }
 
 # CLI utilities
@@ -55,7 +55,6 @@ glob = "0.3"
 globset = "0.4"
 ignore = "0.4"
 dirs = "5"
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 sha2 = "0.10"
 zip = { version = "2", features = ["deflate"] }
 indicatif = "0.17"
@@ -98,14 +97,14 @@ full = []  # Include slow tests (PTY, LLM, network)
 perf = []  # Performance regression tests
 local-llm = ["llama-cpp-2", "hf-hub"]  # Local LLM via llama.cpp
 profiling = ["dep:casparian_profiler"]  # TUI profiler overlay (` or F12 toggle)
-data-plane = ["dep:arrow", "dep:parquet", "dep:csv", "dep:rusqlite"]
+data-plane = ["dep:arrow", "dep:parquet", "dep:csv"]
 # DuckDB: uses system libduckdb (fast dev builds, requires: brew install duckdb)
 duckdb = ["casparian_db/duckdb", "dep:duckdb"]
 # DuckDB bundled: compile from source (slow, but self-contained for releases)
 duckdb-bundled = ["casparian_db/duckdb-bundled", "dep:duckdb", "duckdb/bundled"]
+sqlite = []
 
 [dev-dependencies]
-tempfile = "3.14"
 ureq = "2"
 futures = "0.3"
 portable-pty = "0.8"

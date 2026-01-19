@@ -14,13 +14,8 @@ use crate::cli::output::{print_table, print_table_colored};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use comfy_table::Color;
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-#[allow(unused_imports)]
-use sha2::{Digest, Sha256};
-use sqlx::sqlite::SqlitePool;
-use sqlx::Row;
-use std::collections::HashMap;
+use casparian_db::{DbConnection, DbValue};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -116,22 +111,16 @@ pub enum ParserAction {
 // Data Types
 // ============================================================================
 
-/// Parser info from database
+/// Parser (plugin) info from registry
 #[derive(Debug, Clone, Serialize)]
 struct Parser {
-    id: String,
     name: String,
-    file_pattern: String,
-    pattern_type: Option<String>,
-    source_code: Option<String>,
+    version: String,
+    status: String,
     source_hash: Option<String>,
-    topic: Option<String>,
-    validation_status: Option<String>,
-    validation_error: Option<String>,
-    schema_json: Option<String>,
-    sink_type: Option<String>,
+    env_hash: Option<String>,
+    artifact_hash: Option<String>,
     created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
 }
 
 /// Result of testing a parser
@@ -165,6 +154,7 @@ struct ScoutFile {
 
 /// Backtest result
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct BacktestResult {
     parser_name: String,
     topic: String,
@@ -177,6 +167,7 @@ struct BacktestResult {
 
 /// Categorized failures
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct FailureCategory {
     error_type: String,
     count: usize,
@@ -187,6 +178,7 @@ struct FailureCategory {
 
 /// Schema variant found during backtest
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct SchemaVariant {
     columns: Vec<String>,
     file_count: usize,
@@ -240,11 +232,11 @@ async fn run_async(action: ParserAction) -> anyhow::Result<()> {
 
 /// Get database path using config module
 fn get_db_path() -> PathBuf {
-    config::default_db_path()
+    config::active_db_path()
 }
 
 /// Connect to the database
-async fn connect_db() -> anyhow::Result<SqlitePool> {
+async fn connect_db() -> anyhow::Result<DbConnection> {
     let db_path = get_db_path();
 
     if !db_path.exists() {
@@ -257,14 +249,24 @@ async fn connect_db() -> anyhow::Result<SqlitePool> {
             .into());
     }
 
-    let url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let pool = SqlitePool::connect(&url).await.map_err(|e| {
+    let url = format!("duckdb:{}", db_path.display());
+    let conn = DbConnection::open_from_url(&url).await.map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(e.to_string())
             .with_suggestion("TRY: Ensure the database file is not corrupted")
     })?;
 
-    Ok(pool)
+    Ok(conn)
+}
+
+async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
+    let row = conn
+        .query_optional(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+            &[DbValue::from(table)],
+        )
+        .await?;
+    Ok(row.is_some())
 }
 
 // ============================================================================
@@ -273,43 +275,47 @@ async fn connect_db() -> anyhow::Result<SqlitePool> {
 
 /// List all parsers
 async fn cmd_list(json_output: bool) -> anyhow::Result<()> {
-    let pool = connect_db().await?;
+    let conn = connect_db().await?;
 
-    let rows = sqlx::query(
-        r#"
-        SELECT id, name, file_pattern, pattern_type, source_code,
-               validation_status, schema_json, sink_type,
-               created_at, updated_at
-        FROM parser_lab_parsers
-        ORDER BY updated_at DESC
-        "#,
-    )
-    .fetch_all(&pool)
-    .await?;
+    let rows = conn
+        .query_all(
+            r#"
+            SELECT plugin_name, version, status, source_hash, env_hash, artifact_hash, created_at
+            FROM cf_plugin_manifest
+            ORDER BY created_at DESC
+            "#,
+            &[],
+        )
+        .await?;
 
-    let parsers: Vec<Parser> = rows
-        .iter()
-        .map(|row| {
-            let created_millis: i64 = row.get("created_at");
-            let updated_millis: i64 = row.get("updated_at");
-
-            Parser {
-                id: row.get("id"),
-                name: row.get("name"),
-                file_pattern: row.get("file_pattern"),
-                pattern_type: row.get("pattern_type"),
-                source_code: row.get("source_code"),
-                source_hash: None,
-                topic: row.get::<Option<String>, _>("file_pattern"), // Using file_pattern as topic for now
-                validation_status: row.get("validation_status"),
-                validation_error: None,
-                schema_json: row.get("schema_json"),
-                sink_type: row.get("sink_type"),
-                created_at: DateTime::from_timestamp_millis(created_millis).unwrap_or_default(),
-                updated_at: DateTime::from_timestamp_millis(updated_millis).unwrap_or_default(),
-            }
-        })
-        .collect();
+    let mut parsers = Vec::new();
+    for row in rows {
+        let source_hash_value: String = row.get_by_name("source_hash").unwrap_or_default();
+        let env_hash_value: String = row.get_by_name("env_hash").unwrap_or_default();
+        let artifact_hash_value: String = row.get_by_name("artifact_hash").unwrap_or_default();
+        let parser = Parser {
+            name: row.get_by_name("plugin_name")?,
+            version: row.get_by_name("version")?,
+            status: row.get_by_name::<String>("status")?,
+            source_hash: if source_hash_value.is_empty() {
+                None
+            } else {
+                Some(source_hash_value)
+            },
+            env_hash: if env_hash_value.is_empty() {
+                None
+            } else {
+                Some(env_hash_value)
+            },
+            artifact_hash: if artifact_hash_value.is_empty() {
+                None
+            } else {
+                Some(artifact_hash_value)
+            },
+            created_at: row.get_by_name("created_at")?,
+        };
+        parsers.push(parser);
+    }
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&parsers)?);
@@ -320,30 +326,29 @@ async fn cmd_list(json_output: bool) -> anyhow::Result<()> {
         println!("No parsers found.");
         println!();
         println!("To create a parser:");
-        println!("  casparian parser publish <file.py> --topic <topic>");
+        println!("  casparian publish <file.py> --version <v>");
         return Ok(());
     }
 
     println!("Found {} parser(s)", parsers.len());
     println!();
 
-    let headers = &["Name", "Pattern", "Status", "Sink", "Updated"];
+    let headers = &["Name", "Version", "Status", "Created"];
     let table_rows: Vec<Vec<(String, Option<Color>)>> = parsers
         .iter()
         .map(|p| {
-            let status = p.validation_status.clone().unwrap_or_else(|| "pending".to_string());
+            let status = p.status.clone();
             let status_color = match status.as_str() {
-                "valid" => Some(Color::Green),
-                "invalid" => Some(Color::Red),
+                "ACTIVE" | "DEPLOYED" => Some(Color::Green),
+                "FAILED" | "ERROR" => Some(Color::Red),
                 _ => Some(Color::Yellow),
             };
 
             vec![
                 (p.name.clone(), None),
-                (p.file_pattern.clone(), Some(Color::Cyan)),
+                (p.version.clone(), Some(Color::Cyan)),
                 (status, status_color),
-                (p.sink_type.clone().unwrap_or_else(|| "parquet".to_string()), None),
-                (format_relative_time(p.updated_at), Some(Color::Grey)),
+                (format_relative_time(p.created_at), Some(Color::Grey)),
             ]
         })
         .collect();
@@ -355,154 +360,100 @@ async fn cmd_list(json_output: bool) -> anyhow::Result<()> {
 
 /// Show parser details
 async fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
-    let pool = connect_db().await?;
+    let conn = connect_db().await?;
 
-    let row = sqlx::query(
-        r#"
-        SELECT id, name, file_pattern, pattern_type, source_code,
-               validation_status, validation_error, validation_output,
-               schema_json, sink_type, sink_config_json,
-               created_at, updated_at
-        FROM parser_lab_parsers
-        WHERE name = ?
-        "#,
-    )
-    .bind(name)
-    .fetch_optional(&pool)
-    .await?;
+    let row = conn
+        .query_optional(
+            r#"
+            SELECT plugin_name, version, status, source_hash, env_hash, artifact_hash, created_at, source_code
+            FROM cf_plugin_manifest
+            WHERE plugin_name = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            &[DbValue::from(name)],
+        )
+        .await?;
 
     let row = match row {
         Some(r) => r,
         None => {
             return Err(HelpfulError::new(format!("Parser not found: {}", name))
-                .with_context("No parser with this name exists in the database")
+                .with_context("No plugin with this name exists in the registry")
                 .with_suggestions([
                     "TRY: casparian parser ls  (list all parsers)".to_string(),
-                    "TRY: casparian parser publish <file.py> --topic <topic>".to_string(),
+                    "TRY: casparian publish <file.py> --version <v>".to_string(),
                 ])
                 .into());
         }
     };
 
-    let created_millis: i64 = row.get("created_at");
-    let updated_millis: i64 = row.get("updated_at");
-    let source_code: Option<String> = row.get("source_code");
-
-    let source_hash = source_code.as_ref().map(|code| {
-        let mut hasher = Sha256::new();
-        hasher.update(code.as_bytes());
-        format!("{:x}", hasher.finalize())[..16].to_string()
-    });
-
-    let parser = Parser {
-        id: row.get("id"),
-        name: row.get("name"),
-        file_pattern: row.get("file_pattern"),
-        pattern_type: row.get("pattern_type"),
-        source_code: source_code.clone(),
-        source_hash,
-        topic: row.get::<Option<String>, _>("file_pattern"),
-        validation_status: row.get("validation_status"),
-        validation_error: row.get("validation_error"),
-        schema_json: row.get("schema_json"),
-        sink_type: row.get("sink_type"),
-        created_at: DateTime::from_timestamp_millis(created_millis).unwrap_or_default(),
-        updated_at: DateTime::from_timestamp_millis(updated_millis).unwrap_or_default(),
+    let source_code: String = row.get_by_name("source_code")?;
+    let mut parser = Parser {
+        name: row.get_by_name("plugin_name")?,
+        version: row.get_by_name("version")?,
+        status: row.get_by_name::<String>("status")?,
+        source_hash: None,
+        env_hash: None,
+        artifact_hash: None,
+        created_at: row.get_by_name("created_at")?,
     };
 
+    let source_hash_value: String = row.get_by_name("source_hash").unwrap_or_default();
+    if !source_hash_value.is_empty() {
+        parser.source_hash = Some(source_hash_value);
+    }
+
+    let env_hash_value: String = row.get_by_name("env_hash").unwrap_or_default();
+    if !env_hash_value.is_empty() {
+        parser.env_hash = Some(env_hash_value);
+    }
+
+    let artifact_hash_value: String = row.get_by_name("artifact_hash").unwrap_or_default();
+    if !artifact_hash_value.is_empty() {
+        parser.artifact_hash = Some(artifact_hash_value);
+    }
+
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&parser)?);
+        let result = serde_json::json!({
+            "name": parser.name,
+            "version": parser.version,
+            "status": parser.status,
+            "source_hash": parser.source_hash,
+            "env_hash": parser.env_hash,
+            "artifact_hash": parser.artifact_hash,
+            "created_at": parser.created_at,
+            "source_code": source_code,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
 
-    // Pretty print
     println!("Parser: {}", parser.name);
     println!("========================================");
     println!();
-    println!("ID:          {}", parser.id);
-    println!("Pattern:     {}", parser.file_pattern);
-    println!(
-        "Pattern Type: {}",
-        parser.pattern_type.unwrap_or_else(|| "glob".to_string())
-    );
-    println!(
-        "Status:      {}",
-        parser.validation_status.unwrap_or_else(|| "pending".to_string())
-    );
-    println!(
-        "Sink:        {}",
-        parser.sink_type.unwrap_or_else(|| "parquet".to_string())
-    );
-    println!("Created:     {}", parser.created_at.format("%Y-%m-%d %H:%M:%S"));
-    println!("Updated:     {}", parser.updated_at.format("%Y-%m-%d %H:%M:%S"));
-
+    println!("Version:      {}", parser.version);
+    println!("Status:       {}", parser.status);
+    println!("Created:      {}", parser.created_at);
     if let Some(hash) = &parser.source_hash {
-        println!("Source Hash: {}...", hash);
+        println!("Source Hash:  {}...", &hash[..hash.len().min(16)]);
+    }
+    if let Some(hash) = &parser.env_hash {
+        println!("Env Hash:     {}...", &hash[..hash.len().min(16)]);
+    }
+    if let Some(hash) = &parser.artifact_hash {
+        println!("Artifact:     {}...", &hash[..hash.len().min(16)]);
     }
 
-    if let Some(error) = &parser.validation_error {
-        println!();
-        println!("Validation Error:");
-        println!("  {}", error);
+    println!();
+    println!("Source Code (first 20 lines):");
+    println!("----------------------------------------");
+    for (i, line) in source_code.lines().take(20).enumerate() {
+        println!("{:>4} | {}", i + 1, line);
     }
-
-    if let Some(schema) = &parser.schema_json {
-        if !schema.is_empty() && schema != "null" {
-            println!();
-            println!("Schema:");
-            if let Ok(columns) = serde_json::from_str::<Vec<SchemaColumn>>(schema) {
-                for col in columns {
-                    println!("  - {}: {}", col.name, col.dtype);
-                }
-            } else {
-                println!("  {}", schema);
-            }
-        }
-    }
-
-    // Show source code preview
-    if let Some(code) = &parser.source_code {
-        println!();
-        println!("Source Code (first 20 lines):");
-        println!("----------------------------------------");
-        for (i, line) in code.lines().take(20).enumerate() {
-            println!("{:>4} | {}", i + 1, line);
-        }
-        let total_lines = code.lines().count();
-        if total_lines > 20 {
-            println!("      ... ({} more lines)", total_lines - 20);
-        }
-    }
-
-    // Get file stats
-    let stats: Option<(i64, i64, i64)> = sqlx::query_as(
-        r#"
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN status = 'processed' THEN 1 ELSE 0 END) as processed,
-            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
-        FROM scout_files
-        WHERE tag = ?
-        "#,
-    )
-    .bind(&parser.file_pattern)
-    .fetch_optional(&pool)
-    .await?;
-
-    if let Some((total, processed, failed)) = stats {
-        if total > 0 {
-            println!();
-            println!("Processing Stats:");
-            println!("  Total Files:     {}", total);
-            println!("  Processed:       {}", processed);
-            println!("  Failed:          {}", failed);
-            if total > 0 {
-                println!(
-                    "  Success Rate:    {:.1}%",
-                    (processed as f64 / total as f64) * 100.0
-                );
-            }
-        }
+    let total_lines = source_code.lines().count();
+    if total_lines > 20 {
+        println!("      ... ({} more lines)", total_lines - 20);
     }
 
     Ok(())
@@ -608,149 +559,34 @@ fn cmd_test(parser_path: &PathBuf, input_path: &PathBuf, rows: usize, json_outpu
     Ok(())
 }
 
-/// Publish a parser to the database
-async fn cmd_publish(parser_path: &PathBuf, topic: &str, name: Option<&str>) -> anyhow::Result<()> {
-    // Validate parser file exists
-    if !parser_path.exists() {
-        return Err(HelpfulError::new(format!("Parser file not found: {}", parser_path.display()))
-            .with_context("The specified parser file does not exist")
-            .with_suggestions([
-                format!("TRY: ls -la {}", parser_path.display()),
-                "TRY: Provide the full path to the parser file".to_string(),
-            ])
-            .into());
-    }
-
-    // Validate parser is a Python file
-    if parser_path.extension().and_then(|e| e.to_str()) != Some("py") {
-        return Err(HelpfulError::new("Parser must be a Python file")
-            .with_context(format!("Got: {}", parser_path.display()))
-            .with_suggestion("TRY: Parser files must have .py extension")
-            .into());
-    }
-
-    // Read source code
-    let source_code = std::fs::read_to_string(parser_path).map_err(|e| {
-        HelpfulError::new("Failed to read parser file")
-            .with_context(e.to_string())
-            .with_suggestion(format!("TRY: Check file permissions: ls -la {}", parser_path.display()))
-    })?;
-
-    // Validate Python syntax
-    let syntax_check = Command::new("python3")
-        .args(["-m", "py_compile"])
-        .arg(parser_path)
-        .output();
-
-    match syntax_check {
-        Ok(output) if !output.status.success() => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(HelpfulError::new("Parser has syntax errors")
-                .with_context(stderr.to_string())
-                .with_suggestion("TRY: Fix the syntax errors and try again")
-                .into());
-        }
-        Err(e) => {
-            return Err(HelpfulError::new("Failed to validate Python syntax")
-                .with_context(e.to_string())
-                .with_suggestion("TRY: Ensure python3 is installed and in PATH")
-                .into());
-        }
-        _ => {}
-    }
-
-    // Compute hash
-    let mut hasher = Sha256::new();
-    hasher.update(source_code.as_bytes());
-    let source_hash = format!("{:x}", hasher.finalize());
-
-    // Derive name from filename if not provided
-    let parser_name = name
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            parser_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unnamed")
-                .to_string()
-        });
-
-    let pool = connect_db().await?;
-    let now = Utc::now().timestamp_millis();
-    let id = uuid::Uuid::new_v4().to_string();
-
-    // Check if parser with same name exists
-    let existing: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM parser_lab_parsers WHERE name = ?",
-    )
-    .bind(&parser_name)
-    .fetch_optional(&pool)
-    .await?;
-
-    if let Some((existing_id,)) = existing {
-        // Update existing parser
-        sqlx::query(
-            r#"
-            UPDATE parser_lab_parsers
-            SET source_code = ?,
-                file_pattern = ?,
-                validation_status = 'pending',
-                validation_error = NULL,
-                updated_at = ?
-            WHERE id = ?
-            "#,
-        )
-        .bind(&source_code)
-        .bind(topic)
-        .bind(now)
-        .bind(&existing_id)
-        .execute(&pool)
-        .await?;
-
-        println!("Updated parser '{}' (topic: {})", parser_name, topic);
-        println!("Hash: {}...", &source_hash[..16]);
-    } else {
-        // Insert new parser
-        sqlx::query(
-            r#"
-            INSERT INTO parser_lab_parsers
-                (id, name, file_pattern, pattern_type, source_code, validation_status, sink_type, created_at, updated_at)
-            VALUES (?, ?, ?, 'glob', ?, 'pending', 'parquet', ?, ?)
-            "#,
-        )
-        .bind(&id)
-        .bind(&parser_name)
-        .bind(topic)
-        .bind(&source_code)
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await?;
-
-        println!("Published parser '{}' (topic: {})", parser_name, topic);
-        println!("Hash: {}...", &source_hash[..16]);
-    }
-
-    println!();
-    println!("Next steps:");
-    println!("  1. Test with sample file: casparian parser test {} --input <file>", parser_path.display());
-    println!("  2. Backtest against files: casparian parser backtest {}", parser_name);
-
-    Ok(())
+/// Publish a parser to the registry.
+async fn cmd_publish(parser_path: &PathBuf, _topic: &str, _name: Option<&str>) -> anyhow::Result<()> {
+    Err(HelpfulError::new("Parser publish is deprecated")
+        .with_context("Use the Sentinel publisher workflow for v1")
+        .with_suggestions([
+            format!(
+                "TRY: casparian publish {} --version <v>",
+                parser_path.display()
+            ),
+            "NOTE: --topic is ignored in v1; configure sinks via topic config instead".to_string(),
+        ])
+        .into())
 }
 
 /// Unpublish a parser
 async fn cmd_unpublish(name: &str) -> anyhow::Result<()> {
-    let pool = connect_db().await?;
+    let conn = connect_db().await?;
 
-    let result = sqlx::query("DELETE FROM parser_lab_parsers WHERE name = ?")
-        .bind(name)
-        .execute(&pool)
+    let updated = conn
+        .execute(
+            "UPDATE cf_plugin_manifest SET status = 'INACTIVE' WHERE plugin_name = ? AND status = 'ACTIVE'",
+            &[DbValue::from(name)],
+        )
         .await?;
 
-    if result.rows_affected() == 0 {
-        return Err(HelpfulError::new(format!("Parser not found: {}", name))
-            .with_context("No parser with this name exists")
+    if updated == 0 {
+        return Err(HelpfulError::new(format!("Parser not found or already inactive: {}", name))
+            .with_context("No active plugin with this name exists")
             .with_suggestion("TRY: casparian parser ls  (list all parsers)")
             .into());
     }
@@ -762,248 +598,14 @@ async fn cmd_unpublish(name: &str) -> anyhow::Result<()> {
 
 /// Run backtest against all files for a parser's topic
 async fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> anyhow::Result<()> {
-    let pool = connect_db().await?;
-
-    // Get parser
-    let row = sqlx::query(
-        r#"
-        SELECT id, name, file_pattern, source_code
-        FROM parser_lab_parsers
-        WHERE name = ?
-        "#,
-    )
-    .bind(name)
-    .fetch_optional(&pool)
-    .await?;
-
-    let row = match row {
-        Some(r) => r,
-        None => {
-            return Err(HelpfulError::new(format!("Parser not found: {}", name))
-                .with_context("No parser with this name exists")
-                .with_suggestion("TRY: casparian parser ls  (list all parsers)")
-                .into());
-        }
-    };
-
-    let parser_name: String = row.get("name");
-    let topic: String = row.get("file_pattern");
-    let source_code: Option<String> = row.get("source_code");
-
-    let source_code = match source_code {
-        Some(code) if !code.is_empty() => code,
-        _ => {
-            return Err(HelpfulError::new("Parser has no source code")
-                .with_context(format!("Parser '{}' has no source code to execute", name))
-                .with_suggestion("TRY: casparian parser publish <file.py> --topic <topic>")
-                .into());
-        }
-    };
-
-    // Get files for this topic
-    let limit_value = limit.unwrap_or(1000) as i64;
-    let files: Vec<ScoutFile> = sqlx::query_as::<_, (i64, String, Option<String>, String)>(
-        r#"
-        SELECT id, path, tag, status
-        FROM scout_files
-        WHERE tag = ?
-        LIMIT ?
-        "#,
-    )
-    .bind(&topic)
-    .bind(limit_value)
-    .fetch_all(&pool)
-    .await?
-    .into_iter()
-    .map(|(id, path, tag, status)| ScoutFile { id, path, tag, status })
-    .collect();
-
-    if files.is_empty() {
-        println!("No files found for topic: {}", topic);
-        println!();
-        println!("To tag files with this topic:");
-        println!("  casparian tag <path> {}", topic);
-        return Ok(());
-    }
-
-    println!("Testing {} against {} files...", parser_name, files.len());
-    println!();
-
-    // Write parser to temp file
-    let temp_dir = std::env::temp_dir();
-    let parser_path = temp_dir.join(format!("{}.py", parser_name));
-    std::fs::write(&parser_path, &source_code)?;
-
-    // Run backtest with progress bar
-    let pb = ProgressBar::new(files.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    let mut passed = 0usize;
-    let mut failed = 0usize;
-    let mut failures: HashMap<String, Vec<(String, String)>> = HashMap::new(); // error_type -> [(file, message)]
-    let mut schema_counts: HashMap<String, Vec<String>> = HashMap::new(); // schema_key -> [files]
-
-    for file in &files {
-        pb.inc(1);
-
-        let input_path = PathBuf::from(&file.path);
-        if !input_path.exists() {
-            failures
-                .entry("FILE_NOT_FOUND".to_string())
-                .or_default()
-                .push((file.path.clone(), "File does not exist".to_string()));
-            failed += 1;
-            continue;
-        }
-
-        match run_parser_test(&parser_path, &input_path, 1) {
-            Ok((true, _, schema, _, _, _, _)) => {
-                passed += 1;
-
-                // Track schema variant
-                let schema_key = schema
-                    .map(|s| {
-                        s.iter()
-                            .map(|c| c.name.clone())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                schema_counts
-                    .entry(schema_key)
-                    .or_default()
-                    .push(file.path.clone());
-            }
-            Ok((false, _, _, _, _, errors, error_code)) => {
-                failed += 1;
-
-                // Prefer structured error_code, fall back to string matching
-                let error_type = categorize_error(error_code.as_deref(), &errors);
-                let error_msg = errors.first().cloned().unwrap_or_else(|| "Unknown error".to_string());
-
-                failures
-                    .entry(error_type)
-                    .or_default()
-                    .push((file.path.clone(), error_msg));
-            }
-            Err(e) => {
-                failed += 1;
-                failures
-                    .entry("EXECUTION_ERROR".to_string())
-                    .or_default()
-                    .push((file.path.clone(), e.to_string()));
-            }
-        }
-    }
-
-    pb.finish_with_message("done");
-    println!();
-
-    // Build result
-    let failure_analysis: Vec<FailureCategory> = failures
-        .into_iter()
-        .map(|(error_type, items)| {
-            let sample_files: Vec<String> = items.iter().take(3).map(|(f, _)| f.clone()).collect();
-            let sample_error = items.first().map(|(_, e)| e.clone()).unwrap_or_default();
-
-            FailureCategory {
-                error_type: error_type.clone(),
-                count: items.len(),
-                sample_files,
-                sample_error,
-                suggestions: get_error_suggestions(&error_type),
-            }
-        })
-        .collect();
-
-    let schema_variants: Vec<SchemaVariant> = schema_counts
-        .into_iter()
-        .map(|(columns, files)| {
-            let cols: Vec<String> = columns.split(',').map(|s| s.to_string()).collect();
-            SchemaVariant {
-                columns: cols,
-                file_count: files.len(),
-                sample_files: files.into_iter().take(3).collect(),
-            }
-        })
-        .collect();
-
-    let result = BacktestResult {
-        parser_name: parser_name.clone(),
-        topic: topic.clone(),
-        total_files: files.len(),
-        passed,
-        failed,
-        failure_analysis,
-        schema_variants,
-    };
-
-    // Clean up temp file
-    let _ = std::fs::remove_file(&parser_path);
-
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-        return Ok(());
-    }
-
-    // Pretty print results
-    println!("RESULTS");
-    println!("  Passed:    {} files ({:.1}%)", passed, (passed as f64 / files.len() as f64) * 100.0);
-    println!("  Failed:    {} files", failed);
-    println!();
-
-    if !result.failure_analysis.is_empty() {
-        println!("FAILURE ANALYSIS");
-        println!();
-
-        for category in &result.failure_analysis {
-            println!("[{}] {} files", category.error_type, category.count);
-            println!("  {}", category.sample_error);
-            println!();
-            println!("  Sample files:");
-            for file in &category.sample_files {
-                println!("    - {}", file);
-            }
-            println!();
-            if !category.suggestions.is_empty() {
-                println!("  Options:");
-                for (i, suggestion) in category.suggestions.iter().enumerate() {
-                    println!("    {}) {}", (b'A' + i as u8) as char, suggestion);
-                }
-            }
-            println!();
-        }
-    }
-
-    if result.schema_variants.len() > 1 {
-        println!("SCHEMA VARIANTS DETECTED ({} variants)", result.schema_variants.len());
-        println!();
-
-        for (i, variant) in result.schema_variants.iter().enumerate() {
-            println!(
-                "  Schema {} ({} files): {}",
-                (b'A' + i as u8) as char,
-                variant.file_count,
-                variant.columns.join(", ")
-            );
-        }
-        println!();
-    }
-
-    if failed > 0 {
-        println!("SUGGESTED WORKFLOW");
-        println!("  1. Fix parser to handle the most common error type");
-        println!("  2. Re-run backtest: casparian parser backtest {}", parser_name);
-        println!("  3. If schema variants exist, consider splitting into multiple parsers");
-    }
-
-    Ok(())
+    let _ = (limit, json_output);
+    Err(HelpfulError::new(format!("Backtest is not available in v1: {}", name))
+        .with_context("The parser lab registry was removed in favor of the plugin manifest")
+        .with_suggestions([
+            "TRY: casparian run <parser.py> <input> for manual testing".to_string(),
+            "TRY: casparian publish <parser.py> --version <v> then run jobs via Sentinel".to_string(),
+        ])
+        .into())
 }
 
 /// Register a parser from a directory by bundling it
@@ -1028,7 +630,7 @@ async fn cmd_register(
             .with_context("The register command expects a directory containing parser files")
             .with_suggestions([
                 "TRY: casparian parser register ./my_parser_dir".to_string(),
-                "TRY: For single files, use 'casparian parser publish'".to_string(),
+                "TRY: For single files, use 'casparian publish'".to_string(),
             ])
             .into());
     }
@@ -1072,129 +674,22 @@ async fn cmd_register(
         return Ok(());
     }
 
-    // Register in database
-    let pool = connect_db().await?;
-    let now = Utc::now().timestamp_millis();
-    let id = uuid::Uuid::new_v4().to_string();
-
-    // Check if parser with same name and version exists
-    let existing: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, source_hash FROM cf_parsers WHERE name = ? AND version = ?",
-    )
-    .bind(&bundle.name)
-    .bind(&bundle.version)
-    .fetch_optional(&pool)
-    .await
-    .ok()
-    .flatten();
-
-    if let Some((existing_id, existing_hash)) = existing {
-        // Same name + version exists - check if source hash matches
-        if existing_hash == bundle.source_hash {
-            if json_output {
-                let result = serde_json::json!({
-                    "status": "unchanged",
-                    "name": bundle.name,
-                    "version": bundle.version,
-                    "source_hash": bundle.source_hash,
-                    "parser_id": existing_id,
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                println!("Parser {} v{} already registered (unchanged)", bundle.name, bundle.version);
-                println!("  Parser ID: {}", existing_id);
-            }
-            return Ok(());
-        } else {
-            // Same name + version but different hash - ERROR (must bump version)
-            return Err(HelpfulError::new(format!(
-                "Parser {} v{} already exists with different source",
-                bundle.name, bundle.version
-            ))
-            .with_context("Same (name, version) with different source hash is not allowed")
-            .with_suggestions([
-                format!("TRY: Bump the version in your parser (currently {})", bundle.version),
-                "TRY: Use semantic versioning: 1.0.0 -> 1.0.1 for patches".to_string(),
-            ])
-            .into());
-        }
-    }
-
-    // Ensure cf_parsers table exists
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS cf_parsers (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            version TEXT NOT NULL,
-            source_hash TEXT NOT NULL,
-            lockfile_hash TEXT NOT NULL,
-            archive BLOB,
-            lockfile_content TEXT,
-            created_at INTEGER NOT NULL,
-            UNIQUE(name, version)
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-
-    // Insert new parser
-    sqlx::query(
-        r#"
-        INSERT INTO cf_parsers (id, name, version, source_hash, lockfile_hash, archive, lockfile_content, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(&id)
-    .bind(&bundle.name)
-    .bind(&bundle.version)
-    .bind(&bundle.source_hash)
-    .bind(&bundle.lockfile_hash)
-    .bind(&bundle.archive)
-    .bind(&bundle.lockfile_content)
-    .bind(now)
-    .execute(&pool)
-    .await?;
-
-    if json_output {
-        let result = serde_json::json!({
-            "status": "registered",
-            "name": bundle.name,
-            "version": bundle.version,
-            "source_hash": bundle.source_hash,
-            "lockfile_hash": bundle.lockfile_hash,
-            "archive_size": bundle.archive.len(),
-            "parser_id": id,
-        });
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!("Registered {} v{}", bundle.name, bundle.version);
-        println!("  Parser ID:     {}", id);
-        println!("  Source hash:   {}", &bundle.source_hash[..12]);
-        println!("  Lockfile hash: {}", &bundle.lockfile_hash[..12]);
-        println!("  Archive size:  {:.1}KB", bundle.archive.len() as f64 / 1024.0);
-        println!();
-        println!("Next steps:");
-        println!("  1. Subscribe to topics: casparian parser subscribe {} --topic <topic>", bundle.name);
-        println!("  2. Backfill files: casparian backfill {}", bundle.name);
-    }
-
-    Ok(())
+    Err(HelpfulError::new("Parser register is deprecated")
+        .with_context("Use the Sentinel publisher workflow for v1")
+        .with_suggestions([
+            "TRY: casparian publish <parser.py> --version <v>".to_string(),
+            "TRY: casparian parser register --output <bundle.zip> to export an archive".to_string(),
+        ])
+        .into())
 }
+
 
 /// Resume a paused parser (reset circuit breaker)
 async fn cmd_resume(name: &str) -> anyhow::Result<()> {
-    let pool = connect_db().await?;
+    let conn = connect_db().await?;
 
     // Check if cf_parser_health table exists
-    let table_exists: Option<(String,)> = sqlx::query_as(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='cf_parser_health'"
-    )
-    .fetch_optional(&pool)
-    .await?;
-
-    if table_exists.is_none() {
+    if !table_exists(&conn, "cf_parser_health").await? {
         return Err(HelpfulError::new("Parser health table not found")
             .with_context("No circuit breaker data exists yet")
             .with_suggestion("TRY: Run some jobs first to generate health data")
@@ -1202,26 +697,27 @@ async fn cmd_resume(name: &str) -> anyhow::Result<()> {
     }
 
     // Check if parser exists in health table
-    let health: Option<(i32, Option<String>)> = sqlx::query_as(
-        "SELECT consecutive_failures, paused_at FROM cf_parser_health WHERE parser_name = ?"
-    )
-    .bind(name)
-    .fetch_optional(&pool)
-    .await?;
+    let health = conn
+        .query_optional(
+            "SELECT consecutive_failures, paused_at FROM cf_parser_health WHERE parser_name = ?",
+            &[DbValue::from(name)],
+        )
+        .await?;
 
     match health {
-        Some((failures, paused_at)) => {
+        Some(row) => {
+            let failures: i64 = row.get_by_name("consecutive_failures").unwrap_or_default();
+            let paused_at: Option<String> = row.get_by_name("paused_at").ok();
             if paused_at.is_none() && failures == 0 {
                 println!("Parser '{}' is already healthy (not paused)", name);
                 return Ok(());
             }
 
             // Reset the circuit breaker
-            sqlx::query(
-                "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0, updated_at = datetime('now') WHERE parser_name = ?"
+            conn.execute(
+                "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0, updated_at = CURRENT_TIMESTAMP WHERE parser_name = ?",
+                &[DbValue::from(name)],
             )
-            .bind(name)
-            .execute(&pool)
             .await?;
 
             println!("Parser '{}' resumed", name);
@@ -1246,16 +742,10 @@ async fn cmd_resume(name: &str) -> anyhow::Result<()> {
 
 /// Show health statistics for a parser
 async fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
-    let pool = connect_db().await?;
+    let conn = connect_db().await?;
 
     // Check if cf_parser_health table exists
-    let table_exists: Option<(String,)> = sqlx::query_as(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='cf_parser_health'"
-    )
-    .fetch_optional(&pool)
-    .await?;
-
-    if table_exists.is_none() {
+    if !table_exists(&conn, "cf_parser_health").await? {
         return Err(HelpfulError::new("Parser health table not found")
             .with_context("No circuit breaker data exists yet")
             .with_suggestion("TRY: Run some jobs first to generate health data")
@@ -1263,20 +753,26 @@ async fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
     }
 
     // Get parser health data
-    let health: Option<(String, i64, i64, i32, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"
-        SELECT parser_name, total_executions, successful_executions, consecutive_failures,
-               last_failure_reason, paused_at
-        FROM cf_parser_health
-        WHERE parser_name = ?
-        "#
-    )
-    .bind(name)
-    .fetch_optional(&pool)
-    .await?;
+    let health = conn
+        .query_optional(
+            r#"
+            SELECT parser_name, total_executions, successful_executions, consecutive_failures,
+                   last_failure_reason, paused_at
+            FROM cf_parser_health
+            WHERE parser_name = ?
+            "#,
+            &[DbValue::from(name)],
+        )
+        .await?;
 
     match health {
-        Some((parser_name, total, success, failures, last_error, paused_at)) => {
+        Some(row) => {
+            let parser_name: String = row.get_by_name("parser_name").unwrap_or_default();
+            let total: i64 = row.get_by_name("total_executions").unwrap_or_default();
+            let success: i64 = row.get_by_name("successful_executions").unwrap_or_default();
+            let failures: i64 = row.get_by_name("consecutive_failures").unwrap_or_default();
+            let last_error: Option<String> = row.get_by_name("last_failure_reason").ok();
+            let paused_at: Option<String> = row.get_by_name("paused_at").ok();
             let success_rate = if total > 0 {
                 (success as f64 / total as f64) * 100.0
             } else {
@@ -1585,6 +1081,7 @@ except Exception as e:
 
 /// Categorize an error by type
 /// Prefers structured error_code from Python if available, falls back to string matching
+#[allow(dead_code)]
 fn categorize_error(error_code: Option<&str>, errors: &[String]) -> String {
     // Prefer structured error code from Python (no string matching needed)
     if let Some(code) = error_code {
@@ -1612,6 +1109,7 @@ fn categorize_error(error_code: Option<&str>, errors: &[String]) -> String {
 }
 
 /// Get suggestions for an error type
+#[allow(dead_code)]
 fn get_error_suggestions(error_type: &str) -> Vec<String> {
     match error_type {
         "SCHEMA_MISMATCH" => vec![

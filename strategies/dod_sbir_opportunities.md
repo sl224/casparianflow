@@ -130,7 +130,7 @@ Outcome: Ubiquitous data access regardless of source format
 - Edge computing architecture (single binary)
 - Sensor data fusion (NITF + CoT + PCAP)
 - Standardized output (SQL/Parquet)
-- API-based (MCP integration for AI assistance)
+- API-based (optional AI assistance, future)
 
 ---
 
@@ -214,7 +214,7 @@ Outcome: Ubiquitous data access regardless of source format
 | **Single Binary** | ~50MB static build | Sneakernet deployment |
 | **Python Parsers** | Analyst-modifiable | Extensibility |
 | **Schema Contracts** | Immutable after approval | Data governance |
-| **AI-Assisted** | MCP integration for Claude | Phase 2 differentiator |
+| **AI-Assisted** | Optional AI assistance (future) | Phase 2 differentiator |
 
 ### 4.2 Positioning Statement for Proposals
 
@@ -403,4 +403,3 @@ Large primes (Palantir, Leidos, SAIC, Booz Allen) have SBIR mentorship programs 
 |------|---------|---------|
 | 2026-01-08 | 1.0 | Initial research and analysis |
 | 2026-01-14 | 1.1 | Maintenance workflow: Updated congressional status (Ernst blocking H.R. 5100); added next review date; clarified impasse situation |
-

@@ -108,7 +108,6 @@ fn test_scan_json_filters() {
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 
@@ -163,7 +162,6 @@ fn test_scan_json_error_invalid_path() {
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 

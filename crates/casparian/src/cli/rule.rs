@@ -5,7 +5,7 @@
 use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::print_table;
-use crate::scout::{Database, TaggingRule};
+use casparian::scout::{Database, TaggingRule};
 use clap::Subcommand;
 use glob::Pattern;
 
@@ -367,7 +367,7 @@ async fn test_rule(db: &Database, id: &str, path: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::{ScannedFile, Source, SourceType};
+    use casparian::scout::{ScannedFile, Source, SourceType};
 
     #[test]
     fn test_validate_pattern_valid() {

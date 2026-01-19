@@ -14,7 +14,7 @@ Guest Side Role:
 
 Security Model:
 - No access to AWS credentials, DB passwords, or heavy drivers
-- stdout/stderr redirected to Host logging (keeps data pipe binary-pure)
+- stdout/stderr redirected to Host logging (unless BRIDGE_STDIO_MODE=inherit)
 - Sandboxed execution with minimal attack surface
 
 Communication Protocol:
@@ -162,12 +162,22 @@ def check_memory_for_batch(df: "pd.DataFrame") -> bool:
 #   LENGTH=0: End of stream
 #   LENGTH=0xFFFFFFFF: Error (followed by UTF-8 error message)
 #   LENGTH=0xFFFFFFFE: Log message (sideband logging)
+#   LENGTH=0xFFFFFFFD: Output start (followed by output index)
+#   LENGTH=0xFFFFFFFC: Output end (followed by output index)
+#   LENGTH=0xFFFFFFFB: Metrics payload (JSON)
 
 HEADER_FORMAT = "!I"  # 4-byte unsigned int (big-endian)
 HEADER_SIZE = 4
 END_OF_STREAM = 0
 ERROR_SIGNAL = 0xFFFFFFFF
 LOG_SIGNAL = 0xFFFFFFFE  # Sideband logging signal
+OUTPUT_START_SIGNAL = 0xFFFFFFFD
+OUTPUT_END_SIGNAL = 0xFFFFFFFC
+METRICS_SIGNAL = 0xFFFFFFFB
+
+# Limit batch size by rows to avoid huge IPC frames.
+MAX_ROWS_PER_BATCH = 50_000
+MAX_METRICS_BYTES = 1024 * 1024
 
 # Log levels for protocol
 LOG_LEVEL_STDOUT = 0
@@ -274,6 +284,7 @@ class BridgeContext:
         self._topics: dict[int, str] = {}
         self._next_handle = 1
         self._row_count = 0
+        self._output_index = 0
 
     def connect(self):
         """Connect to the Host via TCP."""
@@ -340,6 +351,23 @@ class BridgeContext:
             # Write to real stderr, not the redirected one
             sys.__stderr__.write(f"Failed to send log: {e}\n")
 
+    def send_metrics(self, metrics: dict):
+        """Send metrics JSON through the sideband channel."""
+        if not self._socket:
+            return
+
+        try:
+            payload = json.dumps(metrics).encode("utf-8")
+            if len(payload) > MAX_METRICS_BYTES:
+                sys.__stderr__.write("Metrics payload too large; skipping metrics send\n")
+                return
+
+            self._socket.sendall(struct.pack(HEADER_FORMAT, METRICS_SIGNAL))
+            self._socket.sendall(struct.pack(HEADER_FORMAT, len(payload)))
+            self._socket.sendall(payload)
+        except Exception as e:
+            sys.__stderr__.write(f"Failed to send metrics: {e}\n")
+
     def register_topic(self, topic: str, default_uri: str = None) -> int:
         """Register a topic and return a handle."""
         handle = self._next_handle
@@ -378,20 +406,29 @@ class BridgeContext:
             else:
                 raise TypeError(f"Unsupported data type: {type(data)}")
 
-            # Serialize to IPC
-            sink = BytesIO()
-            with pa.ipc.new_stream(sink, table.schema) as writer:
-                for batch in table.to_batches():
+            # Stream IPC batches to host with output boundaries
+            self._output_index += 1
+            output_index = self._output_index
+
+            self._socket.sendall(struct.pack(HEADER_FORMAT, OUTPUT_START_SIGNAL))
+            self._socket.sendall(struct.pack(HEADER_FORMAT, output_index))
+
+            total_rows = 0
+            for batch in table.to_batches(max_chunksize=MAX_ROWS_PER_BATCH):
+                total_rows += batch.num_rows
+                sink = BytesIO()
+                with pa.ipc.new_stream(sink, batch.schema) as writer:
                     writer.write_batch(batch)
 
-            ipc_bytes = sink.getvalue()
-            self._row_count += table.num_rows
+                ipc_bytes = sink.getvalue()
+                self._socket.sendall(struct.pack(HEADER_FORMAT, len(ipc_bytes)))
+                self._socket.sendall(ipc_bytes)
 
-            # Send to Host: [LENGTH][IPC_DATA]
-            self._socket.sendall(struct.pack(HEADER_FORMAT, len(ipc_bytes)))
-            self._socket.sendall(ipc_bytes)
+            self._socket.sendall(struct.pack(HEADER_FORMAT, OUTPUT_END_SIGNAL))
+            self._socket.sendall(struct.pack(HEADER_FORMAT, output_index))
 
-            logger.debug(f"Published {table.num_rows} rows ({len(ipc_bytes)} bytes)")
+            self._row_count += total_rows
+            logger.debug(f"Published {total_rows} rows across output {output_index}")
 
         except Exception as e:
             logger.error(f"Publish failed: {e}")
@@ -464,17 +501,25 @@ def execute_plugin(
                     "name": out.name,
                     "table": out.table,
                 })
-        elif hasattr(result, "to_arrow") or hasattr(result, "to_pandas") or hasattr(result, "schema"):
-            # Single output: bare DataFrame/Table - wrap with TOPIC/SINK constants
-            context.publish(1, result)
-            output_info.append({
-                "name": topic,
-                "table": None,
-            })
         else:
-            raise TypeError(
-                f"parse() must return DataFrame, Table, or list[Output], got {type(result)}"
-            )
+            try:
+                import pandas as pd
+            except Exception:  # pragma: no cover - pandas optional
+                pd = None
+
+            is_pandas_df = pd is not None and isinstance(result, pd.DataFrame)
+
+            if is_pandas_df or hasattr(result, "to_arrow") or hasattr(result, "to_pandas") or hasattr(result, "schema"):
+                # Single output: bare DataFrame/Table - wrap with TOPIC/SINK constants
+                context.publish(1, result)
+                output_info.append({
+                    "name": topic,
+                    "table": None,
+                })
+            else:
+                raise TypeError(
+                    f"parse() must return DataFrame, Table, or list[Output], got {type(result)}"
+                )
 
     # Check for Handler class (legacy pattern)
     elif "Handler" in plugin_namespace:
@@ -603,6 +648,9 @@ def main():
         )
         sys.exit(1)
 
+    stdio_mode = os.environ.get("BRIDGE_STDIO_MODE", "piped").lower()
+    inherit_stdio = stdio_mode in ("inherit", "tty")
+
     # Create context and connect
     context = BridgeContext(port, job_id)
 
@@ -613,20 +661,23 @@ def main():
     try:
         context.connect()
 
-        # === SIDEBAND LOGGING SETUP ===
-        # Hijack stdout/stderr BEFORE executing user code to capture print() statements
+        redirected = False
+        if not inherit_stdio:
+            # === SIDEBAND LOGGING SETUP ===
+            # Hijack stdout/stderr BEFORE executing user code to capture print() statements
 
-        # Replace with socket writers
-        sys.stdout = SocketWriter(context, LOG_LEVEL_STDOUT)
-        sys.stderr = SocketWriter(context, LOG_LEVEL_STDERR)
+            # Replace with socket writers
+            sys.stdout = SocketWriter(context, LOG_LEVEL_STDOUT)
+            sys.stderr = SocketWriter(context, LOG_LEVEL_STDERR)
+            redirected = True
 
-        # Route logging through sideband channel
-        bridge_handler = BridgeLogHandler(context)
-        root_logger = logging.getLogger()
-        # Remove default handlers
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-        root_logger.addHandler(bridge_handler)
+            # Route logging through sideband channel
+            bridge_handler = BridgeLogHandler(context)
+            root_logger = logging.getLogger()
+            # Remove default handlers
+            for handler in root_logger.handlers[:]:
+                root_logger.removeHandler(handler)
+            root_logger.addHandler(bridge_handler)
 
         try:
             # Execute plugin
@@ -640,17 +691,20 @@ def main():
             logger.info(f"Plugin execution completed: {metrics}")
 
             # Send completion
+            context.send_metrics(metrics)
             context.close()
 
-            # Restore stdout for final JSON output to host process
-            sys.stdout = original_stdout
-            print(json.dumps(metrics))
+            if not inherit_stdio:
+                # Restore stdout for final JSON output to host process
+                sys.stdout = original_stdout
+                print(json.dumps(metrics))
             sys.exit(0)
 
         finally:
             # Always restore stdio in case of exception
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
+            if redirected:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
 
     except PermanentError as e:
         logger.error(f"Permanent error (no retry): {e}")
@@ -663,12 +717,13 @@ def main():
             context.close()
         except Exception:
             pass
-        # Print error metrics
-        print(json.dumps({
-            "status": "FAILED",
-            "error": str(e),
-            "retryable": False,
-        }))
+        if not inherit_stdio:
+            # Print error metrics
+            print(json.dumps({
+                "status": "FAILED",
+                "error": str(e),
+                "retryable": False,
+            }))
         sys.exit(1)  # Permanent - no retry
 
     except TransientError as e:
@@ -681,11 +736,12 @@ def main():
             context.close()
         except Exception:
             pass
-        print(json.dumps({
-            "status": "FAILED",
-            "error": str(e),
-            "retryable": True,
-        }))
+        if not inherit_stdio:
+            print(json.dumps({
+                "status": "FAILED",
+                "error": str(e),
+                "retryable": True,
+            }))
         sys.exit(2)  # Transient - retry eligible
 
     except MemoryError as e:
@@ -698,11 +754,12 @@ def main():
             context.close()
         except Exception:
             pass
-        print(json.dumps({
-            "status": "FAILED",
-            "error": str(e),
-            "retryable": True,
-        }))
+        if not inherit_stdio:
+            print(json.dumps({
+                "status": "FAILED",
+                "error": str(e),
+                "retryable": True,
+            }))
         sys.exit(2)  # Transient - retry eligible
 
     except Exception as e:
@@ -725,12 +782,13 @@ def main():
         except Exception:
             pass
 
-        # Print error metrics to original stdout
-        print(json.dumps({
-            "status": "FAILED",
-            "error": str(e),
-            "retryable": False,
-        }))
+        if not inherit_stdio:
+            # Print error metrics to original stdout
+            print(json.dumps({
+                "status": "FAILED",
+                "error": str(e),
+                "retryable": False,
+            }))
         sys.exit(1)  # Assume permanent for unknown errors
 
 

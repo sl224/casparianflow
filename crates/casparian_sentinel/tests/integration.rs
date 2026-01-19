@@ -212,7 +212,7 @@ async fn test_job_queue_operations() {
     assert_eq!(job.priority, 10);
 
     // Complete job
-    queue.complete_job(job.id, "Success").await.unwrap();
+    queue.complete_job(job.id, "Success", None).await.unwrap();
 
     // Verify completed
     let row = conn
@@ -297,7 +297,7 @@ async fn test_pipeline_run_status_updates() {
     .await
     .unwrap();
 
-    queue.complete_job(job.id, "Success").await.unwrap();
+    queue.complete_job(job.id, "Success", None).await.unwrap();
 
     let row = conn
         .query_one(

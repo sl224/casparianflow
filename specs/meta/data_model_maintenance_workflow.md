@@ -748,9 +748,8 @@ for each pair (TypeA in CrateX, TypeB in CrateY) where name(A) == name(B):
 
 **Example from codebase:**
 ```
-ScannedFile exists in 3 locations:
+ScannedFile exists in 2 locations:
 - casparian::scout::types::ScannedFile (17 fields, pub) → CANONICAL
-- casparian_mcp::tools::discovery::ScannedFile (6 fields, pub) → INTENTIONAL_VARIANT
 - casparian::cli::tag::ScannedFile (7 fields, private) → INTENTIONAL_VARIANT
 ```
 
@@ -905,12 +904,11 @@ These types share common patterns:
 - `SourceConfig` (casparian::scout)
 - `WorkerConfig` (casparian_worker)
 - `SentinelConfig` (casparian_sentinel)
-- `McpConfig` (casparian_mcp)
 
 Common fields:
-- `name: String` (in all 4)
-- `enabled: bool` (in 3/4)
-- `timeout_ms: u64` (in 3/4)
+- `name: String` (in all 3)
+- `enabled: bool` (in 2/3)
+- `timeout_ms: u64` (in 2/3)
 
 **Recommendation:** Extract `BaseConfig` trait or struct
 ```
@@ -973,7 +971,7 @@ Is the type name prefixed with a crate/module name?
 |--------|---------|---------|
 | Name mismatch | Type name contains other crate's domain | `WorkerConfig` in `casparian_schema` |
 | Inverse dependency | Type imports from dependent crate | Protocol type using Schema type |
-| Usage imbalance | >90% usage in different crate | Type defined elsewhere but only used in MCP |
+| Usage imbalance | >90% usage in different crate | Type defined elsewhere but only used in deprecated tooling |
 | Re-export chain | `pub use other_crate::Type` spanning 3+ crates | Type defined in A, re-exported through B and C |
 
 **OK_WHERE_IT_IS signals:**
@@ -994,7 +992,6 @@ Is the type name prefixed with a crate/module name?
 | Protocol types (`OpCode`, `Message`) | `casparian_protocol` | Shared communication layer |
 | Schema types (`LockedSchema`, `Contract`) | `casparian_schema` | Dedicated schema crate |
 | Scout types (`ScannedFile`, `Source`) | `casparian::scout` module | Scout is module in main binary |
-| MCP tools | `casparian_mcp::tools` | MCP-specific implementations |
 
 ### 5.5 Naming Consistency
 

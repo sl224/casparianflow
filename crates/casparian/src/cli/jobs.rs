@@ -209,20 +209,31 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
 
 /// Get queue statistics
 fn db_url_for_path(db_path: &PathBuf) -> String {
-    match config::default_db_backend() {
-        config::DbBackend::DuckDb => format!("duckdb:{}", db_path.display()),
-        config::DbBackend::Sqlite => format!("sqlite:{}", db_path.display()),
-    }
+    format!("duckdb:{}", db_path.display())
 }
 
 pub(crate) async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
-    let (query, param) = match conn.backend_name() {
-        "DuckDB" => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
-        "SQLite" => ("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", DbValue::from(table)),
-        _ => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
-    };
+    let row = conn
+        .query_optional(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+            &[DbValue::from(table)],
+        )
+        .await?;
+    Ok(row.is_some())
+}
 
-    Ok(conn.query_optional(query, &[param]).await?.is_some())
+pub(crate) async fn column_exists(
+    conn: &DbConnection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let row = conn
+        .query_optional(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
+            &[DbValue::from(table), DbValue::from(column)],
+        )
+        .await?;
+    Ok(row.is_some())
 }
 
 async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
@@ -328,13 +339,19 @@ async fn get_jobs(
         return Ok(Vec::new());
     }
 
-    let has_quarantine = table_exists(conn, "cf_quarantine").await?;
-    let quarantine_select = if has_quarantine {
+    let has_quarantine_column =
+        column_exists(conn, "cf_processing_queue", "quarantine_rows").await?;
+    let has_quarantine_table = table_exists(conn, "cf_quarantine").await?;
+    let quarantine_select = if has_quarantine_column {
+        ", COALESCE(q.quarantine_rows, 0) as quarantine_rows"
+    } else if has_quarantine_table {
         ", COALESCE(qc.quarantine_rows, 0) as quarantine_rows"
     } else {
         ", NULL as quarantine_rows"
     };
-    let quarantine_join = if has_quarantine {
+    let quarantine_join = if has_quarantine_column {
+        ""
+    } else if has_quarantine_table {
         r#"
             LEFT JOIN (
                 SELECT job_id, COUNT(*) AS quarantine_rows

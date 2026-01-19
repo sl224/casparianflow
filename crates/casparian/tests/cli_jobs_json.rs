@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json};
-use rusqlite::{params, Connection};
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
+use casparian_db::{DbConnection, DbValue};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -66,18 +66,74 @@ struct JobFailure {
 #[test]
 fn test_jobs_json_filters() {
     let (home_dir, db_path) = setup_jobs_db();
+    assert!(db_path.exists());
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 
     let jobs_args = vec!["jobs".to_string(), "--json".to_string()];
     let jobs_output: JobsOutput = run_cli_json(&jobs_args, &envs);
     assert_eq!(jobs_output.stats.total, 4);
+    assert_eq!(jobs_output.stats.queued, 1);
+    assert_eq!(jobs_output.stats.running, 1);
+    assert_eq!(jobs_output.stats.completed, 1);
+    assert_eq!(jobs_output.stats.failed, 1);
+    assert_eq!(jobs_output.stats.dead_letter, 0);
     assert_eq!(jobs_output.jobs.len(), 4);
+    assert!(jobs_output.filters.topic.is_none());
     assert!(jobs_output.filters.status.contains(&"QUEUED".to_string()));
+    assert!(!jobs_output.filters.dead_letter);
+    let dead_letter_ids: Vec<i64> = jobs_output.dead_letter.iter().map(|job| job.id).collect();
+    assert!(dead_letter_ids.is_empty());
+
+    let running_job = jobs_output
+        .jobs
+        .iter()
+        .find(|job| job.id == 1)
+        .expect("job 1 present");
+    assert_eq!(running_job.file_path, "/data/sales/2024_12.csv");
+    assert_eq!(running_job.status, "RUNNING");
+    assert_eq!(running_job.priority, 0);
+    assert_eq!(
+        running_job.claim_time.as_deref(),
+        Some("2024-12-16T10:30:05Z")
+    );
+    assert!(running_job.end_time.is_none());
+    assert!(running_job.error_message.is_none());
+    assert!(running_job.result_summary.is_none());
+    assert_eq!(running_job.retry_count, 0);
+    assert!(running_job.quarantine_rows.is_none());
+
+    let completed_job = jobs_output
+        .jobs
+        .iter()
+        .find(|job| job.id == 2)
+        .expect("job 2 present");
+    assert_eq!(completed_job.end_time.as_deref(), Some("2024-12-16T10:30:05Z"));
+    assert_eq!(
+        completed_job.result_summary.as_deref(),
+        Some("Processed 100 rows")
+    );
+
+    let failed_job = jobs_output
+        .jobs
+        .iter()
+        .find(|job| job.id == 3)
+        .expect("job 3 present");
+    assert_eq!(
+        failed_job.error_message.as_deref(),
+        Some("Missing field customer_id")
+    );
+
+    let queued_job = jobs_output
+        .jobs
+        .iter()
+        .find(|job| job.id == 4)
+        .expect("job 4 present");
+    assert_eq!(queued_job.status, "QUEUED");
+    assert!(queued_job.claim_time.is_none());
 
     let failed_args = vec![
         "jobs".to_string(),
@@ -114,7 +170,6 @@ fn test_job_actions_update_db() {
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 
@@ -141,117 +196,169 @@ fn test_job_actions_update_db() {
     assert_eq!(job_status(&db_path, 1), "FAILED");
     assert_eq!(job_error(&db_path, 1), Some("Cancelled by user".to_string()));
 
-    let conn = Connection::open(&db_path).expect("open sqlite db");
-    conn.execute(
-        "UPDATE cf_processing_queue SET status = 'FAILED', error_message = 'Another error' WHERE id = 2",
-        [],
-    )
-    .expect("reset job 2 to failed");
+    cli_support::with_duckdb(&db_path, |conn| async move {
+        conn.execute(
+            "UPDATE cf_processing_queue SET status = 'FAILED', error_message = 'Another error' WHERE id = ?",
+            &[DbValue::from(2i64)],
+        )
+        .await
+        .expect("reset job 2 to failed");
+    });
 
     let retry_all_args = vec!["job".to_string(), "retry-all".to_string()];
     assert_cli_success(&run_cli(&retry_all_args, &envs), &retry_all_args);
-    let failed_count: i64 = conn
-        .query_row(
+    let failed_count = cli_support::with_duckdb(&db_path, |conn| async move {
+        conn.query_scalar::<i64>(
             "SELECT COUNT(*) FROM cf_processing_queue WHERE status = 'FAILED'",
-            [],
-            |row| row.get(0),
+            &[],
         )
-        .expect("count failed jobs");
+        .await
+        .expect("count failed jobs")
+    });
     assert_eq!(failed_count, 0);
 }
 
 fn setup_jobs_db() -> (TempDir, PathBuf) {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.sqlite3");
+    let db_path = home_dir.path().join("casparian_flow.duckdb");
     init_scout_schema(&db_path);
 
     let now = 1_737_187_200_000i64;
-    let conn = Connection::open(&db_path).expect("open sqlite db");
-    insert_source(&conn, "src-1", "test_source", "/data", now);
+    with_duckdb(&db_path, |conn| async move {
+        insert_source(&conn, "src-1", "test_source", "/data", now).await;
 
-    let files = [
-        (1, "/data/sales/2024_12.csv", "sales/2024_12.csv"),
-        (2, "/data/sales/2024_11.csv", "sales/2024_11.csv"),
-        (3, "/data/invoices/inv_003.json", "invoices/inv_003.json"),
-        (4, "/data/sales/2024_10.csv", "sales/2024_10.csv"),
-    ];
-    for (id, path, rel_path) in files {
-        insert_file(
-            &conn,
-            id,
-            "src-1",
-            path,
-            rel_path,
-            1000,
-            "pending",
-            None,
-            None,
-            now,
-        );
-    }
+        let files = [
+            (1, "/data/sales/2024_12.csv", "sales/2024_12.csv"),
+            (2, "/data/sales/2024_11.csv", "sales/2024_11.csv"),
+            (3, "/data/invoices/inv_003.json", "invoices/inv_003.json"),
+            (4, "/data/sales/2024_10.csv", "sales/2024_10.csv"),
+        ];
+        for (id, path, rel_path) in files {
+            insert_file(
+                &conn,
+                id,
+                "src-1",
+                path,
+                rel_path,
+                1000,
+                "pending",
+                None,
+                None,
+                now,
+            )
+            .await;
+        }
 
-    conn.execute_batch(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_id INTEGER NOT NULL,
-            pipeline_run_id TEXT,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'QUEUED',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TEXT,
-            end_time TEXT,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        );
-        "#,
-    )
-    .expect("create processing queue");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE cf_processing_queue (
+                id BIGINT PRIMARY KEY,
+                file_id BIGINT NOT NULL,
+                pipeline_run_id TEXT,
+                plugin_name TEXT NOT NULL,
+                config_overrides TEXT,
+                status TEXT NOT NULL DEFAULT 'QUEUED',
+                priority INTEGER DEFAULT 0,
+                worker_host TEXT,
+                worker_pid INTEGER,
+                claim_time TIMESTAMP,
+                end_time TIMESTAMP,
+                result_summary TEXT,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                quarantine_rows BIGINT DEFAULT 0
+            );
+            "#,
+        )
+        .await
+        .expect("create processing queue");
 
-    conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
-         VALUES (1, 1, 'sales', 'RUNNING', 0, '2024-12-16T10:30:05Z', NULL, NULL)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
-         VALUES (2, 2, 'sales', 'COMPLETED', 0, '2024-12-16T10:30:02Z', '2024-12-16T10:30:05Z', 'Processed 100 rows')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, error_message)
-         VALUES (3, 3, 'invoice', 'FAILED', 0, '2024-12-16T10:29:58Z', '2024-12-16T10:29:59Z', 'Missing field customer_id')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
-         VALUES (4, 4, 'sales', 'QUEUED', 0)",
-        [],
-    )
-    .unwrap();
+        conn.execute(
+            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                DbValue::from(1i64),
+                DbValue::from(1i64),
+                DbValue::from("sales"),
+                DbValue::from("RUNNING"),
+                DbValue::from(0i32),
+                DbValue::from("2024-12-16T10:30:05Z"),
+                DbValue::Null,
+                DbValue::Null,
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                DbValue::from(2i64),
+                DbValue::from(2i64),
+                DbValue::from("sales"),
+                DbValue::from("COMPLETED"),
+                DbValue::from(0i32),
+                DbValue::from("2024-12-16T10:30:02Z"),
+                DbValue::from("2024-12-16T10:30:05Z"),
+                DbValue::from("Processed 100 rows"),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, error_message)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                DbValue::from(3i64),
+                DbValue::from(3i64),
+                DbValue::from("invoice"),
+                DbValue::from("FAILED"),
+                DbValue::from(0i32),
+                DbValue::from("2024-12-16T10:29:58Z"),
+                DbValue::from("2024-12-16T10:29:59Z"),
+                DbValue::from("Missing field customer_id"),
+            ],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
+             VALUES (?, ?, ?, ?, ?)",
+            &[
+                DbValue::from(4i64),
+                DbValue::from(4i64),
+                DbValue::from("sales"),
+                DbValue::from("QUEUED"),
+                DbValue::from(0i32),
+            ],
+        )
+        .await
+        .unwrap();
+    });
 
     (home_dir, db_path)
 }
 
-fn insert_source(conn: &Connection, id: &str, name: &str, path: &str, now: i64) {
+async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, now: i64) {
     let source_type = serde_json::json!({ "type": "local" }).to_string();
     conn.execute(
         "INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 30, 1, ?5, ?6)",
-        params![id, name, source_type, path, now, now],
+         VALUES (?, ?, ?, ?, 30, 1, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(name),
+            DbValue::from(source_type),
+            DbValue::from(path),
+            DbValue::from(now),
+            DbValue::from(now),
+        ],
     )
+    .await
     .expect("insert source");
 }
 
-fn insert_file(
-    conn: &Connection,
+async fn insert_file(
+    conn: &DbConnection,
     id: i64,
     source_id: &str,
     path: &str,
@@ -269,24 +376,25 @@ fn insert_file(
         .map(|ext| ext.to_lowercase());
     conn.execute(
         "INSERT INTO scout_files (id, source_id, path, rel_path, parent_path, name, extension, size, mtime, status, tag, error, first_seen_at, last_seen_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            id,
-            source_id,
-            path,
-            rel_path,
-            parent_path,
-            name,
-            extension,
-            size,
-            now,
-            status,
-            tag,
-            error,
-            now,
-            now
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(source_id),
+            DbValue::from(path),
+            DbValue::from(rel_path),
+            DbValue::from(parent_path),
+            DbValue::from(name),
+            DbValue::from(extension),
+            DbValue::from(size),
+            DbValue::from(now),
+            DbValue::from(status),
+            DbValue::from(tag),
+            DbValue::from(error),
+            DbValue::from(now),
+            DbValue::from(now),
         ],
     )
+    .await
     .expect("insert file");
 }
 
@@ -301,31 +409,35 @@ fn split_rel_path(rel_path: &str) -> (String, String) {
 }
 
 fn job_status(db_path: &Path, job_id: i64) -> String {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    conn.query_row(
-        "SELECT status FROM cf_processing_queue WHERE id = ?1",
-        params![job_id],
-        |row| row.get(0),
-    )
-    .expect("query job status")
+    with_duckdb(db_path, |conn| async move {
+        conn.query_scalar::<String>(
+            "SELECT status FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job_id)],
+        )
+        .await
+        .expect("query job status")
+    })
 }
 
 fn job_retry_count(db_path: &Path, job_id: i64) -> i32 {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    conn.query_row(
-        "SELECT retry_count FROM cf_processing_queue WHERE id = ?1",
-        params![job_id],
-        |row| row.get(0),
-    )
-    .expect("query retry count")
+    with_duckdb(db_path, |conn| async move {
+        conn.query_scalar::<i32>(
+            "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job_id)],
+        )
+        .await
+        .expect("query retry count")
+    })
 }
 
 fn job_error(db_path: &Path, job_id: i64) -> Option<String> {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    conn.query_row(
-        "SELECT error_message FROM cf_processing_queue WHERE id = ?1",
-        params![job_id],
-        |row| row.get(0),
-    )
-    .unwrap_or(None)
+    with_duckdb(db_path, |conn| async move {
+        conn.query_optional(
+            "SELECT error_message FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job_id)],
+        )
+        .await
+        .ok()
+        .and_then(|row| row.and_then(|r| r.get_by_name::<Option<String>>("error_message").ok()).flatten())
+    })
 }

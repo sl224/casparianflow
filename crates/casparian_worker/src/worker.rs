@@ -1111,6 +1111,7 @@ async fn execute_job_inner(
         job_id,
         file_id: cmd.file_id,
         shim_path: shim_path.to_path_buf(),
+        inherit_stdio: false,
     };
 
     let bridge_result = bridge::execute_bridge(config).await.map_err(|e| {
@@ -1152,7 +1153,7 @@ async fn execute_job_inner(
         }
     })?;
 
-    let batches = bridge_result.batches;
+    let output_batches = bridge_result.output_batches;
 
     // Log the captured logs for debugging (will be stored in DB in Phase 3)
     if !bridge_result.logs.is_empty() {
@@ -1175,7 +1176,7 @@ async fn execute_job_inner(
         })
         .collect();
 
-    let outputs = casparian_sinks::plan_outputs(&descriptors, &batches, "output")
+    let outputs = casparian_sinks::plan_outputs(&descriptors, &output_batches, "output")
         .map_err(|e| WorkerError::Permanent { message: e.to_string() })?;
 
     let job_id_str = job_id.to_string();

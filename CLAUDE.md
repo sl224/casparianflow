@@ -2,7 +2,7 @@
 
 ## Quick Orientation
 
-**What is Casparian Flow?** A data processing platform that transforms "dark data" (files on disk) into queryable datasets. Users discover files, approve schemas, and execute pipelines - all with AI assistance via MCP (Model Context Protocol).
+**What is Casparian Flow?** A data processing platform that transforms "dark data" (files on disk) into queryable datasets. Users discover files, approve schemas, and execute pipelines - with optional AI assistance outside the v1 critical path.
 
 **Start Here:**
 1. Read this file for high-level architecture
@@ -25,40 +25,28 @@ The entire system should feel like "drag and drop your messy files, get clean da
 
 ---
 
-## System Architecture (v7.0 - MCP-First)
+## System Architecture (v7.0 - CLI/TUI-First)
 
 ```
-                              ┌─────────────────────────────────────┐
-                              │        Claude Code (MCP Client)     │
-                              │   "Scan these files for me"         │
-                              └──────────────────┬──────────────────┘
-                                                 │ MCP Protocol
-                                                 ▼
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                           CASPARIAN MCP SERVER                                   │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │ quick_scan  │  │  discover   │  │   approve   │  │    run_backtest         │  │
-│  │ apply_scope │  │  _schemas   │  │   _schemas  │  │    fix_parser           │  │
-│  │             │  │             │  │  propose_   │  │    execute_pipeline     │  │
-│  │             │  │             │  │  amendment  │  │    query_output         │  │
-│  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
-│     Discovery          Schema          Approval           Execution              │
-└──────────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-            │   Schema    │ │   Backtest  │ │    Type     │
-            │  Contract   │ │   Engine    │ │  Inference  │
-            │   System    │ │             │ │   Engine    │
-            └─────────────┘ └─────────────┘ └─────────────┘
+Casparian CLI / TUI
+        │
+        ▼
+  Schema Contracts
+        │
+        ▼
+ Sentinel / Job Queue
+        │
+        ▼
+ Worker (Bridge Mode)
+        │
+        ▼
+  Output Sinks
 ```
 
 ### Crate Architecture
 
 | Crate | Purpose | Key Concepts |
 |-------|---------|--------------|
-| `casparian_mcp` | MCP server for Claude Code | 9 tools, JSON-RPC protocol |
 | `casparian_schema` | Schema contracts | Approval workflow, amendments |
 | `casparian_backtest` | Multi-file validation | Fail-fast, high-failure tracking |
 | `casparian_worker` | Parser execution + type inference | Constraint-based inference |
@@ -241,12 +229,6 @@ casparian-flow/
 │   │       ├── main.rs       # CLI entry point
 │   │       └── cli/
 │   │           └── tui/      # Terminal UI (ratatui)
-│   ├── casparian_mcp/        # MCP server
-│   │   ├── CLAUDE.md         # MCP-specific docs
-│   │   └── src/
-│   │       ├── tools/        # 9 MCP tools
-│   │       ├── server.rs     # JSON-RPC server
-│   │       └── protocol.rs   # MCP protocol types
 │   ├── casparian_schema/     # Schema contracts
 │   │   ├── CLAUDE.md         # Schema-specific docs
 │   │   └── src/
@@ -374,37 +356,6 @@ Both should cross-reference each other in their headers.
 
 ---
 
-## MCP Tools Reference
-
-The MCP server exposes 9 tools for Claude Code integration:
-
-### Discovery Tools
-| Tool | Purpose | Key Parameters |
-|------|---------|----------------|
-| `quick_scan` | Fast metadata scan | `path`, `extensions`, `max_depth` |
-| `apply_scope` | Group files for processing | `files`, `scope_name` |
-
-### Schema Tools
-| Tool | Purpose | Key Parameters |
-|------|---------|----------------|
-| `discover_schemas` | Infer schema from files | `scope_id`, `sample_rows` |
-| `approve_schemas` | Create locked contracts | `scope_id`, `approved_by` |
-| `propose_amendment` | Modify existing contract | `scope_id`, `changes` |
-
-### Backtest Tools
-| Tool | Purpose | Key Parameters |
-|------|---------|----------------|
-| `run_backtest` | Validate parser | `scope_id`, `pass_threshold` |
-| `fix_parser` | Generate fixes | `scope_id`, `failures` |
-
-### Execution Tools
-| Tool | Purpose | Key Parameters |
-|------|---------|----------------|
-| `execute_pipeline` | Run full pipeline | `scope_id`, `sink_config` |
-| `query_output` | Query processed data | `scope_id`, `sql` |
-
----
-
 ## Development Workflow
 
 ### After Any Code Change
@@ -418,7 +369,6 @@ cargo build --release
 
 # 3. Test
 cargo test                     # All Rust tests
-cargo test -p casparian_mcp    # Specific crate
 ```
 
 ### Running E2E Tests
@@ -428,7 +378,6 @@ cargo test -p casparian_mcp    # Specific crate
 cargo test --package casparian_worker --test e2e_type_inference
 cargo test --package casparian_schema --test e2e_contracts
 cargo test --package casparian_backtest --test e2e_backtest
-cargo test --package casparian_mcp --test e2e_tools
 
 # E2E test script
 ./tests/e2e/run_e2e_test.sh
@@ -521,14 +470,6 @@ let pool = create_pool(DbConfig::postgres("postgres://...", license)).await?;
 ---
 
 ## Common Tasks
-
-### Add a New MCP Tool
-
-1. Create tool module in `crates/casparian_mcp/src/tools/`
-2. Implement `McpTool` trait
-3. Register in `create_default_registry()`
-4. Add E2E test in `tests/e2e_tools.rs`
-5. Run `cargo test -p casparian_mcp`
 
 ### Add Schema Support for New Type
 
@@ -878,8 +819,8 @@ Per `specs/rule_builder.md` Section 9:
 **Decision:** Test high-failure files first.
 **Consequence:** Rapid feedback during parser development.
 
-### ADR-006: MCP-First Integration (Jan 2025)
-**Decision:** Claude Code integration via MCP protocol.
+### ADR-006: MCP-First Integration (Jan 2025, superseded)
+**Decision (historical):** Claude Code integration via MCP protocol. This approach is not part of v1 and remains archived for context.
 **Consequence:** AI-assisted data processing workflow.
 
 ### ADR-007: CLI-First Architecture (Jan 2025)
@@ -947,7 +888,6 @@ Per `specs/rule_builder.md` Section 9:
 
 | Term | Definition |
 |------|------------|
-| **MCP** | Model Context Protocol - LLM tool integration standard |
 | **Scout** | File discovery + tagging layer |
 | **Sentinel** | Job orchestration + worker management |
 | **Schema Contract** | Approved schema that parser must conform to |
@@ -971,5 +911,4 @@ Per `specs/rule_builder.md` Section 9:
 
 - **Component docs**: Check crate-specific `CLAUDE.md` files
 - **Architecture**: See `ARCHITECTURE.md`
-- **MCP tools**: See `crates/casparian_mcp/CLAUDE.md`
 - **CLI usage**: `./target/release/casparian --help`

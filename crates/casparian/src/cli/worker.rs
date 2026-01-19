@@ -3,7 +3,6 @@
 //! Commands for listing, showing, draining, and removing workers.
 //! Workers are tracked in cf_worker_node table and managed via Sentinel.
 
-use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::jobs::get_db_path;
 use crate::cli::output::print_table_colored;
@@ -311,10 +310,7 @@ async fn run_status(db_path: &PathBuf) -> anyhow::Result<()> {
 
 /// Connect to the database
 fn db_url_for_path(db_path: &PathBuf) -> String {
-    match config::default_db_backend() {
-        config::DbBackend::DuckDb => format!("duckdb:{}", db_path.display()),
-        config::DbBackend::Sqlite => format!("sqlite:{}", db_path.display()),
-    }
+    format!("duckdb:{}", db_path.display())
 }
 
 async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
@@ -436,13 +432,13 @@ async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, 
 }
 
 async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
-    let (query, param) = match conn.backend_name() {
-        "DuckDB" => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
-        "SQLite" => ("SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", DbValue::from(table)),
-        _ => ("SELECT 1 FROM information_schema.tables WHERE table_name = ?", DbValue::from(table)),
-    };
-
-    Ok(conn.query_optional(query, &[param]).await?.is_some())
+    let row = conn
+        .query_optional(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+            &[DbValue::from(table)],
+        )
+        .await?;
+    Ok(row.is_some())
 }
 
 /// Calculate worker statistics

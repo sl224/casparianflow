@@ -10,9 +10,8 @@
 //! 1. **Binary Execution**: Does `casparian tui --help` work?
 //! 2. **TUI App State**: Does the app handle key events correctly?
 //! 3. **Mock LLM Server**: Can we test LLM integration without API keys?
-//! 4. **Full Pipeline**: CSV → ProcessJob → Output file
+//! 4. **Full Pipeline**: CSV → `casparian run` → Output file
 
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 #[cfg(feature = "full")]
@@ -21,7 +20,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tempfile::TempDir;
 
 // =============================================================================
 // BINARY E2E TESTS
@@ -319,39 +317,21 @@ data: {"type":"message_stop"}
         println!("Mock server test inconclusive after {} attempts: {:?}", attempts, last_error);
     }
 
-    /// Test Claude provider types without network
-    #[test]
-    fn test_llm_types() {
-        // Import the public types from casparian_mcp
-        use casparian_mcp::tools::create_default_registry;
-
-        let registry = create_default_registry();
-        let tools: Vec<_> = registry.list();
-
-        // We should have tools to convert to LLM definitions
-        assert!(tools.len() >= 10, "Should have at least 10 tools");
-
-        // Each tool should have name, description, schema
-        for tool in &tools {
-            assert!(!tool.name().is_empty(), "Tool should have name");
-            assert!(!tool.description().is_empty(), "Tool should have description");
-        }
-    }
 }
 
 // =============================================================================
-// FULL PIPELINE E2E - CSV → ProcessJob → Output
+// FULL PIPELINE E2E - CSV → `casparian run` → Output
 // =============================================================================
 
+#[cfg(feature = "full")]
 mod full_pipeline {
     use super::*;
-    #[cfg(feature = "full")]
-    use rusqlite::Connection;
+    use std::fs;
+    use tempfile::TempDir;
 
-    /// Complete pipeline test: Create database, deploy plugin, process job, verify output
+    /// Complete pipeline test: Run parser against CSV and verify output
     /// (Gated - runs cargo run which triggers compilation)
     #[test]
-    #[cfg(feature = "full")]
     fn test_csv_to_parquet_pipeline() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -363,7 +343,7 @@ mod full_pipeline {
         )
         .unwrap();
 
-        // 2. Create plugin code
+        // 2. Create parser code
         let plugin_code = r#"
 import pandas as pd
 
@@ -375,11 +355,10 @@ def process(input_path: str) -> pd.DataFrame:
     return df
 "#;
 
-        // 3. Setup database with plugin
-        let db_path = temp_dir.path().join("test.sqlite3");
-        setup_test_database(&db_path, "csv_processor", plugin_code, &input_csv);
+        let parser_path = temp_dir.path().join("parser.py");
+        fs::write(&parser_path, plugin_code).unwrap();
 
-        // 4. Run ProcessJob command
+        // 3. Run `casparian run`
         let output_dir = temp_dir.path().join("output");
         fs::create_dir_all(&output_dir).unwrap();
 
@@ -390,12 +369,11 @@ def process(input_path: str) -> pd.DataFrame:
                 "casparian",
                 "-q",
                 "--",
-                "process-job",
-                "1",
-                "--db",
-                &db_path.to_string_lossy(),
-                "--output",
-                &output_dir.to_string_lossy(),
+                "run",
+                &parser_path.to_string_lossy(),
+                &input_csv.to_string_lossy(),
+                "--sink",
+                &format!("parquet://{}/", output_dir.display()),
             ])
             .output();
 
@@ -422,7 +400,7 @@ def process(input_path: str) -> pd.DataFrame:
                     let acceptable_failures = stderr.contains("uv")
                         || stderr.contains("venv")
                         || stderr.contains("Python")
-                        || stderr.contains("Plugin")
+                        || stderr.contains("Parser")
                         || stderr.contains("bridge");
 
                     if !acceptable_failures {
@@ -439,141 +417,19 @@ def process(input_path: str) -> pd.DataFrame:
         }
     }
 
-    /// Helper to setup test database with plugin and job
-    #[cfg(feature = "full")]
-    fn setup_test_database(
-        db_path: &std::path::Path,
-        plugin_name: &str,
-        source_code: &str,
-        input_file: &std::path::Path,
-    ) {
-        let conn = Connection::open(db_path).unwrap();
-
-        // Create plugin manifest table
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
-                id INTEGER PRIMARY KEY,
-                plugin_name TEXT NOT NULL,
-                version TEXT NOT NULL,
-                source_code TEXT NOT NULL,
-                env_hash TEXT,
-                status TEXT DEFAULT 'ACTIVE',
-                deployed_at TEXT DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS cf_processing_queue (
-                id INTEGER PRIMARY KEY,
-                pipeline_run_id TEXT,
-                plugin_name TEXT NOT NULL,
-                input_file TEXT,
-                status TEXT DEFAULT 'PENDING',
-                file_id INTEGER,
-                claim_time TEXT,
-                end_time TEXT,
-                result_summary TEXT,
-                error_message TEXT
-            );
-            "#,
-        )
-        .unwrap();
-
-        // Insert plugin
-        conn.execute(
-            "INSERT INTO cf_plugin_manifest (plugin_name, version, source_code, status) VALUES (?, ?, ?, 'ACTIVE')",
-            rusqlite::params![plugin_name, "1.0.0", source_code],
-        )
-        .unwrap();
-
-        // Insert job
-        conn.execute(
-            "INSERT INTO cf_processing_queue (plugin_name, input_file, status) VALUES (?, ?, 'PENDING')",
-            rusqlite::params![plugin_name, input_file.to_string_lossy()],
-        )
-        .unwrap();
-    }
-
-    /// Test that MCP tools work in sequence (scan → discover → approve)
-    #[tokio::test]
-    async fn test_mcp_workflow_sequence() {
-        use casparian_mcp::tools::create_default_registry;
-        use casparian_mcp::types::ToolContent;
-        use serde_json::json;
-
-        let temp_dir = TempDir::new().unwrap();
-
-        // Create test data
-        fs::write(
-            temp_dir.path().join("orders.csv"),
-            "order_id,customer,total\n1,ACME,1500\n2,Beta,2300\n",
-        )
-        .unwrap();
-
-        let registry = create_default_registry();
-
-        // Step 1: Quick scan
-        let scan = registry.get("quick_scan").unwrap();
-        let scan_result = scan
-            .execute(json!({
-                "path": temp_dir.path().to_string_lossy()
-            }))
-            .await
-            .unwrap();
-
-        assert!(!scan_result.is_error);
-
-        // Step 2: Discover schemas
-        let discover = registry.get("discover_schemas").unwrap();
-        let discover_result = discover
-            .execute(json!({
-                "files": [temp_dir.path().join("orders.csv").to_string_lossy()]
-            }))
-            .await
-            .unwrap();
-
-        assert!(!discover_result.is_error);
-
-        // Verify workflow metadata
-        if let Some(ToolContent::Text { text }) = discover_result.content.first() {
-            let response: serde_json::Value = serde_json::from_str(text).unwrap();
-            assert!(response.get("workflow").is_some(), "Should have workflow");
-            assert!(response.get("schemas").is_some(), "Should have schemas");
-        }
-
-        // Step 3: Approve schemas
-        let approve = registry.get("approve_schemas").unwrap();
-        let approve_result = approve
-            .execute(json!({
-                "scope_id": "test-scope",
-                "schemas": [{
-                    "discovery_id": "disc-1",
-                    "name": "orders",
-                    "columns": [
-                        {"name": "order_id", "data_type": "Int64", "nullable": false},
-                        {"name": "customer", "data_type": "String", "nullable": false},
-                        {"name": "total", "data_type": "Float64", "nullable": false}
-                    ],
-                    "output_table_name": "orders_fact"
-                }]
-            }))
-            .await
-            .unwrap();
-
-        assert!(!approve_result.is_error);
-    }
 }
 
 // =============================================================================
 // INTEGRATION BOUNDARIES - Where Things Break
 // =============================================================================
 
+#[cfg(feature = "full")]
 mod integration_boundaries {
     use super::*;
 
     /// Test: Environment without uv installed
     /// (Gated - runs cargo run which triggers compilation)
     #[test]
-    #[cfg(feature = "full")]
     fn test_graceful_without_uv() {
         // This tests that we get a helpful error, not a crash
         let output = Command::new("cargo")
@@ -610,85 +466,4 @@ mod integration_boundaries {
         }
     }
 
-    /// Test: Invalid database path handling
-    /// (Gated - runs cargo run which triggers compilation)
-    #[test]
-    #[cfg(feature = "full")]
-    fn test_invalid_db_path() {
-        let result = Command::new("cargo")
-            .args([
-                "run",
-                "-p",
-                "casparian",
-                "-q",
-                "--",
-                "process-job",
-                "1",
-                "--db",
-                "/this/path/cannot/exist/db.sqlite3",
-                "--output",
-                "/tmp/output",
-            ])
-            .output();
-
-        match result {
-            Ok(out) => {
-                // Should fail with error, not panic
-                assert!(!out.status.success(), "Should fail on invalid path");
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                assert!(
-                    !stderr.contains("panicked"),
-                    "Should not panic on invalid path"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                println!("Skipping: cargo not in PATH");
-            }
-            Err(e) => {
-                println!("Test skipped: {}", e);
-            }
-        }
-    }
-
-    /// Test: Concurrent tool execution
-    #[tokio::test]
-    async fn test_concurrent_tool_execution() {
-        use casparian_mcp::tools::create_default_registry;
-        use serde_json::json;
-
-        let temp_dir = TempDir::new().unwrap();
-
-        // Create multiple directories
-        for i in 0..5 {
-            let dir = temp_dir.path().join(format!("dir_{}", i));
-            fs::create_dir(&dir).unwrap();
-            fs::write(dir.join("data.csv"), format!("id\n{}", i)).unwrap();
-        }
-
-        let registry = create_default_registry();
-        let scan = registry.get("quick_scan").unwrap();
-
-        // Execute 5 scans concurrently
-        let futures: Vec<_> = (0..5)
-            .map(|i| {
-                let dir = temp_dir.path().join(format!("dir_{}", i));
-                let scan_clone = &scan;
-                async move {
-                    scan_clone
-                        .execute(json!({
-                            "path": dir.to_string_lossy()
-                        }))
-                        .await
-                }
-            })
-            .collect();
-
-        let results = futures::future::join_all(futures).await;
-
-        // All should succeed
-        for result in results {
-            assert!(result.is_ok(), "Concurrent scan should succeed");
-            assert!(!result.unwrap().is_error);
-        }
-    }
 }

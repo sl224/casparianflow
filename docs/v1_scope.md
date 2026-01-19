@@ -31,7 +31,7 @@ turn FIX logs into queryable SQL and resolve trade breaks in minutes.
 - Minimal TUI support: Parser Bench + Jobs view.
 
 ## Out of Scope
-- AI-assisted parser generation (MCP tools).
+- AI-assisted parser generation.
 - Additional vertical parsers (HL7, PST, CoT, etc.).
 - Postgres/MSSQL sinks.
 - Streaming/Kafka/Redpanda integration.

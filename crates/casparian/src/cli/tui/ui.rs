@@ -5,7 +5,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
-use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
+use crate::cli::config::active_db_path;
 use crate::cli::output::format_number;
 use ratatui::widgets::Clear;
 use chrono::{DateTime, Local};
@@ -121,19 +121,12 @@ fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect
         return;
     }
 
-    let (db_backend, _db_path) = if let Some(path) = app.config.database.as_ref() {
-        let backend = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("duckdb") => DbBackend::DuckDb,
-            _ => DbBackend::Sqlite,
-        };
-        (backend, path.clone())
-    } else {
-        (default_db_backend(), active_db_path())
-    };
-    let backend_label = match db_backend {
-        DbBackend::Sqlite => "sqlite",
-        DbBackend::DuckDb => "duckdb",
-    };
+    let _db_path = app
+        .config
+        .database
+        .clone()
+        .unwrap_or_else(active_db_path);
+    let backend_label = "duckdb";
 
     let running = app
         .jobs_state
@@ -4403,19 +4396,12 @@ fn draw_settings_screen(frame: &mut Frame, app: &App, area: Rect) {
             if app.settings.category == SettingsCategory::About { Color::Cyan } else { Color::DarkGray }
         ));
 
-    let (db_backend, db_path) = if let Some(path) = app.config.database.as_ref() {
-        let backend = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("duckdb") => DbBackend::DuckDb,
-            _ => DbBackend::Sqlite,
-        };
-        (backend, path.clone())
-    } else {
-        (default_db_backend(), active_db_path())
-    };
-    let backend_label = match db_backend {
-        DbBackend::Sqlite => "sqlite",
-        DbBackend::DuckDb => "duckdb",
-    };
+    let db_path = app
+        .config
+        .database
+        .clone()
+        .unwrap_or_else(active_db_path);
+    let backend_label = "duckdb";
 
     let about_lines = vec![
         Line::from(format!("  Version:    {}", env!("CARGO_PKG_VERSION"))),
@@ -4492,19 +4478,12 @@ fn draw_settings_category(
 }
 
 fn draw_settings_inspector(frame: &mut Frame, app: &App, area: Rect) {
-    let (db_backend, db_path) = if let Some(path) = app.config.database.as_ref() {
-        let backend = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("duckdb") => DbBackend::DuckDb,
-            _ => DbBackend::Sqlite,
-        };
-        (backend, path.clone())
-    } else {
-        (default_db_backend(), active_db_path())
-    };
-    let backend_label = match db_backend {
-        DbBackend::Sqlite => "sqlite",
-        DbBackend::DuckDb => "duckdb",
-    };
+    let db_path = app
+        .config
+        .database
+        .clone()
+        .unwrap_or_else(active_db_path);
+    let backend_label = "duckdb";
 
     let lines = vec![
         Line::from(Span::styled(
@@ -4535,7 +4514,7 @@ mod tests {
     fn test_args() -> TuiArgs {
         TuiArgs {
             database: Some(std::env::temp_dir().join(format!(
-                "casparian_test_{}.sqlite3",
+                "casparian_test_{}.duckdb",
                 uuid::Uuid::new_v4()
             ))),
         }

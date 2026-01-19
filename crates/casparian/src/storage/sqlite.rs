@@ -54,6 +54,7 @@ impl SqliteJobStore {
                 status TEXT NOT NULL DEFAULT 'QUEUED',
                 priority INTEGER NOT NULL DEFAULT 0,
                 retry_count INTEGER NOT NULL DEFAULT 0,
+                quarantine_rows INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT,
                 worker_id TEXT,
                 claim_time TEXT,

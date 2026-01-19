@@ -2,9 +2,8 @@
 //!
 //! Commands for showing, retrying, and cancelling individual jobs.
 
-use crate::cli::config;
 use crate::cli::error::HelpfulError;
-use crate::cli::jobs::{get_db_path, table_exists, Job};
+use crate::cli::jobs::{column_exists, get_db_path, table_exists, Job};
 use crate::cli::output::format_number_signed;
 use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::ProcessingStatus;
@@ -345,10 +344,7 @@ async fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
 /// Connect to the database
 fn db_url_for_path(db_path: &PathBuf) -> String {
-    match config::default_db_backend() {
-        config::DbBackend::DuckDb => format!("duckdb:{}", db_path.display()),
-        config::DbBackend::Sqlite => format!("sqlite:{}", db_path.display()),
-    }
+    format!("duckdb:{}", db_path.display())
 }
 
 async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
@@ -363,13 +359,19 @@ async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
 
 /// Get a single job by ID
 async fn get_job_by_id(conn: &DbConnection, job_id: i64) -> anyhow::Result<Option<Job>> {
-    let has_quarantine = table_exists(conn, "cf_quarantine").await?;
-    let quarantine_select = if has_quarantine {
+    let has_quarantine_column =
+        column_exists(conn, "cf_processing_queue", "quarantine_rows").await?;
+    let has_quarantine_table = table_exists(conn, "cf_quarantine").await?;
+    let quarantine_select = if has_quarantine_column {
+        ", COALESCE(q.quarantine_rows, 0) as quarantine_rows"
+    } else if has_quarantine_table {
         ", COALESCE(qc.quarantine_rows, 0) as quarantine_rows"
     } else {
         ", NULL as quarantine_rows"
     };
-    let quarantine_join = if has_quarantine {
+    let quarantine_join = if has_quarantine_column {
+        ""
+    } else if has_quarantine_table {
         r#"
         LEFT JOIN (
             SELECT job_id, COUNT(*) AS quarantine_rows
@@ -423,14 +425,7 @@ async fn get_job_by_id(conn: &DbConnection, job_id: i64) -> anyhow::Result<Optio
 
 /// Get failure details for a job
 async fn get_job_failure(conn: &DbConnection, job_id: i64) -> anyhow::Result<Option<JobFailure>> {
-    let table_query = match conn.backend_name() {
-        "DuckDB" => "SELECT 1 FROM information_schema.tables WHERE table_name = 'cf_job_failures'",
-        "SQLite" => "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cf_job_failures'",
-        _ => "SELECT 1 FROM information_schema.tables WHERE table_name = 'cf_job_failures'",
-    };
-
-    let table_exists = conn.query_optional(table_query, &[]).await?.is_some();
-    if !table_exists {
+    if !table_exists(conn, "cf_job_failures").await? {
         let error = conn
             .query_optional(
                 "SELECT error_message FROM cf_processing_queue WHERE id = ?",

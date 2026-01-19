@@ -26,14 +26,14 @@ casparian_ids = { path = "../casparian_ids" }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Database abstraction
-casparian_db = { path = "../casparian_db", default-features = false, features = ["sqlite"] }
+casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
 
 # Hashing
 sha2 = "0.10"
+tempfile = "3"
 
 # Error handling
 thiserror.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

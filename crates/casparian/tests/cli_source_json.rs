@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json};
-use rusqlite::Connection;
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
+use casparian_db::DbValue;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -34,7 +34,7 @@ struct SourceFile {
 #[test]
 fn test_source_json_and_sync() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.sqlite3");
+    let db_path = home_dir.path().join("casparian_flow.duckdb");
     init_scout_schema(&db_path);
 
     let data_dir = TempDir::new().expect("create data dir");
@@ -44,7 +44,6 @@ fn test_source_json_and_sync() {
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
         ("RUST_LOG", "error"),
     ];
 
@@ -73,6 +72,8 @@ fn test_source_json_and_sync() {
         .expect("canonicalize");
     assert_eq!(Path::new(&source.path), canonical);
     assert!(source.enabled);
+    assert_eq!(source.files, 0);
+    assert_eq!(source.size, 0);
 
     let sync_args = vec![
         "source".to_string(),
@@ -90,7 +91,10 @@ fn test_source_json_and_sync() {
     ];
     let details: SourceDetails = run_cli_json(&show_args, &envs);
     assert_eq!(details.name, "test_source");
+    assert_eq!(Path::new(&details.path), canonical);
+    assert!(details.enabled);
     assert!(details.files >= 2);
+    assert!(details.size > 0);
     let file_list = details.file_list.expect("file list included");
     assert_eq!(file_list.len(), 2);
     assert!(file_list.iter().any(|f| f.path.ends_with("sample.csv")));
@@ -125,7 +129,9 @@ fn test_source_json_and_sync() {
 }
 
 fn source_count(db_path: &Path) -> i64 {
-    let conn = Connection::open(db_path).expect("open sqlite db");
-    conn.query_row("SELECT COUNT(*) FROM scout_sources", [], |row| row.get(0))
-        .expect("count sources")
+    with_duckdb(db_path, |conn| async move {
+        conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_sources", &[])
+            .await
+            .expect("count sources")
+    })
 }

@@ -31,7 +31,7 @@ Unlike traditional ETL tools that assume standard API sources, Casparian Flow fo
 
 #### A. The "Dev" Loop (Iteration)
 *   **Goal**: Rapidly develop a parser for a new file type.
-*   **Interface**: CLI (`casparian run`) or MCP (Claude Code).
+*   **Interface**: CLI (`casparian run`) or TUI (`casparian tui`).
 *   **Action**: User runs a parser against a sample file.
 *   **Behavior**: Stateless execution. Uses local python environment. Pipes output to stdout/terminal for debugging. `pdb` works.
 *   **Outcome**: A working Python parser file.
@@ -72,7 +72,7 @@ The system supports two execution modes sharing a single core executor.
 [ User / Claude ]
       │
       ▼
-[ Casparian CLI / MCP Server ]
+[ Casparian CLI / TUI ]
       │
       ├─► [ Scout ] (File Discovery & Tagging)
       │
@@ -259,15 +259,10 @@ Database abstraction and job events are defined in `specs/db.md`.
 *   **`casparian jobs replay <job_id>`**:
     *   Re-queues a dead-letter job for processing.
 
-### 5.2 MCP Tools (for Claude)
+### 5.2 Interfaces
 
-1.  **`quick_scan`**: fast filesystem discovery.
-2.  **`apply_scope`**: group files for processing.
-3.  **`discover_schemas`**: infer schema from file samples.
-4.  **`approve_schemas`**: lock a schema contract.
-5.  **`run_backtest`**: validate parser against file history.
-6.  **`execute_pipeline`**: trigger production processing.
-7.  **`query_output`**: SQL interface to processed data.
+- **CLI**: scan, register parsers, run backtests, and execute pipelines.
+- **TUI**: discovery, parser bench, jobs, and inspect workflows.
 
 ### 5.3 Terminal UI (TUI) Specification
 
@@ -617,4 +612,4 @@ All tables use single database: `~/.casparian_flow/casparian_flow.duckdb`
 *   **Phase 3**: Protocol Convergence (Rust Executor + Universal Shim).
 *   **Phase 4**: Worker Loop (Heartbeats).
 *   **Phase 5**: Quarantine Implementation (Rust-side validation).
-*   **Phase 6**: MCP Integration.
+*   **Phase 6**: AI assistance (deferred, not in v1).

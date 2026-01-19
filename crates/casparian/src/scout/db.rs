@@ -13,6 +13,8 @@ use super::types::{
 };
 use casparian_db::{DbConnection, DbValue};
 use chrono::{DateTime, Utc};
+use tempfile::TempDir;
+use std::sync::Arc;
 use std::path::Path;
 
 /// Database schema (v2 - tag-based)
@@ -410,28 +412,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_extraction_fields_rule_name ON extraction
     format!("{sequences}\n{}\n{unique_indexes}", output.join("\n"))
 }
 
-async fn column_exists(
-    conn: &DbConnection,
-    table: &str,
-    column: &str,
-    is_duckdb: bool,
-) -> Result<bool> {
-    if is_duckdb {
-        let rows = conn
-            .query_all(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = ? AND column_name = ?",
-                &[table.into(), column.into()],
-            )
-            .await?;
-        Ok(!rows.is_empty())
-    } else {
-        let query = format!(
-            "SELECT name FROM pragma_table_info('{}') WHERE name = ?",
-            table.replace('\'', "''")
-        );
-        let rows = conn.query_all(&query, &[column.into()]).await?;
-        Ok(!rows.is_empty())
-    }
+async fn column_exists(conn: &DbConnection, table: &str, column: &str) -> Result<bool> {
+    let rows = conn
+        .query_all(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
+            &[DbValue::from(table), DbValue::from(column)],
+        )
+        .await?;
+    Ok(!rows.is_empty())
 }
 
 /// Convert milliseconds since epoch to DateTime
@@ -485,42 +473,35 @@ fn glob_to_like_pattern(glob: &str) -> String {
 #[derive(Clone)]
 pub struct Database {
     conn: DbConnection,
+    _temp_dir: Option<Arc<TempDir>>,
 }
 
 impl Database {
     /// Open or create a database at the given path.
     pub async fn open(path: &Path) -> Result<Self> {
-        let conn = if path.extension().and_then(|ext| ext.to_str()) == Some("duckdb") {
-            #[cfg(feature = "duckdb")]
-            {
-                DbConnection::open_duckdb(path).await?
-            }
-            #[cfg(not(feature = "duckdb"))]
-            {
-                return Err(super::error::ScoutError::Config(
-                    "DuckDB feature not enabled".to_string(),
-                ));
-            }
-        } else {
-            DbConnection::open_sqlite(path).await?
-        };
+        #[cfg(feature = "duckdb")]
+        let conn = DbConnection::open_duckdb(path).await?;
+        #[cfg(not(feature = "duckdb"))]
+        {
+            return Err(super::error::ScoutError::Config(
+                "DuckDB feature not enabled".to_string(),
+            ));
+        }
 
-        let schema_sql = schema_sql(conn.backend_name() == "DuckDB");
+        let schema_sql = schema_sql(true);
         conn.execute_batch(&schema_sql).await?;
         Self::run_migrations(&conn).await?;
 
-        Ok(Self { conn })
+        Ok(Self { conn, _temp_dir: None })
     }
 
     /// Run migrations to add missing columns to existing databases
     async fn run_migrations(conn: &DbConnection) -> Result<()> {
-        let is_duckdb = conn.backend_name() == "DuckDB";
-
         // Migration 1: Add extraction columns (Phase 6)
         let extraction_cols = ["metadata_raw", "extraction_status", "extracted_at"];
         let mut extraction_found = 0;
         for col in extraction_cols {
-            if column_exists(conn, "scout_files", col, is_duckdb).await? {
+            if column_exists(conn, "scout_files", col).await? {
                 extraction_found += 1;
             }
         }
@@ -544,7 +525,7 @@ impl Database {
         let folder_cols = ["parent_path", "name"];
         let mut folder_found = 0;
         for col in folder_cols {
-            if column_exists(conn, "scout_files", col, is_duckdb).await? {
+            if column_exists(conn, "scout_files", col).await? {
                 folder_found += 1;
             }
         }
@@ -559,7 +540,7 @@ impl Database {
         }
 
         // Migration 3: Add extension column for fast filtering by file type
-        if !column_exists(conn, "scout_files", "extension", is_duckdb).await? {
+        if !column_exists(conn, "scout_files", "extension").await? {
             let _ = conn.execute("ALTER TABLE scout_files ADD COLUMN extension TEXT", &[]).await;
             let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_files_extension ON scout_files(source_id, extension)", &[]).await;
         }
@@ -569,11 +550,16 @@ impl Database {
 
     /// Create an in-memory database (for testing).
     pub async fn open_in_memory() -> Result<Self> {
-        let conn = DbConnection::open_sqlite_memory().await?;
-        let schema_sql = schema_sql(false);
+        let temp_dir = Arc::new(TempDir::new()?);
+        let db_path = temp_dir.path().join("scout.duckdb");
+        let conn = DbConnection::open_duckdb(&db_path).await?;
+        let schema_sql = schema_sql(true);
         conn.execute_batch(&schema_sql).await?;
         Self::run_migrations(&conn).await?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            _temp_dir: Some(temp_dir),
+        })
     }
 
     /// Get the underlying connection (for sharing with other code).

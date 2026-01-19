@@ -1,16 +1,14 @@
 #!/bin/bash
-# E2E test for full CLI pipeline: scan → tag → job → process → verify output
+# E2E test for CLI flow: scan -> preview -> run parser -> verify output
 #
-# This test exercises the complete data processing pipeline using a real
-# MCData file and the mcdata_pipeline_parser.py parser.
+# This test exercises a lightweight v1 workflow using a real MCData file
+# (if available) and the mcdata_pipeline_parser.py parser.
 #
 # Tests:
 # 1. Scan input folder to discover files
 # 2. Preview file to understand structure
-# 3. Publish parser to the registry
-# 4. Create job in processing queue
-# 5. Process job with casparian process-job
-# 6. Verify output parquet file exists and contains data
+# 3. Run parser via `casparian run`
+# 4. Verify output parquet files exist
 
 set -e
 
@@ -18,7 +16,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BINARY="$PROJECT_ROOT/target/debug/casparian"
 TEST_DIR=$(mktemp -d)
-DB_FILE="$TEST_DIR/pipeline_test.db"
 OUTPUT_DIR="$TEST_DIR/output"
 PARSER_FILE="$SCRIPT_DIR/parsers/mcdata_pipeline_parser.py"
 
@@ -33,7 +30,6 @@ trap cleanup EXIT
 echo "=== CLI Pipeline E2E Test ==="
 echo "Binary: $BINARY"
 echo "Test dir: $TEST_DIR"
-echo "DB: $DB_FILE"
 echo "Output: $OUTPUT_DIR"
 echo "Parser: $PARSER_FILE"
 echo
@@ -52,103 +48,6 @@ fi
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
-
-# Set up database path (different commands use different env vars)
-export CASPARIAN_DB_PATH="$DB_FILE"
-export CASPARIAN_DB="$DB_FILE"
-
-# Create database with required schema
-echo "Setting up test database..."
-duckdb "$DB_FILE" <<'EOF'
--- Processing queue for jobs (schema matches jobs.rs expectations)
-CREATE TABLE IF NOT EXISTS cf_processing_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    plugin_name TEXT NOT NULL,
-    input_file TEXT,
-    file_id INTEGER,
-    pipeline_run_id TEXT,
-    status TEXT NOT NULL DEFAULT 'PENDING',
-    priority INTEGER DEFAULT 0,
-    created_at TEXT,
-    claim_time TEXT,
-    end_time TEXT,
-    worker_id TEXT,
-    result_summary TEXT,
-    error_message TEXT,
-    retry_count INTEGER DEFAULT 0
-);
-
--- Plugin manifest for deployed parsers
-CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    plugin_name TEXT NOT NULL,
-    version TEXT NOT NULL,
-    source_code TEXT NOT NULL,
-    lockfile_content TEXT,
-    env_hash TEXT,
-    artifact_hash TEXT,
-    signature TEXT,
-    publisher_name TEXT,
-    publisher_email TEXT,
-    status TEXT DEFAULT 'ACTIVE',
-    deployed_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(plugin_name, version)
-);
-
--- Scout files (minimal for test)
-CREATE TABLE IF NOT EXISTS scout_files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    path TEXT NOT NULL
-);
-
--- Parser Lab parsers table (for parser publish command)
-CREATE TABLE IF NOT EXISTS parser_lab_parsers (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    file_pattern TEXT NOT NULL DEFAULT '',
-    pattern_type TEXT DEFAULT 'all',
-    source_code TEXT,
-    validation_status TEXT DEFAULT 'pending',
-    validation_error TEXT,
-    validation_output TEXT,
-    last_validated_at INTEGER,
-    messages_json TEXT,
-    schema_json TEXT,
-    sink_type TEXT DEFAULT 'parquet',
-    sink_config_json TEXT,
-    published_at INTEGER,
-    published_plugin_id INTEGER,
-    is_sample INTEGER DEFAULT 0,
-    output_mode TEXT DEFAULT 'single',
-    detected_topics_json TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
--- Scout files (required by parser show for backtest count)
-CREATE TABLE IF NOT EXISTS scout_files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    rel_path TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    mtime INTEGER NOT NULL,
-    content_hash TEXT,
-    status TEXT NOT NULL DEFAULT 'pending',
-    tag TEXT,
-    tag_source TEXT,
-    rule_id TEXT,
-    manual_plugin TEXT,
-    error TEXT,
-    first_seen_at INTEGER NOT NULL,
-    last_seen_at INTEGER NOT NULL,
-    processed_at INTEGER,
-    sentinel_job_id INTEGER,
-    UNIQUE(source_id, path)
-);
-EOF
-echo "Database schema created."
-echo
 
 # Check if real MCData file exists, otherwise create sample data
 if [ -f "$MCDATA_INPUT" ]; then
@@ -204,189 +103,43 @@ fi
 echo
 
 # ================================================================
-# TEST 3: Publish parser to registry
+# TEST 3: Run parser
 # ================================================================
-echo "--- Test 3: Publish parser ---"
-OUTPUT=$($BINARY parser publish "$PARSER_FILE" --topic mcdata --name mcdata_pipeline 2>&1)
-echo "$OUTPUT"
-if echo "$OUTPUT" | grep -q "Published parser\|Updated parser"; then
-    echo "PASS: Parser published"
-else
-    echo "FAIL: Expected parser publish confirmation"
-    exit 1
-fi
-echo
-
-# ================================================================
-# TEST 4: Verify parser is in registry
-# ================================================================
-echo "--- Test 4: Verify parser in registry ---"
-OUTPUT=$($BINARY parser show mcdata_pipeline 2>&1)
-echo "$OUTPUT"
-if echo "$OUTPUT" | grep -q "mcdata_pipeline"; then
-    echo "PASS: Parser found in registry"
-else
-    echo "FAIL: Expected parser in registry"
-    exit 1
-fi
-echo
-
-# ================================================================
-# TEST 5: Insert parser source into cf_plugin_manifest for process-job
-# ================================================================
-echo "--- Test 5: Deploy parser to plugin manifest ---"
-PARSER_SOURCE=$(cat "$PARSER_FILE" | sed "s/'/''/g")  # Escape single quotes for SQL
-duckdb "$DB_FILE" <<EOF
-INSERT INTO cf_plugin_manifest (plugin_name, version, source_code, status)
-VALUES ('mcdata_pipeline', '1.0.0', '$PARSER_SOURCE', 'ACTIVE');
-EOF
-echo "Parser deployed to cf_plugin_manifest"
-
-# Verify deployment
-COUNT=$(duckdb "$DB_FILE" "SELECT COUNT(*) FROM cf_plugin_manifest WHERE plugin_name='mcdata_pipeline'")
-if [ "$COUNT" -eq "1" ]; then
-    echo "PASS: Parser in plugin manifest"
-else
-    echo "FAIL: Parser not found in manifest"
-    exit 1
-fi
-echo
-
-# ================================================================
-# TEST 6: Create job in processing queue
-# ================================================================
-echo "--- Test 6: Create job in processing queue ---"
-duckdb "$DB_FILE" <<EOF
-INSERT INTO cf_processing_queue (plugin_name, input_file, status, priority)
-VALUES ('mcdata_pipeline', '$INPUT_FILE', 'PENDING', 1);
-EOF
-
-JOB_ID=$(duckdb "$DB_FILE" "SELECT id FROM cf_processing_queue ORDER BY id DESC LIMIT 1")
-echo "Created job ID: $JOB_ID"
-
-# Verify job
-STATUS=$(duckdb "$DB_FILE" "SELECT status FROM cf_processing_queue WHERE id=$JOB_ID")
-if [ "$STATUS" = "PENDING" ]; then
-    echo "PASS: Job created with PENDING status"
-else
-    echo "FAIL: Expected PENDING status, got: $STATUS"
-    exit 1
-fi
-echo
-
-# ================================================================
-# TEST 7: Process the job
-# ================================================================
-echo "--- Test 7: Process job ---"
-echo "Running: $BINARY process-job $JOB_ID --db $DB_FILE --output $OUTPUT_DIR"
-
-# Run process-job and capture both stdout and stderr
-# Don't fail on error - we handle job status separately
+echo "--- Test 3: Run parser ---"
 set +e
-$BINARY process-job "$JOB_ID" --db "$DB_FILE" --output "$OUTPUT_DIR" 2>&1
-PROCESS_EXIT_CODE=$?
+RUN_OUTPUT=$($BINARY run "$PARSER_FILE" "$INPUT_FILE" --sink "parquet://$OUTPUT_DIR/" 2>&1)
+RUN_EXIT_CODE=$?
 set -e
 
-if [ $PROCESS_EXIT_CODE -eq 0 ]; then
-    echo "Process-job completed successfully"
+echo "$RUN_OUTPUT"
+
+if [ $RUN_EXIT_CODE -eq 0 ]; then
+    echo "Parser run completed successfully"
 else
-    echo "Process-job exited with error code $PROCESS_EXIT_CODE (checking status...)"
-fi
-
-# Check job status
-STATUS=$(duckdb "$DB_FILE" "SELECT status FROM cf_processing_queue WHERE id=$JOB_ID")
-echo "Job status after processing: $STATUS"
-
-JOB_PASSED=false
-if [ "$STATUS" = "COMPLETED" ]; then
-    echo "PASS: Job completed successfully"
-    JOB_PASSED=true
-elif [ "$STATUS" = "RUNNING" ]; then
-    echo "INFO: Job still running (may need polars installed)"
-elif [ "$STATUS" = "FAILED" ]; then
-    ERROR_MSG=$(duckdb "$DB_FILE" "SELECT error_message FROM cf_processing_queue WHERE id=$JOB_ID")
-    echo "Job failed with error: $ERROR_MSG"
-    # Check if it's a missing dependency error (acceptable in CI)
-    if echo "$ERROR_MSG" | grep -q "polars\|pandas\|pyarrow\|ModuleNotFoundError"; then
-        echo "SKIP: Job failed due to missing dependencies (polars/pandas/pyarrow - expected in CI)"
-    else
-        echo "FAIL: Job failed with unexpected error"
-        exit 1
+    # Accept missing dependency errors in CI
+    if echo "$RUN_OUTPUT" | grep -qi "uv\|venv\|python\|pyarrow\|pandas\|modulenotfounderror"; then
+        echo "SKIP: Parser run failed due to missing Python dependencies"
+        exit 0
     fi
-else
-    echo "INFO: Unexpected job status: $STATUS"
+    echo "FAIL: Parser run failed"
+    exit 1
 fi
 echo
 
 # ================================================================
-# TEST 8: Verify output exists (if job completed)
+# TEST 4: Verify output
 # ================================================================
-echo "--- Test 8: Verify output ---"
-if [ "$STATUS" = "COMPLETED" ]; then
-    RESULT_PATH=$(duckdb "$DB_FILE" "SELECT result_summary FROM cf_processing_queue WHERE id=$JOB_ID")
-    echo "Result path: $RESULT_PATH"
-
-    if [ -f "$RESULT_PATH" ]; then
-        echo "PASS: Output parquet file exists"
-
-        # Show file size
-        FILE_SIZE=$(ls -lh "$RESULT_PATH" | awk '{print $5}')
-        echo "Output file size: $FILE_SIZE"
-    else
-        echo "INFO: Output file not at expected path"
-        # Check output directory for any parquet files
-        PARQUET_FILES=$(find "$OUTPUT_DIR" -name "*.parquet" 2>/dev/null | head -5)
-        if [ -n "$PARQUET_FILES" ]; then
-            echo "Found parquet files in output directory:"
-            echo "$PARQUET_FILES"
-            echo "PASS: Parquet output generated"
-        else
-            echo "FAIL: No parquet files found in output"
-            exit 1
-        fi
-    fi
+echo "--- Test 4: Verify output ---"
+PARQUET_FILES=$(find "$OUTPUT_DIR" -name "*.parquet" 2>/dev/null | head -5)
+if [ -n "$PARQUET_FILES" ]; then
+    echo "PASS: Parquet output generated"
+    echo "$PARQUET_FILES"
 else
-    echo "SKIP: Job did not complete, skipping output verification"
-fi
-echo
-
-# ================================================================
-# TEST 9: List jobs to verify CLI
-# ================================================================
-echo "--- Test 9: List jobs ---"
-OUTPUT=$($BINARY jobs 2>&1)
-echo "$OUTPUT"
-if echo "$OUTPUT" | grep -q "mcdata_pipeline\|$JOB_ID"; then
-    echo "PASS: Job visible in jobs list"
-else
-    echo "INFO: Job list output may vary based on status"
-fi
-echo
-
-# ================================================================
-# TEST 10: Show specific job details
-# ================================================================
-echo "--- Test 10: Show job details ---"
-OUTPUT=$($BINARY job show "$JOB_ID" 2>&1)
-echo "$OUTPUT"
-if echo "$OUTPUT" | grep -q "$JOB_ID\|mcdata_pipeline\|status"; then
-    echo "PASS: Job details displayed"
-else
-    echo "INFO: Job show output may vary"
+    echo "FAIL: No parquet files found in output"
+    exit 1
 fi
 echo
 
 echo "==================================="
 echo "Pipeline E2E test complete!"
-echo "==================================="
-echo
-echo "Summary:"
-echo "  - Scan: OK"
-echo "  - Preview: OK"
-echo "  - Parser publish: OK"
-echo "  - Job creation: OK"
-echo "  - Job processing: $STATUS"
-if [ "$STATUS" = "COMPLETED" ]; then
-    echo "  - Output verification: OK"
-fi
 echo "==================================="

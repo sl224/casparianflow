@@ -1,4 +1,7 @@
-use rusqlite::{params, Connection};
+mod cli_support;
+
+use casparian_db::{DbConnection, DbValue};
+use cli_support::with_duckdb;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -26,7 +29,7 @@ fn assert_cli_success(output: Output, args: &[String]) {
     );
 }
 
-fn create_tag_schema(conn: &Connection) {
+async fn create_tag_schema(conn: &DbConnection) {
     conn.execute_batch(
         r#"
         CREATE TABLE scout_tagging_rules (
@@ -62,79 +65,101 @@ fn create_tag_schema(conn: &Connection) {
         );
         "#,
     )
+    .await
     .expect("create tag schema");
 }
 
 #[test]
 fn test_tag_and_untag_update_sqlite_db() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.sqlite3");
+    let db_path = home_dir.path().join("casparian_flow.duckdb");
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
     ];
 
     {
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        create_tag_schema(&conn);
+        with_duckdb(&db_path, |conn| async move {
+            create_tag_schema(&conn).await;
 
-        conn.execute(
-            "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-            params!["r1", "src-1", "*.csv", "csv_data", 10],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-            params!["r2", "src-1", "*.json", "json_data", 5],
-        )
-        .unwrap();
-
-        let files = [
-            ("/data/sales.csv", "sales.csv", 1000),
-            ("/data/invoices.csv", "invoices.csv", 2000),
-            ("/data/config.json", "config.json", 500),
-            ("/data/readme.txt", "readme.txt", 100),
-            ("/data/unknown.xyz", "unknown.xyz", 50),
-        ];
-        for (path, rel_path, size) in files {
             conn.execute(
-                "INSERT INTO scout_files (source_id, path, rel_path, size, status)
-                 VALUES ('src-1', ?1, ?2, ?3, 'pending')",
-                params![path, rel_path, size],
+                "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
+                 VALUES (?, ?, ?, ?, ?, 1)",
+                &[
+                    DbValue::from("r1"),
+                    DbValue::from("src-1"),
+                    DbValue::from("*.csv"),
+                    DbValue::from("csv_data"),
+                    DbValue::from(10i32),
+                ],
             )
+            .await
             .unwrap();
-        }
+            conn.execute(
+                "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
+                 VALUES (?, ?, ?, ?, ?, 1)",
+                &[
+                    DbValue::from("r2"),
+                    DbValue::from("src-1"),
+                    DbValue::from("*.json"),
+                    DbValue::from("json_data"),
+                    DbValue::from(5i32),
+                ],
+            )
+            .await
+            .unwrap();
+
+            let files = [
+                ("/data/sales.csv", "sales.csv", 1000),
+                ("/data/invoices.csv", "invoices.csv", 2000),
+                ("/data/config.json", "config.json", 500),
+                ("/data/readme.txt", "readme.txt", 100),
+                ("/data/unknown.xyz", "unknown.xyz", 50),
+            ];
+            for (path, rel_path, size) in files {
+                conn.execute(
+                    "INSERT INTO scout_files (source_id, path, rel_path, size, status)
+                     VALUES ('src-1', ?, ?, ?, 'pending')",
+                    &[
+                        DbValue::from(path),
+                        DbValue::from(rel_path),
+                        DbValue::from(size),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        });
     }
 
     let tag_args = vec!["tag".to_string()];
     assert_cli_success(run_cli(&tag_args, &envs), &tag_args);
 
     {
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        let csv_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM scout_files WHERE tag = 'csv_data'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let json_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM scout_files WHERE tag = 'json_data'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let untagged_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM scout_files WHERE tag IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let (csv_count, json_count, untagged_count) = with_duckdb(&db_path, |conn| async move {
+            let csv_count = conn
+                .query_scalar::<i64>(
+                    "SELECT COUNT(*) FROM scout_files WHERE tag = 'csv_data'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            let json_count = conn
+                .query_scalar::<i64>(
+                    "SELECT COUNT(*) FROM scout_files WHERE tag = 'json_data'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            let untagged_count = conn
+                .query_scalar::<i64>(
+                    "SELECT COUNT(*) FROM scout_files WHERE tag IS NULL",
+                    &[],
+                )
+                .await
+                .unwrap();
+            (csv_count, json_count, untagged_count)
+        });
         assert_eq!(csv_count, 2);
         assert_eq!(json_count, 1);
         assert_eq!(untagged_count, 2);
@@ -148,14 +173,21 @@ fn test_tag_and_untag_update_sqlite_db() {
     assert_cli_success(run_cli(&manual_args, &envs), &manual_args);
 
     {
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        let (tag, tag_source): (Option<String>, Option<String>) = conn
-            .query_row(
-                "SELECT tag, tag_source FROM scout_files WHERE path = ?1",
-                params!["/data/unknown.xyz"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let (tag, tag_source) = with_duckdb(&db_path, |conn| async move {
+            let row = conn
+                .query_optional(
+                    "SELECT tag, tag_source FROM scout_files WHERE path = ?",
+                    &[DbValue::from("/data/unknown.xyz")],
+                )
+                .await
+                .unwrap();
+            row.and_then(|r| {
+                let tag: Option<String> = r.get_by_name("tag").ok().flatten();
+                let tag_source: Option<String> = r.get_by_name("tag_source").ok().flatten();
+                Some((tag, tag_source))
+            })
+            .unwrap_or((None, None))
+        });
         assert_eq!(tag.as_deref(), Some("custom_tag"));
         assert_eq!(tag_source.as_deref(), Some("manual"));
     }
@@ -164,14 +196,21 @@ fn test_tag_and_untag_update_sqlite_db() {
     assert_cli_success(run_cli(&untag_args, &envs), &untag_args);
 
     {
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        let (final_tag, status): (Option<String>, String) = conn
-            .query_row(
-                "SELECT tag, status FROM scout_files WHERE path = ?1",
-                params!["/data/unknown.xyz"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let (final_tag, status) = with_duckdb(&db_path, |conn| async move {
+            let row = conn
+                .query_optional(
+                    "SELECT tag, status FROM scout_files WHERE path = ?",
+                    &[DbValue::from("/data/unknown.xyz")],
+                )
+                .await
+                .unwrap();
+            row.and_then(|r| {
+                let final_tag: Option<String> = r.get_by_name("tag").ok().flatten();
+                let status: String = r.get_by_name("status").unwrap_or_default();
+                Some((final_tag, status))
+            })
+            .unwrap_or((None, String::new()))
+        });
         assert!(final_tag.is_none());
         assert_eq!(status, "pending");
     }
@@ -180,45 +219,47 @@ fn test_tag_and_untag_update_sqlite_db() {
 #[test]
 fn test_pipeline_run_enqueues_jobs() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.sqlite3");
+    let db_path = home_dir.path().join("casparian_flow.duckdb");
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [
         ("CASPARIAN_HOME", home_str.as_str()),
-        ("CASPARIAN_DB_BACKEND", "sqlite"),
     ];
 
     {
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE scout_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_id TEXT NOT NULL,
-                path TEXT NOT NULL,
-                rel_path TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                mtime INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                tag TEXT,
-                extension TEXT
-            );
-            "#,
-        )
-        .unwrap();
-
-        let files = [
-            ("/data/demo/a.csv", "a.csv"),
-            ("/data/demo/b.csv", "b.csv"),
-            ("/data/demo/c.csv", "c.csv"),
-        ];
-        for (path, rel_path) in files {
-            conn.execute(
-                "INSERT INTO scout_files (source_id, path, rel_path, size, mtime, status, tag, extension)
-                 VALUES ('src-1', ?1, ?2, 100, 1737187200000, 'pending', 'demo', 'csv')",
-                params![path, rel_path],
+        with_duckdb(&db_path, |conn| async move {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE scout_files (
+                    id BIGINT,
+                    source_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    rel_path TEXT NOT NULL,
+                    size BIGINT NOT NULL,
+                    mtime BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    tag TEXT,
+                    extension TEXT
+                );
+                "#,
             )
+            .await
             .unwrap();
-        }
+
+            let files = [
+                ("/data/demo/a.csv", "a.csv"),
+                ("/data/demo/b.csv", "b.csv"),
+                ("/data/demo/c.csv", "c.csv"),
+            ];
+            for (path, rel_path) in files {
+                conn.execute(
+                    "INSERT INTO scout_files (source_id, path, rel_path, size, mtime, status, tag, extension)
+                     VALUES ('src-1', ?, ?, 100, 1737187200000, 'pending', 'demo', 'csv')",
+                    &[DbValue::from(path), DbValue::from(rel_path)],
+                )
+                .await
+                .unwrap();
+            }
+        });
     }
 
     let pipeline_file = home_dir.path().join("pipeline.yaml");
@@ -250,13 +291,13 @@ fn test_pipeline_run_enqueues_jobs() {
     ];
     assert_cli_success(run_cli(&run_args, &envs), &run_args);
 
-    let conn = Connection::open(&db_path).expect("open sqlite db");
-    let queued_count: i64 = conn
-        .query_row(
+    let queued_count = with_duckdb(&db_path, |conn| async move {
+        conn.query_scalar::<i64>(
             "SELECT COUNT(*) FROM cf_processing_queue WHERE plugin_name = 'demo_parser'",
-            [],
-            |row| row.get(0),
+            &[],
         )
-        .unwrap();
+        .await
+        .unwrap()
+    });
     assert_eq!(queued_count, 3);
 }

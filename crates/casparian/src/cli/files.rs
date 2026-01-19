@@ -10,12 +10,12 @@
 //! - `--tag <tag>` - Tag matching files
 //! - `--limit <n>` - Maximum files to display
 //!
-//! Uses crate::scout::Database as the single source of truth.
+//! Uses casparian::scout::Database as the single source of truth.
 
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table_colored};
-use crate::scout::{Database, FileStatus, ScannedFile};
+use casparian::scout::{Database, FileStatus, ScannedFile};
 use comfy_table::Color;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
