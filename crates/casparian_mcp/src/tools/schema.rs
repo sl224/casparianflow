@@ -13,7 +13,7 @@ use crate::types::{
 use async_trait::async_trait;
 use casparian_schema::{
     approval::{ApprovedColumn, ApprovedSchemaVariant, SchemaApprovalRequest},
-    DataType, SchemaStorage,
+    AmendmentId, ContractId, DataType, DiscoveryId, SchemaStorage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1070,7 +1070,7 @@ impl Tool for ApproveSchemasTool {
         }
 
         // Create approval request
-        let discovery_id = Uuid::new_v4();
+        let discovery_id = DiscoveryId::new();
         let mut request = SchemaApprovalRequest::new(
             discovery_id,
             parser_id,
@@ -1222,7 +1222,7 @@ impl Tool for ProposeAmendmentTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("Missing required 'contract_id' parameter".into()))?;
 
-        let contract_id = Uuid::parse_str(contract_id_str)
+        let contract_id = ContractId::parse(contract_id_str)
             .map_err(|e| ToolError::InvalidParams(format!("Invalid contract_id: {}", e)))?;
 
         let amendment_type = args
@@ -1311,7 +1311,7 @@ impl Tool for ProposeAmendmentTool {
         };
 
         // Create amendment ID
-        let amendment_id = Uuid::new_v4();
+        let amendment_id = AmendmentId::new();
 
         // Build workflow metadata - amendment proposed, needs approval
         let decision = HumanDecision::new(format!("Approve amendment: {}?", reason))

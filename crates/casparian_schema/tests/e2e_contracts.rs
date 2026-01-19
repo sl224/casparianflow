@@ -17,14 +17,14 @@ use casparian_schema::{
     contract::{DataType, LockedColumn, LockedSchema, SchemaContract, SchemaViolation, ViolationType},
     storage::SchemaStorage,
 };
-use uuid::Uuid;
+use casparian_schema::{ContractId, DiscoveryId};
 
 const TEST_PARSER_ID: &str = "parser-test";
 const TEST_PARSER_VERSION: &str = "1.0.0";
 
 fn new_approval_request(approved_by: &str) -> SchemaApprovalRequest {
     SchemaApprovalRequest::new(
-        Uuid::new_v4(),
+        DiscoveryId::new(),
         TEST_PARSER_ID,
         TEST_PARSER_VERSION,
         approved_by,
@@ -919,7 +919,7 @@ async fn test_delete_sql_injection_safety() {
     storage.save_contract(&legit_contract).await.unwrap();
 
     // Try to delete with injection
-    let malicious_id = Uuid::new_v4();  // Random UUID - won't match legitimate
+    let malicious_id = ContractId::new();  // Random ID - won't match legitimate
     let result = storage.delete_contract(&malicious_id).await;
     assert!(result.is_ok());
 

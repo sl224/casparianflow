@@ -28,11 +28,13 @@
 //! - Timeout
 //! - User stopped
 
+pub mod ids;
 pub mod failfast;
 pub mod high_failure;
 pub mod iteration;
 pub mod metrics;
 
+pub use ids::{FileId, IdParseError, ScopeId};
 pub use failfast::*;
 pub use high_failure::*;
 pub use iteration::*;

@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend};
 
 use crate::db::{models::*, JobQueue};
-use casparian_db::{DbConnection, DbValue, UnifiedDbRow};
+use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
 use crate::metrics::METRICS;
 
 /// Workers are considered stale after this many seconds without heartbeat
@@ -915,7 +915,7 @@ impl Sentinel {
 
         // 3. Execute all DB operations in a transaction
         self.conn.execute("BEGIN TRANSACTION", &[]).await?;
-        let now = chrono::Utc::now();
+        let now = DbTimestamp::now();
 
         // 3a. Upsert the plugin environment (lockfile)
         if !cmd.lockfile_content.is_empty() {
@@ -931,9 +931,9 @@ impl Sentinel {
                         DbValue::from(cmd.env_hash.as_str()),
                         DbValue::from(cmd.lockfile_content.as_str()),
                         DbValue::from(cmd.lockfile_content.len() as f64 / 1_000_000.0),
-                        DbValue::from(now),
-                        DbValue::from(now),
-                        DbValue::from(now),
+                        DbValue::from(now.clone()),
+                        DbValue::from(now.clone()),
+                        DbValue::from(now.clone()),
                     ],
                 )
                 .await
@@ -960,7 +960,7 @@ impl Sentinel {
                     DbValue::from(source_hash.as_str()),
                     DbValue::from(cmd.env_hash.as_str()),
                     DbValue::from(cmd.artifact_hash.as_str()),
-                    DbValue::from(now),
+                    DbValue::from(now.clone()),
                 ],
             )
             .await
@@ -1161,7 +1161,7 @@ impl Sentinel {
                 WHERE id = ?
                 "#,
                 &[
-                    DbValue::from(chrono::Utc::now()),
+                    DbValue::from(DbTimestamp::now()),
                     DbValue::from(full_error.as_str()),
                     DbValue::from(job_id),
                 ],
@@ -1195,13 +1195,13 @@ impl Sentinel {
             // Check threshold
             if h.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
                 // Trip the circuit breaker
-                let now = chrono::Utc::now();
+                let now = DbTimestamp::now();
                 self.conn
                     .execute(
                         "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
                         &[
-                            DbValue::from(now),
-                            DbValue::from(now),
+                            DbValue::from(now.clone()),
+                            DbValue::from(now.clone()),
                             DbValue::from(parser_name),
                         ],
                     )
@@ -1221,7 +1221,7 @@ impl Sentinel {
 
     /// Record successful execution (resets consecutive failures).
     async fn record_success(&self, parser_name: &str) -> Result<()> {
-        let now = chrono::Utc::now();
+        let now = DbTimestamp::now();
         self.conn
             .execute(
                 r#"
@@ -1235,9 +1235,9 @@ impl Sentinel {
                 "#,
                 &[
                     DbValue::from(parser_name),
-                    DbValue::from(now),
-                    DbValue::from(now),
-                    DbValue::from(now),
+                    DbValue::from(now.clone()),
+                    DbValue::from(now.clone()),
+                    DbValue::from(now.clone()),
                 ],
             )
             .await?;
@@ -1248,7 +1248,7 @@ impl Sentinel {
 
     /// Record failed execution (increments consecutive failures).
     async fn record_failure(&self, parser_name: &str, reason: &str) -> Result<()> {
-        let now = chrono::Utc::now();
+        let now = DbTimestamp::now();
         self.conn
             .execute(
                 r#"
@@ -1263,10 +1263,10 @@ impl Sentinel {
                 &[
                     DbValue::from(parser_name),
                     DbValue::from(reason),
-                    DbValue::from(now),
-                    DbValue::from(now),
+                    DbValue::from(now.clone()),
+                    DbValue::from(now.clone()),
                     DbValue::from(reason),
-                    DbValue::from(now),
+                    DbValue::from(now.clone()),
                 ],
             )
             .await?;

@@ -67,7 +67,7 @@ async fn test_worker_heartbeat_responsiveness() -> Result<()> {
 
     // 3. Connect Worker
     let worker_handle = tokio::spawn(async move {
-        let (worker, _shutdown_tx) = Worker::connect(config)
+        let (worker, _worker_handle) = Worker::connect(config)
             .await
             .expect("Worker failed to connect");
         worker.run().await.expect("Worker run failed");
@@ -177,7 +177,7 @@ async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     };
 
     // 3. Connect Worker and get shutdown handle
-    let (worker, shutdown_tx) = Worker::connect(config).await?;
+    let (worker, shutdown_handle) = Worker::connect(config).await?;
 
     let concluded = Arc::new(AtomicBool::new(false));
     let concluded_clone = concluded.clone();
@@ -222,7 +222,9 @@ async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 8. Send shutdown signal
-    shutdown_tx.send(()).await?;
+    shutdown_handle
+        .shutdown_gracefully(Duration::from_secs(5))
+        .await?;
 
     // 9. Worker should send CONCLUDE before exiting (even for failed job)
     let conclude_result = timeout(Duration::from_secs(10), async {

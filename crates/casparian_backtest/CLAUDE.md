@@ -37,14 +37,14 @@ SQLite-backed tracking of files that consistently fail:
 
 ```rust
 pub struct HighFailureFile {
-    pub file_id: Uuid,
+    pub file_id: FileId,
     pub file_path: String,
-    pub scope_id: Uuid,
+    pub scope_id: ScopeId,
     pub failure_count: usize,         // Total failures ever
     pub consecutive_failures: usize,  // Resets on success
-    pub first_failure_at: DateTime<Utc>,
-    pub last_failure_at: DateTime<Utc>,
-    pub last_tested_at: DateTime<Utc>,
+    pub first_failure_at: DbTimestamp,
+    pub last_failure_at: DbTimestamp,
+    pub last_tested_at: DbTimestamp,
     pub failure_history: Vec<FailureHistoryEntry>,
 }
 ```
@@ -61,7 +61,7 @@ pub struct FailureHistoryEntry {
     pub error_message: String,
     pub resolved: bool,           // Was this later fixed?
     pub resolved_by: Option<String>,
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: DbTimestamp,
 }
 ```
 
@@ -343,7 +343,7 @@ impl EarlyTerminator for CustomTerminator {
 #[test]
 fn test_consecutive_failures_increment() {
     let table = create_test_table();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     // First failure
     let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
@@ -359,7 +359,7 @@ fn test_consecutive_failures_increment() {
 #[test]
 fn test_success_resets_consecutive() {
     let table = create_test_table();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     // Record failures
     let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
@@ -393,7 +393,7 @@ fn test_complete_backtest_workflow() {
     let runner = BacktestRunner::new(config, Box::new(parser));
 
     let files = get_test_files(&temp_dir);
-    let result = runner.run(&files, &Uuid::new_v4()).unwrap();
+    let result = runner.run(&files, &ScopeId::new()).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {

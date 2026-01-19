@@ -19,7 +19,7 @@
 //! # Example (Legacy sqlx API)
 //!
 //! ```rust,ignore
-//! use casparian_db::{DbConfig, create_pool};
+//! use casparian_db::legacy::{DbConfig, create_pool};
 //!
 //! let config = DbConfig::sqlite("./data.db");
 //! let pool = create_pool(config).await?;
@@ -28,7 +28,7 @@
 //! # Example (New Unified API)
 //!
 //! ```rust,ignore
-//! use casparian_db::backend::DbConnection;
+//! use casparian_db::DbConnection;
 //!
 //! // SQLite
 //! let conn = DbConnection::open_sqlite(Path::new("./data.db")).await?;
@@ -47,13 +47,27 @@ pub mod lock;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod pool;
 
-pub use backend::{AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbTransaction, DbValue, FromDbValue};
+pub use backend::{
+    AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbTimestamp,
+    DbTimestampError, DbTransaction, DbValue, FromDbValue,
+};
 pub use license::{License, LicenseError, LicenseTier};
 pub use lock::{lock_path_for, DbLockGuard, LockError};
 #[cfg(feature = "duckdb")]
 pub use lock::{is_locked, lock_exclusive, try_lock_exclusive, try_lock_shared};
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub use pool::{create_pool, DbConfig, DbError, DbPool, DbRow};
+pub mod legacy {
+    #[deprecated(note = "Legacy sqlx pool API. Use DbConnection instead.")]
+    pub use super::pool::create_pool;
+    #[deprecated(note = "Legacy sqlx pool API. Use DbConnection instead.")]
+    pub use super::pool::DbConfig;
+    #[deprecated(note = "Legacy sqlx pool API. Use DbConnection instead.")]
+    pub use super::pool::DbError;
+    #[deprecated(note = "Legacy sqlx pool API. Use DbConnection instead.")]
+    pub use super::pool::DbPool;
+    #[deprecated(note = "Legacy sqlx pool API. Use DbConnection instead.")]
+    pub use super::pool::DbRow;
+}
 
 /// Database backend type.
 ///

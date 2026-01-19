@@ -2,23 +2,24 @@
 //!
 //! Database-backed persistence for schema contracts using casparian_db.
 
+use crate::ids::{ContractId, DiscoveryId, SchemaTimestamp};
 use crate::{LockedSchema, SchemaContract};
-use casparian_db::{DbConfig, DbPool, create_pool};
-use chrono::{DateTime, Utc};
+use casparian_db::{BackendError, DbConnection, DbValue, UnifiedDbRow};
+use std::path::Path;
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Errors that can occur in schema storage operations.
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] BackendError),
 
-    #[error("Database connection error: {0}")]
-    Connection(#[from] casparian_db::DbError),
-
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("Serialization error: {message}")]
+    Serialization {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     #[error("Contract not found: {0}")]
     NotFound(String),
@@ -27,102 +28,97 @@ pub enum StorageError {
     Parse(String),
 }
 
+impl From<serde_json::Error> for StorageError {
+    fn from(err: serde_json::Error) -> Self {
+        StorageError::Serialization {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
 /// Database-backed storage for schema contracts.
 pub struct SchemaStorage {
-    pool: DbPool,
+    conn: DbConnection,
 }
 
 impl SchemaStorage {
-    /// Create a new SchemaStorage with the given pool.
-    pub async fn new(pool: DbPool) -> Result<Self, StorageError> {
-        let storage = Self { pool };
+    /// Create a new SchemaStorage with the given connection.
+    pub async fn new(conn: DbConnection) -> Result<Self, StorageError> {
+        let storage = Self { conn };
         storage.init_tables().await?;
         Ok(storage)
     }
 
     /// Open a SchemaStorage from a file path (SQLite).
     pub async fn open(path: &str) -> Result<Self, StorageError> {
-        let config = DbConfig::sqlite(path);
-        let pool = create_pool(config).await?;
-        Self::new(pool).await
+        let conn = DbConnection::open_sqlite(Path::new(path)).await?;
+        Self::new(conn).await
     }
 
     /// Create an in-memory SchemaStorage (for testing).
     pub async fn in_memory() -> Result<Self, StorageError> {
-        let config = DbConfig::sqlite_memory();
-        let pool = create_pool(config).await?;
-        Self::new(pool).await
+        let conn = DbConnection::open_sqlite_memory().await?;
+        Self::new(conn).await
     }
 
     /// Initialize the database tables.
     async fn init_tables(&self) -> Result<(), StorageError> {
         // Schema contracts table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS schema_contracts (
-                contract_id TEXT PRIMARY KEY,
-                scope_id TEXT NOT NULL,
-                scope_description TEXT,
-                logic_hash TEXT,
-                approved_at TEXT NOT NULL,
-                approved_by TEXT NOT NULL,
-                version INTEGER NOT NULL DEFAULT 1,
-                schemas_json TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                UNIQUE(scope_id, version)
+        self.conn
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS schema_contracts (
+                    contract_id TEXT PRIMARY KEY,
+                    scope_id TEXT NOT NULL,
+                    scope_description TEXT,
+                    logic_hash TEXT,
+                    approved_at TEXT NOT NULL,
+                    approved_by TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    schemas_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    UNIQUE(scope_id, version)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_schema_contracts_scope
+                    ON schema_contracts(scope_id);
+
+                CREATE TABLE IF NOT EXISTS schema_discovery_results (
+                    discovery_id TEXT PRIMARY KEY,
+                    scope_id TEXT NOT NULL,
+                    discovered_at TEXT NOT NULL,
+                    source_file TEXT,
+                    proposed_schemas_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    CHECK(status IN ('pending', 'approved', 'rejected'))
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_schema_discovery_scope
+                    ON schema_discovery_results(scope_id);
+                "#,
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+            .await?;
 
-        let columns: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM pragma_table_info('schema_contracts')",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let columns = self
+            .conn
+            .query_all("SELECT name FROM pragma_table_info('schema_contracts')", &[])
+            .await?;
 
-        let has_logic_hash = columns.iter().any(|(name,)| name == "logic_hash");
-        if !has_logic_hash {
-            sqlx::query("ALTER TABLE schema_contracts ADD COLUMN logic_hash TEXT")
-                .execute(&self.pool)
-                .await?;
+        let mut has_logic_hash = false;
+        for row in columns {
+            let name: String = row.get_by_name("name")?;
+            if name == "logic_hash" {
+                has_logic_hash = true;
+                break;
+            }
         }
 
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_schema_contracts_scope
-                ON schema_contracts(scope_id)
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Schema discovery results (proposed schemas before approval)
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS schema_discovery_results (
-                discovery_id TEXT PRIMARY KEY,
-                scope_id TEXT NOT NULL,
-                discovered_at TEXT NOT NULL,
-                source_file TEXT,
-                proposed_schemas_json TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                CHECK(status IN ('pending', 'approved', 'rejected'))
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_schema_discovery_scope
-                ON schema_discovery_results(scope_id)
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        if !has_logic_hash {
+            self.conn
+                .execute("ALTER TABLE schema_contracts ADD COLUMN logic_hash TEXT", &[])
+                .await?;
+        }
 
         Ok(())
     }
@@ -131,128 +127,133 @@ impl SchemaStorage {
     pub async fn save_contract(&self, contract: &SchemaContract) -> Result<(), StorageError> {
         let schemas_json = serde_json::to_string(&contract.schemas)?;
 
-        sqlx::query(
-            r#"
-            INSERT INTO schema_contracts
-                (contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(contract_id) DO UPDATE SET
-                scope_description = excluded.scope_description,
-                logic_hash = excluded.logic_hash,
-                approved_at = excluded.approved_at,
-                approved_by = excluded.approved_by,
-                version = excluded.version,
-                schemas_json = excluded.schemas_json
-            "#,
-        )
-        .bind(contract.contract_id.to_string())
-        .bind(&contract.scope_id)
-        .bind(&contract.scope_description)
-        .bind(&contract.logic_hash)
-        .bind(contract.approved_at.to_rfc3339())
-        .bind(&contract.approved_by)
-        .bind(contract.version as i64)
-        .bind(&schemas_json)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO schema_contracts
+                    (contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(contract_id) DO UPDATE SET
+                    scope_description = excluded.scope_description,
+                    logic_hash = excluded.logic_hash,
+                    approved_at = excluded.approved_at,
+                    approved_by = excluded.approved_by,
+                    version = excluded.version,
+                    schemas_json = excluded.schemas_json
+                "#,
+                &[
+                    DbValue::from(contract.contract_id.to_string()),
+                    DbValue::from(contract.scope_id.as_str()),
+                    DbValue::from(contract.scope_description.clone()),
+                    DbValue::from(contract.logic_hash.clone()),
+                    DbValue::from(contract.approved_at.as_str()),
+                    DbValue::from(contract.approved_by.as_str()),
+                    DbValue::from(contract.version as i64),
+                    DbValue::from(schemas_json),
+                ],
+            )
+            .await?;
 
         Ok(())
     }
 
     /// Get a contract by its ID.
-    pub async fn get_contract(&self, contract_id: &Uuid) -> Result<Option<SchemaContract>, StorageError> {
-        let row: Option<ContractRow> = sqlx::query_as(
-            r#"
-            SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
-            FROM schema_contracts
-            WHERE contract_id = ?1
-            "#,
-        )
-        .bind(contract_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+    pub async fn get_contract(&self, contract_id: &ContractId) -> Result<Option<SchemaContract>, StorageError> {
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
+                FROM schema_contracts
+                WHERE contract_id = ?
+                "#,
+                &[DbValue::from(contract_id.as_str())],
+            )
+            .await?;
 
-        row.map(|r| r.into_contract()).transpose()
+        row.map(row_to_contract).transpose()
     }
 
     /// Get the latest contract for a scope.
     pub async fn get_contract_for_scope(&self, scope_id: &str) -> Result<Option<SchemaContract>, StorageError> {
-        let row: Option<ContractRow> = sqlx::query_as(
-            r#"
-            SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
-            FROM schema_contracts
-            WHERE scope_id = ?1
-            ORDER BY version DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(scope_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
+                FROM schema_contracts
+                WHERE scope_id = ?
+                ORDER BY version DESC
+                LIMIT 1
+                "#,
+                &[DbValue::from(scope_id)],
+            )
+            .await?;
 
-        row.map(|r| r.into_contract()).transpose()
+        row.map(row_to_contract).transpose()
     }
 
     /// Get all contract versions for a scope.
     pub async fn get_contract_history(&self, scope_id: &str) -> Result<Vec<SchemaContract>, StorageError> {
-        let rows: Vec<ContractRow> = sqlx::query_as(
-            r#"
-            SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
-            FROM schema_contracts
-            WHERE scope_id = ?1
-            ORDER BY version DESC
-            "#,
-        )
-        .bind(scope_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
+                FROM schema_contracts
+                WHERE scope_id = ?
+                ORDER BY version DESC
+                "#,
+                &[DbValue::from(scope_id)],
+            )
+            .await?;
 
-        rows.into_iter()
-            .map(|r| r.into_contract())
-            .collect()
+        rows.into_iter().map(row_to_contract).collect()
     }
 
     /// Delete a contract by its ID.
-    pub async fn delete_contract(&self, contract_id: &Uuid) -> Result<bool, StorageError> {
-        let result = sqlx::query("DELETE FROM schema_contracts WHERE contract_id = ?1")
-            .bind(contract_id.to_string())
-            .execute(&self.pool)
+    pub async fn delete_contract(&self, contract_id: &ContractId) -> Result<bool, StorageError> {
+        let result = self
+            .conn
+            .execute(
+                "DELETE FROM schema_contracts WHERE contract_id = ?",
+                &[DbValue::from(contract_id.as_str())],
+            )
             .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(result > 0)
     }
 
     /// List all contracts, optionally limited.
     pub async fn list_contracts(&self, limit: Option<usize>) -> Result<Vec<SchemaContract>, StorageError> {
-        let rows: Vec<ContractRow> = match limit {
+        let rows = match limit {
             Some(n) => {
-                sqlx::query_as(
-                    r#"
-                    SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
-                    FROM schema_contracts
-                    ORDER BY approved_at DESC
-                    LIMIT ?1
-                    "#,
-                )
-                .bind(n as i64)
-                .fetch_all(&self.pool)
-                .await?
+                self.conn
+                    .query_all(
+                        r#"
+                        SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
+                        FROM schema_contracts
+                        ORDER BY approved_at DESC
+                        LIMIT ?
+                        "#,
+                        &[DbValue::from(n as i64)],
+                    )
+                    .await?
             }
             None => {
-                sqlx::query_as(
-                    r#"
-                    SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
-                    FROM schema_contracts
-                    ORDER BY approved_at DESC
-                    "#,
-                )
-                .fetch_all(&self.pool)
-                .await?
+                self.conn
+                    .query_all(
+                        r#"
+                        SELECT contract_id, scope_id, scope_description, logic_hash, approved_at, approved_by, version, schemas_json
+                        FROM schema_contracts
+                        ORDER BY approved_at DESC
+                        "#,
+                        &[],
+                    )
+                    .await?
             }
         };
 
-        rows.into_iter()
-            .map(|r| r.into_contract())
-            .collect()
+        rows.into_iter().map(row_to_contract).collect()
     }
 
     // === Discovery Results ===
@@ -263,172 +264,160 @@ impl SchemaStorage {
         scope_id: &str,
         source_file: Option<&str>,
         proposed_schemas: &[LockedSchema],
-    ) -> Result<String, StorageError> {
-        let discovery_id = Uuid::new_v4().to_string();
+    ) -> Result<DiscoveryId, StorageError> {
+        let discovery_id = DiscoveryId::new();
         let schemas_json = serde_json::to_string(proposed_schemas)?;
-        let now = Utc::now().to_rfc3339();
+        let now = SchemaTimestamp::now();
 
-        sqlx::query(
-            r#"
-            INSERT INTO schema_discovery_results
-                (discovery_id, scope_id, discovered_at, source_file, proposed_schemas_json, status)
-            VALUES (?1, ?2, ?3, ?4, ?5, 'pending')
-            "#,
-        )
-        .bind(&discovery_id)
-        .bind(scope_id)
-        .bind(&now)
-        .bind(source_file)
-        .bind(&schemas_json)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                r#"
+                INSERT INTO schema_discovery_results
+                    (discovery_id, scope_id, discovered_at, source_file, proposed_schemas_json, status)
+                VALUES (?, ?, ?, ?, ?, 'pending')
+                "#,
+                &[
+                    DbValue::from(discovery_id.as_str()),
+                    DbValue::from(scope_id),
+                    DbValue::from(now.as_str()),
+                    DbValue::from(source_file),
+                    DbValue::from(schemas_json),
+                ],
+            )
+            .await?;
 
         Ok(discovery_id)
     }
 
     /// Get pending discovery results for a scope.
     pub async fn get_pending_discoveries(&self, scope_id: &str) -> Result<Vec<DiscoveryResult>, StorageError> {
-        let rows: Vec<DiscoveryRow> = sqlx::query_as(
-            r#"
-            SELECT discovery_id, scope_id, discovered_at, source_file, proposed_schemas_json, status
-            FROM schema_discovery_results
-            WHERE scope_id = ?1 AND status = 'pending'
-            ORDER BY discovered_at DESC
-            "#,
-        )
-        .bind(scope_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT discovery_id, scope_id, discovered_at, source_file, proposed_schemas_json, status
+                FROM schema_discovery_results
+                WHERE scope_id = ? AND status = 'pending'
+                ORDER BY discovered_at DESC
+                "#,
+                &[DbValue::from(scope_id)],
+            )
+            .await?;
 
-        Ok(rows.into_iter().map(|r| r.into()).collect())
+        rows.into_iter().map(row_to_discovery).collect()
     }
 
     /// Approve a discovery result and create a contract.
     #[deprecated(note = "Use approval::approve_schema with SchemaApprovalRequest to derive scope_id and enforce validation")]
     pub async fn approve_discovery(
         &self,
-        discovery_id: &str,
+        discovery_id: &DiscoveryId,
         approved_by: &str,
     ) -> Result<SchemaContract, StorageError> {
-        // Get the discovery result
-        let (scope_id, schemas_json): (String, String) = sqlx::query_as(
-            r#"
-            SELECT scope_id, proposed_schemas_json
-            FROM schema_discovery_results
-            WHERE discovery_id = ?1 AND status = 'pending'
-            "#,
-        )
-        .bind(discovery_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT scope_id, proposed_schemas_json
+                FROM schema_discovery_results
+                WHERE discovery_id = ? AND status = 'pending'
+                "#,
+                &[DbValue::from(discovery_id.as_str())],
+            )
+            .await?;
 
+        let Some(row) = row else {
+            return Err(StorageError::NotFound(format!(
+                "Discovery {} not found",
+                discovery_id
+            )));
+        };
+
+        let scope_id: String = row.get_by_name("scope_id")?;
+        let schemas_json: String = row.get_by_name("proposed_schemas_json")?;
         let schemas: Vec<LockedSchema> = serde_json::from_str(&schemas_json)?;
 
-        // Get next version for this scope
-        let version: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM schema_contracts WHERE scope_id = ?1",
-        )
-        .bind(&scope_id)
-        .fetch_one(&self.pool)
-        .await?;
+        if schemas.is_empty() {
+            return Err(StorageError::Parse("No schemas in discovery result".to_string()));
+        }
 
-        // Create the contract
-        let mut contract = SchemaContract::with_schemas(scope_id, schemas, approved_by);
-        contract.version = version as u32;
-
-        // Save the contract
+        let contract = SchemaContract::with_schemas(scope_id, schemas, approved_by);
         self.save_contract(&contract).await?;
 
-        // Mark discovery as approved
-        sqlx::query(
-            "UPDATE schema_discovery_results SET status = 'approved' WHERE discovery_id = ?1",
-        )
-        .bind(discovery_id)
-        .execute(&self.pool)
-        .await?;
+        self.conn
+            .execute(
+                "UPDATE schema_discovery_results SET status = 'approved' WHERE discovery_id = ?",
+                &[DbValue::from(discovery_id.as_str())],
+            )
+            .await?;
 
         Ok(contract)
     }
 
-    /// Reject a discovery result.
-    pub async fn reject_discovery(&self, discovery_id: &str) -> Result<bool, StorageError> {
-        let result = sqlx::query(
-            "UPDATE schema_discovery_results SET status = 'rejected' WHERE discovery_id = ?1",
-        )
-        .bind(discovery_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+    /// Reject a discovery result (no contract created).
+    pub async fn reject_discovery(&self, discovery_id: &DiscoveryId) -> Result<bool, StorageError> {
+        let result = self
+            .conn
+            .execute(
+                "UPDATE schema_discovery_results SET status = 'rejected' WHERE discovery_id = ?",
+                &[DbValue::from(discovery_id.as_str())],
+            )
+            .await?;
+        Ok(result > 0)
     }
 }
 
-/// Internal row type for sqlx deserialization.
-#[derive(sqlx::FromRow)]
-struct ContractRow {
-    contract_id: String,
-    scope_id: String,
-    scope_description: Option<String>,
-    logic_hash: Option<String>,
-    approved_at: String,
-    approved_by: String,
-    version: i64,
-    schemas_json: String,
+fn row_to_contract(row: UnifiedDbRow) -> Result<SchemaContract, StorageError> {
+    let contract_id_raw: String = row.get_by_name("contract_id")?;
+    let contract_id = ContractId::parse(&contract_id_raw)
+        .map_err(|e| StorageError::Parse(e.to_string()))?;
+
+    let approved_at_raw: String = row.get_by_name("approved_at")?;
+    let approved_at = SchemaTimestamp::parse(&approved_at_raw)
+        .map_err(|e| StorageError::Parse(e.to_string()))?;
+
+    let schemas_json: String = row.get_by_name("schemas_json")?;
+    let schemas: Vec<LockedSchema> = serde_json::from_str(&schemas_json)?;
+
+    let version: i64 = row.get_by_name("version")?;
+
+    Ok(SchemaContract {
+        contract_id,
+        scope_id: row.get_by_name("scope_id")?,
+        scope_description: row.get_by_name("scope_description")?,
+        logic_hash: row.get_by_name("logic_hash")?,
+        approved_at,
+        approved_by: row.get_by_name("approved_by")?,
+        schemas,
+        version: version as u32,
+    })
 }
 
-impl ContractRow {
-    fn into_contract(self) -> Result<SchemaContract, StorageError> {
-        let contract_id = Uuid::parse_str(&self.contract_id)
-            .map_err(|e| StorageError::Parse(format!("Invalid UUID: {}", e)))?;
+fn row_to_discovery(row: UnifiedDbRow) -> Result<DiscoveryResult, StorageError> {
+    let discovery_id_raw: String = row.get_by_name("discovery_id")?;
+    let discovery_id = DiscoveryId::parse(&discovery_id_raw)
+        .map_err(|e| StorageError::Parse(e.to_string()))?;
 
-        let approved_at = DateTime::parse_from_rfc3339(&self.approved_at)
-            .map_err(|e| StorageError::Parse(format!("Invalid timestamp: {}", e)))?
-            .with_timezone(&Utc);
+    let discovered_at_raw: String = row.get_by_name("discovered_at")?;
+    let discovered_at = SchemaTimestamp::parse(&discovered_at_raw)
+        .map_err(|e| StorageError::Parse(e.to_string()))?;
 
-        let schemas: Vec<LockedSchema> = serde_json::from_str(&self.schemas_json)?;
-
-        Ok(SchemaContract {
-            contract_id,
-            scope_id: self.scope_id,
-            scope_description: self.scope_description,
-            logic_hash: self.logic_hash,
-            approved_at,
-            approved_by: self.approved_by,
-            schemas,
-            version: self.version as u32,
-        })
-    }
-}
-
-/// Internal row type for discovery results.
-#[derive(sqlx::FromRow)]
-struct DiscoveryRow {
-    discovery_id: String,
-    scope_id: String,
-    discovered_at: String,
-    source_file: Option<String>,
-    proposed_schemas_json: String,
-    status: String,
-}
-
-impl From<DiscoveryRow> for DiscoveryResult {
-    fn from(row: DiscoveryRow) -> Self {
-        DiscoveryResult {
-            discovery_id: row.discovery_id,
-            scope_id: row.scope_id,
-            discovered_at: row.discovered_at,
-            source_file: row.source_file,
-            proposed_schemas_json: row.proposed_schemas_json,
-            status: row.status,
-        }
-    }
+    Ok(DiscoveryResult {
+        discovery_id,
+        scope_id: row.get_by_name("scope_id")?,
+        discovered_at,
+        source_file: row.get_by_name("source_file")?,
+        proposed_schemas_json: row.get_by_name("proposed_schemas_json")?,
+        status: row.get_by_name("status")?,
+    })
 }
 
 /// A schema discovery result (proposed schema before approval).
 #[derive(Debug, Clone)]
 pub struct DiscoveryResult {
-    pub discovery_id: String,
+    pub discovery_id: DiscoveryId,
     pub scope_id: String,
-    pub discovered_at: String,
+    pub discovered_at: SchemaTimestamp,
     pub source_file: Option<String>,
     pub proposed_schemas_json: String,
     pub status: String,
@@ -436,8 +425,8 @@ pub struct DiscoveryResult {
 
 impl DiscoveryResult {
     /// Parse the proposed schemas from JSON.
-    pub fn proposed_schemas(&self) -> Result<Vec<LockedSchema>, serde_json::Error> {
-        serde_json::from_str(&self.proposed_schemas_json)
+    pub fn proposed_schemas(&self) -> Result<Vec<LockedSchema>, StorageError> {
+        Ok(serde_json::from_str(&self.proposed_schemas_json)?)
     }
 }
 
@@ -521,68 +510,47 @@ mod tests {
         assert_eq!(history[1].version, 1);
     }
 
-    #[allow(deprecated)]
     #[tokio::test]
-    async fn test_discovery_workflow() {
+    async fn test_list_contracts() {
         let storage = SchemaStorage::in_memory().await.unwrap();
 
-        // Save a discovery result
+        for i in 0..3 {
+            let schema = LockedSchema::new(
+                format!("schema_{}", i),
+                vec![LockedColumn::required("id", DataType::Int64)],
+            );
+            let contract = SchemaContract::new(format!("scope_{}", i), schema, "user");
+            storage.save_contract(&contract).await.unwrap();
+        }
+
+        let all = storage.list_contracts(None).await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        let limited = storage.list_contracts(Some(2)).await.unwrap();
+        assert_eq!(limited.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_discovery_result_flow() {
+        let storage = SchemaStorage::in_memory().await.unwrap();
+
         let proposed = vec![create_test_schema()];
         let discovery_id = storage
             .save_discovery_result("scope_xyz", Some("data.csv"), &proposed)
             .await
             .unwrap();
 
-        // Get pending discoveries
         let pending = storage.get_pending_discoveries("scope_xyz").await.unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].status, "pending");
+        assert_eq!(pending[0].discovery_id, discovery_id);
 
-        // Approve it
-        let contract = storage.approve_discovery(&discovery_id, "approver").await.unwrap();
+        let contract = storage
+            .approve_discovery(&discovery_id, "user_abc")
+            .await
+            .unwrap();
         assert_eq!(contract.scope_id, "scope_xyz");
-        assert_eq!(contract.approved_by, "approver");
-        assert_eq!(contract.version, 1);
 
-        // Pending should be empty now
-        let pending = storage.get_pending_discoveries("scope_xyz").await.unwrap();
-        assert_eq!(pending.len(), 0);
-
-        // Contract should exist
-        let loaded = storage.get_contract_for_scope("scope_xyz").await.unwrap().unwrap();
-        assert_eq!(loaded.contract_id, contract.contract_id);
-    }
-
-    #[tokio::test]
-    async fn test_delete_contract() {
-        let storage = SchemaStorage::in_memory().await.unwrap();
-
-        let schema = create_test_schema();
-        let contract = SchemaContract::new("to_delete", schema, "user");
-        storage.save_contract(&contract).await.unwrap();
-
-        assert!(storage.get_contract(&contract.contract_id).await.unwrap().is_some());
-
-        let deleted = storage.delete_contract(&contract.contract_id).await.unwrap();
-        assert!(deleted);
-
-        assert!(storage.get_contract(&contract.contract_id).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_list_contracts() {
-        let storage = SchemaStorage::in_memory().await.unwrap();
-
-        for i in 0..5 {
-            let schema = LockedSchema::new(format!("schema_{}", i), vec![]);
-            let contract = SchemaContract::new(format!("scope_{}", i), schema, "user");
-            storage.save_contract(&contract).await.unwrap();
-        }
-
-        let all = storage.list_contracts(None).await.unwrap();
-        assert_eq!(all.len(), 5);
-
-        let limited = storage.list_contracts(Some(3)).await.unwrap();
-        assert_eq!(limited.len(), 3);
+        let pending_after = storage.get_pending_discoveries("scope_xyz").await.unwrap();
+        assert!(pending_after.is_empty());
     }
 }

@@ -16,7 +16,7 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
-use uuid::Uuid;
+use casparian_backtest::ScopeId;
 
 // =============================================================================
 // REAL PARSER RUNNER - Actually reads and validates files
@@ -200,7 +200,7 @@ impl ParserRunner for TrackingParser {
 #[tokio::test]
 async fn test_high_failure_table_real_sqlite() {
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     // Record a failure
     let entry = FailureHistoryEntry::new(
@@ -223,7 +223,7 @@ async fn test_high_failure_table_real_sqlite() {
 #[tokio::test]
 async fn test_consecutive_failures_increment() {
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let file_path = "/data/problem_file.csv";
 
@@ -248,7 +248,7 @@ async fn test_consecutive_failures_increment() {
 #[tokio::test]
 async fn test_success_resets_consecutive() {
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let file_path = "/data/intermittent.csv";
 
@@ -285,7 +285,7 @@ async fn test_success_resets_consecutive() {
 #[tokio::test]
 async fn test_backtest_order_prioritizes_high_failure() {
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     // Create high-failure entries with different failure counts
     for (path, failures) in [
@@ -359,7 +359,7 @@ async fn test_backtest_all_pass() {
         .collect();
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = FailFastConfig::default();
 
@@ -412,7 +412,7 @@ async fn test_backtest_some_fail() {
         .collect();
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = FailFastConfig {
         high_failure_threshold: 0.8,
@@ -457,7 +457,7 @@ async fn test_early_stop_on_high_failure() {
     );
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     // Pre-populate high-failure table with bad files
     for name in &["bad1.csv", "bad2.csv", "bad3.csv"] {
@@ -608,7 +608,7 @@ async fn test_loop_achieves_pass_rate() {
     let mut parser = ImprovingParser::new(vec!["file1".to_string(), "file2".to_string()]);
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = IterationConfig {
         max_iterations: 10,
@@ -673,7 +673,7 @@ async fn test_loop_max_iterations() {
     let mut parser = NeverImprovesParser;
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = IterationConfig {
         max_iterations: 3, // Only allow 3 iterations
@@ -747,7 +747,7 @@ async fn test_loop_plateau_detection() {
     let mut parser = PlateauParser;
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = IterationConfig {
         max_iterations: 20,
@@ -920,7 +920,7 @@ async fn test_complete_backtest_workflow() {
         .collect();
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     // First backtest run
     let config = FailFastConfig::default();
@@ -990,7 +990,7 @@ async fn test_handles_missing_files_gracefully() {
     ];
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = FailFastConfig::default();
 
@@ -1016,7 +1016,7 @@ async fn test_handles_empty_file_list() {
     let files: Vec<FileInfo> = vec![];
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = FailFastConfig::default();
 
@@ -1052,7 +1052,7 @@ async fn test_handles_unreadable_files() {
     )];
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
@@ -1091,7 +1091,7 @@ async fn test_handles_malformed_csv() {
         .collect();
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
@@ -1128,7 +1128,7 @@ async fn test_failure_categories_recorded_correctly() {
         .collect();
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let _ = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
@@ -1166,7 +1166,7 @@ async fn test_handles_large_file_count() {
         .collect();
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
 
@@ -1183,7 +1183,7 @@ async fn test_handles_large_file_count() {
 #[tokio::test]
 async fn test_no_duplicate_failure_records() {
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     // Record same file failing multiple times
     for i in 1..=5 {
@@ -1235,7 +1235,7 @@ async fn test_loop_handles_parser_errors() {
     )];
 
     let table = HighFailureTable::in_memory().await.unwrap();
-    let scope_id = Uuid::new_v4();
+    let scope_id = ScopeId::new();
 
     let config = IterationConfig {
         max_iterations: 3,

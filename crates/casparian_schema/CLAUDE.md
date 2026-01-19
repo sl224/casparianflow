@@ -35,10 +35,10 @@ The binding agreement between user intent and parser output:
 
 ```rust
 pub struct SchemaContract {
-    pub contract_id: Uuid,
+    pub contract_id: ContractId,
     pub scope_id: String,           // What this applies to
     pub scope_description: Option<String>,
-    pub approved_at: DateTime<Utc>,
+    pub approved_at: SchemaTimestamp,
     pub approved_by: String,        // Who approved
     pub schemas: Vec<LockedSchema>, // The locked definitions
     pub version: u32,               // Incremented on re-approval
@@ -51,7 +51,7 @@ Immutable definition of expected data structure:
 
 ```rust
 pub struct LockedSchema {
-    pub schema_id: Uuid,
+    pub schema_id: SchemaId,
     pub name: String,               // e.g., "transactions"
     pub columns: Vec<LockedColumn>,
     pub source_pattern: Option<String>,  // e.g., "*.csv"
@@ -84,7 +84,7 @@ pub enum DataType {
     Float64,    // 64-bit floating point
     Boolean,    // true/false
     Date,       // Date (no time)
-    Timestamp,  // DateTime with timezone
+    Timestamp,  // RFC3339 timestamp with timezone
     Binary,     // Raw bytes
 }
 ```
@@ -136,12 +136,12 @@ if !DataType::Int64.validate_string("123") {
 ```rust
 use casparian_schema::SchemaStorage;
 
-let storage = SchemaStorage::new("/path/to/db.sqlite")?;
-storage.save_contract(&contract)?;
+let storage = SchemaStorage::open("/path/to/db.sqlite").await?;
+storage.save_contract(&contract).await?;
 
 // Retrieve later
-let contract = storage.get_contract(&contract.contract_id)?;
-let contracts = storage.get_by_scope("parser_123")?;
+let contract = storage.get_contract(&contract.contract_id).await?;
+let contracts = storage.get_contract_history("parser_123").await?;
 ```
 
 ---
@@ -260,33 +260,45 @@ SQLite-backed persistence for contracts:
 
 ```rust
 pub struct SchemaStorage {
-    conn: Connection,
+    conn: DbConnection,
 }
 
 impl SchemaStorage {
+    /// Create with connection
+    pub async fn new(conn: DbConnection) -> Result<Self, StorageError>;
+
     /// Create with file path
-    pub fn new(path: &str) -> Result<Self, SchemaError>;
+    pub async fn open(path: &str) -> Result<Self, StorageError>;
 
     /// Create in-memory (for testing)
-    pub fn in_memory() -> Result<Self, SchemaError>;
+    pub async fn in_memory() -> Result<Self, StorageError>;
 
     /// Save a contract
-    pub fn save_contract(&self, contract: &SchemaContract) -> Result<(), SchemaError>;
+    pub async fn save_contract(&self, contract: &SchemaContract) -> Result<(), StorageError>;
 
     /// Get by contract ID
-    pub fn get_contract(&self, id: &Uuid) -> Result<Option<SchemaContract>, SchemaError>;
+    pub async fn get_contract(
+        &self,
+        id: &ContractId,
+    ) -> Result<Option<SchemaContract>, StorageError>;
 
     /// Get all contracts for a scope
-    pub fn get_by_scope(&self, scope_id: &str) -> Result<Vec<SchemaContract>, SchemaError>;
+    pub async fn get_contract_history(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<SchemaContract>, StorageError>;
 
     /// Get latest version for scope
-    pub fn get_latest(&self, scope_id: &str) -> Result<Option<SchemaContract>, SchemaError>;
+    pub async fn get_contract_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Option<SchemaContract>, StorageError>;
 
     /// List all contracts
-    pub fn list_contracts(&self) -> Result<Vec<SchemaContract>, SchemaError>;
+    pub async fn list_contracts(&self) -> Result<Vec<SchemaContract>, StorageError>;
 
     /// Delete a contract
-    pub fn delete_contract(&self, id: &Uuid) -> Result<bool, SchemaError>;
+    pub async fn delete_contract(&self, id: &ContractId) -> Result<bool, StorageError>;
 }
 ```
 

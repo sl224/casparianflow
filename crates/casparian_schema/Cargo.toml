@@ -19,15 +19,14 @@ serde_json.workspace = true
 # Protocol types (canonical DataType)
 casparian_protocol = { path = "../casparian_protocol" }
 
-# UUID for contract IDs
-uuid = { version = "1.11", features = ["v4", "serde"] }
+# Shared IDs
+casparian_ids = { path = "../casparian_ids" }
 
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
 
 # Database abstraction
 casparian_db = { path = "../casparian_db", default-features = false, features = ["sqlite"] }
-sqlx = { workspace = true, default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 
 # Hashing
 sha2 = "0.10"

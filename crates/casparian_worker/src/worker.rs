@@ -19,12 +19,12 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-use crate::bridge::{self, BridgeConfig};
+use crate::bridge::{self, BridgeConfig, BridgeError};
 use crate::schema_validation;
 use crate::venv_manager::VenvManager;
 use arrow::array::{
@@ -58,7 +58,26 @@ pub enum WorkerError {
 
     /// Bridge communication error
     #[error("Bridge error: {0}")]
-    Bridge(#[from] anyhow::Error),
+    Bridge(#[from] BridgeError),
+
+    /// Internal worker error
+    #[error("Worker error: {message}")]
+    Internal {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+}
+
+pub type WorkerResult<T> = std::result::Result<T, WorkerError>;
+
+impl From<anyhow::Error> for WorkerError {
+    fn from(err: anyhow::Error) -> Self {
+        WorkerError::Internal {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
 }
 
 impl WorkerError {
@@ -70,6 +89,13 @@ impl WorkerError {
     /// Check if this error is permanent (no retry)
     pub fn is_permanent(&self) -> bool {
         matches!(self, WorkerError::Permanent { .. })
+    }
+
+    fn internal(err: impl std::fmt::Display) -> Self {
+        WorkerError::Internal {
+            message: err.to_string(),
+            source: None,
+        }
     }
 
     /// Create from exit code using the Casparian convention:
@@ -122,6 +148,7 @@ const MAX_CONCURRENT_JOBS: usize = 4;
 
 /// Heartbeat interval (seconds) - worker sends heartbeat to Sentinel
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Worker configuration (plain data)
 pub struct WorkerConfig {
@@ -140,14 +167,41 @@ pub struct WorkerConfig {
 /// Handle for controlling a running worker
 pub struct WorkerHandle {
     shutdown_tx: mpsc::Sender<()>,
-    join_handle: JoinHandle<Result<()>>,
+    completion_rx: oneshot::Receiver<()>,
 }
 
 impl WorkerHandle {
-    /// Request graceful shutdown
-    pub async fn shutdown(self) -> Result<()> {
-        let _ = self.shutdown_tx.send(()).await;
-        self.join_handle.await?
+    /// Request immediate shutdown (send signal only).
+    pub async fn shutdown_now(self) -> WorkerResult<()> {
+        self.shutdown_tx
+            .send(())
+            .await
+            .map_err(WorkerError::internal)
+    }
+
+    /// Request graceful shutdown and wait for completion (with timeout).
+    pub async fn shutdown_gracefully(self, timeout: Duration) -> WorkerResult<()> {
+        let Self {
+            shutdown_tx,
+            completion_rx,
+        } = self;
+        shutdown_tx
+            .send(())
+            .await
+            .map_err(WorkerError::internal)?;
+        match tokio::time::timeout(timeout, completion_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(WorkerError::internal(err)),
+            Err(_) => Err(WorkerError::internal("worker shutdown timed out")),
+        }
+    }
+
+    /// Request graceful shutdown with default timeout.
+    pub async fn shutdown(self) -> WorkerResult<()> {
+        self.shutdown_gracefully(Duration::from_secs(
+            DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+        ))
+        .await
     }
 }
 
@@ -159,6 +213,7 @@ pub struct Worker {
     result_tx: mpsc::Sender<JobResult>,
     result_rx: mpsc::Receiver<JobResult>,
     shutdown_rx: mpsc::Receiver<()>,
+    shutdown_complete_tx: Option<oneshot::Sender<()>>,
     active_jobs: HashMap<u64, JoinHandle<()>>,
 }
 
@@ -171,7 +226,13 @@ struct JobResult {
 impl Worker {
     /// Connect to sentinel and create worker.
     /// Returns (Worker, ShutdownHandle) - call run() on Worker, use handle for shutdown.
-    pub async fn connect(config: WorkerConfig) -> Result<(Self, mpsc::Sender<()>)> {
+    pub async fn connect(config: WorkerConfig) -> WorkerResult<(Self, WorkerHandle)> {
+        Self::connect_inner(config)
+            .await
+            .map_err(WorkerError::internal)
+    }
+
+    async fn connect_inner(config: WorkerConfig) -> Result<(Self, WorkerHandle)> {
         // Initialize VenvManager once (now uses std::sync::Mutex internally)
         let venv_manager = match &config.venvs_dir {
             Some(path) => VenvManager::with_path(path.clone())?,
@@ -202,6 +263,12 @@ impl Worker {
         // Initialize channels
         let (result_tx, result_rx) = mpsc::channel(MAX_CONCURRENT_JOBS * 2);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (completion_tx, completion_rx) = oneshot::channel();
+
+        let handle = WorkerHandle {
+            shutdown_tx,
+            completion_rx,
+        };
 
         Ok((
             Self {
@@ -211,14 +278,24 @@ impl Worker {
                 result_tx,
                 result_rx,
                 shutdown_rx,
+                shutdown_complete_tx: Some(completion_tx),
                 active_jobs: HashMap::new(),
             },
-            shutdown_tx,
+            handle,
         ))
     }
 
     /// Main event loop - consumes self (can only be called once)
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self) -> WorkerResult<()> {
+        let completion_tx = self.shutdown_complete_tx.take();
+        let result = self.run_inner().await.map_err(WorkerError::internal);
+        if let Some(tx) = completion_tx {
+            let _ = tx.send(());
+        }
+        result
+    }
+
+    async fn run_inner(mut self) -> Result<()> {
         info!("Entering event loop...");
 
         // Create heartbeat interval timer
@@ -551,9 +628,9 @@ fn inject_lineage_batches(
     source_hash: &str,
     job_id: &str,
     parser_version: &str,
-) -> Result<Vec<RecordBatch>> {
+) -> Result<Vec<casparian_sinks::OutputBatch>> {
     if batches.is_empty() {
-        return Ok(batches);
+        return Ok(Vec::new());
     }
 
     let total_batches = batches.len();
@@ -565,8 +642,13 @@ fn inject_lineage_batches(
 
     if existing_count == 0 {
         for batch in batches {
-            let injected =
-                casparian_sinks::inject_lineage_columns(&batch, source_hash, job_id, parser_version)?;
+            let wrapped = casparian_sinks::OutputBatch::from_record_batch(batch);
+            let injected = casparian_sinks::inject_lineage_columns(
+                &wrapped,
+                source_hash,
+                job_id,
+                parser_version,
+            )?;
             with_lineage.push(injected);
         }
         return Ok(with_lineage);
@@ -577,7 +659,10 @@ fn inject_lineage_batches(
             "Output '{}' already includes lineage columns; skipping injection.",
             output_name
         );
-        return Ok(batches);
+        return Ok(batches
+            .into_iter()
+            .map(casparian_sinks::OutputBatch::from_record_batch)
+            .collect());
     }
 
     anyhow::bail!(
@@ -1117,7 +1202,9 @@ async fn execute_job_inner(
     let mut quarantine_owned = Vec::new();
 
     for output in outputs {
-        let sink_config = find_sink_config(cmd, &output.name);
+        let output_name = output.name().to_string();
+        let output_table = output.table().map(|table| table.to_string());
+        let sink_config = find_sink_config(cmd, &output_name);
         let schema_def = sink_config
             .and_then(|sink| sink.schema_def.as_deref())
             .and_then(normalize_schema_def);
@@ -1125,16 +1212,19 @@ async fn execute_job_inner(
             .map(|sink| sink.uri.as_str())
             .unwrap_or(sink_uri);
 
-        let mut output_batches: Vec<RecordBatch> =
-            output.batches.iter().map(|batch| (*batch).clone()).collect();
+        let mut output_batches: Vec<RecordBatch> = output
+            .batches()
+            .iter()
+            .map(|batch| batch.as_record_batch().clone())
+            .collect();
         if let Some(schema_def) = schema_def {
             output_batches = schema_validation::enforce_schema_on_batches(
                 &output_batches,
                 schema_def,
-                &output.name,
+                &output_name,
             )
             .map_err(|e| WorkerError::Permanent {
-                message: format!("schema validation failed for '{}': {}", output.name, e),
+                message: format!("schema validation failed for '{}': {}", output_name, e),
             })?;
         }
 
@@ -1148,45 +1238,49 @@ async fn execute_job_inner(
         quarantine_rows += quarantined;
         lineage_unavailable_rows += lineage_unavailable;
         output_metrics.push(OutputMetrics {
-            name: output.name.clone(),
+            name: output_name.clone(),
             rows: valid_rows,
             quarantine_rows: quarantined,
             lineage_unavailable_rows: lineage_unavailable,
         });
 
-        let quarantine_config = resolve_quarantine_config(schema_def, sink_uri_for_config, &output.name)
+        let quarantine_config =
+            resolve_quarantine_config(schema_def, sink_uri_for_config, &output_name)
             .map_err(|e| WorkerError::Permanent {
-                message: format!("invalid quarantine config for '{}': {}", output.name, e),
+                message: format!("invalid quarantine config for '{}': {}", output_name, e),
             })?;
         if let Some(reason) =
-            check_quarantine_policy(&output.name, quarantined, output_rows, &quarantine_config)
+            check_quarantine_policy(&output_name, quarantined, output_rows, &quarantine_config)
         {
             policy_failures.push(reason);
         }
 
         if !valid_batches.is_empty() {
             let lineage_batches = inject_lineage_batches(
-                &output.name,
+                &output_name,
                 valid_batches,
                 &source_hash,
                 &job_id_str,
                 parser_version,
             )
             .map_err(|e| WorkerError::Permanent {
-                message: format!("lineage injection failed for '{}': {}", output.name, e),
+                message: format!("lineage injection failed for '{}': {}", output_name, e),
             })?;
             valid_owned.push(OwnedOutput {
-                name: output.name.clone(),
-                table: output.table.clone(),
+                name: output_name.clone(),
+                table: output_table.clone(),
                 batches: lineage_batches,
             });
         }
         if !quarantine_batches.is_empty() {
-            let quarantine_name = format!("{}_quarantine", output.name);
-            let quarantine_table = output
-                .table
+            let quarantine_name = format!("{}_quarantine", output_name);
+            let quarantine_table = output_table
                 .as_ref()
-                .map(|t| format!("{}_quarantine", t));
+                .map(|table| format!("{}_quarantine", table));
+            let quarantine_batches = quarantine_batches
+                .into_iter()
+                .map(casparian_sinks::OutputBatch::from_record_batch)
+                .collect();
             quarantine_owned.push(OwnedOutput {
                 name: quarantine_name,
                 table: quarantine_table,
@@ -1247,16 +1341,18 @@ async fn execute_job_inner(
 struct OwnedOutput {
     name: String,
     table: Option<String>,
-    batches: Vec<RecordBatch>,
+    batches: Vec<casparian_sinks::OutputBatch>,
 }
 
-fn to_output_plans<'a>(outputs: &'a [OwnedOutput]) -> Vec<casparian_sinks::OutputPlan<'a>> {
+fn to_output_plans(outputs: &[OwnedOutput]) -> Vec<casparian_sinks::OutputPlan> {
     outputs
         .iter()
-        .map(|output| casparian_sinks::OutputPlan {
-            name: output.name.clone(),
-            table: output.table.clone(),
-            batches: output.batches.iter().collect(),
+        .map(|output| {
+            casparian_sinks::OutputPlan::new(
+                output.name.clone(),
+                output.table.clone(),
+                output.batches.clone(),
+            )
         })
         .collect()
 }
@@ -1872,15 +1968,23 @@ mod tests {
         assert!(!quarantine.is_empty());
 
         let mut outputs = Vec::new();
+        let valid_batches = valid
+            .into_iter()
+            .map(casparian_sinks::OutputBatch::from_record_batch)
+            .collect();
         outputs.push(OwnedOutput {
             name: "output".to_string(),
             table: None,
-            batches: valid,
+            batches: valid_batches,
         });
+        let quarantine_batches = quarantine
+            .into_iter()
+            .map(casparian_sinks::OutputBatch::from_record_batch)
+            .collect();
         outputs.push(OwnedOutput {
             name: "output_quarantine".to_string(),
             table: None,
-            batches: quarantine,
+            batches: quarantine_batches,
         });
 
         let plans = to_output_plans(&outputs);

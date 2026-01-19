@@ -22,7 +22,8 @@ cargo check -p casparian_db --features postgres  # With PostgreSQL
 1. **SQLite is always free** - Community tier, no license required
 2. **Enterprise DBs require license** - PostgreSQL (Professional), MSSQL (Enterprise)
 3. **Single source of truth** - All crates use this crate for database types
-4. **Fail at connection time** - License check happens when creating pool, not at query time
+4. **Unified connection API** - Use `DbConnection` for backend-agnostic access
+5. **Fail at connection time** - License check happens when creating pool, not at query time
 
 ---
 
@@ -67,7 +68,22 @@ pub enum DatabaseType {
 }
 ```
 
-### DbConfig
+### DbConnection
+
+```rust
+pub struct DbConnection { /* ... */ }
+
+// Constructors
+DbConnection::open_sqlite(Path::new("./data.db")).await?
+DbConnection::open_sqlite_memory().await?
+DbConnection::open_duckdb(Path::new("./data.duckdb")).await?
+DbConnection::open_postgres("postgres://localhost/mydb").await?
+DbConnection::open_from_url("sqlite:./data.db").await?
+```
+
+### Legacy DbConfig (sqlx pool)
+
+Available via `casparian_db::legacy::DbConfig`.
 
 ```rust
 pub struct DbConfig {
@@ -118,22 +134,28 @@ pub enum LicenseTier {
 
 ## Usage
 
-### Basic SQLite (No License)
+### Unified API (recommended)
 
 ```rust
-use casparian_db::{DbConfig, create_pool};
+use casparian_db::DbConnection;
+
+let conn = DbConnection::open_sqlite(Path::new("./data.db")).await?;
+conn.execute("SELECT 1", &[]).await?;
+```
+
+### Legacy sqlx pool (deprecated)
+
+```rust
+use casparian_db::legacy::{create_pool, DbConfig};
 
 let config = DbConfig::sqlite("./data.db");
 let pool = create_pool(config).await?;
-
-// Use pool for queries
-sqlx::query("SELECT 1").execute(&pool).await?;
 ```
 
-### PostgreSQL (License Required)
+### PostgreSQL (License Required, legacy pool)
 
 ```rust
-use casparian_db::{DbConfig, create_pool, load_license};
+use casparian_db::legacy::{create_pool, load_license, DbConfig};
 
 let license = load_license();  // Loads from standard locations
 let config = DbConfig::postgres("postgres://localhost/mydb", license);
@@ -178,17 +200,18 @@ casparian_db = { path = "../casparian_db" }
 // Before
 let pool = SqlitePool::connect(&url).await?;
 
-// After
-use casparian_db::{DbConfig, create_pool, DbPool};
+// After (preferred)
+use casparian_db::DbConnection;
 
-let config = DbConfig::sqlite(&path);
-let pool: DbPool = create_pool(config).await?;
+let conn = DbConnection::open_sqlite(Path::new(&path)).await?;
 ```
 
-3. Use `DbPool` type alias:
+3. If you still need a sqlx pool (legacy):
 ```rust
+use casparian_db::legacy::{create_pool, DbConfig, DbPool};
+
 pub struct MyStorage {
-    pool: DbPool,  // Works with any database
+    pool: DbPool,  // Legacy sqlx pool
 }
 ```
 
@@ -196,7 +219,20 @@ pub struct MyStorage {
 
 ## Error Handling
 
+`DbConnection` returns `BackendError`. Legacy pool APIs return `legacy::DbError`.
+
 ```rust
+pub enum BackendError {
+    Database(String),
+    Locked(String),
+    ReadOnly,
+    Query(String),
+    Transaction(String),
+    TypeConversion(String),
+    NotAvailable(String),
+    // backend-specific variants
+}
+
 pub enum DbError {
     Database(sqlx::Error),           // Connection/query errors
     License(LicenseError),           // License validation failed
@@ -223,8 +259,9 @@ casparian_db/
 ├── Cargo.toml          # Feature flags
 └── src/
     ├── lib.rs          # DatabaseType, exports
+    ├── backend.rs      # DbConnection, DbValue
     ├── license.rs      # License, LicenseTier
-    └── pool.rs         # DbConfig, create_pool()
+    └── pool.rs         # Legacy sqlx pool API
 ```
 
 ---

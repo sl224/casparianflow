@@ -2,7 +2,7 @@
 //!
 //! These models are backend-agnostic and map from casparian_db rows.
 
-use casparian_db::{BackendError, UnifiedDbRow};
+use casparian_db::{BackendError, DbTimestamp, UnifiedDbRow};
 use casparian_protocol::{SinkMode, WorkerStatus};
 use serde::{Deserialize, Serialize};
 
@@ -165,8 +165,8 @@ pub struct ProcessingJob {
     pub priority: i32,
     pub worker_host: Option<String>,
     pub worker_pid: Option<i32>,
-    pub claim_time: Option<chrono::DateTime<chrono::Utc>>,
-    pub end_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub claim_time: Option<DbTimestamp>,
+    pub end_time: Option<DbTimestamp>,
     pub result_summary: Option<String>,
     pub error_message: Option<String>,
     pub retry_count: i32,
@@ -203,8 +203,8 @@ pub struct Publisher {
     pub azure_oid: Option<String>,
     pub name: String,
     pub email: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub last_active: chrono::DateTime<chrono::Utc>,
+    pub created_at: DbTimestamp,
+    pub last_active: DbTimestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -212,8 +212,8 @@ pub struct PluginEnvironment {
     pub hash: String,
     pub lockfile_content: String,
     pub size_mb: f64,
-    pub last_used: chrono::DateTime<chrono::Utc>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_used: DbTimestamp,
+    pub created_at: DbTimestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -226,8 +226,8 @@ pub struct PluginManifest {
     pub status: PluginStatusEnum,
     pub signature: Option<String>,
     pub validation_error: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub deployed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: DbTimestamp,
+    pub deployed_at: Option<DbTimestamp>,
     pub env_hash: Option<String>,
     pub artifact_hash: Option<String>,
     pub publisher_id: Option<i32>,
@@ -283,7 +283,7 @@ pub struct DeadLetterJob {
     pub plugin_name: String,
     pub error_message: Option<String>,
     pub retry_count: i32,
-    pub moved_at: chrono::DateTime<chrono::Utc>,
+    pub moved_at: DbTimestamp,
     pub reason: Option<String>,
 }
 
@@ -309,9 +309,9 @@ pub struct ParserHealth {
     pub successful_executions: i64,
     pub consecutive_failures: i32,
     pub last_failure_reason: Option<String>,
-    pub paused_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub paused_at: Option<DbTimestamp>,
+    pub created_at: DbTimestamp,
+    pub updated_at: DbTimestamp,
 }
 
 impl ParserHealth {
@@ -348,7 +348,7 @@ pub struct QuarantinedRow {
     pub row_index: i32,
     pub error_reason: String,
     pub raw_data: Option<Vec<u8>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DbTimestamp,
 }
 
 impl QuarantinedRow {
@@ -397,8 +397,8 @@ mod tests {
             consecutive_failures: 0,
             last_failure_reason: None,
             paused_at: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
+            created_at: DbTimestamp::now(),
+            updated_at: DbTimestamp::now(),
         };
         assert_eq!(health.success_rate(), 100.0);
     }

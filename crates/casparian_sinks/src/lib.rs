@@ -13,6 +13,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{debug, info, warn};
 
 fn job_prefix(job_id: &str) -> &str {
@@ -27,16 +28,119 @@ pub fn output_filename(output_name: &str, job_id: &str, extension: &str) -> Stri
     format!("{}_{}.{}", output_name, job_prefix(job_id), extension)
 }
 
+/// Errors returned by sink planning and writing.
+#[derive(Debug, Error)]
+pub enum SinkError {
+    #[error("{message}")]
+    Message { message: String },
+    #[error("{message}")]
+    Source {
+        message: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type SinkResult<T> = std::result::Result<T, SinkError>;
+
+impl SinkError {
+    fn message(message: impl Into<String>) -> Self {
+        SinkError::Message {
+            message: message.into(),
+        }
+    }
+
+    fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        SinkError::Source {
+            message: message.into(),
+            source: Box::new(source),
+        }
+    }
+}
+
+impl From<anyhow::Error> for SinkError {
+    fn from(err: anyhow::Error) -> Self {
+        SinkError::with_source(err.to_string(), err)
+    }
+}
+
+/// Output batch wrapper to avoid leaking Arrow types in public APIs.
+#[derive(Debug, Clone)]
+pub struct OutputBatch {
+    batch: Arc<RecordBatch>,
+}
+
+impl OutputBatch {
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
+    pub fn from_record_batch(batch: RecordBatch) -> Self {
+        Self {
+            batch: Arc::new(batch),
+        }
+    }
+
+    #[cfg(not(feature = "internal"))]
+    pub(crate) fn from_record_batch(batch: RecordBatch) -> Self {
+        Self {
+            batch: Arc::new(batch),
+        }
+    }
+
+    pub fn num_rows(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    pub(crate) fn record_batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+
+    #[cfg(feature = "internal")]
+    #[doc(hidden)]
+    pub fn as_record_batch(&self) -> &RecordBatch {
+        self.record_batch()
+    }
+
+    pub(crate) fn schema(&self) -> Arc<Schema> {
+        self.batch.schema()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputDescriptor {
     pub name: String,
     pub table: Option<String>,
 }
 
-pub struct OutputPlan<'a> {
-    pub name: String,
-    pub table: Option<String>,
-    pub batches: Vec<&'a RecordBatch>,
+#[derive(Debug, Clone)]
+pub struct OutputPlan {
+    name: String,
+    table: Option<String>,
+    batches: Vec<OutputBatch>,
+}
+
+impl OutputPlan {
+    pub fn new(name: impl Into<String>, table: Option<String>, batches: Vec<OutputBatch>) -> Self {
+        Self {
+            name: name.into(),
+            table,
+            batches,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn table(&self) -> Option<&str> {
+        self.table.as_deref()
+    }
+
+    pub fn batches(&self) -> &[OutputBatch] {
+        &self.batches
+    }
 }
 
 pub struct OutputArtifact {
@@ -45,34 +149,32 @@ pub struct OutputArtifact {
     pub rows: u64,
 }
 
-pub fn plan_outputs<'a>(
+pub fn plan_outputs(
     descriptors: &[OutputDescriptor],
-    batches: &'a [RecordBatch],
+    batches: &[OutputBatch],
     default_name: &str,
-) -> Result<Vec<OutputPlan<'a>>> {
+) -> SinkResult<Vec<OutputPlan>> {
     if descriptors.is_empty() {
-        return Ok(vec![OutputPlan {
-            name: default_name.to_string(),
-            table: None,
-            batches: batches.iter().collect(),
-        }]);
+        return Ok(vec![OutputPlan::new(
+            default_name,
+            None,
+            batches.to_vec(),
+        )]);
     }
 
     if descriptors.len() != batches.len() {
-        bail!(
+        return Err(SinkError::message(format!(
             "Output metadata count ({}) does not match batch count ({})",
             descriptors.len(),
             batches.len()
-        );
+        )));
     }
 
     Ok(descriptors
         .iter()
         .zip(batches.iter())
-        .map(|(info, batch)| OutputPlan {
-            name: info.name.clone(),
-            table: info.table.clone(),
-            batches: vec![batch],
+        .map(|(info, batch)| {
+            OutputPlan::new(info.name.clone(), info.table.clone(), vec![batch.clone()])
         })
         .collect())
 }
@@ -82,7 +184,7 @@ pub fn artifact_uri_for_output(
     output_name: &str,
     output_table: Option<&str>,
     job_id: &str,
-) -> Result<String> {
+) -> SinkResult<String> {
     use casparian_protocol::types::SinkScheme;
 
     let table_name = output_table.unwrap_or(output_name);
@@ -122,46 +224,47 @@ pub fn artifact_uri_for_output(
 
 pub fn write_output_plan(
     sink_uri: &str,
-    outputs: &[OutputPlan<'_>],
+    outputs: &[OutputPlan],
     job_id: &str,
-) -> Result<Vec<OutputArtifact>> {
+) -> SinkResult<Vec<OutputArtifact>> {
     let parsed = casparian_protocol::types::ParsedSinkUri::parse(sink_uri)
-        .map_err(|e| anyhow::anyhow!(e))?;
+        .map_err(|e| SinkError::message(format!("Failed to parse sink URI: {}", e)))?;
     let mut registry = SinkRegistry::new();
 
     for output in outputs {
         let sink = create_sink_from_uri(
             sink_uri,
-            &output.name,
-            output.table.as_deref(),
+            output.name(),
+            output.table(),
             job_id,
         )?;
-        registry.add(&output.name, sink);
+        registry.add(output.name(), sink);
     }
 
     let mut artifacts = Vec::new();
 
     for output in outputs {
-        if output.batches.is_empty() {
+        if output.batches().is_empty() {
             continue;
         }
 
-        registry.init(&output.name, output.batches[0].schema().as_ref())?;
+        let first_schema = output.batches()[0].schema();
+        registry.init(output.name(), first_schema.as_ref())?;
         let mut rows = 0;
-        for batch in &output.batches {
-            registry.write_batch(&output.name, batch)?;
+        for batch in output.batches() {
+            registry.write_batch(output.name(), batch.record_batch())?;
             rows += batch.num_rows() as u64;
         }
 
         let uri = artifact_uri_for_output(
             &parsed,
-            &output.name,
-            output.table.as_deref(),
+            output.name(),
+            output.table(),
             job_id,
         )?;
 
         artifacts.push(OutputArtifact {
-            name: output.name.clone(),
+            name: output.name().to_string(),
             uri,
             rows,
         });
@@ -173,7 +276,7 @@ pub fn write_output_plan(
 }
 
 /// Trait for sink writers
-pub trait SinkWriter: Send {
+pub(crate) trait SinkWriter: Send {
     /// Initialize the sink with the expected schema
     fn init(&mut self, schema: &Schema) -> Result<()>;
 
@@ -947,7 +1050,7 @@ impl SinkRegistry {
 /// Validate that a batch conforms to a declared schema
 ///
 /// Returns Ok(()) if the batch schema matches, or an error describing the mismatch.
-pub fn validate_batch_schema(
+pub(crate) fn validate_batch_schema(
     batch: &RecordBatch,
     declared_schema: &Schema,
     sink_name: &str,
@@ -1024,7 +1127,7 @@ fn types_compatible(actual: &DataType, expected: &DataType) -> bool {
     }
 }
 
-/// Inject lineage columns into a RecordBatch
+/// Inject lineage columns into an OutputBatch
 ///
 /// Adds:
 /// - _cf_source_hash: Blake3 hash of the source file
@@ -1032,11 +1135,12 @@ fn types_compatible(actual: &DataType, expected: &DataType) -> bool {
 /// - _cf_processed_at: ISO 8601 timestamp of when the record was processed
 /// - _cf_parser_version: Parser version that processed this record
 pub fn inject_lineage_columns(
-    batch: &RecordBatch,
+    batch: &OutputBatch,
     source_hash: &str,
     job_id: &str,
     parser_version: &str,
-) -> Result<RecordBatch> {
+) -> Result<OutputBatch> {
+    let batch = batch.record_batch();
     let num_rows = batch.num_rows();
 
     // Current timestamp in ISO 8601 format
@@ -1064,12 +1168,13 @@ pub fn inject_lineage_columns(
     columns.push(processed_at_array);
     columns.push(parser_version_array);
 
-    RecordBatch::try_new(new_schema, columns)
-        .context("Failed to create batch with lineage columns")
+    let batch = RecordBatch::try_new(new_schema, columns)
+        .context("Failed to create batch with lineage columns")?;
+    Ok(OutputBatch::from_record_batch(batch))
 }
 
 /// Create a sink from a SinkUri
-pub fn create_sink_from_uri(
+pub(crate) fn create_sink_from_uri(
     uri: &str,
     output_name: &str,
     output_table: Option<&str>,
@@ -1360,8 +1465,10 @@ mod tests {
 
     #[test]
     fn test_inject_lineage_columns() {
-        let batch = create_test_batch();
-        let with_lineage = inject_lineage_columns(&batch, "abc123", "job-456", "1.0.0").unwrap();
+        let batch = OutputBatch::from_record_batch(create_test_batch());
+        let with_lineage =
+            inject_lineage_columns(&batch, "abc123", "job-456", "1.0.0").unwrap();
+        let with_lineage = with_lineage.record_batch();
 
         // Original 2 columns + 4 lineage columns
         assert_eq!(with_lineage.num_columns(), 6);

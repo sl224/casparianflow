@@ -20,12 +20,14 @@
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
+use casparian_sinks::OutputBatch;
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 /// Embedded Python bridge shim source code.
@@ -68,6 +70,39 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for read operations on the socket
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Errors returned by bridge operations.
+#[derive(Debug, Error)]
+pub enum BridgeError {
+    #[error("{message}")]
+    Message { message: String },
+    #[error("{message}")]
+    Source {
+        message: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+pub type BridgeExecResult<T> = std::result::Result<T, BridgeError>;
+
+impl BridgeError {
+    fn with_source(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        BridgeError::Source {
+            message: message.into(),
+            source: Box::new(source),
+        }
+    }
+}
+
+impl From<anyhow::Error> for BridgeError {
+    fn from(err: anyhow::Error) -> Self {
+        BridgeError::with_source(err.to_string(), err)
+    }
+}
 
 /// Streaming log writer that writes to a temp file with size cap.
 /// Memory usage is O(1) regardless of log volume - key for preventing OOM.
@@ -181,7 +216,7 @@ pub struct OutputInfo {
 #[derive(Debug)]
 pub struct BridgeResult {
     /// Arrow record batches produced by the plugin
-    pub batches: Vec<RecordBatch>,
+    pub batches: Vec<OutputBatch>,
     /// Captured logs from the plugin (stdout, stderr, logging)
     /// This is O(1) memory during execution but loaded at end (capped at 10MB)
     pub logs: String,
@@ -192,7 +227,11 @@ pub struct BridgeResult {
 /// Execute a bridge job. This is the only public entry point.
 /// Runs blocking I/O in a separate thread pool.
 /// Returns both the data batches and captured logs.
-pub async fn execute_bridge(config: BridgeConfig) -> Result<BridgeResult> {
+pub async fn execute_bridge(config: BridgeConfig) -> BridgeExecResult<BridgeResult> {
+    execute_bridge_inner(config).await.map_err(BridgeError::from)
+}
+
+async fn execute_bridge_inner(config: BridgeConfig) -> Result<BridgeResult> {
     // Move all blocking work to spawn_blocking
     tokio::task::spawn_blocking(move || execute_bridge_sync(config))
         .await
@@ -328,6 +367,11 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
 
     info!("[Job {}] Bridge execution complete: {} batches, {} bytes logs, {} outputs",
           job_id, batches.len(), logs.len(), output_info.len());
+
+    let batches = batches
+        .into_iter()
+        .map(OutputBatch::from_record_batch)
+        .collect();
 
     Ok(BridgeResult { batches, logs, output_info })
 }
@@ -734,7 +778,11 @@ fn read_error_message(
 ///
 /// The function is idempotent: if files exist and match, they're reused.
 /// Version changes cause a new directory to be created.
-pub fn materialize_bridge_shim() -> Result<PathBuf> {
+pub fn materialize_bridge_shim() -> BridgeExecResult<PathBuf> {
+    materialize_bridge_shim_inner().map_err(BridgeError::from)
+}
+
+fn materialize_bridge_shim_inner() -> Result<PathBuf> {
     // Resolve cache directory: ~/.casparian_flow/shim/{version}/
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -835,7 +883,7 @@ pub fn materialize_bridge_shim() -> Result<PathBuf> {
 /// This function is kept for backward compatibility but now delegates
 /// to the new materialization logic.
 #[deprecated(since = "0.2.0", note = "Use materialize_bridge_shim() instead")]
-pub fn find_bridge_shim() -> Result<PathBuf> {
+pub fn find_bridge_shim() -> BridgeExecResult<PathBuf> {
     materialize_bridge_shim()
 }
 

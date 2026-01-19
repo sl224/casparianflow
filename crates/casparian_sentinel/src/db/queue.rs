@@ -3,7 +3,7 @@
 //! Uses DbConnection for all queries to keep DB backend swappable.
 
 use anyhow::{Context, Result};
-use casparian_db::{DbConnection, DbValue};
+use casparian_db::{DbConnection, DbTimestamp, DbValue};
 
 use super::models::{DeadLetterJob, ParserHealth, ProcessingJob, QuarantinedRow};
 
@@ -31,8 +31,8 @@ pub struct JobQueue {
     conn: DbConnection,
 }
 
-fn now_ts() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
+fn now_ts() -> DbTimestamp {
+    DbTimestamp::now()
 }
 
 impl JobQueue {
@@ -451,7 +451,12 @@ impl JobQueue {
                     consecutive_failures = 0,
                     updated_at = ?
                 "#,
-                &[DbValue::from(parser_name), DbValue::from(now), DbValue::from(now), DbValue::from(now)],
+                &[
+                    DbValue::from(parser_name),
+                    DbValue::from(now.clone()),
+                    DbValue::from(now.clone()),
+                    DbValue::from(now),
+                ],
             )
             .await?;
         Ok(())
@@ -473,8 +478,8 @@ impl JobQueue {
                 &[
                     DbValue::from(parser_name),
                     DbValue::from(reason),
-                    DbValue::from(now),
-                    DbValue::from(now),
+                    DbValue::from(now.clone()),
+                    DbValue::from(now.clone()),
                     DbValue::from(reason),
                     DbValue::from(now),
                 ],
@@ -490,7 +495,11 @@ impl JobQueue {
         self.conn
             .execute(
                 "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
-                &[DbValue::from(now), DbValue::from(now), DbValue::from(parser_name)],
+                &[
+                    DbValue::from(now.clone()),
+                    DbValue::from(now),
+                    DbValue::from(parser_name),
+                ],
             )
             .await?;
         Ok(())
@@ -516,7 +525,7 @@ impl JobQueue {
             )
             .await?;
         Ok(row
-            .and_then(|r| r.get_by_name::<Option<chrono::DateTime<chrono::Utc>>>("paused_at").ok())
+            .and_then(|r| r.get_by_name::<Option<DbTimestamp>>("paused_at").ok())
             .flatten()
             .is_some())
     }

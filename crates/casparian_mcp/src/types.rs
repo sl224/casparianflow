@@ -4,118 +4,9 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 use thiserror::Error;
-use uuid::Uuid;
 
-// =============================================================================
-// Wrapper Types for Domain IDs
-// =============================================================================
-
-/// Unique identifier for a Scope (data context)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ScopeId(pub Uuid);
-
-impl ScopeId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-}
-
-impl Default for ScopeId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for ScopeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::str::FromStr for ScopeId {
-    type Err = uuid::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-}
-
-/// Unique identifier for a Contract (transformation definition)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ContractId(pub Uuid);
-
-impl ContractId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-}
-
-impl Default for ContractId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for ContractId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::str::FromStr for ContractId {
-    type Err = uuid::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-}
-
-/// Unique identifier for a Backtest run
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct BacktestId(pub Uuid);
-
-impl BacktestId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-}
-
-impl Default for BacktestId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for BacktestId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::str::FromStr for BacktestId {
-    type Err = uuid::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-}
+pub use casparian_ids::{BacktestId, ContractId, ScopeId};
 
 // =============================================================================
 // Tool Error Types
@@ -141,12 +32,38 @@ pub enum ToolError {
     Internal(String),
 
     /// Serialization/deserialization error
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("Serialization error: {message}")]
+    Serialization {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
 
     /// I/O error
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("I/O error: {message}")]
+    Io {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+}
+
+impl From<serde_json::Error> for ToolError {
+    fn from(err: serde_json::Error) -> Self {
+        ToolError::Serialization {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
+impl From<std::io::Error> for ToolError {
+    fn from(err: std::io::Error) -> Self {
+        ToolError::Io {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
 }
 
 impl ToolError {
@@ -157,8 +74,8 @@ impl ToolError {
             ToolError::NotFound(_) => -32001,      // Custom: not found
             ToolError::ExecutionFailed(_) => -32002, // Custom: execution failed
             ToolError::Internal(_) => -32603,      // Internal error
-            ToolError::Serialization(_) => -32700, // Parse error
-            ToolError::Io(_) => -32603,            // Internal error
+            ToolError::Serialization { .. } => -32700, // Parse error
+            ToolError::Io { .. } => -32603,            // Internal error
         }
     }
 }

@@ -3,9 +3,8 @@
 //! Schema = Intent. Once approved, schema is a CONTRACT.
 //! Parser must conform. Violations are failures, not fallbacks.
 
-use chrono::{DateTime, Utc};
+use crate::ids::{ContractId, SchemaId, SchemaTimestamp};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// A schema contract - the binding agreement between user intent and parser output.
 ///
@@ -14,7 +13,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaContract {
     /// Unique identifier for this contract
-    pub contract_id: Uuid,
+    pub contract_id: ContractId,
 
     /// The scope this contract applies to (e.g., parser_id, pipeline_id, tag)
     pub scope_id: String,
@@ -26,7 +25,7 @@ pub struct SchemaContract {
     pub logic_hash: Option<String>,
 
     /// When this contract was approved by the user
-    pub approved_at: DateTime<Utc>,
+    pub approved_at: SchemaTimestamp,
 
     /// Who approved this contract (user_id or "system")
     pub approved_by: String,
@@ -42,11 +41,11 @@ impl SchemaContract {
     /// Create a new schema contract with a single schema
     pub fn new(scope_id: impl Into<String>, schema: LockedSchema, approved_by: impl Into<String>) -> Self {
         Self {
-            contract_id: Uuid::new_v4(),
+            contract_id: ContractId::new(),
             scope_id: scope_id.into(),
             scope_description: None,
             logic_hash: None,
-            approved_at: Utc::now(),
+            approved_at: SchemaTimestamp::now(),
             approved_by: approved_by.into(),
             schemas: vec![schema],
             version: 1,
@@ -60,11 +59,11 @@ impl SchemaContract {
         approved_by: impl Into<String>,
     ) -> Self {
         Self {
-            contract_id: Uuid::new_v4(),
+            contract_id: ContractId::new(),
             scope_id: scope_id.into(),
             scope_description: None,
             logic_hash: None,
-            approved_at: Utc::now(),
+            approved_at: SchemaTimestamp::now(),
             approved_by: approved_by.into(),
             schemas,
             version: 1,
@@ -90,7 +89,7 @@ impl SchemaContract {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockedSchema {
     /// Unique identifier for this schema
-    pub schema_id: Uuid,
+    pub schema_id: SchemaId,
 
     /// Human-readable name (e.g., "transactions", "users")
     pub name: String,
@@ -111,7 +110,7 @@ impl LockedSchema {
         let name = name.into();
         let content_hash = Self::compute_hash(&name, &columns);
         Self {
-            schema_id: Uuid::new_v4(),
+            schema_id: SchemaId::new(),
             name,
             columns,
             source_pattern: None,

@@ -15,12 +15,11 @@
 //! After approval, any deviation from the contract is a FAILURE.
 
 use crate::{DataType, LockedColumn, LockedSchema, SchemaContract};
+use crate::ids::{DiscoveryId, SchemaTimestamp, SchemaVariantId};
 use crate::storage::{SchemaStorage, StorageError};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Errors that can occur during schema approval.
 #[derive(Debug, Error)]
@@ -56,7 +55,7 @@ pub enum ApprovalError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaApprovalRequest {
     /// ID of the discovery result being approved
-    pub discovery_id: Uuid,
+    pub discovery_id: DiscoveryId,
 
     /// Parser identifier (stable across versions)
     #[serde(default)]
@@ -92,7 +91,7 @@ pub struct SchemaApprovalRequest {
 impl SchemaApprovalRequest {
     /// Create a new approval request
     pub fn new(
-        discovery_id: Uuid,
+        discovery_id: DiscoveryId,
         parser_id: impl Into<String>,
         parser_version: impl Into<String>,
         approved_by: impl Into<String>,
@@ -161,7 +160,7 @@ impl SchemaApprovalRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovedSchemaVariant {
     /// ID of this variant (for tracking)
-    pub variant_id: Uuid,
+    pub variant_id: SchemaVariantId,
 
     /// Human-readable name for this schema
     pub name: String,
@@ -183,7 +182,7 @@ impl ApprovedSchemaVariant {
     /// Create a new approved schema variant
     pub fn new(name: impl Into<String>, output_table_name: impl Into<String>) -> Self {
         Self {
-            variant_id: Uuid::new_v4(),
+            variant_id: SchemaVariantId::new(),
             name: name.into(),
             columns: Vec::new(),
             output_table_name: output_table_name.into(),
@@ -395,7 +394,7 @@ pub struct ApprovalResult {
     pub warnings: Vec<ApprovalWarning>,
 
     /// When the approval happened
-    pub approved_at: DateTime<Utc>,
+    pub approved_at: SchemaTimestamp,
 }
 
 /// Warning generated during approval (non-fatal issues).
@@ -503,7 +502,7 @@ pub async fn approve_schema(
         contract,
         excluded_files: request.excluded_files,
         warnings,
-        approved_at: Utc::now(),
+        approved_at: SchemaTimestamp::now(),
     })
 }
 
@@ -614,7 +613,7 @@ fn generate_approval_warnings(request: &SchemaApprovalRequest) -> Vec<ApprovalWa
 #[deprecated(note = "Use approve_schema with SchemaApprovalRequest to derive scope_id and enforce validation")]
 pub async fn approve_discovery_directly(
     storage: &SchemaStorage,
-    discovery_id: &str,
+    discovery_id: &DiscoveryId,
     approved_by: &str,
 ) -> Result<ApprovalResult, ApprovalError> {
     // Use storage's built-in approval
@@ -624,7 +623,7 @@ pub async fn approve_discovery_directly(
         contract,
         excluded_files: Vec::new(),
         warnings: Vec::new(),
-        approved_at: Utc::now(),
+        approved_at: SchemaTimestamp::now(),
     })
 }
 
@@ -638,7 +637,7 @@ mod tests {
     }
 
     fn new_request(approved_by: &str) -> SchemaApprovalRequest {
-        SchemaApprovalRequest::new(Uuid::new_v4(), "parser-123", "1.0.0", approved_by)
+        SchemaApprovalRequest::new(DiscoveryId::new(), "parser-123", "1.0.0", approved_by)
     }
 
     #[test]
@@ -705,7 +704,7 @@ mod tests {
         let logic_hash = "deadbeef";
 
         let request = SchemaApprovalRequest::new(
-            Uuid::new_v4(),
+            DiscoveryId::new(),
             parser_id,
             parser_version,
             "approver",

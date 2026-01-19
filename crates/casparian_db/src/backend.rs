@@ -45,9 +45,9 @@ pub enum BackendError {
     #[error("Backend not available: {0}")]
     NotAvailable(String),
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[error("SQLx error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    Sqlx(String),
 
     #[cfg(feature = "duckdb")]
     #[error("DuckDB error: {0}")]
@@ -61,6 +61,11 @@ impl From<duckdb::Error> for BackendError {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn map_sqlx_error(err: sqlx::Error) -> BackendError {
+    BackendError::Sqlx(err.to_string())
+}
+
 
 /// Database access mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +74,98 @@ pub enum AccessMode {
     ReadWrite,
     /// Read-only access (can coexist with other readers)
     ReadOnly,
+}
+
+/// Timestamp wrapper for database values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DbTimestamp {
+    inner: chrono::DateTime<chrono::Utc>,
+}
+
+/// Errors that can occur when parsing or constructing timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbTimestampError {
+    message: String,
+}
+
+impl DbTimestampError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DbTimestampError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DbTimestampError {}
+
+impl DbTimestamp {
+    /// Current timestamp in UTC.
+    pub fn now() -> Self {
+        Self {
+            inner: chrono::Utc::now(),
+        }
+    }
+
+    /// Parse an RFC3339 timestamp string.
+    pub fn from_rfc3339(value: &str) -> Result<Self, DbTimestampError> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .map(|dt| Self {
+                inner: dt.with_timezone(&chrono::Utc),
+            })
+            .map_err(|e| DbTimestampError::new(format!("Invalid timestamp: {}", e)))
+    }
+
+    /// Construct from Unix milliseconds.
+    pub fn from_unix_millis(ms: i64) -> Result<Self, DbTimestampError> {
+        let secs = ms / 1_000;
+        let nanos = ((ms % 1_000) * 1_000_000) as u32;
+        chrono::DateTime::from_timestamp(secs, nanos)
+            .map(|dt| Self { inner: dt })
+            .ok_or_else(|| DbTimestampError::new("Invalid Unix milliseconds"))
+    }
+
+    /// RFC3339 string representation.
+    pub fn to_rfc3339(&self) -> String {
+        self.inner.to_rfc3339()
+    }
+
+    /// Unix milliseconds since epoch.
+    pub fn unix_millis(&self) -> i64 {
+        self.inner.timestamp_millis()
+    }
+
+    pub(crate) fn from_chrono(value: chrono::DateTime<chrono::Utc>) -> Self {
+        Self { inner: value }
+    }
+
+    pub(crate) fn as_chrono(&self) -> &chrono::DateTime<chrono::Utc> {
+        &self.inner
+    }
+}
+
+impl serde::Serialize for DbTimestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_rfc3339())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DbTimestamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
+        DbTimestamp::from_rfc3339(&raw).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Value type for query parameters.
@@ -80,7 +177,7 @@ pub enum DbValue {
     Text(String),
     Blob(Vec<u8>),
     Boolean(bool),
-    Timestamp(chrono::DateTime<chrono::Utc>),
+    Timestamp(DbTimestamp),
 }
 
 impl From<i32> for DbValue {
@@ -119,8 +216,8 @@ impl From<bool> for DbValue {
     }
 }
 
-impl From<chrono::DateTime<chrono::Utc>> for DbValue {
-    fn from(v: chrono::DateTime<chrono::Utc>) -> Self {
+impl From<DbTimestamp> for DbValue {
+    fn from(v: DbTimestamp) -> Self {
         DbValue::Timestamp(v)
     }
 }
@@ -329,13 +426,12 @@ impl FromDbValue for f64 {
     }
 }
 
-impl FromDbValue for chrono::DateTime<chrono::Utc> {
+impl FromDbValue for DbTimestamp {
     fn from_db_value(value: &DbValue) -> Result<Self, BackendError> {
         match value {
             DbValue::Timestamp(v) => Ok(v.clone()),
-            DbValue::Text(v) => chrono::DateTime::parse_from_rfc3339(v)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .map_err(|e| BackendError::TypeConversion(format!("Invalid timestamp: {}", e))),
+            DbValue::Text(v) => DbTimestamp::from_rfc3339(v)
+                .map_err(|e| BackendError::TypeConversion(e.to_string())),
             _ => Err(BackendError::TypeConversion("Expected timestamp".to_string())),
         }
     }
@@ -554,7 +650,8 @@ impl DbConnection {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(10)
             .connect(url)
-            .await?;
+            .await
+            .map_err(map_sqlx_error)?;
 
         info!("Opened PostgreSQL database");
         Ok(Self {
@@ -637,7 +734,10 @@ impl DbConnection {
             DbConnectionInner::Postgres(pool) => {
                 // WARNING: This breaks SQL with semicolons in string literals
                 for stmt in sql.split(';').filter(|s| !s.trim().is_empty()) {
-                    sqlx::query(stmt).execute(pool).await?;
+                    sqlx::query(stmt)
+                        .execute(pool)
+                        .await
+                        .map_err(map_sqlx_error)?;
                 }
                 Ok(())
             }
@@ -794,7 +894,7 @@ impl DbConnection {
             let mut conn = match runtime.block_on(sqlx::SqliteConnection::connect(&url)) {
                 Ok(conn) => conn,
                 Err(err) => {
-                    let _ = init_tx.send(Err(BackendError::from(err)));
+                    let _ = init_tx.send(Err(map_sqlx_error(err)));
                     return;
                 }
             };
@@ -852,7 +952,10 @@ impl DbConnection {
         op: Box<dyn SqliteTxOp>,
     ) -> Result<Box<dyn Any + Send>, BackendError> {
         runtime.block_on(async {
-            sqlx::query("BEGIN").execute(&mut *conn).await?;
+            sqlx::query("BEGIN")
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
             Ok::<(), BackendError>(())
         })?;
 
@@ -862,13 +965,21 @@ impl DbConnection {
         match result {
             Ok(value) => {
                 runtime.block_on(async {
-                    sqlx::query("COMMIT").execute(conn).await?;
+                    sqlx::query("COMMIT")
+                        .execute(conn)
+                        .await
+                        .map_err(map_sqlx_error)?;
                     Ok::<(), BackendError>(())
                 })?;
                 Ok(value)
             }
             Err(err) => {
-                let _ = runtime.block_on(async { sqlx::query("ROLLBACK").execute(conn).await });
+                let _ = runtime.block_on(async {
+                    sqlx::query("ROLLBACK")
+                        .execute(conn)
+                        .await
+                        .map_err(map_sqlx_error)
+                });
                 Err(err)
             }
         }
@@ -889,10 +1000,10 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
-                DbValue::Timestamp(v) => query.bind(v.clone()),
+                DbValue::Timestamp(v) => query.bind(v.as_chrono().clone()),
             };
         }
-        let result = query.execute(conn).await?;
+        let result = query.execute(conn).await.map_err(map_sqlx_error)?;
         Ok(result.rows_affected())
     }
 
@@ -903,7 +1014,10 @@ impl DbConnection {
     ) -> Result<(), BackendError> {
         // WARNING: This breaks SQL with semicolons in string literals
         for stmt in sql.split(';').filter(|s| !s.trim().is_empty()) {
-            sqlx::query(stmt).execute(&mut *conn).await?;
+            sqlx::query(stmt)
+                .execute(&mut *conn)
+                .await
+                .map_err(map_sqlx_error)?;
         }
         Ok(())
     }
@@ -925,11 +1039,11 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
-                DbValue::Timestamp(v) => query.bind(v.clone()),
+                DbValue::Timestamp(v) => query.bind(v.as_chrono().clone()),
             };
         }
 
-        let rows = query.fetch_all(conn).await?;
+        let rows = query.fetch_all(conn).await.map_err(map_sqlx_error)?;
         let mut result = Vec::with_capacity(rows.len());
 
         for row in rows {
@@ -958,7 +1072,9 @@ impl DbConnection {
                     }
                     "DATETIME" | "TIMESTAMP" => {
                         let v: Option<chrono::DateTime<chrono::Utc>> = row.try_get(i).ok();
-                        v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
+                        v.map(DbTimestamp::from_chrono)
+                            .map(DbValue::Timestamp)
+                            .unwrap_or(DbValue::Null)
                     }
                     "TEXT" | "VARCHAR" | "CHAR" => {
                         let v: Option<Option<String>> = row.try_get(i).ok();
@@ -1011,7 +1127,9 @@ impl DbConnection {
                                                 _ => DbValue::Null,
                                             }
                                         } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
-                                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
+                                            v.map(DbTimestamp::from_chrono)
+                                                .map(DbValue::Timestamp)
+                                                .unwrap_or(DbValue::Null)
                                         } else if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
                                             v.map(DbValue::Integer).unwrap_or(DbValue::Null)
                                         } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
@@ -1032,7 +1150,9 @@ impl DbConnection {
                                 _ => DbValue::Null,
                             }
                         } else if let Ok(v) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i) {
-                            v.map(DbValue::Timestamp).unwrap_or(DbValue::Null)
+                            v.map(DbTimestamp::from_chrono)
+                                .map(DbValue::Timestamp)
+                                .unwrap_or(DbValue::Null)
                         } else if let Ok(v) = row.try_get::<Option<i64>, _>(i) {
                             v.map(DbValue::Integer).unwrap_or(DbValue::Null)
                         } else if let Ok(v) = row.try_get::<Option<f64>, _>(i) {
@@ -1059,8 +1179,14 @@ impl DbConnection {
     async fn apply_sqlite_optimizations_on_conn(
         conn: &mut sqlx::SqliteConnection,
     ) -> Result<(), BackendError> {
-        sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *conn).await?;
-        sqlx::query("PRAGMA synchronous=NORMAL").execute(&mut *conn).await?;
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx_error)?;
         Ok(())
     }
 
@@ -1285,7 +1411,7 @@ impl DbConnection {
             DbValue::Blob(v) => duckdb::types::Value::Blob(v.clone()),
             DbValue::Boolean(v) => duckdb::types::Value::Boolean(*v),
             DbValue::Timestamp(v) => {
-                let micros = v.timestamp_micros();
+                let micros = v.as_chrono().timestamp_micros();
                 duckdb::types::Value::Timestamp(duckdb::types::TimeUnit::Microsecond, micros)
             }
         }).collect()
@@ -1325,7 +1451,7 @@ impl DbConnection {
                 let secs = micros / 1_000_000;
                 let nanos = ((micros % 1_000_000) * 1_000) as u32;
                 if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                    Ok(DbValue::Timestamp(dt))
+                    Ok(DbValue::Timestamp(DbTimestamp::from_chrono(dt)))
                 } else {
                     Ok(DbValue::Integer(micros))
                 }
@@ -1395,10 +1521,10 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
-                DbValue::Timestamp(v) => query.bind(v.clone()),
+                DbValue::Timestamp(v) => query.bind(v.as_chrono().clone()),
             };
         }
-        let result = query.execute(pool).await?;
+        let result = query.execute(pool).await.map_err(map_sqlx_error)?;
         Ok(result.rows_affected())
     }
 
@@ -1415,11 +1541,11 @@ impl DbConnection {
                 DbValue::Text(v) => query.bind(v.as_str()),
                 DbValue::Blob(v) => query.bind(v.as_slice()),
                 DbValue::Boolean(v) => query.bind(*v),
-                DbValue::Timestamp(v) => query.bind(v.clone()),
+                DbValue::Timestamp(v) => query.bind(v.as_chrono().clone()),
             };
         }
 
-        let rows = query.fetch_all(pool).await?;
+        let rows = query.fetch_all(pool).await.map_err(map_sqlx_error)?;
         let mut result = Vec::with_capacity(rows.len());
 
         for row in rows {
@@ -1437,7 +1563,7 @@ impl DbConnection {
                 } else if let Ok(v) = row.try_get::<Vec<u8>, _>(i) {
                     DbValue::Blob(v)
                 } else if let Ok(v) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(i) {
-                    DbValue::Timestamp(v)
+                    DbValue::Timestamp(DbTimestamp::from_chrono(v))
                 } else if let Ok(v) = row.try_get::<String, _>(i) {
                     DbValue::Text(v)
                 } else {

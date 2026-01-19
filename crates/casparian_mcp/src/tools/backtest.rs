@@ -12,10 +12,10 @@ use casparian_backtest::{
     high_failure::{FailureHistoryEntry, FileInfo, HighFailureTable},
     iteration::IterationConfig,
     metrics::{FailureCategory, IterationMetrics},
+    ScopeId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use uuid::Uuid;
 
 // =============================================================================
 // Run Backtest Tool
@@ -254,8 +254,8 @@ impl Tool for RunBacktestTool {
 
         let scope_id = scope_id_str
             .as_ref()
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or_else(Uuid::new_v4);
+            .and_then(|s| ScopeId::parse(s).ok())
+            .unwrap_or_else(ScopeId::new);
 
         let _parser_code = args
             .get("parser_code")

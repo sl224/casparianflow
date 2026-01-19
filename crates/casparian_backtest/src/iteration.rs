@@ -6,10 +6,10 @@
 use crate::failfast::{backtest_with_failfast, BacktestResult, FailFastConfig, ParserRunner};
 use crate::high_failure::{FileInfo, HighFailureError, HighFailureTable};
 use crate::metrics::{BacktestMetrics, IterationMetrics};
+use crate::ScopeId;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 /// Configuration for the backtest iteration loop
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,7 +233,7 @@ pub async fn run_backtest_loop<P: MutableParser>(
     parser: &mut P,
     files: &[FileInfo],
     high_failure_table: &HighFailureTable,
-    scope_id: &Uuid,
+    scope_id: &ScopeId,
     config: &IterationConfig,
 ) -> Result<BacktestLoopResult, HighFailureError> {
     let start_time = Instant::now();
@@ -328,7 +328,7 @@ pub async fn run_single_backtest<P: ParserRunner>(
     parser: &P,
     files: &[FileInfo],
     high_failure_table: &HighFailureTable,
-    scope_id: &Uuid,
+    scope_id: &ScopeId,
     parser_version: usize,
     config: &FailFastConfig,
 ) -> Result<BacktestResult, HighFailureError> {
@@ -464,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn test_loop_achieves_pass_rate() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         // Parser starts with 2 failing files, fixes one per iteration
         let mut parser = TestParser {
@@ -496,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn test_loop_hits_max_iterations() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         // Parser never improves
         let mut parser = TestParser {
@@ -528,7 +528,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_backtest() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         let parser = TestParser {
             version: 1,

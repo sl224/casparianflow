@@ -20,11 +20,10 @@
 //! 5. Contract is updated (if approved) with new version
 
 use crate::{DataType, LockedColumn, LockedSchema, SchemaContract};
+use crate::ids::{AmendmentId, ContractId, SchemaTimestamp};
 use crate::storage::{SchemaStorage, StorageError};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Errors that can occur during schema amendment.
 #[derive(Debug, Error)]
@@ -36,10 +35,10 @@ pub enum AmendmentError {
     ContractNotFound(String),
 
     #[error("Amendment not found: {0}")]
-    AmendmentNotFound(Uuid),
+    AmendmentNotFound(AmendmentId),
 
     #[error("Amendment already processed: {0}")]
-    AlreadyProcessed(Uuid),
+    AlreadyProcessed(AmendmentId),
 
     #[error("Invalid amendment action: {0}")]
     InvalidAction(String),
@@ -58,10 +57,10 @@ pub enum AmendmentError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaAmendmentProposal {
     /// Unique identifier for this amendment proposal
-    pub amendment_id: Uuid,
+    pub amendment_id: AmendmentId,
 
     /// The contract being amended
-    pub contract_id: Uuid,
+    pub contract_id: ContractId,
 
     /// Why the amendment is needed
     pub reason: AmendmentReason,
@@ -82,7 +81,7 @@ pub struct SchemaAmendmentProposal {
     pub sample_values: Vec<SampleValue>,
 
     /// When this proposal was created
-    pub created_at: DateTime<Utc>,
+    pub created_at: SchemaTimestamp,
 
     /// Current status of the proposal
     pub status: AmendmentStatus,
@@ -94,7 +93,7 @@ pub struct SchemaAmendmentProposal {
 impl SchemaAmendmentProposal {
     /// Create a new amendment proposal
     pub fn new(
-        contract_id: Uuid,
+        contract_id: ContractId,
         reason: AmendmentReason,
         current_schema: LockedSchema,
         proposed_schema: LockedSchema,
@@ -102,7 +101,7 @@ impl SchemaAmendmentProposal {
         let changes = compute_schema_changes(&current_schema, &proposed_schema);
 
         Self {
-            amendment_id: Uuid::new_v4(),
+            amendment_id: AmendmentId::new(),
             contract_id,
             reason,
             current_schema,
@@ -110,7 +109,7 @@ impl SchemaAmendmentProposal {
             changes,
             affected_files: 0,
             sample_values: Vec::new(),
-            created_at: Utc::now(),
+            created_at: SchemaTimestamp::now(),
             status: AmendmentStatus::Pending,
             system_notes: None,
         }
@@ -458,7 +457,7 @@ pub struct AmendmentResult {
     pub status: AmendmentStatus,
 
     /// Timestamp of the action
-    pub processed_at: DateTime<Utc>,
+    pub processed_at: SchemaTimestamp,
 
     /// User who processed the amendment
     pub processed_by: String,
@@ -480,7 +479,7 @@ pub fn propose_amendment(
 
     // Create the proposal
     let proposal = SchemaAmendmentProposal::new(
-        contract.contract_id,
+        contract.contract_id.clone(),
         reason,
         current_schema,
         proposed_schema,
@@ -580,7 +579,7 @@ fn propose_amendment_internal(
     proposed_schema: LockedSchema,
 ) -> Result<SchemaAmendmentProposal, AmendmentError> {
     Ok(SchemaAmendmentProposal::new(
-        contract.contract_id,
+        contract.contract_id.clone(),
         reason,
         current_schema,
         proposed_schema,
@@ -595,11 +594,11 @@ pub async fn approve_amendment(
     processed_by: impl Into<String>,
 ) -> Result<AmendmentResult, AmendmentError> {
     if !proposal.is_pending() {
-        return Err(AmendmentError::AlreadyProcessed(proposal.amendment_id));
+        return Err(AmendmentError::AlreadyProcessed(proposal.amendment_id.clone()));
     }
 
     let processed_by = processed_by.into();
-    let processed_at = Utc::now();
+    let processed_at = SchemaTimestamp::now();
 
     match action {
         AmendmentAction::ApproveAsProposed => {
@@ -924,7 +923,7 @@ mod tests {
         );
 
         let proposal = SchemaAmendmentProposal::new(
-            Uuid::new_v4(),
+            ContractId::new(),
             AmendmentReason::NewColumns {
                 column_names: vec!["new_col".to_string()],
                 file_count: 5,

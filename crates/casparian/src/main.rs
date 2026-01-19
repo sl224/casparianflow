@@ -938,17 +938,19 @@ fn run_unified(
                 anyhow::bail!("Sentinel failed to start");
             }
 
-            let (worker, internal_shutdown_tx) = Worker::connect(worker_config).await?;
+            let (worker, worker_handle) = Worker::connect(worker_config)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
 
             // Forward external shutdown to internal shutdown
             let mut external_rx = worker_shutdown_rx;
             tokio::spawn(async move {
                 if external_rx.recv().await.is_some() {
-                    let _ = internal_shutdown_tx.send(()).await;
+                    let _ = worker_handle.shutdown().await;
                 }
             });
 
-            worker.run().await
+            worker.run().await.map_err(|e| anyhow::anyhow!(e))
         })
     });
 
@@ -1097,7 +1099,7 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
 
     rt.block_on(async move {
         // Materialize embedded bridge shim to disk (single binary distribution)
-        let shim_path = bridge::materialize_bridge_shim()?;
+        let shim_path = bridge::materialize_bridge_shim().map_err(|e| anyhow::anyhow!(e))?;
         let worker_id = args.worker_id.unwrap_or_else(|| {
             format!(
                 "rust-{}",
@@ -1114,7 +1116,9 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
             venvs_dir: None, // Use default ~/.casparian_flow/venvs
         };
 
-        let (worker, shutdown_tx) = Worker::connect(config).await?;
+        let (worker, worker_handle) = Worker::connect(config)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         // Spawn shutdown monitor
         let flag = shutdown_flag.clone();
@@ -1122,10 +1126,10 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
             while !flag.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let _ = shutdown_tx.send(()).await;
+            let _ = worker_handle.shutdown().await;
         });
 
-        worker.run().await
+        worker.run().await.map_err(|e| anyhow::anyhow!(e))
     })
 }
 
@@ -1432,7 +1436,7 @@ fn process_single_job(
         Err(e) => {
             error!(job_id, error = %e, elapsed_ms = elapsed.as_millis(), "Job failed");
             rt.block_on(queue.fail_job(job_id, &e.to_string()))?;
-            Err(e)
+            Err(anyhow::anyhow!(e))
         }
     }
 }

@@ -334,7 +334,7 @@ impl McpProtocol {
 
                     let request: JsonRpcRequest = serde_json::from_str(trimmed).map_err(|e| {
                         error!("Failed to parse request: {}", e);
-                        ToolError::Serialization(e)
+                        ToolError::from(e)
                     })?;
 
                     debug!("Parsed request: method={}", request.method);
@@ -342,7 +342,7 @@ impl McpProtocol {
                 }
                 Err(e) => {
                     error!("Failed to read from stdin: {}", e);
-                    return Err(ToolError::Io(e));
+                    return Err(ToolError::from(e));
                 }
             }
         }
@@ -356,12 +356,12 @@ impl McpProtocol {
         self.stdout
             .write_all(json.as_bytes())
             .await
-            .map_err(ToolError::Io)?;
+            .map_err(ToolError::from)?;
         self.stdout
             .write_all(b"\n")
             .await
-            .map_err(ToolError::Io)?;
-        self.stdout.flush().await.map_err(ToolError::Io)?;
+            .map_err(ToolError::from)?;
+        self.stdout.flush().await.map_err(ToolError::from)?;
 
         debug!("Sent response for id={:?}", response.id);
         Ok(())
@@ -386,12 +386,12 @@ impl McpProtocol {
         self.stdout
             .write_all(json.as_bytes())
             .await
-            .map_err(ToolError::Io)?;
+            .map_err(ToolError::from)?;
         self.stdout
             .write_all(b"\n")
             .await
-            .map_err(ToolError::Io)?;
-        self.stdout.flush().await.map_err(ToolError::Io)?;
+            .map_err(ToolError::from)?;
+        self.stdout.flush().await.map_err(ToolError::from)?;
 
         debug!("Sent notification: {}", method);
         Ok(())
@@ -435,7 +435,7 @@ impl<R: BufRead, W: Write> SyncProtocol<R, W> {
                     let request: JsonRpcRequest = serde_json::from_str(trimmed)?;
                     return Ok(Some(request));
                 }
-                Err(e) => return Err(ToolError::Io(e)),
+                Err(e) => return Err(ToolError::from(e)),
             }
         }
     }
@@ -443,8 +443,8 @@ impl<R: BufRead, W: Write> SyncProtocol<R, W> {
     /// Write a JSON-RPC response
     pub fn write_response(&mut self, response: &JsonRpcResponse) -> Result<(), ToolError> {
         let json = serde_json::to_string(response)?;
-        writeln!(self.writer, "{}", json).map_err(ToolError::Io)?;
-        self.writer.flush().map_err(ToolError::Io)?;
+        writeln!(self.writer, "{}", json).map_err(ToolError::from)?;
+        self.writer.flush().map_err(ToolError::from)?;
         Ok(())
     }
 }

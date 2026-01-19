@@ -5,9 +5,9 @@
 
 use crate::high_failure::{FailureHistoryEntry, FileInfo, HighFailureError, HighFailureTable};
 use crate::metrics::{FailureCategory, IterationMetrics};
+use crate::ScopeId;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
-use uuid::Uuid;
 
 /// Configuration for fail-fast backtest
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,7 +123,7 @@ pub async fn backtest_with_failfast<P: ParserRunner>(
     parser: &P,
     files: &[FileInfo],
     high_failure_table: &HighFailureTable,
-    scope_id: &Uuid,
+    scope_id: &ScopeId,
     parser_version: usize,
     iteration: usize,
     config: &FailFastConfig,
@@ -274,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn test_backtest_all_pass() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
         let parser = MockParser {
             failing_files: vec![],
         };
@@ -296,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn test_backtest_some_fail() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
         let parser = MockParser {
             failing_files: vec!["/path/a.csv".to_string()],
         };
@@ -318,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn test_backtest_early_stop() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         // Record some prior failures
         for i in 0..5 {
@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn test_backtest_continues_if_high_failure_passes() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         // Record some prior failures
         for i in 0..3 {
@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_files() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
         let parser = MockParser {
             failing_files: vec![],
         };

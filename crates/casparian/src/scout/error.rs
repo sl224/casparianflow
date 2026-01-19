@@ -16,7 +16,7 @@ pub enum ScoutError {
     Sqlite(#[from] sqlx::Error),
 
     #[error("Database pool error: {0}")]
-    DbPool(#[from] casparian_db::DbError),
+    DbPool(#[from] casparian_db::legacy::DbError),
 
     #[error("Walk error: {0}")]
     Walk(#[from] walkdir::Error),

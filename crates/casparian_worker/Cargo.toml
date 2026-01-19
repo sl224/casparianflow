@@ -13,7 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 # Protocol
 casparian_protocol = { path = "../casparian_protocol" }
-casparian_sinks = { path = "../casparian_sinks" }
+casparian_sinks = { path = "../casparian_sinks", features = ["internal"] }
 
 # Async runtime
 tokio.workspace = true

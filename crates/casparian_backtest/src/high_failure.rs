@@ -3,48 +3,59 @@
 //! Tracks files that have historically failed during backtest iterations.
 //! Files with high failure rates are tested first to enable early termination.
 
-use casparian_db::{DbConfig, DbPool, create_pool};
-use chrono::{DateTime, Utc};
+use casparian_db::{BackendError, DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use thiserror::Error;
-use uuid::Uuid;
 
+use crate::ids::{FileId, ScopeId};
 use crate::metrics::FailureCategory;
 
 /// Error types for high-failure table operations
 #[derive(Error, Debug)]
 pub enum HighFailureError {
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-    #[error("Database pool error: {0}")]
-    DbPool(#[from] casparian_db::DbError),
-    #[error("Serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    Database(#[from] BackendError),
+    #[error("Serialization error: {message}")]
+    Serialization {
+        message: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     #[error("File not found: {0}")]
     FileNotFound(String),
     #[error("Parse error: {0}")]
     Parse(String),
 }
 
+impl From<serde_json::Error> for HighFailureError {
+    fn from(err: serde_json::Error) -> Self {
+        HighFailureError::Serialization {
+            message: err.to_string(),
+            source: Some(Box::new(err)),
+        }
+    }
+}
+
 /// A file that has historically failed during backtest iterations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HighFailureFile {
     /// Unique identifier for this entry
-    pub file_id: Uuid,
+    pub file_id: FileId,
     /// Absolute path to the file
     pub file_path: String,
     /// The scope (parser/pipeline) this failure belongs to
-    pub scope_id: Uuid,
+    pub scope_id: ScopeId,
     /// Total number of failures across all iterations
     pub failure_count: usize,
     /// Number of consecutive failures (resets on success)
     pub consecutive_failures: usize,
     /// When this file first failed
-    pub first_failure_at: DateTime<Utc>,
+    pub first_failure_at: DbTimestamp,
     /// When this file last failed
-    pub last_failure_at: DateTime<Utc>,
+    pub last_failure_at: DbTimestamp,
     /// When this file was last tested (pass or fail)
-    pub last_tested_at: DateTime<Utc>,
+    pub last_tested_at: DbTimestamp,
     /// History of failures for this file
     pub failure_history: Vec<FailureHistoryEntry>,
 }
@@ -65,7 +76,7 @@ pub struct FailureHistoryEntry {
     /// What resolved it (e.g., "parser v3", "schema update")
     pub resolved_by: Option<String>,
     /// When this failure occurred
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: DbTimestamp,
 }
 
 impl FailureHistoryEntry {
@@ -83,7 +94,7 @@ impl FailureHistoryEntry {
             error_message: error_message.into(),
             resolved: false,
             resolved_by: None,
-            occurred_at: Utc::now(),
+            occurred_at: DbTimestamp::now(),
         }
     }
 
@@ -99,7 +110,7 @@ impl FailureHistoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     /// Unique identifier for this file
-    pub id: Uuid,
+    pub id: FileId,
     /// Absolute path to the file
     pub path: String,
     /// File size in bytes
@@ -116,7 +127,7 @@ impl FileInfo {
     /// Create a new file info
     pub fn new(path: impl Into<String>, size: u64) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: FileId::new(),
             path: path.into(),
             size,
             tested: false,
@@ -135,63 +146,55 @@ impl FileInfo {
 
 /// Tracks high-failure files for a scope.
 pub struct HighFailureTable {
-    pool: DbPool,
+    conn: DbConnection,
 }
 
 impl HighFailureTable {
     /// Create a new high-failure table with the given pool.
-    pub async fn new(pool: DbPool) -> Result<Self, HighFailureError> {
-        let table = Self { pool };
+    pub async fn new(conn: DbConnection) -> Result<Self, HighFailureError> {
+        let table = Self { conn };
         table.init_schema().await?;
         Ok(table)
     }
 
     /// Open from a file path.
     pub async fn open(path: &str) -> Result<Self, HighFailureError> {
-        let config = DbConfig::sqlite(path);
-        let pool = create_pool(config).await?;
-        Self::new(pool).await
+        let conn = DbConnection::open_sqlite(Path::new(path)).await?;
+        Self::new(conn).await
     }
 
     /// Create an in-memory table (for testing).
     pub async fn in_memory() -> Result<Self, HighFailureError> {
-        let config = DbConfig::sqlite_memory();
-        let pool = create_pool(config).await?;
-        Self::new(pool).await
+        let conn = DbConnection::open_sqlite_memory().await?;
+        Self::new(conn).await
     }
 
     /// Initialize the database schema
     async fn init_schema(&self) -> Result<(), HighFailureError> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS high_failure_files (
-                file_id TEXT PRIMARY KEY,
-                file_path TEXT NOT NULL,
-                scope_id TEXT NOT NULL,
-                failure_count INTEGER NOT NULL DEFAULT 0,
-                consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                first_failure_at TEXT NOT NULL,
-                last_failure_at TEXT NOT NULL,
-                last_tested_at TEXT NOT NULL,
-                failure_history_json TEXT NOT NULL DEFAULT '[]',
-                UNIQUE(file_path, scope_id)
+        self.conn
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS high_failure_files (
+                    file_id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    first_failure_at TEXT NOT NULL,
+                    last_failure_at TEXT NOT NULL,
+                    last_tested_at TEXT NOT NULL,
+                    failure_history_json TEXT NOT NULL DEFAULT '[]',
+                    UNIQUE(file_path, scope_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_high_failure_scope
+                    ON high_failure_files(scope_id);
+
+                CREATE INDEX IF NOT EXISTS idx_high_failure_consecutive
+                    ON high_failure_files(scope_id, consecutive_failures DESC);
+                "#,
             )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_high_failure_scope ON high_failure_files(scope_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_high_failure_consecutive ON high_failure_files(scope_id, consecutive_failures DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
+            .await?;
 
         Ok(())
     }
@@ -200,101 +203,102 @@ impl HighFailureTable {
     pub async fn record_failure(
         &self,
         file_path: &str,
-        scope_id: &Uuid,
+        scope_id: &ScopeId,
         entry: FailureHistoryEntry,
     ) -> Result<HighFailureFile, HighFailureError> {
-        let now = Utc::now();
-        let file_id = Uuid::new_v4();
-        let scope_str = scope_id.to_string();
+        let now = DbTimestamp::now();
+        let file_id = FileId::new();
 
-        // Check if entry exists
-        let existing: Option<ExistingRow> = sqlx::query_as(
-            r#"
-            SELECT file_id, failure_count, consecutive_failures, first_failure_at, failure_history_json
-            FROM high_failure_files
-            WHERE file_path = ?1 AND scope_id = ?2
-            "#,
-        )
-        .bind(file_path)
-        .bind(&scope_str)
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing = self
+            .conn
+            .query_optional(
+                r#"
+                SELECT file_id, failure_count, consecutive_failures, first_failure_at, failure_history_json
+                FROM high_failure_files
+                WHERE file_path = ?1 AND scope_id = ?2
+                "#,
+                &[DbValue::from(file_path), DbValue::from(scope_id.as_str())],
+            )
+            .await?;
 
-        if let Some(existing) = existing {
-            // Update existing entry
+        if let Some(row) = existing {
+            let existing = ExistingRow::from_row(&row)?;
             let mut history: Vec<FailureHistoryEntry> =
                 serde_json::from_str(&existing.failure_history_json)?;
             history.push(entry.clone());
             let new_history_json = serde_json::to_string(&history)?;
 
-            sqlx::query(
-                r#"
-                UPDATE high_failure_files
-                SET failure_count = ?1,
-                    consecutive_failures = ?2,
-                    last_failure_at = ?3,
-                    last_tested_at = ?4,
-                    failure_history_json = ?5
-                WHERE file_path = ?6 AND scope_id = ?7
-                "#,
-            )
-            .bind(existing.failure_count + 1)
-            .bind(existing.consecutive_failures + 1)
-            .bind(now.to_rfc3339())
-            .bind(now.to_rfc3339())
-            .bind(&new_history_json)
-            .bind(file_path)
-            .bind(&scope_str)
-            .execute(&self.pool)
-            .await?;
+            self.conn
+                .execute(
+                    r#"
+                    UPDATE high_failure_files
+                    SET failure_count = ?1,
+                        consecutive_failures = ?2,
+                        last_failure_at = ?3,
+                        last_tested_at = ?4,
+                        failure_history_json = ?5
+                    WHERE file_path = ?6 AND scope_id = ?7
+                    "#,
+                    &[
+                        DbValue::from(existing.failure_count + 1),
+                        DbValue::from(existing.consecutive_failures + 1),
+                        DbValue::from(now.to_rfc3339()),
+                        DbValue::from(now.to_rfc3339()),
+                        DbValue::from(new_history_json),
+                        DbValue::from(file_path),
+                        DbValue::from(scope_id.as_str()),
+                    ],
+                )
+                .await?;
 
-            let first_failure_at: DateTime<Utc> = existing
-                .first_failure_at
-                .parse()
-                .unwrap_or(now);
+            let first_failure_at =
+                parse_timestamp(&existing.first_failure_at, "first_failure_at")?;
+            let existing_file_id = FileId::parse(&existing.file_id)
+                .map_err(|e| HighFailureError::Parse(format!("Invalid file_id: {}", e)))?;
 
             Ok(HighFailureFile {
-                file_id: Uuid::parse_str(&existing.file_id).unwrap_or(file_id),
+                file_id: existing_file_id,
                 file_path: file_path.to_string(),
-                scope_id: *scope_id,
+                scope_id: scope_id.clone(),
                 failure_count: (existing.failure_count + 1) as usize,
                 consecutive_failures: (existing.consecutive_failures + 1) as usize,
                 first_failure_at,
-                last_failure_at: now,
+                last_failure_at: now.clone(),
                 last_tested_at: now,
                 failure_history: history,
             })
         } else {
-            // Insert new entry
             let history = vec![entry.clone()];
             let history_json = serde_json::to_string(&history)?;
 
-            sqlx::query(
-                r#"
-                INSERT INTO high_failure_files
-                (file_id, file_path, scope_id, failure_count, consecutive_failures,
-                 first_failure_at, last_failure_at, last_tested_at, failure_history_json)
-                VALUES (?1, ?2, ?3, 1, 1, ?4, ?5, ?6, ?7)
-                "#,
-            )
-            .bind(file_id.to_string())
-            .bind(file_path)
-            .bind(&scope_str)
-            .bind(now.to_rfc3339())
-            .bind(now.to_rfc3339())
-            .bind(now.to_rfc3339())
-            .bind(&history_json)
-            .execute(&self.pool)
-            .await?;
+            self.conn
+                .execute(
+                    r#"
+                    INSERT INTO high_failure_files
+                    (file_id, file_path, scope_id, failure_count, consecutive_failures,
+                     first_failure_at, last_failure_at, last_tested_at, failure_history_json)
+                    VALUES (?1, ?2, ?3, 1, 1, ?4, ?5, ?6, ?7)
+                    "#,
+                    &[
+                        DbValue::from(file_id.to_string()),
+                        DbValue::from(file_path),
+                        DbValue::from(scope_id.as_str()),
+                        DbValue::from(now.to_rfc3339()),
+                        DbValue::from(now.to_rfc3339()),
+                        DbValue::from(now.to_rfc3339()),
+                        DbValue::from(history_json),
+                    ],
+                )
+                .await?;
 
             Ok(HighFailureFile {
                 file_id,
                 file_path: file_path.to_string(),
-                scope_id: *scope_id,
+                scope_id: scope_id.clone(),
                 failure_count: 1,
                 consecutive_failures: 1,
-                first_failure_at: now,
-                last_failure_at: now,
+                first_failure_at: now.clone(),
+                last_failure_at: now.clone(),
                 last_tested_at: now,
                 failure_history: history,
             })
@@ -305,21 +309,20 @@ impl HighFailureTable {
     pub async fn record_success(
         &self,
         file_path: &str,
-        scope_id: &Uuid,
+        scope_id: &ScopeId,
     ) -> Result<(), HighFailureError> {
-        let now = Utc::now();
-        let scope_str = scope_id.to_string();
+        let now = DbTimestamp::now();
 
-        // Get existing history
-        let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT failure_history_json FROM high_failure_files WHERE file_path = ?1 AND scope_id = ?2",
-        )
-        .bind(file_path)
-        .bind(&scope_str)
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing = self
+            .conn
+            .query_optional(
+                "SELECT failure_history_json FROM high_failure_files WHERE file_path = ?1 AND scope_id = ?2",
+                &[DbValue::from(file_path), DbValue::from(scope_id.as_str())],
+            )
+            .await?;
 
-        if let Some((history_json,)) = existing {
+        if let Some(row) = existing {
+            let history_json: String = row.get_by_name("failure_history_json")?;
             let mut history: Vec<FailureHistoryEntry> = serde_json::from_str(&history_json)?;
             for entry in &mut history {
                 if !entry.resolved {
@@ -329,68 +332,64 @@ impl HighFailureTable {
             }
             let new_history_json = serde_json::to_string(&history)?;
 
-            sqlx::query(
-                r#"
-                UPDATE high_failure_files
-                SET consecutive_failures = 0,
-                    last_tested_at = ?1,
-                    failure_history_json = ?2
-                WHERE file_path = ?3 AND scope_id = ?4
-                "#,
-            )
-            .bind(now.to_rfc3339())
-            .bind(&new_history_json)
-            .bind(file_path)
-            .bind(&scope_str)
-            .execute(&self.pool)
-            .await?;
+            self.conn
+                .execute(
+                    r#"
+                    UPDATE high_failure_files
+                    SET consecutive_failures = 0,
+                        last_tested_at = ?1,
+                        failure_history_json = ?2
+                    WHERE file_path = ?3 AND scope_id = ?4
+                    "#,
+                    &[
+                        DbValue::from(now.to_rfc3339()),
+                        DbValue::from(new_history_json),
+                        DbValue::from(file_path),
+                        DbValue::from(scope_id.as_str()),
+                    ],
+                )
+                .await?;
         }
 
         Ok(())
     }
 
     /// Get all active high-failure files for a scope (consecutive_failures > 0)
-    pub async fn get_active(&self, scope_id: &Uuid) -> Result<Vec<HighFailureFile>, HighFailureError> {
-        let scope_str = scope_id.to_string();
+    pub async fn get_active(&self, scope_id: &ScopeId) -> Result<Vec<HighFailureFile>, HighFailureError> {
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT file_id, file_path, scope_id, failure_count, consecutive_failures,
+                       first_failure_at, last_failure_at, last_tested_at, failure_history_json
+                FROM high_failure_files
+                WHERE scope_id = ?1 AND consecutive_failures > 0
+                ORDER BY consecutive_failures DESC
+                "#,
+                &[DbValue::from(scope_id.as_str())],
+            )
+            .await?;
 
-        let rows: Vec<HighFailureRow> = sqlx::query_as(
-            r#"
-            SELECT file_id, file_path, scope_id, failure_count, consecutive_failures,
-                   first_failure_at, last_failure_at, last_tested_at, failure_history_json
-            FROM high_failure_files
-            WHERE scope_id = ?1 AND consecutive_failures > 0
-            ORDER BY consecutive_failures DESC
-            "#,
-        )
-        .bind(&scope_str)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|r| r.into_high_failure_file())
-            .collect()
+        rows.into_iter().map(row_to_high_failure).collect()
     }
 
     /// Get all files for a scope (including resolved)
-    pub async fn get_all(&self, scope_id: &Uuid) -> Result<Vec<HighFailureFile>, HighFailureError> {
-        let scope_str = scope_id.to_string();
+    pub async fn get_all(&self, scope_id: &ScopeId) -> Result<Vec<HighFailureFile>, HighFailureError> {
+        let rows = self
+            .conn
+            .query_all(
+                r#"
+                SELECT file_id, file_path, scope_id, failure_count, consecutive_failures,
+                       first_failure_at, last_failure_at, last_tested_at, failure_history_json
+                FROM high_failure_files
+                WHERE scope_id = ?1
+                ORDER BY consecutive_failures DESC, failure_count DESC
+                "#,
+                &[DbValue::from(scope_id.as_str())],
+            )
+            .await?;
 
-        let rows: Vec<HighFailureRow> = sqlx::query_as(
-            r#"
-            SELECT file_id, file_path, scope_id, failure_count, consecutive_failures,
-                   first_failure_at, last_failure_at, last_tested_at, failure_history_json
-            FROM high_failure_files
-            WHERE scope_id = ?1
-            ORDER BY consecutive_failures DESC, failure_count DESC
-            "#,
-        )
-        .bind(&scope_str)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|r| r.into_high_failure_file())
-            .collect()
+        rows.into_iter().map(row_to_high_failure).collect()
     }
 
     /// Get files ordered for backtest: high-failure first, then resolved, then untested, then passing
@@ -403,7 +402,7 @@ impl HighFailureTable {
     pub async fn get_backtest_order(
         &self,
         all_files: &[FileInfo],
-        scope_id: &Uuid,
+        scope_id: &ScopeId,
     ) -> Result<Vec<FileInfo>, HighFailureError> {
         // Get all high-failure info
         let high_failure_files = self.get_all(scope_id).await?;
@@ -454,18 +453,19 @@ impl HighFailureTable {
     }
 
     /// Clear all entries for a scope (useful for fresh backtest)
-    pub async fn clear_scope(&self, scope_id: &Uuid) -> Result<usize, HighFailureError> {
-        let scope_str = scope_id.to_string();
-        let result = sqlx::query("DELETE FROM high_failure_files WHERE scope_id = ?1")
-            .bind(&scope_str)
-            .execute(&self.pool)
+    pub async fn clear_scope(&self, scope_id: &ScopeId) -> Result<usize, HighFailureError> {
+        let result = self
+            .conn
+            .execute(
+                "DELETE FROM high_failure_files WHERE scope_id = ?1",
+                &[DbValue::from(scope_id.as_str())],
+            )
             .await?;
-        Ok(result.rows_affected() as usize)
+        Ok(result as usize)
     }
 }
 
-/// Internal row type for existing record lookup
-#[derive(sqlx::FromRow)]
+/// Internal row type for existing record lookup.
 struct ExistingRow {
     file_id: String,
     failure_count: i64,
@@ -474,8 +474,19 @@ struct ExistingRow {
     failure_history_json: String,
 }
 
-/// Internal row type for full record
-#[derive(sqlx::FromRow)]
+impl ExistingRow {
+    fn from_row(row: &UnifiedDbRow) -> Result<Self, HighFailureError> {
+        Ok(Self {
+            file_id: row.get_by_name("file_id")?,
+            failure_count: row.get_by_name("failure_count")?,
+            consecutive_failures: row.get_by_name("consecutive_failures")?,
+            first_failure_at: row.get_by_name("first_failure_at")?,
+            failure_history_json: row.get_by_name("failure_history_json")?,
+        })
+    }
+}
+
+/// Internal row type for full record.
 struct HighFailureRow {
     file_id: String,
     file_path: String,
@@ -489,17 +500,28 @@ struct HighFailureRow {
 }
 
 impl HighFailureRow {
+    fn from_row(row: &UnifiedDbRow) -> Result<Self, HighFailureError> {
+        Ok(Self {
+            file_id: row.get_by_name("file_id")?,
+            file_path: row.get_by_name("file_path")?,
+            scope_id: row.get_by_name("scope_id")?,
+            failure_count: row.get_by_name("failure_count")?,
+            consecutive_failures: row.get_by_name("consecutive_failures")?,
+            first_failure_at: row.get_by_name("first_failure_at")?,
+            last_failure_at: row.get_by_name("last_failure_at")?,
+            last_tested_at: row.get_by_name("last_tested_at")?,
+            failure_history_json: row.get_by_name("failure_history_json")?,
+        })
+    }
+
     fn into_high_failure_file(self) -> Result<HighFailureFile, HighFailureError> {
-        let file_id = Uuid::parse_str(&self.file_id)
+        let file_id = FileId::parse(&self.file_id)
             .map_err(|e| HighFailureError::Parse(format!("Invalid file_id: {}", e)))?;
-        let scope_id = Uuid::parse_str(&self.scope_id)
+        let scope_id = ScopeId::parse(&self.scope_id)
             .map_err(|e| HighFailureError::Parse(format!("Invalid scope_id: {}", e)))?;
-        let first_failure_at = self.first_failure_at.parse()
-            .map_err(|e| HighFailureError::Parse(format!("Invalid first_failure_at: {}", e)))?;
-        let last_failure_at = self.last_failure_at.parse()
-            .map_err(|e| HighFailureError::Parse(format!("Invalid last_failure_at: {}", e)))?;
-        let last_tested_at = self.last_tested_at.parse()
-            .map_err(|e| HighFailureError::Parse(format!("Invalid last_tested_at: {}", e)))?;
+        let first_failure_at = parse_timestamp(&self.first_failure_at, "first_failure_at")?;
+        let last_failure_at = parse_timestamp(&self.last_failure_at, "last_failure_at")?;
+        let last_tested_at = parse_timestamp(&self.last_tested_at, "last_tested_at")?;
         let failure_history: Vec<FailureHistoryEntry> =
             serde_json::from_str(&self.failure_history_json)?;
 
@@ -517,6 +539,15 @@ impl HighFailureRow {
     }
 }
 
+fn parse_timestamp(raw: &str, label: &str) -> Result<DbTimestamp, HighFailureError> {
+    DbTimestamp::from_rfc3339(raw)
+        .map_err(|e| HighFailureError::Parse(format!("Invalid {}: {}", label, e)))
+}
+
+fn row_to_high_failure(row: UnifiedDbRow) -> Result<HighFailureFile, HighFailureError> {
+    HighFailureRow::from_row(&row)?.into_high_failure_file()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn test_record_failure() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         let entry = FailureHistoryEntry::new(
             1,
@@ -548,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_failures_increment() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         // First failure
         let entry1 = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error 1");
@@ -566,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn test_success_resets_consecutive() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         // Record failures
         let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
@@ -589,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn test_backtest_order() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
+        let scope_id = ScopeId::new();
 
         // Record some failures
         let entry1 = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
@@ -628,8 +659,8 @@ mod tests {
     #[tokio::test]
     async fn test_clear_scope() {
         let table = create_test_table().await;
-        let scope_id = Uuid::new_v4();
-        let other_scope = Uuid::new_v4();
+        let scope_id = ScopeId::new();
+        let other_scope = ScopeId::new();
 
         let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
         table.record_failure("/path/file1.csv", &scope_id, entry.clone()).await.unwrap();

@@ -1,0 +1,16 @@
+[package]
+name = "casparian_ids"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared identifier wrappers for Casparian Flow"
+
+[lib]
+name = "casparian_ids"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }

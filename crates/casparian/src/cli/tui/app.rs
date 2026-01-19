@@ -3795,8 +3795,8 @@ impl App {
             TextInputResult::Committed => {
                 let new_name = self.discover.source_edit_input.trim().to_string();
                 if !new_name.is_empty() {
-                    if let Some(source_id) = &self.discover.editing_source {
-                        self.update_source_name(source_id, &new_name);
+                    if let Some(source_id) = self.discover.editing_source.clone() {
+                        self.update_source_name(&source_id, &new_name);
                     }
                 }
                 self.discover.editing_source = None;
@@ -7715,8 +7715,13 @@ impl App {
         if self.sources_state.confirm_delete {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
-                    if let Some(source) = self.discover.sources.get(self.sources_state.selected_index) {
-                        self.delete_source(&source.id);
+                    let source_id = self
+                        .discover
+                        .sources
+                        .get(self.sources_state.selected_index)
+                        .map(|source| source.id.clone());
+                    if let Some(source_id) = source_id {
+                        self.delete_source(&source_id);
                     }
                     self.sources_state.confirm_delete = false;
                 }
@@ -7741,8 +7746,15 @@ impl App {
                     if !value.is_empty() {
                         if self.sources_state.creating {
                             self.create_source(&value, "");
-                        } else if let Some(source) = self.discover.sources.get(self.sources_state.selected_index) {
-                            self.update_source_path(&source.id, &value);
+                        } else {
+                            let source_id = self
+                                .discover
+                                .sources
+                                .get(self.sources_state.selected_index)
+                                .map(|source| source.id.clone());
+                            if let Some(source_id) = source_id {
+                                self.update_source_path(&source_id, &value);
+                            }
                         }
                     }
                     self.sources_state.editing = false;

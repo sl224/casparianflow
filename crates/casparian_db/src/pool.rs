@@ -20,7 +20,7 @@ use crate::{DatabaseType, License, LicenseError};
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(String),
 
     #[error("License error: {0}")]
     License(#[from] LicenseError),
@@ -30,6 +30,11 @@ pub enum DbError {
 
     #[error("Database type {0} not compiled in. Rebuild with the '{1}' feature.")]
     NotCompiled(String, String),
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn map_sqlx_error(err: sqlx::Error) -> DbError {
+    DbError::Database(err.to_string())
 }
 
 /// Database pool type alias.
@@ -181,7 +186,8 @@ pub async fn create_pool(config: DbConfig) -> Result<DbPool, DbError> {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.url)
-            .await?;
+            .await
+            .map_err(map_sqlx_error)?;
 
         apply_sqlite_optimizations(&pool).await?;
 
@@ -194,7 +200,8 @@ pub async fn create_pool(config: DbConfig) -> Result<DbPool, DbError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.url)
-            .await?;
+            .await
+            .map_err(map_sqlx_error)?;
 
         info!("Connected to {} database", config.db_type);
         return Ok(pool);
@@ -220,12 +227,14 @@ async fn apply_sqlite_optimizations(pool: &DbPool) -> Result<(), DbError> {
     // WAL mode for better concurrent access
     sqlx::query("PRAGMA journal_mode=WAL")
         .execute(pool)
-        .await?;
+        .await
+        .map_err(map_sqlx_error)?;
 
     // NORMAL sync for better performance
     sqlx::query("PRAGMA synchronous=NORMAL")
         .execute(pool)
-        .await?;
+        .await
+        .map_err(map_sqlx_error)?;
 
     Ok(())
 }

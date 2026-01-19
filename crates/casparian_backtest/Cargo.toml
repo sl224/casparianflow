@@ -12,11 +12,11 @@ name = "casparian_backtest"
 path = "src/lib.rs"
 
 [dependencies]
-# Schema contracts
-casparian_schema = { path = "../casparian_schema" }
-
 # Database abstraction
 casparian_db = { path = "../casparian_db" }
+
+# Shared IDs
+casparian_ids = { path = "../casparian_ids" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -24,18 +24,6 @@ tokio = { workspace = true }
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-
-# UUID for IDs
-uuid = { version = "1.11", features = ["v4", "serde"] }
-
-# Timestamps
-chrono = { version = "0.4", features = ["serde"] }
-
-# Database (async sqlx)
-sqlx = { workspace = true, default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
-
-# Logging
-tracing.workspace = true
 
 # Error handling
 thiserror.workspace = true
