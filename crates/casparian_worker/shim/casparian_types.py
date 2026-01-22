@@ -2,7 +2,8 @@
 Casparian Types: Parser Contract Definitions
 
 This module defines the Output NamedTuple that parsers use to declare
-their outputs; sink selection is handled at the job level.
+ their outputs; sink selection is handled per output name with an explicit
+ default (topic "*" or "output") fallback.
 
 This file is injected into the parser execution environment by the host,
 ensuring the contract is always in sync with the host version.

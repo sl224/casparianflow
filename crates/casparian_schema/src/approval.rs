@@ -448,7 +448,7 @@ pub fn derive_scope_id(parser_id: &str, parser_version: &str, output_table_name:
 /// 2. Applies user modifications
 /// 3. Creates the locked schema contract
 /// 4. Updates storage
-pub async fn approve_schema(
+pub fn approve_schema(
     storage: &SchemaStorage,
     request: SchemaApprovalRequest,
 ) -> Result<ApprovalResult, ApprovalError> {
@@ -496,7 +496,7 @@ pub async fn approve_schema(
     contract.logic_hash = request.logic_hash.clone();
 
     // Save to storage
-    storage.save_contract(&contract).await?;
+    storage.save_contract(&contract)?;
 
     Ok(ApprovalResult {
         contract,
@@ -604,36 +604,13 @@ fn generate_approval_warnings(request: &SchemaApprovalRequest) -> Vec<ApprovalWa
     warnings
 }
 
-/// Approve a discovery result directly from storage.
-///
-/// This is a convenience function that:
-/// 1. Retrieves the discovery result
-/// 2. Creates an approval request with the proposed schemas as-is
-/// 3. Approves and creates the contract
-#[deprecated(note = "Use approve_schema with SchemaApprovalRequest to derive scope_id and enforce validation")]
-pub async fn approve_discovery_directly(
-    storage: &SchemaStorage,
-    discovery_id: &DiscoveryId,
-    approved_by: &str,
-) -> Result<ApprovalResult, ApprovalError> {
-    // Use storage's built-in approval
-    let contract = storage.approve_discovery(discovery_id, approved_by).await?;
-
-    Ok(ApprovalResult {
-        contract,
-        excluded_files: Vec::new(),
-        warnings: Vec::new(),
-        approved_at: SchemaTimestamp::now(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::SchemaStorage;
 
-    async fn create_test_storage() -> SchemaStorage {
-        SchemaStorage::in_memory().await.unwrap()
+    fn create_test_storage() -> SchemaStorage {
+        SchemaStorage::in_memory().unwrap()
     }
 
     fn new_request(approved_by: &str) -> SchemaApprovalRequest {
@@ -674,9 +651,9 @@ mod tests {
         assert_eq!(locked.description, Some("A date column".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_approve_schema_success() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_approve_schema_success() {
+        let storage = create_test_storage();
 
         let request = new_request("approver")
             .with_schema(
@@ -687,16 +664,16 @@ mod tests {
                     ])
             );
 
-        let result = approve_schema(&storage, request).await.unwrap();
+        let result = approve_schema(&storage, request).unwrap();
         assert_eq!(result.contract.approved_by, "approver");
         assert_eq!(result.contract.schemas.len(), 1);
         assert_eq!(result.contract.schemas[0].name, "test_output");
         assert_eq!(result.contract.schemas[0].columns.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_scope_id_and_logic_hash() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_scope_id_and_logic_hash() {
+        let storage = create_test_storage();
 
         let parser_id = "parser-alpha";
         let parser_version = "2024.05";
@@ -715,25 +692,25 @@ mod tests {
                 .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)]),
         );
 
-        let result = approve_schema(&storage, request).await.unwrap();
+        let result = approve_schema(&storage, request).unwrap();
         let expected_scope_id = derive_scope_id(parser_id, parser_version, output_table_name);
         assert_eq!(result.contract.scope_id, expected_scope_id);
         assert_eq!(result.contract.logic_hash.as_deref(), Some(logic_hash));
     }
 
-    #[tokio::test]
-    async fn test_approve_schema_no_schemas() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_approve_schema_no_schemas() {
+        let storage = create_test_storage();
 
         let request = new_request("user");
 
-        let err = approve_schema(&storage, request).await.unwrap_err();
+        let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::NoSchemasApproved));
     }
 
-    #[tokio::test]
-    async fn test_approve_schema_empty_name() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_approve_schema_empty_name() {
+        let storage = create_test_storage();
 
         let request = new_request("user")
             .with_schema(
@@ -741,24 +718,24 @@ mod tests {
                     .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
             );
 
-        let err = approve_schema(&storage, request).await.unwrap_err();
+        let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
     }
 
-    #[tokio::test]
-    async fn test_approve_schema_no_columns() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_approve_schema_no_columns() {
+        let storage = create_test_storage();
 
         let request = new_request("user")
             .with_schema(ApprovedSchemaVariant::new("test", "test_output"));
 
-        let err = approve_schema(&storage, request).await.unwrap_err();
+        let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
     }
 
-    #[tokio::test]
-    async fn test_nested_types_rejected_by_default() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_nested_types_rejected_by_default() {
+        let storage = create_test_storage();
 
         let request = new_request("user").with_schema(
             ApprovedSchemaVariant::new("nested", "nested_output")
@@ -770,13 +747,13 @@ mod tests {
                 )]),
         );
 
-        let err = approve_schema(&storage, request).await.unwrap_err();
+        let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::Validation(_)));
     }
 
-    #[tokio::test]
-    async fn test_nested_types_allowed_with_flag() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_nested_types_allowed_with_flag() {
+        let storage = create_test_storage();
 
         let request = new_request("user")
             .with_allow_nested_types(true)
@@ -790,13 +767,13 @@ mod tests {
                     )]),
             );
 
-        let result = approve_schema(&storage, request).await.unwrap();
+        let result = approve_schema(&storage, request).unwrap();
         assert_eq!(result.contract.schemas.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_approval_warnings_for_exclusions() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_approval_warnings_for_exclusions() {
+        let storage = create_test_storage();
 
         let request = new_request("user")
             .with_schema(
@@ -805,13 +782,13 @@ mod tests {
             )
             .exclude_files(vec!["bad1.csv".into(), "bad2.csv".into()]);
 
-        let result = approve_schema(&storage, request).await.unwrap();
+        let result = approve_schema(&storage, request).unwrap();
         assert!(result.warnings.iter().any(|w| w.warning_type == WarningType::FilesExcluded));
     }
 
-    #[tokio::test]
-    async fn test_approval_warnings_for_rename() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_approval_warnings_for_rename() {
+        let storage = create_test_storage();
 
         let request = new_request("user")
             .with_schema(
@@ -821,7 +798,7 @@ mod tests {
                     ])
             );
 
-        let result = approve_schema(&storage, request).await.unwrap();
+        let result = approve_schema(&storage, request).unwrap();
         assert!(result.warnings.iter().any(|w| w.warning_type == WarningType::ColumnRenamed));
     }
 
@@ -840,9 +817,9 @@ mod tests {
         assert!(answer.explanation.is_some());
     }
 
-    #[tokio::test]
-    async fn test_multiple_output_tables_rejected() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_multiple_output_tables_rejected() {
+        let storage = create_test_storage();
 
         let request = new_request("user")
             .with_schemas(vec![
@@ -857,13 +834,13 @@ mod tests {
                     .with_source_pattern("*_b.csv"),
             ]);
 
-        let err = approve_schema(&storage, request).await.unwrap_err();
+        let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::MultipleOutputsNotSupported));
     }
 
-    #[tokio::test]
-    async fn test_duplicate_column_name_rejected() {
-        let storage = create_test_storage().await;
+    #[test]
+    fn test_duplicate_column_name_rejected() {
+        let storage = create_test_storage();
 
         let request = new_request("user")
             .with_schema(
@@ -874,7 +851,7 @@ mod tests {
                     ])
             );
 
-        let err = approve_schema(&storage, request).await.unwrap_err();
+        let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
     }
 }

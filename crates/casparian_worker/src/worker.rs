@@ -10,21 +10,24 @@
 use anyhow::Result;
 use thiserror::Error;
 use casparian_protocol::types::{
-    self, DispatchCommand, HeartbeatStatus, JobStatus, ParsedSinkUri, PrepareEnvCommand,
+    self, DispatchCommand, HeartbeatStatus, JobStatus, ParsedSinkUri, RuntimeKind, SinkScheme,
 };
-use casparian_protocol::{Message, OpCode};
-use std::collections::HashMap;
+use casparian_protocol::{schema_hash, table_name_with_schema, JobId, Message, OpCode};
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use zmq::{Context, Socket};
 
-use crate::bridge::{self, BridgeConfig, BridgeError};
+use crate::bridge::BridgeError;
+use crate::native_runtime::NativeSubprocessRuntime;
+use crate::runtime::{PluginRuntime, PythonShimRuntime, RunContext};
 use crate::schema_validation;
 use crate::venv_manager::VenvManager;
 use arrow::array::{
@@ -52,6 +55,13 @@ pub enum WorkerError {
     #[error("Permanent error (no retry): {message}")]
     Permanent { message: String },
 
+    /// Permanent error with structured diagnostics.
+    #[error("Permanent error (no retry): {message}")]
+    PermanentWithDiagnostics {
+        message: String,
+        diagnostics: types::JobDiagnostics,
+    },
+
     /// Transient error - may succeed on retry (e.g., network timeout, resource busy)
     #[error("Transient error (retry eligible): {message}")]
     Transient { message: String },
@@ -65,7 +75,7 @@ pub enum WorkerError {
     Internal {
         message: String,
         #[source]
-        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+        source: Option<anyhow::Error>,
     },
 }
 
@@ -75,7 +85,7 @@ impl From<anyhow::Error> for WorkerError {
     fn from(err: anyhow::Error) -> Self {
         WorkerError::Internal {
             message: err.to_string(),
-            source: Some(Box::new(err)),
+            source: Some(err),
         }
     }
 }
@@ -88,7 +98,14 @@ impl WorkerError {
 
     /// Check if this error is permanent (no retry)
     pub fn is_permanent(&self) -> bool {
-        matches!(self, WorkerError::Permanent { .. })
+        matches!(self, WorkerError::Permanent { .. } | WorkerError::PermanentWithDiagnostics { .. })
+    }
+
+    pub fn diagnostics(&self) -> Option<&types::JobDiagnostics> {
+        match self {
+            WorkerError::PermanentWithDiagnostics { diagnostics, .. } => Some(diagnostics),
+            _ => None,
+        }
     }
 
     fn internal(err: impl std::fmt::Display) -> Self {
@@ -139,6 +156,30 @@ impl WorkerError {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct BridgeErrorPayload {
+    retryable: Option<bool>,
+    kind: Option<String>,
+}
+
+fn parse_bridge_retryable(message: &str) -> Option<bool> {
+    const MARKER: &str = "Guest process error:";
+    let payload = if let Some(idx) = message.find(MARKER) {
+        message[idx + MARKER.len()..].trim()
+    } else {
+        message.trim()
+    };
+
+    if !payload.starts_with('{') {
+        return None;
+    }
+
+    let parsed: BridgeErrorPayload = serde_json::from_str(payload).ok()?;
+    parsed
+        .retryable
+        .or_else(|| parsed.kind.as_deref().map(|k| k == "transient"))
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -167,72 +208,69 @@ pub struct WorkerConfig {
 /// Handle for controlling a running worker
 pub struct WorkerHandle {
     shutdown_tx: mpsc::Sender<()>,
-    completion_rx: oneshot::Receiver<()>,
+    completion_rx: mpsc::Receiver<()>,
 }
 
 impl WorkerHandle {
     /// Request immediate shutdown (send signal only).
-    pub async fn shutdown_now(self) -> WorkerResult<()> {
-        self.shutdown_tx
-            .send(())
-            .await
-            .map_err(WorkerError::internal)
+    pub fn shutdown_now(self) -> WorkerResult<()> {
+        self.shutdown_tx.send(()).map_err(WorkerError::internal)
     }
 
     /// Request graceful shutdown and wait for completion (with timeout).
-    pub async fn shutdown_gracefully(self, timeout: Duration) -> WorkerResult<()> {
+    pub fn shutdown_gracefully(self, timeout: Duration) -> WorkerResult<()> {
         let Self {
             shutdown_tx,
             completion_rx,
         } = self;
-        shutdown_tx
-            .send(())
-            .await
-            .map_err(WorkerError::internal)?;
-        match tokio::time::timeout(timeout, completion_rx).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(WorkerError::internal(err)),
-            Err(_) => Err(WorkerError::internal("worker shutdown timed out")),
+        shutdown_tx.send(()).map_err(WorkerError::internal)?;
+        match completion_rx.recv_timeout(timeout) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(WorkerError::internal("worker shutdown timed out"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(WorkerError::internal("worker shutdown channel closed"))
+            }
         }
     }
 
     /// Request graceful shutdown with default timeout.
-    pub async fn shutdown(self) -> WorkerResult<()> {
-        self.shutdown_gracefully(Duration::from_secs(
-            DEFAULT_SHUTDOWN_TIMEOUT_SECS,
-        ))
-        .await
+    pub fn shutdown(self) -> WorkerResult<()> {
+        self.shutdown_gracefully(Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS))
     }
 }
 
 /// Active worker with connected socket
 pub struct Worker {
     config: WorkerConfig,
-    socket: DealerSocket,
+    context: Context,
+    socket: Socket,
     venv_manager: Arc<VenvManager>, // VenvManager is now Sync (uses std::sync::Mutex internally)
     result_tx: mpsc::Sender<JobResult>,
     result_rx: mpsc::Receiver<JobResult>,
     shutdown_rx: mpsc::Receiver<()>,
-    shutdown_complete_tx: Option<oneshot::Sender<()>>,
-    active_jobs: HashMap<u64, JoinHandle<()>>,
+    shutdown_complete_tx: Option<mpsc::Sender<()>>,
+    active_jobs: HashMap<JobId, JoinHandle<()>>,
+    cancelled_jobs: HashSet<JobId>,
 }
 
 /// Result from a completed job
 struct JobResult {
-    job_id: u64,
+    job_id: JobId,
     receipt: types::JobReceipt,
 }
 
 impl Worker {
     /// Connect to sentinel and create worker.
     /// Returns (Worker, ShutdownHandle) - call run() on Worker, use handle for shutdown.
-    pub async fn connect(config: WorkerConfig) -> WorkerResult<(Self, WorkerHandle)> {
+    pub fn connect(config: WorkerConfig) -> WorkerResult<(Self, WorkerHandle)> {
         Self::connect_inner(config)
-            .await
+            
             .map_err(WorkerError::internal)
     }
 
-    async fn connect_inner(config: WorkerConfig) -> Result<(Self, WorkerHandle)> {
+    fn connect_inner(config: WorkerConfig) -> Result<(Self, WorkerHandle)> {
         // Initialize VenvManager once (now uses std::sync::Mutex internally)
         let venv_manager = match &config.venvs_dir {
             Some(path) => VenvManager::with_path(path.clone())?,
@@ -242,8 +280,16 @@ impl Worker {
         info!("VenvManager: {} cached envs, {} MB", count, bytes / 1_000_000);
 
         // Create and connect socket
-        let mut socket = DealerSocket::new();
-        socket.connect(&config.sentinel_addr).await?;
+        let context = Context::new();
+        let socket = context
+            .socket(zmq::DEALER)
+            .map_err(|err| anyhow::anyhow!("Failed to create DEALER socket: {}", err))?;
+        socket
+            .connect(&config.sentinel_addr)
+            .map_err(|err| anyhow::anyhow!("Failed to connect to sentinel: {}", err))?;
+        socket
+            .set_rcvtimeo(100)
+            .map_err(|err| anyhow::anyhow!("Failed to set socket receive timeout: {}", err))?;
 
         info!("Connected to sentinel: {}", config.sentinel_addr);
 
@@ -257,13 +303,13 @@ impl Worker {
             capabilities,
             worker_id: Some(config.worker_id.clone()),
         };
-        send_message(&mut socket, OpCode::Identify, 0, &identify).await?;
+        send_message(&socket, OpCode::Identify, JobId::new(0), &identify)?;
         info!("Sent IDENTIFY as {}", config.worker_id);
 
         // Initialize channels
-        let (result_tx, result_rx) = mpsc::channel(MAX_CONCURRENT_JOBS * 2);
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let (completion_tx, completion_rx) = oneshot::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
 
         let handle = WorkerHandle {
             shutdown_tx,
@@ -273,6 +319,7 @@ impl Worker {
         Ok((
             Self {
                 config,
+                context,
                 socket,
                 venv_manager: Arc::new(venv_manager),
                 result_tx,
@@ -280,103 +327,105 @@ impl Worker {
                 shutdown_rx,
                 shutdown_complete_tx: Some(completion_tx),
                 active_jobs: HashMap::new(),
+                cancelled_jobs: HashSet::new(),
             },
             handle,
         ))
     }
 
     /// Main event loop - consumes self (can only be called once)
-    pub async fn run(mut self) -> WorkerResult<()> {
+    pub fn run(mut self) -> WorkerResult<()> {
         let completion_tx = self.shutdown_complete_tx.take();
-        let result = self.run_inner().await.map_err(WorkerError::internal);
+        let result = self.run_inner().map_err(WorkerError::internal);
         if let Some(tx) = completion_tx {
             let _ = tx.send(());
         }
         result
     }
 
-    async fn run_inner(mut self) -> Result<()> {
+    fn run_inner(mut self) -> Result<()> {
         info!("Entering event loop...");
 
-        // Create heartbeat interval timer
-        let mut heartbeat_interval = tokio::time::interval(
-            Duration::from_secs(HEARTBEAT_INTERVAL_SECS)
-        );
-        // First tick completes immediately, skip it
-        heartbeat_interval.tick().await;
+        let mut last_heartbeat = Instant::now();
 
         loop {
             // Clean up completed jobs
             self.reap_completed_jobs();
 
-            // Use biased select to prioritize shutdown and results over new messages
-            tokio::select! {
-                biased;
-
-                // Branch 1: Shutdown signal (highest priority)
-                _ = self.shutdown_rx.recv() => {
-                    info!("Shutdown signal received, waiting for {} active jobs...", self.active_jobs.len());
-                    self.wait_for_all_jobs().await;
+            match self.shutdown_rx.try_recv() {
+                Ok(()) => {
+                    info!(
+                        "Shutdown signal received, waiting for {} active jobs...",
+                        self.active_jobs.len()
+                    );
+                    self.wait_for_all_jobs();
                     break;
                 }
-
-                // Branch 2: Job Results from spawned tasks
-                Some(result) = self.result_rx.recv() => {
-                    info!("Job {} finished, sending CONCLUDE", result.job_id);
-                    if let Err(e) = send_message(&mut self.socket, OpCode::Conclude, result.job_id, &result.receipt).await {
-                        error!("Failed to send CONCLUDE for job {}: {}", result.job_id, e);
-                    }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    warn!("Shutdown channel closed, stopping worker");
+                    self.wait_for_all_jobs();
+                    break;
                 }
+            }
 
-                // Branch 3: Proactive heartbeat (keep Sentinel informed)
-                _ = heartbeat_interval.tick() => {
-                    let active_job_ids: Vec<i64> = self.active_jobs.keys()
-                        .map(|&id| id as i64)
-                        .collect();
-                    let status = if active_job_ids.is_empty() { HeartbeatStatus::Idle } else { HeartbeatStatus::Busy };
-                    let payload = types::HeartbeatPayload {
-                        status,
-                        current_job_id: active_job_ids.first().copied(),
-                        active_job_count: active_job_ids.len(),
-                        active_job_ids,
+            while let Ok(result) = self.result_rx.try_recv() {
+                if self.cancelled_jobs.remove(&result.job_id) {
+                    debug!("Dropping result for cancelled job {}", result.job_id);
+                    continue;
+                }
+                info!("Job {} finished, sending CONCLUDE", result.job_id);
+                if let Err(e) = send_message(&self.socket, OpCode::Conclude, result.job_id, &result.receipt) {
+                    error!("Failed to send CONCLUDE for job {}: {}", result.job_id, e);
+                }
+            }
+
+            if last_heartbeat.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
+                let active_job_ids: Vec<JobId> = self.active_jobs.keys().copied().collect();
+                let status = if active_job_ids.is_empty() {
+                    HeartbeatStatus::Idle
+                } else {
+                    HeartbeatStatus::Busy
+                };
+                let payload = types::HeartbeatPayload {
+                    status,
+                    active_job_count: active_job_ids.len(),
+                    active_job_ids,
+                };
+                debug!(
+                    "Sending heartbeat: {:?} ({} active jobs)",
+                    status, payload.active_job_count
+                );
+                if let Err(e) = send_message(&self.socket, OpCode::Heartbeat, JobId::new(0), &payload) {
+                    warn!("Failed to send heartbeat: {}", e);
+                }
+                last_heartbeat = Instant::now();
+            }
+
+            match self.socket.recv_multipart(0) {
+                Ok(parts) => {
+                    let (header, payload) = match parts.len() {
+                        2 => (parts[0].clone(), parts[1].clone()),
+                        3 if parts[0].is_empty() => (parts[1].clone(), parts[2].clone()),
+                        count => {
+                            warn!("Expected 2 frames [header, payload], got {}", count);
+                            continue;
+                        }
                     };
-                    debug!("Sending heartbeat: {:?} ({} active jobs)", status, payload.active_job_count);
-                    if let Err(e) = send_message(&mut self.socket, OpCode::Heartbeat, 0, &payload).await {
-                        warn!("Failed to send heartbeat: {}", e);
-                    }
-                }
 
-                // Branch 4: Control Plane Messages from Sentinel
-                // Inline recv logic to avoid borrowing self twice
-                recv_result = tokio::time::timeout(Duration::from_millis(100), self.socket.recv()) => {
-                    match recv_result {
-                        Ok(Ok(multipart)) => {
-                            // Extract frames
-                            let parts: Vec<Vec<u8>> = multipart
-                                .into_vec()
-                                .into_iter()
-                                .map(|b| b.to_vec())
-                                .collect();
-
-                            if parts.len() >= 2 {
-                                match Message::unpack(&[parts[0].clone(), parts[1].clone()]) {
-                                    Ok(msg) => {
-                                        if let Err(e) = self.handle_message(msg).await {
-                                            error!("Error handling message: {}", e);
-                                        }
-                                    }
-                                    Err(e) => warn!("Failed to unpack message: {}", e),
-                                }
-                            } else {
-                                warn!("Expected 2 frames [header, payload], got {}", parts.len());
+                    match Message::unpack(&[header, payload]) {
+                        Ok(msg) => {
+                            if let Err(e) = self.handle_message(msg) {
+                                error!("Error handling message: {}", e);
                             }
                         }
-                        Ok(Err(e)) => {
-                            error!("ZMQ recv error: {}", e);
-                            break;
-                        }
-                        Err(_) => {} // Timeout - continue loop
+                        Err(e) => warn!("Failed to unpack message: {}", e),
                     }
+                }
+                Err(zmq::Error::EAGAIN) => {}
+                Err(e) => {
+                    error!("ZMQ recv error: {}", e);
+                    break;
                 }
             }
         }
@@ -387,34 +436,70 @@ impl Worker {
 
     /// Remove completed job handles from active_jobs map
     fn reap_completed_jobs(&mut self) {
-        self.active_jobs.retain(|job_id, handle| {
-            if handle.is_finished() {
+        let finished: Vec<JobId> = self
+            .active_jobs
+            .iter()
+            .filter(|(_, handle)| handle.is_finished())
+            .map(|(job_id, _)| *job_id)
+            .collect();
+
+        for job_id in finished {
+            if let Some(handle) = self.active_jobs.remove(&job_id) {
                 debug!("Reaped completed job {}", job_id);
-                false
-            } else {
-                true
+                if let Err(err) = handle.join() {
+                    warn!("Job {} thread panicked: {:?}", job_id, err);
+                }
             }
-        });
+        }
     }
 
     /// Wait for all active jobs to complete and send their CONCLUDE messages (for graceful shutdown)
     ///
     /// This is critical for graceful shutdown - we must:
-    /// 1. Wait for all job tasks to complete
+    /// 1. Wait for all job tasks to complete (with timeout)
     /// 2. Drain any pending results from result_rx
     /// 3. Send CONCLUDE messages for all completed jobs
     ///
     /// Otherwise, the sentinel will never know jobs finished.
-    async fn wait_for_all_jobs(&mut self) {
+    /// Jobs that exceed the timeout are aborted; Sentinel's stale-worker cleanup handles them.
+    fn wait_for_all_jobs(&mut self) {
         let job_count = self.active_jobs.len();
         info!("Graceful shutdown: waiting for {} active jobs to complete...", job_count);
 
-        // Wait for all job handles to complete
+        let shutdown_timeout = Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
+        let mut timed_out_jobs = Vec::new();
+
+        // Wait for all job handles to complete (with per-job timeout)
         for (job_id, handle) in self.active_jobs.drain() {
             debug!("Waiting for job {} to complete...", job_id);
-            if let Err(e) = handle.await {
-                warn!("Job {} task panicked during shutdown: {:?}", job_id, e);
+            let start = Instant::now();
+            let mut handle = handle;
+            loop {
+                if handle.is_finished() {
+                    match handle.join() {
+                        Ok(()) => debug!("Job {} completed during shutdown", job_id),
+                        Err(e) => warn!("Job {} task panicked during shutdown: {:?}", job_id, e),
+                    }
+                    break;
+                }
+                if start.elapsed() >= shutdown_timeout {
+                    warn!(
+                        "Job {} timed out during shutdown ({}s), aborting",
+                        job_id, DEFAULT_SHUTDOWN_TIMEOUT_SECS
+                    );
+                    timed_out_jobs.push(job_id);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
             }
+        }
+
+        if !timed_out_jobs.is_empty() {
+            warn!(
+                "Shutdown: {} jobs timed out and were aborted: {:?}. Sentinel will handle via stale-worker cleanup.",
+                timed_out_jobs.len(),
+                timed_out_jobs
+            );
         }
 
         // Drain all pending results and send CONCLUDE messages
@@ -426,11 +511,11 @@ impl Worker {
                 result.job_id, result.receipt.status
             );
             if let Err(e) = send_message(
-                &mut self.socket,
+                &self.socket,
                 OpCode::Conclude,
                 result.job_id,
                 &result.receipt,
-            ).await {
+            ) {
                 error!(
                     "Failed to send CONCLUDE for job {} during shutdown: {}",
                     result.job_id, e
@@ -446,7 +531,7 @@ impl Worker {
     }
 
     /// Handle a message
-    async fn handle_message(&mut self, msg: Message) -> Result<()> {
+    fn handle_message(&mut self, msg: Message) -> Result<()> {
         match msg.header.opcode {
             OpCode::Dispatch => {
                 let cmd: DispatchCommand = serde_json::from_slice(&msg.payload)?;
@@ -463,8 +548,9 @@ impl Worker {
                         metrics: HashMap::new(),
                         artifacts: vec![],
                         error_message: Some("Worker at capacity".to_string()),
+                        diagnostics: None,
                     };
-                    send_message(&mut self.socket, OpCode::Conclude, job_id, &receipt).await?;
+                    send_message(&self.socket, OpCode::Conclude, job_id, &receipt)?;
                     return Ok(());
                 }
 
@@ -481,48 +567,20 @@ impl Worker {
                 let parquet_root = self.config.parquet_root.clone();
                 let shim_path = self.config.shim_path.clone();
 
-                let handle = tokio::spawn(async move {
+                let handle = std::thread::spawn(move || {
                     let receipt =
-                        execute_job(job_id, cmd, venv_mgr, parquet_root, shim_path).await;
+                        execute_job(job_id, cmd, venv_mgr, parquet_root, shim_path);
                     // If channel is closed, worker is shutting down - that's fine
-                    let _ = tx.send(JobResult { job_id, receipt }).await;
+                    let _ = tx.send(JobResult { job_id, receipt });
                 });
 
                 self.active_jobs.insert(job_id, handle);
             }
 
-            OpCode::PrepareEnv => {
-                let cmd: PrepareEnvCommand = serde_json::from_slice(&msg.payload)?;
-                info!("PREPARE_ENV {}", truncate_hash(&cmd.env_hash));
-
-                match self.prepare_env(&cmd).await {
-                    Ok(interpreter_path) => {
-                        let payload = types::EnvReadyPayload {
-                            env_hash: cmd.env_hash,
-                            interpreter_path: interpreter_path.display().to_string(),
-                            cached: true,
-                        };
-                        send_message(&mut self.socket, OpCode::EnvReady, 0, &payload).await?;
-                    }
-                    Err(e) => {
-                        let payload = types::ErrorPayload {
-                            message: e.to_string(),
-                            traceback: None,
-                        };
-                        send_message(&mut self.socket, OpCode::Err, 0, &payload).await?;
-                    }
-                }
-            }
-
             OpCode::Heartbeat => {
                 debug!("Received HEARTBEAT, replying...");
-                // Convert job IDs to i64, filtering any that would overflow (shouldn't happen)
-                let active_job_ids: Vec<i64> = self.active_jobs.keys()
-                    .copied()
-                    .filter_map(|id| i64::try_from(id).ok())
-                    .collect();
-                let active_job_count = self.active_jobs.len(); // Use actual count, not filtered
-                let current_job = active_job_ids.first().copied();
+                let active_job_ids: Vec<JobId> = self.active_jobs.keys().copied().collect();
+                let active_job_count = self.active_jobs.len();
 
                 let status = if active_job_count == 0 {
                     HeartbeatStatus::Idle
@@ -534,26 +592,26 @@ impl Worker {
 
                 let payload = types::HeartbeatPayload {
                     status,
-                    current_job_id: current_job,
                     active_job_count,
                     active_job_ids,
                 };
-                send_message(&mut self.socket, OpCode::Heartbeat, 0, &payload).await?;
+                send_message(&self.socket, OpCode::Heartbeat, JobId::new(0), &payload)?;
             }
 
             OpCode::Abort => {
                 let job_id = msg.header.job_id;
-                if let Some(handle) = self.active_jobs.remove(&job_id) {
+                if self.active_jobs.contains_key(&job_id) {
                     warn!("ABORT job {} - cancelling task", job_id);
-                    handle.abort();
+                    self.cancelled_jobs.insert(job_id);
                     // Send failure receipt
                     let receipt = types::JobReceipt {
                         status: JobStatus::Aborted,
                         metrics: HashMap::new(),
                         artifacts: vec![],
                         error_message: Some("Job aborted by sentinel".to_string()),
+                        diagnostics: None,
                     };
-                    send_message(&mut self.socket, OpCode::Conclude, job_id, &receipt).await?;
+                    send_message(&self.socket, OpCode::Conclude, job_id, &receipt)?;
                 } else {
                     warn!("ABORT job {} - not found in active jobs", job_id);
                 }
@@ -571,19 +629,6 @@ impl Worker {
         Ok(())
     }
 
-    /// Prepare environment (blocking operation)
-    async fn prepare_env(&self, cmd: &PrepareEnvCommand) -> Result<PathBuf> {
-        let env_hash = cmd.env_hash.clone();
-        let lockfile = cmd.lockfile_content.clone();
-        let python_version = cmd.python_version.clone();
-        let venv_manager = self.venv_manager.clone();
-
-        // VenvManager now uses std::sync::Mutex, so this is safe
-        tokio::task::spawn_blocking(move || {
-            venv_manager.get_or_create(&env_hash, &lockfile, python_version.as_deref())
-        })
-        .await?
-    }
 }
 
 // --- Helper functions ---
@@ -612,6 +657,79 @@ fn compute_source_hash(path: &str) -> Result<String> {
         hasher.update(&buffer[..bytes]);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn build_schema_hashes(cmd: &DispatchCommand) -> HashMap<String, String> {
+    let mut hashes = HashMap::new();
+    for sink in &cmd.sinks {
+        if let Some(schema) = sink.schema.as_ref() {
+            if let Some(hash) = schema_hash(Some(schema)) {
+                hashes.insert(sink.topic.clone(), hash);
+            }
+        }
+    }
+    hashes
+}
+
+fn resolve_entrypoint(cmd: &DispatchCommand) -> WorkerResult<String> {
+    match cmd.runtime_kind {
+        RuntimeKind::PythonShim => Ok(cmd.entrypoint.clone()),
+        RuntimeKind::NativeExec => {
+            let version = cmd
+                .parser_version
+                .as_deref()
+                .ok_or_else(|| WorkerError::Permanent {
+                    message: "parser_version is required for native plugins".to_string(),
+                })?;
+            let os = cmd.platform_os.as_deref().ok_or_else(|| WorkerError::Permanent {
+                message: "platform_os is required for native plugins".to_string(),
+            })?;
+            let arch = cmd
+                .platform_arch
+                .as_deref()
+                .ok_or_else(|| WorkerError::Permanent {
+                    message: "platform_arch is required for native plugins".to_string(),
+                })?;
+            let base = casparian_home()?.join("plugins").join(&cmd.plugin_name).join(version).join(os).join(arch);
+            let path = base.join(&cmd.entrypoint);
+            if !path.exists() {
+                return Err(WorkerError::Permanent {
+                    message: format!("Native entrypoint not found: {}", path.display()),
+                });
+            }
+            Ok(path.to_string_lossy().to_string())
+        }
+    }
+}
+
+fn allow_unsigned_native() -> WorkerResult<bool> {
+    if let Ok(value) = std::env::var("CASPARIAN_ALLOW_UNSIGNED_NATIVE") {
+        let normalized = value.trim().to_lowercase();
+        return Ok(matches!(normalized.as_str(), "1" | "true" | "yes"));
+    }
+
+    let config_path = casparian_home()?.join("config.toml");
+    if !config_path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(WorkerError::internal)?;
+    let parsed: toml::Value = toml::from_str(&content)
+        .map_err(WorkerError::internal)?;
+    Ok(parsed
+        .get("trust")
+        .and_then(|trust| trust.get("allow_unsigned_native"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false))
+}
+
+fn casparian_home() -> WorkerResult<PathBuf> {
+    if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
+        return Ok(PathBuf::from(override_path));
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".casparian_flow"))
+        .ok_or_else(|| WorkerError::internal("Could not determine home directory"))
 }
 
 fn batch_has_lineage_columns(batch: &RecordBatch) -> bool {
@@ -671,12 +789,50 @@ fn inject_lineage_batches(
     );
 }
 
-fn normalize_schema_def(schema_def: &str) -> Option<&str> {
-    let trimmed = schema_def.trim();
-    if trimmed.is_empty() || trimmed == "null" {
-        None
+/// Per-output status for multi-output jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStatus {
+    /// All rows processed successfully
+    Success,
+    /// Some rows quarantined but within policy limits
+    PartialSuccess,
+    /// Output failed (e.g., quarantine policy exceeded)
+    Failed,
+}
+
+/// Aggregate per-output statuses into a job status.
+///
+/// Rules:
+/// - If ANY output is Failed → JobStatus::Failed
+/// - If ANY output is PartialSuccess (and none Failed) → JobStatus::PartialSuccess
+/// - If ALL outputs are Success → JobStatus::Success
+fn aggregate_job_status(outputs: &[OutputMetrics]) -> JobStatus {
+    if outputs.is_empty() {
+        return JobStatus::Success;
+    }
+
+    let mut has_failed = false;
+    let mut has_partial = false;
+
+    for output in outputs {
+        match output.status {
+            OutputStatus::Failed => {
+                has_failed = true;
+                break; // Short-circuit: any failure means job fails
+            }
+            OutputStatus::PartialSuccess => {
+                has_partial = true;
+            }
+            OutputStatus::Success => {}
+        }
+    }
+
+    if has_failed {
+        JobStatus::Failed
+    } else if has_partial {
+        JobStatus::PartialSuccess
     } else {
-        Some(trimmed)
+        JobStatus::Success
     }
 }
 
@@ -685,6 +841,7 @@ struct OutputMetrics {
     rows: usize,
     quarantine_rows: usize,
     lineage_unavailable_rows: usize,
+    status: OutputStatus,
 }
 
 struct ExecutionMetrics {
@@ -705,58 +862,6 @@ enum ExecutionOutcome {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-struct QuarantineConfig {
-    allow_quarantine: bool,
-    max_quarantine_pct: f64,
-    max_quarantine_count: Option<usize>,
-}
-
-impl Default for QuarantineConfig {
-    fn default() -> Self {
-        Self {
-            allow_quarantine: false,
-            max_quarantine_pct: 10.0,
-            max_quarantine_count: None,
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-struct QuarantineConfigOverrides {
-    allow_quarantine: Option<bool>,
-    max_quarantine_pct: Option<f64>,
-    max_quarantine_count: Option<usize>,
-}
-
-impl QuarantineConfig {
-    fn apply(&mut self, overrides: QuarantineConfigOverrides) {
-        if let Some(allow) = overrides.allow_quarantine {
-            self.allow_quarantine = allow;
-        }
-        if let Some(max_pct) = overrides.max_quarantine_pct {
-            self.max_quarantine_pct = max_pct;
-        }
-        if let Some(max_count) = overrides.max_quarantine_count {
-            self.max_quarantine_count = Some(max_count);
-        }
-    }
-}
-
-impl QuarantineConfigOverrides {
-    fn apply(&mut self, overrides: QuarantineConfigOverrides) {
-        if overrides.allow_quarantine.is_some() {
-            self.allow_quarantine = overrides.allow_quarantine;
-        }
-        if overrides.max_quarantine_pct.is_some() {
-            self.max_quarantine_pct = overrides.max_quarantine_pct;
-        }
-        if overrides.max_quarantine_count.is_some() {
-            self.max_quarantine_count = overrides.max_quarantine_count;
-        }
-    }
-}
-
 fn insert_execution_metrics(metrics: &mut HashMap<String, i64>, exec: &ExecutionMetrics) {
     metrics.insert("rows".to_string(), exec.rows as i64);
     metrics.insert("quarantine_rows".to_string(), exec.quarantine_rows as i64);
@@ -764,6 +869,9 @@ fn insert_execution_metrics(metrics: &mut HashMap<String, i64>, exec: &Execution
         "lineage_unavailable_rows".to_string(),
         exec.lineage_unavailable_rows as i64,
     );
+    metrics.insert("output_count".to_string(), exec.outputs.len() as i64);
+
+    // Per-output metrics including status
     for output in &exec.outputs {
         metrics.insert(format!("rows.{}", output.name), output.rows as i64);
         metrics.insert(
@@ -774,117 +882,113 @@ fn insert_execution_metrics(metrics: &mut HashMap<String, i64>, exec: &Execution
             format!("lineage_unavailable_rows.{}", output.name),
             output.lineage_unavailable_rows as i64,
         );
+        // Per-output status as numeric: 0=success, 1=partial_success, 2=failed
+        let status_code = match output.status {
+            OutputStatus::Success => 0,
+            OutputStatus::PartialSuccess => 1,
+            OutputStatus::Failed => 2,
+        };
+        metrics.insert(format!("status.{}", output.name), status_code);
     }
 }
 
-fn find_sink_config<'a>(
+fn is_default_sink(topic: &str) -> bool {
+    topic == "*" || topic == "output"
+}
+
+fn select_sink_config<'a>(
     cmd: &'a DispatchCommand,
     output_name: &str,
-) -> Option<&'a types::SinkConfig> {
-    cmd.sinks
-        .iter()
-        .find(|sink| sink.topic == output_name)
-        .or_else(|| cmd.sinks.first())
-}
-
-fn resolve_quarantine_config(
-    schema_def: Option<&str>,
-    sink_uri: &str,
-    output_name: &str,
-) -> Result<QuarantineConfig> {
-    let mut config = QuarantineConfig::default();
-    if let Some(schema_def) = schema_def {
-        let overrides = parse_quarantine_overrides_from_schema_def(schema_def, output_name)?;
-        config.apply(overrides);
+) -> WorkerResult<Option<&'a types::SinkConfig>> {
+    if let Some(exact) = cmd.sinks.iter().find(|sink| sink.topic == output_name) {
+        return Ok(Some(exact));
+    }
+    if let Some(default) = cmd.sinks.iter().find(|sink| is_default_sink(&sink.topic)) {
+        return Ok(Some(default));
+    }
+    if cmd.sinks.len() <= 1 {
+        return Ok(cmd.sinks.first());
     }
 
-    let sink_overrides = parse_quarantine_overrides_from_sink_uri(sink_uri)?;
-    config.apply(sink_overrides);
+    let topics = cmd
+        .sinks
+        .iter()
+        .map(|sink| sink.topic.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(WorkerError::Permanent {
+        message: format!(
+            "Output '{}' has no sink config; configured topics: {}",
+            output_name, topics
+        ),
+    })
+}
 
+fn resolve_quarantine_config(config: Option<&types::QuarantineConfig>) -> Result<types::QuarantineConfig> {
+    let mut config = config.cloned().unwrap_or_default();
+    if let Some(dir) = config.quarantine_dir.as_ref() {
+        if dir.trim().is_empty() {
+            config.quarantine_dir = None;
+        }
+    }
     validate_quarantine_config(&config)?;
     Ok(config)
 }
 
-fn parse_quarantine_overrides_from_schema_def(
-    schema_def: &str,
-    output_name: &str,
-) -> Result<QuarantineConfigOverrides> {
-    let value: serde_json::Value = serde_json::from_str(schema_def)
-        .map_err(|e| anyhow::anyhow!("schema_def is not valid JSON: {}", e))?;
-
-    let Some(obj) = value.as_object() else {
-        return Ok(QuarantineConfigOverrides::default());
+fn sink_uri_for_quarantine(sink_uri: &str, quarantine_dir: Option<&str>) -> Result<String> {
+    let Some(dir) = quarantine_dir else {
+        return Ok(sink_uri.to_string());
     };
-
-    let mut overrides = QuarantineConfigOverrides::default();
-
-    if let Some(config_value) = obj.get("quarantine_config") {
-        overrides.apply(parse_quarantine_overrides_value(config_value)?);
+    let trimmed = dir.trim();
+    if trimmed.is_empty() {
+        return Ok(sink_uri.to_string());
     }
 
-    if let Some(schemas) = obj.get("schemas").and_then(|v| v.as_array()) {
-        if let Some(schema) = schemas.iter().find(|schema| {
-            schema
-                .get("name")
-                .and_then(|v| v.as_str())
-                .is_some_and(|name| name == output_name)
-        }) {
-            if let Some(config_value) = schema.get("quarantine_config") {
-                overrides.apply(parse_quarantine_overrides_value(config_value)?);
-            }
+    let query_suffix = sink_uri
+        .split_once('?')
+        .and_then(|(_, query)| if query.is_empty() { None } else { Some(query) });
+
+    let parsed = ParsedSinkUri::parse(sink_uri)
+        .map_err(|e| anyhow::anyhow!("invalid sink uri '{}': {}", sink_uri, e))?;
+
+    let is_duckdb_file = matches!(parsed.scheme, SinkScheme::File)
+        && parsed
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "duckdb" | "db"))
+            .unwrap_or(false);
+
+    if matches!(parsed.scheme, SinkScheme::Duckdb) || is_duckdb_file {
+        anyhow::bail!("quarantine_dir is not supported for duckdb sinks");
+    }
+
+    let target_path = match parsed.scheme {
+        SinkScheme::Parquet | SinkScheme::Csv => PathBuf::from(trimmed),
+        SinkScheme::File => {
+            let ext = parsed
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("parquet");
+            let mut path = PathBuf::from(trimmed);
+            path.push(format!("placeholder.{}", ext));
+            path
         }
-    }
-
-    Ok(overrides)
-}
-
-fn parse_quarantine_overrides_value(value: &serde_json::Value) -> Result<QuarantineConfigOverrides> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("quarantine_config must be an object"))?;
-
-    let allow_quarantine = match obj.get("allow_quarantine") {
-        Some(value) => Some(parse_bool_value(value)?),
-        None => None,
+        SinkScheme::Duckdb => {
+            unreachable!("duckdb handled above");
+        }
     };
 
-    let max_quarantine_pct = match obj.get("max_quarantine_pct") {
-        Some(value) => Some(parse_f64_value(value, "max_quarantine_pct")?),
-        None => None,
-    };
-
-    let max_quarantine_count = match obj.get("max_quarantine_count") {
-        Some(value) => Some(parse_usize_value(value, "max_quarantine_count")?),
-        None => None,
-    };
-
-    Ok(QuarantineConfigOverrides {
-        allow_quarantine,
-        max_quarantine_pct,
-        max_quarantine_count,
-    })
+    let mut uri = format!("{}://{}", parsed.scheme.as_str(), target_path.display());
+    if let Some(query) = query_suffix {
+        uri.push('?');
+        uri.push_str(query);
+    }
+    Ok(uri)
 }
 
-fn parse_quarantine_overrides_from_sink_uri(uri: &str) -> Result<QuarantineConfigOverrides> {
-    let parsed = ParsedSinkUri::parse(uri)
-        .map_err(|e| anyhow::anyhow!("invalid sink uri '{}': {}", uri, e))?;
-
-    let mut overrides = QuarantineConfigOverrides::default();
-
-    if let Some(value) = parsed.query.get("allow_quarantine") {
-        overrides.allow_quarantine = Some(parse_bool_str(value)?);
-    }
-    if let Some(value) = parsed.query.get("max_quarantine_pct") {
-        overrides.max_quarantine_pct = Some(parse_f64_str(value, "max_quarantine_pct")?);
-    }
-    if let Some(value) = parsed.query.get("max_quarantine_count") {
-        overrides.max_quarantine_count = Some(parse_usize_str(value, "max_quarantine_count")?);
-    }
-
-    Ok(overrides)
-}
-
-fn validate_quarantine_config(config: &QuarantineConfig) -> Result<()> {
+fn validate_quarantine_config(config: &types::QuarantineConfig) -> Result<()> {
     if !config.max_quarantine_pct.is_finite() {
         anyhow::bail!("max_quarantine_pct must be finite");
     }
@@ -894,73 +998,11 @@ fn validate_quarantine_config(config: &QuarantineConfig) -> Result<()> {
     Ok(())
 }
 
-fn parse_bool_value(value: &serde_json::Value) -> Result<bool> {
-    match value {
-        serde_json::Value::Bool(v) => Ok(*v),
-        serde_json::Value::Number(num) => {
-            if num == &0.into() {
-                Ok(false)
-            } else if num == &1.into() {
-                Ok(true)
-            } else {
-                anyhow::bail!("invalid boolean number '{}'", num);
-            }
-        }
-        serde_json::Value::String(text) => parse_bool_str(text),
-        _ => anyhow::bail!("invalid boolean value '{}'", value),
-    }
-}
-
-fn parse_f64_value(value: &serde_json::Value, field: &str) -> Result<f64> {
-    match value {
-        serde_json::Value::Number(num) => num
-            .as_f64()
-            .ok_or_else(|| anyhow::anyhow!("{} must be a number", field)),
-        serde_json::Value::String(text) => parse_f64_str(text, field),
-        _ => anyhow::bail!("{} must be a number", field),
-    }
-}
-
-fn parse_usize_value(value: &serde_json::Value, field: &str) -> Result<usize> {
-    match value {
-        serde_json::Value::Number(num) => num
-            .as_u64()
-            .map(|v| v as usize)
-            .ok_or_else(|| anyhow::anyhow!("{} must be a non-negative integer", field)),
-        serde_json::Value::String(text) => parse_usize_str(text, field),
-        _ => anyhow::bail!("{} must be a non-negative integer", field),
-    }
-}
-
-fn parse_bool_str(value: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "y" => Ok(true),
-        "false" | "0" | "no" | "n" => Ok(false),
-        other => anyhow::bail!("invalid boolean '{}'", other),
-    }
-}
-
-fn parse_f64_str(value: &str, field: &str) -> Result<f64> {
-    let parsed: f64 = value
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{} must be a number", field))?;
-    Ok(parsed)
-}
-
-fn parse_usize_str(value: &str, field: &str) -> Result<usize> {
-    let parsed: usize = value
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{} must be a non-negative integer", field))?;
-    Ok(parsed)
-}
-
 fn check_quarantine_policy(
     output_name: &str,
-    quarantine_rows: usize,
-    total_rows: usize,
-    config: &QuarantineConfig,
+    quarantine_rows: u64,
+    total_rows: u64,
+    config: &types::QuarantineConfig,
 ) -> Option<String> {
     if quarantine_rows == 0 {
         return None;
@@ -992,7 +1034,7 @@ fn check_quarantine_policy(
     None
 }
 
-fn quarantine_pct(quarantine_rows: usize, total_rows: usize) -> f64 {
+fn quarantine_pct(quarantine_rows: u64, total_rows: u64) -> f64 {
     if total_rows == 0 {
         0.0
     } else {
@@ -1005,27 +1047,27 @@ fn quarantine_pct(quarantine_rows: usize, total_rows: usize) -> f64 {
 /// The receipt includes error classification for retry decisions:
 /// - `error_message` contains the error details
 /// - `metrics["is_transient"]` indicates if the error is retry-eligible (1 = transient, 0 = permanent)
-async fn execute_job(
-    job_id: u64,
+fn execute_job(
+    job_id: JobId,
     cmd: DispatchCommand,
     venv_manager: Arc<VenvManager>,
     parquet_root: PathBuf,
     shim_path: PathBuf,
 ) -> types::JobReceipt {
-    match execute_job_inner(job_id, &cmd, &venv_manager, &parquet_root, &shim_path).await {
+    match execute_job_inner(job_id, &cmd, &venv_manager, &parquet_root, &shim_path) {
         Ok(ExecutionOutcome::Success { metrics: exec_metrics, artifacts }) => {
             let mut metrics = HashMap::new();
             insert_execution_metrics(&mut metrics, &exec_metrics);
 
+            // Use per-output status aggregation for multi-output jobs
+            let aggregated_status = aggregate_job_status(&exec_metrics.outputs);
+
             types::JobReceipt {
-                status: if exec_metrics.quarantine_rows > 0 {
-                    JobStatus::PartialSuccess
-                } else {
-                    JobStatus::Success
-                },
+                status: aggregated_status,
                 metrics,
                 artifacts,
                 error_message: None,
+                diagnostics: None,
             }
         }
         Ok(ExecutionOutcome::QuarantineRejected { metrics: exec_metrics, reason }) => {
@@ -1039,11 +1081,13 @@ async fn execute_job(
                 metrics,
                 artifacts: vec![],
                 error_message: Some(reason),
+                diagnostics: None,
             }
         }
         Err(worker_err) => {
             let is_transient = worker_err.is_transient();
             let error_message = worker_err.to_string();
+            let diagnostics = worker_err.diagnostics().cloned();
 
             if is_transient {
                 warn!("Job {} failed (transient, retry eligible): {}", job_id, error_message);
@@ -1060,63 +1104,63 @@ async fn execute_job(
                 metrics,
                 artifacts: vec![],
                 error_message: Some(error_message),
+                diagnostics,
             }
         }
     }
 }
 
 /// Execute a job, returning WorkerError with retry classification on failure
-async fn execute_job_inner(
-    job_id: u64,
+fn execute_job_inner(
+    job_id: JobId,
     cmd: &DispatchCommand,
-    venv_manager: &VenvManager,
+    venv_manager: &Arc<VenvManager>,
     parquet_root: &std::path::Path,
     shim_path: &std::path::Path,
 ) -> std::result::Result<ExecutionOutcome, WorkerError> {
-    // Determine interpreter path
-    let interpreter = if cmd.env_hash == "system" {
-        // Use system Python for legacy plugins without lockfile
-        which::which("python3")
-            .or_else(|_| which::which("python"))
-            .map_err(|e| WorkerError::Permanent {
-                message: format!("No system Python found: {}", e),
-            })?
-    } else {
-        // Use venv interpreter
-        let interp = venv_manager.interpreter_path(&cmd.env_hash);
-        if !interp.exists() {
-            info!(
-                "Job {}: environment {} not cached, provisioning...",
-                job_id,
-                truncate_hash(&cmd.env_hash)
-            );
-            // Environment not provisioned - this is a transient error, worker can retry
-            // after sentinel sends PREPARE_ENV
-            return Err(WorkerError::Transient {
-                message: format!(
-                    "Environment {} not provisioned. Worker cannot auto-provision without lockfile. \
-                     Either send PREPARE_ENV first, or include lockfile in DISPATCH.",
-                    truncate_hash(&cmd.env_hash)
-                ),
+    if cmd.runtime_kind == RuntimeKind::NativeExec && !cmd.signature_verified {
+        if !allow_unsigned_native().unwrap_or(false) {
+            return Err(WorkerError::Permanent {
+                message: "Unsigned native plugin blocked by trust policy".to_string(),
             });
         }
-        interp
-    };
+    }
 
-    // Execute bridge
-    let config = BridgeConfig {
-        interpreter_path: interpreter,
-        source_code: cmd.source_code.clone(),
-        file_path: cmd.file_path.clone(),
+    let entrypoint = resolve_entrypoint(cmd)?;
+    let schema_hashes = build_schema_hashes(cmd);
+    let ctx = RunContext {
         job_id,
         file_id: cmd.file_id,
-        shim_path: shim_path.to_path_buf(),
-        inherit_stdio: false,
+        entrypoint,
+        env_hash: cmd.env_hash.clone(),
+        source_code: cmd.source_code.clone(),
+        schema_hashes,
     };
 
-    let bridge_result = bridge::execute_bridge(config).await.map_err(|e| {
+    let runtime: Box<dyn PluginRuntime> = match cmd.runtime_kind {
+        RuntimeKind::PythonShim => Box::new(PythonShimRuntime::new(
+            venv_manager.clone(),
+            shim_path.to_path_buf(),
+        )),
+        RuntimeKind::NativeExec => Box::new(NativeSubprocessRuntime::new()),
+    };
+
+    let run_outputs = runtime.run_file(&ctx, Path::new(&cmd.file_path)).map_err(|e| {
+        let error_message = e.to_string();
+        if let Some(retryable) = parse_bridge_retryable(&error_message) {
+            return if retryable {
+                WorkerError::Transient {
+                    message: error_message,
+                }
+            } else {
+                WorkerError::Permanent {
+                    message: error_message,
+                }
+            };
+        }
+
         // Classify bridge errors by examining the error message
-        let error_str = e.to_string().to_lowercase();
+        let error_str = error_message.to_lowercase();
 
         // Permanent errors: syntax errors, import errors, schema violations
         if error_str.contains("syntaxerror")
@@ -1126,13 +1170,13 @@ async fn execute_job_inner(
             || error_str.contains("exited with exit status: 1")
         {
             WorkerError::Permanent {
-                message: e.to_string(),
+                message: error_message,
             }
         }
         // Exit code 2 explicitly indicates transient
         else if error_str.contains("exited with exit status: 2") {
             WorkerError::Transient {
-                message: e.to_string(),
+                message: error_message,
             }
         }
         // Transient errors: timeouts, network issues, resource unavailable
@@ -1142,22 +1186,27 @@ async fn execute_job_inner(
             || error_str.contains("signal")
         {
             WorkerError::Transient {
-                message: e.to_string(),
+                message: error_message,
             }
         }
         // Default to transient (conservative - allow retry)
         else {
             WorkerError::Transient {
-                message: e.to_string(),
+                message: error_message,
             }
         }
     })?;
 
-    let output_batches = bridge_result.output_batches;
+    let output_batches = run_outputs.output_batches;
 
     // Log the captured logs for debugging (will be stored in DB in Phase 3)
-    if !bridge_result.logs.is_empty() {
-        debug!("Job {} logs ({} bytes):\n{}", job_id, bridge_result.logs.len(), bridge_result.logs);
+    if !run_outputs.logs.is_empty() {
+        debug!(
+            "Job {} logs ({} bytes):\n{}",
+            job_id,
+            run_outputs.logs.len(),
+            run_outputs.logs
+        );
     }
 
     let default_sink = format!("parquet://{}", parquet_root.display());
@@ -1167,7 +1216,7 @@ async fn execute_job_inner(
         .map(|s| s.uri.as_str())
         .unwrap_or(default_sink.as_str());
 
-    let descriptors: Vec<casparian_sinks::OutputDescriptor> = bridge_result
+    let descriptors: Vec<casparian_sinks::OutputDescriptor> = run_outputs
         .output_info
         .iter()
         .map(|info| casparian_sinks::OutputDescriptor {
@@ -1199,19 +1248,25 @@ async fn execute_job_inner(
     let mut output_metrics = Vec::new();
     let mut policy_failures = Vec::new();
 
-    let mut valid_owned = Vec::new();
-    let mut quarantine_owned = Vec::new();
+    let mut owned_outputs = Vec::new();
 
     for output in outputs {
         let output_name = output.name().to_string();
-        let output_table = output.table().map(|table| table.to_string());
-        let sink_config = find_sink_config(cmd, &output_name);
-        let schema_def = sink_config
-            .and_then(|sink| sink.schema_def.as_deref())
-            .and_then(normalize_schema_def);
+        let mut output_table = output.table().map(|table| table.to_string());
+        let sink_config = select_sink_config(cmd, &output_name)?;
+        let schema_def = sink_config.and_then(|sink| sink.schema.as_ref());
+        let schema_hash_value = schema_hash(schema_def);
+        if schema_hash_value.is_some() {
+            let base = output_table.as_deref().unwrap_or(&output_name);
+            output_table = Some(table_name_with_schema(
+                base,
+                schema_hash_value.as_deref(),
+            ));
+        }
         let sink_uri_for_config = sink_config
             .map(|sink| sink.uri.as_str())
             .unwrap_or(sink_uri);
+        let sink_uri_for_output = sink_uri_for_config.to_string();
 
         let mut output_batches: Vec<RecordBatch> = output
             .batches()
@@ -1219,14 +1274,31 @@ async fn execute_job_inner(
             .map(|batch| batch.as_record_batch().clone())
             .collect();
         if let Some(schema_def) = schema_def {
-            output_batches = schema_validation::enforce_schema_on_batches(
+            output_batches = match schema_validation::enforce_schema_on_batches(
                 &output_batches,
                 schema_def,
                 &output_name,
-            )
-            .map_err(|e| WorkerError::Permanent {
-                message: format!("schema validation failed for '{}': {}", output_name, e),
-            })?;
+            ) {
+                Ok(batches) => batches,
+                Err(err) => {
+                    return Err(match err {
+                        schema_validation::SchemaValidationError::SchemaMismatch { mismatch, .. } => {
+                            let summary = schema_validation::summarize_schema_mismatch(&mismatch);
+                            WorkerError::PermanentWithDiagnostics {
+                                message: summary,
+                                diagnostics: types::JobDiagnostics {
+                                    schema_mismatch: Some(mismatch),
+                                },
+                            }
+                        }
+                        schema_validation::SchemaValidationError::InvalidSchemaDef { message } => {
+                            WorkerError::Permanent {
+                                message: format!("schema validation failed for '{}': {}", output_name, message),
+                            }
+                        }
+                    });
+                }
+            };
         }
 
         let output_batch_refs: Vec<&RecordBatch> = output_batches.iter().collect();
@@ -1238,23 +1310,49 @@ async fn execute_job_inner(
         total_rows += valid_rows;
         quarantine_rows += quarantined;
         lineage_unavailable_rows += lineage_unavailable;
+
+        let quarantine_config =
+            resolve_quarantine_config(sink_config.and_then(|sink| sink.quarantine_config.as_ref()))
+                .map_err(|e| WorkerError::Permanent {
+                    message: format!("invalid quarantine config for '{}': {}", output_name, e),
+                })?;
+        let quarantine_sink_uri = sink_uri_for_quarantine(
+            &sink_uri_for_output,
+            quarantine_config.quarantine_dir.as_deref(),
+        )
+        .map_err(|e| WorkerError::Permanent {
+            message: format!("invalid quarantine_dir for '{}': {}", output_name, e),
+        })?;
+        let quarantined_u64 = u64::try_from(quarantined).map_err(|_| WorkerError::Permanent {
+            message: format!("quarantine row count overflow for '{}'", output_name),
+        })?;
+        let output_rows_u64 = u64::try_from(output_rows).map_err(|_| WorkerError::Permanent {
+            message: format!("output row count overflow for '{}'", output_name),
+        })?;
+
+        // Determine per-output status based on quarantine policy
+        let output_status = if let Some(reason) = check_quarantine_policy(
+            &output_name,
+            quarantined_u64,
+            output_rows_u64,
+            &quarantine_config,
+        )
+        {
+            policy_failures.push(reason);
+            OutputStatus::Failed
+        } else if quarantined > 0 {
+            OutputStatus::PartialSuccess
+        } else {
+            OutputStatus::Success
+        };
+
         output_metrics.push(OutputMetrics {
             name: output_name.clone(),
             rows: valid_rows,
             quarantine_rows: quarantined,
             lineage_unavailable_rows: lineage_unavailable,
+            status: output_status,
         });
-
-        let quarantine_config =
-            resolve_quarantine_config(schema_def, sink_uri_for_config, &output_name)
-            .map_err(|e| WorkerError::Permanent {
-                message: format!("invalid quarantine config for '{}': {}", output_name, e),
-            })?;
-        if let Some(reason) =
-            check_quarantine_policy(&output_name, quarantined, output_rows, &quarantine_config)
-        {
-            policy_failures.push(reason);
-        }
 
         if !valid_batches.is_empty() {
             let lineage_batches = inject_lineage_batches(
@@ -1267,10 +1365,11 @@ async fn execute_job_inner(
             .map_err(|e| WorkerError::Permanent {
                 message: format!("lineage injection failed for '{}': {}", output_name, e),
             })?;
-            valid_owned.push(OwnedOutput {
+            owned_outputs.push(OwnedOutput {
                 name: output_name.clone(),
                 table: output_table.clone(),
                 batches: lineage_batches,
+                sink_uri: sink_uri_for_output.clone(),
             });
         }
         if !quarantine_batches.is_empty() {
@@ -1282,10 +1381,11 @@ async fn execute_job_inner(
                 .into_iter()
                 .map(casparian_sinks::OutputBatch::from_record_batch)
                 .collect();
-            quarantine_owned.push(OwnedOutput {
+            owned_outputs.push(OwnedOutput {
                 name: quarantine_name,
                 table: quarantine_table,
                 batches: quarantine_batches,
+                sink_uri: quarantine_sink_uri,
             });
         }
     }
@@ -1305,26 +1405,19 @@ async fn execute_job_inner(
         });
     }
 
-    if !valid_owned.is_empty() {
-        let plans = to_output_plans(&valid_owned);
-        let written = casparian_sinks::write_output_plan(sink_uri, &plans, &job_id_str)
-            .map_err(|e| WorkerError::Transient { message: e.to_string() })?;
+    if !owned_outputs.is_empty() {
+        let output_table_map: HashMap<String, Option<String>> = owned_outputs
+            .iter()
+            .map(|output| (output.name.clone(), output.table.clone()))
+            .collect();
+        let written = write_outputs_grouped(owned_outputs, &job_id_str)?;
         for output in written {
             let mut artifact = HashMap::new();
-            artifact.insert("topic".to_string(), output.name);
+            artifact.insert("topic".to_string(), output.name.clone());
             artifact.insert("uri".to_string(), output.uri);
-            artifacts.push(artifact);
-        }
-    }
-
-    if !quarantine_owned.is_empty() {
-        let plans = to_output_plans(&quarantine_owned);
-        let written = casparian_sinks::write_output_plan(sink_uri, &plans, &job_id_str)
-            .map_err(|e| WorkerError::Transient { message: e.to_string() })?;
-        for output in written {
-            let mut artifact = HashMap::new();
-            artifact.insert("topic".to_string(), output.name);
-            artifact.insert("uri".to_string(), output.uri);
+            if let Some(Some(table)) = output_table_map.get(&output.name) {
+                artifact.insert("table".to_string(), table.clone());
+            }
             artifacts.push(artifact);
         }
     }
@@ -1343,6 +1436,7 @@ struct OwnedOutput {
     name: String,
     table: Option<String>,
     batches: Vec<casparian_sinks::OutputBatch>,
+    sink_uri: String,
 }
 
 fn to_output_plans(outputs: &[OwnedOutput]) -> Vec<casparian_sinks::OutputPlan> {
@@ -1358,8 +1452,28 @@ fn to_output_plans(outputs: &[OwnedOutput]) -> Vec<casparian_sinks::OutputPlan> 
         .collect()
 }
 
+fn write_outputs_grouped(
+    outputs: Vec<OwnedOutput>,
+    job_id: &str,
+) -> WorkerResult<Vec<casparian_sinks::OutputArtifact>> {
+    let mut grouped: HashMap<String, Vec<OwnedOutput>> = HashMap::new();
+    for output in outputs {
+        grouped.entry(output.sink_uri.clone()).or_default().push(output);
+    }
+
+    let mut artifacts = Vec::new();
+    for (sink_uri, group) in grouped {
+        let plans = to_output_plans(&group);
+        let written = casparian_sinks::write_output_plan(&sink_uri, &plans, job_id)
+            .map_err(|e| WorkerError::Transient { message: e.to_string() })?;
+        artifacts.extend(written);
+    }
+
+    Ok(artifacts)
+}
+
 fn split_output_batches(
-    job_id: u64,
+    job_id: JobId,
     batches: &[&RecordBatch],
 ) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>, usize, usize)> {
     let mut valid_batches = Vec::new();
@@ -1409,7 +1523,7 @@ fn augment_quarantine_batch(
     batch: &RecordBatch,
     source_batch: &RecordBatch,
     invalid_mask: &BooleanArray,
-    job_id: u64,
+    job_id: JobId,
 ) -> Result<(RecordBatch, usize)> {
     let mut fields: Vec<Field> = batch
         .schema()
@@ -1586,7 +1700,7 @@ fn build_violation_type_array(messages: &[Option<String>]) -> ArrayRef {
     Arc::new(builder.finish())
 }
 
-fn build_job_id_array(job_id: u64, rows: usize) -> ArrayRef {
+fn build_job_id_array(job_id: JobId, rows: usize) -> ArrayRef {
     let mut builder = StringBuilder::new();
     let job_id_str = job_id.to_string();
     for _ in 0..rows {
@@ -1725,10 +1839,10 @@ fn build_quarantine_masks(error_col: &ArrayRef) -> Result<(BooleanArray, Boolean
 }
 
 /// Send a protocol message as multipart (header + body in one ZMQ message)
-async fn send_message<T: serde::Serialize>(
-    socket: &mut DealerSocket,
+fn send_message<T: serde::Serialize>(
+    socket: &Socket,
     opcode: OpCode,
-    job_id: u64,
+    job_id: JobId,
     payload: &T,
 ) -> Result<()> {
     let payload_bytes = serde_json::to_vec(payload)?;
@@ -1737,9 +1851,10 @@ async fn send_message<T: serde::Serialize>(
     let (header, body) = msg.pack()
         .map_err(|e| anyhow::anyhow!("Failed to pack message: {}", e))?;
 
-    let mut multipart = ZmqMessage::from(header.to_vec());
-    multipart.push_back(body.into());
-    socket.send(multipart).await?;
+    let frames = [header.as_ref(), body.as_slice()];
+    socket
+        .send_multipart(&frames, 0)
+        .map_err(|e| anyhow::anyhow!("ZMQ send error: {}", e))?;
     Ok(())
 }
 
@@ -1748,8 +1863,28 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    fn make_dispatch_command(sinks: Vec<types::SinkConfig>) -> DispatchCommand {
+        DispatchCommand {
+            plugin_name: "test_plugin".to_string(),
+            parser_version: Some("v1".to_string()),
+            file_path: "/tmp/input.csv".to_string(),
+            sinks,
+            file_id: 1,
+            runtime_kind: types::RuntimeKind::PythonShim,
+            entrypoint: "test_plugin.py:Handler".to_string(),
+            platform_os: None,
+            platform_arch: None,
+            signature_verified: false,
+            signer_id: None,
+            env_hash: Some("env_hash_test".to_string()),
+            source_code: Some("print('ok')".to_string()),
+            artifact_hash: "artifact_hash_test".to_string(),
+        }
+    }
 
     #[test]
     fn test_worker_config() {
@@ -1883,7 +2018,7 @@ mod tests {
         .unwrap();
 
         let (valid, quarantine, quarantined, lineage_unavailable) =
-            split_output_batches(42, &[&batch]).unwrap();
+            split_output_batches(JobId::new(42), &[&batch]).unwrap();
         let valid_rows: usize = valid.iter().map(|b| b.num_rows()).sum();
         let quarantine_rows: usize = quarantine.iter().map(|b| b.num_rows()).sum();
 
@@ -1939,7 +2074,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ids) as ArrayRef]).unwrap();
 
         let (valid, quarantine, quarantined, lineage_unavailable) =
-            split_output_batches(1, &[&batch]).unwrap();
+            split_output_batches(JobId::new(1), &[&batch]).unwrap();
         let valid_rows: usize = valid.iter().map(|b| b.num_rows()).sum();
 
         assert_eq!(quarantined, 0);
@@ -1950,7 +2085,14 @@ mod tests {
 
     #[test]
     fn test_quarantine_artifacts_from_schema_def() {
-        let schema_def = r#"[{"name":"id","data_type":"int64","nullable":false}]"#;
+        let schema_def = types::SchemaDefinition {
+            columns: vec![types::SchemaColumnSpec {
+                name: "id".to_string(),
+                data_type: casparian_protocol::DataType::Int64,
+                nullable: false,
+                format: None,
+            }],
+        };
         let ids = Int64Array::from(vec![Some(1), None]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
@@ -1958,11 +2100,11 @@ mod tests {
         )
         .unwrap();
 
-        let validated = schema_validation::enforce_schema_on_batches(&[batch], schema_def, "output")
+        let validated = schema_validation::enforce_schema_on_batches(&[batch], &schema_def, "output")
             .unwrap();
         let validated_refs: Vec<&RecordBatch> = validated.iter().collect();
         let (valid, quarantine, quarantined, _lineage_unavailable) =
-            split_output_batches(7, &validated_refs).unwrap();
+            split_output_batches(JobId::new(7), &validated_refs).unwrap();
 
         assert_eq!(quarantined, 1);
         assert!(!valid.is_empty());
@@ -1977,6 +2119,7 @@ mod tests {
             name: "output".to_string(),
             table: None,
             batches: valid_batches,
+            sink_uri: "parquet://./output".to_string(),
         });
         let quarantine_batches = quarantine
             .into_iter()
@@ -1986,6 +2129,7 @@ mod tests {
             name: "output_quarantine".to_string(),
             table: None,
             batches: quarantine_batches,
+            sink_uri: "parquet://./output".to_string(),
         });
 
         let plans = to_output_plans(&outputs);
@@ -2005,11 +2149,150 @@ mod tests {
     }
 
     #[test]
+    fn test_write_outputs_grouped_routes_by_sink() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch_one = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .unwrap();
+        let batch_two = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![3])) as ArrayRef],
+        )
+        .unwrap();
+
+        let dir_one = tempdir().unwrap();
+        let dir_two = tempdir().unwrap();
+        let sink_one = format!("parquet://{}", dir_one.path().display());
+        let sink_two = format!("parquet://{}", dir_two.path().display());
+
+        let outputs = vec![
+            OwnedOutput {
+                name: "alpha".to_string(),
+                table: None,
+                batches: vec![casparian_sinks::OutputBatch::from_record_batch(batch_one)],
+                sink_uri: sink_one,
+            },
+            OwnedOutput {
+                name: "beta".to_string(),
+                table: None,
+                batches: vec![casparian_sinks::OutputBatch::from_record_batch(batch_two)],
+                sink_uri: sink_two,
+            },
+        ];
+
+        let artifacts = write_outputs_grouped(outputs, "job-xyz").unwrap();
+        assert_eq!(artifacts.len(), 2);
+
+        let mut paths = HashMap::new();
+        for artifact in artifacts {
+            assert!(artifact.uri.starts_with("file://"));
+            let path = std::path::Path::new(&artifact.uri["file://".len()..]).to_path_buf();
+            assert!(path.exists());
+            paths.insert(artifact.name, path);
+        }
+
+        assert!(paths
+            .get("alpha")
+            .unwrap()
+            .starts_with(dir_one.path()));
+        assert!(paths
+            .get("beta")
+            .unwrap()
+            .starts_with(dir_two.path()));
+    }
+
+    #[test]
+    fn test_select_sink_config_exact_match() {
+        let cmd = make_dispatch_command(vec![
+            types::SinkConfig {
+                topic: "alpha".to_string(),
+                uri: "parquet:///tmp/alpha".to_string(),
+                mode: types::SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+            types::SinkConfig {
+                topic: "beta".to_string(),
+                uri: "parquet:///tmp/beta".to_string(),
+                mode: types::SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+        ]);
+
+        let selected = select_sink_config(&cmd, "beta").unwrap().unwrap();
+        assert_eq!(selected.uri, "parquet:///tmp/beta");
+    }
+
+    #[test]
+    fn test_select_sink_config_default_wildcard() {
+        let cmd = make_dispatch_command(vec![
+            types::SinkConfig {
+                topic: "alpha".to_string(),
+                uri: "parquet:///tmp/alpha".to_string(),
+                mode: types::SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+            types::SinkConfig {
+                topic: "*".to_string(),
+                uri: "parquet:///tmp/default".to_string(),
+                mode: types::SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+        ]);
+
+        let selected = select_sink_config(&cmd, "gamma").unwrap().unwrap();
+        assert_eq!(selected.uri, "parquet:///tmp/default");
+    }
+
+    #[test]
+    fn test_select_sink_config_single_sink_fallback() {
+        let cmd = make_dispatch_command(vec![types::SinkConfig {
+            topic: "alpha".to_string(),
+            uri: "parquet:///tmp/alpha".to_string(),
+            mode: types::SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }]);
+
+        let selected = select_sink_config(&cmd, "gamma").unwrap().unwrap();
+        assert_eq!(selected.uri, "parquet:///tmp/alpha");
+    }
+
+    #[test]
+    fn test_select_sink_config_requires_explicit_default() {
+        let cmd = make_dispatch_command(vec![
+            types::SinkConfig {
+                topic: "alpha".to_string(),
+                uri: "parquet:///tmp/alpha".to_string(),
+                mode: types::SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+            types::SinkConfig {
+                topic: "beta".to_string(),
+                uri: "parquet:///tmp/beta".to_string(),
+                mode: types::SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+        ]);
+
+        let err = select_sink_config(&cmd, "gamma").unwrap_err();
+        assert!(err.to_string().contains("no sink config"));
+    }
+
+    #[test]
     fn test_quarantine_policy_disallowed() {
-        let config = QuarantineConfig {
+        let config = types::QuarantineConfig {
             allow_quarantine: false,
             max_quarantine_pct: 10.0,
             max_quarantine_count: None,
+            quarantine_dir: None,
         };
         let reason = check_quarantine_policy("output", 1, 10, &config).unwrap();
         assert!(reason.contains("quarantine disabled"));
@@ -2037,7 +2320,7 @@ mod tests {
         .unwrap();
 
         let (_valid, quarantine, quarantined, lineage_unavailable) =
-            split_output_batches(9, &[&batch]).unwrap();
+            split_output_batches(JobId::new(9), &[&batch]).unwrap();
         assert_eq!(quarantined, 1);
         assert_eq!(lineage_unavailable, 0);
         assert_eq!(quarantine.len(), 1);
@@ -2058,10 +2341,11 @@ mod tests {
 
     #[test]
     fn test_quarantine_policy_pct_threshold() {
-        let config = QuarantineConfig {
+        let config = types::QuarantineConfig {
             allow_quarantine: true,
             max_quarantine_pct: 5.0,
             max_quarantine_count: None,
+            quarantine_dir: None,
         };
         let reason = check_quarantine_policy("output", 6, 100, &config).unwrap();
         assert!(reason.contains("pct exceeded"));
@@ -2069,38 +2353,53 @@ mod tests {
 
     #[test]
     fn test_quarantine_policy_count_threshold() {
-        let config = QuarantineConfig {
+        let config = types::QuarantineConfig {
             allow_quarantine: true,
             max_quarantine_pct: 100.0,
             max_quarantine_count: Some(2),
+            quarantine_dir: None,
         };
         let reason = check_quarantine_policy("output", 3, 100, &config).unwrap();
         assert!(reason.contains("count exceeded"));
     }
 
     #[test]
-    fn test_quarantine_config_from_sink_uri() {
-        let config = resolve_quarantine_config(
-            None,
-            "parquet:///tmp/out?allow_quarantine=true&max_quarantine_pct=2.5&max_quarantine_count=7",
-            "output",
-        )
-        .unwrap();
-        assert!(config.allow_quarantine);
-        assert_eq!(config.max_quarantine_pct, 2.5);
-        assert_eq!(config.max_quarantine_count, Some(7));
+    fn test_resolve_quarantine_config_defaults() {
+        let config = resolve_quarantine_config(None).unwrap();
+        assert!(!config.allow_quarantine);
+        assert_eq!(config.max_quarantine_pct, 10.0);
+        assert_eq!(config.max_quarantine_count, None);
     }
 
     #[test]
-    fn test_quarantine_config_from_schema_def() {
-        let schema_def = r#"{"name":"output","columns":[{"name":"id","data_type":"int64"}],"quarantine_config":{"allow_quarantine":true,"max_quarantine_pct":1.0}}"#;
-        let config = resolve_quarantine_config(
-            Some(schema_def),
-            "parquet:///tmp/out",
-            "output",
+    fn test_quarantine_dir_overrides_sink_uri() {
+        let uri = sink_uri_for_quarantine("parquet:///tmp/out", Some("/tmp/quarantine")).unwrap();
+        assert_eq!(uri, "parquet:///tmp/quarantine");
+    }
+
+    #[test]
+    fn test_quarantine_dir_preserves_query_params() {
+        let uri = sink_uri_for_quarantine(
+            "parquet:///tmp/out?compression=zstd&row_group_size=1000",
+            Some("/tmp/quarantine"),
         )
         .unwrap();
-        assert!(config.allow_quarantine);
-        assert_eq!(config.max_quarantine_pct, 1.0);
+        assert_eq!(
+            uri,
+            "parquet:///tmp/quarantine?compression=zstd&row_group_size=1000"
+        );
+    }
+
+    #[test]
+    fn test_quarantine_dir_rejects_duckdb() {
+        let err = sink_uri_for_quarantine("duckdb:///tmp/out.db", Some("/tmp/quarantine"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_quarantine_dir_preserves_file_extension() {
+        let uri = sink_uri_for_quarantine("file:///tmp/out.csv", Some("/tmp/quarantine")).unwrap();
+        assert!(uri.starts_with("file:///tmp/quarantine/"));
+        assert!(uri.ends_with(".csv"));
     }
 }

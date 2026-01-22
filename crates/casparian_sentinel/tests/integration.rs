@@ -3,36 +3,16 @@
 //! Tests the complete control plane: worker registration, job dispatch, and ZMQ communication.
 
 use casparian_protocol::types::{IdentifyPayload, JobReceipt, JobStatus};
-use casparian_protocol::{Message, OpCode};
+use casparian_protocol::{JobId, Message, OpCode, PipelineRunStatus, ProcessingStatus};
 use casparian_db::{DbConnection, DbValue};
 use std::time::Duration;
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend};
+use zmq::Context;
 
-async fn setup_queue_db() -> DbConnection {
-    let conn = DbConnection::open_duckdb_memory().await.unwrap();
-    conn.execute(
-        r#"
-        CREATE TABLE cf_processing_queue (
-            id INTEGER PRIMARY KEY,
-            file_id INTEGER NOT NULL,
-            pipeline_run_id TEXT,
-            plugin_name TEXT NOT NULL,
-            config_overrides TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            priority INTEGER DEFAULT 0,
-            worker_host TEXT,
-            worker_pid INTEGER,
-            claim_time TIMESTAMP,
-            end_time TIMESTAMP,
-            result_summary TEXT,
-            error_message TEXT,
-            retry_count INTEGER DEFAULT 0
-        )
-        "#,
-        &[],
-    )
-    .await
-    .unwrap();
+fn setup_queue_db() -> DbConnection {
+    let conn = DbConnection::open_duckdb_memory().unwrap();
+    let queue = casparian_sentinel::db::queue::JobQueue::new(conn.clone());
+    queue.init_queue_schema().unwrap();
+    queue.init_error_handling_schema().unwrap();
     conn.execute(
         r#"
         CREATE TABLE cf_pipeline_runs (
@@ -50,7 +30,7 @@ async fn setup_queue_db() -> DbConnection {
         "#,
         &[],
     )
-    .await
+    
     .unwrap();
     conn.execute(
         r#"
@@ -61,7 +41,7 @@ async fn setup_queue_db() -> DbConnection {
         "#,
         &[],
     )
-    .await
+    
     .unwrap();
     conn
 }
@@ -75,7 +55,7 @@ fn test_identify_message() {
     };
 
     let payload = serde_json::to_vec(&identify).unwrap();
-    let msg = Message::new(OpCode::Identify, 0, payload).unwrap();
+    let msg = Message::new(OpCode::Identify, JobId::new(0), payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     // Verify header format
@@ -99,16 +79,17 @@ fn test_conclude_message() {
         metrics: std::collections::HashMap::from([("rows".to_string(), 1000i64)]),
         artifacts: vec![],
         error_message: None,
+        diagnostics: None,
     };
 
     let payload = serde_json::to_vec(&receipt).unwrap();
-    let msg = Message::new(OpCode::Conclude, 42, payload).unwrap();
+    let msg = Message::new(OpCode::Conclude, JobId::new(42), payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     assert_eq!(header[1], 0x05); // CONCLUDE = 5
 
     let unpacked = Message::unpack(&[header.to_vec(), body]).unwrap();
-    assert_eq!(unpacked.header.job_id, 42);
+    assert_eq!(unpacked.header.job_id, JobId::new(42));
 
     let parsed: JobReceipt = serde_json::from_slice(&unpacked.payload).unwrap();
     assert_eq!(parsed.status, JobStatus::Success);
@@ -120,20 +101,19 @@ fn test_conclude_message() {
 /// This tests the ACTUAL communication pattern:
 /// - DEALER sends 2 frames (header, payload)
 /// - ROUTER receives 3 frames (identity, header, payload)
-#[tokio::test]
-async fn test_worker_sentinel_exchange() {
-    use zeromq::RouterSocket;
+#[test]
+fn test_worker_sentinel_exchange() {
+    let context = Context::new();
 
-    // Bind ROUTER (like Sentinel)
-    let mut router = RouterSocket::new();
-    router.bind("tcp://127.0.0.1:15556").await.unwrap();
+    let router = context.socket(zmq::ROUTER).unwrap();
+    router.bind("tcp://127.0.0.1:15556").unwrap();
+    router.set_rcvtimeo(2000).unwrap();
 
-    // Connect DEALER (like Worker)
-    let mut dealer = DealerSocket::new();
-    dealer.connect("tcp://127.0.0.1:15556").await.unwrap();
+    let dealer = context.socket(zmq::DEALER).unwrap();
+    dealer.connect("tcp://127.0.0.1:15556").unwrap();
 
     // Small delay to ensure connection is established
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    std::thread::sleep(Duration::from_millis(50));
 
     // Worker sends IDENTIFY (2 frames: header + payload)
     let identify = IdentifyPayload {
@@ -141,25 +121,13 @@ async fn test_worker_sentinel_exchange() {
         worker_id: Some("worker-1".to_string()),
     };
     let payload = serde_json::to_vec(&identify).unwrap();
-    let msg = Message::new(OpCode::Identify, 0, payload).unwrap();
+    let msg = Message::new(OpCode::Identify, JobId::new(0), payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
-    // Send as multipart message (not separate sends!)
-    // zeromq-rs: create a ZmqMessage with multiple frames
-    use zeromq::ZmqMessage;
-    let mut multipart = ZmqMessage::from(header.to_vec());
-    multipart.push_back(body.into());
-    dealer.send(multipart).await.unwrap();
+    let frames = [header.as_slice(), body.as_slice()];
+    dealer.send_multipart(&frames, 0).unwrap();
 
-    // ROUTER receives one multipart message: [identity, header, payload]
-    let recv_msg = tokio::time::timeout(Duration::from_secs(2), router.recv())
-        .await
-        .expect("Timeout on recv")
-        .expect("ZMQ error on recv");
-
-    let parts: Vec<Vec<u8>> = recv_msg.into_vec().into_iter()
-        .map(|b| b.to_vec())
-        .collect();
+    let parts = router.recv_multipart(0).expect("ZMQ error on recv");
 
     println!("Received {} parts", parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -170,8 +138,12 @@ async fn test_worker_sentinel_exchange() {
     assert!(parts.len() >= 3, "Expected at least 3 parts, got {}", parts.len());
 
     let _identity = &parts[0];
-    let header = &parts[1];
-    let payload = &parts[2];
+    let mut cursor = 1;
+    if parts.get(1).map(|p| p.is_empty()).unwrap_or(false) {
+        cursor += 1;
+    }
+    let header = &parts[cursor];
+    let payload = &parts[cursor + 1];
 
     // Parse message
     let msg = Message::unpack(&[header.clone(), payload.clone()]).unwrap();
@@ -185,126 +157,136 @@ async fn test_worker_sentinel_exchange() {
 }
 
 /// Test job queue operations
-#[tokio::test]
-async fn test_job_queue_operations() {
+#[test]
+fn test_job_queue_operations() {
     use casparian_sentinel::db::queue::JobQueue;
 
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
     let queue = JobQueue::new(conn.clone());
 
     // Insert test job
     conn.execute(
         r#"
         INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
-        VALUES (1, 1, 'test_plugin', 'QUEUED', 10)
+        VALUES (1, 1, 'test_plugin', ?, 10)
         "#,
-        &[],
+        &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    .await
+    
     .unwrap();
 
     // Pop job
-    let job = queue.pop_job().await.unwrap();
+    let job = queue.pop_job().unwrap();
     assert!(job.is_some());
 
     let job = job.unwrap();
     assert_eq!(job.plugin_name, "test_plugin");
     assert_eq!(job.priority, 10);
 
-    // Complete job
-    queue.complete_job(job.id, "Success", None).await.unwrap();
+    // Complete job with SUCCESS completion_status using enum helper
+    use casparian_protocol::types::JobStatus as ProtocolJobStatus;
+    queue.complete_job(job.id, ProtocolJobStatus::Success.as_str(), "Success", None).unwrap();
 
-    // Verify completed
+    // Verify completed with completion_status
     let row = conn
         .query_optional(
-            "SELECT status FROM cf_processing_queue WHERE id = ?",
+            "SELECT status, completion_status FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job.id)],
         )
-        .await
+        
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
+    let completion_status: Option<String> = row.get_by_name("completion_status").unwrap();
 
-    assert_eq!(status, "COMPLETED");
+    assert_eq!(status, ProcessingStatus::Completed.as_str());
+    assert_eq!(completion_status, Some(ProtocolJobStatus::Success.as_str().to_string()));
 }
 
 /// Test job details lookup via scout_files
-#[tokio::test]
-async fn test_job_details_uses_scout_files() {
+#[test]
+fn test_job_details_uses_scout_files() {
     use casparian_sentinel::db::queue::JobQueue;
 
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
     let queue = JobQueue::new(conn.clone());
 
     conn.execute(
         "INSERT INTO scout_files (id, path) VALUES (1, '/data/demo/sample.csv')",
         &[],
     )
-    .await
+    
     .unwrap();
 
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'demo', 'QUEUED')",
-        &[],
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'demo', ?)",
+        &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    .await
+    
     .unwrap();
 
-    let details = queue.get_job_details(1).await.unwrap().unwrap();
+    let details = queue.get_job_details(1).unwrap().unwrap();
     assert_eq!(details.plugin_name, "demo");
     assert_eq!(details.file_path, "/data/demo/sample.csv");
 }
 
 /// Test pipeline run status transitions based on job status changes.
-#[tokio::test]
-async fn test_pipeline_run_status_updates() {
+#[test]
+fn test_pipeline_run_status_updates() {
     use casparian_sentinel::db::queue::JobQueue;
 
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
     let queue = JobQueue::new(conn.clone());
 
     conn.execute(
-        "INSERT INTO cf_pipeline_runs (id, pipeline_id, selection_spec_id, selection_snapshot_hash, logical_date, status) VALUES ('run-1', 'pipe-1', 'spec-1', 'hash-1', '2025-01-01', 'queued')",
-        &[],
+        "INSERT INTO cf_pipeline_runs (id, pipeline_id, selection_spec_id, selection_snapshot_hash, logical_date, status) VALUES ('run-1', 'pipe-1', 'spec-1', 'hash-1', '2025-01-01', ?)",
+        &[DbValue::from(PipelineRunStatus::Queued.as_str())],
     )
-    .await
+    
     .unwrap();
 
     conn.execute(
         "INSERT INTO scout_files (id, path) VALUES (1, '/data/demo/a.csv')",
         &[],
     )
-    .await
+    
     .unwrap();
 
     conn.execute(
         r#"
         INSERT INTO cf_processing_queue (id, file_id, pipeline_run_id, plugin_name, status, priority)
-        VALUES (1, 1, 'run-1', 'demo', 'QUEUED', 0)
+        VALUES (1, 1, 'run-1', 'demo', ?, 0)
         "#,
-        &[],
+        &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    .await
+    
     .unwrap();
 
-    let job = queue.pop_job().await.unwrap().unwrap();
+    let job = queue.pop_job().unwrap().unwrap();
     assert_eq!(job.pipeline_run_id.as_deref(), Some("run-1"));
 
     conn.execute(
-        "UPDATE cf_pipeline_runs SET status = 'running', started_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
-        &[],
+        "UPDATE cf_pipeline_runs SET status = ?, started_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
+        &[DbValue::from(PipelineRunStatus::Running.as_str())],
     )
-    .await
+    
     .unwrap();
 
-    queue.complete_job(job.id, "Success", None).await.unwrap();
+    use casparian_protocol::types::JobStatus as ProtocolJobStatus;
+    queue.complete_job(job.id, ProtocolJobStatus::Success.as_str(), "Success", None).unwrap();
 
     let row = conn
         .query_one(
-            "SELECT SUM(CASE WHEN status IN ('QUEUED', 'RUNNING') THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completed FROM cf_processing_queue WHERE pipeline_run_id = ?",
-            &[DbValue::from("run-1")],
+            "SELECT SUM(CASE WHEN status IN (?, ?) THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS failed, SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS completed FROM cf_processing_queue WHERE pipeline_run_id = ?",
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+                DbValue::from(ProcessingStatus::Completed.as_str()),
+                DbValue::from("run-1"),
+            ],
         )
-        .await
+        
         .unwrap();
     let active: i64 = row.get_by_name("active").unwrap_or(0);
     let failed: i64 = row.get_by_name("failed").unwrap_or(0);
@@ -312,72 +294,76 @@ async fn test_pipeline_run_status_updates() {
 
     if failed > 0 {
         conn.execute(
-            "UPDATE cf_pipeline_runs SET status = 'failed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
-            &[],
+            "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
+            &[DbValue::from(PipelineRunStatus::Failed.as_str())],
         )
-        .await
+        
         .unwrap();
     } else if active > 0 {
         conn.execute(
-            "UPDATE cf_pipeline_runs SET status = 'running' WHERE id = 'run-1'",
-            &[],
+            "UPDATE cf_pipeline_runs SET status = ? WHERE id = 'run-1'",
+            &[DbValue::from(PipelineRunStatus::Running.as_str())],
         )
-        .await
+        
         .unwrap();
     } else if completed > 0 {
         conn.execute(
-            "UPDATE cf_pipeline_runs SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
-            &[],
+            "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
+            &[DbValue::from(PipelineRunStatus::Completed.as_str())],
         )
-        .await
+        
         .unwrap();
     }
 
     let status_row = conn
         .query_one("SELECT status FROM cf_pipeline_runs WHERE id = 'run-1'", &[])
-        .await
+        
         .unwrap();
     let status: String = status_row.get_by_name("status").unwrap();
-    assert_eq!(status, "completed");
+    assert_eq!(status, PipelineRunStatus::Completed.as_str());
 }
 
 /// Test job priority ordering
-#[tokio::test]
-async fn test_job_priority_ordering() {
+#[test]
+fn test_job_priority_ordering() {
     use casparian_sentinel::db::queue::JobQueue;
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
 
     // Insert jobs with different priorities
+    let queued = ProcessingStatus::Queued.as_str();
     conn.execute(
-        r#"
+        &format!(
+            r#"
         INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
         VALUES
-            (1, 1, 'low', 'QUEUED', 0),
-            (2, 2, 'high', 'QUEUED', 100),
-            (3, 3, 'medium', 'QUEUED', 50)
+            (1, 1, 'low', '{queued}', 0),
+            (2, 2, 'high', '{queued}', 100),
+            (3, 3, 'medium', '{queued}', 50)
         "#,
+            queued = queued
+        ),
         &[],
     )
-    .await
+    
     .unwrap();
 
     let queue = JobQueue::new(conn);
 
     // Should pop highest priority first
-    let job1 = queue.pop_job().await.unwrap().unwrap();
+    let job1 = queue.pop_job().unwrap().unwrap();
     assert_eq!(job1.plugin_name, "high");
     assert_eq!(job1.priority, 100);
 
-    let job2 = queue.pop_job().await.unwrap().unwrap();
+    let job2 = queue.pop_job().unwrap().unwrap();
     assert_eq!(job2.plugin_name, "medium");
     assert_eq!(job2.priority, 50);
 
-    let job3 = queue.pop_job().await.unwrap().unwrap();
+    let job3 = queue.pop_job().unwrap().unwrap();
     assert_eq!(job3.plugin_name, "low");
     assert_eq!(job3.priority, 0);
 
     // Queue should be empty
-    let job4 = queue.pop_job().await.unwrap();
+    let job4 = queue.pop_job().unwrap();
     assert!(job4.is_none());
 }
 
@@ -386,67 +372,70 @@ async fn test_job_priority_ordering() {
 // ============================================================================
 
 /// Test that failed jobs are properly marked and can be retried
-#[tokio::test]
-async fn test_job_failure_marks_status_and_error() {
+#[test]
+fn test_job_failure_marks_status_and_error() {
     use casparian_sentinel::db::queue::JobQueue;
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
 
     // Insert a job
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'test', 'QUEUED')",
-        &[],
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'test', ?)",
+        &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    .await
+    
     .unwrap();
 
     let queue = JobQueue::new(conn.clone());
-    let job = queue.pop_job().await.unwrap().unwrap();
+    let job = queue.pop_job().unwrap().unwrap();
 
-    // Fail the job with an error message
-    queue.fail_job(job.id, "Parser crashed: division by zero").await.unwrap();
+    // Fail the job with an error message using enum helper
+    use casparian_protocol::types::JobStatus as ProtocolJobStatus;
+    queue.fail_job(job.id, ProtocolJobStatus::Failed.as_str(), "Parser crashed: division by zero").unwrap();
 
-    // Verify status and error message
+    // Verify status, completion_status, and error message
     let row = conn
         .query_optional(
-            "SELECT status, error_message FROM cf_processing_queue WHERE id = ?",
+            "SELECT status, completion_status, error_message FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job.id)],
         )
-        .await
+        
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
+    let completion_status: Option<String> = row.get_by_name("completion_status").unwrap();
     let error: Option<String> = row.get_by_name("error_message").ok();
 
-    assert_eq!(status, "FAILED");
+    assert_eq!(status, ProcessingStatus::Failed.as_str());
+    assert_eq!(completion_status, Some(ProtocolJobStatus::Failed.as_str().to_string()));
     assert_eq!(error, Some("Parser crashed: division by zero".to_string()));
 }
 
 /// Test job requeue increments retry count
-#[tokio::test]
-async fn test_job_requeue_increments_retry_count() {
+#[test]
+fn test_job_requeue_increments_retry_count() {
     use casparian_sentinel::db::queue::JobQueue;
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
 
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', 'QUEUED', 0)",
-        &[],
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', ?, 0)",
+        &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    .await
+    
     .unwrap();
 
     let queue = JobQueue::new(conn.clone());
 
     // Pop and requeue 3 times
     for expected_retry in 1..=3 {
-        let job = queue.pop_job().await.unwrap().unwrap();
-        queue.requeue_job(job.id).await.unwrap();
+        let job = queue.pop_job().unwrap().unwrap();
+        queue.requeue_job(job.id).unwrap();
 
         let row = conn
             .query_optional(
                 "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
                 &[DbValue::from(job.id)],
             )
-            .await
+            
             .unwrap()
             .unwrap();
         let retry_count: i32 = row.get_by_name("retry_count").unwrap();
@@ -456,23 +445,23 @@ async fn test_job_requeue_increments_retry_count() {
 }
 
 /// Test jobs exceeding max retries are marked failed
-#[tokio::test]
-async fn test_job_exceeds_max_retries_marked_failed() {
+#[test]
+fn test_job_exceeds_max_retries_marked_failed() {
     use casparian_sentinel::db::queue::JobQueue;
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
 
-    // Insert job that's already at max retries (5 = MAX_RETRY_COUNT)
+    // Insert job that's already at max retries (3 = MAX_RETRY_COUNT)
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', 'RUNNING', 5)",
-        &[],
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', ?, 3)",
+        &[DbValue::from(ProcessingStatus::Running.as_str())],
     )
-    .await
+    
     .unwrap();
 
     let queue = JobQueue::new(conn.clone());
 
     // This should fail the job permanently, not requeue
-    let _result = queue.requeue_job(1).await;
+    let _result = queue.requeue_job(1);
 
     // Check that job is now FAILED, not QUEUED
     let row = conn
@@ -480,12 +469,16 @@ async fn test_job_exceeds_max_retries_marked_failed() {
             "SELECT status FROM cf_processing_queue WHERE id = 1",
             &[],
         )
-        .await
+        
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
 
-    assert_eq!(status, "FAILED", "Job exceeding max retries should be marked FAILED");
+    assert_eq!(
+        status,
+        ProcessingStatus::Failed.as_str(),
+        "Job exceeding max retries should be marked FAILED"
+    );
 }
 
 // ============================================================================
@@ -496,48 +489,52 @@ async fn test_job_exceeds_max_retries_marked_failed() {
 ///
 /// Note: This test uses sequential job claiming to verify the atomicity of pop_job().
 /// True concurrent stress testing of SQLite is beyond the scope of unit tests.
-#[tokio::test]
-async fn test_concurrent_job_claim_only_one_wins() {
+#[test]
+fn test_concurrent_job_claim_only_one_wins() {
     use casparian_sentinel::db::queue::JobQueue;
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
 
     // Insert exactly ONE job
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'contested_job', 'QUEUED')",
-        &[],
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'contested_job', ?)",
+        &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    .await
+    
     .unwrap();
 
     let queue = JobQueue::new(conn);
 
     // First pop should succeed
-    let first = queue.pop_job().await.unwrap();
+    let first = queue.pop_job().unwrap();
     assert!(first.is_some(), "First pop should get the job");
 
     // Second pop should get nothing (job already claimed)
-    let second = queue.pop_job().await.unwrap();
+    let second = queue.pop_job().unwrap();
     assert!(second.is_none(), "Second pop should get nothing");
 
     // Third pop should also get nothing
-    let third = queue.pop_job().await.unwrap();
+    let third = queue.pop_job().unwrap();
     assert!(third.is_none(), "Third pop should get nothing");
 }
 
 /// Test that multiple jobs can be claimed sequentially with no duplicates
-#[tokio::test]
-async fn test_multiple_jobs_claimed_sequentially() {
+#[test]
+fn test_multiple_jobs_claimed_sequentially() {
     use casparian_sentinel::db::queue::JobQueue;
     use std::collections::HashSet;
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
 
     // Insert 10 jobs
     for i in 1..=10 {
         conn.execute(
-            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (?, ?, 'job', 'QUEUED')",
-            &[DbValue::from(i), DbValue::from(i)],
+            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (?, ?, 'job', ?)",
+            &[
+                DbValue::from(i),
+                DbValue::from(i),
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+            ],
         )
-        .await
+        
         .unwrap();
     }
 
@@ -546,7 +543,7 @@ async fn test_multiple_jobs_claimed_sequentially() {
     // Claim all 10 jobs sequentially
     let mut claimed_ids: Vec<i64> = vec![];
     for _ in 0..15 {  // Try more times than jobs exist
-        if let Some(job) = queue.pop_job().await.unwrap() {
+        if let Some(job) = queue.pop_job().unwrap() {
             claimed_ids.push(job.id);
         }
     }
@@ -559,7 +556,7 @@ async fn test_multiple_jobs_claimed_sequentially() {
     assert_eq!(unique_ids.len(), 10, "All claimed jobs should be unique");
 
     // Another pop should get nothing
-    let extra = queue.pop_job().await.unwrap();
+    let extra = queue.pop_job().unwrap();
     assert!(extra.is_none(), "Queue should be empty after claiming all jobs");
 }
 
@@ -568,28 +565,34 @@ async fn test_multiple_jobs_claimed_sequentially() {
 // ============================================================================
 
 /// Test that running jobs from disconnected workers can be recovered
-#[tokio::test]
-async fn test_stale_running_jobs_can_be_recovered() {
-    let conn = setup_queue_db().await;
+#[test]
+fn test_stale_running_jobs_can_be_recovered() {
+    let conn = setup_queue_db();
 
     // Insert a job that's been "running" for a long time (stale)
     // claim_time is 1 hour ago
     let stale_time = chrono::Utc::now() - chrono::Duration::hours(1);
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, claim_time, worker_host) VALUES (1, 1, 'stale_job', 'RUNNING', ?, 'dead-worker')",
-        &[DbValue::from(stale_time.to_rfc3339())],
+        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, claim_time, worker_host) VALUES (1, 1, 'stale_job', ?, ?, 'dead-worker')",
+        &[
+            DbValue::from(ProcessingStatus::Running.as_str()),
+            DbValue::from(stale_time.to_rfc3339()),
+        ],
     )
-    .await
+    
     .unwrap();
 
     // Query for stale jobs (running for more than 10 minutes with no heartbeat)
     let stale_threshold = chrono::Utc::now() - chrono::Duration::minutes(10);
     let stale_rows = conn
         .query_all(
-            "SELECT id, plugin_name FROM cf_processing_queue WHERE status = 'RUNNING' AND claim_time < ?",
-            &[DbValue::from(stale_threshold.to_rfc3339())],
+            "SELECT id, plugin_name FROM cf_processing_queue WHERE status = ? AND claim_time < ?",
+            &[
+                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(stale_threshold.to_rfc3339()),
+            ],
         )
-        .await
+        
         .unwrap();
     let mut stale_jobs = Vec::new();
     for row in stale_rows {
@@ -603,10 +606,13 @@ async fn test_stale_running_jobs_can_be_recovered() {
 
     // Requeue the stale job
     conn.execute(
-        "UPDATE cf_processing_queue SET status = 'QUEUED', claim_time = NULL, worker_host = NULL, retry_count = retry_count + 1 WHERE id = ?",
-        &[DbValue::from(stale_jobs[0].0)],
+        "UPDATE cf_processing_queue SET status = ?, claim_time = NULL, worker_host = NULL, retry_count = retry_count + 1 WHERE id = ?",
+        &[
+            DbValue::from(ProcessingStatus::Queued.as_str()),
+            DbValue::from(stale_jobs[0].0),
+        ],
     )
-    .await
+    
     .unwrap();
 
     // Verify it's now available
@@ -615,12 +621,16 @@ async fn test_stale_running_jobs_can_be_recovered() {
             "SELECT status FROM cf_processing_queue WHERE id = 1",
             &[],
         )
-        .await
+        
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
 
-    assert_eq!(status, "QUEUED", "Stale job should be requeued");
+    assert_eq!(
+        status,
+        ProcessingStatus::Queued.as_str(),
+        "Stale job should be requeued"
+    );
 }
 
 // ============================================================================
@@ -628,58 +638,75 @@ async fn test_stale_running_jobs_can_be_recovered() {
 // ============================================================================
 
 /// Test behavior when queue is completely empty
-#[tokio::test]
-async fn test_empty_queue_returns_none_not_error() {
+#[test]
+fn test_empty_queue_returns_none_not_error() {
     use casparian_sentinel::db::queue::JobQueue;
 
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
     let queue = JobQueue::new(conn);
 
     // Empty queue should return Ok(None), not an error
-    let result = queue.pop_job().await;
+    let result = queue.pop_job();
     assert!(result.is_ok(), "Empty queue should not error");
     assert!(result.unwrap().is_none(), "Empty queue should return None");
 
     // Multiple calls should all return None without error
     for _ in 0..10 {
-        let result = queue.pop_job().await;
+        let result = queue.pop_job();
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
 }
 
 /// Test that all PENDING jobs are not picked up (only QUEUED)
-#[tokio::test]
-async fn test_only_queued_jobs_are_dispatched() {
+#[test]
+fn test_only_queued_jobs_are_dispatched() {
     use casparian_sentinel::db::queue::JobQueue;
 
-    let conn = setup_queue_db().await;
+    let conn = setup_queue_db();
 
     // Insert jobs in various states
     conn.execute(
-        r#"
+        &format!(
+            r#"
         INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES
-            (1, 1, 'pending_job', 'PENDING'),
-            (2, 2, 'running_job', 'RUNNING'),
-            (3, 3, 'completed_job', 'COMPLETED'),
-            (4, 4, 'failed_job', 'FAILED'),
-            (5, 5, 'queued_job', 'QUEUED')
+            (1, 1, 'pending_job', '{pending}'),
+            (2, 2, 'running_job', '{running}'),
+            (3, 3, 'completed_job', '{completed}'),
+            (4, 4, 'failed_job', '{failed}'),
+            (5, 5, 'queued_job', '{queued}')
         "#,
+            pending = ProcessingStatus::Pending.as_str(),
+            running = ProcessingStatus::Running.as_str(),
+            completed = ProcessingStatus::Completed.as_str(),
+            failed = ProcessingStatus::Failed.as_str(),
+            queued = ProcessingStatus::Queued.as_str(),
+        ),
         &[],
     )
-    .await
+    
     .unwrap();
 
     let queue = JobQueue::new(conn);
 
     // Should only get the QUEUED job
-    let job = queue.pop_job().await.unwrap();
+    let job = queue.pop_job().unwrap();
     assert!(job.is_some());
     assert_eq!(job.unwrap().plugin_name, "queued_job");
 
     // No more jobs available
-    let job = queue.pop_job().await.unwrap();
-    assert!(job.is_none(), "PENDING, RUNNING, COMPLETED, FAILED should not be picked up");
+    let job = queue.pop_job().unwrap();
+    assert!(
+        job.is_none(),
+        "{} should not be picked up",
+        format!(
+            "{}, {}, {}, {}",
+            ProcessingStatus::Pending.as_str(),
+            ProcessingStatus::Running.as_str(),
+            ProcessingStatus::Completed.as_str(),
+            ProcessingStatus::Failed.as_str(),
+        )
+    );
 }
 
 // ============================================================================
@@ -687,19 +714,19 @@ async fn test_only_queued_jobs_are_dispatched() {
 // ============================================================================
 
 /// Test bidirectional message flow: IDENTIFY -> ACK -> DISPATCH -> CONCLUDE
-#[tokio::test]
-async fn test_full_worker_lifecycle_message_flow() {
-    use zeromq::{RouterSocket, ZmqMessage};
-    use casparian_protocol::types::{DispatchCommand, SinkConfig, SinkMode};
+#[test]
+fn test_full_worker_lifecycle_message_flow() {
+    use casparian_protocol::types::{DispatchCommand, RuntimeKind, SinkConfig, SinkMode};
+    let context = Context::new();
 
-    // Sentinel (ROUTER)
-    let mut router = RouterSocket::new();
-    router.bind("tcp://127.0.0.1:15560").await.unwrap();
+    let router = context.socket(zmq::ROUTER).unwrap();
+    router.bind("tcp://127.0.0.1:15560").unwrap();
+    router.set_rcvtimeo(2000).unwrap();
 
-    // Worker (DEALER)
-    let mut dealer = DealerSocket::new();
-    dealer.connect("tcp://127.0.0.1:15560").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let dealer = context.socket(zmq::DEALER).unwrap();
+    dealer.connect("tcp://127.0.0.1:15560").unwrap();
+    dealer.set_rcvtimeo(2000).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
 
     // Step 1: Worker sends IDENTIFY
     let identify = IdentifyPayload {
@@ -707,23 +734,22 @@ async fn test_full_worker_lifecycle_message_flow() {
         worker_id: Some("lifecycle-test-worker".to_string()),
     };
     let payload = serde_json::to_vec(&identify).unwrap();
-    let msg = Message::new(OpCode::Identify, 0, payload).unwrap();
+    let msg = Message::new(OpCode::Identify, JobId::new(0), payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
-    let mut identify_msg = ZmqMessage::from(header.to_vec());
-    identify_msg.push_back(body.into());
-    dealer.send(identify_msg).await.unwrap();
+    let identify_frames = [header.as_slice(), body.as_slice()];
+    dealer.send_multipart(&identify_frames, 0).unwrap();
 
     // Sentinel receives IDENTIFY
-    let recv = tokio::time::timeout(Duration::from_secs(2), router.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let parts: Vec<Vec<u8>> = recv.into_vec().into_iter().map(|b| b.to_vec()).collect();
+    let parts = router.recv_multipart(0).unwrap();
     assert!(parts.len() >= 3);
 
     let worker_identity = parts[0].clone();
-    let recv_msg = Message::unpack(&[parts[1].clone(), parts[2].clone()]).unwrap();
+    let mut cursor = 1;
+    if parts.get(1).map(|p| p.is_empty()).unwrap_or(false) {
+        cursor += 1;
+    }
+    let recv_msg = Message::unpack(&[parts[cursor].clone(), parts[cursor + 1].clone()]).unwrap();
     assert_eq!(recv_msg.header.opcode, OpCode::Identify);
 
     // Step 2: Sentinel sends DISPATCH
@@ -735,33 +761,39 @@ async fn test_full_worker_lifecycle_message_flow() {
             topic: "output".to_string(),
             uri: "parquet://output.parquet".to_string(),
             mode: SinkMode::Append,
-            schema_def: None,
+            quarantine_config: None,
+            schema: None,
         }],
         file_id: 1,
-        env_hash: "abc123".to_string(),
-        source_code: "# parser code".to_string(),
-        artifact_hash: None,
+        runtime_kind: RuntimeKind::PythonShim,
+        entrypoint: "test_parser.py:Handler".to_string(),
+        platform_os: None,
+        platform_arch: None,
+        signature_verified: false,
+        signer_id: None,
+        env_hash: Some("abc123".to_string()),
+        source_code: Some("# parser code".to_string()),
+        artifact_hash: "artifact_hash_test".to_string(),
     };
     let payload = serde_json::to_vec(&dispatch).unwrap();
-    let dispatch_msg = Message::new(OpCode::Dispatch, 12345, payload).unwrap();
+    let dispatch_msg = Message::new(OpCode::Dispatch, JobId::new(12345), payload).unwrap();
     let (header, body) = dispatch_msg.pack().unwrap();
 
     // ROUTER sends back to specific worker identity
-    let mut reply = ZmqMessage::from(worker_identity);
-    reply.push_back(header.to_vec().into());
-    reply.push_back(body.into());
-    router.send(reply).await.unwrap();
+    let reply = vec![worker_identity, header.to_vec(), body.to_vec()];
+    router.send_multipart(&reply, 0).unwrap();
 
     // Worker receives DISPATCH
-    let recv = tokio::time::timeout(Duration::from_secs(2), dealer.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let parts: Vec<Vec<u8>> = recv.into_vec().into_iter().map(|b| b.to_vec()).collect();
+    let parts = dealer.recv_multipart(0).unwrap();
 
-    let recv_msg = Message::unpack(&parts).unwrap();
+    let frames = if parts.len() == 3 && parts[0].is_empty() {
+        vec![parts[1].clone(), parts[2].clone()]
+    } else {
+        parts
+    };
+    let recv_msg = Message::unpack(&frames).unwrap();
     assert_eq!(recv_msg.header.opcode, OpCode::Dispatch);
-    assert_eq!(recv_msg.header.job_id, 12345);
+    assert_eq!(recv_msg.header.job_id, JobId::new(12345));
 
     let parsed: DispatchCommand = serde_json::from_slice(&recv_msg.payload).unwrap();
     assert_eq!(parsed.plugin_name, "test_parser");
@@ -771,19 +803,18 @@ async fn test_full_worker_lifecycle_message_flow() {
 }
 
 /// Test heartbeat message format
-#[tokio::test]
-async fn test_heartbeat_message_format() {
+#[test]
+fn test_heartbeat_message_format() {
     use casparian_protocol::types::{HeartbeatPayload, HeartbeatStatus};
 
     let heartbeat = HeartbeatPayload {
         status: HeartbeatStatus::Busy,
-        current_job_id: Some(42),
         active_job_count: 1,
-        active_job_ids: vec![42],
+        active_job_ids: vec![JobId::new(42)],
     };
 
     let payload = serde_json::to_vec(&heartbeat).unwrap();
-    let msg = Message::new(OpCode::Heartbeat, 0, payload).unwrap();
+    let msg = Message::new(OpCode::Heartbeat, JobId::new(0), payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     assert_eq!(header[1], 0x04); // HEARTBEAT = 4
@@ -793,7 +824,6 @@ async fn test_heartbeat_message_format() {
 
     let parsed: HeartbeatPayload = serde_json::from_slice(&unpacked.payload).unwrap();
     assert_eq!(parsed.status, HeartbeatStatus::Busy);
-    assert_eq!(parsed.current_job_id, Some(42));
 }
 
 // ============================================================================
@@ -801,8 +831,8 @@ async fn test_heartbeat_message_format() {
 // ============================================================================
 
 /// Test ERROR message carries full error info
-#[tokio::test]
-async fn test_error_message_carries_full_info() {
+#[test]
+fn test_error_message_carries_full_info() {
     use casparian_protocol::types::ErrorPayload;
 
     let error = ErrorPayload {
@@ -811,7 +841,7 @@ async fn test_error_message_carries_full_info() {
     };
 
     let payload = serde_json::to_vec(&error).unwrap();
-    let msg = Message::new(OpCode::Err, 99, payload).unwrap();
+    let msg = Message::new(OpCode::Err, JobId::new(99), payload).unwrap();
     let (header, body) = msg.pack().unwrap();
 
     assert_eq!(header[1], 0x06); // ERR = 6

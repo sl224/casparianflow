@@ -5,8 +5,9 @@
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_number_signed, print_table_colored};
-use casparian_db::{DbConnection, DbValue};
-use casparian_protocol::ProcessingStatus;
+use casparian_db::{DbConnection, DbTimestamp, DbValue};
+use casparian_protocol::{JobId, ProcessingStatus};
+use chrono::SecondsFormat;
 use comfy_table::Color;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ fn status_color(status: ProcessingStatus) -> Color {
 /// A job from the processing queue
 #[derive(Debug, Clone, Serialize)]
 pub struct Job {
-    pub id: i64,
+    pub id: JobId,
     pub file_path: String,
     pub plugin_name: String,
     pub status: ProcessingStatus,
@@ -68,7 +69,7 @@ pub struct QueueStats {
 #[derive(Debug, Clone, Serialize)]
 pub struct DeadLetterJobDisplay {
     pub id: i64,
-    pub original_job_id: i64,
+    pub original_job_id: JobId,
     pub plugin_name: String,
     pub error_message: Option<String>,
     pub retry_count: i32,
@@ -105,35 +106,28 @@ pub fn run(args: JobsArgs) -> anyhow::Result<()> {
             .into());
     }
 
-    // Run the async query
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async { run_async(args, &db_path).await })
+    run_with_db(args, &db_path)
 }
 
-async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
-    let db_url = db_url_for_path(db_path);
-    let conn = DbConnection::open_from_url(&db_url).await.map_err(|e| {
+fn run_with_db(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
+    let conn = DbConnection::open_duckdb_readonly(db_path).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(format!("Database: {}", db_path.display()))
             .with_suggestion(format!("Error: {}", e))
             .with_suggestion("TRY: Check file permissions")
-            .with_suggestion("TRY: Ensure database is not locked by another process")
     })?;
 
     // Get queue statistics
-    let stats = get_queue_stats(&conn).await?;
+    let stats = get_queue_stats(&conn)?;
 
     // Build filter based on flags
     let status_filter = build_status_filter(&args);
 
     if args.json {
         let (jobs, dead_letter) = if args.dead_letter {
-            (Vec::new(), get_dead_letter_jobs(&conn, &args.topic, args.limit).await?)
+            (Vec::new(), get_dead_letter_jobs(&conn, &args.topic, args.limit)?)
         } else {
-            (get_jobs(&conn, &args.topic, &status_filter, args.limit).await?, Vec::new())
+            (get_jobs(&conn, &args.topic, &status_filter, args.limit)?, Vec::new())
         };
 
         let output = JobsOutput {
@@ -162,13 +156,13 @@ async fn run_async(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
 
     // Handle dead letter mode separately
     if args.dead_letter {
-        let dead_letter_jobs = get_dead_letter_jobs(&conn, &args.topic, args.limit).await?;
+        let dead_letter_jobs = get_dead_letter_jobs(&conn, &args.topic, args.limit)?;
         print_dead_letter_table(&dead_letter_jobs, args.limit);
         return Ok(());
     }
 
     // Get jobs
-    let jobs = get_jobs(&conn, &args.topic, &status_filter, args.limit).await?;
+    let jobs = get_jobs(&conn, &args.topic, &status_filter, args.limit)?;
 
     // Output
     print_jobs_table(&jobs, args.limit);
@@ -186,43 +180,46 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
     let mut statuses = Vec::new();
 
     if args.pending {
-        statuses.push("QUEUED");
-        statuses.push("PENDING");
+        statuses.push(ProcessingStatus::Queued.as_str());
+        statuses.push(ProcessingStatus::Pending.as_str());
     }
     if args.running {
-        statuses.push("RUNNING");
+        statuses.push(ProcessingStatus::Running.as_str());
     }
     if args.failed {
-        statuses.push("FAILED");
+        statuses.push(ProcessingStatus::Failed.as_str());
     }
     if args.done {
-        statuses.push("COMPLETED");
+        statuses.push(ProcessingStatus::Completed.as_str());
     }
 
     // If no specific filter, show all
     if statuses.is_empty() {
-        statuses.extend(&["QUEUED", "RUNNING", "COMPLETED", "FAILED", "PENDING"]);
+        statuses.extend(&[
+            ProcessingStatus::Queued.as_str(),
+            ProcessingStatus::Running.as_str(),
+            ProcessingStatus::Completed.as_str(),
+            ProcessingStatus::Failed.as_str(),
+            ProcessingStatus::Pending.as_str(),
+        ]);
     }
 
     statuses
 }
 
 /// Get queue statistics
-fn db_url_for_path(db_path: &PathBuf) -> String {
-    format!("duckdb:{}", db_path.display())
-}
 
-pub(crate) async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
+pub(crate) fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
     let row = conn
         .query_optional(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
             &[DbValue::from(table)],
         )
-        .await?;
+        ?;
     Ok(row.is_some())
 }
 
-pub(crate) async fn column_exists(
+pub(crate) fn column_exists(
     conn: &DbConnection,
     table: &str,
     column: &str,
@@ -232,29 +229,35 @@ pub(crate) async fn column_exists(
             "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
             &[DbValue::from(table), DbValue::from(column)],
         )
-        .await?;
+        ?;
     Ok(row.is_some())
 }
 
-async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
-    if !table_exists(conn, "cf_processing_queue").await? {
+fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
+    if !table_exists(conn, "cf_processing_queue")? {
         return Ok(QueueStats::default());
     }
 
     let row = conn
         .query_one(
-        r#"
+            &format!(
+                r#"
         SELECT
             COUNT(*) as total,
-            COALESCE(SUM(CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END), 0) as queued,
-            COALESCE(SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END), 0) as running,
-            COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) as completed,
-            COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) as failed
+            COALESCE(SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END), 0) as queued,
+            COALESCE(SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END), 0) as running,
+            COALESCE(SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END), 0) as completed,
+            COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed
         FROM cf_processing_queue
         "#,
-        &[],
+                queued = ProcessingStatus::Queued.as_str(),
+                running = ProcessingStatus::Running.as_str(),
+                completed = ProcessingStatus::Completed.as_str(),
+                failed = ProcessingStatus::Failed.as_str(),
+            ),
+            &[],
         )
-        .await?;
+        ?;
 
     let total: i64 = row.get(0)?;
     let queued: i64 = row.get(1)?;
@@ -262,9 +265,9 @@ async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
     let completed: i64 = row.get(3)?;
     let failed: i64 = row.get(4)?;
 
-    let dead_letter_count = if table_exists(conn, "cf_dead_letter").await? {
+    let dead_letter_count = if table_exists(conn, "cf_dead_letter")? {
         conn.query_scalar::<i64>("SELECT COUNT(*) FROM cf_dead_letter", &[])
-            .await
+            
             .unwrap_or(0)
     } else {
         0
@@ -281,12 +284,12 @@ async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
 }
 
 /// Get dead letter jobs
-async fn get_dead_letter_jobs(
+fn get_dead_letter_jobs(
     conn: &DbConnection,
     topic: &Option<String>,
     limit: usize,
 ) -> anyhow::Result<Vec<DeadLetterJobDisplay>> {
-    if !table_exists(conn, "cf_dead_letter").await? {
+    if !table_exists(conn, "cf_dead_letter")? {
         return Ok(Vec::new());
     }
 
@@ -311,37 +314,43 @@ async fn get_dead_letter_jobs(
         "#
     };
 
-    let rows = conn.query_all(query, &params).await?;
+    let rows = conn.query_all(query, &params)?;
     let jobs = rows
         .into_iter()
-        .map(|row| DeadLetterJobDisplay {
-            id: row.get(0).unwrap_or_default(),
-            original_job_id: row.get(1).unwrap_or_default(),
-            plugin_name: row.get(2).unwrap_or_default(),
-            error_message: row.get(3).ok(),
-            retry_count: row.get(4).unwrap_or_default(),
-            moved_at: row.get(5).unwrap_or_default(),
-            reason: row.get(6).ok(),
+        .map(|row| -> anyhow::Result<DeadLetterJobDisplay> {
+            let id = row.get(0)?;
+            let raw_job_id: i64 = row.get(1)?;
+            let original_job_id = JobId::try_from(raw_job_id)
+                .map_err(|err| anyhow::anyhow!("Invalid job id {} in dead letter: {}", raw_job_id, err))?;
+            Ok(DeadLetterJobDisplay {
+                id,
+                original_job_id,
+                plugin_name: row.get(2)?,
+                error_message: row.get(3).ok(),
+                retry_count: row.get(4)?,
+                moved_at: row.get(5)?,
+                reason: row.get(6).ok(),
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(jobs)
 }
 
 /// Get jobs matching filter criteria
-async fn get_jobs(
+fn get_jobs(
     conn: &DbConnection,
     topic: &Option<String>,
     statuses: &[&str],
     limit: usize,
 ) -> anyhow::Result<Vec<Job>> {
-    if !table_exists(conn, "cf_processing_queue").await? {
+    if !table_exists(conn, "cf_processing_queue")? {
         return Ok(Vec::new());
     }
 
     let has_quarantine_column =
-        column_exists(conn, "cf_processing_queue", "quarantine_rows").await?;
-    let has_quarantine_table = table_exists(conn, "cf_quarantine").await?;
+        column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
+    let has_quarantine_table = table_exists(conn, "cf_quarantine")?;
     let quarantine_select = if has_quarantine_column {
         ", COALESCE(q.quarantine_rows, 0) as quarantine_rows"
     } else if has_quarantine_table {
@@ -429,24 +438,36 @@ async fn get_jobs(
     }
     params.push(DbValue::from(limit as i64));
 
-    let rows = conn.query_all(&base_query, &params).await?;
+    let rows = conn.query_all(&base_query, &params)?;
 
-    let jobs: Vec<Job> = rows
+    let jobs = rows
         .into_iter()
-        .map(|row| Job {
-            id: row.get(0).unwrap_or_default(),
-            file_path: row.get(1).unwrap_or_default(),
-            plugin_name: row.get(2).unwrap_or_default(),
-            status: row.get::<String>(3).unwrap_or_default().parse().unwrap_or_default(),
-            priority: row.get(4).unwrap_or_default(),
-            claim_time: row.get(5).ok(),
-            end_time: row.get(6).ok(),
-            error_message: row.get(7).ok(),
-            result_summary: row.get(8).ok(),
-            retry_count: row.get(9).unwrap_or_default(),
-            quarantine_rows: row.get(10).ok(),
+        .map(|row| -> anyhow::Result<Job> {
+            let raw_id: i64 = row.get(0)?;
+            let id = JobId::try_from(raw_id)
+                .map_err(|err| anyhow::anyhow!("Invalid job id {} in queue: {}", raw_id, err))?;
+            let status_str: String = row.get(3)?;
+            let status = status_str.parse::<ProcessingStatus>()
+                .map_err(|e| anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e))?;
+            Ok(Job {
+                id,
+                file_path: row.get(1)?,
+                plugin_name: row.get(2)?,
+                status,
+                priority: row.get(4)?,
+                claim_time: format_db_timestamp(row.get::<Option<DbTimestamp>>(5).ok().flatten()),
+                end_time: format_db_timestamp(row.get::<Option<DbTimestamp>>(6).ok().flatten()),
+                error_message: row.get::<Option<String>>(7).ok().flatten(),
+                result_summary: row.get::<Option<String>>(8).ok().flatten(),
+                retry_count: row.get(9)?,
+                quarantine_rows: row
+                    .get::<Option<i64>>(10)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| if value > 0 { Some(value) } else { None }),
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(jobs)
 }
@@ -632,6 +653,10 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
+fn format_db_timestamp(ts: Option<DbTimestamp>) -> Option<String> {
+    ts.map(|value| value.as_chrono().to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
 /// Format a datetime string for display
 fn format_datetime(dt_str: &str) -> String {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(dt_str) {
@@ -647,11 +672,42 @@ mod tests {
 
     #[test]
     fn test_processing_status_from_str() {
-        assert_eq!("QUEUED".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Queued);
-        assert_eq!("RUNNING".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Running);
-        assert_eq!("COMPLETED".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Completed);
-        assert_eq!("FAILED".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Failed);
-        assert_eq!("queued".parse::<ProcessingStatus>().unwrap(), ProcessingStatus::Queued);
+        assert_eq!(
+            ProcessingStatus::Queued
+                .as_str()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Queued
+        );
+        assert_eq!(
+            ProcessingStatus::Running
+                .as_str()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Running
+        );
+        assert_eq!(
+            ProcessingStatus::Completed
+                .as_str()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Completed
+        );
+        assert_eq!(
+            ProcessingStatus::Failed
+                .as_str()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Failed
+        );
+        assert_eq!(
+            ProcessingStatus::Queued
+                .as_str()
+                .to_ascii_lowercase()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Queued
+        );
         assert!("unknown".parse::<ProcessingStatus>().is_err());
     }
 
@@ -686,9 +742,9 @@ mod tests {
             json: false,
         };
         let filter = build_status_filter(&args);
-        assert!(filter.contains(&"QUEUED"));
-        assert!(filter.contains(&"PENDING"));
-        assert!(!filter.contains(&"RUNNING"));
+        assert!(filter.contains(&ProcessingStatus::Queued.as_str()));
+        assert!(filter.contains(&ProcessingStatus::Pending.as_str()));
+        assert!(!filter.contains(&ProcessingStatus::Running.as_str()));
     }
 
     #[test]

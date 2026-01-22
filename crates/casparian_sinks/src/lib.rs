@@ -7,7 +7,7 @@
 //! - Batch writing
 //! - Lineage column injection
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
@@ -37,7 +37,7 @@ pub enum SinkError {
     Source {
         message: String,
         #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: anyhow::Error,
     },
 }
 
@@ -49,21 +49,14 @@ impl SinkError {
             message: message.into(),
         }
     }
-
-    fn with_source(
-        message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        SinkError::Source {
-            message: message.into(),
-            source: Box::new(source),
-        }
-    }
 }
 
 impl From<anyhow::Error> for SinkError {
     fn from(err: anyhow::Error) -> Self {
-        SinkError::with_source(err.to_string(), err)
+        SinkError::Source {
+            message: err.to_string(),
+            source: err,
+        }
     }
 }
 
@@ -256,6 +249,7 @@ pub fn write_output_plan(
         registry.init(output.name(), first_schema.as_ref())?;
         let mut rows = 0;
         for batch in output.batches() {
+            validate_batch_schema(batch.record_batch(), first_schema.as_ref(), output.name())?;
             registry.write_batch(output.name(), batch.record_batch())?;
             rows += batch.num_rows() as u64;
         }
@@ -277,21 +271,6 @@ pub fn write_output_plan(
     registry.finish()?;
 
     Ok(artifacts)
-}
-
-/// Trait for sink writers
-pub(crate) trait SinkWriter: Send {
-    /// Initialize the sink with the expected schema
-    fn init(&mut self, schema: &Schema) -> Result<()>;
-
-    /// Write a batch of records
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64>;
-
-    /// Finalize and close the sink
-    fn finish(self: Box<Self>) -> Result<()>;
-
-    /// Get the name of this sink
-    fn name(&self) -> &str;
 }
 
 /// Parquet sink writer
@@ -327,7 +306,7 @@ impl ParquetSink {
     }
 }
 
-impl SinkWriter for ParquetSink {
+impl ParquetSink {
     fn init(&mut self, schema: &Schema) -> Result<()> {
         // Partition by job_id: {output_name}_{job_id}.parquet
         let filename = output_filename(&self.output_name, &self.job_id, "parquet");
@@ -370,7 +349,7 @@ impl SinkWriter for ParquetSink {
         Ok(rows)
     }
 
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    fn finish(mut self) -> Result<()> {
         if let Some(writer) = self.writer.take() {
             writer.close().context("Failed to close Parquet writer")?;
 
@@ -388,9 +367,6 @@ impl SinkWriter for ParquetSink {
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        &self.output_name
-    }
 }
 
 impl Drop for ParquetSink {
@@ -437,7 +413,7 @@ impl CsvSink {
     }
 }
 
-impl SinkWriter for CsvSink {
+impl CsvSink {
     fn init(&mut self, _schema: &Schema) -> Result<()> {
         // Partition by job_id: {output_name}_{job_id}.csv
         let filename = output_filename(&self.output_name, &self.job_id, "csv");
@@ -476,7 +452,7 @@ impl SinkWriter for CsvSink {
         Ok(rows)
     }
 
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    fn finish(mut self) -> Result<()> {
         // Drop writer to flush
         drop(self.writer.take());
 
@@ -493,9 +469,6 @@ impl SinkWriter for CsvSink {
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        &self.output_name
-    }
 }
 
 impl Drop for CsvSink {
@@ -510,213 +483,11 @@ impl Drop for CsvSink {
     }
 }
 
-/// SQLite sink writer
-pub struct SqliteSink {
-    db_path: PathBuf,
-    table_name: String,
-    conn: Option<rusqlite::Connection>,
-    rows_written: u64,
-    schema: Option<Schema>,
-}
-
-impl SqliteSink {
-    pub fn new(db_path: PathBuf, table_name: &str) -> Result<Self> {
-        // Ensure parent directory exists
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create database directory: {}", parent.display()))?;
-        }
-
-        Ok(Self {
-            db_path,
-            table_name: table_name.to_string(),
-            conn: None,
-            rows_written: 0,
-            schema: None,
-        })
-    }
-
-    /// Convert Arrow DataType to SQLite type
-    fn arrow_to_sqlite_type(dt: &DataType) -> &'static str {
-        match dt {
-            DataType::Boolean => "INTEGER",
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "INTEGER",
-            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "INTEGER",
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => "REAL",
-            DataType::Utf8 | DataType::LargeUtf8 => "TEXT",
-            DataType::Binary | DataType::LargeBinary => "BLOB",
-            DataType::Date32 | DataType::Date64 => "TEXT",
-            DataType::Timestamp(_, _) => "TEXT",
-            DataType::Time32(_) | DataType::Time64(_) => "TEXT",
-            _ => "TEXT",
-        }
-    }
-}
-
-impl SinkWriter for SqliteSink {
-    fn init(&mut self, schema: &Schema) -> Result<()> {
-        info!("Initializing SQLite sink: {} (table: {})", self.db_path.display(), self.table_name);
-
-        let conn = rusqlite::Connection::open(&self.db_path)
-            .with_context(|| format!("Failed to open SQLite database: {}", self.db_path.display()))?;
-
-        // Build CREATE TABLE statement
-        let columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| {
-                let sql_type = Self::arrow_to_sqlite_type(f.data_type());
-                let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
-                format!("\"{}\" {}{}", f.name(), sql_type, nullable)
-            })
-            .collect();
-
-        let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
-            self.table_name,
-            columns.join(", ")
-        );
-
-        debug!("CREATE TABLE: {}", create_sql);
-        conn.execute(&create_sql, [])
-            .context("Failed to create table")?;
-
-        self.conn = Some(conn);
-        self.schema = Some(schema.clone());
-        Ok(())
-    }
-
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let conn = self.conn.as_mut()
-            .ok_or_else(|| anyhow::anyhow!("SQLite sink not initialized"))?;
-
-        let schema = self.schema.as_ref().unwrap();
-        let num_cols = batch.num_columns();
-        let num_rows = batch.num_rows();
-
-        // Build INSERT statement
-        let placeholders: Vec<&str> = (0..num_cols).map(|_| "?").collect();
-        let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-
-        let insert_sql = format!(
-            "INSERT INTO \"{}\" ({}) VALUES ({})",
-            self.table_name,
-            columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", "),
-            placeholders.join(", ")
-        );
-
-        // Begin transaction for batch insert
-        let tx = conn.transaction().context("Failed to begin transaction")?;
-
-        {
-            let mut stmt = tx.prepare(&insert_sql).context("Failed to prepare INSERT")?;
-
-            for row_idx in 0..num_rows {
-                let params: Vec<Box<dyn rusqlite::ToSql>> = (0..num_cols)
-                    .map(|col_idx| {
-                        let array = batch.column(col_idx);
-                        arrow_value_to_sqlite(array, row_idx)
-                    })
-                    .collect();
-
-                let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-                stmt.execute(params_refs.as_slice())
-                    .context("Failed to execute INSERT")?;
-            }
-        }
-
-        tx.commit().context("Failed to commit transaction")?;
-
-        self.rows_written += num_rows as u64;
-        debug!("Wrote {} rows to SQLite (total: {})", num_rows, self.rows_written);
-
-        Ok(num_rows as u64)
-    }
-
-    fn finish(self: Box<Self>) -> Result<()> {
-        // Connection closes on drop
-        info!("Closed SQLite sink: {} total rows", self.rows_written);
-        Ok(())
-    }
-
-    fn name(&self) -> &str {
-        &self.table_name
-    }
-}
-
-/// Convert an Arrow array value at index to SQLite parameter
-fn arrow_value_to_sqlite(array: &ArrayRef, row: usize) -> Box<dyn rusqlite::ToSql> {
-    use arrow::array::*;
-
-    if array.is_null(row) {
-        return Box::new(rusqlite::types::Null);
-    }
-
-    match array.data_type() {
-        DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            Box::new(arr.value(row) as i32)
-        }
-        DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            Box::new(arr.value(row))
-        }
-        DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            Box::new(arr.value(row) as i64)
-        }
-        DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            Box::new(arr.value(row) as f64)
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            Box::new(arr.value(row))
-        }
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            Box::new(arr.value(row).to_string())
-        }
-        DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            Box::new(arr.value(row).to_string())
-        }
-        _ => {
-            // Fallback: convert to string
-            Box::new(format!("{:?}", array.slice(row, 1)))
-        }
-    }
-}
-
 /// DuckDB sink writer
 pub struct DuckDbSink {
     db_path: PathBuf,
     table_name: String,
-    conn: Option<duckdb::Connection>,
+    conn: duckdb::Connection,
     rows_written: u64,
     schema: Option<Schema>,
 }
@@ -728,13 +499,23 @@ impl DuckDbSink {
                 .with_context(|| format!("Failed to create database directory: {}", parent.display()))?;
         }
 
+        let conn = duckdb::Connection::open(&db_path)
+            .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
+
         Ok(Self {
             db_path,
             table_name: table_name.to_string(),
-            conn: None,
+            conn,
             rows_written: 0,
             schema: None,
         })
+    }
+
+    fn with_conn_mut<F, T>(&mut self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut duckdb::Connection) -> Result<T>,
+    {
+        f(&mut self.conn)
     }
 
     fn arrow_to_duckdb_type(dt: &DataType) -> String {
@@ -771,12 +552,9 @@ impl DuckDbSink {
     }
 }
 
-impl SinkWriter for DuckDbSink {
+impl DuckDbSink {
     fn init(&mut self, schema: &Schema) -> Result<()> {
         info!("Initializing DuckDB sink: {} (table: {})", self.db_path.display(), self.table_name);
-
-        let conn = duckdb::Connection::open(&self.db_path)
-            .with_context(|| format!("Failed to open DuckDB database: {}", self.db_path.display()))?;
 
         let columns: Vec<String> = schema
             .fields()
@@ -795,18 +573,17 @@ impl SinkWriter for DuckDbSink {
         );
 
         debug!("CREATE TABLE: {}", create_sql);
-        conn.execute(&create_sql, [])
-            .context("Failed to create DuckDB table")?;
+        self.with_conn_mut(|conn| {
+            conn.execute(&create_sql, [])
+                .context("Failed to create DuckDB table")?;
+            Ok(())
+        })?;
 
-        self.conn = Some(conn);
         self.schema = Some(schema.clone());
         Ok(())
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let conn = self.conn.as_mut()
-            .ok_or_else(|| anyhow::anyhow!("DuckDB sink not initialized"))?;
-
         let schema = self.schema.as_ref().unwrap();
         let num_cols = batch.num_columns();
         let num_rows = batch.num_rows();
@@ -825,23 +602,26 @@ impl SinkWriter for DuckDbSink {
             placeholders.join(", ")
         );
 
-        let tx = conn.transaction().context("Failed to begin DuckDB transaction")?;
-        {
-            let mut stmt = tx.prepare(&insert_sql).context("Failed to prepare DuckDB INSERT")?;
-            for row_idx in 0..num_rows {
-                let params: Vec<duckdb::types::Value> = (0..num_cols)
-                    .map(|col_idx| {
-                        let array = batch.column(col_idx);
-                        arrow_value_to_duckdb(array, row_idx)
-                    })
-                    .collect();
-                let param_refs: Vec<&dyn duckdb::ToSql> =
-                    params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
-                stmt.execute(param_refs.as_slice())
-                    .context("Failed to execute DuckDB INSERT")?;
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction().context("Failed to begin DuckDB transaction")?;
+            {
+                let mut stmt = tx.prepare(&insert_sql).context("Failed to prepare DuckDB INSERT")?;
+                for row_idx in 0..num_rows {
+                    let params: Vec<duckdb::types::Value> = (0..num_cols)
+                        .map(|col_idx| {
+                            let array = batch.column(col_idx);
+                            arrow_value_to_duckdb(array, row_idx)
+                        })
+                        .collect();
+                    let param_refs: Vec<&dyn duckdb::ToSql> =
+                        params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
+                    stmt.execute(param_refs.as_slice())
+                        .context("Failed to execute DuckDB INSERT")?;
+                }
             }
-        }
-        tx.commit().context("Failed to commit DuckDB transaction")?;
+            tx.commit().context("Failed to commit DuckDB transaction")?;
+            Ok(())
+        })?;
 
         self.rows_written += num_rows as u64;
         debug!("Wrote {} rows to DuckDB (total: {})", num_rows, self.rows_written);
@@ -849,13 +629,47 @@ impl SinkWriter for DuckDbSink {
         Ok(num_rows as u64)
     }
 
-    fn finish(self: Box<Self>) -> Result<()> {
+    fn finish(mut self) -> Result<()> {
+        self.with_conn_mut(|conn| {
+            conn.execute_batch("CHECKPOINT")
+                .context("Failed to checkpoint DuckDB database")?;
+            Ok(())
+        })?;
         info!("Closed DuckDB sink: {} total rows", self.rows_written);
         Ok(())
     }
 
-    fn name(&self) -> &str {
-        &self.table_name
+}
+
+enum Sink {
+    Parquet(ParquetSink),
+    Csv(CsvSink),
+    DuckDb(DuckDbSink),
+}
+
+impl Sink {
+    fn init(&mut self, schema: &Schema) -> Result<()> {
+        match self {
+            Sink::Parquet(sink) => sink.init(schema),
+            Sink::Csv(sink) => sink.init(schema),
+            Sink::DuckDb(sink) => sink.init(schema),
+        }
+    }
+
+    fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
+        match self {
+            Sink::Parquet(sink) => sink.write_batch(batch),
+            Sink::Csv(sink) => sink.write_batch(batch),
+            Sink::DuckDb(sink) => sink.write_batch(batch),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Sink::Parquet(sink) => sink.finish(),
+            Sink::Csv(sink) => sink.finish(),
+            Sink::DuckDb(sink) => sink.finish(),
+        }
     }
 }
 
@@ -1002,7 +816,7 @@ fn arrow_value_to_duckdb(array: &ArrayRef, row: usize) -> duckdb::types::Value {
 
 /// Sink registry - manages multiple sinks for a run
 pub struct SinkRegistry {
-    sinks: HashMap<String, Box<dyn SinkWriter>>,
+    sinks: HashMap<String, Sink>,
 }
 
 impl SinkRegistry {
@@ -1013,7 +827,7 @@ impl SinkRegistry {
     }
 
     /// Add a sink for an output name
-    pub fn add(&mut self, name: &str, sink: Box<dyn SinkWriter>) {
+    pub(crate) fn add(&mut self, name: &str, sink: Sink) {
         self.sinks.insert(name.to_string(), sink);
     }
 
@@ -1042,6 +856,7 @@ impl SinkRegistry {
             debug!("Finishing sink: {}", name);
             sink.finish()?;
         }
+
         Ok(())
     }
 
@@ -1183,36 +998,38 @@ pub(crate) fn create_sink_from_uri(
     output_name: &str,
     output_table: Option<&str>,
     job_id: &str,
-) -> Result<Box<dyn SinkWriter>> {
+) -> Result<Sink> {
     let parsed = casparian_protocol::types::ParsedSinkUri::parse(uri)
         .map_err(|e| anyhow::anyhow!(e))?;
     let table_name = output_table.unwrap_or(output_name);
 
     match parsed.scheme {
         casparian_protocol::types::SinkScheme::Parquet => {
-            Ok(Box::new(ParquetSink::new(parsed.path, output_name, job_id)?))
+            Ok(Sink::Parquet(ParquetSink::new(parsed.path, output_name, job_id)?))
         }
         casparian_protocol::types::SinkScheme::Csv => {
-            Ok(Box::new(CsvSink::new(parsed.path, output_name, job_id)?))
+            Ok(Sink::Csv(CsvSink::new(parsed.path, output_name, job_id)?))
         }
         casparian_protocol::types::SinkScheme::Duckdb => {
-            Ok(Box::new(DuckDbSink::new(parsed.path, table_name)?))
+            Ok(Sink::DuckDb(DuckDbSink::new(parsed.path, table_name)?))
         }
         casparian_protocol::types::SinkScheme::File => {
             // File sink: infer by extension
             let ext = parsed.path.extension().and_then(|e| e.to_str()).unwrap_or("");
             match ext {
-                "parquet" => Ok(Box::new(ParquetSink::new(
+                "parquet" => Ok(Sink::Parquet(ParquetSink::new(
                     parsed.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
                     output_name,
                     job_id,
                 )?)),
-                "csv" => Ok(Box::new(CsvSink::new(
+                "csv" => Ok(Sink::Csv(CsvSink::new(
                     parsed.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
                     output_name,
                     job_id,
                 )?)),
-                "duckdb" | "db" => Ok(Box::new(DuckDbSink::new(parsed.path, table_name)?)),
+                "duckdb" | "db" => {
+                    Ok(Sink::DuckDb(DuckDbSink::new(parsed.path, table_name)?))
+                }
                 _ => bail!("Unsupported file sink extension: '{}'", ext),
             }
         }
@@ -1262,7 +1079,7 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        Box::new(sink).finish().unwrap();
+        sink.finish().unwrap();
 
         // Verify partitioned file exists
         let output_path = dir.path().join("test_12345678.parquet");
@@ -1311,7 +1128,7 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        Box::new(sink).finish().unwrap();
+        sink.finish().unwrap();
 
         let output_path = dir.path().join("test_decimal_tz_12345678.parquet");
         assert!(output_path.exists());
@@ -1364,7 +1181,7 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        Box::new(sink).finish().unwrap();
+        sink.finish().unwrap();
 
         // Verify partitioned file exists and has content
         let output_path = dir.path().join("test_12345678.csv");
@@ -1380,27 +1197,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_sink() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let mut sink = SqliteSink::new(db_path.clone(), "records").unwrap();
-
-        let batch = create_test_batch();
-        sink.init(batch.schema().as_ref()).unwrap();
-        let rows = sink.write_batch(&batch).unwrap();
-        assert_eq!(rows, 3);
-
-        Box::new(sink).finish().unwrap();
-
-        // Verify data was written
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 3);
-    }
-
-    #[test]
     fn test_duckdb_sink() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.duckdb");
@@ -1411,7 +1207,7 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        Box::new(sink).finish().unwrap();
+        sink.finish().unwrap();
 
         let conn = duckdb::Connection::open(db_path).unwrap();
         let count: i64 = conn
@@ -1458,7 +1254,7 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        Box::new(sink).finish().unwrap();
+        sink.finish().unwrap();
 
         let conn = duckdb::Connection::open(db_path).unwrap();
         let count: i64 = conn

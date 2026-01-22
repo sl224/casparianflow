@@ -1,35 +1,26 @@
 //! Storage abstraction layer for Casparian Flow.
 //!
-//! This module provides traits for storage operations (JobStore, ParserStore,
-//! QuarantineStore) along with SQLite implementations. The abstraction allows
-//! swapping storage backends without changing application code.
+//! Pipeline storage utilities for Casparian Flow.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use casparian::storage::{DuckDbPipelineStore, PipelineStore};
+//! use casparian::storage::DuckDbPipelineStore;
 //! use std::path::Path;
 //!
-//! #[tokio::main]
-//! async fn main() -> anyhow::Result<()> {
-//!     let store = DuckDbPipelineStore::open(Path::new("./data.duckdb")).await?;
+//! fn main() -> anyhow::Result<()> {
+//!     let store = DuckDbPipelineStore::open(Path::new("./data.duckdb"))?;
 //!
-//!     let pipeline = store.get_latest_pipeline("daily_report").await?;
+//!     let pipeline = store.get_latest_pipeline("daily_report")?;
 //!     println!("Latest pipeline: {:?}", pipeline);
 //!     Ok(())
 //! }
 //! ```
 
 mod duckdb;
-#[cfg(feature = "sqlite")]
-mod sqlite;
-mod traits;
+mod types;
 
 pub use duckdb::DuckDbPipelineStore;
-#[cfg(feature = "sqlite")]
-pub use sqlite::{SqliteJobStore, SqliteParserStore, SqliteQuarantineStore};
-pub use traits::{
-    Job, JobStore, ParserBundle, ParserStore, Pipeline, PipelineRun, PipelineStore, QuarantinedRow,
-    QuarantineStore, SelectionFilters, SelectionResolution, SelectionSnapshot, SelectionSpec,
-    WatermarkField,
+pub use types::{
+    Pipeline, PipelineRun, SelectionFilters, SelectionResolution, SelectionSnapshot, WatermarkField,
 };

@@ -2,8 +2,21 @@
 
 **Status:** Validated via Job Postings & Forums
 **Purpose:** Ground product strategy in real-world user workflows
-**Version:** 1.0
-**Date:** January 8, 2026
+**Version:** 1.1
+**Date:** January 21, 2026
+
+---
+
+## v1 Target: DFIR / Incident Response
+
+**Primary target personas for v1:**
+
+| Title | Role | Technical Level | Why They Fit |
+|-------|------|-----------------|--------------|
+| **DFIR Engineer** | Parse and analyze digital forensic artifacts | Writes Python; CLI-comfortable | Core platform value |
+| **Forensic Engineer** | Build evidence timelines; court-defensible analysis | Python/PowerShell; evidence handling | Lineage/quarantine = insurance |
+| **IR Engineer** | Incident response; rapid triage | Python; artifact parsing | Speed + reproducibility |
+| **Detection Engineer** (consumer) | Consume parsed outputs for detection logic | SQL; queries outputs | Uses outputs, not parsers |
 
 ---
 
@@ -17,7 +30,68 @@ Each persona validated through:
 
 ---
 
-## 1. Finance: Trade Support Analyst
+## 0. DFIR: Forensic Consultant (v1 PRIMARY)
+
+### Validation Evidence
+
+**Job Posting Evidence:**
+
+> "Experience with **Python scripting** for automating forensic analysis tasks"
+> — DFIR Analyst job descriptions
+
+> "Parse **Windows Event Logs, Shimcache, Amcache, Prefetch** to build attacker timelines"
+> — Incident Response job postings
+
+> "Maintain **chain of custody** documentation for all evidence handling"
+> — Digital Forensics Analyst requirements
+
+**Market Pain (The "Fragile Scripts" Problem):**
+
+> DFIR practitioners write Python scripts using `construct`, `kaitai struct`, or direct struct unpacking. These scripts crash on corrupted data, have no governance, and provide no audit trail.
+
+**Market Size:**
+- Global cybersecurity services: ~$150B (2024)
+- Incident response services: ~$15-20B
+- Average data breach cost: $4.45M (2023)
+
+**Salary Range:**
+- Entry: **$70,000**
+- Mid: **$100,000-$130,000**
+- Senior: **$150,000+**
+- With specialized certs (GREM, GCFA): Premium pay
+
+### Validated Persona
+
+| Attribute | Evidence-Based Reality |
+|-----------|------------------------|
+| **Job Title** | DFIR Engineer, Forensic Analyst, Incident Responder |
+| **Works At** | Boutique IR firms, Big 4 consulting, enterprise SOC/CIRT |
+| **Technical skill** | **Python, PowerShell, forensic tools**; highly technical |
+| **Pain** | Parsers crash on corrupted data; no governance on custom scripts |
+| **Goal** | Build timeline without losing evidence |
+| **Buying power** | Can expense tools; firm approves $500-2K/engagement |
+
+### Why DFIR is #1 (The Winner)
+
+| Factor | DFIR | Finance (contrast) |
+|--------|------|-------------------|
+| **Writes Python?** | YES (binary artifact parsing) | NO (Excel/VBA) |
+| **Uses Parser Dev Loop?** | YES | NO |
+| **Audit Trail Required?** | **LEGALLY MANDATED** (chain of custody) | Nice-to-have |
+| **Urgency** | **EXTREME** (stop breach NOW) | High (T+1) |
+| **Sales Cycle** | FAST (practitioners decide) | Medium (operations budget) |
+
+### Casparian Value Proposition
+
+**Pain:** "If my script deletes a row, I destroy evidence."
+
+**Solution:** Casparian quarantines bad rows—nothing is lost. Per-row lineage proves what was processed, when, by which parser version. Reproducibility: same inputs + same parser = identical outputs (court-defensible).
+
+---
+
+## 1. Finance: Trade Support Analyst (DEPRIORITIZED to P3)
+
+> **Note:** Trade Support has been deprioritized to P3 (consultant-delivered only) because they don't write parsers. See STRATEGY.md for full analysis.
 
 ### Validation Evidence
 
@@ -542,3 +616,4 @@ LIMIT 20;
 |------|---------|---------|
 | 2026-01-08 | 1.0 | Initial validated personas based on job posting research |
 | 2026-01-08 | 1.1 | **Healthcare positioning fix:** Clarified Casparian is complementary to Mirth, not a replacement |
+| 2026-01-21 | 1.2 | **DFIR-first update:** Added DFIR Forensic Consultant as Section 0 (v1 PRIMARY); Added v1 target persona table; Marked Finance Trade Support as deprioritized to P3 |

@@ -1,10 +1,13 @@
 # Pipelines & SWE Workflows Specification
 
-**Status:** Draft
+**Status:** Reference (post-v1)
 **Version:** 0.1
 **Parent:** spec.md
 **Related:** specs/job_types.md, specs/features/streaming_scanner.md, docs/schema_rfc.md
 **Last Updated:** 2026-01-18
+
+**Note:** Pipelines/scheduling are post-v1 and not implemented in the current
+codebase. This spec is kept as future reference only.
 
 ---
 

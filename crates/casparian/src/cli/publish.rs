@@ -1,76 +1,32 @@
 //! Publish command shared helper.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use crate::publish::prepare_publish;
+use casparian_protocol::types::DeployCommand;
+use casparian_protocol::{JobId, Message, OpCode};
+use zmq::Context;
 
 /// Publish a plugin to the Sentinel registry.
-pub async fn run_publish(
+pub fn run_publish(
     file: std::path::PathBuf,
     version: String,
     addr: Option<String>,
     publisher: Option<String>,
     email: Option<String>,
 ) -> Result<()> {
-    use casparian_protocol::types::DeployCommand;
-    use casparian_protocol::{Message, OpCode};
-    use casparian_security::signing::sha256;
-    use casparian_security::Gatekeeper;
-    use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
-
     tracing::info!("Publishing plugin: {:?} v{}", file, version);
 
-    // 1. Read plugin source code
-    let source_code = std::fs::read_to_string(&file)
-        .with_context(|| format!("Failed to read plugin file: {:?}", file))?;
+    let artifact = prepare_publish(&file)?;
 
-    // 2. Validate with Gatekeeper (AST-based security checks)
-    let gatekeeper = Gatekeeper::new();
-    gatekeeper
-        .validate(&source_code)
-        .context("Plugin failed security validation")?;
-    tracing::info!("✓ Security validation passed");
-
-    // 3. Check for uv.lock, run `uv lock` if missing
-    let plugin_dir = file
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Plugin file has no parent directory"))?;
-    let lockfile_path = plugin_dir.join("uv.lock");
-
-    if !lockfile_path.exists() {
-        tracing::info!("No uv.lock found, running `uv lock` in {:?}...", plugin_dir);
-        let output = std::process::Command::new("uv")
-            .arg("lock")
-            .current_dir(plugin_dir)
-            .output()
-            .context("Failed to run `uv lock` (is uv installed?)")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "uv lock failed:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        tracing::info!("✓ Generated uv.lock");
+    if artifact.manifest.version != version {
+        anyhow::bail!(
+            "Version mismatch: CLI version '{}' does not match manifest version '{}'",
+            version,
+            artifact.manifest.version
+        );
     }
 
-    let lockfile_content = std::fs::read_to_string(&lockfile_path)
-        .context("Failed to read uv.lock after generation")?;
-
-    // 4. Compute hashes
-    let env_hash = sha256(lockfile_content.as_bytes());
-    let artifact_content = format!("{}{}", source_code, lockfile_content);
-    let artifact_hash = sha256(artifact_content.as_bytes());
-    tracing::info!(
-        "✓ Computed hashes (env: {}..., artifact: {}...)",
-        &env_hash[..8],
-        &artifact_hash[..8]
-    );
-
-    // 5. Extract plugin name from file
-    let plugin_name = file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Could not extract plugin name from file path"))?
-        .to_string();
+    let plugin_name = artifact.plugin_name.clone();
 
     // Get publisher name (default to system username)
     let publisher_name = publisher.unwrap_or_else(|| {
@@ -79,14 +35,17 @@ pub async fn run_publish(
             .unwrap_or_else(|_| "unknown".to_string())
     });
 
-    // 6. Construct DeployCommand
+    // Construct DeployCommand
     let deploy_cmd = DeployCommand {
         plugin_name: plugin_name.clone(),
         version: version.clone(),
-        source_code,
-        lockfile_content,
-        env_hash,
-        artifact_hash,
+        source_code: artifact.source_code,
+        lockfile_content: artifact.lockfile_content,
+        env_hash: artifact.env_hash,
+        artifact_hash: artifact.artifact_hash,
+        manifest_json: artifact.manifest_json,
+        protocol_version: artifact.manifest.protocol_version,
+        schema_artifacts_json: artifact.schema_artifacts_json,
         publisher_name,
         publisher_email: email,
         azure_oid: None,
@@ -97,32 +56,29 @@ pub async fn run_publish(
     let sentinel_addr = addr.unwrap_or_else(crate::get_default_ipc_addr);
     tracing::info!("Connecting to Sentinel at {}", sentinel_addr);
 
-    let mut socket = zeromq::DealerSocket::new();
-    socket.connect(&sentinel_addr).await?;
+    let context = Context::new();
+    let socket = context.socket(zmq::DEALER)?;
+    socket.connect(&sentinel_addr)?;
     tracing::info!("✓ Connected to Sentinel");
 
     // Serialize payload
     let payload = serde_json::to_vec(&deploy_cmd)?;
 
     // Create protocol message
-    let msg = Message::new(OpCode::Deploy, 0, payload)?;
+    let msg = Message::new(OpCode::Deploy, JobId::new(0), payload)?;
     let (header_bytes, payload_bytes) = msg.pack()?;
 
     // Send message (multipart)
-    let mut multipart = ZmqMessage::from(header_bytes);
-    multipart.push_back(payload_bytes.into());
-    socket.send(multipart).await?;
+    socket.send_multipart(vec![header_bytes, payload_bytes], 0)?;
     tracing::info!("✓ Sent deployment request");
 
     // 8. Await ACK/ERR response
-    let response_frames: ZmqMessage = socket.recv().await?;
-    let response_msg = Message::unpack(
-        &response_frames
-            .into_vec()
-            .iter()
-            .map(|f| f.to_vec())
-            .collect::<Vec<_>>(),
-    )?;
+    let response_frames = socket.recv_multipart(0)?;
+    let mut start = 0;
+    while start < response_frames.len() && response_frames[start].is_empty() {
+        start += 1;
+    }
+    let response_msg = Message::unpack(&response_frames[start..])?;
 
     match response_msg.header.opcode {
         OpCode::Ack => {

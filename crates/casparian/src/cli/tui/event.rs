@@ -28,23 +28,16 @@ impl EventHandler {
     }
 
     /// Get next event (blocking with timeout)
-    pub async fn next(&self) -> Event {
-        // Use tokio's spawn_blocking to avoid blocking the async runtime
-        let tick_rate = self.tick_rate;
-
-        tokio::task::spawn_blocking(move || {
-            if event::poll(tick_rate).unwrap_or(false) {
-                match event::read() {
-                    Ok(CrosstermEvent::Key(key)) => Event::Key(key),
-                    Ok(CrosstermEvent::Resize(w, h)) => Event::Resize(w, h),
-                    _ => Event::Tick,
-                }
-            } else {
-                Event::Tick
+    pub fn next(&self) -> Event {
+        if event::poll(self.tick_rate).unwrap_or(false) {
+            match event::read() {
+                Ok(CrosstermEvent::Key(key)) => Event::Key(key),
+                Ok(CrosstermEvent::Resize(w, h)) => Event::Resize(w, h),
+                _ => Event::Tick,
             }
-        })
-        .await
-        .unwrap_or(Event::Tick)
+        } else {
+            Event::Tick
+        }
     }
 }
 

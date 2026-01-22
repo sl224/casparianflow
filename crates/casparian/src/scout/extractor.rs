@@ -26,11 +26,11 @@ use crate::scout::error::Result;
 use crate::scout::types::{ExtractionLogStatus, ExtractionStatus, Extractor, ScannedFile};
 use anyhow::Context;
 use chrono::Utc;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use std::{process::Command, thread};
 use tracing::{debug, error, info, warn};
 
 /// Default timeout for extractor execution (5 seconds)
@@ -186,7 +186,7 @@ impl ExtractorRunner {
     /// 2. Extract metadata from the path
     /// 3. Print JSON metadata to stdout
     /// 4. Exit with code 0 on success, non-zero on failure
-    pub async fn run_extractor(
+    pub fn run_extractor(
         &self,
         extractor: &Extractor,
         file_path: &str,
@@ -199,43 +199,54 @@ impl ExtractorRunner {
             extractor.name, file_path
         );
 
-        // Build the Python command
-        // The extractor script is expected to take file path from stdin and output JSON to stdout
-        let result = tokio::time::timeout(timeout, self.spawn_extractor(extractor, file_path)).await;
-
         let duration_ms = start.elapsed().as_millis() as u64;
 
-        match result {
-            Ok(Ok(metadata)) => {
+        match self.spawn_extractor(extractor, file_path, timeout) {
+            Ok(output) => {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    return ExtractorResult::Crash {
+                        exit_code: output.status.code(),
+                        stderr,
+                        duration_ms,
+                    };
+                }
+
+                let stdout = match String::from_utf8(output.stdout) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        return ExtractorResult::Error {
+                            message: format!("Extractor output is not valid UTF-8: {}", e),
+                            duration_ms,
+                        };
+                    }
+                };
+
+                let trimmed = stdout.trim();
+                if trimmed.is_empty() {
+                    return ExtractorResult::Error {
+                        message: "Extractor returned empty output".to_string(),
+                        duration_ms,
+                    };
+                }
+
+                if let Err(err) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return ExtractorResult::Error {
+                        message: format!("Extractor output is not valid JSON: {}", err),
+                        duration_ms,
+                    };
+                }
+
                 debug!(
                     "Extractor '{}' succeeded in {}ms",
                     extractor.name, duration_ms
                 );
                 ExtractorResult::Ok {
-                    metadata,
+                    metadata: trimmed.to_string(),
                     duration_ms,
                 }
             }
-            Ok(Err(e)) => {
-                // Check if it's a crash (non-zero exit) or other error
-                let error_str = e.to_string();
-                if error_str.contains("exit code:") {
-                    let exit_code = e
-                        .downcast_ref::<std::io::Error>()
-                        .and_then(|_| None); // Exit code extraction from error string
-                    ExtractorResult::Crash {
-                        exit_code,
-                        stderr: error_str,
-                        duration_ms,
-                    }
-                } else {
-                    ExtractorResult::Error {
-                        message: error_str,
-                        duration_ms,
-                    }
-                }
-            }
-            Err(_timeout) => {
+            Err(ExtractorSpawnError::Timeout(timeout)) => {
                 warn!(
                     "Extractor '{}' timed out after {:?}",
                     extractor.name, timeout
@@ -245,69 +256,111 @@ impl ExtractorRunner {
                     duration_ms,
                 }
             }
+            Err(ExtractorSpawnError::Io(err)) => ExtractorResult::Error {
+                message: err.to_string(),
+                duration_ms,
+            },
         }
     }
 
-    /// Spawn the extractor subprocess and wait for result
-    async fn spawn_extractor(&self, extractor: &Extractor, file_path: &str) -> anyhow::Result<String> {
-        // Spawn Python with the extractor script
+    /// Spawn the extractor subprocess and wait for result with a timeout.
+    fn spawn_extractor(
+        &self,
+        extractor: &Extractor,
+        file_path: &str,
+        timeout: Duration,
+    ) -> SpawnResult<ExtractorProcessOutput> {
         let mut child = Command::new(&self.config.python_path)
             .arg(&extractor.source_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .with_context(|| {
                 format!(
                     "Failed to spawn extractor '{}' at {}",
                     extractor.name, extractor.source_path
                 )
-            })?;
+            })
+            .map_err(ExtractorSpawnError::Io)?;
 
         // Write file path to stdin
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(file_path.as_bytes())
-                .await
-                .with_context(|| "Failed to write file path to extractor stdin")?;
-            stdin.flush().await?;
+                .with_context(|| "Failed to write file path to extractor stdin")
+                .map_err(ExtractorSpawnError::Io)?;
+            stdin.flush().map_err(ExtractorSpawnError::io)?;
         }
 
-        // Wait for process to complete
-        let output = child
-            .wait_with_output()
-            .await
-            .with_context(|| format!("Failed to wait for extractor '{}'", extractor.name))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let exit_code = output.status.code();
-            anyhow::bail!(
-                "Extractor '{}' failed with exit code: {:?}, stderr: {}",
-                extractor.name,
-                exit_code,
-                stderr
-            );
-        }
-
-        // Parse stdout as the metadata JSON
-        let stdout = String::from_utf8(output.stdout)
-            .with_context(|| "Extractor output is not valid UTF-8")?;
-
-        // Validate that output is valid JSON
-        let trimmed = stdout.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("Extractor returned empty output");
-        }
-
-        // Try to parse as JSON to validate
-        serde_json::from_str::<serde_json::Value>(trimmed)
-            .with_context(|| format!("Extractor output is not valid JSON: {}", trimmed))?;
-
-        Ok(trimmed.to_string())
+        wait_for_child(extractor, child, timeout)
     }
 }
+
+#[derive(Debug)]
+struct ExtractorProcessOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum ExtractorSpawnError {
+    Timeout(Duration),
+    Io(anyhow::Error),
+}
+
+impl ExtractorSpawnError {
+    fn io<T: Into<anyhow::Error>>(err: T) -> Self {
+        ExtractorSpawnError::Io(err.into())
+    }
+}
+
+fn wait_for_child(
+    _extractor: &Extractor,
+    mut child: Child,
+    timeout: Duration,
+) -> SpawnResult<ExtractorProcessOutput> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExtractorSpawnError::io(anyhow::anyhow!("Missing extractor stdout pipe")))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ExtractorSpawnError::io(anyhow::anyhow!("Missing extractor stderr pipe")))?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait().map_err(ExtractorSpawnError::io)? {
+            Some(status) => {
+                let mut stdout_buf = Vec::new();
+                stdout
+                    .read_to_end(&mut stdout_buf)
+                    .map_err(ExtractorSpawnError::io)?;
+                let mut stderr_buf = Vec::new();
+                stderr
+                    .read_to_end(&mut stderr_buf)
+                    .map_err(ExtractorSpawnError::io)?;
+                return Ok(ExtractorProcessOutput {
+                    status,
+                    stdout: stdout_buf,
+                    stderr: stderr_buf,
+                });
+            }
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ExtractorSpawnError::Timeout(timeout));
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+type SpawnResult<T> = std::result::Result<T, ExtractorSpawnError>;
 
 impl Default for ExtractorRunner {
     fn default() -> Self {
@@ -348,7 +401,7 @@ impl BatchExtractor {
     /// - Returns early with partial results
     ///
     /// Returns: (successes, failures, was_paused)
-    pub async fn run_batch(
+    pub fn run_batch(
         &self,
         extractor: &mut Extractor,
         files: &[ScannedFile],
@@ -384,17 +437,17 @@ impl BatchExtractor {
                 extractor.paused_at = Some(Utc::now());
 
                 // Persist pause state to database
-                self.pause_extractor(&extractor.id).await?;
+                self.pause_extractor(&extractor.id)?;
 
                 return Ok((successes, failures, true));
             }
 
             let file_path = &file.path;
-            let result = self.runner.run_extractor(extractor, file_path).await;
+            let result = self.runner.run_extractor(extractor, file_path);
 
             // Log the extraction attempt
             if let Some(file_id) = file.id {
-                self.log_extraction(file_id, &extractor.id, &result).await?;
+                self.log_extraction(file_id, &extractor.id, &result)?;
             }
 
             if result.is_ok() {
@@ -402,7 +455,7 @@ impl BatchExtractor {
                 if let Some(file_id) = file.id {
                     if let Some(metadata) = result.metadata() {
                         self.update_file_metadata(file_id, metadata, ExtractionStatus::Extracted)
-                            .await?;
+                            ?;
                     }
                 }
 
@@ -419,7 +472,7 @@ impl BatchExtractor {
                         "{}",
                         result.to_status(),
                     )
-                    .await?;
+                    ?;
                 }
 
                 error!(
@@ -432,7 +485,7 @@ impl BatchExtractor {
         // Update consecutive failures in database (but don't pause)
         extractor.consecutive_failures = consecutive_failures;
         self.update_extractor_failures(&extractor.id, consecutive_failures)
-            .await?;
+            ?;
 
         info!(
             "Batch complete for '{}': {} successes, {} failures",
@@ -445,14 +498,14 @@ impl BatchExtractor {
     /// Run all enabled extractors on files needing extraction
     ///
     /// Returns: Vec<(extractor_id, successes, failures, was_paused)>
-    pub async fn run_all_extractors(&self) -> Result<Vec<(String, usize, usize, bool)>> {
+    pub fn run_all_extractors(&self) -> Result<Vec<(String, usize, usize, bool)>> {
         // Get all enabled, non-paused extractors
-        let extractors = self.db.get_enabled_extractors().await?;
+        let extractors = self.db.get_enabled_extractors()?;
         let mut results = Vec::new();
 
         for mut extractor in extractors {
             // Get files pending extraction for this extractor
-            let files = self.db.get_files_pending_extraction().await?;
+            let files = self.db.get_files_pending_extraction()?;
 
             if files.is_empty() {
                 debug!("No files pending extraction for '{}'", extractor.name);
@@ -460,7 +513,7 @@ impl BatchExtractor {
             }
 
             let (successes, failures, was_paused) =
-                self.run_batch(&mut extractor, &files).await?;
+                self.run_batch(&mut extractor, &files)?;
 
             results.push((extractor.id.clone(), successes, failures, was_paused));
         }
@@ -469,23 +522,23 @@ impl BatchExtractor {
     }
 
     /// Pause an extractor in the database
-    async fn pause_extractor(&self, extractor_id: &str) -> Result<()> {
-        self.db.pause_extractor(extractor_id).await
+    fn pause_extractor(&self, extractor_id: &str) -> Result<()> {
+        self.db.pause_extractor(extractor_id)
     }
 
     /// Update extractor consecutive failure count
-    async fn update_extractor_failures(
+    fn update_extractor_failures(
         &self,
         extractor_id: &str,
         failures: u32,
     ) -> Result<()> {
         self.db
             .update_extractor_consecutive_failures(extractor_id, failures)
-            .await
+            
     }
 
     /// Log an extraction attempt
-    async fn log_extraction(
+    fn log_extraction(
         &self,
         file_id: i64,
         extractor_id: &str,
@@ -500,11 +553,11 @@ impl BatchExtractor {
                 result.error_message().as_deref(),
                 result.metadata(),
             )
-            .await
+            
     }
 
     /// Update file metadata after extraction
-    async fn update_file_metadata(
+    fn update_file_metadata(
         &self,
         file_id: i64,
         metadata_raw: &str,
@@ -512,7 +565,7 @@ impl BatchExtractor {
     ) -> Result<()> {
         self.db
             .update_file_extraction(file_id, metadata_raw, status)
-            .await
+            
     }
 }
 

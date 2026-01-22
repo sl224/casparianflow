@@ -2149,7 +2149,7 @@ run_all() {
     # Glob Explorer
     run_glob_tests
 
-    # Help overlay (legacy)
+    # Help overlay (old)
     test_help_overlay
 
     # Sources Manager
@@ -2340,7 +2340,7 @@ case "${1:-list}" in
         print_summary
         ;;
 
-    # Help overlay (legacy)
+    # Help overlay (old)
     help)
         test_help_overlay
         print_summary

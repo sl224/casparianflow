@@ -33,52 +33,63 @@ pub struct SchemaContract {
     /// The locked schemas in this contract
     pub schemas: Vec<LockedSchema>,
 
+    /// Optional quarantine policy for this contract
+    pub quarantine_config: Option<QuarantineConfig>,
+
     /// Contract version (incremented on re-approval)
     pub version: u32,
 }
 
 impl SchemaContract {
     /// Create a new schema contract with a single schema
-    pub fn new(scope_id: impl Into<String>, schema: LockedSchema, approved_by: impl Into<String>) -> Self {
+    pub fn new(scope_id: &str, schema: LockedSchema, approved_by: &str) -> Self {
         Self {
             contract_id: ContractId::new(),
-            scope_id: scope_id.into(),
+            scope_id: scope_id.to_string(),
             scope_description: None,
             logic_hash: None,
             approved_at: SchemaTimestamp::now(),
-            approved_by: approved_by.into(),
+            approved_by: approved_by.to_string(),
             schemas: vec![schema],
+            quarantine_config: None,
             version: 1,
         }
     }
 
     /// Create a contract with multiple schemas
     pub fn with_schemas(
-        scope_id: impl Into<String>,
+        scope_id: &str,
         schemas: Vec<LockedSchema>,
-        approved_by: impl Into<String>,
+        approved_by: &str,
     ) -> Self {
         Self {
             contract_id: ContractId::new(),
-            scope_id: scope_id.into(),
+            scope_id: scope_id.to_string(),
             scope_description: None,
             logic_hash: None,
             approved_at: SchemaTimestamp::now(),
-            approved_by: approved_by.into(),
+            approved_by: approved_by.to_string(),
             schemas,
+            quarantine_config: None,
             version: 1,
         }
     }
 
     /// Add description to the contract
-    pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.scope_description = Some(description.into());
+    pub fn with_description(mut self, description: &str) -> Self {
+        self.scope_description = Some(description.to_string());
         self
     }
 
     /// Attach an advisory logic hash
     pub fn with_logic_hash(mut self, logic_hash: Option<String>) -> Self {
         self.logic_hash = logic_hash;
+        self
+    }
+
+    /// Attach a quarantine policy to the contract
+    pub fn with_quarantine_config(mut self, config: Option<QuarantineConfig>) -> Self {
+        self.quarantine_config = config;
         self
     }
 }
@@ -106,8 +117,8 @@ pub struct LockedSchema {
 
 impl LockedSchema {
     /// Create a new locked schema
-    pub fn new(name: impl Into<String>, columns: Vec<LockedColumn>) -> Self {
-        let name = name.into();
+    pub fn new(name: &str, columns: Vec<LockedColumn>) -> Self {
+        let name = name.to_string();
         let content_hash = Self::compute_hash(&name, &columns);
         Self {
             schema_id: SchemaId::new(),
@@ -119,8 +130,8 @@ impl LockedSchema {
     }
 
     /// Set the source pattern
-    pub fn with_source_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.source_pattern = Some(pattern.into());
+    pub fn with_source_pattern(mut self, pattern: &str) -> Self {
+        self.source_pattern = Some(pattern.to_string());
         self
     }
 
@@ -191,9 +202,9 @@ pub struct LockedColumn {
 
 impl LockedColumn {
     /// Create a new required (non-nullable) column
-    pub fn required(name: impl Into<String>, data_type: DataType) -> Self {
+    pub fn required(name: &str, data_type: DataType) -> Self {
         Self {
-            name: name.into(),
+            name: name.to_string(),
             data_type,
             nullable: false,
             format: None,
@@ -202,9 +213,9 @@ impl LockedColumn {
     }
 
     /// Create a new optional (nullable) column
-    pub fn optional(name: impl Into<String>, data_type: DataType) -> Self {
+    pub fn optional(name: &str, data_type: DataType) -> Self {
         Self {
-            name: name.into(),
+            name: name.to_string(),
             data_type,
             nullable: true,
             format: None,
@@ -213,20 +224,20 @@ impl LockedColumn {
     }
 
     /// Set format string (for dates, timestamps, etc.)
-    pub fn with_format(mut self, format: impl Into<String>) -> Self {
-        self.format = Some(format.into());
+    pub fn with_format(mut self, format: &str) -> Self {
+        self.format = Some(format.to_string());
         self
     }
 
     /// Set description
-    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.description = Some(desc.into());
+    pub fn with_description(mut self, desc: &str) -> Self {
+        self.description = Some(desc.to_string());
         self
     }
 }
 
 /// Canonical data type used for schema contracts (shared across crates).
-pub use casparian_protocol::DataType;
+pub use casparian_protocol::{DataType, QuarantineConfig};
 
 /// A schema contract violation - parser output doesn't match contract.
 ///
@@ -258,26 +269,26 @@ impl SchemaViolation {
     pub fn type_mismatch(
         column: usize,
         expected: DataType,
-        got: impl Into<String>,
+        got: &str,
     ) -> Self {
         Self {
             file_path: None,
             row: None,
             column: Some(column),
             expected: expected.to_string(),
-            got: got.into(),
+            got: got.to_string(),
             violation_type: ViolationType::TypeMismatch,
         }
     }
 
     /// Create a null not allowed violation
-    pub fn null_not_allowed(column: usize, column_name: impl Into<String>) -> Self {
+    pub fn null_not_allowed(column: usize, column_name: &str) -> Self {
         Self {
             file_path: None,
             row: None,
             column: Some(column),
             expected: "non-null value".to_string(),
-            got: format!("null in column '{}'", column_name.into()),
+            got: format!("null in column '{}'", column_name),
             violation_type: ViolationType::NullNotAllowed,
         }
     }
@@ -285,22 +296,22 @@ impl SchemaViolation {
     /// Create a format mismatch violation
     pub fn format_mismatch(
         column: usize,
-        expected_format: impl Into<String>,
-        got: impl Into<String>,
+        expected_format: &str,
+        got: &str,
     ) -> Self {
         Self {
             file_path: None,
             row: None,
             column: Some(column),
-            expected: expected_format.into(),
-            got: got.into(),
+            expected: expected_format.to_string(),
+            got: got.to_string(),
             violation_type: ViolationType::FormatMismatch,
         }
     }
 
     /// Set the file path context
-    pub fn with_file(mut self, path: impl Into<String>) -> Self {
-        self.file_path = Some(path.into());
+    pub fn with_file(mut self, path: &str) -> Self {
+        self.file_path = Some(path.to_string());
         self
     }
 
@@ -456,7 +467,8 @@ mod tests {
 
         let msg = v.to_string();
         assert!(msg.contains("TypeMismatch"));
-        assert!(msg.contains("Int64"));
+        // DataType Display uses lowercase
+        assert!(msg.contains("int64"));
         assert!(msg.contains("abc"));
         assert!(msg.contains("column 2"));
         assert!(msg.contains("row 42"));

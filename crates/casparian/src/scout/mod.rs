@@ -16,5 +16,6 @@ pub use db::Database;
 pub use extractor::{BatchExtractor, ExtractorConfig, ExtractorResult, ExtractorRunner};
 pub use scanner::{ScanConfig, ScanProgress, Scanner};
 pub use types::{
-    ExtractionStatus, Extractor, FileStatus, ScannedFile, Source, SourceType, TaggingRule,
+    ExtractionStatus, Extractor, FileStatus, ScannedFile, Source, SourceId, SourceType, TagSource,
+    TaggingRule, TaggingRuleId,
 };

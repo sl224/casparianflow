@@ -24,9 +24,12 @@ echo
 # Set up database path
 export CASPARIAN_DB_PATH="$DB_FILE"
 
+# Validation status values (mirrors ParserValidationStatus enum in Rust)
+PARSER_VALIDATION_STATUSES="'pending', 'valid', 'invalid', 'error'"
+
 # Create a minimal SQLite database with the required schema
 echo "Setting up test database..."
-duckdb "$DB_FILE" <<'EOF'
+duckdb "$DB_FILE" <<EOF
 -- Parser Lab parsers table
 CREATE TABLE IF NOT EXISTS parser_lab_parsers (
     id TEXT PRIMARY KEY,
@@ -34,12 +37,12 @@ CREATE TABLE IF NOT EXISTS parser_lab_parsers (
     file_pattern TEXT NOT NULL DEFAULT '',
     pattern_type TEXT DEFAULT 'all',
     source_code TEXT,
-    validation_status TEXT DEFAULT 'pending',
+    validation_status TEXT DEFAULT 'pending'
+        CHECK (validation_status IN ($PARSER_VALIDATION_STATUSES)),
     validation_error TEXT,
     validation_output TEXT,
     last_validated_at INTEGER,
     messages_json TEXT,
-    schema_json TEXT,
     sink_type TEXT DEFAULT 'parquet',
     sink_config_json TEXT,
     published_at INTEGER,
@@ -65,7 +68,7 @@ CREATE TABLE IF NOT EXISTS parser_lab_test_files (
 -- Scout files for backtest
 CREATE TABLE IF NOT EXISTS scout_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id TEXT NOT NULL,
+    source_id BIGINT NOT NULL,
     path TEXT NOT NULL,
     rel_path TEXT NOT NULL,
     size INTEGER NOT NULL,
@@ -74,7 +77,7 @@ CREATE TABLE IF NOT EXISTS scout_files (
     status TEXT NOT NULL DEFAULT 'pending',
     tag TEXT,
     tag_source TEXT,
-    rule_id TEXT,
+    rule_id BIGINT,
     manual_plugin TEXT,
     error TEXT,
     first_seen_at INTEGER NOT NULL,

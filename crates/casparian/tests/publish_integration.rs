@@ -19,6 +19,19 @@ fn create_valid_plugin(dir: &TempDir, name: &str) -> std::path::PathBuf {
     let source = r#"
 import pandas as pd
 
+outputs = {
+    "processed_data": {
+        "columns": [
+            {"name": "processed", "type": "boolean", "nullable": False}
+        ]
+    },
+    "errors": {
+        "columns": [
+            {"name": "message", "type": "string", "nullable": False}
+        ]
+    }
+}
+
 class Handler:
     def configure(self, context, config):
         """Configure the handler with topic registrations."""
@@ -44,6 +57,14 @@ fn create_invalid_plugin(dir: &TempDir, name: &str) -> std::path::PathBuf {
 import os
 import subprocess
 
+outputs = {
+    "processed_data": {
+        "columns": [
+            {"name": "processed", "type": "boolean", "nullable": False}
+        ]
+    }
+}
+
 class Handler:
     def execute(self, file_path):
         # This is banned by Gatekeeper
@@ -64,6 +85,23 @@ requires-python = ">=3.10"
 dependencies = ["pandas>=2.0"]
 "#;
     fs::write(dir.path().join("pyproject.toml"), pyproject).expect("Failed to write pyproject.toml");
+}
+
+/// Helper to create a casparian.toml manifest for publish
+fn create_manifest(dir: &TempDir, name: &str, version: &str) {
+    let manifest = format!(
+        r#"
+name = "{name}"
+version = "{version}"
+protocol_version = "0.1"
+runtime_kind = "python_shim"
+entrypoint = "{name}.py:Handler"
+"#,
+        name = name,
+        version = version
+    );
+    fs::write(dir.path().join("casparian.toml"), manifest)
+        .expect("Failed to write casparian.toml");
 }
 
 // ===========================================================================
@@ -213,6 +251,7 @@ fn test_prepare_publish_fails_for_invalid_plugin() {
     let temp_dir = TempDir::new().unwrap();
     let plugin_path = create_invalid_plugin(&temp_dir, "invalid_for_publish");
     create_pyproject(&temp_dir);
+    create_manifest(&temp_dir, "invalid_for_publish", "0.1.0");
 
     // Should fail because plugin doesn't pass validation
     let result = prepare_publish(&plugin_path);
@@ -227,9 +266,26 @@ fn test_prepare_publish_fails_for_invalid_plugin() {
 }
 
 #[test]
+fn test_prepare_publish_requires_manifest() {
+    let temp_dir = TempDir::new().unwrap();
+    let plugin_path = create_valid_plugin(&temp_dir, "missing_manifest");
+    fs::write(temp_dir.path().join("uv.lock"), "# test lockfile").unwrap();
+
+    let result = prepare_publish(&plugin_path);
+    assert!(result.is_err(), "Should fail without manifest");
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("casparian.toml"),
+        "Error should mention manifest requirement: {}",
+        error
+    );
+}
+
+#[test]
 fn test_prepare_publish_uses_existing_lockfile() {
     let temp_dir = TempDir::new().unwrap();
     let plugin_path = create_valid_plugin(&temp_dir, "existing_lock");
+    create_manifest(&temp_dir, "existing_lock", "0.1.0");
 
     // Create existing lockfile
     let lockfile_content = "# existing uv.lock\nversion = 1";
@@ -250,6 +306,7 @@ fn test_prepare_publish_uses_existing_lockfile() {
 fn test_prepare_publish_computes_artifact_hash() {
     let temp_dir = TempDir::new().unwrap();
     let plugin_path = create_valid_plugin(&temp_dir, "artifact_hash_test");
+    create_manifest(&temp_dir, "artifact_hash_test", "0.1.0");
 
     // Create lockfile (avoid running uv lock in tests)
     fs::write(temp_dir.path().join("uv.lock"), "# test lockfile").unwrap();
@@ -272,6 +329,7 @@ fn test_prepare_publish_computes_artifact_hash() {
 fn test_prepare_publish_preserves_detected_topics() {
     let temp_dir = TempDir::new().unwrap();
     let plugin_path = create_valid_plugin(&temp_dir, "topics_preserved");
+    create_manifest(&temp_dir, "topics_preserved", "0.1.0");
 
     fs::write(temp_dir.path().join("uv.lock"), "# test lockfile").unwrap();
 
@@ -300,6 +358,7 @@ fn test_publish_flow_end_to_end() {
 
     let temp_dir = TempDir::new().unwrap();
     let plugin_path = create_valid_plugin(&temp_dir, "end_to_end_plugin");
+    create_manifest(&temp_dir, "end_to_end_plugin", "0.1.0");
     fs::write(temp_dir.path().join("uv.lock"), "# e2e lockfile").unwrap();
 
     // Step 1: Analyze (simulates analyze_plugin_manifest command)
@@ -322,6 +381,8 @@ fn test_publish_flow_end_to_end() {
     assert!(!artifact.lockfile_content.is_empty());
     assert!(!artifact.env_hash.is_empty());
     assert!(!artifact.artifact_hash.is_empty());
+    assert!(!artifact.manifest_json.is_empty());
+    assert!(!artifact.schema_artifacts_json.is_empty());
 
     // The actual database operations would be tested in Tauri command tests
     // with a real SQLite fixture, following the "Map Is Not The Territory" principle

@@ -33,7 +33,7 @@ pub struct TuiArgs {
 }
 
 /// Run the TUI
-pub async fn run(args: TuiArgs) -> Result<()> {
+pub fn run(args: TuiArgs) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -48,7 +48,7 @@ pub async fn run(args: TuiArgs) -> Result<()> {
     let mut events = EventHandler::new(std::time::Duration::from_millis(250));
 
     // Main loop
-    let result = run_app(&mut terminal, &mut app, &mut events).await;
+    let result = run_app(&mut terminal, &mut app, &mut events);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -62,7 +62,7 @@ pub async fn run(args: TuiArgs) -> Result<()> {
 }
 
 /// Run the application loop
-async fn run_app<B: Backend>(
+fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     events: &mut EventHandler,
@@ -84,9 +84,9 @@ async fn run_app<B: Backend>(
         })?;
 
         // Handle events
-        match events.next().await {
-            Event::Key(key) => app.handle_key(key).await,
-            Event::Tick => app.tick().await,
+        match events.next() {
+            Event::Key(key) => app.handle_key(key),
+            Event::Tick => app.tick(),
             Event::Resize(_, _) => {} // Ratatui handles resize
         }
 

@@ -1,0 +1,52 @@
+[package]
+name = "casparian_mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "MCP (Model Context Protocol) server for Casparian Flow"
+
+[dependencies]
+# Workspace dependencies
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+# Async runtime
+tokio = { version = "1", features = ["full", "sync", "io-util", "io-std"] }
+
+# UUID for job/approval IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# SHA256 for redaction hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Async trait for tool implementations
+async-trait = "0.1"
+
+# File system utilities
+walkdir = "2"
+glob = "0.3"
+dirs = "5"
+
+# Regex for SQL validation
+regex = "1"
+
+# Internal crates - we call these directly, not via CLI
+casparian_db = { path = "../casparian_db" }
+casparian_schema = { path = "../casparian_schema" }
+casparian_backtest = { path = "../casparian_backtest" }
+casparian_worker = { path = "../casparian_worker" }
+casparian_sinks = { path = "../casparian_sinks" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"
+
+[features]
+default = []

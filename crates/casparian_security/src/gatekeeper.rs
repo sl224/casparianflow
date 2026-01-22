@@ -10,6 +10,7 @@
 //! Zero-dependency on Python interpreter for security checks.
 
 use anyhow::{Context, Result};
+use rustpython_ast::Visitor;
 use rustpython_parser::{ast, Parse};
 use std::collections::HashSet;
 
@@ -53,113 +54,103 @@ impl Gatekeeper {
         let ast = ast::Suite::parse(source_code, "<plugin>")
             .context("Failed to parse Python source code")?;
 
-        // Collect all violations
-        let mut violations = Vec::new();
+        let mut visitor = GatekeeperVisitor::new(&self.banned_modules);
+        for stmt in ast {
+            visitor.visit_stmt(stmt);
+        }
 
-        // Walk the AST and check for banned imports
-        self.check_imports(&ast, &mut violations);
-
-        if violations.is_empty() {
+        if visitor.violations.is_empty() {
             Ok(())
         } else {
             anyhow::bail!(
                 "Security validation failed:\n{}",
-                violations.join("\n")
+                visitor.violations.join("\n")
             )
         }
     }
+}
 
-    /// Recursively check all imports in the AST
-    fn check_imports(&self, suite: &[ast::Stmt], violations: &mut Vec<String>) {
-        for stmt in suite {
-            self.check_statement(stmt, violations);
+struct GatekeeperVisitor<'a> {
+    banned_modules: &'a HashSet<String>,
+    violations: Vec<String>,
+}
+
+impl<'a> GatekeeperVisitor<'a> {
+    fn new(banned_modules: &'a HashSet<String>) -> Self {
+        Self {
+            banned_modules,
+            violations: Vec::new(),
         }
     }
 
-    /// Check a single statement for banned imports
-    fn check_statement(&self, stmt: &ast::Stmt, violations: &mut Vec<String>) {
-        match stmt {
-            // Direct import: import os
-            ast::Stmt::Import(import) => {
-                for alias in &import.names {
-                    let module_name = alias.name.to_string();
-                    if self.banned_modules.contains(&module_name) {
-                        violations.push(format!(
-                            "Banned import: 'import {}'",
-                            module_name
-                        ));
-                    }
-                }
-            }
+    fn check_import(&mut self, module_name: &str, context: &str) {
+        if self.banned_modules.contains(module_name) {
+            self.violations
+                .push(format!("Banned import: '{} {}'", context, module_name));
+        }
+    }
 
-            // From import: from subprocess import run
-            ast::Stmt::ImportFrom(import_from) => {
-                if let Some(module) = &import_from.module {
-                    let module_name = module.to_string();
-                    if self.banned_modules.contains(&module_name) {
-                        violations.push(format!(
-                            "Banned import: 'from {} import ...'",
-                            module_name
-                        ));
-                    }
-                }
-            }
+    fn check_dynamic_import(&mut self, func: &ast::Expr) {
+        if let Some(name) = dynamic_import_name(func) {
+            self.violations
+                .push(format!("Banned dynamic import: '{}'", name));
+        }
+    }
+}
 
-            // Recursively check function definitions
-            ast::Stmt::FunctionDef(func) => {
-                self.check_imports(&func.body, violations);
+fn dynamic_import_name(func: &ast::Expr) -> Option<String> {
+    match func {
+        ast::Expr::Name(name) => {
+            if name.id.as_str() == "__import__" {
+                Some("__import__".to_string())
+            } else {
+                None
             }
-
-            // Recursively check async function definitions
-            ast::Stmt::AsyncFunctionDef(func) => {
-                self.check_imports(&func.body, violations);
-            }
-
-            // Recursively check class definitions
-            ast::Stmt::ClassDef(class) => {
-                self.check_imports(&class.body, violations);
-            }
-
-            // Recursively check if/else blocks
-            ast::Stmt::If(if_stmt) => {
-                self.check_imports(&if_stmt.body, violations);
-                self.check_imports(&if_stmt.orelse, violations);
-            }
-
-            // Recursively check while loops
-            ast::Stmt::While(while_stmt) => {
-                self.check_imports(&while_stmt.body, violations);
-                self.check_imports(&while_stmt.orelse, violations);
-            }
-
-            // Recursively check for loops
-            ast::Stmt::For(for_stmt) => {
-                self.check_imports(&for_stmt.body, violations);
-                self.check_imports(&for_stmt.orelse, violations);
-            }
-
-            // Recursively check try/except blocks
-            ast::Stmt::Try(try_stmt) => {
-                self.check_imports(&try_stmt.body, violations);
-                for handler in &try_stmt.handlers {
-                    match handler {
-                        ast::ExceptHandler::ExceptHandler(h) => {
-                            self.check_imports(&h.body, violations);
+        }
+        ast::Expr::Attribute(attr) => {
+            let attr_name = attr.attr.as_str();
+            match attr_name {
+                "import_module" | "reload" => {
+                    if let ast::Expr::Name(value) = attr.value.as_ref() {
+                        if value.id.as_str() == "importlib" {
+                            return Some(format!("importlib.{}", attr_name));
                         }
                     }
                 }
-                self.check_imports(&try_stmt.orelse, violations);
-                self.check_imports(&try_stmt.finalbody, violations);
+                "__import__" => {
+                    if let ast::Expr::Name(value) = attr.value.as_ref() {
+                        let name = value.id.as_str();
+                        if name == "builtins" || name == "__builtins__" {
+                            return Some(format!("{}.{}", name, attr_name));
+                        }
+                    }
+                }
+                _ => {}
             }
-
-            // Recursively check with blocks
-            ast::Stmt::With(with_stmt) => {
-                self.check_imports(&with_stmt.body, violations);
-            }
-
-            // Other statement types don't need recursion
-            _ => {}
+            None
         }
+        _ => None,
+    }
+}
+
+impl<'a> Visitor for GatekeeperVisitor<'a> {
+    fn visit_stmt_import(&mut self, node: ast::StmtImport) {
+        for alias in &node.names {
+            self.check_import(alias.name.as_str(), "import");
+        }
+        self.generic_visit_stmt_import(node);
+    }
+
+    fn visit_stmt_import_from(&mut self, node: ast::StmtImportFrom) {
+        if let Some(module) = &node.module {
+            self.check_import(module.as_str(), "from");
+        }
+        self.generic_visit_stmt_import_from(node);
+    }
+
+    fn visit_expr_call(&mut self, node: ast::ExprCall) {
+        self.check_dynamic_import(&node.func);
+        self.generic_visit_expr_call(node);
     }
 }
 
@@ -211,7 +202,7 @@ class Handler:
         let result = gatekeeper.validate(code);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Banned import: 'from subprocess import ...'"));
+        assert!(err.contains("Banned import: 'from subprocess'"));
     }
 
     #[test]
@@ -245,6 +236,34 @@ import socket
         assert!(err.contains("import os"));
         assert!(err.contains("from subprocess"));
         assert!(err.contains("import socket"));
+    }
+
+    #[test]
+    fn test_banned_dynamic_import_dunder() {
+        let gatekeeper = Gatekeeper::new();
+        let code = r#"
+class Handler:
+    def execute(self, file_path):
+        __import__("os")
+"#;
+        let result = gatekeeper.validate(code);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Banned dynamic import: '__import__'"));
+    }
+
+    #[test]
+    fn test_banned_dynamic_import_importlib() {
+        let gatekeeper = Gatekeeper::new();
+        let code = r#"
+class Handler:
+    def execute(self, file_path):
+        importlib.import_module("os")
+"#;
+        let result = gatekeeper.validate(code);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Banned dynamic import: 'importlib.import_module'"));
     }
 
     #[test]

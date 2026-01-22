@@ -14,13 +14,9 @@ path = "src/lib.rs"
 [dependencies]
 # Protocol
 casparian_protocol = { path = "../casparian_protocol" }
-casparian_logging = { path = "../casparian_logging" }
-
-# Async runtime
-tokio.workspace = true
 
 # ZeroMQ
-zeromq.workspace = true
+zmq.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -28,6 +24,7 @@ serde_json.workspace = true
 
 # Database
 casparian_db = { path = "../casparian_db" }
+casparian_schema = { path = "../casparian_schema" }
 
 # Error handling
 anyhow.workspace = true
@@ -47,4 +44,3 @@ dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"
-futures = "0.3"

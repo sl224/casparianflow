@@ -1,8 +1,9 @@
 # FIX Demo Quickstart
 
 This walkthrough uses the tiny demo log at `docs/demo/fix/fix_demo.fix` and the
-parser at `docs/demo/fix/fix_lifecycle_parser.py`. It produces a DuckDB table
-named `fix_order_lifecycle` and queries by `cl_ord_id`.
+first-class parser at `parsers/fix/fix_parser.py`. It produces DuckDB tables
+named `fix_order_lifecycle`, `fix_session_events`, and `fix_parse_errors`
+(plus optional `fix_tags` when `FIX_TAGS_ALLOWLIST` is set).
 
 Prereqs:
 - Build the CLI: `cargo build --release` (or use `cargo build` and adjust paths).
@@ -21,11 +22,11 @@ Prereqs:
 ./target/release/casparian preview docs/demo/fix/fix_demo.fix --head 3
 ```
 
-3) Run the parser (creates `fix_order_lifecycle`)
+3) Run the parser (creates `fix_order_lifecycle`, `fix_session_events`, `fix_parse_errors`)
 
 ```bash
-./target/release/casparian run \
-  docs/demo/fix/fix_lifecycle_parser.py \
+FIX_TZ=UTC ./target/release/casparian run \
+  parsers/fix/fix_parser.py \
   docs/demo/fix/fix_demo.fix \
   --sink duckdb://./output/fix_demo.duckdb
 ```

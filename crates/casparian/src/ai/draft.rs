@@ -66,7 +66,7 @@ impl DraftManager {
     ///
     /// The content is written to a file in the drafts directory and metadata
     /// is stored in the database.
-    pub async fn create_draft(
+    pub fn create_draft(
         &self,
         draft_type: DraftType,
         content: &str,
@@ -118,7 +118,7 @@ impl DraftManager {
                     DbValue::from(expires_at.timestamp_millis()),
                 ],
             )
-            .await?;
+            ?;
 
         Ok(Draft {
             id,
@@ -135,7 +135,7 @@ impl DraftManager {
     }
 
     /// Get a draft by ID
-    pub async fn get_draft(&self, id: &DraftId) -> Result<Option<Draft>> {
+    pub fn get_draft(&self, id: &DraftId) -> Result<Option<Draft>> {
         let row = self
             .conn
             .query_optional(
@@ -147,7 +147,7 @@ impl DraftManager {
                 "#,
                 &[DbValue::from(id.as_str())],
             )
-            .await?;
+            ?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_draft(&row)?)),
@@ -156,7 +156,7 @@ impl DraftManager {
     }
 
     /// List all pending drafts
-    pub async fn list_pending(&self) -> Result<Vec<Draft>> {
+    pub fn list_pending(&self) -> Result<Vec<Draft>> {
         let now_millis = Utc::now().timestamp_millis();
 
         let rows = self
@@ -166,12 +166,15 @@ impl DraftManager {
                 SELECT id, draft_type, file_path, status, source_context_json,
                        model_name, created_at, expires_at, approved_at, approved_by
                 FROM cf_ai_drafts
-                WHERE status = 'pending' AND expires_at > ?
+                WHERE status = ? AND expires_at > ?
                 ORDER BY created_at DESC
                 "#,
-                &[DbValue::from(now_millis)],
+                &[
+                    DbValue::from(DraftStatus::Pending.as_str()),
+                    DbValue::from(now_millis),
+                ],
             )
-            .await?;
+            ?;
 
         let mut drafts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -181,7 +184,7 @@ impl DraftManager {
     }
 
     /// List drafts by type
-    pub async fn list_by_type(&self, draft_type: DraftType) -> Result<Vec<Draft>> {
+    pub fn list_by_type(&self, draft_type: DraftType) -> Result<Vec<Draft>> {
         let rows = self
             .conn
             .query_all(
@@ -194,7 +197,7 @@ impl DraftManager {
                 "#,
                 &[DbValue::from(draft_type.as_str())],
             )
-            .await?;
+            ?;
 
         let mut drafts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -207,10 +210,10 @@ impl DraftManager {
     ///
     /// This marks the draft as approved and records who approved it.
     /// The actual commit to runtime configuration is handled by the caller.
-    pub async fn approve_draft(&self, id: &DraftId, approved_by: &str) -> Result<Draft> {
+    pub fn approve_draft(&self, id: &DraftId, approved_by: &str) -> Result<Draft> {
         let draft = self
             .get_draft(id)
-            .await?
+            ?
             .ok_or_else(|| DraftError::NotFound(id.to_string()))?;
 
         if draft.status != DraftStatus::Pending {
@@ -238,7 +241,7 @@ impl DraftManager {
                     DbValue::from(id.as_str()),
                 ],
             )
-            .await?;
+            ?;
 
         Ok(Draft {
             status: DraftStatus::Approved,
@@ -249,10 +252,10 @@ impl DraftManager {
     }
 
     /// Reject a draft
-    pub async fn reject_draft(&self, id: &DraftId) -> Result<()> {
+    pub fn reject_draft(&self, id: &DraftId) -> Result<()> {
         let draft = self
             .get_draft(id)
-            .await?
+            ?
             .ok_or_else(|| DraftError::NotFound(id.to_string()))?;
 
         if draft.status != DraftStatus::Pending {
@@ -271,7 +274,7 @@ impl DraftManager {
                     DbValue::from(id.as_str()),
                 ],
             )
-            .await?;
+            ?;
 
         // Optionally delete the file
         if draft.file_path.exists() {
@@ -284,7 +287,7 @@ impl DraftManager {
     /// Clean up expired drafts
     ///
     /// Returns the number of drafts cleaned up.
-    pub async fn cleanup_expired(&self) -> Result<usize> {
+    pub fn cleanup_expired(&self) -> Result<usize> {
         let now_millis = Utc::now().timestamp_millis();
 
         // Get expired drafts to delete their files
@@ -293,11 +296,14 @@ impl DraftManager {
             .query_all(
                 r#"
                 SELECT file_path FROM cf_ai_drafts
-                WHERE status = 'pending' AND expires_at <= ?
+                WHERE status = ? AND expires_at <= ?
                 "#,
-                &[DbValue::from(now_millis)],
+                &[
+                    DbValue::from(DraftStatus::Pending.as_str()),
+                    DbValue::from(now_millis),
+                ],
             )
-            .await?;
+            ?;
 
         // Delete files
         for row in &expired_rows {
@@ -315,22 +321,23 @@ impl DraftManager {
                 r#"
                 UPDATE cf_ai_drafts
                 SET status = ?
-                WHERE status = 'pending' AND expires_at <= ?
+                WHERE status = ? AND expires_at <= ?
                 "#,
                 &[
                     DbValue::from(DraftStatus::Expired.as_str()),
+                    DbValue::from(DraftStatus::Pending.as_str()),
                     DbValue::from(now_millis),
                 ],
             )
-            .await?;
+            ?;
 
         Ok(result as usize)
     }
 
     /// Delete all drafts (for testing)
     #[cfg(test)]
-    pub async fn delete_all(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM cf_ai_drafts", &[]).await?;
+    pub fn delete_all(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM cf_ai_drafts", &[])?;
         Ok(())
     }
 
@@ -394,40 +401,40 @@ mod tests {
     use casparian_db::DbConnection;
     use tempfile::TempDir;
 
-    async fn setup() -> (DraftManager, TempDir) {
+    fn setup() -> (DraftManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.duckdb");
 
-        let conn = DbConnection::open_duckdb(&db_path).await.unwrap();
+        let conn = DbConnection::open_duckdb(&db_path).unwrap();
 
         // Create the drafts table
-        conn.execute_batch(
+        let schema = format!(
             r#"
             CREATE TABLE IF NOT EXISTS cf_ai_drafts (
                 id TEXT PRIMARY KEY,
                 draft_type TEXT NOT NULL,
                 file_path TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT '{}',
                 source_context_json TEXT,
                 model_name TEXT,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                approved_at INTEGER,
+                created_at BIGINT NOT NULL,
+                expires_at BIGINT NOT NULL,
+                approved_at BIGINT,
                 approved_by TEXT
             )
             "#,
-        )
-        .await
-        .unwrap();
+            DraftStatus::Pending.as_str()
+        );
+        conn.execute_batch(&schema).unwrap();
 
         let drafts_dir = temp_dir.path().join("drafts");
         let manager = DraftManager::new(conn, drafts_dir);
         (manager, temp_dir)
     }
 
-    #[tokio::test]
-    async fn test_create_and_get_draft() {
-        let (manager, _temp) = setup().await;
+    #[test]
+    fn test_create_and_get_draft() {
+        let (manager, _temp) = setup();
 
         let context = DraftContext {
             sample_paths: vec![PathBuf::from("/data/test.csv")],
@@ -443,21 +450,21 @@ mod tests {
                 context.clone(),
                 Some("qwen2.5-coder:7b"),
             )
-            .await
+            
             .unwrap();
 
         assert_eq!(draft.draft_type, DraftType::Extractor);
         assert_eq!(draft.status, DraftStatus::Pending);
         assert!(draft.file_path.exists());
 
-        let retrieved = manager.get_draft(&draft.id).await.unwrap().unwrap();
+        let retrieved = manager.get_draft(&draft.id).unwrap().unwrap();
         assert_eq!(retrieved.id, draft.id);
         assert_eq!(retrieved.source_context.user_hints, context.user_hints);
     }
 
-    #[tokio::test]
-    async fn test_approve_draft() {
-        let (manager, _temp) = setup().await;
+    #[test]
+    fn test_approve_draft() {
+        let (manager, _temp) = setup();
 
         let draft = manager
             .create_draft(
@@ -466,12 +473,12 @@ mod tests {
                 DraftContext::default(),
                 None,
             )
-            .await
+            
             .unwrap();
 
         let approved = manager
             .approve_draft(&draft.id, "test_user")
-            .await
+            
             .unwrap();
 
         assert_eq!(approved.status, DraftStatus::Approved);
@@ -479,9 +486,9 @@ mod tests {
         assert!(approved.approved_at.is_some());
     }
 
-    #[tokio::test]
-    async fn test_reject_draft() {
-        let (manager, _temp) = setup().await;
+    #[test]
+    fn test_reject_draft() {
+        let (manager, _temp) = setup();
 
         let draft = manager
             .create_draft(
@@ -490,21 +497,21 @@ mod tests {
                 DraftContext::default(),
                 None,
             )
-            .await
+            
             .unwrap();
 
         assert!(draft.file_path.exists());
 
-        manager.reject_draft(&draft.id).await.unwrap();
+        manager.reject_draft(&draft.id).unwrap();
 
-        let retrieved = manager.get_draft(&draft.id).await.unwrap().unwrap();
+        let retrieved = manager.get_draft(&draft.id).unwrap().unwrap();
         assert_eq!(retrieved.status, DraftStatus::Rejected);
         assert!(!draft.file_path.exists()); // File should be deleted
     }
 
-    #[tokio::test]
-    async fn test_list_pending() {
-        let (manager, _temp) = setup().await;
+    #[test]
+    fn test_list_pending() {
+        let (manager, _temp) = setup();
 
         // Create multiple drafts
         for i in 0..3 {
@@ -515,11 +522,11 @@ mod tests {
                     DraftContext::default(),
                     None,
                 )
-                .await
+                
                 .unwrap();
         }
 
-        let pending = manager.list_pending().await.unwrap();
+        let pending = manager.list_pending().unwrap();
         assert_eq!(pending.len(), 3);
     }
 }

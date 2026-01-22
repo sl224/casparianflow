@@ -15,7 +15,7 @@
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table_colored};
-use casparian::scout::{Database, FileStatus, ScannedFile};
+use casparian::scout::{Database, FileStatus, ScannedFile, Source, SourceId};
 use comfy_table::Color;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
@@ -45,7 +45,7 @@ struct FilesOutput {
 #[derive(Debug, Serialize)]
 struct FileOutput {
     id: Option<i64>,
-    source_id: String,
+    source_id: SourceId,
     path: String,
     rel_path: String,
     size: u64,
@@ -64,7 +64,7 @@ struct FilesSummary {
 
 #[derive(Debug, Serialize)]
 struct FilesFilters {
-    source: Option<String>,
+    source_id: Option<SourceId>,
     all_sources: bool,
     topic: Option<String>,
     status: Option<String>,
@@ -73,17 +73,20 @@ struct FilesFilters {
     tag: Option<String>,
 }
 
-/// Valid file statuses
-const VALID_STATUSES: &[&str] = &[
-    "pending",
-    "tagged",
-    "queued",
-    "processing",
-    "processed",
-    "failed",
-    "skipped",
-    "deleted",
-];
+fn valid_statuses_list() -> String {
+    FileStatus::ALL
+        .iter()
+        .map(|status| status.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn find_source<'a>(sources: &'a [Source], input: &str) -> Option<&'a Source> {
+    let parsed_id = SourceId::parse(input).ok();
+    sources
+        .iter()
+        .find(|s| s.name == input || parsed_id.map_or(false, |id| s.id == id))
+}
 
 /// Get the active database path
 fn get_db_path() -> PathBuf {
@@ -100,28 +103,32 @@ fn validate_status(status: &str) -> Result<FileStatus, HelpfulError> {
         s => s,
     };
 
+    let valid_statuses = valid_statuses_list();
     FileStatus::parse(normalized).ok_or_else(|| {
         HelpfulError::new(format!("Invalid status: '{}'", status))
             .with_context("Status must be one of the valid file statuses")
             .with_suggestions([
-                format!("TRY: Valid statuses: {}", VALID_STATUSES.join(", ")),
-                "TRY: Use 'done' as an alias for 'processed'".to_string(),
+                format!("TRY: Valid statuses: {}", valid_statuses),
+                format!(
+                    "TRY: Use 'done' as an alias for '{}'",
+                    FileStatus::Processed.as_str()
+                ),
             ])
     })
 }
 
 /// Get color for status display
 fn color_for_status(status: &str) -> Color {
-    match status {
-        "pending" => Color::Yellow,
-        "tagged" => Color::Blue,
-        "queued" => Color::Cyan,
-        "processing" => Color::Magenta,
-        "processed" => Color::Green,
-        "failed" => Color::Red,
-        "skipped" => Color::Grey,
-        "deleted" => Color::DarkGrey,
-        _ => Color::White,
+    match FileStatus::parse(status) {
+        Some(FileStatus::Pending) => Color::Yellow,
+        Some(FileStatus::Tagged) => Color::Blue,
+        Some(FileStatus::Queued) => Color::Cyan,
+        Some(FileStatus::Processing) => Color::Magenta,
+        Some(FileStatus::Processed) => Color::Green,
+        Some(FileStatus::Failed) => Color::Red,
+        Some(FileStatus::Skipped) => Color::Grey,
+        Some(FileStatus::Deleted) => Color::DarkGrey,
+        None => Color::White,
     }
 }
 
@@ -158,7 +165,7 @@ fn matches_patterns(
 }
 
 /// Execute the files command (async version)
-pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
+pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Validate status if provided
     let validated_status = args.status
         .as_ref()
@@ -177,19 +184,19 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
             .into());
     }
 
-    let db = Database::open(&db_path).await
+    let db = Database::open(&db_path)
         .map_err(|e| HelpfulError::new(format!("Cannot open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the database file is not corrupted or locked"))?;
 
     // Determine which source(s) to query
     // Priority: explicit --source > --all > default context > all sources (with hint)
-    let sources = db.list_sources().await
+    let sources = db.list_sources()
         .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
-    let (source_ids, source_context_name, source_context_msg): (Vec<String>, Option<String>, Option<String>) = if let Some(ref source_name) = args.source {
+    let (source_ids, source_context_name, source_context_msg): (Vec<SourceId>, Option<String>, Option<String>) = if let Some(ref source_name) = args.source {
         // Explicit --source flag
-        let source = sources.iter().find(|s| s.name == *source_name || s.id == *source_name);
+        let source = find_source(&sources, source_name);
         match source {
             Some(s) => (
                 vec![s.id.clone()],
@@ -207,7 +214,7 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
         (sources.iter().map(|s| s.id.clone()).collect(), None, None)
     } else if let Some(default_source) = context::get_default_source() {
         // Use default context
-        let source = sources.iter().find(|s| s.name == default_source || s.id == default_source);
+        let source = find_source(&sources, &default_source);
         match source {
             Some(s) => (
                 vec![s.id.clone()],
@@ -228,23 +235,23 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Query files based on filters, restricted to selected sources
     let all_files: Vec<ScannedFile> = if let Some(topic) = &args.topic {
         // Filter by topic - this queries across all sources, then we filter
-        let topic_files = db.list_files_by_tag(topic, 10000).await
+        let topic_files = db.list_files_by_tag(topic, 10000)
             .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
         topic_files.into_iter()
-            .filter(|f| source_ids.iter().any(|s| s.as_str() == &*f.source_id))
+            .filter(|f| source_ids.iter().any(|s| s == &f.source_id))
             .collect()
     } else if let Some(status) = &validated_status {
         // Filter by status - queries across all sources, then we filter
-        let status_files = db.list_files_by_status(*status, 10000).await
+        let status_files = db.list_files_by_status(*status, 10000)
             .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
         status_files.into_iter()
-            .filter(|f| source_ids.iter().any(|s| s.as_str() == &*f.source_id))
+            .filter(|f| source_ids.iter().any(|s| s == &f.source_id))
             .collect()
     } else if args.untagged {
         // Get untagged files from selected sources
         let mut untagged_files = Vec::new();
         for source_id in &source_ids {
-            let files = db.list_untagged_files(source_id, 10000).await
+            let files = db.list_untagged_files(source_id, 10000)
                 .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
             untagged_files.extend(files);
         }
@@ -253,7 +260,7 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
         // Get all files from selected sources
         let mut all = Vec::new();
         for source_id in &source_ids {
-            let files = db.list_files_by_source(source_id, 10000).await
+            let files = db.list_files_by_source(source_id, 10000)
                 .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
             all.extend(files);
         }
@@ -296,6 +303,11 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
 
     let normalized_status = validated_status.as_ref().map(|status| status.as_str().to_string());
     let all_sources = args.all || (args.source.is_none() && source_context_name.is_none());
+    let source_id_filter = if all_sources {
+        None
+    } else {
+        source_ids.first().copied()
+    };
 
     // Handle empty results
     if files.is_empty() {
@@ -309,7 +321,7 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
                     tagged: args.tag.as_ref().map(|_| 0),
                 },
                 filters: FilesFilters {
-                    source: args.source.clone().or(source_context_name.clone()),
+                    source_id: source_id_filter,
                     all_sources,
                     topic: args.topic.clone(),
                     status: normalized_status.clone(),
@@ -346,7 +358,7 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
         }
 
         // Get total file count
-        let stats = db.get_stats().await
+        let stats = db.get_stats()
             .map_err(|e| HelpfulError::new(format!("Failed to get stats: {}", e)))?;
 
         if stats.total_files > 0 {
@@ -366,7 +378,7 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Tag files if requested
     let tagged_count = if let Some(ref new_tag) = args.tag {
         let ids: Vec<i64> = files.iter().filter_map(|f| f.id).collect();
-        let tagged = db.tag_files(&ids, new_tag).await
+        let tagged = db.tag_files(&ids, new_tag)
             .map_err(|e| HelpfulError::new(format!("Failed to tag files: {}", e)))?;
         if !args.json {
             println!(
@@ -385,7 +397,7 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
             .iter()
             .map(|f| FileOutput {
                 id: f.id,
-                source_id: f.source_id.as_ref().to_string(),
+                source_id: f.source_id,
                 path: f.path.clone(),
                 rel_path: f.rel_path.clone(),
                 size: f.size,
@@ -406,7 +418,7 @@ pub async fn run(args: FilesArgs) -> anyhow::Result<()> {
                 tagged: tagged_count,
             },
             filters: FilesFilters {
-                source: args.source.clone().or(source_context_name.clone()),
+                source_id: source_id_filter,
                 all_sources,
                 topic: args.topic.clone(),
                 status: normalized_status.clone(),
@@ -502,19 +514,29 @@ mod tests {
 
     #[test]
     fn test_validate_status() {
-        assert!(validate_status("pending").is_ok());
-        assert!(validate_status("PENDING").is_ok());
-        assert!(validate_status("Pending").is_ok());
+        let pending = FileStatus::Pending.as_str();
+        let pending_upper = pending.to_ascii_uppercase();
+        assert!(validate_status(pending).is_ok());
+        assert!(validate_status(&pending_upper).is_ok());
         assert!(validate_status("done").is_ok()); // Alias for processed
-        assert!(validate_status("failed").is_ok());
+        assert!(validate_status(FileStatus::Failed.as_str()).is_ok());
         assert!(validate_status("invalid").is_err());
     }
 
     #[test]
     fn test_color_for_status() {
-        assert!(matches!(color_for_status("pending"), Color::Yellow));
-        assert!(matches!(color_for_status("failed"), Color::Red));
-        assert!(matches!(color_for_status("processed"), Color::Green));
+        assert!(matches!(
+            color_for_status(FileStatus::Pending.as_str()),
+            Color::Yellow
+        ));
+        assert!(matches!(
+            color_for_status(FileStatus::Failed.as_str()),
+            Color::Red
+        ));
+        assert!(matches!(
+            color_for_status(FileStatus::Processed.as_str()),
+            Color::Green
+        ));
     }
 
     #[test]

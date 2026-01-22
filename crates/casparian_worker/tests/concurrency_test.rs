@@ -1,10 +1,9 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use casparian_worker::{Worker, WorkerConfig};
 use casparian_protocol::types::{self};
-use casparian_protocol::{Message, OpCode};
-use std::time::Duration;
-use tokio::time::timeout;
-use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use casparian_protocol::{JobId, Message, OpCode};
+use std::time::{Duration, Instant};
+use zmq::Context;
 
 /// Generate a random port in the ephemeral range to avoid collisions
 fn random_test_port() -> u16 {
@@ -18,13 +17,13 @@ fn random_test_port() -> u16 {
     ((seed ^ pid) % 10000 + 50000) as u16 // Ports 50000-59999
 }
 
-async fn bind_router() -> Result<(RouterSocket, String)> {
+fn bind_router(context: &Context) -> Result<(zmq::Socket, String)> {
     let mut last_err = None;
     for _ in 0..25 {
-        let mut sentinel = RouterSocket::new();
+        let sentinel = context.socket(zmq::ROUTER)?;
         let port = random_test_port();
         let bound_addr = format!("tcp://127.0.0.1:{}", port);
-        match sentinel.bind(&bound_addr).await {
+        match sentinel.bind(&bound_addr) {
             Ok(_) => return Ok((sentinel, bound_addr)),
             Err(err) => {
                 last_err = Some(err);
@@ -32,18 +31,32 @@ async fn bind_router() -> Result<(RouterSocket, String)> {
         }
     }
 
-    Err(anyhow::anyhow!(
+    Err(anyhow!(
         "Failed to bind mock sentinel after multiple attempts: {:?}",
         last_err
     ))
 }
 
+fn recv_multipart_with_timeout(
+    socket: &zmq::Socket,
+    timeout: Duration,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    socket.set_rcvtimeo(timeout_ms)?;
+    match socket.recv_multipart(0) {
+        Ok(parts) => Ok(Some(parts)),
+        Err(zmq::Error::EAGAIN) => Ok(None),
+        Err(err) => Err(anyhow!("ZMQ error: {}", err)),
+    }
+}
+
 /// Test that worker responds to heartbeat messages promptly.
 /// This validates the worker's event loop is non-blocking.
-#[tokio::test]
-async fn test_worker_heartbeat_responsiveness() -> Result<()> {
+#[test]
+fn test_worker_heartbeat_responsiveness() -> Result<()> {
     // 1. Setup Mock Sentinel (Router) with random port
-    let (mut sentinel, bound_addr) = bind_router().await?;
+    let context = Context::new();
+    let (sentinel, bound_addr) = bind_router(&context)?;
     println!("Mock Sentinel bound to {}", bound_addr);
 
     // 2. Setup Worker with isolated temp directory
@@ -65,20 +78,23 @@ async fn test_worker_heartbeat_responsiveness() -> Result<()> {
         venvs_dir: Some(venvs_dir),
     };
 
-    // 3. Connect Worker
-    let worker_handle = tokio::spawn(async move {
-        let (worker, _worker_handle) = Worker::connect(config)
-            .await
-            .expect("Worker failed to connect");
-        worker.run().await.expect("Worker run failed");
+    let (worker, worker_handle) = Worker::connect(config)
+        .expect("Worker failed to connect");
+    let worker_thread = std::thread::spawn(move || {
+        worker.run().expect("Worker run failed");
     });
 
     // 4. Accept IDENTIFY from worker
-    let multipart = timeout(Duration::from_secs(5), sentinel.recv()).await??;
+    let multipart = recv_multipart_with_timeout(&sentinel, Duration::from_secs(5))?
+        .ok_or_else(|| anyhow!("Timeout waiting for IDENTIFY"))?;
     let identity = multipart.get(0).unwrap().to_vec();
+    let mut cursor = 1;
+    if multipart.get(1).map(|p| p.is_empty()).unwrap_or(false) {
+        cursor += 1;
+    }
     let msg = Message::unpack(&[
-        multipart.get(1).unwrap().to_vec(),
-        multipart.get(2).unwrap().to_vec(),
+        multipart.get(cursor).unwrap().to_vec(),
+        multipart.get(cursor + 1).unwrap().to_vec(),
     ])?;
     assert_eq!(msg.header.opcode, OpCode::Identify);
     println!("Received IDENTIFY from worker");
@@ -87,28 +103,30 @@ async fn test_worker_heartbeat_responsiveness() -> Result<()> {
     for i in 0..3 {
         let heartbeat_payload = types::HeartbeatPayload {
             status: types::HeartbeatStatus::Alive,
-            current_job_id: None,
             active_job_count: 0,
             active_job_ids: vec![],
         };
-        let hb_msg = Message::new(OpCode::Heartbeat, 0, serde_json::to_vec(&heartbeat_payload)?)
+        let hb_msg = Message::new(OpCode::Heartbeat, JobId::new(0), serde_json::to_vec(&heartbeat_payload)?)
             .map_err(|e| anyhow::anyhow!("Failed to create message: {}", e))?;
         let (h, p) = hb_msg.pack()
             .map_err(|e| anyhow::anyhow!("Failed to pack message: {}", e))?;
-        let mut multipart = ZmqMessage::from(identity.clone());
-        multipart.push_back(h.into());
-        multipart.push_back(p.into());
+        let frames = vec![identity.clone(), h.to_vec(), p.to_vec()];
 
-        let start = std::time::Instant::now();
-        sentinel.send(multipart).await?;
+        let start = Instant::now();
+        sentinel.send_multipart(&frames, 0)?;
 
         // Response should arrive within 500ms (worker loop timeout is 100ms)
-        let reply = timeout(Duration::from_millis(500), sentinel.recv()).await??;
+        let reply = recv_multipart_with_timeout(&sentinel, Duration::from_millis(500))?
+            .ok_or_else(|| anyhow!("Timeout waiting for heartbeat response"))?;
         let elapsed = start.elapsed();
 
+        let mut reply_cursor = 1;
+        if reply.get(1).map(|p| p.is_empty()).unwrap_or(false) {
+            reply_cursor += 1;
+        }
         let reply_msg = Message::unpack(&[
-            reply.get(1).unwrap().to_vec(),
-            reply.get(2).unwrap().to_vec(),
+            reply.get(reply_cursor).unwrap().to_vec(),
+            reply.get(reply_cursor + 1).unwrap().to_vec(),
         ])?;
         assert_eq!(reply_msg.header.opcode, OpCode::Heartbeat);
 
@@ -128,19 +146,21 @@ async fn test_worker_heartbeat_responsiveness() -> Result<()> {
     println!("SUCCESS: Worker responds promptly to heartbeats");
 
     // Cleanup
-    worker_handle.abort();
+    let _ = worker_handle.shutdown();
+    let _ = worker_thread.join();
     Ok(())
 }
 
 /// Test graceful shutdown: worker should send CONCLUDE for active jobs before exiting.
 /// This validates the critical path for graceful shutdown draining.
-#[tokio::test]
-async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
+#[test]
+fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     // 1. Setup Mock Sentinel
-    let (mut sentinel, bound_addr) = bind_router().await?;
+    let context = Context::new();
+    let (sentinel, bound_addr) = bind_router(&context)?;
 
     // 2. Setup Worker with test venv
     let tmp = tempfile::tempdir()?;
@@ -177,22 +197,25 @@ async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     };
 
     // 3. Connect Worker and get shutdown handle
-    let (worker, shutdown_handle) = Worker::connect(config).await?;
+    let (worker, shutdown_handle) = Worker::connect(config)?;
 
     let concluded = Arc::new(AtomicBool::new(false));
     let concluded_clone = concluded.clone();
 
     // 4. Spawn worker task
-    let worker_handle = tokio::spawn(async move {
-        worker.run().await
-    });
+    let worker_thread = std::thread::spawn(move || worker.run().expect("Worker run failed"));
 
     // 5. Accept IDENTIFY
-    let multipart = timeout(Duration::from_secs(5), sentinel.recv()).await??;
+    let multipart = recv_multipart_with_timeout(&sentinel, Duration::from_secs(5))?
+        .ok_or_else(|| anyhow!("Timeout waiting for IDENTIFY"))?;
     let identity = multipart.get(0).unwrap().to_vec();
+    let mut cursor = 1;
+    if multipart.get(1).map(|p| p.is_empty()).unwrap_or(false) {
+        cursor += 1;
+    }
     let msg = Message::unpack(&[
-        multipart.get(1).unwrap().to_vec(),
-        multipart.get(2).unwrap().to_vec(),
+        multipart.get(cursor).unwrap().to_vec(),
+        multipart.get(cursor + 1).unwrap().to_vec(),
     ])?;
     assert_eq!(msg.header.opcode, OpCode::Identify);
 
@@ -203,69 +226,71 @@ async fn test_graceful_shutdown_sends_conclude() -> Result<()> {
         file_path: "/tmp/test.csv".to_string(),
         sinks: vec![],
         file_id: 1,
-        env_hash: env_hash.to_string(),
-        source_code: "# test".to_string(),
-        artifact_hash: None,
+        runtime_kind: types::RuntimeKind::PythonShim,
+        entrypoint: "test_plugin.py:Handler".to_string(),
+        platform_os: None,
+        platform_arch: None,
+        signature_verified: false,
+        signer_id: None,
+        env_hash: Some(env_hash.to_string()),
+        source_code: Some("# test".to_string()),
+        artifact_hash: "artifact_hash_test".to_string(),
     };
     let payload = serde_json::to_vec(&dispatch_cmd)?;
-    let dispatch_msg = Message::new(OpCode::Dispatch, 42, payload)
+    let dispatch_msg = Message::new(OpCode::Dispatch, JobId::new(42), payload)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let (h, p) = dispatch_msg.pack()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let mut multipart = ZmqMessage::from(identity.clone());
-    multipart.push_back(h.into());
-    multipart.push_back(p.into());
-    sentinel.send(multipart).await?;
+    let frames = vec![identity.clone(), h.to_vec(), p.to_vec()];
+    sentinel.send_multipart(&frames, 0)?;
 
     // 7. Wait a bit for job to start processing
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    std::thread::sleep(Duration::from_millis(100));
 
     // 8. Send shutdown signal
     shutdown_handle
         .shutdown_gracefully(Duration::from_secs(5))
-        .await?;
+        ?;
 
     // 9. Worker should send CONCLUDE before exiting (even for failed job)
-    let conclude_result = timeout(Duration::from_secs(10), async {
-        loop {
-            match timeout(Duration::from_millis(500), sentinel.recv()).await {
-                Ok(Ok(multipart)) => {
-                    if multipart.len() >= 3 {
-                        if let Ok(msg) = Message::unpack(&[
-                            multipart.get(1).unwrap().to_vec(),
-                            multipart.get(2).unwrap().to_vec(),
-                        ]) {
-                            if msg.header.opcode == OpCode::Conclude {
-                                concluded_clone.store(true, Ordering::SeqCst);
-                                return Ok::<_, anyhow::Error>(msg);
-                            }
+    let start = Instant::now();
+    let mut conclude_result = None;
+    while start.elapsed() < Duration::from_secs(10) {
+        match recv_multipart_with_timeout(&sentinel, Duration::from_millis(500))? {
+            Some(multipart) => {
+                if multipart.len() >= 3 {
+                    let mut cursor = 1;
+                    if multipart.get(1).map(|p| p.is_empty()).unwrap_or(false) {
+                        cursor += 1;
+                    }
+                    if let Ok(msg) = Message::unpack(&[
+                        multipart.get(cursor).unwrap().to_vec(),
+                        multipart.get(cursor + 1).unwrap().to_vec(),
+                    ]) {
+                        if msg.header.opcode == OpCode::Conclude {
+                            concluded_clone.store(true, Ordering::SeqCst);
+                            conclude_result = Some(msg);
+                            break;
                         }
                     }
                 }
-                Ok(Err(e)) => {
-                    // ZMQ error - might be shutdown
-                    return Err(anyhow::anyhow!("ZMQ error: {}", e));
-                }
-                Err(_) => {
-                    // Timeout - check if worker exited
-                    if worker_handle.is_finished() {
-                        return Err(anyhow::anyhow!("Worker exited without sending CONCLUDE"));
-                    }
-                }
+            }
+            None => {
+                continue;
             }
         }
-    }).await;
+    }
 
     // 10. Verify CONCLUDE was sent
     assert!(
-        concluded.load(Ordering::SeqCst) || conclude_result.is_ok(),
+        concluded.load(Ordering::SeqCst) || conclude_result.is_some(),
         "Worker should send CONCLUDE for active job during graceful shutdown"
     );
 
     println!("SUCCESS: Worker sent CONCLUDE during graceful shutdown");
 
     // Cleanup
-    worker_handle.abort();
+    let _ = worker_thread.join();
     Ok(())
 }

@@ -13,7 +13,6 @@
 //! 4. Favor end-to-end flows over unit-only coverage
 
 use std::fs;
-use std::future::Future;
 #[cfg(feature = "full")]
 use std::process::Command;
 use tempfile::TempDir;
@@ -30,38 +29,27 @@ use cli_support::with_duckdb;
 mod database {
     use super::*;
 
-    fn run_async<F: Future<Output = T>, T>(future: F) -> T {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build runtime");
-        rt.block_on(future)
-    }
-
     /// Critical: DuckDB must persist data to disk
     #[test]
     fn test_duckdb_persistence() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.duckdb");
 
-        with_duckdb(&db_path, |conn| async move {
+        with_duckdb(&db_path, |conn| {
             conn.execute(
                 "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)",
                 &[],
             )
-            .await
             .unwrap();
             conn.execute(
                 "INSERT INTO test (id, value) VALUES (?, ?)",
                 &[DbValue::from(1i64), DbValue::from("data1")],
             )
-                .await
-                .unwrap();
+            .unwrap();
         });
 
-        let value: String = with_duckdb(&db_path, |conn| async move {
+        let value: String = with_duckdb(&db_path, |conn| {
             conn.query_scalar("SELECT value FROM test WHERE id = 1", &[])
-                .await
                 .unwrap()
         });
         assert_eq!(value, "data1");
@@ -75,35 +63,32 @@ mod database {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("readonly.duckdb");
 
-        with_duckdb(&db_path, |conn| async move {
+        with_duckdb(&db_path, |conn| {
             conn.execute(
                 "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)",
                 &[],
             )
-            .await
             .unwrap();
             conn.execute(
                 "INSERT INTO test (id, value) VALUES (?, ?)",
                 &[DbValue::from(1i64), DbValue::from("data1")],
             )
-                .await
-                .unwrap();
+            .unwrap();
         });
 
-        let readonly = run_async(DbConnection::open_duckdb_readonly(&db_path))
+        let readonly = DbConnection::open_duckdb_readonly(&db_path)
             .expect("open readonly");
-        let value: String = run_async(readonly.query_scalar(
-            "SELECT value FROM test WHERE id = 1",
-            &[],
-        ))
-        .expect("read value");
+        let value: String = readonly
+            .query_scalar("SELECT value FROM test WHERE id = 1", &[])
+            .expect("read value");
         assert_eq!(value, "data1");
 
-        let write_err = run_async(readonly.execute(
-            "INSERT INTO test (value) VALUES (?)",
-            &[DbValue::from("data2")],
-        ))
-        .expect_err("read-only should reject writes");
+        let write_err = readonly
+            .execute(
+                "INSERT INTO test (value) VALUES (?)",
+                &[DbValue::from("data2")],
+            )
+            .expect_err("read-only should reject writes");
         assert!(matches!(write_err, BackendError::ReadOnly));
     }
 
@@ -113,10 +98,10 @@ mod database {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("concurrent.duckdb");
 
-        let writer = run_async(DbConnection::open_duckdb(&db_path))
+        let writer = DbConnection::open_duckdb(&db_path)
             .expect("open writer");
 
-        let second_writer = run_async(DbConnection::open_duckdb(&db_path));
+        let second_writer = DbConnection::open_duckdb(&db_path);
         assert!(
             matches!(second_writer, Err(BackendError::Locked(_))),
             "expected lock error, got: {:?}",
@@ -125,7 +110,7 @@ mod database {
 
         drop(writer);
 
-        let reopened = run_async(DbConnection::open_duckdb(&db_path));
+        let reopened = DbConnection::open_duckdb(&db_path);
         assert!(reopened.is_ok(), "expected writer lock released");
     }
 }
@@ -213,12 +198,12 @@ mod binary {
 
 mod scout {
     use super::*;
-    use casparian::scout::{Database, Scanner, ScanProgress, Source, SourceType};
-    use tokio::sync::mpsc;
+    use casparian::scout::{Database, Scanner, ScanProgress, Source, SourceId, SourceType};
+    use std::sync::mpsc;
 
     /// Critical: Scanner must send progress updates during scan
-    #[tokio::test]
-    async fn test_scanner_sends_progress_updates() {
+    #[test]
+    fn test_scanner_sends_progress_updates() {
         let temp_dir = TempDir::new().unwrap();
 
         // Create test files - enough to trigger progress updates
@@ -228,11 +213,11 @@ mod scout {
         }
 
         // Create in-memory database
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory().unwrap();
 
         // Create source
         let source = Source {
-            id: "test-source".to_string(),
+            id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: temp_dir.path().to_string_lossy().to_string(),
@@ -241,24 +226,17 @@ mod scout {
         };
 
         // Create progress channel
-        let (progress_tx, mut progress_rx) = mpsc::channel::<ScanProgress>(256);
+        let (progress_tx, progress_rx) = mpsc::channel::<ScanProgress>();
 
         // Create scanner
         let scanner = Scanner::new(db);
 
         // Run scan with progress
-        let scan_handle = tokio::spawn(async move {
-            scanner.scan(&source, Some(progress_tx), None).await
-        });
+        let result = scanner.scan(&source, Some(progress_tx.clone()), None).unwrap();
+        drop(progress_tx);
 
         // Collect progress updates
-        let mut progress_updates = Vec::new();
-        while let Some(progress) = progress_rx.recv().await {
-            progress_updates.push(progress);
-        }
-
-        // Wait for scan to complete
-        let result = scan_handle.await.unwrap().unwrap();
+        let progress_updates: Vec<_> = progress_rx.try_iter().collect();
 
         // CRITICAL: Must receive at least initial and final progress
         assert!(
@@ -284,8 +262,8 @@ mod scout {
     }
 
     /// Critical: Rescanning same path should work (use existing source)
-    #[tokio::test]
-    async fn test_rescan_existing_source_works() {
+    #[test]
+    fn test_rescan_existing_source_works() {
         let temp_dir = TempDir::new().unwrap();
 
         // Create test files
@@ -293,10 +271,10 @@ mod scout {
             fs::write(temp_dir.path().join(format!("file_{}.txt", i)), "content").unwrap();
         }
 
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory().unwrap();
 
         let source = Source {
-            id: "test-source".to_string(),
+            id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: temp_dir.path().to_string_lossy().to_string(),
@@ -305,30 +283,30 @@ mod scout {
         };
 
         // Upsert source
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         let scanner = Scanner::new(db.clone());
 
         // First scan
-        let result1 = scanner.scan_source(&source).await.unwrap();
+        let result1 = scanner.scan_source(&source).unwrap();
         assert_eq!(result1.stats.files_discovered, 10);
 
         // Rescan same source (should work without error)
-        let result2 = scanner.scan_source(&source).await.unwrap();
+        let result2 = scanner.scan_source(&source).unwrap();
         assert_eq!(result2.stats.files_discovered, 10);
 
         // Source should still exist
-        let loaded = db.get_source_by_path(&source.path).await.unwrap();
+        let loaded = db.get_source_by_path(&source.path).unwrap();
         assert!(loaded.is_some(), "Source should still exist after rescan");
     }
 
     /// Critical: Source names must be unique
-    #[tokio::test]
-    async fn test_unique_source_names() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_unique_source_names() {
+        let db = Database::open_in_memory().unwrap();
 
         let source1 = Source {
-            id: "source-1".to_string(),
+            id: SourceId::new(),
             name: "data".to_string(),
             source_type: SourceType::Local,
             path: "/path/to/data".to_string(),
@@ -337,7 +315,7 @@ mod scout {
         };
 
         let source2 = Source {
-            id: "source-2".to_string(),
+            id: SourceId::new(),
             name: "data".to_string(), // Same name!
             source_type: SourceType::Local,
             path: "/other/path/to/data".to_string(),
@@ -346,10 +324,10 @@ mod scout {
         };
 
         // First insert should succeed
-        db.upsert_source(&source1).await.unwrap();
+        db.upsert_source(&source1).unwrap();
 
         // Second insert with same name but different ID should fail
-        let result = db.upsert_source(&source2).await;
+        let result = db.upsert_source(&source2);
         assert!(result.is_err(), "Should fail with duplicate name");
     }
 }

@@ -501,6 +501,28 @@ class TradeParser:
     }
 ```
 
+**Decision (pre-v1)**:
+- Publish requires a `casparian.toml` manifest (name/version/protocol_version).
+- Schema-as-code is the only supported authoring path for publish (Registry/Vault eligible).
+- A canonical schema artifact (JSON/Arrow) is required for signing/registry and may be produced by tooling.
+- Hand-authored JSON sidecars are not supported for publish.
+- AST-extractable literals are required; no code execution at publish time.
+  - An import tool may exist for migration, but JSON is not a supported authoring format.
+
+**Publish manifest (required):**
+Each parser directory must include a `casparian.toml` with minimal metadata:
+
+```toml
+name = "trade_parser"
+version = "1.0.0"
+protocol_version = "0.1"
+# optional for Python; required for non-Python runtimes later
+entrypoint = "parser.py:parse"
+```
+
+The manifest is serialized to canonical JSON at publish time and included in the
+artifact hash for reproducibility and registry/Vault signing.
+
 ### 6.2 Type System
 
 #### 6.2.1 Manifest Type Notation (Python dict)
@@ -573,7 +595,7 @@ pub enum DataType {
     List { item: Box<DataType> },
     Struct { fields: Vec<StructField> },
 
-    // DEFERRED to v2: Union type for dirty legacy data
+    // DEFERRED to v2: Union type for dirty data
     // Union { variants: Vec<DataType> },
 }
 
@@ -809,16 +831,18 @@ SELECT * FROM trades_quarantine WHERE _cf_job_id = 'abc123'
 
 ### 6.8 SDK (Optional Authoring Helper)
 
-The SDK is for **validation and codegen**, not inline use:
+The SDK is for **validation and codegen**, not runtime execution. It produces
+AST-extractable schema-as-code and a canonical schema artifact (JSON/Arrow).
+Hand-authored JSON sidecars are not accepted for publish.
 
 ```python
 # WRONG: Function calls not AST-extractable
 from casparian import schema
 outputs = {"trades": {"columns": [{"type": schema.decimal(18, 8)}]}}  # FAILS
 
-# RIGHT: SDK generates literal dict, user copies to file
+# RIGHT: SDK generates schema-as-code, user copies to file
 $ casparian schema generate trade_parser.py
-# Outputs:
+# Outputs (example in trade_parser.schema.py):
 outputs = {
     "trades": {
         "mode": "strict",
@@ -834,6 +858,7 @@ $ casparian parser validate trade_parser.py
 ✓ outputs manifest is valid
 ✓ All types recognized
 ✓ No variable references (AST-safe)
+✓ JSON sidecar schemas are rejected for publish
 ```
 
 ---
@@ -944,26 +969,21 @@ class TradeParser:
 
 **Trade-off**: PyArrow has rich types and IDE support, but breaks the non-execution constraint.
 
-### 8.2 Sidecar Manifest File
+### 8.2 JSON Sidecar Manifest File
 
 **Approach**: `trade_parser.schema.json` alongside `trade_parser.py`.
 
-```json
-{
-  "outputs": {
-    "trades": {
-      "columns": [...]
-    }
-  }
-}
-```
+**Rejected (as authoring path)**:
+- Publish/Registry/Vault are schema-as-code only (AST-extractable).
+- Hand-authored JSON sidecars are not supported for publish.
 
-**Partially adopted**:
-- Sidecar is fallback when AST extraction fails
-- Primary is in-parser `outputs` dict
-- Sidecar includes `parser_source_hash` for staleness detection
+**Canonical artifact (kept)**:
+- A canonical schema artifact (JSON/Arrow) is required for signing/registry and
+  may be produced by tooling from schema-as-code or other languages.
 
-**Trade-off**: Two files to maintain, but provides escape hatch for complex cases.
+**Migration note**:
+- A one-time import tool may exist to convert JSON to schema-as-code,
+  but JSON is not a supported authoring format.
 
 ### 8.3 String-Based Type Notation
 
@@ -1008,7 +1028,7 @@ class TradeParser:
 - Query engines (DuckDB, Pandas) have poor Union support
 - Quarantine pattern handles this case adequately for v1
 
-**Trade-off**: Cleaner data model vs. supporting dirty legacy data inline.
+**Trade-off**: Cleaner data model vs. supporting dirty data inline.
 
 ---
 
@@ -1081,7 +1101,7 @@ Future consideration: Add tooling to suggest compatible amendments.
 
 ### 10.1 Union Type (v2)
 
-For dirty legacy data where a column is "mostly Int, sometimes String":
+For dirty data where a column is "mostly Int, sometimes String":
 
 ```python
 {"kind": "union", "variants": [{"kind": "int64"}, {"kind": "string"}]}
@@ -1130,9 +1150,18 @@ class ADTParser:
 **Proposed path**:
 1. Parsers without `outputs` continue to work (inference mode)
 2. TUI shows warning: "Parser lacks outputs manifest. Schema inferred."
-3. CLI command: `casparian schema infer parser.py` generates manifest from sample
+3. CLI command: `casparian schema infer parser.py` generates schema-as-code + manifest from sample
 4. User adds generated manifest to parser
 5. Next approval creates contract from manifest
+
+### 10.6 Language-Neutral Plugin Protocol (Future)
+
+If non-Python plugins are supported, the runtime contract becomes a **process protocol**:
+- Engine spawns a plugin subprocess (python_uv first; native/wasm later).
+- **stdout** streams Arrow IPC batches; **stderr** emits newline-delimited JSON control frames.
+- Output boundaries are explicit (`output_begin` / `output_end`) to support multi-output.
+- Publish remains **manifest-first**; canonical schema artifacts (JSON/Arrow) are language-neutral.
+- `casparian.toml` grows `runtime_kind` + `entrypoint`/`artifact` fields; Vault signing becomes mandatory for native binaries.
 
 ---
 

@@ -5,7 +5,7 @@
 use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::print_table;
-use casparian::scout::{Database, TaggingRule};
+use casparian::scout::{Database, TaggingRule, TaggingRuleId};
 use clap::Subcommand;
 use glob::Pattern;
 
@@ -57,25 +57,32 @@ fn validate_pattern(pattern: &str) -> Result<Pattern, HelpfulError> {
     })
 }
 
+fn find_rule<'a>(rules: &'a [TaggingRule], input: &str) -> Option<&'a TaggingRule> {
+    let parsed_id = TaggingRuleId::parse(input).ok();
+    rules
+        .iter()
+        .find(|r| r.pattern == input || parsed_id.map_or(false, |id| r.id == id))
+}
+
 /// Count how many files in the database match a pattern
-async fn count_matching_files(db: &Database, pattern: &str) -> u64 {
+fn count_matching_files(db: &Database, pattern: &str) -> u64 {
     let pat = match Pattern::new(pattern) {
         Ok(p) => p,
         Err(_) => return 0,
     };
 
     // Get all files and count matches
-    let stats = db.get_stats().await.unwrap_or_default();
+    let stats = db.get_stats().unwrap_or_default();
     if stats.total_files == 0 {
         return 0;
     }
 
     // Query all sources and their files
-    let sources = db.list_sources().await.unwrap_or_default();
+    let sources = db.list_sources().unwrap_or_default();
     let mut matched = 0u64;
 
     for source in sources {
-        let files = db.list_files_by_source(&source.id, 100000).await.unwrap_or_default();
+        let files = db.list_files_by_source(&source.id, 100000).unwrap_or_default();
         for file in files {
             // Match against relative path
             if pat.matches(&file.rel_path) {
@@ -88,39 +95,34 @@ async fn count_matching_files(db: &Database, pattern: &str) -> u64 {
 }
 
 /// Get matched file count for a specific rule
-async fn get_rule_matched_count(db: &Database, rule: &TaggingRule) -> u64 {
-    count_matching_files(db, &rule.pattern).await
+fn get_rule_matched_count(db: &Database, rule: &TaggingRule) -> u64 {
+    count_matching_files(db, &rule.pattern)
 }
 
 /// Execute the rule command
 pub fn run(action: RuleAction) -> anyhow::Result<()> {
-    // Create a runtime for async operations
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(run_async(action))
+    run_with_action(action)
 }
 
-async fn run_async(action: RuleAction) -> anyhow::Result<()> {
+fn run_with_action(action: RuleAction) -> anyhow::Result<()> {
     let db_path = active_db_path();
-    let db = Database::open(&db_path).await.map_err(|e| {
+    let db = Database::open(&db_path).map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
 
     match action {
-        RuleAction::List { json } => list_rules(&db, json).await,
-        RuleAction::Add { pattern, topic, priority } => add_rule(&db, pattern, topic, priority).await,
-        RuleAction::Show { id, json } => show_rule(&db, &id, json).await,
-        RuleAction::Remove { id, force } => remove_rule(&db, &id, force).await,
-        RuleAction::Test { id, path } => test_rule(&db, &id, &path).await,
+        RuleAction::List { json } => list_rules(&db, json),
+        RuleAction::Add { pattern, topic, priority } => add_rule(&db, pattern, topic, priority),
+        RuleAction::Show { id, json } => show_rule(&db, &id, json),
+        RuleAction::Remove { id, force } => remove_rule(&db, &id, force),
+        RuleAction::Test { id, path } => test_rule(&db, &id, &path),
     }
 }
 
-async fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules().await.map_err(|e| {
+fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
+    let rules = db.list_tagging_rules().map_err(|e| {
         HelpfulError::new(format!("Failed to list rules: {}", e))
     })?;
 
@@ -135,7 +137,7 @@ async fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
     if json {
         let mut output = Vec::new();
         for rule in &rules {
-            let matched = get_rule_matched_count(db, rule).await;
+            let matched = get_rule_matched_count(db, rule);
             output.push(serde_json::json!({
                 "id": rule.id,
                 "pattern": rule.pattern,
@@ -153,7 +155,7 @@ async fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
 
     let mut rows = Vec::new();
     for rule in &rules {
-        let matched = get_rule_matched_count(db, rule).await;
+        let matched = get_rule_matched_count(db, rule);
         rows.push(vec![
             rule.pattern.clone(),
             rule.tag.clone(),
@@ -169,12 +171,12 @@ async fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> anyhow::Result<()> {
+fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> anyhow::Result<()> {
     // Validate pattern
     validate_pattern(&pattern)?;
 
     // Check if we have any sources
-    let sources = db.list_sources().await?;
+    let sources = db.list_sources()?;
     if sources.is_empty() {
         return Err(HelpfulError::new("No sources configured")
             .with_context("Rules require at least one source")
@@ -183,9 +185,9 @@ async fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) 
     }
 
     // Check if pattern already exists
-    let existing = db.list_tagging_rules().await?;
+    let existing = db.list_tagging_rules()?;
     for rule in &existing {
-        if rule.pattern == pattern {
+                if rule.pattern == pattern {
             return Err(HelpfulError::new(format!("Pattern already exists: {}", pattern))
                 .with_context(format!("Rule ID: {}, Topic: {}", rule.id, rule.tag))
                 .with_suggestion("TRY: Use 'casparian rule rm' to remove the existing rule first")
@@ -198,7 +200,7 @@ async fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) 
     let source = &sources[0];
 
     let rule = TaggingRule {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: TaggingRuleId::new(),
         name: format!("{} -> {}", pattern, topic),
         source_id: source.id.clone(),
         pattern: pattern.clone(),
@@ -207,12 +209,12 @@ async fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) 
         enabled: true,
     };
 
-    db.upsert_tagging_rule(&rule).await.map_err(|e| {
+    db.upsert_tagging_rule(&rule).map_err(|e| {
         HelpfulError::new(format!("Failed to create rule: {}", e))
     })?;
 
     // Count existing matches
-    let matched = count_matching_files(db, &pattern).await;
+    let matched = count_matching_files(db, &pattern);
 
     println!("Added rule: {} -> {}", pattern, topic);
     println!("  Priority: {}", priority);
@@ -228,9 +230,9 @@ async fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) 
     Ok(())
 }
 
-async fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules().await?;
-    let rule = rules.iter().find(|r| r.id == id || r.pattern == id);
+fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
+    let rules = db.list_tagging_rules()?;
+    let rule = find_rule(&rules, id);
 
     let rule = match rule {
         Some(r) => r,
@@ -241,7 +243,7 @@ async fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
         }
     };
 
-    let matched = get_rule_matched_count(db, rule).await;
+    let matched = get_rule_matched_count(db, rule);
 
     if json {
         let output = serde_json::json!({
@@ -273,7 +275,7 @@ async fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
         println!();
         println!("SAMPLE MATCHES (first 5):");
         let pat = Pattern::new(&rule.pattern).unwrap();
-        let files = db.list_files_by_source(&rule.source_id, 1000).await.unwrap_or_default();
+        let files = db.list_files_by_source(&rule.source_id, 1000).unwrap_or_default();
         let mut count = 0;
         for file in files {
             if pat.matches(&file.rel_path) {
@@ -289,9 +291,9 @@ async fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules().await?;
-    let rule = rules.iter().find(|r| r.id == id || r.pattern == id);
+fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()> {
+    let rules = db.list_tagging_rules()?;
+    let rule = find_rule(&rules, id);
 
     let rule = match rule {
         Some(r) => r,
@@ -303,10 +305,10 @@ async fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()>
     };
 
     // Count files that were tagged by this rule
-    let files = db.list_files_by_source(&rule.source_id, 100000).await.unwrap_or_default();
+    let files = db.list_files_by_source(&rule.source_id, 100000).unwrap_or_default();
     let tagged_by_rule: Vec<_> = files
         .iter()
-        .filter(|f| f.rule_id.as_deref() == Some(&rule.id))
+        .filter(|f| f.rule_id.as_ref() == Some(&rule.id))
         .collect();
 
     if !tagged_by_rule.is_empty() && !force {
@@ -323,7 +325,7 @@ async fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()>
     let rule_id = rule.id.clone();
     let rule_pattern = rule.pattern.clone();
 
-    db.delete_tagging_rule(&rule_id).await.map_err(|e| {
+    db.delete_tagging_rule(&rule_id).map_err(|e| {
         HelpfulError::new(format!("Failed to remove rule: {}", e))
     })?;
 
@@ -336,9 +338,9 @@ async fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn test_rule(db: &Database, id: &str, path: &str) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules().await?;
-    let rule = rules.iter().find(|r| r.id == id || r.pattern == id);
+fn test_rule(db: &Database, id: &str, path: &str) -> anyhow::Result<()> {
+    let rules = db.list_tagging_rules()?;
+    let rule = find_rule(&rules, id);
 
     let rule = match rule {
         Some(r) => r,
@@ -367,7 +369,7 @@ async fn test_rule(db: &Database, id: &str, path: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian::scout::{ScannedFile, Source, SourceType};
+    use casparian::scout::{ScannedFile, Source, SourceId, SourceType, TaggingRuleId};
 
     #[test]
     fn test_validate_pattern_valid() {
@@ -401,72 +403,74 @@ mod tests {
         assert!(!pat.matches("test.json"));
     }
 
-    #[tokio::test]
-    async fn test_add_rule_creates_entry() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_add_rule_creates_entry() {
+        let db = Database::open_in_memory().unwrap();
+        let source_id = SourceId::new();
 
         // Add a source first
         let source = Source {
-            id: "src-1".to_string(),
+            id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         // Add a rule
         let rule = TaggingRule {
-            id: "rule-1".to_string(),
+            id: TaggingRuleId::new(),
             name: "CSV Files".to_string(),
-            source_id: "src-1".to_string(),
+            source_id: source_id.clone(),
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,
             enabled: true,
         };
-        db.upsert_tagging_rule(&rule).await.unwrap();
+        db.upsert_tagging_rule(&rule).unwrap();
 
-        let rules = db.list_tagging_rules().await.unwrap();
+        let rules = db.list_tagging_rules().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].pattern, "*.csv");
         assert_eq!(rules[0].tag, "csv_data");
     }
 
-    #[tokio::test]
-    async fn test_count_matching_files() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_count_matching_files() {
+        let db = Database::open_in_memory().unwrap();
+        let source_id = SourceId::new();
 
         let source = Source {
-            id: "src-1".to_string(),
+            id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         // Add files
         for name in &["test.csv", "data.csv", "info.json"] {
             let file = ScannedFile::new(
-                "src-1",
+                source_id.clone(),
                 &format!("/data/{}", name),
                 name,
                 1000,
                 12345,
             );
-            db.upsert_file(&file).await.unwrap();
+            db.upsert_file(&file).unwrap();
         }
 
-        let csv_matches = count_matching_files(&db, "*.csv").await;
+        let csv_matches = count_matching_files(&db, "*.csv");
         assert_eq!(csv_matches, 2);
 
-        let json_matches = count_matching_files(&db, "*.json").await;
+        let json_matches = count_matching_files(&db, "*.json");
         assert_eq!(json_matches, 1);
 
-        let all_matches = count_matching_files(&db, "*.*").await;
+        let all_matches = count_matching_files(&db, "*.*");
         assert_eq!(all_matches, 3);
     }
 }

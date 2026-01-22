@@ -306,14 +306,19 @@ class BridgeContext:
             finally:
                 self._socket = None
 
-    def send_error(self, message: str):
+    def send_error(self, message: str, retryable: bool, kind: str):
         """Send an error signal to the Host."""
         if self._socket:
             try:
                 # Error signal header
                 self._socket.sendall(struct.pack(HEADER_FORMAT, ERROR_SIGNAL))
                 # Error message
-                error_bytes = message.encode("utf-8")
+                payload = {
+                    "error": message,
+                    "retryable": retryable,
+                    "kind": kind,
+                }
+                error_bytes = json.dumps(payload).encode("utf-8")
                 self._socket.sendall(struct.pack(HEADER_FORMAT, len(error_bytes)))
                 self._socket.sendall(error_bytes)
             except Exception as e:
@@ -414,7 +419,16 @@ class BridgeContext:
             self._socket.sendall(struct.pack(HEADER_FORMAT, output_index))
 
             total_rows = 0
-            for batch in table.to_batches(max_chunksize=MAX_ROWS_PER_BATCH):
+            batches = []
+            if table.num_rows == 0:
+                empty_arrays = [
+                    pa.array([], type=field.type) for field in table.schema
+                ]
+                batches = [pa.RecordBatch.from_arrays(empty_arrays, schema=table.schema)]
+            else:
+                batches = table.to_batches(max_chunksize=MAX_ROWS_PER_BATCH)
+
+            for batch in batches:
                 total_rows += batch.num_rows
                 sink = BytesIO()
                 with pa.ipc.new_stream(sink, batch.schema) as writer:
@@ -448,9 +462,8 @@ def execute_plugin(
     """
     Execute plugin code with the provided file path.
 
-    Supports two patterns:
-    1. parse() function (new) - returns DataFrame or list[Output]
-    2. Handler class (legacy) - execute()/consume() methods that yield batches
+    Supports a single pattern:
+    1. parse() function - returns DataFrame or list[Output]
 
     Args:
         source_code: Plugin source code
@@ -478,7 +491,7 @@ def execute_plugin(
     # Track output metadata for multi-output parsers
     output_info = []
 
-    # Check for parse() function (new pattern)
+    # Check for parse() function
     if "parse" in plugin_namespace and callable(plugin_namespace["parse"]):
         parse_fn = plugin_namespace["parse"]
 
@@ -521,47 +534,8 @@ def execute_plugin(
                     f"parse() must return DataFrame, Table, or list[Output], got {type(result)}"
                 )
 
-    # Check for Handler class (legacy pattern)
-    elif "Handler" in plugin_namespace:
-        handler_class = plugin_namespace["Handler"]
-        handler = handler_class()
-
-        # Configure the handler with context
-        if hasattr(handler, "configure"):
-            handler.configure(context, {})
-
-        # Create file event with lineage tracking
-        file_event = type("FileEvent", (), {"path": file_path, "file_id": file_id})()
-
-        # Execute the plugin
-        if hasattr(handler, "consume") and callable(handler.consume):
-            try:
-                result = handler.consume(file_event)
-            except NotImplementedError:
-                result = handler.execute(file_path)
-        elif hasattr(handler, "execute"):
-            result = handler.execute(file_path)
-        else:
-            raise ValueError("Handler must have 'consume' or 'execute' method")
-
-        # Handle generator results
-        if result:
-            for batch in result:
-                if batch is not None:
-                    # Check if batch is an Output object
-                    if isinstance(batch, Output):
-                        validate_output(batch)
-                        context.publish(1, batch.data)
-                        output_info.append({
-                            "name": batch.name,
-                            "table": batch.table,
-                        })
-                    else:
-                        # Legacy: bare DataFrame/Table
-                        context.publish(1, batch)
-
     else:
-        raise ValueError("Plugin must define either a 'parse' function or a 'Handler' class")
+        raise ValueError("Plugin must define a 'parse' function")
 
     return {
         "rows_published": context.get_row_count(),
@@ -619,7 +593,7 @@ def main():
             logger.error(f"Failed to extract parser archive: {e}")
             sys.exit(1)
     elif plugin_code_b64:
-        # Legacy mode: base64-encoded source code from env
+        # Inline source: base64-encoded source code from env
         try:
             source_code = base64.b64decode(plugin_code_b64).decode("utf-8")
         except Exception as e:
@@ -710,7 +684,7 @@ def main():
         logger.error(f"Permanent error (no retry): {e}")
         # Send error to host if possible
         try:
-            context.send_error(str(e))
+            context.send_error(str(e), retryable=False, kind="permanent")
         except Exception:
             pass
         try:
@@ -729,7 +703,7 @@ def main():
     except TransientError as e:
         logger.error(f"Transient error (retry eligible): {e}")
         try:
-            context.send_error(str(e))
+            context.send_error(str(e), retryable=True, kind="transient")
         except Exception:
             pass
         try:
@@ -747,7 +721,7 @@ def main():
     except MemoryError as e:
         logger.error(f"Memory error: {e}")
         try:
-            context.send_error(f"Memory error: {e}")
+            context.send_error(f"Memory error: {e}", retryable=True, kind="transient")
         except Exception:
             pass
         try:
@@ -774,7 +748,7 @@ def main():
 
         # Send error to Host via error signal
         try:
-            context.send_error(str(e))
+            context.send_error(str(e), retryable=False, kind="permanent")
         except Exception:
             pass
         try:

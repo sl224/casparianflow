@@ -1,7 +1,6 @@
 mod cli_support;
 
 use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
-use casparian_db::DbValue;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -129,9 +128,8 @@ fn test_source_json_and_sync() {
 }
 
 fn source_count(db_path: &Path) -> i64 {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_sources", &[])
-            .await
             .expect("count sources")
     })
 }

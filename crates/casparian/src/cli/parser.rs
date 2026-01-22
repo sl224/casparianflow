@@ -4,7 +4,6 @@
 //! - `parser ls` - List all parsers
 //! - `parser show <name>` - Show parser details
 //! - `parser test <file.py> --input <data>` - Test a parser against a file
-//! - `parser publish <file.py> --topic <topic>` - Deploy a parser
 //! - `parser unpublish <name>` - Remove parser from active duty
 //! - `parser backtest <name> [--limit N]` - Run parser against all files for its topic
 
@@ -15,12 +14,12 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use comfy_table::Color;
 use serde::{Deserialize, Serialize};
-use casparian_db::{DbConnection, DbValue};
+use casparian_db::{DbConnection, DbTimestamp, DbValue};
+use casparian_protocol::PluginStatus;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 // Import bundler for register command
-use casparian::bundler::bundle_parser;
 
 /// Subcommands for parser management
 #[derive(Subcommand, Debug, Clone)]
@@ -54,17 +53,6 @@ pub enum ParserAction {
         #[arg(long)]
         json: bool,
     },
-    /// Publish a parser as a plugin
-    Publish {
-        /// Path to parser Python file
-        parser: PathBuf,
-        /// Topic to subscribe to
-        #[arg(long)]
-        topic: String,
-        /// Parser name (defaults to filename without extension)
-        #[arg(long)]
-        name: Option<String>,
-    },
     /// Unpublish a parser (remove from active duty)
     Unpublish {
         /// Parser name
@@ -77,17 +65,6 @@ pub enum ParserAction {
         /// Maximum files to process
         #[arg(long, short = 'n')]
         limit: Option<usize>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Register a parser from a directory (bundles with deterministic hashing)
-    Register {
-        /// Path to parser directory (must contain uv.lock and parser.py)
-        path: PathBuf,
-        /// Output bundle as file instead of registering
-        #[arg(long)]
-        output: Option<PathBuf>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -117,9 +94,9 @@ struct Parser {
     name: String,
     version: String,
     status: String,
-    source_hash: Option<String>,
-    env_hash: Option<String>,
-    artifact_hash: Option<String>,
+    source_hash: String,
+    env_hash: String,
+    artifact_hash: String,
     created_at: DateTime<Utc>,
 }
 
@@ -191,38 +168,25 @@ struct SchemaVariant {
 
 /// Execute the parser command
 pub fn run(action: ParserAction) -> anyhow::Result<()> {
-    // Create a runtime for async operations
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(run_async(action))
+    run_with_action(action)
 }
 
-async fn run_async(action: ParserAction) -> anyhow::Result<()> {
+fn run_with_action(action: ParserAction) -> anyhow::Result<()> {
     match action {
-        ParserAction::List { json } => cmd_list(json).await,
-        ParserAction::Show { name, json } => cmd_show(&name, json).await,
+        ParserAction::List { json } => cmd_list(json),
+        ParserAction::Show { name, json } => cmd_show(&name, json),
         ParserAction::Test {
             parser,
             input,
             rows,
             json,
         } => cmd_test(&parser, &input, rows, json),
-        ParserAction::Publish {
-            parser,
-            topic,
-            name,
-        } => cmd_publish(&parser, &topic, name.as_deref()).await,
-        ParserAction::Unpublish { name } => cmd_unpublish(&name).await,
+        ParserAction::Unpublish { name } => cmd_unpublish(&name),
         ParserAction::Backtest { name, limit, json } => {
-            cmd_backtest(&name, limit, json).await
+            cmd_backtest(&name, limit, json)
         }
-        ParserAction::Register { path, output, json } => {
-            cmd_register(&path, output.as_deref(), json).await
-        }
-        ParserAction::Resume { name } => cmd_resume(&name).await,
-        ParserAction::Health { name, json } => cmd_health(&name, json).await,
+        ParserAction::Resume { name } => cmd_resume(&name),
+        ParserAction::Health { name, json } => cmd_health(&name, json),
     }
 }
 
@@ -236,7 +200,7 @@ fn get_db_path() -> PathBuf {
 }
 
 /// Connect to the database
-async fn connect_db() -> anyhow::Result<DbConnection> {
+fn connect_db() -> anyhow::Result<DbConnection> {
     let db_path = get_db_path();
 
     if !db_path.exists() {
@@ -250,7 +214,7 @@ async fn connect_db() -> anyhow::Result<DbConnection> {
     }
 
     let url = format!("duckdb:{}", db_path.display());
-    let conn = DbConnection::open_from_url(&url).await.map_err(|e| {
+    let conn = DbConnection::open_from_url(&url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(e.to_string())
             .with_suggestion("TRY: Ensure the database file is not corrupted")
@@ -259,13 +223,33 @@ async fn connect_db() -> anyhow::Result<DbConnection> {
     Ok(conn)
 }
 
-async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
+fn connect_db_readonly() -> anyhow::Result<DbConnection> {
+    let db_path = get_db_path();
+
+    if !db_path.exists() {
+        return Err(HelpfulError::new("Database not found")
+            .with_context(format!("Expected database at: {}", db_path.display()))
+            .with_suggestions([
+                "TRY: Run 'casparian start' to initialize the database".to_string(),
+                format!("TRY: Check if {} exists", db_path.display()),
+            ])
+            .into());
+    }
+
+    Ok(DbConnection::open_duckdb_readonly(&db_path).map_err(|e| {
+        HelpfulError::new("Failed to connect to database")
+            .with_context(e.to_string())
+            .with_suggestion("TRY: Ensure the database file is not corrupted")
+    })?)
+}
+
+fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
     let row = conn
         .query_optional(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
             &[DbValue::from(table)],
         )
-        .await?;
+        ?;
     Ok(row.is_some())
 }
 
@@ -274,8 +258,8 @@ async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> 
 // ============================================================================
 
 /// List all parsers
-async fn cmd_list(json_output: bool) -> anyhow::Result<()> {
-    let conn = connect_db().await?;
+fn cmd_list(json_output: bool) -> anyhow::Result<()> {
+    let conn = connect_db_readonly()?;
 
     let rows = conn
         .query_all(
@@ -286,33 +270,51 @@ async fn cmd_list(json_output: bool) -> anyhow::Result<()> {
             "#,
             &[],
         )
-        .await?;
+        ?;
 
     let mut parsers = Vec::new();
     for row in rows {
-        let source_hash_value: String = row.get_by_name("source_hash").unwrap_or_default();
-        let env_hash_value: String = row.get_by_name("env_hash").unwrap_or_default();
-        let artifact_hash_value: String = row.get_by_name("artifact_hash").unwrap_or_default();
+        let name: String = row.get_by_name("plugin_name")?;
+        let source_hash_value: String = row.get_by_name("source_hash")?;
+        let env_hash_value: String = row.get_by_name("env_hash")?;
+        let artifact_hash_value: String = row.get_by_name("artifact_hash")?;
+
+        if source_hash_value.trim().is_empty() {
+            return Err(HelpfulError::new(format!(
+                "Parser '{}' is missing source_hash",
+                name
+            ))
+            .with_context("Registry data is incomplete")
+            .into());
+        }
+        if env_hash_value.trim().is_empty() {
+            return Err(HelpfulError::new(format!(
+                "Parser '{}' is missing env_hash",
+                name
+            ))
+            .with_context("Registry data is incomplete")
+            .into());
+        }
+        if artifact_hash_value.trim().is_empty() {
+            return Err(HelpfulError::new(format!(
+                "Parser '{}' is missing artifact_hash",
+                name
+            ))
+            .with_context("Registry data is incomplete")
+            .into());
+        }
+
         let parser = Parser {
-            name: row.get_by_name("plugin_name")?,
+            name,
             version: row.get_by_name("version")?,
             status: row.get_by_name::<String>("status")?,
-            source_hash: if source_hash_value.is_empty() {
-                None
-            } else {
-                Some(source_hash_value)
-            },
-            env_hash: if env_hash_value.is_empty() {
-                None
-            } else {
-                Some(env_hash_value)
-            },
-            artifact_hash: if artifact_hash_value.is_empty() {
-                None
-            } else {
-                Some(artifact_hash_value)
-            },
-            created_at: row.get_by_name("created_at")?,
+            source_hash: source_hash_value,
+            env_hash: env_hash_value,
+            artifact_hash: artifact_hash_value,
+            created_at: row
+                .get_by_name::<DbTimestamp>("created_at")?
+                .as_chrono()
+                .clone(),
         };
         parsers.push(parser);
     }
@@ -338,10 +340,12 @@ async fn cmd_list(json_output: bool) -> anyhow::Result<()> {
         .iter()
         .map(|p| {
             let status = p.status.clone();
-            let status_color = match status.as_str() {
-                "ACTIVE" | "DEPLOYED" => Some(Color::Green),
-                "FAILED" | "ERROR" => Some(Color::Red),
-                _ => Some(Color::Yellow),
+            let status_color = match status.parse::<PluginStatus>() {
+                Ok(PluginStatus::Active | PluginStatus::Deployed) => Some(Color::Green),
+                Ok(PluginStatus::Rejected) => Some(Color::Red),
+                Ok(PluginStatus::Superseded) => Some(Color::Grey),
+                Ok(PluginStatus::Pending | PluginStatus::Staging) => Some(Color::Yellow),
+                Err(_) => Some(Color::Yellow),
             };
 
             vec![
@@ -359,8 +363,8 @@ async fn cmd_list(json_output: bool) -> anyhow::Result<()> {
 }
 
 /// Show parser details
-async fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
-    let conn = connect_db().await?;
+fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
+    let conn = connect_db_readonly()?;
 
     let row = conn
         .query_optional(
@@ -373,7 +377,7 @@ async fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
             "#,
             &[DbValue::from(name)],
         )
-        .await?;
+        ?;
 
     let row = match row {
         Some(r) => r,
@@ -389,30 +393,48 @@ async fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
     };
 
     let source_code: String = row.get_by_name("source_code")?;
-    let mut parser = Parser {
-        name: row.get_by_name("plugin_name")?,
+    let name: String = row.get_by_name("plugin_name")?;
+    let source_hash_value: String = row.get_by_name("source_hash")?;
+    let env_hash_value: String = row.get_by_name("env_hash")?;
+    let artifact_hash_value: String = row.get_by_name("artifact_hash")?;
+
+    if source_hash_value.trim().is_empty() {
+        return Err(HelpfulError::new(format!(
+            "Parser '{}' is missing source_hash",
+            name
+        ))
+        .with_context("Registry data is incomplete")
+        .into());
+    }
+    if env_hash_value.trim().is_empty() {
+        return Err(HelpfulError::new(format!(
+            "Parser '{}' is missing env_hash",
+            name
+        ))
+        .with_context("Registry data is incomplete")
+        .into());
+    }
+    if artifact_hash_value.trim().is_empty() {
+        return Err(HelpfulError::new(format!(
+            "Parser '{}' is missing artifact_hash",
+            name
+        ))
+        .with_context("Registry data is incomplete")
+        .into());
+    }
+
+    let parser = Parser {
+        name,
         version: row.get_by_name("version")?,
         status: row.get_by_name::<String>("status")?,
-        source_hash: None,
-        env_hash: None,
-        artifact_hash: None,
-        created_at: row.get_by_name("created_at")?,
+        source_hash: source_hash_value,
+        env_hash: env_hash_value,
+        artifact_hash: artifact_hash_value,
+        created_at: row
+            .get_by_name::<DbTimestamp>("created_at")?
+            .as_chrono()
+            .clone(),
     };
-
-    let source_hash_value: String = row.get_by_name("source_hash").unwrap_or_default();
-    if !source_hash_value.is_empty() {
-        parser.source_hash = Some(source_hash_value);
-    }
-
-    let env_hash_value: String = row.get_by_name("env_hash").unwrap_or_default();
-    if !env_hash_value.is_empty() {
-        parser.env_hash = Some(env_hash_value);
-    }
-
-    let artifact_hash_value: String = row.get_by_name("artifact_hash").unwrap_or_default();
-    if !artifact_hash_value.is_empty() {
-        parser.artifact_hash = Some(artifact_hash_value);
-    }
 
     if json_output {
         let result = serde_json::json!({
@@ -435,15 +457,18 @@ async fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
     println!("Version:      {}", parser.version);
     println!("Status:       {}", parser.status);
     println!("Created:      {}", parser.created_at);
-    if let Some(hash) = &parser.source_hash {
-        println!("Source Hash:  {}...", &hash[..hash.len().min(16)]);
-    }
-    if let Some(hash) = &parser.env_hash {
-        println!("Env Hash:     {}...", &hash[..hash.len().min(16)]);
-    }
-    if let Some(hash) = &parser.artifact_hash {
-        println!("Artifact:     {}...", &hash[..hash.len().min(16)]);
-    }
+    println!(
+        "Source Hash:  {}...",
+        &parser.source_hash[..parser.source_hash.len().min(16)]
+    );
+    println!(
+        "Env Hash:     {}...",
+        &parser.env_hash[..parser.env_hash.len().min(16)]
+    );
+    println!(
+        "Artifact:     {}...",
+        &parser.artifact_hash[..parser.artifact_hash.len().min(16)]
+    );
 
     println!();
     println!("Source Code (first 20 lines):");
@@ -559,33 +584,26 @@ fn cmd_test(parser_path: &PathBuf, input_path: &PathBuf, rows: usize, json_outpu
     Ok(())
 }
 
-/// Publish a parser to the registry.
-async fn cmd_publish(parser_path: &PathBuf, _topic: &str, _name: Option<&str>) -> anyhow::Result<()> {
-    Err(HelpfulError::new("Parser publish is deprecated")
-        .with_context("Use the Sentinel publisher workflow for v1")
-        .with_suggestions([
-            format!(
-                "TRY: casparian publish {} --version <v>",
-                parser_path.display()
-            ),
-            "NOTE: --topic is ignored in v1; configure sinks via topic config instead".to_string(),
-        ])
-        .into())
-}
-
 /// Unpublish a parser
-async fn cmd_unpublish(name: &str) -> anyhow::Result<()> {
-    let conn = connect_db().await?;
+fn cmd_unpublish(name: &str) -> anyhow::Result<()> {
+    let conn = connect_db()?;
 
+    // Mark the active/deployed plugin as SUPERSEDED (the canonical status for deactivated plugins)
+    // Handle both ACTIVE and DEPLOYED since DEPLOYED is a legacy alias for ACTIVE
     let updated = conn
         .execute(
-            "UPDATE cf_plugin_manifest SET status = 'INACTIVE' WHERE plugin_name = ? AND status = 'ACTIVE'",
-            &[DbValue::from(name)],
+            "UPDATE cf_plugin_manifest SET status = ? WHERE plugin_name = ? AND status IN (?, ?)",
+            &[
+                DbValue::from(PluginStatus::Superseded.as_str()),
+                DbValue::from(name),
+                DbValue::from(PluginStatus::Active.as_str()),
+                DbValue::from(PluginStatus::Deployed.as_str()),
+            ],
         )
-        .await?;
+        ?;
 
     if updated == 0 {
-        return Err(HelpfulError::new(format!("Parser not found or already inactive: {}", name))
+        return Err(HelpfulError::new(format!("Parser not found or already unpublished: {}", name))
             .with_context("No active plugin with this name exists")
             .with_suggestion("TRY: casparian parser ls  (list all parsers)")
             .into());
@@ -597,7 +615,7 @@ async fn cmd_unpublish(name: &str) -> anyhow::Result<()> {
 }
 
 /// Run backtest against all files for a parser's topic
-async fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> anyhow::Result<()> {
+fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> anyhow::Result<()> {
     let _ = (limit, json_output);
     Err(HelpfulError::new(format!("Backtest is not available in v1: {}", name))
         .with_context("The parser lab registry was removed in favor of the plugin manifest")
@@ -608,88 +626,12 @@ async fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> an
         .into())
 }
 
-/// Register a parser from a directory by bundling it
-async fn cmd_register(
-    path: &PathBuf,
-    output: Option<&std::path::Path>,
-    json_output: bool,
-) -> anyhow::Result<()> {
-    // Validate directory exists
-    if !path.exists() {
-        return Err(HelpfulError::new(format!("Parser directory not found: {}", path.display()))
-            .with_context("The specified directory does not exist")
-            .with_suggestions([
-                format!("TRY: ls -la {}", path.display()),
-                "TRY: Provide the full path to the parser directory".to_string(),
-            ])
-            .into());
-    }
-
-    if !path.is_dir() {
-        return Err(HelpfulError::new(format!("Path is not a directory: {}", path.display()))
-            .with_context("The register command expects a directory containing parser files")
-            .with_suggestions([
-                "TRY: casparian parser register ./my_parser_dir".to_string(),
-                "TRY: For single files, use 'casparian publish'".to_string(),
-            ])
-            .into());
-    }
-
-    // Bundle the parser
-    let bundle = bundle_parser(path).map_err(|e| {
-        HelpfulError::new("Failed to bundle parser")
-            .with_context(e.to_string())
-            .with_suggestions([
-                "TRY: Ensure uv.lock exists: run 'uv lock' in the parser directory".to_string(),
-                "TRY: Ensure parser has 'name' and 'version' attributes".to_string(),
-            ])
-    })?;
-
-    // If output path specified, write bundle to file
-    if let Some(output_path) = output {
-        std::fs::write(output_path, &bundle.archive).map_err(|e| {
-            HelpfulError::new("Failed to write bundle file")
-                .with_context(e.to_string())
-                .with_suggestion(format!("TRY: Check write permissions for {}", output_path.display()))
-        })?;
-
-        if json_output {
-            let result = serde_json::json!({
-                "name": bundle.name,
-                "version": bundle.version,
-                "source_hash": bundle.source_hash,
-                "lockfile_hash": bundle.lockfile_hash,
-                "archive_size": bundle.archive.len(),
-                "output_path": output_path.display().to_string(),
-            });
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        } else {
-            println!("Bundled {} v{}", bundle.name, bundle.version);
-            println!("  Source hash:   {}", &bundle.source_hash[..12]);
-            println!("  Lockfile hash: {}", &bundle.lockfile_hash[..12]);
-            println!("  Archive size:  {:.1}KB", bundle.archive.len() as f64 / 1024.0);
-            println!("  Output:        {}", output_path.display());
-        }
-
-        return Ok(());
-    }
-
-    Err(HelpfulError::new("Parser register is deprecated")
-        .with_context("Use the Sentinel publisher workflow for v1")
-        .with_suggestions([
-            "TRY: casparian publish <parser.py> --version <v>".to_string(),
-            "TRY: casparian parser register --output <bundle.zip> to export an archive".to_string(),
-        ])
-        .into())
-}
-
-
 /// Resume a paused parser (reset circuit breaker)
-async fn cmd_resume(name: &str) -> anyhow::Result<()> {
-    let conn = connect_db().await?;
+fn cmd_resume(name: &str) -> anyhow::Result<()> {
+    let conn = connect_db()?;
 
     // Check if cf_parser_health table exists
-    if !table_exists(&conn, "cf_parser_health").await? {
+    if !table_exists(&conn, "cf_parser_health")? {
         return Err(HelpfulError::new("Parser health table not found")
             .with_context("No circuit breaker data exists yet")
             .with_suggestion("TRY: Run some jobs first to generate health data")
@@ -702,7 +644,7 @@ async fn cmd_resume(name: &str) -> anyhow::Result<()> {
             "SELECT consecutive_failures, paused_at FROM cf_parser_health WHERE parser_name = ?",
             &[DbValue::from(name)],
         )
-        .await?;
+        ?;
 
     match health {
         Some(row) => {
@@ -718,7 +660,7 @@ async fn cmd_resume(name: &str) -> anyhow::Result<()> {
                 "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0, updated_at = CURRENT_TIMESTAMP WHERE parser_name = ?",
                 &[DbValue::from(name)],
             )
-            .await?;
+            ?;
 
             println!("Parser '{}' resumed", name);
             println!("  - Circuit breaker reset");
@@ -741,11 +683,11 @@ async fn cmd_resume(name: &str) -> anyhow::Result<()> {
 }
 
 /// Show health statistics for a parser
-async fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
-    let conn = connect_db().await?;
+fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
+    let conn = connect_db_readonly()?;
 
     // Check if cf_parser_health table exists
-    if !table_exists(&conn, "cf_parser_health").await? {
+    if !table_exists(&conn, "cf_parser_health")? {
         return Err(HelpfulError::new("Parser health table not found")
             .with_context("No circuit breaker data exists yet")
             .with_suggestion("TRY: Run some jobs first to generate health data")
@@ -763,7 +705,7 @@ async fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
             "#,
             &[DbValue::from(name)],
         )
-        .await?;
+        ?;
 
     match health {
         Some(row) => {
@@ -1079,66 +1021,6 @@ except Exception as e:
     }
 }
 
-/// Categorize an error by type
-/// Prefers structured error_code from Python if available, falls back to string matching
-#[allow(dead_code)]
-fn categorize_error(error_code: Option<&str>, errors: &[String]) -> String {
-    // Prefer structured error code from Python (no string matching needed)
-    if let Some(code) = error_code {
-        return code.to_string();
-    }
-
-    // Fallback: string matching for legacy/external errors
-    let error_text = errors.join(" ").to_lowercase();
-
-    if error_text.contains("missing column") || error_text.contains("keyerror") {
-        "SCHEMA_MISMATCH".to_string()
-    } else if error_text.contains("could not convert") || error_text.contains("invalid") {
-        "INVALID_DATA".to_string()
-    } else if error_text.contains("file not found") || error_text.contains("no such file") {
-        "FILE_NOT_FOUND".to_string()
-    } else if error_text.contains("permission") {
-        "PERMISSION_ERROR".to_string()
-    } else if error_text.contains("encoding") || error_text.contains("decode") {
-        "ENCODING_ERROR".to_string()
-    } else if error_text.contains("memory") || error_text.contains("out of memory") {
-        "MEMORY_ERROR".to_string()
-    } else {
-        "UNKNOWN_ERROR".to_string()
-    }
-}
-
-/// Get suggestions for an error type
-#[allow(dead_code)]
-fn get_error_suggestions(error_type: &str) -> Vec<String> {
-    match error_type {
-        "SCHEMA_MISMATCH" => vec![
-            "Re-tag files with different schema: casparian rule add \"pattern\" --topic <new_topic>".to_string(),
-            "Update parser to handle missing columns with defaults".to_string(),
-        ],
-        "INVALID_DATA" => vec![
-            "Add data validation in parser to handle edge cases".to_string(),
-            "Use try/except to catch and log invalid rows".to_string(),
-        ],
-        "FILE_NOT_FOUND" => vec![
-            "Re-scan sources: casparian scan <path>".to_string(),
-            "Check if files were moved or deleted".to_string(),
-        ],
-        "ENCODING_ERROR" => vec![
-            "Specify encoding in parser: pl.read_csv(path, encoding='latin1')".to_string(),
-            "Convert files to UTF-8 before processing".to_string(),
-        ],
-        "MEMORY_ERROR" => vec![
-            "Process files in smaller batches".to_string(),
-            "Use streaming/chunked reading in parser".to_string(),
-        ],
-        _ => vec![
-            "Check parser logs for more details".to_string(),
-            "Test parser manually: python3 <parser.py>".to_string(),
-        ],
-    }
-}
-
 /// Format a datetime as relative time
 fn format_relative_time(dt: DateTime<Utc>) -> String {
     let now = Utc::now();
@@ -1163,40 +1045,6 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use tempfile::TempDir;
-
-    #[test]
-    fn test_categorize_error_with_structured_code() {
-        // Structured error_code from Python takes precedence
-        assert_eq!(
-            categorize_error(Some("SCHEMA_MISMATCH"), &["some error text".to_string()]),
-            "SCHEMA_MISMATCH"
-        );
-        assert_eq!(
-            categorize_error(Some("INVALID_DATA"), &["KeyError: would match string".to_string()]),
-            "INVALID_DATA"
-        );
-    }
-
-    #[test]
-    fn test_categorize_error_fallback_string_matching() {
-        // When no structured error_code, fall back to string matching
-        assert_eq!(
-            categorize_error(None, &["KeyError: 'missing_column'".to_string()]),
-            "SCHEMA_MISMATCH"
-        );
-        assert_eq!(
-            categorize_error(None, &["Could not convert 'abc' to float".to_string()]),
-            "INVALID_DATA"
-        );
-        assert_eq!(
-            categorize_error(None, &["FileNotFoundError: No such file".to_string()]),
-            "FILE_NOT_FOUND"
-        );
-        assert_eq!(
-            categorize_error(None, &["Some random error".to_string()]),
-            "UNKNOWN_ERROR"
-        );
-    }
 
     #[test]
     fn test_format_relative_time() {
@@ -1267,13 +1115,4 @@ def transform(df):
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_get_error_suggestions() {
-        let suggestions = get_error_suggestions("SCHEMA_MISMATCH");
-        assert!(!suggestions.is_empty());
-        assert!(suggestions[0].contains("tag") || suggestions[0].contains("Re-tag"));
-
-        let suggestions = get_error_suggestions("UNKNOWN_ERROR");
-        assert!(!suggestions.is_empty());
-    }
 }

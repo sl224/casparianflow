@@ -3,9 +3,9 @@
 //! Used for local development and testing. Outputs logs to terminal
 //! and does not write to any database. Uses job_id 0 for dev mode.
 
-use super::{ExecutionResult, LogDestination, ParserRef, Runner};
+use super::{ExecutionResult, LogDestination, ParserRef};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
+use casparian_protocol::JobId;
 use std::path::Path;
 
 /// Development mode runner that executes parsers without database integration.
@@ -29,11 +29,8 @@ impl DevRunner {
         let python_path = resolve_python()?;
         Ok(Self { python_path })
     }
-}
 
-#[async_trait]
-impl Runner for DevRunner {
-    async fn execute(
+    pub fn execute(
         &self,
         parser: ParserRef,
         input: &Path,
@@ -57,14 +54,14 @@ impl Runner for DevRunner {
             interpreter_path: self.python_path.clone(),
             source_code: source,
             file_path: input.to_string_lossy().to_string(),
-            job_id: 0, // Dev mode uses job_id 0
+            job_id: JobId::new(0), // Dev mode uses job_id 0
             file_id: 0,
             shim_path,
             inherit_stdio,
         };
 
         // Execute with terminal output (logs captured by bridge)
-        let result = casparian_worker::bridge::execute_bridge(config).await?;
+        let result = casparian_worker::bridge::execute_bridge(config)?;
 
         Ok(ExecutionResult {
             output_batches: result.output_batches,

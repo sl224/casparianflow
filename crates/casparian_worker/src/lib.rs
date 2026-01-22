@@ -1,14 +1,14 @@
-pub mod analyzer;
 pub mod bridge;
 pub mod metrics;
+pub mod native_runtime;
+pub mod runtime;
 mod schema_validation;
-pub mod shredder;
 pub mod type_inference;
 pub mod venv_manager;
 pub mod worker;
 
 pub use metrics::METRICS;
-pub use worker::{Worker, WorkerConfig, WorkerError};
+pub use worker::{Worker, WorkerConfig, WorkerError, WorkerHandle};
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "casparian-worker", about = "Rust Worker for Casparian Flow")]

@@ -142,14 +142,13 @@ def run_cmd():
     assert!(result.errors.iter().any(|e| e.contains("subprocess")));
 }
 
-#[tokio::test]
-async fn test_python_generator_with_mock_llm() {
+#[test]
+fn test_python_generator_with_mock_llm() {
     use casparian::ai::pathfinder::{PathAnalyzer, PythonGenerator};
 
     // Create a mock LLM callback that returns reasonable Python code
     let mock_llm: casparian::ai::pathfinder::python_gen::LlmGenerateFn = Box::new(|_prompt| {
-        Box::pin(async {
-            Ok(r#"```python
+        Ok(r#"```python
 import re
 from pathlib import Path
 
@@ -165,7 +164,6 @@ def extract(path: str) -> dict:
         }
     return {}
 ```"#.to_string())
-        })
     });
 
     let python_gen = PythonGenerator::new(mock_llm);
@@ -180,8 +178,7 @@ def extract(path: str) -> dict:
     let pattern = analyzer.analyze(&paths).expect("Analysis failed");
 
     let result = python_gen
-        .generate(&paths, &pattern, Some("extract date, node, and version"))
-        .await;
+        .generate(&paths, &pattern, Some("extract date, node, and version"));
 
     match result {
         Ok(code) => {

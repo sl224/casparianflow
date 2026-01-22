@@ -19,9 +19,9 @@ Casparian Flow has **two distinct rule systems** that serve different purposes:
 
 ```sql
 CREATE TABLE scout_tagging_rules (
-    id TEXT PRIMARY KEY,
+    id BIGINT PRIMARY KEY,
     name TEXT NOT NULL,
-    source_id TEXT NOT NULL,
+    source_id BIGINT NOT NULL,
     pattern TEXT NOT NULL,     -- e.g., "*.csv"
     tag TEXT NOT NULL,          -- e.g., "sales_data"
     priority INTEGER DEFAULT 0,
@@ -43,7 +43,7 @@ CREATE TABLE scout_tagging_rules (
 ```sql
 CREATE TABLE extraction_rules (
     id TEXT PRIMARY KEY,
-    source_id TEXT,
+    source_id BIGINT,
     name TEXT NOT NULL,
     glob_pattern TEXT NOT NULL,  -- e.g., "{client}/{year}/**/*.pdf"
     description TEXT,

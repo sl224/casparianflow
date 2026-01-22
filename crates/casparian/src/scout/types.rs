@@ -6,30 +6,253 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::fmt;
+use std::str::FromStr;
+use uuid::Uuid;
 
 // ============================================================================
-// Serde helpers for Arc<str>
+// Identifier Types
 // ============================================================================
 
-/// Custom serde for Arc<str> - serializes as String, deserializes efficiently
-mod arc_str_serde {
-    use serde::{self, Deserialize, Deserializer, Serializer};
-    use std::sync::Arc;
+/// Error returned when parsing a UUID-backed identifier fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdParseError {
+    message: String,
+}
 
-    pub fn serialize<S>(value: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(value)
+impl IdParseError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for IdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for IdParseError {}
+
+fn parse_i64_id(label: &str, value: &str) -> Result<i64, IdParseError> {
+    let id = value
+        .parse::<i64>()
+        .map_err(|e| IdParseError::new(format!("Invalid {}: {}", label, e)))?;
+    validate_i64_id(label, id)
+}
+
+fn validate_i64_id(label: &str, value: i64) -> Result<i64, IdParseError> {
+    if value <= 0 {
+        return Err(IdParseError::new(format!("Invalid {}: must be positive", label)));
+    }
+    Ok(value)
+}
+
+fn new_random_id() -> i64 {
+    let raw = Uuid::new_v4().as_u128();
+    let id = (raw & 0x7fff_ffff_ffff_ffff) as i64;
+    if id == 0 {
+        1
+    } else {
+        id
+    }
+}
+
+/// Unique identifier for a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceId(i64);
+
+impl SourceId {
+    pub fn new() -> Self {
+        Self(new_random_id())
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Arc<str>, D::Error>
+    pub fn parse(value: &str) -> Result<Self, IdParseError> {
+        Ok(Self(parse_i64_id("source ID", value)?))
+    }
+
+    pub fn as_i64(&self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for SourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for SourceId {
+    type Err = IdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        SourceId::parse(s)
+    }
+}
+
+impl TryFrom<String> for SourceId {
+    type Error = IdParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        SourceId::parse(&value)
+    }
+}
+
+impl TryFrom<i64> for SourceId {
+    type Error = IdParseError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Ok(Self(validate_i64_id("source ID", value)?))
+    }
+}
+
+impl Serialize for SourceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        D: Deserializer<'de>,
+        S: serde::Serializer,
     {
-        let s = String::deserialize(deserializer)?;
-        Ok(Arc::from(s))
+        serializer.serialize_i64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = SourceId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("positive integer source ID")
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                SourceId::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = i64::try_from(value).map_err(E::custom)?;
+                SourceId::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                SourceId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// Unique identifier for a tagging rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaggingRuleId(i64);
+
+impl TaggingRuleId {
+    pub fn new() -> Self {
+        Self(new_random_id())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, IdParseError> {
+        Ok(Self(parse_i64_id("tagging rule ID", value)?))
+    }
+
+    pub fn as_i64(&self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for TaggingRuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for TaggingRuleId {
+    type Err = IdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        TaggingRuleId::parse(s)
+    }
+}
+
+impl TryFrom<String> for TaggingRuleId {
+    type Error = IdParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        TaggingRuleId::parse(&value)
+    }
+}
+
+impl TryFrom<i64> for TaggingRuleId {
+    type Error = IdParseError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        Ok(Self(validate_i64_id("tagging rule ID", value)?))
+    }
+}
+
+impl Serialize for TaggingRuleId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_i64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for TaggingRuleId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = TaggingRuleId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("positive integer tagging rule ID")
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                TaggingRuleId::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let value = i64::try_from(value).map_err(E::custom)?;
+                TaggingRuleId::try_from(value).map_err(E::custom)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                TaggingRuleId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -42,7 +265,7 @@ mod arc_str_serde {
 #[serde(rename_all = "camelCase")]
 pub struct Source {
     /// Unique identifier
-    pub id: String,
+    pub id: SourceId,
     /// Human-readable name
     pub name: String,
     /// Type of source (local, smb, s3)
@@ -92,11 +315,11 @@ pub enum SourceType {
 #[serde(rename_all = "camelCase")]
 pub struct TaggingRule {
     /// Unique identifier
-    pub id: String,
+    pub id: TaggingRuleId,
     /// Human-readable name
     pub name: String,
     /// Source ID this rule applies to
-    pub source_id: String,
+    pub source_id: SourceId,
     /// Glob pattern to match files (e.g., "*.csv", "data/**/*.json")
     pub pattern: String,
     /// Tag to assign to matching files
@@ -105,6 +328,33 @@ pub struct TaggingRule {
     pub priority: i32,
     /// Whether this rule is enabled
     pub enabled: bool,
+}
+
+/// How a tag was assigned to a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TagSource {
+    Rule,
+    Manual,
+}
+
+impl TagSource {
+    pub const ALL: &'static [TagSource] = &[TagSource::Rule, TagSource::Manual];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TagSource::Rule => "rule",
+            TagSource::Manual => "manual",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "rule" => Some(TagSource::Rule),
+            "manual" => Some(TagSource::Manual),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -134,6 +384,17 @@ pub enum FileStatus {
 }
 
 impl FileStatus {
+    pub const ALL: &'static [FileStatus] = &[
+        FileStatus::Pending,
+        FileStatus::Tagged,
+        FileStatus::Queued,
+        FileStatus::Processing,
+        FileStatus::Processed,
+        FileStatus::Failed,
+        FileStatus::Skipped,
+        FileStatus::Deleted,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -169,10 +430,7 @@ pub struct ScannedFile {
     /// Database ID (None if not yet persisted)
     pub id: Option<i64>,
     /// Source ID this file belongs to
-    /// PERF: Uses Arc<str> to share source_id across all files in a scan,
-    /// eliminating 1M allocations when scanning 1M files.
-    #[serde(with = "arc_str_serde")]
-    pub source_id: Arc<str>,
+    pub source_id: SourceId,
     /// Full path to the file
     pub path: String,
     /// Relative path from source root
@@ -196,10 +454,10 @@ pub struct ScannedFile {
     pub status: FileStatus,
     /// Assigned tag (None = untagged)
     pub tag: Option<String>,
-    /// How the tag was assigned: "rule" (auto) or "manual"
-    pub tag_source: Option<String>,
+    /// How the tag was assigned: rule or manual
+    pub tag_source: Option<TagSource>,
     /// ID of the tagging rule that matched (if tag_source = "rule")
-    pub rule_id: Option<String>,
+    pub rule_id: Option<TaggingRuleId>,
     /// Manual plugin override (None = use tag subscription)
     pub manual_plugin: Option<String>,
     /// Error message if failed
@@ -245,13 +503,13 @@ fn extract_extension(name: &str) -> Option<String> {
 
 impl ScannedFile {
     /// Create a new pending file
-    pub fn new(source_id: &str, path: &str, rel_path: &str, size: u64, mtime: i64) -> Self {
+    pub fn new(source_id: SourceId, path: &str, rel_path: &str, size: u64, mtime: i64) -> Self {
         let now = Utc::now();
         let (parent_path, name) = split_rel_path(rel_path);
         let extension = extract_extension(name);
         Self {
             id: None,
-            source_id: Arc::from(source_id),
+            source_id,
             path: path.to_string(),
             rel_path: rel_path.to_string(),
             parent_path: parent_path.to_string(),
@@ -280,10 +538,9 @@ impl ScannedFile {
     /// F-007: Create from pre-allocated strings to avoid redundant allocations
     ///
     /// Use this in hot paths where strings are already owned (e.g., scanner).
-    /// For source_id, use Arc<str> to share across all files in a scan.
-    /// PERF: No allocation - Arc is cloned (ref count bump only).
+    /// For source_id, pass the SourceId for this scan to avoid string duplication.
     pub fn from_parts(
-        source_id: Arc<str>,
+        source_id: SourceId,
         path: String,
         rel_path: String,
         size: u64,
@@ -294,7 +551,7 @@ impl ScannedFile {
         let extension = extract_extension(name);
         Self {
             id: None,
-            source_id, // PERF: No allocation - just Arc clone (ref count bump)
+            source_id,
             path,
             parent_path: parent_path.to_string(),
             name: name.to_string(),
@@ -345,6 +602,15 @@ pub enum ExtractionStatus {
 }
 
 impl ExtractionStatus {
+    pub const ALL: &'static [ExtractionStatus] = &[
+        ExtractionStatus::Pending,
+        ExtractionStatus::Extracted,
+        ExtractionStatus::Timeout,
+        ExtractionStatus::Crash,
+        ExtractionStatus::Stale,
+        ExtractionStatus::Error,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
@@ -441,6 +707,13 @@ pub enum ExtractionLogStatus {
 }
 
 impl ExtractionLogStatus {
+    pub const ALL: &'static [ExtractionLogStatus] = &[
+        ExtractionLogStatus::Success,
+        ExtractionLogStatus::Timeout,
+        ExtractionLogStatus::Crash,
+        ExtractionLogStatus::Error,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Success => "success",
@@ -458,6 +731,64 @@ impl ExtractionLogStatus {
             "error" => Some(Self::Error),
             _ => None,
         }
+    }
+}
+
+// ============================================================================
+// Parser Lab Types
+// ============================================================================
+
+/// Validation status for a parser in Parser Lab
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParserValidationStatus {
+    /// Not yet validated
+    Pending,
+    /// Passed validation
+    Valid,
+    /// Failed validation (see validation_error for details)
+    Invalid,
+    /// Error during validation (system error)
+    Error,
+}
+
+impl ParserValidationStatus {
+    pub const ALL: &'static [ParserValidationStatus] = &[
+        ParserValidationStatus::Pending,
+        ParserValidationStatus::Valid,
+        ParserValidationStatus::Invalid,
+        ParserValidationStatus::Error,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Valid => "valid",
+            Self::Invalid => "invalid",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "pending" => Some(Self::Pending),
+            "valid" => Some(Self::Valid),
+            "invalid" => Some(Self::Invalid),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ParserValidationStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+impl fmt::Display for ParserValidationStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -616,10 +947,12 @@ mod tests {
 
     #[test]
     fn test_tagging_rule_serialization() {
+        let source_id = SourceId::new();
+        let rule_id = TaggingRuleId::new();
         let rule = TaggingRule {
-            id: "rule-1".to_string(),
+            id: rule_id,
             name: "CSV Files".to_string(),
-            source_id: "src-1".to_string(),
+            source_id,
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,

@@ -36,7 +36,7 @@ pub struct BackfillArgs {
 }
 
 /// Run the backfill command
-pub async fn run(args: BackfillArgs) -> Result<()> {
+pub fn run(args: BackfillArgs) -> Result<()> {
     let _ = (
         &args.parser_name,
         args.execute,

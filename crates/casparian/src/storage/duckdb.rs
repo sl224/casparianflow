@@ -4,14 +4,14 @@
 //! query paths already in casparian_db.
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
+use casparian_protocol::{JobId, PipelineRunStatus};
+use crate::scout::FileStatus;
 use std::path::Path;
 
 use casparian_db::{DbConnection, DbValue};
 
-use super::traits::{
-    Pipeline, PipelineRun, PipelineStore, SelectionFilters, SelectionResolution, SelectionSnapshot,
-    WatermarkField,
+use super::types::{
+    Pipeline, PipelineRun, SelectionFilters, SelectionResolution, SelectionSnapshot, WatermarkField,
 };
 use uuid::Uuid;
 
@@ -20,13 +20,12 @@ pub struct DuckDbPipelineStore {
 }
 
 impl DuckDbPipelineStore {
-    pub async fn open(db_path: &Path) -> Result<Self> {
+    pub fn open(db_path: &Path) -> Result<Self> {
         let db_url = format!("duckdb:{}", db_path.display());
         let conn = DbConnection::open_from_url(&db_url)
-            .await
             .context("Failed to connect to DuckDB")?;
         let store = Self { conn };
-        store.initialize_tables().await?;
+        store.initialize_tables()?;
         Ok(store)
     }
 
@@ -38,7 +37,7 @@ impl DuckDbPipelineStore {
         self.conn.clone()
     }
 
-    pub async fn get_pipeline_run(&self, run_id: &str) -> Result<Option<PipelineRun>> {
+    pub fn get_pipeline_run(&self, run_id: &str) -> Result<Option<PipelineRun>> {
         let row = self
             .conn
             .query_optional(
@@ -58,23 +57,35 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(run_id)],
             )
-            .await
+            
             .context("Failed to fetch pipeline run")?;
 
-        Ok(row.map(|row| PipelineRun {
-            id: row.get_by_name("id").unwrap_or_default(),
-            pipeline_id: row.get_by_name("pipeline_id").unwrap_or_default(),
-            selection_spec_id: row.get_by_name("selection_spec_id").unwrap_or_default(),
-            selection_snapshot_hash: row.get_by_name("selection_snapshot_hash").unwrap_or_default(),
-            context_snapshot_hash: row.get_by_name("context_snapshot_hash").ok().flatten(),
-            logical_date: row.get_by_name("logical_date").unwrap_or_default(),
-            status: row.get_by_name("status").unwrap_or_default(),
-            started_at: row.get_by_name("started_at").ok().flatten(),
-            completed_at: row.get_by_name("completed_at").ok().flatten(),
-        }))
+        let run = match row {
+            Some(row) => {
+                let status_raw: String = row.get_by_name("status").unwrap_or_default();
+                let status = status_raw
+                    .parse()
+                    .map_err(|err| anyhow::anyhow!("Invalid pipeline run status '{}': {}", status_raw, err))?;
+                Some(PipelineRun {
+                    id: row.get_by_name("id").unwrap_or_default(),
+                    pipeline_id: row.get_by_name("pipeline_id").unwrap_or_default(),
+                    selection_spec_id: row.get_by_name("selection_spec_id").unwrap_or_default(),
+                    selection_snapshot_hash: row.get_by_name("selection_snapshot_hash").unwrap_or_default(),
+                    context_snapshot_hash: row.get_by_name("context_snapshot_hash").ok().flatten(),
+                    logical_date: row.get_by_name("logical_date").unwrap_or_default(),
+                    status,
+                    started_at: row.get_by_name("started_at").ok().flatten(),
+                    completed_at: row.get_by_name("completed_at").ok().flatten(),
+                })
+            }
+            None => None,
+        };
+
+        Ok(run)
     }
 
-    pub async fn get_pipeline_run_for_job(&self, job_id: i64) -> Result<Option<PipelineRun>> {
+    pub fn get_pipeline_run_for_job(&self, job_id: JobId) -> Result<Option<PipelineRun>> {
+        let job_id = job_id.to_i64().map_err(|err| anyhow::anyhow!(err))?;
         let row = self
             .conn
             .query_optional(
@@ -86,23 +97,34 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(job_id)],
             )
-            .await
+            
             .context("Failed to fetch pipeline run for job")?;
 
-        Ok(row.map(|row| PipelineRun {
-            id: row.get_by_name("id").unwrap_or_default(),
-            pipeline_id: row.get_by_name("pipeline_id").unwrap_or_default(),
-            selection_spec_id: row.get_by_name("selection_spec_id").unwrap_or_default(),
-            selection_snapshot_hash: row.get_by_name("selection_snapshot_hash").unwrap_or_default(),
-            context_snapshot_hash: row.get_by_name("context_snapshot_hash").ok().flatten(),
-            logical_date: row.get_by_name("logical_date").unwrap_or_default(),
-            status: row.get_by_name("status").unwrap_or_default(),
-            started_at: row.get_by_name("started_at").ok().flatten(),
-            completed_at: row.get_by_name("completed_at").ok().flatten(),
-        }))
+        let run = match row {
+            Some(row) => {
+                let status_raw: String = row.get_by_name("status").unwrap_or_default();
+                let status = status_raw
+                    .parse()
+                    .map_err(|err| anyhow::anyhow!("Invalid pipeline run status '{}': {}", status_raw, err))?;
+                Some(PipelineRun {
+                    id: row.get_by_name("id").unwrap_or_default(),
+                    pipeline_id: row.get_by_name("pipeline_id").unwrap_or_default(),
+                    selection_spec_id: row.get_by_name("selection_spec_id").unwrap_or_default(),
+                    selection_snapshot_hash: row.get_by_name("selection_snapshot_hash").unwrap_or_default(),
+                    context_snapshot_hash: row.get_by_name("context_snapshot_hash").ok().flatten(),
+                    logical_date: row.get_by_name("logical_date").unwrap_or_default(),
+                    status,
+                    started_at: row.get_by_name("started_at").ok().flatten(),
+                    completed_at: row.get_by_name("completed_at").ok().flatten(),
+                })
+            }
+            None => None,
+        };
+
+        Ok(run)
     }
 
-    pub async fn get_selection_snapshot_by_hash(
+    pub fn get_selection_snapshot_by_hash(
         &self,
         snapshot_hash: &str,
     ) -> Result<Option<SelectionSnapshot>> {
@@ -124,7 +146,7 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(snapshot_hash)],
             )
-            .await
+            
             .context("Failed to fetch selection snapshot")?;
 
         Ok(row.map(|row| SelectionSnapshot {
@@ -137,7 +159,7 @@ impl DuckDbPipelineStore {
         }))
     }
 
-    pub async fn get_selection_snapshots_for_file(
+    pub fn get_selection_snapshots_for_file(
         &self,
         file_id: i64,
         limit: i64,
@@ -161,7 +183,7 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(file_id), DbValue::from(limit)],
             )
-            .await
+            
             .context("Failed to fetch selection snapshots for file")?;
 
         rows.iter()
@@ -178,10 +200,14 @@ impl DuckDbPipelineStore {
             .collect()
     }
 
-    async fn initialize_tables(&self) -> Result<()> {
-        self.conn
-            .execute_batch(
-                r#"
+    fn initialize_tables(&self) -> Result<()> {
+        let pipeline_status_values = PipelineRunStatus::ALL
+            .iter()
+            .map(|status| format!("'{}'", status.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let create_sql = format!(
+            r#"
                 CREATE TABLE IF NOT EXISTS cf_selection_specs (
                     id TEXT PRIMARY KEY,
                     spec_json TEXT NOT NULL,
@@ -227,7 +253,8 @@ impl DuckDbPipelineStore {
                     selection_snapshot_hash TEXT NOT NULL,
                     context_snapshot_hash TEXT,
                     logical_date TEXT NOT NULL,
-                    status TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN ({pipeline_status_values})),
                     started_at TIMESTAMP,
                     completed_at TIMESTAMP,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -236,29 +263,31 @@ impl DuckDbPipelineStore {
                 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline
                 ON cf_pipeline_runs(pipeline_id, logical_date);
                 "#,
-            )
-            .await
+            pipeline_status_values = pipeline_status_values
+        );
+        self.conn
+            .execute_batch(&create_sql)
+            
             .context("Failed to initialize pipeline tables")?;
 
         Ok(())
     }
 }
 
-#[async_trait]
-impl PipelineStore for DuckDbPipelineStore {
-    async fn create_selection_spec(&self, spec_json: &str) -> Result<String> {
+impl DuckDbPipelineStore {
+    pub fn create_selection_spec(&self, spec_json: &str) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.conn
             .execute(
                 "INSERT INTO cf_selection_specs (id, spec_json) VALUES (?, ?)",
                 &[DbValue::from(id.as_str()), DbValue::from(spec_json)],
             )
-            .await
+            
             .context("Failed to insert selection spec")?;
         Ok(id)
     }
 
-    async fn create_selection_snapshot(
+    pub fn create_selection_snapshot(
         &self,
         spec_id: &str,
         snapshot_hash: &str,
@@ -282,25 +311,25 @@ impl PipelineStore for DuckDbPipelineStore {
                     DbValue::from(watermark_value),
                 ],
             )
-            .await
+            
             .context("Failed to insert selection snapshot")?;
         Ok(id)
     }
 
-    async fn insert_snapshot_files(&self, snapshot_id: &str, file_ids: &[i64]) -> Result<()> {
+    pub fn insert_snapshot_files(&self, snapshot_id: &str, file_ids: &[i64]) -> Result<()> {
         for file_id in file_ids {
             self.conn
                 .execute(
                     "INSERT INTO cf_selection_snapshot_files (snapshot_id, file_id) VALUES (?, ?)",
                     &[DbValue::from(snapshot_id), DbValue::from(*file_id)],
                 )
-                .await
+                
                 .context("Failed to insert snapshot file")?;
         }
         Ok(())
     }
 
-    async fn create_pipeline(&self, name: &str, version: i64, config_json: &str) -> Result<String> {
+    pub fn create_pipeline(&self, name: &str, version: i64, config_json: &str) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.conn
             .execute(
@@ -312,12 +341,12 @@ impl PipelineStore for DuckDbPipelineStore {
                     DbValue::from(config_json),
                 ],
             )
-            .await
+            
             .context("Failed to insert pipeline")?;
         Ok(id)
     }
 
-    async fn get_latest_pipeline(&self, name: &str) -> Result<Option<Pipeline>> {
+    pub fn get_latest_pipeline(&self, name: &str) -> Result<Option<Pipeline>> {
         let row = self
             .conn
             .query_optional(
@@ -330,7 +359,7 @@ impl PipelineStore for DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(name)],
             )
-            .await
+            
             .context("Failed to fetch latest pipeline")?;
 
         Ok(row.map(|row| Pipeline {
@@ -342,14 +371,14 @@ impl PipelineStore for DuckDbPipelineStore {
         }))
     }
 
-    async fn create_pipeline_run(
+    pub fn create_pipeline_run(
         &self,
         pipeline_id: &str,
         selection_spec_id: &str,
         selection_snapshot_hash: &str,
         context_snapshot_hash: Option<&str>,
         logical_date: &str,
-        status: &str,
+        status: PipelineRunStatus,
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.conn
@@ -373,19 +402,21 @@ impl PipelineStore for DuckDbPipelineStore {
                     DbValue::from(selection_snapshot_hash),
                     DbValue::from(context_snapshot_hash),
                     DbValue::from(logical_date),
-                    DbValue::from(status),
+                    DbValue::from(status.as_str()),
                 ],
             )
-            .await
+            
             .context("Failed to insert pipeline run")?;
         Ok(id)
     }
 
-    async fn set_pipeline_run_status(&self, run_id: &str, status: &str) -> Result<()> {
+    pub fn set_pipeline_run_status(&self, run_id: &str, status: PipelineRunStatus) -> Result<()> {
         let (set_started, set_completed) = match status {
-            "running" => (true, false),
-            "completed" | "failed" | "no_op" => (false, true),
-            _ => (false, false),
+            PipelineRunStatus::Running => (true, false),
+            PipelineRunStatus::Completed | PipelineRunStatus::Failed | PipelineRunStatus::NoOp => {
+                (false, true)
+            }
+            PipelineRunStatus::Queued => (false, false),
         };
 
         let mut query = String::from("UPDATE cf_pipeline_runs SET status = ?");
@@ -398,13 +429,13 @@ impl PipelineStore for DuckDbPipelineStore {
         query.push_str(" WHERE id = ?");
 
         self.conn
-            .execute(&query, &[DbValue::from(status), DbValue::from(run_id)])
-            .await
+            .execute(&query, &[DbValue::from(status.as_str()), DbValue::from(run_id)])
+            
             .context("Failed to update pipeline run status")?;
         Ok(())
     }
 
-    async fn pipeline_run_exists(&self, pipeline_id: &str, logical_date: &str) -> Result<bool> {
+    pub fn pipeline_run_exists(&self, pipeline_id: &str, logical_date: &str) -> Result<bool> {
         let row = self
             .conn
             .query_optional(
@@ -415,22 +446,22 @@ impl PipelineStore for DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(pipeline_id), DbValue::from(logical_date)],
             )
-            .await
+            
             .context("Failed to query pipeline runs")?;
         Ok(row.is_some())
     }
 
-    async fn resolve_selection_files(
+    pub fn resolve_selection_files(
         &self,
         filters: &SelectionFilters,
         logical_date_ms: i64,
     ) -> Result<SelectionResolution> {
-        let mut sql = String::from("SELECT id, mtime FROM scout_files WHERE status != 'deleted'");
-        let mut params: Vec<DbValue> = Vec::new();
+        let mut sql = String::from("SELECT id, mtime FROM scout_files WHERE status != ?");
+        let mut params: Vec<DbValue> = vec![DbValue::from(FileStatus::Deleted.as_str())];
 
         if let Some(source_id) = &filters.source_id {
             sql.push_str(" AND source_id = ?");
-            params.push(DbValue::from(source_id.as_str()));
+            params.push(DbValue::from(source_id.as_i64()));
         }
         if let Some(tag) = &filters.tag {
             sql.push_str(" AND tag = ?");
@@ -450,7 +481,7 @@ impl PipelineStore for DuckDbPipelineStore {
         let rows = self
             .conn
             .query_all(&sql, &params)
-            .await
+            
             .context("Failed to resolve selection files")?;
 
         let mut file_ids = Vec::with_capacity(rows.len());

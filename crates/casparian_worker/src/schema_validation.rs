@@ -1,10 +1,90 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::anyhow;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::record_batch::RecordBatch;
 use casparian_protocol::DataType as SchemaDataType;
-use serde_json::Value;
-use std::str::FromStr;
+use casparian_protocol::types::{
+    ColumnOrderMismatch, ObservedColumn, ObservedDataType, SchemaColumnSpec, SchemaDefinition,
+    SchemaMismatch, TypeMismatch,
+};
+use thiserror::Error;
+
+type SchemaResult<T> = std::result::Result<T, SchemaValidationError>;
+type AnyhowResult<T> = std::result::Result<T, anyhow::Error>;
+
+#[derive(Debug, Error)]
+pub enum SchemaValidationError {
+    #[error("{message}")]
+    InvalidSchemaDef { message: String },
+    #[error("schema mismatch for '{output_name}'")]
+    SchemaMismatch { output_name: String, mismatch: SchemaMismatch },
+}
+
+pub fn summarize_schema_mismatch(mismatch: &SchemaMismatch) -> String {
+    let mut parts = Vec::new();
+
+    let expected_len = mismatch.expected_columns.len();
+    let actual_len = mismatch.actual_columns.len();
+    if expected_len != actual_len {
+        parts.push(format!(
+            "expected {} columns, got {}",
+            expected_len, actual_len
+        ));
+    }
+    if !mismatch.missing_columns.is_empty() {
+        parts.push(format!(
+            "missing: {}",
+            mismatch.missing_columns.join(", ")
+        ));
+    }
+    if !mismatch.extra_columns.is_empty() {
+        parts.push(format!(
+            "extra: {}",
+            mismatch.extra_columns.join(", ")
+        ));
+    }
+    if !mismatch.order_mismatches.is_empty() {
+        let details = mismatch
+            .order_mismatches
+            .iter()
+            .take(3)
+            .map(|m| format!("#{} {} != {}", m.index, m.expected, m.actual))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("order: {}", details));
+    }
+    if !mismatch.type_mismatches.is_empty() {
+        let details = mismatch
+            .type_mismatches
+            .iter()
+            .take(3)
+            .map(|m| {
+                format!(
+                    "{}: {} != {}",
+                    m.name,
+                    m.expected,
+                    observed_type_label(&m.actual)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("types: {}", details));
+    }
+
+    if parts.is_empty() {
+        format!("schema mismatch for '{}'", mismatch.output_name)
+    } else {
+        format!("schema mismatch for '{}': {}", mismatch.output_name, parts.join("; "))
+    }
+}
+
+impl From<anyhow::Error> for SchemaValidationError {
+    fn from(err: anyhow::Error) -> Self {
+        SchemaValidationError::InvalidSchemaDef {
+            message: err.to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SchemaDef {
@@ -23,195 +103,43 @@ struct ColumnDef {
 
 pub fn enforce_schema_on_batches(
     batches: &[RecordBatch],
-    schema_def_json: &str,
+    schema_def: &SchemaDefinition,
     output_name: &str,
-) -> Result<Vec<RecordBatch>> {
-    let schema_def = parse_schema_def(schema_def_json, output_name)?;
+) -> SchemaResult<Vec<RecordBatch>> {
+    let schema_def = schema_def_from_definition(schema_def)?;
     let mut validated = Vec::with_capacity(batches.len());
     for batch in batches {
-        validated.push(validate_record_batch(batch, &schema_def)?);
+        validated.push(validate_record_batch(batch, &schema_def, output_name)?);
     }
     Ok(validated)
 }
 
-fn parse_schema_def(schema_def_json: &str, output_name: &str) -> Result<SchemaDef> {
-    let raw = schema_def_json.trim();
-    if raw.is_empty() || raw == "null" {
-        bail!("schema_def is empty");
+fn schema_def_from_definition(schema_def: &SchemaDefinition) -> SchemaResult<SchemaDef> {
+    if schema_def.columns.is_empty() {
+        return Err(SchemaValidationError::InvalidSchemaDef {
+            message: "schema_def.columns is empty".to_string(),
+        });
     }
 
-    let value: Value = serde_json::from_str(raw)
-        .map_err(|e| anyhow!("schema_def is not valid JSON: {}", e))?;
+    let columns = schema_def
+        .columns
+        .iter()
+        .map(|col| ColumnDef {
+            name: col.name.clone(),
+            data_type: col.data_type.clone(),
+            nullable: col.nullable,
+            format: col.format.clone(),
+        })
+        .collect();
 
-    if let Some(schemas_value) = value.get("schemas") {
-        let schemas = schemas_value
-            .as_array()
-            .ok_or_else(|| anyhow!("schema_def.schemas must be an array"))?;
-        if schemas.is_empty() {
-            bail!("schema_def.schemas is empty");
-        }
-        let selected = schemas
-            .iter()
-            .find(|schema| schema.get("name").and_then(|v| v.as_str()) == Some(output_name))
-            .unwrap_or(&schemas[0]);
-        return schema_from_value(selected);
-    }
-
-    if let Some(columns_value) = value.get("columns") {
-        let columns = columns_from_value(columns_value)?;
-        return Ok(SchemaDef { columns });
-    }
-
-    if value.is_array() {
-        let columns = columns_from_value(&value)?;
-        return Ok(SchemaDef { columns });
-    }
-
-    Err(anyhow!(
-        "schema_def must be a contract, schema object with columns, or array of columns"
-    ))
-}
-
-fn schema_from_value(value: &Value) -> Result<SchemaDef> {
-    let columns_value = value
-        .get("columns")
-        .ok_or_else(|| anyhow!("schema missing columns"))?;
-    let columns = columns_from_value(columns_value)?;
     Ok(SchemaDef { columns })
 }
 
-fn columns_from_value(value: &Value) -> Result<Vec<ColumnDef>> {
-    let arr = value
-        .as_array()
-        .ok_or_else(|| anyhow!("columns must be an array"))?;
-    let mut columns = Vec::with_capacity(arr.len());
-    for col_value in arr {
-        columns.push(column_from_value(col_value)?);
-    }
-    Ok(columns)
-}
-
-fn column_from_value(value: &Value) -> Result<ColumnDef> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow!("column must be an object"))?;
-    let name = obj
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("column.name is required"))?
-        .to_string();
-    let nullable = obj
-        .get("nullable")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let format = obj
-        .get("format")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let data_type = if let Some(dt_value) = obj.get("data_type").or_else(|| obj.get("type")) {
-        serde_json::from_value::<SchemaDataType>(dt_value.clone())
-            .map_err(|e| anyhow!("column.data_type invalid: {}", e))?
-    } else if let Some(dtype_value) = obj.get("dtype") {
-        let dtype = dtype_value
-            .as_str()
-            .ok_or_else(|| anyhow!("column.dtype must be a string"))?;
-        parse_dtype_string(dtype)?
-    } else {
-        bail!("column.data_type or column.dtype is required");
-    };
-
-    Ok(ColumnDef {
-        name,
-        data_type,
-        nullable,
-        format,
-    })
-}
-
-fn parse_dtype_string(raw: &str) -> Result<SchemaDataType> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("dtype is empty");
-    }
-
-    if let Ok(dt) = SchemaDataType::from_str(trimmed) {
-        return Ok(dt);
-    }
-
-    let lower = trimmed.to_lowercase();
-    if let Some(dt) = parse_polars_datetime(&lower) {
-        return Ok(dt);
-    }
-    if let Some(dt) = parse_polars_decimal(&lower) {
-        return Ok(dt);
-    }
-    if let Some(dt) = parse_pandas_datetime(&lower) {
-        return Ok(dt);
-    }
-
-    let dt = match lower.as_str() {
-        "int" | "integer" | "int8" | "int16" | "int32" | "int64" => SchemaDataType::Int64,
-        "uint8" | "uint16" | "uint32" | "uint64" => SchemaDataType::Int64,
-        "float" | "float32" | "float64" | "double" => SchemaDataType::Float64,
-        "bool" | "boolean" => SchemaDataType::Boolean,
-        "str" | "string" | "utf8" | "text" | "object" | "category" => SchemaDataType::String,
-        "binary" | "bytes" => SchemaDataType::Binary,
-        "date" | "date32" | "date64" => SchemaDataType::Date,
-        "time" | "time32" | "time64" => SchemaDataType::Time,
-        "timestamp" | "datetime" => SchemaDataType::Timestamp,
-        _ => {
-            bail!("unsupported dtype string '{}'", trimmed);
-        }
-    };
-
-    Ok(dt)
-}
-
-fn parse_polars_datetime(lower: &str) -> Option<SchemaDataType> {
-    if !lower.starts_with("datetime(") {
-        return None;
-    }
-    let tz = extract_between(lower, "time_zone=", &[',', ')'])
-        .map(|s| s.trim_matches('\'').trim_matches('"').to_string());
-    match tz.as_deref() {
-        Some("none") | Some("null") => Some(SchemaDataType::Timestamp),
-        Some(tz) if !tz.is_empty() => Some(SchemaDataType::TimestampTz { tz: tz.to_string() }),
-        _ => Some(SchemaDataType::Timestamp),
-    }
-}
-
-fn parse_polars_decimal(lower: &str) -> Option<SchemaDataType> {
-    if !lower.starts_with("decimal(") {
-        return None;
-    }
-    let precision = extract_between(lower, "precision=", &[',', ')'])?.parse::<u8>().ok()?;
-    let scale = extract_between(lower, "scale=", &[',', ')'])?.parse::<u8>().ok()?;
-    Some(SchemaDataType::Decimal { precision, scale })
-}
-
-fn parse_pandas_datetime(lower: &str) -> Option<SchemaDataType> {
-    if !lower.starts_with("datetime64") {
-        return None;
-    }
-    if lower.contains("utc") || lower.contains("tz=") {
-        return Some(SchemaDataType::TimestampTz {
-            tz: "UTC".to_string(),
-        });
-    }
-    Some(SchemaDataType::Timestamp)
-}
-
-fn extract_between<'a>(value: &'a str, key: &str, terminators: &[char]) -> Option<&'a str> {
-    let start = value.find(key)? + key.len();
-    let slice = &value[start..];
-    let end = slice
-        .find(|c| terminators.contains(&c))
-        .unwrap_or(slice.len());
-    Some(&slice[..end])
-}
-
-fn validate_record_batch(batch: &RecordBatch, schema_def: &SchemaDef) -> Result<RecordBatch> {
+fn validate_record_batch(
+    batch: &RecordBatch,
+    schema_def: &SchemaDef,
+    output_name: &str,
+) -> SchemaResult<RecordBatch> {
     let mut data_field_indices = Vec::with_capacity(batch.num_columns());
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         if field.name() == "_cf_row_error" {
@@ -221,28 +149,25 @@ fn validate_record_batch(batch: &RecordBatch, schema_def: &SchemaDef) -> Result<
     }
 
     if schema_def.columns.len() != data_field_indices.len() {
-        bail!(
-            "schema mismatch: expected {} columns, got {}",
-            schema_def.columns.len(),
-            data_field_indices.len()
-        );
+        return Err(build_schema_mismatch(
+            output_name,
+            schema_def,
+            batch,
+            &data_field_indices,
+        ));
     }
 
     let schema = batch.schema();
-    for (pos, (expected, idx)) in schema_def
-        .columns
-        .iter()
-        .zip(data_field_indices.iter())
-        .enumerate()
+    for (expected, idx) in schema_def.columns.iter().zip(data_field_indices.iter())
     {
         let actual_name = schema.field(*idx).name();
         if expected.name != *actual_name {
-            bail!(
-                "schema mismatch at column {}: expected '{}', got '{}'",
-                pos,
-                expected.name,
-                actual_name
-            );
+            return Err(build_schema_mismatch(
+                output_name,
+                schema_def,
+                batch,
+                &data_field_indices,
+            ));
         }
     }
 
@@ -251,7 +176,7 @@ fn validate_record_batch(batch: &RecordBatch, schema_def: &SchemaDef) -> Result<
 
     for (expected, idx) in schema_def.columns.iter().zip(data_field_indices.iter()) {
         let array = batch.column(*idx);
-        let type_check = type_check_mode(&expected.data_type, array.data_type(), expected)?;
+        let type_check = type_check_mode(&expected.data_type, array.data_type(), expected);
 
         match type_check {
             TypeCheck::Compatible => {
@@ -281,6 +206,14 @@ fn validate_record_batch(batch: &RecordBatch, schema_def: &SchemaDef) -> Result<
                     }
                 }
             }
+            TypeCheck::Mismatch => {
+                return Err(build_schema_mismatch(
+                    output_name,
+                    schema_def,
+                    batch,
+                    &data_field_indices,
+                ));
+            }
         }
     }
 
@@ -295,18 +228,15 @@ fn validate_record_batch(batch: &RecordBatch, schema_def: &SchemaDef) -> Result<
 enum TypeCheck {
     Compatible,
     NullOnly,
+    Mismatch,
 }
 
-fn type_check_mode(
-    expected: &SchemaDataType,
-    actual: &ArrowDataType,
-    column: &ColumnDef,
-) -> Result<TypeCheck> {
+fn type_check_mode(expected: &SchemaDataType, actual: &ArrowDataType, column: &ColumnDef) -> TypeCheck {
     use ArrowDataType as A;
     use SchemaDataType as S;
 
     if matches!(actual, A::Null) {
-        return Ok(TypeCheck::NullOnly);
+        return TypeCheck::NullOnly;
     }
 
     let compatible = match (expected, actual) {
@@ -341,22 +271,198 @@ fn type_check_mode(
     };
 
     if compatible {
-        return Ok(TypeCheck::Compatible);
+        TypeCheck::Compatible
+    } else {
+        TypeCheck::Mismatch
+    }
+}
+
+fn build_schema_mismatch(
+    output_name: &str,
+    schema_def: &SchemaDef,
+    batch: &RecordBatch,
+    data_field_indices: &[usize],
+) -> SchemaValidationError {
+    let expected_columns: Vec<SchemaColumnSpec> = schema_def
+        .columns
+        .iter()
+        .map(|col| SchemaColumnSpec {
+            name: col.name.clone(),
+            data_type: col.data_type.clone(),
+            nullable: col.nullable,
+            format: col.format.clone(),
+        })
+        .collect();
+
+    let schema = batch.schema();
+    let actual_columns: Vec<ObservedColumn> = data_field_indices
+        .iter()
+        .map(|idx| {
+            let field = schema.field(*idx);
+            ObservedColumn {
+                name: field.name().to_string(),
+                data_type: observed_data_type(field.data_type()),
+            }
+        })
+        .collect();
+
+    let expected_names: Vec<String> = expected_columns.iter().map(|col| col.name.clone()).collect();
+    let actual_names: Vec<String> = actual_columns.iter().map(|col| col.name.clone()).collect();
+
+    let expected_set: std::collections::HashSet<&str> =
+        expected_names.iter().map(|name| name.as_str()).collect();
+    let actual_set: std::collections::HashSet<&str> =
+        actual_names.iter().map(|name| name.as_str()).collect();
+
+    let missing_columns = expected_names
+        .iter()
+        .filter(|name| !actual_set.contains(name.as_str()))
+        .cloned()
+        .collect();
+    let extra_columns = actual_names
+        .iter()
+        .filter(|name| !expected_set.contains(name.as_str()))
+        .cloned()
+        .collect();
+
+    let mut order_mismatches = Vec::new();
+    let min_len = std::cmp::min(expected_names.len(), actual_names.len());
+    for idx in 0..min_len {
+        let expected = &expected_names[idx];
+        let actual = &actual_names[idx];
+        if expected != actual {
+            order_mismatches.push(ColumnOrderMismatch {
+                index: idx,
+                expected: expected.clone(),
+                actual: actual.clone(),
+            });
+        }
     }
 
-    Err(anyhow!(
-        "schema mismatch for '{}': expected {}, got {}",
-        column.name,
-        expected,
-        actual
-    ))
+    let mut type_mismatches = Vec::new();
+    for expected in &schema_def.columns {
+        if let Some((idx, _)) = actual_names
+            .iter()
+            .enumerate()
+            .find(|(_, name)| name.as_str() == expected.name.as_str())
+        {
+            let field = schema.field(data_field_indices[idx]);
+            let actual_type = field.data_type();
+            if !is_type_compatible(&expected.data_type, actual_type, expected) {
+                type_mismatches.push(TypeMismatch {
+                    name: expected.name.clone(),
+                    expected: expected.data_type.clone(),
+                    actual: observed_data_type(actual_type),
+                });
+            }
+        }
+    }
+
+    SchemaValidationError::SchemaMismatch {
+        output_name: output_name.to_string(),
+        mismatch: SchemaMismatch {
+            output_name: output_name.to_string(),
+            expected_columns,
+            actual_columns,
+            missing_columns,
+            extra_columns,
+            order_mismatches,
+            type_mismatches,
+        },
+    }
+}
+
+fn is_type_compatible(expected: &SchemaDataType, actual: &ArrowDataType, column: &ColumnDef) -> bool {
+    use ArrowDataType as A;
+    use SchemaDataType as S;
+
+    if matches!(actual, A::Null) {
+        return true;
+    }
+
+    match (expected, actual) {
+        (S::Null, A::Null) => true,
+        (S::Boolean, A::Boolean) => true,
+        (S::Int64, A::Int8 | A::Int16 | A::Int32 | A::Int64) => true,
+        (S::Float64, A::Float32 | A::Float64) => true,
+        (S::Float64, A::Int8 | A::Int16 | A::Int32 | A::Int64) => true,
+        (S::Date, A::Date32 | A::Date64) => true,
+        (S::Timestamp, A::Timestamp(_, tz)) => tz.is_none(),
+        (S::TimestampTz { tz }, A::Timestamp(_, tz_actual)) => {
+            tz_actual.as_ref().map(|s| eq_tz(s, tz)).unwrap_or(false)
+        }
+        (S::Time, A::Time32(_) | A::Time64(_)) => true,
+        (S::Date | S::Timestamp | S::TimestampTz { .. } | S::Time, A::Utf8 | A::LargeUtf8)
+            if column.format.is_some() =>
+        {
+            true
+        }
+        (S::Duration, A::Duration(_)) => true,
+        (S::String, A::Utf8 | A::LargeUtf8) => true,
+        (S::Binary, A::Binary | A::LargeBinary) => true,
+        (S::Decimal { precision, scale }, A::Decimal128(p, s)) => {
+            *precision == *p && *scale as i8 == *s
+        }
+        (S::Decimal { precision, scale }, A::Decimal256(p, s)) => {
+            *precision == *p && *scale as i8 == *s
+        }
+        (S::List { .. }, A::List(_) | A::LargeList(_)) => true,
+        (S::Struct { .. }, A::Struct(_)) => true,
+        _ => false,
+    }
+}
+
+fn observed_data_type(actual: &ArrowDataType) -> ObservedDataType {
+    if let Some(data_type) = canonical_type_for_arrow(actual) {
+        return ObservedDataType::Canonical { data_type };
+    }
+    ObservedDataType::Arrow {
+        name: format!("{:?}", actual),
+    }
+}
+
+fn observed_type_label(actual: &ObservedDataType) -> String {
+    match actual {
+        ObservedDataType::Canonical { data_type } => data_type.to_string(),
+        ObservedDataType::Arrow { name } => name.clone(),
+    }
+}
+
+fn canonical_type_for_arrow(actual: &ArrowDataType) -> Option<SchemaDataType> {
+    use ArrowDataType as A;
+    use SchemaDataType as S;
+
+    match actual {
+        A::Null => Some(S::Null),
+        A::Boolean => Some(S::Boolean),
+        A::Int8 | A::Int16 | A::Int32 | A::Int64 => Some(S::Int64),
+        A::Float32 | A::Float64 => Some(S::Float64),
+        A::Date32 | A::Date64 => Some(S::Date),
+        A::Timestamp(_, tz) => match tz.as_ref() {
+            Some(tz) => Some(S::TimestampTz { tz: tz.to_string() }),
+            None => Some(S::Timestamp),
+        },
+        A::Time32(_) | A::Time64(_) => Some(S::Time),
+        A::Duration(_) => Some(S::Duration),
+        A::Utf8 | A::LargeUtf8 => Some(S::String),
+        A::Binary | A::LargeBinary => Some(S::Binary),
+        A::Decimal128(p, s) => Some(S::Decimal {
+            precision: u8::try_from(*p).ok()?,
+            scale: u8::try_from(*s).ok()?,
+        }),
+        A::Decimal256(p, s) => Some(S::Decimal {
+            precision: u8::try_from(*p).ok()?,
+            scale: u8::try_from(*s).ok()?,
+        }),
+        _ => None,
+    }
 }
 
 fn validate_format_values(
     expected: &ColumnDef,
     array: &ArrayRef,
     row_errors: &mut [String],
-) -> Result<bool> {
+) -> AnyhowResult<bool> {
     let Some(format) = expected.format.as_deref() else {
         return Ok(false);
     };
@@ -427,7 +533,7 @@ fn validate_format_values(
     Ok(has_errors)
 }
 
-fn merge_error_column(batch: &RecordBatch, new_errors: &[String]) -> Result<RecordBatch> {
+fn merge_error_column(batch: &RecordBatch, new_errors: &[String]) -> AnyhowResult<RecordBatch> {
     let error_idx = batch.schema().index_of("_cf_row_error").ok();
     let use_large = match error_idx {
         Some(idx) => matches!(batch.column(idx).data_type(), ArrowDataType::LargeUtf8),
@@ -510,7 +616,7 @@ fn merge_error_column(batch: &RecordBatch, new_errors: &[String]) -> Result<Reco
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
-fn error_value(array: &ArrayRef, row: usize) -> Result<Option<String>> {
+fn error_value(array: &ArrayRef, row: usize) -> AnyhowResult<Option<String>> {
     match array.data_type() {
         ArrowDataType::Utf8 => {
             let arr = array
@@ -565,19 +671,24 @@ mod tests {
     use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
 
+    fn schema_def(columns: Vec<SchemaColumnSpec>) -> SchemaDef {
+        schema_def_from_definition(&SchemaDefinition { columns }).unwrap()
+    }
+
     #[test]
-    fn test_parse_schema_def_array() {
-        let json = r#"[{"name":"id","dtype":"int64"},{"name":"name","dtype":"utf8"}]"#;
-        let schema = parse_schema_def(json, "output").unwrap();
-        assert_eq!(schema.columns.len(), 2);
-        assert_eq!(schema.columns[0].name, "id");
-        assert_eq!(schema.columns[1].data_type, SchemaDataType::String);
+    fn test_schema_def_empty_columns_rejected() {
+        let err = schema_def_from_definition(&SchemaDefinition { columns: vec![] }).unwrap_err();
+        assert!(err.to_string().contains("schema_def.columns is empty"));
     }
 
     #[test]
     fn test_schema_validation_string_hardfail() {
-        let json = r#"[{"name":"id","dtype":"int64","nullable":false}]"#;
-        let schema = parse_schema_def(json, "output").unwrap();
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "id".to_string(),
+            data_type: SchemaDataType::Int64,
+            nullable: false,
+            format: None,
+        }]);
         let ids = StringArray::from(vec![Some("1"), Some("bad")]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Utf8, true)])),
@@ -585,14 +696,18 @@ mod tests {
         )
         .unwrap();
 
-        let err = validate_record_batch(&batch, &schema).unwrap_err();
+        let err = validate_record_batch(&batch, &schema, "output").unwrap_err();
         assert!(err.to_string().contains("schema mismatch"));
     }
 
     #[test]
     fn test_schema_validation_nullability() {
-        let json = r#"[{"name":"id","dtype":"int64","nullable":false}]"#;
-        let schema = parse_schema_def(json, "output").unwrap();
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "id".to_string(),
+            data_type: SchemaDataType::Int64,
+            nullable: false,
+            format: None,
+        }]);
         let ids = Int64Array::from(vec![Some(1), None]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Int64, true)])),
@@ -600,7 +715,7 @@ mod tests {
         )
         .unwrap();
 
-        let validated = validate_record_batch(&batch, &schema).unwrap();
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
         let error_idx = validated.schema().index_of("_cf_row_error").unwrap();
         let error_col = validated
             .column(error_idx)
@@ -613,8 +728,12 @@ mod tests {
 
     #[test]
     fn test_schema_validation_type_mismatch() {
-        let json = r#"[{"name":"id","dtype":"int64"}]"#;
-        let schema = parse_schema_def(json, "output").unwrap();
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "id".to_string(),
+            data_type: SchemaDataType::Int64,
+            nullable: true,
+            format: None,
+        }]);
         let ids = arrow::array::BooleanArray::from(vec![Some(true), Some(false)]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Boolean, true)])),
@@ -622,14 +741,18 @@ mod tests {
         )
         .unwrap();
 
-        let err = validate_record_batch(&batch, &schema).unwrap_err();
+        let err = validate_record_batch(&batch, &schema, "output").unwrap_err();
         assert!(err.to_string().contains("schema mismatch"));
     }
 
     #[test]
     fn test_schema_validation_format_date_string() {
-        let json = r#"[{"name":"date","dtype":"date","format":"%Y-%m-%d"}]"#;
-        let schema = parse_schema_def(json, "output").unwrap();
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "date".to_string(),
+            data_type: SchemaDataType::Date,
+            nullable: true,
+            format: Some("%Y-%m-%d".to_string()),
+        }]);
         let dates = StringArray::from(vec![Some("2024-01-15"), Some("01/15/2024")]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("date", ArrowDataType::Utf8, true)])),
@@ -637,7 +760,7 @@ mod tests {
         )
         .unwrap();
 
-        let validated = validate_record_batch(&batch, &schema).unwrap();
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
         let error_idx = validated.schema().index_of("_cf_row_error").unwrap();
         let error_col = validated
             .column(error_idx)
@@ -650,8 +773,12 @@ mod tests {
 
     #[test]
     fn test_schema_validation_format_timestamp_string_success() {
-        let json = r#"[{"name":"created_at","dtype":"timestamp","format":"%Y-%m-%d %H:%M:%S"}]"#;
-        let schema = parse_schema_def(json, "output").unwrap();
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "created_at".to_string(),
+            data_type: SchemaDataType::Timestamp,
+            nullable: true,
+            format: Some("%Y-%m-%d %H:%M:%S".to_string()),
+        }]);
         let values =
             StringArray::from(vec![Some("2024-01-15 10:30:00"), Some("2024-01-16 09:00:00")]);
         let batch = RecordBatch::try_new(
@@ -664,7 +791,7 @@ mod tests {
         )
         .unwrap();
 
-        let validated = validate_record_batch(&batch, &schema).unwrap();
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
         assert!(validated.schema().index_of("_cf_row_error").is_err());
     }
 
@@ -673,5 +800,207 @@ mod tests {
         assert!(eq_tz("UTC", "Etc/UTC"));
         assert!(eq_tz("gmt", "UTC"));
         assert!(eq_tz("America/New_York", "america/new_york"));
+    }
+
+    #[test]
+    fn test_timestamp_tz_explicit_timezone_required() {
+        // TimestampTz should only match Timestamp with explicit timezone
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "ts".to_string(),
+            data_type: SchemaDataType::TimestampTz {
+                tz: "UTC".to_string(),
+            },
+            nullable: true,
+            format: None,
+        }]);
+        assert!(matches!(
+            schema.columns[0].data_type,
+            SchemaDataType::TimestampTz { ref tz } if tz == "UTC"
+        ));
+
+        // Timestamp without TZ should fail
+        let ts_no_tz = arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000), Some(2000000)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            )])),
+            vec![Arc::new(ts_no_tz) as ArrayRef],
+        )
+        .unwrap();
+        let err = validate_record_batch(&batch, &schema, "output").unwrap_err();
+        assert!(err.to_string().contains("schema mismatch"));
+    }
+
+    #[test]
+    fn test_timestamp_tz_with_matching_timezone() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "ts".to_string(),
+            data_type: SchemaDataType::TimestampTz {
+                tz: "UTC".to_string(),
+            },
+            nullable: true,
+            format: None,
+        }]);
+
+        // Timestamp WITH matching TZ should pass
+        let ts_with_tz = arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000), Some(2000000)])
+            .with_timezone("UTC");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )])),
+            vec![Arc::new(ts_with_tz) as ArrayRef],
+        )
+        .unwrap();
+        let result = validate_record_batch(&batch, &schema, "output");
+        assert!(result.is_ok(), "Expected success, got {:?}", result.err());
+    }
+
+    #[test]
+    fn test_timestamp_tz_mismatched_timezone() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "ts".to_string(),
+            data_type: SchemaDataType::TimestampTz {
+                tz: "America/New_York".to_string(),
+            },
+            nullable: true,
+            format: None,
+        }]);
+
+        // Timestamp with different TZ should fail
+        let ts_utc = arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000)])
+            .with_timezone("UTC");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )])),
+            vec![Arc::new(ts_utc) as ArrayRef],
+        )
+        .unwrap();
+        let err = validate_record_batch(&batch, &schema, "output").unwrap_err();
+        assert!(err.to_string().contains("schema mismatch"));
+    }
+
+    #[test]
+    fn test_decimal_precision_scale_validation() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "price".to_string(),
+            data_type: SchemaDataType::Decimal {
+                precision: 38,
+                scale: 10,
+            },
+            nullable: true,
+            format: None,
+        }]);
+
+        // Decimal with matching precision/scale should pass
+        let decimal_array = arrow::array::Decimal128Array::from(vec![Some(123456789012345678i128)])
+            .with_precision_and_scale(38, 10)
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "price",
+                ArrowDataType::Decimal128(38, 10),
+                true,
+            )])),
+            vec![Arc::new(decimal_array) as ArrayRef],
+        )
+        .unwrap();
+        let result = validate_record_batch(&batch, &schema, "output");
+        assert!(result.is_ok(), "Expected success, got {:?}", result.err());
+    }
+
+    #[test]
+    fn test_decimal_precision_mismatch() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "price".to_string(),
+            data_type: SchemaDataType::Decimal {
+                precision: 38,
+                scale: 10,
+            },
+            nullable: true,
+            format: None,
+        }]);
+
+        // Decimal with different precision should fail
+        let decimal_array = arrow::array::Decimal128Array::from(vec![Some(1234567890i128)])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "price",
+                ArrowDataType::Decimal128(10, 2),
+                true,
+            )])),
+            vec![Arc::new(decimal_array) as ArrayRef],
+        )
+        .unwrap();
+        let err = validate_record_batch(&batch, &schema, "output").unwrap_err();
+        assert!(err.to_string().contains("schema mismatch"));
+    }
+
+    #[test]
+    fn test_timestamp_tz_string_with_format() {
+        // TimestampTz can be represented as string with format for validation
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "ts".to_string(),
+            data_type: SchemaDataType::TimestampTz {
+                tz: "UTC".to_string(),
+            },
+            nullable: true,
+            format: Some("%Y-%m-%dT%H:%M:%S%z".to_string()),
+        }]);
+
+        // Valid RFC3339 format should pass
+        let ts_strings = StringArray::from(vec![
+            Some("2024-01-15T10:30:00+00:00"),
+            Some("2024-01-16T09:00:00+00:00")
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ts", ArrowDataType::Utf8, true)])),
+            vec![Arc::new(ts_strings) as ArrayRef],
+        )
+        .unwrap();
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
+        // Should not have errors
+        assert!(validated.schema().index_of("_cf_row_error").is_err());
+    }
+
+    #[test]
+    fn test_timestamp_tz_string_format_invalid() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "ts".to_string(),
+            data_type: SchemaDataType::TimestampTz {
+                tz: "UTC".to_string(),
+            },
+            nullable: true,
+            format: Some("%Y-%m-%dT%H:%M:%S%z".to_string()),
+        }]);
+
+        // Invalid format should quarantine
+        let ts_strings = StringArray::from(vec![
+            Some("2024-01-15 10:30:00"),  // Missing timezone offset
+            Some("2024-01-16T09:00:00+00:00")  // Valid
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("ts", ArrowDataType::Utf8, true)])),
+            vec![Arc::new(ts_strings) as ArrayRef],
+        )
+        .unwrap();
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
+        let error_idx = validated.schema().index_of("_cf_row_error").unwrap();
+        let error_col = validated
+            .column(error_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(error_col.value(0).contains("format"));
+        assert!(error_col.is_null(1));
     }
 }

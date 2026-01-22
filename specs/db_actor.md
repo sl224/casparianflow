@@ -1,20 +1,20 @@
-# DB Actor Boundary Spec (DuckDB + SQLite)
+# DB Actor Boundary Spec (DuckDB)
 
 ## Purpose
 Own the async boundary for all DB backends with a single, explicit concurrency
 model. Provide a stable async API while preventing UI/event-loop blocking and
-avoiding multi-writer contention for single-writer engines (DuckDB/SQLite).
+avoiding multi-writer contention for DuckDB's single-writer semantics.
 
 ## Context (Casparian-specific)
 - Local-first, air-gapped, single DB file.
 - Control-plane writes are small and frequent; data-plane reads are heavier.
-- SQLite is sync; "async" only means "do not block the UI/event loop."
+- DuckDB is sync; "async" only means "do not block the UI/event loop."
 - DuckDB allows multiple readers but only one writer at a time.
 - Embedded DB deployments are single-worker by product policy; concurrent
-  workers require Postgres/SQL Server.
+  workers require a server backend (post-v1).
 
 ## Goals
-- Single async API (`DbConnection`) across backends.
+- Single async API (`DbConnection`) with a DuckDB-backed actor in v1.
 - Dedicated DB actor thread that serializes writes and isolates sync work.
 - Deterministic backpressure controls.
 - Clear shutdown semantics and error propagation.
@@ -23,7 +23,7 @@ avoiding multi-writer contention for single-writer engines (DuckDB/SQLite).
 - Make the embedded mode concurrency policy explicit (single worker).
 
 ## Non-Goals (v1)
-- Multi-writer parallelism for DuckDB/SQLite.
+- Multi-writer parallelism for DuckDB.
 - Transparent automatic reconnect/retry policies.
 - Implicit write batching (only explicit batching/transactions).
 - Read-scaling via a separate read pool (can be added later).
@@ -49,7 +49,7 @@ avoiding multi-writer contention for single-writer engines (DuckDB/SQLite).
   lives across awaits outside the actor.
 
 ## Concurrency Model
-- Single writer discipline for DuckDB/SQLite. All writes are serialized in the
+- Single writer discipline for DuckDB. All writes are serialized in the
   actor thread.
 - Reads run in the actor thread in v1 for simplicity and determinism.
   (Later: split reads into a pool or allow read-only connections.)
@@ -57,8 +57,8 @@ avoiding multi-writer contention for single-writer engines (DuckDB/SQLite).
 - Any async method may block the caller until the actor completes the request,
   but will not block the UI/event loop.
 - Embedded deployments are single-worker by product policy. If a deployment
-  requires multiple concurrent workers, use Postgres/SQL Server instead of
-  DuckDB/SQLite.
+  requires multiple concurrent workers, use a server backend instead of
+  DuckDB.
 
 ## Batching and Transactions
 - No implicit batching in v1.
@@ -118,18 +118,18 @@ FROM job_events
 GROUP BY job_id;
 ```
 
-For the control plane (small, frequent writes), prefer SQLite unless we move to
-append-only event modeling or DuckDB appenders.
+For the control plane (small, frequent writes), favor append-only modeling or
+DuckDB appenders to stay columnar-friendly.
 
 ## Tradeoff Notes (Actor vs async-duckdb)
-- Actor boundary keeps a single, owned async model across SQLite and DuckDB.
+- Actor boundary keeps a single, owned async model around DuckDB.
 - It is more code we own but avoids mismatched abstractions around single-writer
   semantics and gives us explicit backpressure/instrumentation control.
 - async-duckdb is less code we own but still requires single-writer discipline.
 
 ## Extension: Multi-writer Backends (Future)
 The boundary stays the same; only execution strategy changes:
-- DuckDB/SQLite: serialize writes.
+- DuckDB: serialize writes.
 - Postgres/SQL Server: actor dispatches to a small worker pool but still owns
   backpressure, retries, and batching rules.
 
@@ -159,8 +159,8 @@ The boundary stays the same; only execution strategy changes:
 - Graceful shutdown drains queue and returns success.
 - Forced shutdown cancels pending requests with clear errors.
 
-7) SQLite UI protection
-- Long-running SQLite operation should not block async runtime/UI loop.
+7) DuckDB UI protection
+- Long-running DuckDB operation should not block async runtime/UI loop.
 
 8) Crash recovery
 - Simulate actor panic mid-batch.
@@ -191,12 +191,12 @@ Where: `crates/casparian_db/tests/db_actor.rs` (integration) + targeted unit
 tests in `crates/casparian_db/src/backend.rs`.
 
 Core building blocks:
-- Helper to open temp SQLite/DuckDB DB and return `DbConnection`.
+- Helper to open temp DuckDB DB and return `DbConnection`.
 - Helper to spawn N tasks, collect latency stats, and assert ordering.
 - Shared barrier for precise concurrency start (avoid sleeps).
 
 Scenarios to implement first:
-1) Transaction isolation (SQLite actor)
+1) Transaction isolation (DuckDB actor)
    - Use `DbConnection::transaction` to create table + insert rows.
    - Interleave concurrent `execute` calls; assert no interleaving inside tx.
 2) Cancellation storm

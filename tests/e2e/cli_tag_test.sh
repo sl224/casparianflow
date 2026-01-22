@@ -28,7 +28,7 @@ echo "Setting up test database..."
 duckdb "$DB_PATH" <<'EOF'
 -- Create schema
 CREATE TABLE scout_sources (
-    id TEXT PRIMARY KEY,
+    id BIGINT PRIMARY KEY,
     name TEXT NOT NULL,
     source_type TEXT NOT NULL,
     path TEXT NOT NULL,
@@ -39,9 +39,9 @@ CREATE TABLE scout_sources (
 );
 
 CREATE TABLE scout_tagging_rules (
-    id TEXT PRIMARY KEY,
+    id BIGINT PRIMARY KEY,
     name TEXT,
-    source_id TEXT NOT NULL,
+    source_id BIGINT NOT NULL,
     pattern TEXT NOT NULL,
     tag TEXT NOT NULL,
     priority INTEGER DEFAULT 0,
@@ -52,7 +52,7 @@ CREATE TABLE scout_tagging_rules (
 
 CREATE TABLE scout_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id TEXT NOT NULL,
+    source_id BIGINT NOT NULL,
     path TEXT NOT NULL,
     rel_path TEXT NOT NULL,
     size INTEGER NOT NULL,
@@ -61,7 +61,7 @@ CREATE TABLE scout_files (
     status TEXT DEFAULT 'pending',
     tag TEXT,
     tag_source TEXT,
-    rule_id TEXT,
+    rule_id BIGINT,
     manual_plugin TEXT,
     error TEXT,
     first_seen_at INTEGER,
@@ -71,27 +71,27 @@ CREATE TABLE scout_files (
 );
 
 -- Insert test source
-INSERT INTO scout_sources (id, name, source_type, path) VALUES ('src-1', 'Test Source', 'local', '/test/data');
+INSERT INTO scout_sources (id, name, source_type, path) VALUES (1, 'Test Source', 'local', '/test/data');
 
 -- Insert test tagging rules
 INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
-    VALUES ('r1', 'src-1', '*.csv', 'csv_data', 10, 1);
+    VALUES (2, 1, '*.csv', 'csv_data', 10, 1);
 INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
-    VALUES ('r2', 'src-1', '*.json', 'json_data', 5, 1);
+    VALUES (3, 1, '*.json', 'json_data', 5, 1);
 INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
-    VALUES ('r3', 'src-1', '*.txt', 'text_data', 0, 0);
+    VALUES (4, 1, '*.txt', 'text_data', 0, 0);
 
 -- Insert test files (untagged)
 INSERT INTO scout_files (source_id, path, rel_path, size, status)
-    VALUES ('src-1', '/test/data/sales.csv', 'sales.csv', 1000, 'pending');
+    VALUES (1, '/test/data/sales.csv', 'sales.csv', 1000, 'pending');
 INSERT INTO scout_files (source_id, path, rel_path, size, status)
-    VALUES ('src-1', '/test/data/invoices.csv', 'invoices.csv', 2000, 'pending');
+    VALUES (1, '/test/data/invoices.csv', 'invoices.csv', 2000, 'pending');
 INSERT INTO scout_files (source_id, path, rel_path, size, status)
-    VALUES ('src-1', '/test/data/config.json', 'config.json', 500, 'pending');
+    VALUES (1, '/test/data/config.json', 'config.json', 500, 'pending');
 INSERT INTO scout_files (source_id, path, rel_path, size, status)
-    VALUES ('src-1', '/test/data/readme.txt', 'readme.txt', 100, 'pending');
+    VALUES (1, '/test/data/readme.txt', 'readme.txt', 100, 'pending');
 INSERT INTO scout_files (source_id, path, rel_path, size, status)
-    VALUES ('src-1', '/test/data/unknown.xyz', 'unknown.xyz', 50, 'pending');
+    VALUES (1, '/test/data/unknown.xyz', 'unknown.xyz', 50, 'pending');
 EOF
 
 echo "Test database created."

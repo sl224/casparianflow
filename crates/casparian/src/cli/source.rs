@@ -6,7 +6,7 @@ use crate::cli::config::active_db_path;
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table};
-use casparian::scout::{Database, Scanner, Source, SourceType};
+use casparian::scout::{Database, Scanner, Source, SourceId, SourceType};
 use clap::Subcommand;
 use std::path::PathBuf;
 
@@ -68,10 +68,17 @@ struct SourceStats {
     total_size: u64,
 }
 
+fn find_source<'a>(sources: &'a [Source], input: &str) -> Option<&'a Source> {
+    let parsed_id = SourceId::parse(input).ok();
+    sources
+        .iter()
+        .find(|s| s.name == input || parsed_id.map_or(false, |id| s.id == id))
+}
+
 /// Get stats for a source from the database
-async fn get_source_stats(db: &Database, source_id: &str) -> SourceStats {
+fn get_source_stats(db: &Database, source_id: &SourceId) -> SourceStats {
     // Query file count and total size for this source
-    let files = db.list_files_by_source(source_id, 100000).await.unwrap_or_default();
+    let files = db.list_files_by_source(source_id, 100000).unwrap_or_default();
     let file_count = files.len() as u64;
     let total_size = files.iter().map(|f| f.size).sum();
     SourceStats { file_count, total_size }
@@ -79,39 +86,34 @@ async fn get_source_stats(db: &Database, source_id: &str) -> SourceStats {
 
 /// Execute the source command
 pub fn run(action: SourceAction) -> anyhow::Result<()> {
-    // Create a runtime for async operations
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(run_async(action))
+    run_with_action(action)
 }
 
-async fn run_async(action: SourceAction) -> anyhow::Result<()> {
+fn run_with_action(action: SourceAction) -> anyhow::Result<()> {
     // Handle `use` command separately - it doesn't need DB for showing current context
     if let SourceAction::Use { name, clear } = action {
-        return use_source(name, clear).await;
+        return use_source(name, clear);
     }
 
     let db_path = active_db_path();
-    let db = Database::open(&db_path).await.map_err(|e| {
+    let db = Database::open(&db_path).map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
 
     match action {
-        SourceAction::List { json } => list_sources(&db, json).await,
-        SourceAction::Add { path, name, recursive: _ } => add_source(&db, path, name).await,
-        SourceAction::Show { name, files, limit, json } => show_source(&db, &name, files, limit, json).await,
-        SourceAction::Remove { name, force } => remove_source(&db, &name, force).await,
-        SourceAction::Sync { name, all } => sync_sources(&db, name, all).await,
+        SourceAction::List { json } => list_sources(&db, json),
+        SourceAction::Add { path, name, recursive: _ } => add_source(&db, path, name),
+        SourceAction::Show { name, files, limit, json } => show_source(&db, &name, files, limit, json),
+        SourceAction::Remove { name, force } => remove_source(&db, &name, force),
+        SourceAction::Sync { name, all } => sync_sources(&db, name, all),
         SourceAction::Use { .. } => unreachable!(), // Handled above
     }
 }
 
-async fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
-    let sources = db.list_sources().await.map_err(|e| {
+fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
+    let sources = db.list_sources().map_err(|e| {
         HelpfulError::new(format!("Failed to list sources: {}", e))
     })?;
 
@@ -127,7 +129,7 @@ async fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
         let output: Vec<serde_json::Value> = {
             let mut result = Vec::new();
             for s in &sources {
-                let stats = get_source_stats(db, &s.id).await;
+                let stats = get_source_stats(db, &s.id);
                 result.push(serde_json::json!({
                     "name": s.name,
                     "path": s.path,
@@ -149,7 +151,7 @@ async fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
     let mut total_size = 0u64;
 
     for source in &sources {
-        let stats = get_source_stats(db, &source.id).await;
+        let stats = get_source_stats(db, &source.id);
         total_files += stats.file_count;
         total_size += stats.total_size;
 
@@ -173,7 +175,7 @@ async fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
     // Validate path exists and is a directory
     if !path.exists() {
         return Err(HelpfulError::path_not_found(&path).into());
@@ -202,7 +204,7 @@ async fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyho
     });
 
     // Check if source with this path already exists
-    let existing = db.list_sources().await?;
+    let existing = db.list_sources()?;
     for s in &existing {
         if s.path == canonical.display().to_string() {
             return Err(HelpfulError::new(format!("Source already exists: {}", s.name))
@@ -219,7 +221,7 @@ async fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyho
 
     // Create the source
     let source = Source {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: SourceId::new(),
         name: source_name.clone(),
         source_type: SourceType::Local,
         path: canonical.display().to_string(),
@@ -227,7 +229,7 @@ async fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyho
         enabled: true,
     };
 
-    db.upsert_source(&source).await.map_err(|e| {
+    db.upsert_source(&source).map_err(|e| {
         HelpfulError::new(format!("Failed to create source: {}", e))
     })?;
 
@@ -242,9 +244,9 @@ async fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyho
     Ok(())
 }
 
-async fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: bool) -> anyhow::Result<()> {
-    let sources = db.list_sources().await?;
-    let source = sources.iter().find(|s| s.name == name || s.id == name);
+fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: bool) -> anyhow::Result<()> {
+    let sources = db.list_sources()?;
+    let source = find_source(&sources, name);
 
     let source = match source {
         Some(s) => s,
@@ -255,7 +257,7 @@ async fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, 
         }
     };
 
-    let stats = get_source_stats(db, &source.id).await;
+    let stats = get_source_stats(db, &source.id);
 
     if json {
         let mut output = serde_json::json!({
@@ -271,7 +273,7 @@ async fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, 
 
         // Include files in JSON output if requested
         if show_files {
-            let files = db.list_files_by_source(&source.id, limit).await?;
+            let files = db.list_files_by_source(&source.id, limit)?;
             let files_json: Vec<serde_json::Value> = files.iter().map(|f| {
                 serde_json::json!({
                     "path": f.rel_path,
@@ -300,7 +302,7 @@ async fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, 
     println!();
 
     // Show rules for this source
-    let rules = db.list_tagging_rules_for_source(&source.id).await?;
+    let rules = db.list_tagging_rules_for_source(&source.id)?;
     if !rules.is_empty() {
         println!("RULES");
         for rule in &rules {
@@ -315,7 +317,7 @@ async fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, 
 
     // Show files if requested
     if show_files {
-        let files = db.list_files_by_source(&source.id, limit).await?;
+        let files = db.list_files_by_source(&source.id, limit)?;
         if files.is_empty() {
             println!("No files discovered yet.");
             println!("  TRY: casparian source sync {}", source.name);
@@ -345,9 +347,9 @@ async fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, 
     Ok(())
 }
 
-async fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
-    let sources = db.list_sources().await?;
-    let source = sources.iter().find(|s| s.name == name || s.id == name);
+fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
+    let sources = db.list_sources()?;
+    let source = find_source(&sources, name);
 
     let source = match source {
         Some(s) => s,
@@ -358,7 +360,7 @@ async fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result
         }
     };
 
-    let stats = get_source_stats(db, &source.id).await;
+    let stats = get_source_stats(db, &source.id);
 
     if stats.file_count > 0 && !force {
         return Err(HelpfulError::new(format!(
@@ -374,7 +376,7 @@ async fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result
     let source_id = source.id.clone();
     let source_name = source.name.clone();
 
-    db.delete_source(&source_id).await.map_err(|e| {
+    db.delete_source(&source_id).map_err(|e| {
         HelpfulError::new(format!("Failed to remove source: {}", e))
     })?;
 
@@ -386,7 +388,7 @@ async fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result
     Ok(())
 }
 
-async fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow::Result<()> {
+fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow::Result<()> {
     if name.is_none() && !all {
         return Err(HelpfulError::new("No source specified")
             .with_suggestion("TRY: casparian source sync <name>")
@@ -394,7 +396,7 @@ async fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow:
             .into());
     }
 
-    let sources = db.list_sources().await?;
+    let sources = db.list_sources()?;
 
     if sources.is_empty() {
         return Err(HelpfulError::new("No sources configured")
@@ -406,7 +408,7 @@ async fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow:
         sources.iter().filter(|s| s.enabled).collect()
     } else {
         let name = name.as_ref().unwrap();
-        match sources.iter().find(|s| s.name == *name || s.id == *name) {
+        match find_source(&sources, name) {
             Some(s) => vec![s],
             None => {
                 return Err(HelpfulError::new(format!("Source not found: {}", name))
@@ -426,7 +428,7 @@ async fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow:
 
         // Use the scanner from casparian_scout
         let scanner = Scanner::new(db.clone());
-        match scanner.scan_source(source).await {
+        match scanner.scan_source(source) {
             Ok(result) => {
                 println!(
                     "  {} files discovered ({} new, {} changed)",
@@ -445,7 +447,7 @@ async fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow:
 }
 
 /// Set or show the default source context
-async fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
+fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
     // Handle --clear flag
     if clear {
         context::clear_default_source()?;
@@ -472,14 +474,14 @@ async fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
     // Validate source exists before setting
     let source_name = name.unwrap();
     let db_path = active_db_path();
-    let db = Database::open(&db_path).await.map_err(|e| {
+    let db = Database::open(&db_path).map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
 
-    let sources = db.list_sources().await?;
-    let source = sources.iter().find(|s| s.name == source_name || s.id == source_name);
+    let sources = db.list_sources()?;
+    let source = find_source(&sources, &source_name);
 
     let source = match source {
         Some(s) => s,
@@ -504,78 +506,80 @@ async fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian::scout::ScannedFile;
+    use casparian::scout::{ScannedFile, SourceId};
     use std::fs;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_add_source_path_validation() {
+    #[test]
+    fn test_add_source_path_validation() {
         let temp = TempDir::new().unwrap();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory().unwrap();
 
         // Test adding a valid directory
         let test_dir = temp.path().join("test_data");
         fs::create_dir(&test_dir).unwrap();
 
         let source = Source {
-            id: "test-1".to_string(),
+            id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: test_dir.display().to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
-        let sources = db.list_sources().await.unwrap();
+        let sources = db.list_sources().unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].name, "test");
     }
 
-    #[tokio::test]
-    async fn test_source_stats() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_source_stats() {
+        let db = Database::open_in_memory().unwrap();
+        let source_id = SourceId::new();
 
         let source = Source {
-            id: "src-1".to_string(),
+            id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         // Add some files
-        let file = ScannedFile::new("src-1", "/data/test.csv", "test.csv", 1000, 12345);
-        db.upsert_file(&file).await.unwrap();
+        let file = ScannedFile::new(source_id.clone(), "/data/test.csv", "test.csv", 1000, 12345);
+        db.upsert_file(&file).unwrap();
 
-        let stats = get_source_stats(&db, "src-1").await;
+        let stats = get_source_stats(&db, &source_id);
         assert_eq!(stats.file_count, 1);
         assert_eq!(stats.total_size, 1000);
     }
 
-    #[tokio::test]
-    async fn test_remove_source_with_files() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_remove_source_with_files() {
+        let db = Database::open_in_memory().unwrap();
+        let source_id = SourceId::new();
 
         let source = Source {
-            id: "src-1".to_string(),
+            id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         // Add a file
-        let file = ScannedFile::new("src-1", "/data/test.csv", "test.csv", 1000, 12345);
-        db.upsert_file(&file).await.unwrap();
+        let file = ScannedFile::new(source_id.clone(), "/data/test.csv", "test.csv", 1000, 12345);
+        db.upsert_file(&file).unwrap();
 
         // Delete source should remove files too
-        db.delete_source("src-1").await.unwrap();
-        let sources = db.list_sources().await.unwrap();
+        db.delete_source(&source_id).unwrap();
+        let sources = db.list_sources().unwrap();
         assert!(sources.is_empty());
     }
 }

@@ -17,21 +17,25 @@
 //! - LEN (u32): Payload length in bytes (I = unsigned int, 4 bytes)
 
 pub mod error;
+pub mod idempotency;
 pub mod types;
 
 // Re-export types for convenience
 pub use types::{
     // Canonical enums (use these everywhere)
-    DataType, ProcessingStatus, SinkMode, WorkerStatus,
+    DataType, JobId, PipelineRunStatus, PluginStatus, ProcessingStatus, RuntimeKind, SinkMode, WorkerStatus,
     // Protocol types
-    DeployCommand, DeployResponse, DispatchCommand, ErrorPayload, EnvReadyPayload,
+    DeployCommand, DeployResponse, DispatchCommand, ErrorPayload,
     HeartbeatPayload, HeartbeatStatus, IdentifyPayload, JobReceipt, JobStatus,
-    PrepareEnvCommand, SinkConfig,
+    JobDiagnostics, SchemaMismatch, SchemaColumnSpec, SchemaDefinition, ObservedColumn, ObservedDataType,
+    ColumnOrderMismatch, TypeMismatch, QuarantineConfig, SinkConfig,
     // Shredder types
     AnalysisResult, DetectionConfidence, LineageBlock,
     LineageChain, LineageFileType, LineageHop, LlmConfig, LlmProvider,
     ShardMeta, ShredConfig, ShredResult, ShredStrategy,
 };
+
+pub use idempotency::{materialization_key, output_target_key, schema_hash, table_name_with_schema};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use error::{ProtocolError, Result};
@@ -70,10 +74,6 @@ pub enum OpCode {
     // Sentinel -> Worker (Config Refresh)
     Reload = 7, // "Reload configuration / plugins."
 
-    // v5.0 Bridge Mode: Environment Provisioning
-    PrepareEnv = 8, // "Provision this environment (lockfile) before execution."
-    EnvReady = 9,   // "Environment is ready for use."
-
     // v5.0 Bridge Mode: Artifact Deployment
     Deploy = 10, // "Deploy this artifact (source + lockfile + signature)."
     Ack = 11,    // "Generic acknowledgment (used for DeployResponse, etc.)"
@@ -91,8 +91,6 @@ impl OpCode {
             5 => Ok(OpCode::Conclude),
             6 => Ok(OpCode::Err),
             7 => Ok(OpCode::Reload),
-            8 => Ok(OpCode::PrepareEnv),
-            9 => Ok(OpCode::EnvReady),
             10 => Ok(OpCode::Deploy),
             11 => Ok(OpCode::Ack),
             _ => Err(ProtocolError::InvalidOpCode(value)),
@@ -111,13 +109,13 @@ pub struct Header {
     pub version: u8,
     pub opcode: OpCode,
     pub reserved: u16,
-    pub job_id: u64,
+    pub job_id: JobId,
     pub payload_len: u32,
 }
 
 impl Header {
     /// Create a new header
-    pub fn new(opcode: OpCode, job_id: u64, payload_len: u32) -> Self {
+    pub fn new(opcode: OpCode, job_id: JobId, payload_len: u32) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             opcode,
@@ -145,7 +143,7 @@ impl Header {
         cursor.write_u8(self.version)?;
         cursor.write_u8(self.opcode.as_u8())?;
         cursor.write_u16::<BigEndian>(self.reserved)?;
-        cursor.write_u64::<BigEndian>(self.job_id)?;
+        cursor.write_u64::<BigEndian>(self.job_id.as_u64())?;
         cursor.write_u32::<BigEndian>(self.payload_len)?;
 
         Ok(buf)
@@ -165,7 +163,7 @@ impl Header {
         let version = cursor.read_u8()?;
         let op_raw = cursor.read_u8()?;
         let reserved = cursor.read_u16::<BigEndian>()?;
-        let job_id = cursor.read_u64::<BigEndian>()?;
+        let job_id = JobId::new(cursor.read_u64::<BigEndian>()?);
         let payload_len = cursor.read_u32::<BigEndian>()?;
 
         if version != PROTOCOL_VERSION {
@@ -201,7 +199,7 @@ impl Message {
     /// Create a new message
     ///
     /// Returns an error if payload exceeds MAX_PAYLOAD_SIZE (4GB).
-    pub fn new(opcode: OpCode, job_id: u64, payload: Vec<u8>) -> Result<Self> {
+    pub fn new(opcode: OpCode, job_id: JobId, payload: Vec<u8>) -> Result<Self> {
         if payload.len() > MAX_PAYLOAD_SIZE {
             return Err(ProtocolError::PayloadTooLarge {
                 size: payload.len(),
@@ -248,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_header_pack_unpack() {
-        let header = Header::new(OpCode::Dispatch, 12345, 1024);
+        let header = Header::new(OpCode::Dispatch, JobId::new(12345), 1024);
         let packed = header.pack().unwrap();
 
         assert_eq!(packed.len(), HEADER_SIZE);
@@ -256,7 +254,7 @@ mod tests {
         let unpacked = Header::unpack(&packed).unwrap();
         assert_eq!(unpacked.version, PROTOCOL_VERSION);
         assert_eq!(unpacked.opcode, OpCode::Dispatch);
-        assert_eq!(unpacked.job_id, 12345);
+        assert_eq!(unpacked.job_id, JobId::new(12345));
         assert_eq!(unpacked.payload_len, 1024);
     }
 
@@ -268,7 +266,7 @@ mod tests {
             OpCode::Heartbeat,
             OpCode::Conclude,
         ] {
-            let header = Header::new(opcode, 9999, 512);
+            let header = Header::new(opcode, JobId::new(9999), 512);
             let packed = header.pack().unwrap();
             let unpacked = Header::unpack(&packed).unwrap();
             assert_eq!(header, unpacked);
@@ -294,14 +292,14 @@ mod tests {
     #[test]
     fn test_message_pack_unpack() {
         let payload = b"Hello, Protocol!".to_vec();
-        let msg = Message::new(OpCode::Identify, 42, payload.clone()).unwrap();
+        let msg = Message::new(OpCode::Identify, JobId::new(42), payload.clone()).unwrap();
 
         let (header_bytes, payload_bytes) = msg.pack().unwrap();
         let frames = vec![header_bytes, payload_bytes];
 
         let unpacked = Message::unpack(&frames).unwrap();
         assert_eq!(unpacked.header.opcode, OpCode::Identify);
-        assert_eq!(unpacked.header.job_id, 42);
+        assert_eq!(unpacked.header.job_id, JobId::new(42));
         assert_eq!(unpacked.payload, payload);
     }
 }

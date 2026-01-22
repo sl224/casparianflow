@@ -1,6 +1,7 @@
 //! Error types for the Scout system
 
 use std::io;
+use super::types::IdParseError;
 use thiserror::Error;
 
 /// Scout error type
@@ -70,6 +71,12 @@ pub enum ScoutError {
         existing_name: String,
         existing_path: String,
     },
+}
+
+impl From<IdParseError> for ScoutError {
+    fn from(error: IdParseError) -> Self {
+        ScoutError::InvalidState(error.to_string())
+    }
 }
 
 /// Result type alias

@@ -12,6 +12,16 @@
 
 ---
 
+## Engineering Ethos
+
+We follow the "make illegal states unrepresentable" ethos in the spirit of
+world-class codebases like Doom and engineers like Jon Blow, Casey Muratori,
+and John Carmack. Prefer compile-time guarantees and type-driven design over
+stringly-typed logic or runtime patching. If a bug class can be prevented by
+structure, choose the structural approach.
+
+---
+
 ## Pre-Implementation Checklist
 
 Before writing any code, verify these:
@@ -123,7 +133,7 @@ This is an **alpha application**. Breaking changes are expected.
 | Deprecation warnings | Remove old code entirely |
 | Feature flags for old behavior | Replace old behavior |
 
-**Why:** Migration code is complexity debt. In alpha, the cost of maintaining backwards compatibility exceeds the cost of users resetting state. Users can delete `~/.casparian_flow/` and start fresh.
+**Why:** Migration code is complexity debt. In alpha, the cost of maintaining compatibility exceeds the cost of users resetting state. Users can delete `~/.casparian_flow/` and start fresh.
 
 **When this changes:** After 1.0 release, migrations become necessary.
 

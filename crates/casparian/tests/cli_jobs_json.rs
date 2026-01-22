@@ -2,9 +2,13 @@ mod cli_support;
 
 use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use casparian_db::{DbConnection, DbValue};
+use casparian::scout::FileStatus;
+use casparian_protocol::ProcessingStatus;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+const SOURCE_ID: i64 = 1;
 
 #[derive(Debug, Deserialize)]
 struct JobsOutput {
@@ -83,7 +87,10 @@ fn test_jobs_json_filters() {
     assert_eq!(jobs_output.stats.dead_letter, 0);
     assert_eq!(jobs_output.jobs.len(), 4);
     assert!(jobs_output.filters.topic.is_none());
-    assert!(jobs_output.filters.status.contains(&"QUEUED".to_string()));
+    assert!(jobs_output
+        .filters
+        .status
+        .contains(&ProcessingStatus::Queued.as_str().to_string()));
     assert!(!jobs_output.filters.dead_letter);
     let dead_letter_ids: Vec<i64> = jobs_output.dead_letter.iter().map(|job| job.id).collect();
     assert!(dead_letter_ids.is_empty());
@@ -94,7 +101,7 @@ fn test_jobs_json_filters() {
         .find(|job| job.id == 1)
         .expect("job 1 present");
     assert_eq!(running_job.file_path, "/data/sales/2024_12.csv");
-    assert_eq!(running_job.status, "RUNNING");
+    assert_eq!(running_job.status, ProcessingStatus::Running.as_str());
     assert_eq!(running_job.priority, 0);
     assert_eq!(
         running_job.claim_time.as_deref(),
@@ -132,7 +139,7 @@ fn test_jobs_json_filters() {
         .iter()
         .find(|job| job.id == 4)
         .expect("job 4 present");
-    assert_eq!(queued_job.status, "QUEUED");
+    assert_eq!(queued_job.status, ProcessingStatus::Queued.as_str());
     assert!(queued_job.claim_time.is_none());
 
     let failed_args = vec![
@@ -142,7 +149,10 @@ fn test_jobs_json_filters() {
     ];
     let failed_output: JobsOutput = run_cli_json(&failed_args, &envs);
     assert_eq!(failed_output.jobs.len(), 1);
-    assert!(failed_output.jobs.iter().all(|job| job.status == "FAILED"));
+    assert!(failed_output
+        .jobs
+        .iter()
+        .all(|job| job.status == ProcessingStatus::Failed.as_str()));
 
     let topic_args = vec![
         "jobs".to_string(),
@@ -180,7 +190,7 @@ fn test_job_actions_update_db() {
         "--json".to_string(),
     ];
     let details: JobDetails = run_cli_json(&show_args, &envs);
-    assert_eq!(details.job.status, "FAILED");
+    assert_eq!(details.job.status, ProcessingStatus::Failed.as_str());
     assert!(details
         .failure
         .as_ref()
@@ -188,31 +198,32 @@ fn test_job_actions_update_db() {
 
     let retry_args = vec!["job".to_string(), "retry".to_string(), "3".to_string()];
     assert_cli_success(&run_cli(&retry_args, &envs), &retry_args);
-    assert_eq!(job_status(&db_path, 3), "QUEUED");
+    assert_eq!(job_status(&db_path, 3), ProcessingStatus::Queued.as_str());
     assert_eq!(job_retry_count(&db_path, 3), 1);
 
     let cancel_args = vec!["job".to_string(), "cancel".to_string(), "1".to_string()];
     assert_cli_success(&run_cli(&cancel_args, &envs), &cancel_args);
-    assert_eq!(job_status(&db_path, 1), "FAILED");
+    assert_eq!(job_status(&db_path, 1), ProcessingStatus::Failed.as_str());
     assert_eq!(job_error(&db_path, 1), Some("Cancelled by user".to_string()));
 
-    cli_support::with_duckdb(&db_path, |conn| async move {
+    cli_support::with_duckdb(&db_path, |conn| {
         conn.execute(
-            "UPDATE cf_processing_queue SET status = 'FAILED', error_message = 'Another error' WHERE id = ?",
-            &[DbValue::from(2i64)],
+            "UPDATE cf_processing_queue SET status = ?, error_message = 'Another error' WHERE id = ?",
+            &[
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+                DbValue::from(2i64),
+            ],
         )
-        .await
         .expect("reset job 2 to failed");
     });
 
     let retry_all_args = vec!["job".to_string(), "retry-all".to_string()];
     assert_cli_success(&run_cli(&retry_all_args, &envs), &retry_all_args);
-    let failed_count = cli_support::with_duckdb(&db_path, |conn| async move {
+    let failed_count = cli_support::with_duckdb(&db_path, |conn| {
         conn.query_scalar::<i64>(
-            "SELECT COUNT(*) FROM cf_processing_queue WHERE status = 'FAILED'",
-            &[],
+            "SELECT COUNT(*) FROM cf_processing_queue WHERE status = ?",
+            &[DbValue::from(ProcessingStatus::Failed.as_str())],
         )
-        .await
         .expect("count failed jobs")
     });
     assert_eq!(failed_count, 0);
@@ -224,8 +235,8 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
     init_scout_schema(&db_path);
 
     let now = 1_737_187_200_000i64;
-    with_duckdb(&db_path, |conn| async move {
-        insert_source(&conn, "src-1", "test_source", "/data", now).await;
+    with_duckdb(&db_path, |conn| {
+        insert_source(&conn, SOURCE_ID, "test_source", "/data", now);
 
         let files = [
             (1, "/data/sales/2024_12.csv", "sales/2024_12.csv"),
@@ -237,19 +248,18 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
             insert_file(
                 &conn,
                 id,
-                "src-1",
+                SOURCE_ID,
                 path,
                 rel_path,
                 1000,
-                "pending",
+                FileStatus::Pending.as_str(),
                 None,
                 None,
                 now,
-            )
-            .await;
+            );
         }
 
-        conn.execute_batch(
+        let queue_schema = format!(
             r#"
             CREATE TABLE cf_processing_queue (
                 id BIGINT PRIMARY KEY,
@@ -257,7 +267,7 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
                 pipeline_run_id TEXT,
                 plugin_name TEXT NOT NULL,
                 config_overrides TEXT,
-                status TEXT NOT NULL DEFAULT 'QUEUED',
+                status TEXT NOT NULL DEFAULT '{}',
                 priority INTEGER DEFAULT 0,
                 worker_host TEXT,
                 worker_pid INTEGER,
@@ -269,9 +279,10 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
                 quarantine_rows BIGINT DEFAULT 0
             );
             "#,
-        )
-        .await
-        .expect("create processing queue");
+            ProcessingStatus::Queued.as_str()
+        );
+        conn.execute_batch(&queue_schema)
+            .expect("create processing queue");
 
         conn.execute(
             "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
@@ -280,14 +291,13 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
                 DbValue::from(1i64),
                 DbValue::from(1i64),
                 DbValue::from("sales"),
-                DbValue::from("RUNNING"),
+                DbValue::from(ProcessingStatus::Running.as_str()),
                 DbValue::from(0i32),
                 DbValue::from("2024-12-16T10:30:05Z"),
                 DbValue::Null,
                 DbValue::Null,
             ],
         )
-        .await
         .unwrap();
         conn.execute(
             "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, result_summary)
@@ -296,14 +306,13 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
                 DbValue::from(2i64),
                 DbValue::from(2i64),
                 DbValue::from("sales"),
-                DbValue::from("COMPLETED"),
+                DbValue::from(ProcessingStatus::Completed.as_str()),
                 DbValue::from(0i32),
                 DbValue::from("2024-12-16T10:30:02Z"),
                 DbValue::from("2024-12-16T10:30:05Z"),
                 DbValue::from("Processed 100 rows"),
             ],
         )
-        .await
         .unwrap();
         conn.execute(
             "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority, claim_time, end_time, error_message)
@@ -312,14 +321,13 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
                 DbValue::from(3i64),
                 DbValue::from(3i64),
                 DbValue::from("invoice"),
-                DbValue::from("FAILED"),
+                DbValue::from(ProcessingStatus::Failed.as_str()),
                 DbValue::from(0i32),
                 DbValue::from("2024-12-16T10:29:58Z"),
                 DbValue::from("2024-12-16T10:29:59Z"),
                 DbValue::from("Missing field customer_id"),
             ],
         )
-        .await
         .unwrap();
         conn.execute(
             "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
@@ -328,18 +336,17 @@ fn setup_jobs_db() -> (TempDir, PathBuf) {
                 DbValue::from(4i64),
                 DbValue::from(4i64),
                 DbValue::from("sales"),
-                DbValue::from("QUEUED"),
+                DbValue::from(ProcessingStatus::Queued.as_str()),
                 DbValue::from(0i32),
             ],
         )
-        .await
         .unwrap();
     });
 
     (home_dir, db_path)
 }
 
-async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, now: i64) {
+fn insert_source(conn: &DbConnection, id: i64, name: &str, path: &str, now: i64) {
     let source_type = serde_json::json!({ "type": "local" }).to_string();
     conn.execute(
         "INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
@@ -353,14 +360,13 @@ async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, no
             DbValue::from(now),
         ],
     )
-    .await
     .expect("insert source");
 }
 
-async fn insert_file(
+fn insert_file(
     conn: &DbConnection,
     id: i64,
-    source_id: &str,
+    source_id: i64,
     path: &str,
     rel_path: &str,
     size: i64,
@@ -394,7 +400,6 @@ async fn insert_file(
             DbValue::from(now),
         ],
     )
-    .await
     .expect("insert file");
 }
 
@@ -409,34 +414,31 @@ fn split_rel_path(rel_path: &str) -> (String, String) {
 }
 
 fn job_status(db_path: &Path, job_id: i64) -> String {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         conn.query_scalar::<String>(
             "SELECT status FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job_id)],
         )
-        .await
         .expect("query job status")
     })
 }
 
 fn job_retry_count(db_path: &Path, job_id: i64) -> i32 {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         conn.query_scalar::<i32>(
             "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job_id)],
         )
-        .await
         .expect("query retry count")
     })
 }
 
 fn job_error(db_path: &Path, job_id: i64) -> Option<String> {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         conn.query_optional(
             "SELECT error_message FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job_id)],
         )
-        .await
         .ok()
         .and_then(|row| row.and_then(|r| r.get_by_name::<Option<String>>("error_message").ok()).flatten())
     })

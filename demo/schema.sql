@@ -64,8 +64,7 @@ CREATE TABLE IF NOT EXISTS cf_topic_config (
     plugin_name TEXT NOT NULL,
     topic_name TEXT NOT NULL,
     uri TEXT NOT NULL,
-    mode TEXT DEFAULT 'append',
-    schema_json TEXT
+    mode TEXT DEFAULT 'append'
 );
 
 CREATE INDEX IF NOT EXISTS ix_topic_lookup ON cf_topic_config(plugin_name, topic_name);

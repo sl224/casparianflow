@@ -205,7 +205,7 @@ fn fallback_metadata(path: &Path) -> ParserMetadata {
     meta
 }
 
-fn extract_attribute(content: &str, attr: &str) -> Option<String> {
+pub(crate) fn extract_attribute(content: &str, attr: &str) -> Option<String> {
     let pattern = format!(r#"(?m)^\s*{}\s*=\s*['"]([^'"]+)['"]"#, attr);
     let re = Regex::new(&pattern).ok()?;
     re.captures(content)

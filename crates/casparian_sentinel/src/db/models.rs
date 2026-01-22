@@ -3,56 +3,13 @@
 //! These models are backend-agnostic and map from casparian_db rows.
 
 use casparian_db::{BackendError, DbTimestamp, UnifiedDbRow};
-use casparian_protocol::{SinkMode, WorkerStatus};
-use serde::{Deserialize, Serialize};
+use casparian_protocol::{
+    JobStatus as ProtocolJobStatus, PluginStatus, ProcessingStatus, QuarantineConfig, SinkMode,
+    WorkerStatus,
+};
 
-// ============================================================================
-// Enums
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StatusEnum {
-    Pending,
-    Queued,
-    Running,
-    Completed,
-    Failed,
-    Skipped,
-}
-
-impl StatusEnum {
-    pub fn from_db(value: &str) -> Self {
-        match value {
-            "PENDING" | "Pending" => Self::Pending,
-            "QUEUED" | "Queued" => Self::Queued,
-            "RUNNING" | "Running" => Self::Running,
-            "COMPLETED" | "Completed" => Self::Completed,
-            "FAILED" | "Failed" => Self::Failed,
-            "SKIPPED" | "Skipped" => Self::Skipped,
-            _ => Self::Pending,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PluginStatusEnum {
-    Pending,
-    Staging,
-    Active,
-    Rejected,
-}
-
-impl PluginStatusEnum {
-    pub fn from_db(value: &str) -> Self {
-        match value {
-            "PENDING" | "Pending" => Self::Pending,
-            "STAGING" | "Staging" => Self::Staging,
-            "ACTIVE" | "Active" => Self::Active,
-            "REJECTED" | "Rejected" => Self::Rejected,
-            _ => Self::Pending,
-        }
-    }
-}
+// Re-export canonical enums from protocol for convenience
+pub use casparian_protocol::{PluginStatus as PluginStatusEnum, ProcessingStatus as StatusEnum};
 
 // ============================================================================
 // Core Models
@@ -88,7 +45,7 @@ pub struct FileLocation {
 
 #[derive(Debug, Clone)]
 pub struct FileTag {
-    pub file_id: i32,
+    pub file_id: i64,
     pub tag: String,
 }
 
@@ -121,23 +78,60 @@ pub struct TopicConfig {
     pub plugin_name: String,
     pub topic_name: String,
     pub uri: String,
-    pub mode: String,
-    pub schema_json: Option<String>,
+    /// Sink mode - stored as SinkMode enum, parsed at the boundary.
+    pub mode: SinkMode,
+    pub quarantine_config: Option<QuarantineConfig>,
 }
 
 impl TopicConfig {
-    pub fn sink_mode(&self) -> SinkMode {
-        self.mode.parse().unwrap_or_default()
-    }
-
+    /// Parse TopicConfig from a database row.
+    /// Mode is parsed at the boundary with error propagation.
     pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        let mode_str: String = row.get_by_name("mode")?;
+        let mode = mode_str.parse::<SinkMode>().map_err(|e| {
+            BackendError::TypeConversion(format!("Invalid sink mode '{}': {}", mode_str, e))
+        })?;
+
+        let allow_quarantine: Option<bool> = row.get_by_name("quarantine_allow")?;
+        let max_quarantine_pct: Option<f64> = row.get_by_name("quarantine_max_pct")?;
+        let max_quarantine_count: Option<i64> = row.get_by_name("quarantine_max_count")?;
+        let quarantine_dir: Option<String> = row.get_by_name("quarantine_dir")?;
+
+        let mut quarantine_config = QuarantineConfig::default();
+        let mut has_quarantine_config = false;
+        if let Some(value) = allow_quarantine {
+            quarantine_config.allow_quarantine = value;
+            has_quarantine_config = true;
+        }
+        if let Some(value) = max_quarantine_pct {
+            quarantine_config.max_quarantine_pct = value;
+            has_quarantine_config = true;
+        }
+        if let Some(value) = max_quarantine_count {
+            let count = u64::try_from(value).map_err(|_| {
+                BackendError::TypeConversion(
+                    "quarantine_max_count out of range".to_string(),
+                )
+            })?;
+            quarantine_config.max_quarantine_count = Some(count);
+            has_quarantine_config = true;
+        }
+        if let Some(value) = quarantine_dir {
+            quarantine_config.quarantine_dir = Some(value);
+            has_quarantine_config = true;
+        }
+
         Ok(Self {
             id: row.get_by_name("id")?,
             plugin_name: row.get_by_name("plugin_name")?,
             topic_name: row.get_by_name("topic_name")?,
             uri: row.get_by_name("uri")?,
-            mode: row.get_by_name("mode")?,
-            schema_json: row.get_by_name("schema_json")?,
+            mode,
+            quarantine_config: if has_quarantine_config {
+                Some(quarantine_config)
+            } else {
+                None
+            },
         })
     }
 }
@@ -157,11 +151,13 @@ pub struct PluginSubscription {
 #[derive(Debug, Clone)]
 pub struct ProcessingJob {
     pub id: i64,
-    pub file_id: i32,
+    pub file_id: i64,
     pub pipeline_run_id: Option<String>,
     pub plugin_name: String,
     pub config_overrides: Option<String>,
-    pub status: StatusEnum,
+    pub status: ProcessingStatus,
+    /// Completion outcome (only set for terminal jobs)
+    pub completion_status: Option<ProtocolJobStatus>,
     pub priority: i32,
     pub worker_host: Option<String>,
     pub worker_pid: Option<i32>,
@@ -173,14 +169,31 @@ pub struct ProcessingJob {
 }
 
 impl ProcessingJob {
+    /// Parse ProcessingJob from a database row.
+    /// Status is parsed at the boundary with error propagation.
     pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        let status_str: String = row.get_by_name("status")?;
+        let status = status_str.parse::<ProcessingStatus>().map_err(|e| {
+            BackendError::TypeConversion(format!("Invalid processing status '{}': {}", status_str, e))
+        })?;
+
+        // Parse completion_status if present - this is optional, but if present should be valid
+        let completion_status_raw: Option<String> = row.get_by_name("completion_status")?;
+        let completion_status = match completion_status_raw {
+            Some(s) if !s.is_empty() => Some(s.parse::<ProtocolJobStatus>().map_err(|e| {
+                BackendError::TypeConversion(format!("Invalid completion status '{}': {}", s, e))
+            })?),
+            _ => None,
+        };
+
         Ok(Self {
             id: row.get_by_name("id")?,
             file_id: row.get_by_name("file_id")?,
             pipeline_run_id: row.get_by_name("pipeline_run_id")?,
             plugin_name: row.get_by_name("plugin_name")?,
             config_overrides: row.get_by_name("config_overrides")?,
-            status: StatusEnum::from_db(&row.get_by_name::<String>("status")?),
+            status,
+            completion_status,
             priority: row.get_by_name("priority")?,
             worker_host: row.get_by_name("worker_host")?,
             worker_pid: row.get_by_name("worker_pid")?,
@@ -221,17 +234,63 @@ pub struct PluginManifest {
     pub id: i32,
     pub plugin_name: String,
     pub version: String,
+    pub runtime_kind: String,
+    pub entrypoint: String,
+    pub platform_os: Option<String>,
+    pub platform_arch: Option<String>,
     pub source_code: String,
     pub source_hash: String,
-    pub status: PluginStatusEnum,
-    pub signature: Option<String>,
+    pub status: PluginStatus,
     pub validation_error: Option<String>,
     pub created_at: DbTimestamp,
     pub deployed_at: Option<DbTimestamp>,
-    pub env_hash: Option<String>,
-    pub artifact_hash: Option<String>,
+    pub env_hash: String,
+    pub artifact_hash: String,
+    pub manifest_json: String,
+    pub protocol_version: String,
+    pub schema_artifacts_json: String,
+    pub outputs_json: String,
+    pub signature_verified: bool,
+    pub signer_id: Option<String>,
     pub publisher_id: Option<i32>,
     pub system_requirements: Option<String>,
+}
+
+impl PluginManifest {
+    /// Parse PluginManifest from a database row.
+    /// Status is parsed at the boundary with error propagation.
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        let status_str: String = row.get_by_name("status")?;
+        let status = status_str.parse::<PluginStatus>().map_err(|e| {
+            BackendError::TypeConversion(format!("Invalid plugin status '{}': {}", status_str, e))
+        })?;
+
+        Ok(Self {
+            id: row.get_by_name("id")?,
+            plugin_name: row.get_by_name("plugin_name")?,
+            version: row.get_by_name("version")?,
+            runtime_kind: row.get_by_name("runtime_kind")?,
+            entrypoint: row.get_by_name("entrypoint")?,
+            platform_os: row.get_by_name("platform_os")?,
+            platform_arch: row.get_by_name("platform_arch")?,
+            source_code: row.get_by_name("source_code")?,
+            source_hash: row.get_by_name("source_hash")?,
+            status,
+            validation_error: row.get_by_name("validation_error")?,
+            created_at: row.get_by_name("created_at")?,
+            deployed_at: row.get_by_name("deployed_at")?,
+            env_hash: row.get_by_name("env_hash")?,
+            artifact_hash: row.get_by_name("artifact_hash")?,
+            manifest_json: row.get_by_name("manifest_json")?,
+            protocol_version: row.get_by_name("protocol_version")?,
+            schema_artifacts_json: row.get_by_name("schema_artifacts_json")?,
+            outputs_json: row.get_by_name("outputs_json")?,
+            signature_verified: row.get_by_name("signature_verified")?,
+            signer_id: row.get_by_name("signer_id")?,
+            publisher_id: row.get_by_name("publisher_id")?,
+            system_requirements: row.get_by_name("system_requirements")?,
+        })
+    }
 }
 
 // ============================================================================
@@ -261,13 +320,28 @@ pub struct WorkerNode {
     pub id: i32,
     pub host: String,
     pub pid: i32,
-    pub status: String,
+    /// Worker status - stored as WorkerStatus enum, not String.
+    /// Parsing happens at the boundary (from_row), not at access time.
+    pub status: WorkerStatus,
     pub current_job_id: Option<i32>,
 }
 
 impl WorkerNode {
-    pub fn worker_status(&self) -> WorkerStatus {
-        self.status.parse().unwrap_or_default()
+    /// Parse WorkerNode from a database row.
+    /// Status is parsed at the boundary and errors are propagated, not swallowed.
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        let status_str: String = row.get_by_name("status")?;
+        let status = status_str.parse::<WorkerStatus>().map_err(|e| {
+            BackendError::TypeConversion(format!("Invalid worker status '{}': {}", status_str, e))
+        })?;
+
+        Ok(Self {
+            id: row.get_by_name("id")?,
+            host: row.get_by_name("host").or_else(|_| row.get_by_name("hostname"))?,
+            pid: row.get_by_name("pid")?,
+            status,
+            current_job_id: row.get_by_name("current_job_id")?,
+        })
     }
 }
 
@@ -369,23 +443,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_status_enum_serialization() {
+    fn test_processing_status_serialization() {
+        // ProcessingStatus uses SCREAMING_SNAKE_CASE
         assert_eq!(
-            serde_json::to_string(&StatusEnum::Pending).unwrap(),
-            "\"Pending\""
+            serde_json::to_string(&ProcessingStatus::Pending).unwrap(),
+            format!("\"{}\"", ProcessingStatus::Pending.as_str())
         );
         assert_eq!(
-            serde_json::to_string(&StatusEnum::Running).unwrap(),
-            "\"Running\""
+            serde_json::to_string(&ProcessingStatus::Running).unwrap(),
+            format!("\"{}\"", ProcessingStatus::Running.as_str())
         );
     }
 
     #[test]
-    fn test_plugin_status_enum() {
+    fn test_processing_status_from_str() {
         assert_eq!(
-            serde_json::to_string(&PluginStatusEnum::Active).unwrap(),
-            "\"Active\""
+            ProcessingStatus::Pending
+                .as_str()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Pending
         );
+        assert_eq!(
+            ProcessingStatus::Running
+                .as_str()
+                .to_ascii_lowercase()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Running
+        );
+        assert_eq!(
+            ProcessingStatus::Completed
+                .as_str()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Completed
+        );
+    }
+
+    #[test]
+    fn test_plugin_status_serialization() {
+        assert_eq!(
+            serde_json::to_string(&PluginStatus::Active).unwrap(),
+            format!("\"{}\"", PluginStatus::Active.as_str())
+        );
+        assert_eq!(
+            serde_json::to_string(&PluginStatus::Superseded).unwrap(),
+            format!("\"{}\"", PluginStatus::Superseded.as_str())
+        );
+    }
+
+    #[test]
+    fn test_plugin_status_from_str() {
+        assert_eq!(
+            PluginStatus::Active
+                .as_str()
+                .parse::<PluginStatus>()
+                .unwrap(),
+            PluginStatus::Active
+        );
+        assert_eq!(
+            PluginStatus::Deployed
+                .as_str()
+                .parse::<PluginStatus>()
+                .unwrap(),
+            PluginStatus::Deployed
+        );
+        assert_eq!(
+            PluginStatus::Superseded
+                .as_str()
+                .parse::<PluginStatus>()
+                .unwrap(),
+            PluginStatus::Superseded
+        );
+    }
+
+    #[test]
+    fn test_plugin_status_normalize() {
+        assert_eq!(PluginStatus::Deployed.normalize(), PluginStatus::Active);
+        assert_eq!(PluginStatus::Active.normalize(), PluginStatus::Active);
     }
 
     #[test]

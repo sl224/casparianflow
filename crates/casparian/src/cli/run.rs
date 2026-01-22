@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::cli::error::HelpfulError;
-use casparian::runner::{DevRunner, LogDestination, ParserRef, Runner};
+use casparian::runner::{DevRunner, LogDestination, ParserRef};
 use casparian_sinks::{plan_outputs, write_output_plan, OutputDescriptor};
 use casparian_security::signing::sha256;
 
@@ -83,7 +83,7 @@ struct RunResult {
 }
 
 /// Execute the run command
-pub async fn cmd_run(args: RunArgs) -> Result<()> {
+pub fn cmd_run(args: RunArgs) -> Result<()> {
     // Validate paths
     if !args.parser.exists() {
         return Err(HelpfulError::new(format!("Parser not found: {}", args.parser.display()))
@@ -150,7 +150,7 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
             &args.input,
             LogDestination::Terminal,
         )
-        .await?;
+        ?;
 
     let batches = result
         .output_batches
@@ -235,7 +235,7 @@ pub async fn cmd_run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn ensure_dev_venv(source: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn ensure_dev_venv(source: &str) -> Result<Option<PathBuf>> {
     if std::env::var("VIRTUAL_ENV").is_ok() {
         return Ok(None);
     }
@@ -269,8 +269,10 @@ fn ensure_dev_venv(source: &str) -> Result<Option<PathBuf>> {
     if !interpreter.exists() {
         std::fs::create_dir_all(&venv_path)?;
 
+        // Use --clear to handle race conditions when multiple processes
+        // try to create the same venv concurrently
         let output = Command::new("uv")
-            .args(["venv", venv_path.to_str().unwrap()])
+            .args(["venv", "--clear", venv_path.to_str().unwrap()])
             .output()
             .context("Failed to create venv with uv")?;
 
@@ -362,5 +364,8 @@ fn is_stdlib_module(module: &str) -> bool {
             | "subprocess" | "threading" | "multiprocessing"
             | "hashlib" | "uuid" | "random" | "string" | "struct"
             | "copy" | "enum" | "dataclasses" | "abc" | "contextlib"
+            | "decimal" | "stat"  // Used by FIX parser for DECIMAL types and file stat
+            | "zoneinfo"  // Python 3.9+ stdlib
+            | "casparian_types"  // Bridge shim module, not a pip package
     )
 }

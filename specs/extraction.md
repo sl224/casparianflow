@@ -140,7 +140,7 @@ rules:
     tag: mission_data                    # Base tag applied to all matches
     tag_conditions:                      # Conditional tags (optional)
       - if: "mission_id < 100"
-        tag: legacy_missions
+        tag: archived_missions
       - if: "date.year = 2024"
         tag: current_year
     priority: 100
@@ -391,7 +391,7 @@ User files ───► Path Intelligence Engine ───► Extraction Rules (
 -- Extraction rules
 CREATE TABLE extraction_rules (
     id TEXT PRIMARY KEY,
-    source_id TEXT REFERENCES scout_sources(id),
+    source_id BIGINT REFERENCES scout_sources(id),
     name TEXT NOT NULL,
     glob_pattern TEXT NOT NULL,
     semantic_source TEXT,          -- Optional semantic expression
@@ -428,7 +428,7 @@ CREATE TABLE equivalence_classes (
 -- Class membership
 CREATE TABLE equivalence_members (
     class_id TEXT REFERENCES equivalence_classes(id),
-    source_id TEXT REFERENCES scout_sources(id),
+    source_id BIGINT REFERENCES scout_sources(id),
     similarity REAL NOT NULL,
     PRIMARY KEY (class_id, source_id)
 );

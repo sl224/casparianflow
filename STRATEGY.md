@@ -1,6 +1,6 @@
 # Casparian Flow: Product Strategy
 
-> Last updated: January 14, 2026
+> Last updated: January 20, 2026
 
 ## Executive Summary
 
@@ -9,10 +9,12 @@ Casparian Flow is a **local-first data platform** that transforms industry-speci
 **Core insight:** The bronze layer (raw file → structured data) for industry-specific formats is underserved. Enterprise tools (Databricks, Relativity, Palantir) are overkill for many use cases, while DIY Python lacks governance.
 
 **Key differentiators:**
-1. **Premade parsers** for arcane formats (FIX, HL7, CoT, PST, load files)
-2. **Local-first execution** - data never leaves the machine
-3. **Schema contracts** - governance and audit trails for compliance
-4. **AI-assisted development** (Phase 2) - Claude helps build custom parsers
+1. **Deterministic execution** - schema contracts enforced in Rust, not Python; no silent coercion
+2. **Local-first execution** - data never leaves the machine; air-gapped and sovereignty-friendly
+3. **Trust primitives** - per-row lineage, quarantine semantics, reproducibility manifests
+4. **Premade parsers** for arcane formats (EVTX, FIX, HL7, CoT) with DFIR-first focus
+
+**v1 Focus:** DFIR / Incident Response artifact parsing. Case folder ingestion, evidence bundle workflows, Windows-first (EVTX as flagship parser). NOT streaming, NOT orchestration, NOT BI.
 
 V1 scope and success metrics are defined in `docs/v1_scope.md`.
 
@@ -52,16 +54,29 @@ Casparian provides:
 ### Core Philosophy
 
 **What We Believe:**
-1. **Parsers are the product.** The core value is transforming arcane formats to SQL. Everything else is infrastructure.
+1. **Determinism over convenience.** Execution is reproducible; same inputs + same parser bundle hash = identical outputs.
 2. **Local-first, always.** Data sovereignty isn't negotiable. Cloud is optional, local is default.
 3. **Governance built-in.** Schema contracts, audit trails, and versioning aren't enterprise add-ons—they're core.
-4. **AI enhances, humans decide.** AI can help build parsers, but execution is deterministic. No AI in production data paths.
-5. **Show results, not code.** Users care about output tables, not parser implementation.
+4. **Fail loud, not silent.** Invalid rows go to quarantine with context; no silent coercion into clean tables.
+5. **Parsers are the product.** The core value is transforming arcane formats to SQL. Everything else is infrastructure.
 
 **What We Don't Believe:**
 - "Cloud is always better" - Regulated industries need local options
 - "AI can figure it out" - Premade parsers for known formats beat AI improvisation
+- "AI makes tools obsolete" - AI makes first-draft code cheap; operational guarantees remain valuable
 - "One tool fits all" - Different verticals have different competitors (see below)
+
+### AI Era: Why We're Defensible
+
+AI makes first-draft code cheaper (one-off parsers, glue, demo UIs). Buyers still pay for operational guarantees:
+- **Repeatability** across cases and over time
+- **Auditability/defensibility** (what ran, on which inputs, with what versions)
+- **Safe failure modes** (quarantine vs silent coercion)
+- **Maintenance** as formats evolve
+- **Packaging** in constrained environments (offline/air-gap/Windows)
+- **Accountability** when something breaks under pressure
+
+Casparian's moat is "integrity as a system" (deterministic runs + schema contracts + quarantine + lineage + reproducibility + backfill planning), not a thin wrapper around AI.
 
 ---
 
@@ -79,18 +94,70 @@ Casparian provides:
 | **Enterprise (500+)** | **YES** | Have data needs; compliance requirements |
 | **Technical consultants** | **YES** | Build for clients; need productivity tools |
 
-### Validated Target Segments
+### Validated Target Segments (Refined January 2026)
 
-| Segment | Technical Buyer | Format Examples | Why Casparian |
-|---------|-----------------|-----------------|---------------|
-| **Financial Services** | Trade ops, quant teams | FIX logs, SEC filings, ISO 20022 | Trade break resolution; audit trails | [→ Deep Dive](strategies/finance.md) |
-| **Defense/Aerospace** | In-house dev teams | CoT, NITF, PCAP, KLV telemetry | Air-gapped; compliance; custom formats | [→ Deep Dive](strategies/defense_tactical.md) |
-| **Healthcare IT** | Hospital IT departments | HL7 exports, EHR dumps, lab systems | HIPAA; can't use cloud; legacy formats | [→ Deep Dive](strategies/healthcare_hl7.md) |
-| **Legal Tech/eDiscovery** | Litigation support | PST archives, load files, Slack | Pre-processing tier; cost reduction | [→ Deep Dive](strategies/legal_ediscovery.md) |
-| **Manufacturing (mid-market+)** | Plant IT teams | Historian exports, MTConnect, SPC | No cloud on factory floor; proprietary formats | [→ Deep Dive](strategies/manufacturing.md) |
-| **Mid-Size Business** | FP&A analysts, IT generalists | QuickBooks, Salesforce, ERP exports | Can't afford enterprise ETL; Excel hell | [→ Deep Dive](strategies/midsize_business.md) |
-| **Government/Public Sector** | Agency IT teams | Permit systems, legacy databases | Budget constraints; data must stay local |
-| **Technical Consultants** | Themselves | Client data projects | 10x productivity; reusable parsers |
+> **Final Prioritization:** Based on constraints analysis—**data at rest on network drives**, **needs schematization**, **technical Python users**, **high willingness to pay**—segments ranked by speed to revenue + product fit.
+
+| Rank | Segment | Technical Buyer | Format Examples | Why They Win |
+|------|---------|-----------------|-----------------|--------------|
+| **#1** | **DFIR (Incident Response)** | Forensic Consultants | Disk images, Amcache, Shimcache, $MFT, memory dumps | **Urgent + legally mandated audit trail**; air-gapped; writes "fragile scripts" today | [→ Deep Dive](strategies/dfir.md) |
+| **#2** | **Pharma R&D Data Engineers** | Lab Data Engineers | Mass spec XML, HPLC binary, instrument logs | **FDA 21 CFR Part 11 compliance**; Source Hash = compliance feature; highest LTV | [→ Deep Dive](strategies/pharma.md) |
+| **#3** | **IIoT/OT Data Engineers** | Industrial Data Engineers | Historian exports (PI/IP21), PLC logs, SCADA telemetry | **Billions of rows locked in proprietary historians**; bespoke ETL to Parquet; data lakes initiative | [→ Deep Dive](strategies/iiot.md) |
+| **#4** | **Satellite/Space Data Engineers** | Space Data Engineers | CCSDS telemetry, TLE files, binary downlinks | **50TB/hour downlinks**; custom binary formats; Python infra (COSMOS, SatNOGS) | [→ Deep Dive](strategies/satellite.md) |
+| **#5** | **Defense/GEOINT** | Intel Contractors | NITF imagery, drone logs, CoT tracks | **Perfect product fit**; air-gapped classified networks; slow sales (target subcontractors) | [→ Deep Dive](strategies/defense_tactical.md) |
+| **P3** | **eDiscovery (LST only)** | Litigation Support Technologist | PST, Slack exports, Load Files | "Maybe" bridge market; reluctant Python users; DFIR is where idea landed | [→ Deep Dive](strategies/ediscovery.md) |
+| **P3** | **Data Consultants** | Themselves | Client-specific formats | Uses full platform; fast sales; platform feedback | |
+
+### Do Not Target (Explicitly Cut)
+
+| Segment | Why Cut |
+|---------|---------|
+| **Trade Support Analyst** | They want an *answer*, not a database. Don't write parsers. Excel users. |
+| **eDiscovery Analyst** | Click "Process" in Relativity. When fails, email vendor. Treat Casparian as "Magic Converter." **You become free IT support.** |
+| **General IT Admin** | Use Splunk/Cribl. Want search bars, not schema definitions. |
+| **Marketing Agencies** | Data is in APIs (Facebook/Google), not files on network drives. |
+
+> **Key Insight:** "eDiscovery" is a business process, not a job title. The DFIR Consultant (Python daily) survived; the eDiscovery Analyst (Excel, support tickets) was cut.
+
+### Why DFIR Is #1 (The Winner)
+
+**The v1 wedge:** DFIR / Incident Response artifact parsing teams. The product value story:
+
+Casparian is a **deterministic, governed "data build system"** for file artifacts:
+- Schema contracts enforced authoritatively (Rust validation) — no silent coercion
+- Quarantine invalid/out-of-range rows — partial success is safe
+- Per-row lineage: source hash + job id + processed timestamp + parser version
+- Reproducible run identity (content-addressed parser bundle: code + lockfile hash)
+- Incremental ingest primitives: version-dedup + backfill planning when parser versions change
+- CLI-first; minimal TUI for discovery/bench/jobs/quarantine summary
+
+**We are NOT "another EVTX parser."** We are: "turn DFIR parsing into an auditable, repeatable, backfillable dataset build process."
+
+DFIR consultants are the **only customer** with "network drive data" that is both **urgent** (active breach) and **legally mandated** to have a perfect audit trail:
+
+| Factor | DFIR | Pharma (contrast) | Trade Desk (cut) |
+|--------|------|-------------------|------------------|
+| **Data Location** | Disk images on air-gapped evidence server | Instrument files on lab network drives | FIX logs on trading servers |
+| **Current Tool** | "Fragile" Python scripts (construct, kaitai) | ETL scripts to Snowflake | grep + Excel |
+| **Writes Python?** | YES (binary artifact parsing) | YES (instrument data munging) | NO |
+| **Urgency** | EXTREME (stop breach NOW) | Medium (nightly batch) | High (T+1) |
+| **Audit Trail** | **LEGALLY MANDATED** (evidence chain) | **FDA REQUIRED** (21 CFR Part 11) | Nice-to-have |
+| **Why They Pay** | Speed + Liability ("script deletes row = destroyed evidence") | Compliance + Traceability | Time savings |
+| **Sales Cycle** | FAST (boutique firms, practitioners decide) | Slow (enterprise) | Medium |
+
+**Key Insight:** Your **Lineage/Quarantine** feature is their insurance policy. "If my script deletes a row, I destroy evidence."
+
+### Why Pharma R&D Is #2 (Highest LTV)
+
+Pharma has the deepest pockets and the most permanent problem:
+
+| Attribute | Detail |
+|-----------|--------|
+| **The Data** | Terabytes of XML, JSON, binary from Mass Spectrometers & HPLC on shared lab network drives |
+| **The Workflow** | Scripts sweep drives nightly, push structured data to Snowflake/Databricks for scientists |
+| **Why They Pay** | **FDA 21 CFR Part 11**: Must prove DB data matches raw file on drive |
+| **Casparian Value** | **Source Hash** + **Schema Contract** = compliance features |
+| **Sales Cycle** | Slower (enterprise), but sticky forever |
 
 ### Strategic Positioning: "Universal Local ETL"
 
@@ -110,18 +177,23 @@ Cold Data (historical) → [CASPARIAN] → Local SQL/Parquet
 3. **Air-gap compatible:** Works where cloud tools can't
 4. **Compliance friendly:** Data never leaves premises
 
-**Strategic Grid:**
+**Strategic Grid (Refined January 2026):**
 
-| | **Low Complexity** | **High Complexity** |
-|---|---|---|
-| **High $$$** | **FINANCE** (Trade Break Workbench) | Defense (SBIR pathway) |
-| **Low $$$** | Mid-size Business (PLG) | Healthcare (long sales cycle) |
+| | **Urgent + Mandated Audit** | **High LTV + Compliance** | **Massive Data Volume** | **Good Fit, Slow Sales** |
+|---|---|---|---|---|
+| **Technical (writes Python)** | **DFIR (#1)** | **Pharma R&D (#2)** | **IIoT/OT (#3)**, **Satellite (#4)** | Defense/GEOINT (#5) |
+| **Semi-Technical** | eDiscovery (P3) | — | — | Data Consultants |
+| **Non-Technical** | ❌ Cut | ❌ Cut | ❌ Cut | ❌ Cut (Trade Desk, IT Admin) |
 
-**Recommended Priority:**
-1. **Phase 1:** Finance (Trade Break Workbench) - Fastest path to revenue
-2. **Phase 2:** Legal eDiscovery - Adjacent to finance, similar buyers
-3. **Phase 3:** Defense - SBIR pathway, longer timeline
-4. **Phase 4:** Healthcare - Requires compliance certifications
+**The Attack Plan:**
+
+| Phase | Target | Pitch | Goal | Timeline |
+|-------|--------|-------|------|----------|
+| **Immediate Cash** | Boutique DFIR Firms | *"The first IDE for forensic artifact parsing. Stop trusting fragile scripts for evidence."* | 5-10 consulting licenses; validate Parser Dev Loop | Months 1-3 |
+| **Enterprise Growth** | Biotech/Pharma R&D | *"Automated, compliant ingestion for instrument data. 21 CFR Part 11 ready out of the box."* | Large annual contracts ($50K+) | Months 6+ |
+| **Industrial Expansion** | IIoT/OT Data Teams | *"Escape your historian. Query decades of PLC data with SQL."* | Data lake modernization contracts ($25K+) | Months 6+ |
+| **Space Sector** | Satellite Operators | *"Parse 50TB/hour downlinks. Schema contracts for mission-critical telemetry."* | Ground station contracts | Months 9+ |
+| **Dark Horse** | Defense Subcontractors | *"Process classified telemetry locally. Air-gapped, auditable, Python-native."* | Gov contracts via smaller integrators | Months 12+ |
 
 ### MSP Channel: B2B2B Opportunity (Researched)
 
@@ -178,7 +250,7 @@ Cold Data (historical) → [CASPARIAN] → Local SQL/Parquet
 
 **ROI example:** A hospital IT team spending 20 hours/week on manual data wrangling → $50K/year in labor. Casparian at $500/month saves $44K/year.
 
-### Why "No Cloud" Matters
+### Why "No Cloud" Matters (Local-First Core)
 
 | Concern | Who Cares | Casparian Answer |
 |---------|-----------|------------------|
@@ -186,6 +258,13 @@ Cold Data (historical) → [CASPARIAN] → Local SQL/Parquet
 | **HIPAA/data sovereignty** | Healthcare, finance | Data never leaves premises |
 | **Network restrictions** | Manufacturing, critical infrastructure | Works without internet |
 | **Cost control** | Budget-conscious IT teams | No cloud compute bills |
+
+**Cloud Sinks (Optional Extension):**
+- Local-first is the **default and core value**
+- Cloud is **optional output destination only** (pluggable sinks)
+- Supported: Write Parquet to S3, load into cloud SQL (Snowflake, BigQuery, etc.)
+- **No cloud control plane** - Casparian runs locally; cloud is just where outputs go
+- **No SaaS dependency** - Product works fully offline; cloud connectivity is user-initiated
 
 ### Invalidated Hypotheses
 
@@ -347,111 +426,347 @@ Generic comparisons (Fivetran, Airbyte) are misleading. A Trade Support Engineer
 | Parser IP accumulation | High | Switching cost increases over time |
 | (Phase 2) AI integration | Medium | 12-18 months to replicate |
 
+### The Awareness Gap (Validated Jan 2026)
+
+Casparian sits in a market gap that buyers don't know exists:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     ENTERPRISE TIER                          │
+│  Databricks, Relativity, Palantir ($50K-$500K/year)         │
+│  → Data teams know these exist                               │
+└─────────────────────────────────────────────────────────────┘
+                          ↑
+                    AWARENESS GAP
+              (Buyers don't know tools exist here)
+                          ↓
+┌─────────────────────────────────────────────────────────────┐
+│                     DIY / MANUAL TIER                        │
+│  grep + Excel + Python scripts ("free")                      │
+│  → Operations teams think this is the only alternative      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Why this matters:**
+
+| Observation | Implication |
+|-------------|-------------|
+| The pain is real | 6+ hours/day lost to manual FIX log analysis |
+| The market is large | $156B by 2034 for unstructured data management |
+| But buyers won't come to us | They don't know a $300/month solution can exist |
+| Category awareness is zero | They think options are: manual (free) or enterprise ($150K+) |
+
+**GTM implication:** We must create category awareness. Buyers need to be shown that mid-market local data tooling exists before they can evaluate it.
+
+**Sales motion:**
+1. **Find them** - LinkedIn outreach to Trade Support analysts
+2. **Show them** - 60-second demo: "Watch me solve a trade break"
+3. **Prove ROI** - Calculator: 40 min × 10 breaks × $75/hr = $X saved
+
+**Why "begging" doesn't happen:** The people who feel "bronze layer" pain (data engineers) already have enterprise tools. The people without tools (Trade Support, Operations) don't frame it as a "bronze layer problem" - they call it "why does this take 45 minutes?"
+
 ---
 
 ## Go-to-Market Strategy
 
-### GTM Philosophy: Vertical-First, Not Horizontal
+### GTM Philosophy: Technical Users with Data at Rest
 
-Generic "data platform" positioning fails. Each vertical has different:
-- **Competitors** (Databricks vs. Relativity vs. Palantir)
-- **Buyers** (Trade Support vs. Litigation Support vs. Intel Analyst)
-- **Sales cycles** (30 days vs. 18 months)
-- **Pricing tolerance** ($75/mo vs. $150K/year)
+> **Final Insight (Jan 2026):** Target **technical Python users** with **data at rest on network drives** that **requires schematization** and has **high willingness to pay**.
 
-**Priority Order:** Finance → Legal → Defense → Healthcare
+The path keeps focus on users who value the specific architecture (Local-First + Python + Governance) and avoids the support nightmare of non-technical analysts.
 
-### Phase 1: Finance / Trade Break Workbench (Months 0-6)
+**Priority Order:** DFIR (#1) → Pharma R&D (#2) → IIoT/OT (#3) → Satellite/Space (#4) → Defense/GEOINT (#5)
 
-**Why Finance First:**
-- Highest willingness to pay
-- Fastest sales cycle (operations budget, not IT budget)
-- Quantifiable ROI (40 min saved × 10 breaks/day = 6+ hours)
-- T+1 settlement pressure creates urgency
+---
 
-**Target Persona:** Trade Support Engineer / Middle Office
+### Commercialization: Product-First + Productized Onboarding
+
+**Critical:** We remain **product-first**. We sell adoption via productized onboarding SKUs (fixed scope), not bespoke services-led ingestion. Services are used only as repeatable onboarding + enablement, delivered inside the product framework.
+
+**Productized SKUs:**
+
+| SKU | Scope | Deliverables |
+|-----|-------|--------------|
+| **DFIR Starter Pack** | Fixed scope, short engagement | Deploy on workstation/server (offline/air-gap friendly); ingest one real case corpus (or redacted); EVTX → governed DuckDB/Parquet + quarantine workflow; evidence-grade manifest template + runbook |
+| **Custom Artifact Pack** | Fixed scope | Implement 1–2 custom artifacts as Casparian parsers; include regression tests against corpus; deliver as internal parser bundle |
+| **Maintenance Subscription** | Recurring | Parser pack updates as artifacts evolve; regression suite + compatibility guarantees; support for backfill planning and controlled upgrades |
+
+**Pricing Guidance:**
+- Do NOT "race to the bottom" on price just because code is promptable
+- Price around risk/time-to-trust/time-to-maintain and the cost of being wrong (silent drift)
+- Offer pricing axes options (license/subscription/usage) without committing to exact figures until validation
+
+---
+
+### Phase 1: DFIR - Immediate Cash (Months 1-3)
+
+**Why DFIR First (The Winner):**
+
+They are the **only customer** with network drive data that is both **urgent** (active breach) and **legally mandated** for audit trail:
+
+| Factor | Detail |
+|--------|--------|
+| **The Data** | Disk images, memory dumps, obscure system logs (Amcache, Shimcache, $MFT) on air-gapped evidence servers |
+| **Current Tool** | "Fragile" Python scripts using `construct` or `kaitai` to parse binary artifacts |
+| **Why They Pay** | **Speed:** Parse 1 hour faster = stop breach sooner. **Liability:** Script deletes row = destroyed evidence |
+| **Our Value** | **Lineage/Quarantine** = their insurance policy |
+| **Sales Cycle** | FAST - Boutique firms (5-50 people) have decision-makers who are practitioners |
+
+**Target Persona:** DFIR Consultant at boutique firm
+
+**The Pitch:**
+> *"The first IDE for forensic artifact parsing. Stop trusting fragile scripts for evidence."*
 
 **Go-to-Market:**
 | Action | Target |
 |--------|--------|
-| Ship FIX parser with `fix_order_lifecycle` table | Core product |
-| Demo: "Debug trade break in 5 minutes" | 2-minute video |
-| Direct outreach to prop trading firms, broker-dealers | 50 companies |
-| Content: "T+1 is killing your Trade Support team" | SEO + thought leadership |
-| Partner with FIX protocol consultants | Channel |
+| Target SANS community, DFIR Discord, LinkedIn | Direct outreach |
+| Ship example parsers: Amcache, Shimcache, $MFT, EVTX | Starter kits |
+| Demo: "Corrupted artifacts that crash Plaso" | Pain agitation |
+| Partner with boutique IR firms | Channel |
 
 **Pricing:**
 | Tier | Price | Features |
 |------|-------|----------|
-| **Pro** | $75/user/month | FIX parser, unlimited files |
-| **Trading Team** | $400/month | Multi-venue, custom tags |
-| **Enterprise** | Custom | Audit trails, SSO, support |
+| **Pro** | $100/user/month | Full platform, example parsers |
+| **Team** | $400/month | Multi-engagement, shared parsers |
+| **Consultant** | $600/month | White-label, multi-client |
 
 **Success Metrics:**
-- 10 trading desks using weekly
-- $10K MRR from finance vertical
-- 3 case studies published
+- 5-10 consulting licenses in first 3 months
+- Validate Parser Dev Loop with real users
+- $5K MRR from DFIR segment
 
-### Phase 2: Legal / eDiscovery (Months 6-12)
+---
 
-**Why Legal Second:**
-- Adjacent to finance (similar buyer profile)
-- Clear ROI ($5-15K saved per matter)
-- Small firm market underserved (80K+ firms)
+### Phase 2: Pharma R&D - Enterprise Growth (Months 6+)
 
-**Target Persona:** Litigation Support Specialist
+**Why Pharma Second (Highest LTV):**
+
+Deepest pockets and most permanent problem:
+
+| Factor | Detail |
+|--------|--------|
+| **The Data** | Terabytes of XML, JSON, binary from Mass Spectrometers & HPLC on **shared lab network drives** |
+| **Current Tool** | Scripts to sweep drives nightly, push to Snowflake/Databricks for scientists |
+| **Why They Pay** | **FDA 21 CFR Part 11**: Must prove DB data matches raw file on drive |
+| **Our Value** | **Source Hash** + **Schema Contract** = compliance features |
+| **Sales Cycle** | Slower (enterprise), but **sticky forever** |
+
+**Target Persona:** Lab Data Engineer at Biotech/Pharma
+
+**The Pitch:**
+> *"Automated, compliant ingestion for instrument data. 21 CFR Part 11 ready out of the box."*
 
 **Go-to-Market:**
 | Action | Target |
 |--------|--------|
-| Ship PST parser with email/attachment extraction | Core product |
-| Demo: "Process 50GB PST in 30 minutes" | Cost savings angle |
-| Target litigation support communities (ACEDS) | Direct outreach |
-| Partner with legal tech consultants | Channel |
+| Target lab informatics communities, LinkedIn | Direct outreach |
+| Content: "FDA-compliant data pipelines from instrument files" | Compliance angle |
+| Partner with lab automation vendors | Channel |
 
 **Pricing:**
 | Tier | Price | Features |
 |------|-------|----------|
-| **Pro** | $75/user/month | PST + load file parsers |
-| **Team** | $300/month | Multi-custodian, export |
-| **Consultant** | $500/month | White-label, multi-client |
+| **Team** | $1,000/month | Multi-instrument, compliance reports |
+| **Enterprise** | $50K+/year | SSO, validation packages, support |
 
 **Success Metrics:**
-- 25 legal customers
-- $5K MRR from legal vertical
+- 2-3 enterprise pilots in first year
+- $50K+ annual contracts
+- FDA compliance validation documentation
 
-### Phase 3: Defense / SBIR Pathway (Months 6-18)
+---
 
-**Why Defense Third:**
-- Longer sales cycle (SBIR process)
-- Requires air-gap features (bundle mode)
-- High value but slow to close
+### Phase 3: IIoT/OT - Industrial Expansion (Months 6+)
 
-**Target:** AFWERX, DIU, SOCOM SBIR topics
+**Why IIoT/OT Third:**
 
-> **SBIR Program Status (Jan 2026):** Programs expired Sept 30, 2025; awaiting congressional reauthorization (expected late Jan 2026). Best-fit topic identified: **A254-011 "AI for Interoperability"** - almost a verbatim description of Casparian's capabilities. See [strategies/dod_sbir_opportunities.md](strategies/dod_sbir_opportunities.md) for detailed analysis.
+Massive data volumes locked in proprietary historians:
+
+| Factor | Detail |
+|--------|--------|
+| **The Data** | Billions of rows in OSIsoft PI, AspenTech IP21, Wonderware on **industrial networks** |
+| **Current Tool** | Bespoke Python ETL pipelines to convert historian exports to Parquet for data lakes |
+| **Why They Pay** | **Data lake modernization**: Escape $100K+/year historian licenses; ML on operational data |
+| **Our Value** | **Schema Contracts** = data quality for ML pipelines; **Quarantine** = handle sensor noise |
+| **Sales Cycle** | Medium (mid-market manufacturing) |
+
+**Target Persona:** Industrial Data Engineer at manufacturing or utility company
+
+**The Pitch:**
+> *"Escape your historian. Query decades of PLC data with SQL."*
 
 **Go-to-Market:**
 | Action | Target |
 |--------|--------|
-| Ship CoT + PCAP + NITF parsers | Core product |
+| Target industrial data communities, LinkedIn | Direct outreach |
+| Content: "From PI to Parquet: modernizing historian data" | Data lake angle |
+| Partner with IIoT platform vendors (Uptake, Samsara) | Channel |
+
+**Pricing:**
+| Tier | Price | Features |
+|------|-------|----------|
+| **Team** | $1,000/month | Multi-site, historian parsers |
+| **Enterprise** | $25K+/year | Integration support, custom formats |
+
+**Success Metrics:**
+- 3-5 manufacturing/utility pilots
+- $25K+ annual contracts
+- Historian escape velocity: 10B+ rows migrated
+
+---
+
+### Phase 4: Satellite/Space - New Frontier (Months 9+)
+
+**Why Satellite Fourth:**
+
+Emerging sector with perfect technical fit:
+
+| Factor | Detail |
+|--------|--------|
+| **The Data** | CCSDS telemetry, TLE files, binary downlinks generating **50TB/hour** from satellite constellations |
+| **Current Tool** | Python scripts using COSMOS, SatNOGS, custom binary parsers |
+| **Why They Pay** | **Mission-critical data integrity**: One parsing bug = lost science; **Volume**: Can't manually review |
+| **Our Value** | **Schema Contracts** = validate telemetry before storage; **Lineage** = trace anomalies to source |
+| **Sales Cycle** | Medium (startup-friendly sector) |
+
+**Target Persona:** Ground Systems Data Engineer at satellite operator
+
+**The Pitch:**
+> *"Parse 50TB/hour downlinks. Schema contracts for mission-critical telemetry."*
+
+**Go-to-Market:**
+| Action | Target |
+|--------|--------|
+| Target NewSpace communities, SmallSat conferences | Direct outreach |
+| Content: "CCSDS telemetry to Parquet at scale" | Technical demo |
+| Partner with ground station providers | Channel |
+
+**Pricing:**
+| Tier | Price | Features |
+|------|-------|----------|
+| **Mission** | $2,000/month | Multi-satellite, telemetry parsers |
+| **Constellation** | $50K+/year | High-volume, custom formats, priority support |
+
+**Success Metrics:**
+- 2-3 satellite operator pilots
+- Integration with COSMOS or SatNOGS ecosystem
+- 1TB+ telemetry processed in demo
+
+---
+
+### Phase 5: Defense/GEOINT - Dark Horse (Months 12+)
+
+**Why Defense Fifth:**
+
+Perfect product fit, but painful sales cycle:
+
+| Factor | Detail |
+|--------|--------|
+| **The Data** | Satellite telemetry, NITF imagery, drone logs on **air-gapped classified networks** (SIPRNet/JWICS) |
+| **Current Tool** | Python (GDAL, NumPy) to "munge" data before analysts see it |
+| **Why They Pay** | **National security** - process petabytes of custom binary locally |
+| **Cloud Illegal** | Cloud tools are literally illegal on classified networks |
+| **Sales Cycle** | Very slow (gov procurement) |
+
+**Strategy:** Target **subcontractors** (smaller defense tech firms) rather than Raytheon directly.
+
+**Target Persona:** Data Engineer at defense subcontractor
+
+**The Pitch:**
+> *"Process classified telemetry locally. Air-gapped, auditable, Python-native."*
+
+**Go-to-Market:**
+| Action | Target |
+|--------|--------|
+| SBIR applications (A254-011 "AI for Interoperability") | Non-dilutive funding |
+| Target smaller integrators, not primes | Faster decision cycle |
 | `casparian bundle` for air-gapped deployment | Required feature |
-| Register in SAM.gov + DSIP Portal | Required for federal work |
-| SBIR Phase I application | $50-250K funding |
-| Demo to DoD stakeholders | Build relationships |
+
+> **SBIR Status:** Programs expired Sept 30, 2025; awaiting reauthorization. See [strategies/dod_sbir_opportunities.md](strategies/dod_sbir_opportunities.md).
 
 **Success Metrics:**
 - 1 SBIR Phase I award
-- 5 DoD pilot users
+- 3-5 subcontractor pilots
 
-### Phase 4: Healthcare / HL7 Archive Analytics (Months 12-24)
+---
 
-**Why Healthcare Fourth:**
-- Long sales cycle (12-18 months)
-- Requires compliance certifications (HIPAA)
-- Mirth went commercial (Mar 2025) - organizations want more value from HL7 data
+---
 
-**Defer until:** Finance + Legal revenue covers runway
+## Parser Ecosystem / Registry Strategy
+
+### Open Core Model: Open Parsers + Proprietary Engine
+
+**Open (public repos):**
+- Casparian Parser Protocol + SDK
+- Standard Tables (schema definitions for common artifacts: EVTX, Shimcache, Amcache, etc.)
+- Community parser library (parser implementations)
+
+**Closed (commercial engine):**
+- Incremental state + deduplication
+- Authoritative validation (Rust-side schema enforcement)
+- Quarantine management + retention policies
+- Reproducibility manifests + evidence-grade exports
+- Enterprise governance controls (approvals, audit logs)
+- Backfill planning + version migration
+
+**Principle:** "Logic is open; execution guarantees are in the engine."
+
+### Registry Trust Tiers
+
+| Tier | Label | Criteria | Maintenance |
+|------|-------|----------|-------------|
+| **Verified / Gold** | ✓ Verified | Casparian-maintained; regression tested against real artifacts; schema contracts published | Casparian team |
+| **Community / Silver** | Community | Tests required; schema contract required; versioning required; error taxonomy required | Community + Casparian review |
+| **Experimental / Bronze** | Experimental | Basic functionality; may lack full test coverage | Community |
+
+### Contribution Guidelines
+
+Parsers submitted to the registry must:
+1. Include regression tests against sample artifacts
+2. Declare schema contracts for all outputs
+3. Follow semantic versioning
+4. Use standardized error taxonomy for quarantine classification
+5. Pass CI validation (schema validation + sample run)
+
+---
+
+### Phase 4: eDiscovery - Bridge Market Only (P3)
+
+> **Critical Insight:** "eDiscovery" is a business process, not a job title. We segmented it into three personas:
+
+| Persona | Verdict | Why |
+|---------|---------|-----|
+| **eDiscovery Analyst** | **CUT** | Excel user. Clicks "Process" in Relativity. Files support tickets. |
+| **Litigation Support Technologist** | **MAYBE** | Reluctant Python. Can code but hates it. Bridge market. |
+| **DFIR Consultant** | **WINNER** | Python daily. This is where the eDiscovery idea actually landed. |
+
+**Bottom Line:** We aren't selling to "Legal Tech" anymore. We're selling to "Cybersecurity & Forensics." Same budgets, much more technical users.
+
+**Approach:** If Litigation Support Technologists find us organically, great. But don't prioritize outreach—focus on DFIR. See [strategies/ediscovery.md](strategies/ediscovery.md) for the narrow LST-only strategy.
+
+---
+
+### Explicitly Cut: Do Not Target
+
+| Segment | Why Cut |
+|---------|---------|
+| **Trade Support Analyst** | Want an *answer*, not a database. Don't write parsers. Excel users. Service Trap risk. |
+| **eDiscovery Analyst** | Click "Process" in Relativity. When parsing fails, email vendor or mark as "Exception." Will treat Casparian as "Magic Converter" and file support tickets. **You become their free IT support.** |
+| **General IT Admin** | Use Splunk/Cribl. Want search bars, not schema definitions. |
+| **Marketing Agencies** | Data in APIs (Facebook/Google), not files on network drives. |
+| **Healthcare IT** | 12-18 month sales cycle, HIPAA requirements. Defer until revenue covers runway. |
+| **Bioinformatics** | Lower budget (academic), slower cycle. |
+
+### The Qualifying Question
+
+When evaluating any prospect, ask:
+
+> "When a weird file format fails to parse, do they (a) write a Python script, or (b) email a vendor?"
+
+- **(a) Write a script** → Valid target
+- **(b) Email a vendor** → **DO NOT TARGET**
 
 ### MSP Channel (Parallel, Lower Priority)
 
@@ -701,6 +1016,175 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 
 ---
 
+## Appendix: Segments Explicitly Not v1
+
+We are NOT ignoring other markets. We are explicitly sequencing. The following segments are attractive but have gating constraints that make them unsuitable for v1:
+
+| Segment | Why It's Attractive | Why It's NOT v1 (Gating Reason) |
+|---------|---------------------|--------------------------------|
+| **Healthcare HL7** (batch/file drops) | Compliance + PHI, recurring ingestion | Often message-transport/integration-engine domain (MLLP); incumbents already provide file polling connectors; hospital procurement is slow (12-18 months); needs sharper wedge than "parse HL7" |
+| **eDiscovery** | Chain-of-custody, massive corpora | End-to-end platforms dominate (Relativity, Nuix); expectations include OCR/review workflows beyond v1 parsing scope |
+| **Payments** (ISO8583/FIX/SWIFT) | High governance + budgets | Often real-time/stateful; offline logs possible but not core wedge; long procurement cycles with entrenched incumbents |
+| **Genomics / Sequencing** | Huge file volumes, recurring drops | Success depends on orchestration/compute workflows beyond v1 scope; we are explicitly NOT an orchestrator |
+| **GIS / Weather / LiDAR** (Shapefile, NetCDF, GRIB, LAS) | Real file formats | Commoditized OSS exists (GDAL, xarray); lower governance urgency; differentiation harder |
+| **Automotive / Semicon / Life Sciences** | Technically strong fit | Longer procurement cycles; revisit post-wedge validation |
+| **DICOM / PACS** | Compliance + on-prem | Deeply integrated clinical systems; buying unit expects clinical workflow integration |
+| **Utilities / CIM** | Critical infra, standards | Utility procurement + program-driven integration; slow cycles |
+| **Defense / Space Telemetry** | Air-gap, integrity | Procurement + bespoke programs; long cycles (target via subcontractors) |
+
+**Note:** Cloud output sinks (S3, cloud SQL) don't change segment ranking. Main blockers are: protocol-vs-file nature, orchestration dependency, and procurement/incumbent lock-in.
+
+---
+
+## Appendix: Trust Primitives / Integrity Guarantees
+
+Casparian provides the following guarantees (these are the "trust primitives" that justify the product):
+
+| Guarantee | Description |
+|-----------|-------------|
+| **Reproducibility** | Same inputs + same parser bundle hash → identical outputs |
+| **Per-row lineage** | Every output row has: `_cf_source_hash`, `_cf_job_id`, `_cf_processed_at`, `_cf_parser_version` |
+| **Authoritative validation** | Schema contracts are enforced in Rust; invalid rows never silently coerce into clean tables |
+| **Quarantine semantics** | Invalid rows go to quarantine with error context; runs may succeed partially (PartialSuccess) |
+| **Content-addressed identity** | Parser identity = blake3(parser_content + lockfile); changes trigger re-processing |
+| **Backfill planning** | When parser version changes, backfill command shows exactly what needs reprocessing |
+| **Evidence-grade manifests** | Export includes: inputs + hashes + parser IDs + outputs + timestamps |
+
+---
+
+## Appendix: Success Metrics (DFIR-First)
+
+| Metric | Definition | Target |
+|--------|------------|--------|
+| **Time-to-first-query** | Minutes from case folder to SQL query | <15 minutes |
+| **Quarantine rate** | % rows quarantined per parser version | Track per parser |
+| **Reproducibility check** | Same inputs + parser hash → identical outputs | 100% |
+| **Backfill accuracy** | Files/jobs selected correctly for reprocessing | 100% |
+| **Silent drift incidents** | Parsers that changed output without version bump | 0 |
+
+---
+
+## Appendix: TAM Expansion via Parser Ecosystem (Vault Strategy)
+
+### Executive Take
+
+The "Vault + community contributions + minimal stable protocol" direction is **pragmatic and TAM-expanding**, *as long as we keep the DFIR wedge and don't market Casparian as "a general data processing engine" in the Spark/dbt/Airflow sense.*
+
+It **doesn't magically make v1 horizontal overnight**, but it **materially increases the addressable surface area over time** by turning "parser coverage" into a compounding asset rather than an internal services burden.
+
+### What This Direction Changes (And Why It's Sane)
+
+We're moving from:
+- "we ship a tool + we write parsers"
+
+to:
+- "we ship an integrity-focused engine + we standardize a parser ecosystem + we sell *trust* (Vault)"
+
+This is aligned with how DFIR ecosystems already work: practitioners share reusable "content" (artifacts/rules/targets), while the execution environment provides operational leverage.
+
+**Concrete Precedent Signals:**
+
+| Ecosystem | Evidence |
+|-----------|----------|
+| **Velociraptor** | Uses shareable "Artifacts" and Rapid7 reports that most users use built-ins + artifact exchange, and **over 60% of users develop their own artifacts**. [Source](https://www.rapid7.com/blog/post/2023/05/10/the-velociraptor-2023-annual-community-survey/) |
+| **KAPE** | Has a GitHub repo (KapeFiles) that "contains all the Targets and Modules" used by KAPE and is positioned as community-updatable content. [Source](https://github.com/EricZimmerman/KapeFiles) |
+| **Sigma** | The main repo explicitly says it offers **3000+ detection rules** and is a collaboration hub for defenders. [Source](https://github.com/SigmaHQ/sigma) |
+
+The *behavioral* bet ("security practitioners will contribute long-tail logic") is not speculative.
+
+**Why the "Vault" Layer Is Important:**
+
+A pure community registry creates adoption but also creates **trust problems** (quality, regressions, blame, supply-chain risk). Airbyte's approach is instructive: it introduced explicit connector classifications (Certified vs Community) and documents different support expectations. [Source](https://airbyte.com/blog/introducing-certified-community-connectors)
+
+Our Vault is basically "Certified connectors, but for parsers," plus stronger integrity demands (fixtures, determinism checks, signing, offline bundles).
+
+### TAM Impact
+
+**First: a precision point.** TAM is "how much spending exists for the problem you solve." This direction **doesn't change the existence of demand**, but it **does change what we can credibly claim to serve** and therefore how big our *addressable* market becomes.
+
+**The Quantifiable Context: Two Big Adjacent Markets**
+
+| Market | 2024 Size | 2030 Projection | Source |
+|--------|-----------|-----------------|--------|
+| **Digital Forensics** | ~$11.45B | ~$26.15B | [Grand View Research](https://www.grandviewresearch.com/horizon/outlook/digital-forensics-market-size/global) |
+| **Data Integration** | ~$15.19B | ~$30.27B | [Grand View Research](https://www.grandviewresearch.com/industry-analysis/data-integration-market-report) |
+
+*Caveat: these market numbers include categories we won't serve (services, hardware, streaming, full-stack platforms). But they show we're not in a tiny niche.*
+
+**What the Ecosystem Direction Does to "Potential TAM" in Practice:**
+
+Think of it as a **coverage multiplier**, not a "new market":
+
+| Without Community + Vault | With Community + Vault |
+|---------------------------|------------------------|
+| Effective addressable market limited by: how many parsers we can build/maintain, how many formats we can support with confidence, and how many "weird" customer formats we can absorb without becoming services | Can credibly expand to many more verticals because: **long-tail formats become supportable** (community writes parser → we don't staff it), **regulated buyers become winnable** (Vault provides trust: tests, signing, offline bundle, support), **standard tables become sticky** across orgs and tools |
+
+This is exactly the ecosystem flywheel in DFIR content systems (Velociraptor artifacts, Sigma rules, KAPE targets).
+
+**What It Does NOT Automatically Do:**
+
+It does **not** automatically make us a credible replacement for:
+- Orchestrators (Dagster/Airflow)
+- Warehouse ELT (Fivetran-esque)
+- Streaming (Kafka/Flink)
+- General compute engines (Spark)
+- Interface engines in healthcare
+
+Our differentiator remains **governed parsing of files-at-rest** + integrity guarantees.
+
+### The "General Data Processing Engine" Claim
+
+**It IS an exaggeration** if we mean "general-purpose compute platform." If we market that, buyers will assume: distributed compute/cluster execution, orchestration & scheduling, connectors & transports, transformations beyond parsing (joins, incremental models), and SLAs typical of data platforms. Casparian (by v1 constraints) is **not** that.
+
+**It is NOT an exaggeration** if we mean: Casparian is a **general-purpose governed execution engine for parsers that turn file artifacts into typed tables**.
+
+That is real because:
+- Our engine is format-agnostic (anything that can be parsed into Arrow)
+- We have job identity, lineage, strict validation, quarantine semantics, reproducibility, and corpus backtesting
+- The Vault direction strengthens "trust + regression" as a first-class product
+
+**Pragmatic Wording That Won't Backfire:**
+
+| Avoid | Use Instead |
+|-------|-------------|
+| "General data processing engine" | **"Governed artifact-to-table build system"** |
+| "Data platform" | **"Local-first governed ingestion runtime for dark files"** |
+| "ETL tool" | **"Deterministic parser execution engine with lineage + quarantine + reproducibility"** |
+
+These claim what we actually do, and still support broad TAM narratives later.
+
+### Risks of the Ecosystem Direction
+
+| Risk | Description | Mitigation |
+|------|-------------|------------|
+| **Ecosystem trust collapse** | If community parsers are unreliable, "addressable market" shrinks because enterprises won't trust the registry | Vault tiers modeled after connector ecosystems (Airbyte Certified vs Community is a concrete precedent) |
+| **"Forkable runner" commoditization** | If our open protocol makes it easy for someone to write a competitor runner, we lose pricing power | Keep "hard stuff" proprietary: incremental state + backfill planning, quarantine tooling, attestations/signing workflows, enterprise policy controls |
+| **License/community backlash** | If we build a big ecosystem and later change the rules, we invite a fork (HashiCorp Terraform → OpenTofu cautionary tale). [Source](https://opentofu.org/manifesto/) | Decide up front what is open forever (protocol + SDK + standard tables) and what is closed (engine), and stick to it |
+| **Messaging dilution** | A platform narrative can reduce near-term sales because buyers can't map it to a concrete pain | Keep DFIR-first messaging; treat ecosystem/Vault as how we scale coverage, not why the first customer buys |
+
+### Net Impact on TAM
+
+**The "honest" TAM story after this change:**
+
+1. **Near-term SAM stays DFIR-first**, because that's where we can win with EVTX + evidence-grade manifests + quarantine + reproducibility.
+
+2. **Potential TAM expands materially** because we can now plausibly serve many more file-format domains without staffing each parser, by combining:
+   - Community contributions for breadth (like Velociraptor artifacts / Sigma rules / KAPE targets)
+   - Vault-certified packs for regulated buyers (like Airbyte's Certified vs Community connectors + support tiers)
+
+3. The big "category TAM" anchors we can reference (carefully) are:
+   - Digital forensics spend (large and growing)
+   - Eventually parts of data integration spend (also large)
+   - But we should be explicit that we're addressing the **file-at-rest / dark data / governed parsing** slice
+
+### Bottom Line
+
+- **Not too high in the sky** as an architecture + ecosystem plan.
+- **Too high in the sky** only if we start selling it as a generic "data processing engine" today.
+- The pragmatic win is: **DFIR wedge + ecosystem/Vault as the scaling mechanism** that expands what we can address over time without becoming a services shop
+
+---
+
 ## Appendix: Technical Stack
 
 ### Backend (Rust)
@@ -738,6 +1222,12 @@ Casparian can pursue grants to fund core infrastructure while maintaining commer
 | 2026-01 | 2.2 | **SBIR research:** Added program status note (expired Sept 2025, pending reauth); Identified best-fit topic A254-011; Created [dod_sbir_opportunities.md](strategies/dod_sbir_opportunities.md) |
 | 2026-01 | 2.3 | **Non-dilutive funding:** Added Open Core grant strategy; Created [non_dilutive_funding.md](strategies/non_dilutive_funding.md) with verified civilian funding sources (STF, NLNet, OTF, NIH) |
 | 2026-01 | 2.4 | **Streaming strategy:** Evaluated Redpanda/ADP for architecture; Documented phased approach (differentiate → complement → integrate); Created [streaming_redpanda.md](strategies/streaming_redpanda.md) |
+| 2026-01 | 3.0 | **Major strategic pivot:** Reprioritized target segments based on strategic fork evaluation; P0 = eDiscovery + DFIR (audit trails legally required, writes Python); P1 = Data Consultants; Trade Desk deprioritized to P3 (consultant-delivered only); Added "Consultant-First" GTM strategy; See [strategic_fork_evaluation.md](docs/strategic_fork_evaluation.md) |
+| 2026-01 | 3.1 | **Refined prioritization:** DFIR confirmed as #1 (urgent + legally mandated); Added Pharma R&D as #2 (highest LTV, FDA 21 CFR Part 11); Defense/GEOINT as #3 (dark horse); eDiscovery demoted to P2; Explicitly cut Trade Desk, IT Admin, Marketing; Added "Attack Plan" with specific pitches |
+| 2026-01 | 3.2 | **eDiscovery segmentation:** Split into 3 personas (Analyst=CUT, LST=Maybe, DFIR=Winner); Added eDiscovery Analyst to "Do Not Target" list; Demoted eDiscovery to P3 bridge market; Added "Qualifying Question" (write script vs email vendor); Clarified "Legal Tech → Cybersecurity & Forensics" pivot |
+| 2026-01 | 3.3 | **Expanded target segments:** Added IIoT/OT Data Engineers as #3 (historian escape, data lake modernization); Added Satellite/Space Data Engineers as #4 (CCSDS telemetry, NewSpace boom); Defense/GEOINT moved to #5; Created strategies/iiot.md and strategies/satellite.md; Updated attack plan with Industrial Expansion and Space Sector phases |
+| 2026-01-21 | 4.0 | **Major update per authoritative decisions:** Added AI-era defensibility narrative; Added open ecosystem / parser registry strategy with trust tiers; Added productized onboarding SKUs (DFIR Starter Pack, Custom Artifact Pack, Maintenance); Added Trust Primitives / Integrity Guarantees appendix; Added Segments Not v1 appendix with gating reasons; Added cloud sinks as optional extension; Emphasized DFIR-first v1 focus; Clarified NOT streaming/orchestrator/BI/no-code/AI-dependent |
+| 2026-01-21 | 4.1 | **TAM validation appendix:** Added "TAM Expansion via Parser Ecosystem (Vault Strategy)" appendix with market size context (Digital Forensics ~$11.45B, Data Integration ~$15.19B), ecosystem precedents (Velociraptor, KAPE, Sigma, Airbyte), risk analysis (trust collapse, forkable runner, license backlash, messaging dilution), and positioning guidance (avoid "general data processing engine" claim) |
 
 ---
 

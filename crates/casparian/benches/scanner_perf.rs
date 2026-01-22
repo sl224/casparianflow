@@ -1,4 +1,4 @@
-use casparian::scout::{Database, ScanConfig, ScannedFile, Scanner, Source, SourceType};
+use casparian::scout::{Database, ScanConfig, ScannedFile, Scanner, Source, SourceId, SourceType};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ignore::WalkBuilder;
 use std::fs::File;
@@ -51,7 +51,7 @@ fn create_fixture(file_count: usize, depth: usize, file_size: usize) -> Fixture 
 
 fn create_source(path: &Path) -> Source {
     Source {
-        id: "bench-src".to_string(),
+        id: SourceId::new(),
         name: "Bench Source".to_string(),
         source_type: SourceType::Local,
         path: path.to_string_lossy().to_string(),
@@ -149,13 +149,13 @@ fn walk_count_bytes(root: &Path, config: &ScanConfig) -> (usize, u64) {
     (total_files.load(Ordering::Relaxed), total_bytes.load(Ordering::Relaxed))
 }
 
-fn build_scanned_files(source_id: &str, count: usize) -> Vec<ScannedFile> {
+fn build_scanned_files(source_id: &SourceId, count: usize) -> Vec<ScannedFile> {
     let mut files = Vec::with_capacity(count);
     for i in 0..count {
         let rel_path = format!("level_{}/file_{:06}.dat", i % 16, i);
         let full_path = format!("/bench/{}", rel_path);
         files.push(ScannedFile::new(
-            source_id,
+            source_id.clone(),
             &full_path,
             &rel_path,
             FILE_SIZE_BYTES as u64,
@@ -166,7 +166,6 @@ fn build_scanned_files(source_id: &str, count: usize) -> Vec<ScannedFile> {
 }
 
 fn bench_scanner_full_scan(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("create runtime");
     let fixture = create_fixture(FILE_COUNT, DEPTH, FILE_SIZE_BYTES);
 
     let mut group = c.benchmark_group("scanner_full_scan");
@@ -176,15 +175,15 @@ fn bench_scanner_full_scan(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("batch_size", batch_size), &batch_size, |b, &batch| {
             b.iter_batched(
                 || {
-                    let db = rt.block_on(Database::open_in_memory()).expect("open db");
+                    let db = Database::open_in_memory().expect("open db");
                     let source = create_source(fixture.temp_dir.path());
-                    rt.block_on(db.upsert_source(&source)).expect("insert source");
+                    db.upsert_source(&source).expect("insert source");
                     (db, source)
                 },
                 |(db, source)| {
                     let config = ScanConfig { batch_size: batch, ..Default::default() };
                     let scanner = Scanner::with_config(db, config);
-                    rt.block_on(scanner.scan_source(&source)).expect("scan");
+                    scanner.scan_source(&source).expect("scan");
                 },
                 BatchSize::LargeInput,
             );
@@ -195,7 +194,6 @@ fn bench_scanner_full_scan(c: &mut Criterion) {
 }
 
 fn bench_scanner_rescan(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("create runtime");
     let fixture = create_fixture(FILE_COUNT, DEPTH, FILE_SIZE_BYTES);
 
     let mut group = c.benchmark_group("scanner_rescan");
@@ -205,18 +203,18 @@ fn bench_scanner_rescan(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("batch_size", batch_size), &batch_size, |b, &batch| {
             b.iter_batched(
                 || {
-                    let db = rt.block_on(Database::open_in_memory()).expect("open db");
+                    let db = Database::open_in_memory().expect("open db");
                     let source = create_source(fixture.temp_dir.path());
-                    rt.block_on(db.upsert_source(&source)).expect("insert source");
+                    db.upsert_source(&source).expect("insert source");
                     let config = ScanConfig { batch_size: batch, ..Default::default() };
                     let scanner = Scanner::with_config(db.clone(), config);
-                    rt.block_on(scanner.scan_source(&source)).expect("warm scan");
+                    scanner.scan_source(&source).expect("warm scan");
                     (db, source)
                 },
                 |(db, source)| {
                     let config = ScanConfig { batch_size: batch, ..Default::default() };
                     let scanner = Scanner::with_config(db, config);
-                    rt.block_on(scanner.scan_source(&source)).expect("rescan");
+                    scanner.scan_source(&source).expect("rescan");
                 },
                 BatchSize::LargeInput,
             );
@@ -245,33 +243,34 @@ fn bench_scanner_walk_only(c: &mut Criterion) {
 }
 
 fn bench_scanner_db_write(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("create runtime");
-    let files = build_scanned_files("bench-src", FILE_COUNT);
+    let source_id = SourceId::new();
+    let files = build_scanned_files(&source_id, FILE_COUNT);
 
     let mut group = c.benchmark_group("scanner_db_write");
     group.throughput(Throughput::Elements(FILE_COUNT as u64));
 
     for &batch_size in WRITE_BATCH_SIZES {
+        let source_id = source_id.clone();
         group.bench_with_input(BenchmarkId::new("batch_size", batch_size), &batch_size, |b, &batch| {
             b.iter_batched(
                 || {
-                    let db = rt.block_on(Database::open_in_memory()).expect("open db");
+                    let db = Database::open_in_memory().expect("open db");
                     let source = Source {
-                        id: "bench-src".to_string(),
+                        id: source_id.clone(),
                         name: "Bench Source".to_string(),
                         source_type: SourceType::Local,
                         path: "/bench".to_string(),
                         poll_interval_secs: 0,
                         enabled: true,
                     };
-                    rt.block_on(db.upsert_source(&source)).expect("insert source");
+                    db.upsert_source(&source).expect("insert source");
                     db
                 },
                 |db| {
                     let mut offset = 0;
                     while offset < files.len() {
                         let end = (offset + batch).min(files.len());
-                        rt.block_on(db.batch_upsert_files(&files[offset..end], None))
+                        db.batch_upsert_files(&files[offset..end], None)
                             .expect("batch upsert");
                         offset = end;
                     }

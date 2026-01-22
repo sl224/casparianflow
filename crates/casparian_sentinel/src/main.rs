@@ -19,10 +19,13 @@ struct Args {
     /// Database connection string
     #[arg(long)]
     database: Option<String>,
+
+    /// Maximum number of workers (default 4, hard cap 8)
+    #[arg(long, default_value_t = 4)]
+    max_workers: usize,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::registry()
         .with(
@@ -38,15 +41,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("  Bind: {}", args.bind);
     let database = args.database.unwrap_or_else(default_db_url);
     tracing::info!("  Database: {}", database);
+    tracing::info!("  Max workers: {}", args.max_workers);
 
     let config = SentinelConfig {
         bind_addr: args.bind,
         database_url: database,
+        max_workers: args.max_workers,
     };
 
     // Bind and run
-    let mut sentinel = Sentinel::bind(config).await?;
-    sentinel.run().await?;
+    let mut sentinel = Sentinel::bind(config)?;
+    sentinel.run()?;
 
     Ok(())
 }

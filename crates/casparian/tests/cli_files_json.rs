@@ -6,6 +6,8 @@ use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
 
+const SOURCE_ID: i64 = 1;
+
 #[derive(Debug, Deserialize)]
 struct FilesOutput {
     files: Vec<FileOutput>,
@@ -41,8 +43,8 @@ fn test_files_json_filters_and_limits() {
 
     let now = 1_737_187_200_000i64;
 
-    with_duckdb(&db_path, |conn| async move {
-        insert_source(&conn, "src-1", "test_source", "/data", now).await;
+    with_duckdb(&db_path, |conn| {
+        insert_source(&conn, SOURCE_ID, "test_source", "/data", now);
 
         let files = [
             (1, "/data/sales/report.csv", "sales/report.csv", 10_000, "pending", None, None),
@@ -58,7 +60,7 @@ fn test_files_json_filters_and_limits() {
             insert_file(
                 &conn,
                 id,
-                "src-1",
+                SOURCE_ID,
                 path,
                 rel_path,
                 size,
@@ -66,8 +68,7 @@ fn test_files_json_filters_and_limits() {
                 tag,
                 error,
                 now,
-            )
-            .await;
+            );
         }
     });
 
@@ -163,7 +164,7 @@ fn test_files_json_filters_and_limits() {
     );
 }
 
-async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, now: i64) {
+fn insert_source(conn: &DbConnection, id: i64, name: &str, path: &str, now: i64) {
     let source_type = serde_json::json!({ "type": "local" }).to_string();
     conn.execute(
         "INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
@@ -177,14 +178,13 @@ async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, no
             DbValue::from(now),
         ],
     )
-    .await
     .expect("insert source");
 }
 
-async fn insert_file(
+fn insert_file(
     conn: &DbConnection,
     id: i64,
-    source_id: &str,
+    source_id: i64,
     path: &str,
     rel_path: &str,
     size: i64,
@@ -218,7 +218,6 @@ async fn insert_file(
             DbValue::from(now),
         ],
     )
-    .await
     .expect("insert file");
 }
 

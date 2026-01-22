@@ -7,16 +7,18 @@
 #![allow(dead_code)]
 
 use casparian_db::{DbConnection, DbValue};
+use casparian_protocol::{JobStatus as ProtocolJobStatus, ProcessingStatus};
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use std::sync::mpsc;
 
 use super::TuiArgs;
 use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
 use casparian::scout::{
     scan_path, Database as ScoutDatabase,
-    ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source, SourceType,
+    ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source, SourceId, SourceType,
+    TaggingRuleId,
 };
 
 /// Current TUI mode/screen
@@ -455,7 +457,8 @@ pub struct JobFailure {
     pub line: Option<u32>,
 }
 
-/// Job status enumeration
+/// Job status enumeration for UI display (UiJobStatus)
+/// Derived from (ProcessingStatus, Option<JobStatus>) per enum_consolidation_plan.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobStatus {
     #[default]
@@ -492,6 +495,65 @@ impl JobStatus {
             JobStatus::PartialSuccess => "Partial",
             JobStatus::Failed => "Failed",
             JobStatus::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Map from DB status string (ProcessingStatus) and optional completion_status (JobStatus)
+    /// to UI status. Per enum_consolidation_plan.md mapping:
+    ///
+    /// ui_status(queue, outcome):
+    ///   if queue in {Pending, Queued} -> Pending
+    ///   if queue in {Running, Staged} -> Running
+    ///   if queue == Skipped -> Completed
+    ///   if queue == Failed:
+    ///     if outcome == Aborted -> Cancelled
+    ///     else -> Failed
+    ///   if queue == Completed:
+    ///     if outcome in {PartialSuccess, CompletedWithWarnings} -> PartialSuccess
+    ///     if outcome == Failed -> Failed
+    ///     if outcome == Aborted -> Cancelled
+    ///     else -> Completed
+    pub fn from_db_status(queue_status_str: &str, completion_status: Option<&str>) -> Self {
+        let queue_status = queue_status_str.parse::<ProcessingStatus>().ok();
+        let completion_status = completion_status
+            .and_then(|status| status.parse::<ProtocolJobStatus>().ok());
+
+        match queue_status {
+            Some(ProcessingStatus::Pending) | Some(ProcessingStatus::Queued) => JobStatus::Pending,
+            Some(ProcessingStatus::Running) | Some(ProcessingStatus::Staged) => JobStatus::Running,
+            Some(ProcessingStatus::Skipped) => JobStatus::Completed,
+            Some(ProcessingStatus::Failed) => {
+                if matches!(completion_status, Some(ProtocolJobStatus::Aborted)) {
+                    JobStatus::Cancelled
+                } else {
+                    JobStatus::Failed
+                }
+            }
+            Some(ProcessingStatus::Completed) => match completion_status {
+                Some(ProtocolJobStatus::PartialSuccess | ProtocolJobStatus::CompletedWithWarnings) => {
+                    JobStatus::PartialSuccess
+                }
+                Some(ProtocolJobStatus::Failed) => JobStatus::Failed,
+                Some(ProtocolJobStatus::Aborted) => JobStatus::Cancelled,
+                _ => JobStatus::Completed,
+            },
+            _ => {
+                if queue_status_str.eq_ignore_ascii_case(JobStatus::Cancelled.as_str()) {
+                    JobStatus::Cancelled
+                } else if let Ok(legacy) = queue_status_str.parse::<ProtocolJobStatus>() {
+                    match legacy {
+                        ProtocolJobStatus::Success => JobStatus::Completed,
+                        ProtocolJobStatus::PartialSuccess | ProtocolJobStatus::CompletedWithWarnings => {
+                            JobStatus::PartialSuccess
+                        }
+                        ProtocolJobStatus::Failed => JobStatus::Failed,
+                        ProtocolJobStatus::Aborted => JobStatus::Cancelled,
+                        ProtocolJobStatus::Rejected => JobStatus::Pending,
+                    }
+                } else {
+                    JobStatus::Pending
+                }
+            }
         }
     }
 }
@@ -594,7 +656,7 @@ pub struct HomeState {
     pub recent_jobs: Vec<JobSummary>,
     /// Last error message (if any)
     pub last_error: Option<String>,
-    /// Statistics displayed on cards (legacy, used for stats loading)
+    /// Statistics displayed on cards
     pub stats: HomeStats,
     /// Whether stats have been loaded from database
     pub stats_loaded: bool,
@@ -838,38 +900,12 @@ fn handle_text_input(key: KeyEvent, input: &mut String) -> TextInputResult {
 // Newtypes for type safety
 // =============================================================================
 
-/// Strongly-typed source ID (from database)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct SourceId(pub String);
-
-impl SourceId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl From<String> for SourceId {
-    fn from(s: String) -> Self {
-        SourceId(s)
-    }
-}
-
-impl std::fmt::Display for SourceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Strongly-typed rule ID (None = unsaved rule)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RuleId(pub Option<String>);
+pub struct RuleId(pub Option<TaggingRuleId>);
 
 impl RuleId {
-    pub fn new(id: String) -> Self {
+    pub fn new(id: TaggingRuleId) -> Self {
         RuleId(Some(id))
     }
 
@@ -910,7 +946,7 @@ pub enum DiscoverViewState {
     TagsDropdown,       // Filtering/selecting tags
     // --- Full dialogs ---
     RulesManager,       // Dialog for rule CRUD
-    RuleCreation,       // Dialog for creating/editing single rule (legacy)
+    RuleCreation,       // Dialog for creating/editing single rule
     RuleBuilder,        // Split-view Rule Builder (specs/rule_builder.md)
     // --- Sources Manager (spec v1.7) ---
     SourcesManager,     // Dialog for source CRUD (M key)
@@ -961,7 +997,7 @@ pub struct PendingTagWrite {
 /// Pending source update (name/path changes)
 #[derive(Debug, Clone)]
 pub struct PendingSourceUpdate {
-    pub id: String,
+    pub id: SourceId,
     pub name: Option<String>,
     pub path: Option<String>,
 }
@@ -969,7 +1005,7 @@ pub struct PendingSourceUpdate {
 /// Pending source delete
 #[derive(Debug, Clone)]
 pub struct PendingSourceDelete {
-    pub id: String,
+    pub id: SourceId,
 }
 
 /// Result from background directory scan
@@ -1033,14 +1069,14 @@ pub struct PendingRuleWrite {
 /// Pending rule update for persistence (enabled toggle)
 #[derive(Debug, Clone)]
 pub struct PendingRuleUpdate {
-    pub id: String,
+    pub id: TaggingRuleId,
     pub enabled: bool,
 }
 
 /// Pending rule delete for persistence
 #[derive(Debug, Clone)]
 pub struct PendingRuleDelete {
-    pub id: String,
+    pub id: TaggingRuleId,
 }
 
 // ============================================================================
@@ -1075,7 +1111,7 @@ pub struct GlobExplorerState {
     /// Whether cache has been loaded for current source
     pub cache_loaded: bool,
     /// Source ID for which cache was loaded (to detect source changes)
-    pub cache_source_id: Option<String>,
+    pub cache_source_id: Option<SourceId>,
 
     // --- UI state ---
     /// Currently selected folder index
@@ -1418,7 +1454,7 @@ pub struct DiscoverState {
     pub pending_source_updates: Vec<PendingSourceUpdate>,
     pub pending_source_deletes: Vec<PendingSourceDelete>,
     /// Source ID to touch for MRU ordering (set on source selection)
-    pub pending_source_touch: Option<String>,
+    pub pending_source_touch: Option<SourceId>,
 
     // --- Background scanning ---
     /// Path being scanned (for display)
@@ -1573,7 +1609,7 @@ pub struct App {
 enum CacheLoadMessage {
     /// Loading complete (includes folder cache and tags)
     Complete {
-        source_id: String,
+        source_id: SourceId,
         total_files: usize,
         tags: Vec<TagInfo>,
         cache: HashMap<String, Vec<FsEntry>>,
@@ -1630,7 +1666,7 @@ pub struct CacheLoadTiming {
     /// Number of files loaded
     pub files_loaded: usize,
     /// Source ID that was loaded
-    pub source_id: String,
+    pub source_id: SourceId,
 }
 
 /// Result of background glob search
@@ -1648,7 +1684,7 @@ struct RuleBuilderSearchResult {
 }
 
 impl App {
-    async fn check_db_health_once(&mut self) {
+    fn check_db_health_once(&mut self) {
         if self.db_health_checked {
             return;
         }
@@ -1664,7 +1700,7 @@ impl App {
             }
         }
 
-        let conn = match App::open_db_readonly_with(backend, &path).await {
+        let conn = match App::open_db_readonly_with(backend, &path) {
             Some(conn) => conn,
             None => return,
         };
@@ -1683,7 +1719,7 @@ impl App {
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
                 &[],
             )
-            .await
+            
             .unwrap_or_default()
             .into_iter()
             .filter_map(|row| row.get::<String>(0).ok())
@@ -1830,7 +1866,7 @@ impl App {
         if self.discover.rule_builder.is_none() {
             let source_id = self.discover.selected_source_id
                 .as_ref()
-                .map(|id| id.as_str().to_string());
+                .map(|id| id.to_string());
             let mut builder = super::extraction::RuleBuilderState::new(source_id);
             builder.pattern = "**/*".to_string();
             self.discover.rule_builder = Some(builder);
@@ -1850,20 +1886,20 @@ impl App {
         }
     }
 
-    async fn open_db_readonly(&self) -> Option<DbConnection> {
+    fn open_db_readonly(&self) -> Option<DbConnection> {
         let (backend, path) = self.resolve_db_target();
-        Self::open_db_readonly_with(backend, &path).await
+        Self::open_db_readonly_with(backend, &path)
     }
 
-    async fn open_db_write(&self) -> Option<DbConnection> {
+    fn open_db_write(&self) -> Option<DbConnection> {
         if self.db_read_only {
             return None;
         }
         let (backend, path) = self.resolve_db_target();
-        Self::open_db_write_with(backend, &path).await
+        Self::open_db_write_with(backend, &path)
     }
 
-    async fn open_scout_db_for_writes(&self) -> Option<ScoutDatabase> {
+    fn open_scout_db_for_writes(&self) -> Option<ScoutDatabase> {
         if self.db_read_only {
             return None;
         }
@@ -1871,10 +1907,10 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        ScoutDatabase::open(&path).await.ok()
+        ScoutDatabase::open(&path).ok()
     }
 
-    async fn open_db_readonly_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
+    fn open_db_readonly_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
         if !path.exists() {
             return None;
         }
@@ -1882,7 +1918,7 @@ impl App {
         let _ = backend;
         #[cfg(feature = "duckdb")]
         {
-            DbConnection::open_duckdb_readonly(path).await.ok()
+            DbConnection::open_duckdb_readonly(path).ok()
         }
         #[cfg(not(feature = "duckdb"))]
         {
@@ -1890,7 +1926,7 @@ impl App {
         }
     }
 
-    async fn open_db_write_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
+    fn open_db_write_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
         if !path.exists() {
             return None;
         }
@@ -1898,7 +1934,7 @@ impl App {
         let _ = backend;
         #[cfg(feature = "duckdb")]
         {
-            DbConnection::open_duckdb(path).await.ok()
+            DbConnection::open_duckdb(path).ok()
         }
         #[cfg(not(feature = "duckdb"))]
         {
@@ -1906,31 +1942,31 @@ impl App {
         }
     }
 
-    async fn table_exists(conn: &DbConnection, table: &str) -> bool {
+    fn table_exists(conn: &DbConnection, table: &str) -> bool {
         let query =
             "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?"
                 .to_string();
         let params = vec![DbValue::from(table)];
 
         conn.query_optional(&query, &params)
-            .await
+            
             .map(|row| row.is_some())
             .unwrap_or(false)
     }
 
-    async fn column_exists(conn: &DbConnection, table: &str, column: &str) -> bool {
+    fn column_exists(conn: &DbConnection, table: &str, column: &str) -> bool {
         let query = "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?"
             .to_string();
         let params = vec![DbValue::from(table), DbValue::from(column)];
 
         conn.query_optional(&query, &params)
-            .await
+            
             .map(|row| row.is_some())
             .unwrap_or(false)
     }
 
     /// Handle key event
-    pub async fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent) {
         // Global keys - always active
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2922,9 +2958,8 @@ impl App {
                 // Update from cache - O(1) hashmap lookup, no SQL
                 self.update_folders_from_cache();
             }
-            KeyCode::Left | KeyCode::Backspace => {
+            KeyCode::Left => {
                 // Go back to parent folder - O(1) using cache
-                // Backspace kept for backwards compatibility
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if let Some((prev_prefix, prev_pattern)) = explorer.nav_history.pop() {
                         explorer.current_prefix = prev_prefix;
@@ -3472,7 +3507,7 @@ impl App {
                     self.discover.select_source_by_index(preview_idx);
                     // Schedule source touch for MRU ordering (processed in tick)
                     if let Some(source_id) = &self.discover.selected_source_id {
-                        self.discover.pending_source_touch = Some(source_id.as_str().to_string());
+                        self.discover.pending_source_touch = Some(source_id.clone());
                     }
                     self.discover.data_loaded = false;
                     self.discover.selected_tag = None;
@@ -3952,7 +3987,7 @@ impl App {
                 };
             }
 
-            // BackTab (Shift+Tab) cycles focus backwards
+            // BackTab (Shift+Tab) cycles focus in reverse
             KeyCode::BackTab => {
                 builder.focus = match builder.focus {
                     RuleBuilderFocus::Pattern => RuleBuilderFocus::FileList,
@@ -4071,11 +4106,21 @@ impl App {
                 }
                 if builder.can_save() {
                     let _draft = builder.to_draft();
-                    if let Some(source_id) = builder.source_id.clone() {
+                    if let Some(source_id_raw) = builder.source_id.clone() {
+                        let source_id = match SourceId::parse(&source_id_raw) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                self.discover.status_message = Some((
+                                    format!("Invalid source ID: {}", e),
+                                    true,
+                                ));
+                                return;
+                            }
+                        };
                         self.discover.pending_rule_writes.push(PendingRuleWrite {
                             pattern: builder.pattern.clone(),
                             tag: builder.tag.clone(),
-                            source_id: SourceId(source_id),
+                            source_id,
                         });
                         self.discover.status_message = Some((
                             format!("Rule '{}' saved", builder.tag),
@@ -4566,7 +4611,7 @@ impl App {
         }
 
         let source_path = expanded_path.display().to_string();
-        let source_id = format!("local:{}", source_path.replace(['/', '\\'], "_"));
+        let source_id = SourceId::new();
 
         let new_source = Source {
             id: source_id.clone(),
@@ -4579,13 +4624,13 @@ impl App {
 
         self.discover.pending_source_creates.push(new_source);
         self.discover.sources.push(SourceInfo {
-            id: SourceId::from(source_id.clone()),
+            id: source_id.clone(),
             name: source_name.clone(),
             path: std::path::PathBuf::from(&source_path),
             file_count: 0,
         });
 
-        self.discover.selected_source_id = Some(SourceId::from(source_id));
+        self.discover.selected_source_id = Some(source_id);
         self.sources_state.selected_index = self.discover.sources.len().saturating_sub(1);
 
         self.discover.status_message = Some((
@@ -4612,7 +4657,7 @@ impl App {
             .discover
             .sources
             .iter()
-            .any(|s| s.name == trimmed && s.id.as_str() != source_id.as_str())
+            .any(|s| s.name == trimmed && s.id != *source_id)
         {
             self.discover.status_message = Some((
                 format!("Source name '{}' already exists", trimmed),
@@ -4625,13 +4670,13 @@ impl App {
             .discover
             .sources
             .iter_mut()
-            .find(|s| s.id.as_str() == source_id.as_str())
+            .find(|s| s.id == *source_id)
         {
             source.name = trimmed.to_string();
         }
 
         self.discover.pending_source_updates.push(PendingSourceUpdate {
-            id: source_id.as_str().to_string(),
+            id: source_id.clone(),
             name: Some(trimmed.to_string()),
             path: None,
         });
@@ -4659,7 +4704,7 @@ impl App {
 
         let new_canon = scan_path::canonicalize_scan_path(&expanded_path);
         for source in &self.discover.sources {
-            if source.id.as_str() == source_id.as_str() {
+            if source.id == *source_id {
                 continue;
             }
             let existing_canon = scan_path::canonicalize_scan_path(&source.path);
@@ -4677,13 +4722,13 @@ impl App {
             .discover
             .sources
             .iter_mut()
-            .find(|s| s.id.as_str() == source_id.as_str())
+            .find(|s| s.id == *source_id)
         {
             source.path = std::path::PathBuf::from(&source_path);
         }
 
         self.discover.pending_source_updates.push(PendingSourceUpdate {
-            id: source_id.as_str().to_string(),
+            id: source_id.clone(),
             name: None,
             path: Some(source_path),
         });
@@ -4704,11 +4749,11 @@ impl App {
         }
 
         self.discover.pending_source_deletes.push(PendingSourceDelete {
-            id: source_id.as_str().to_string(),
+            id: source_id.clone(),
         });
         self.discover
             .sources
-            .retain(|s| s.id.as_str() != source_id.as_str());
+            .retain(|s| s.id != *source_id);
         self.discover.validate_source_selection();
 
         if self.sources_state.selected_index >= self.discover.sources.len()
@@ -4960,14 +5005,15 @@ impl App {
         // because the in-memory folder_cache only contains root-level entries
         if glob_pattern.contains("**") && !is_match_all {
             // Get source ID from glob_explorer
-            let source_id = match self.discover.glob_explorer.as_ref() {
-                Some(e) => e.cache_source_id.clone().unwrap_or_default(),
+            let source_id = match self
+                .discover
+                .glob_explorer
+                .as_ref()
+                .and_then(|e| e.cache_source_id)
+            {
+                Some(id) => id,
                 None => return,
             };
-
-            if source_id.is_empty() {
-                return; // No source loaded yet
-            }
 
             // Parse pattern for database query
             let query = super::pattern_query::PatternQuery::from_glob(&glob_pattern);
@@ -4993,18 +5039,18 @@ impl App {
 
             // Spawn async database search
             let pattern_for_msg = glob_pattern.clone();
-            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (tx, rx) = mpsc::sync_channel(1);
             self.pending_rule_builder_search = Some(rx);
 
-            tokio::spawn(async move {
-                let conn = match App::open_db_readonly_with(backend, &db_path).await {
+            std::thread::spawn(move || {
+                let conn = match App::open_db_readonly_with(backend, &db_path) {
                     Some(conn) => conn,
                     None => {
                         let _ = tx.send(RuleBuilderSearchResult {
                             folder_matches: vec![],
                             total_count: 0,
                             pattern: pattern_for_msg,
-                        }).await;
+                        });
                         return;
                     }
                 };
@@ -5017,11 +5063,9 @@ impl App {
                     })
                     .collect();
 
-                let total_count = query.count_files(&conn, &source_id).await as usize;
+                let total_count = query.count_files(&conn, source_id) as usize;
 
-                let results = query
-                    .search_files(&conn, &source_id, 1000, 0)
-                    .await;
+                let results = query.search_files(&conn, source_id, 1000, 0);
 
                 // Group by parent folder
                 let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
@@ -5059,7 +5103,7 @@ impl App {
                     folder_matches,
                     total_count,
                     pattern: pattern_for_msg,
-                }).await;
+                });
             });
 
             return;
@@ -5404,14 +5448,11 @@ impl App {
 
         // Queue rule write
         if tagged_count > 0 {
-            let source_id = self.discover.selected_source()
-                .map(|s| s.id.clone())
-                .unwrap_or_default();
-            if !source_id.is_empty() {
+            if let Some(source) = self.discover.selected_source() {
                 self.discover.pending_rule_writes.push(PendingRuleWrite {
                     pattern: pattern.to_string(),
                     tag: tag.to_string(),
-                    source_id,
+                    source_id: source.id.clone(),
                 });
             }
         }
@@ -5802,33 +5843,39 @@ impl App {
     ///
     /// Uses structure-aware sampling: buckets paths by prefix and takes N per bucket.
     fn run_sample_schema_eval(&mut self) {
-        let builder = match self.discover.rule_builder.as_ref() {
-            Some(b) => b,
+        let (source_id_raw, pattern, eval_running) = match self.discover.rule_builder.as_ref() {
+            Some(builder) => (
+                builder.source_id.clone(),
+                builder.pattern.clone(),
+                matches!(builder.eval_state, super::extraction::EvalState::Running { .. }),
+            ),
             None => return,
         };
 
-        if matches!(builder.eval_state, super::extraction::EvalState::Running { .. })
-            || self.pending_schema_eval.is_some()
-            || self.pending_sample_eval.is_some()
-        {
+        if eval_running || self.pending_schema_eval.is_some() || self.pending_sample_eval.is_some() {
             return;
         }
 
-        let source_id = match builder.source_id.as_deref() {
-            Some(id) => id.to_string(),
+        let source_id = match source_id_raw.as_deref() {
+            Some(raw) => match SourceId::parse(raw) {
+                Ok(id) => id,
+                Err(err) => {
+                    self.discover.status_message = Some((format!("Invalid source ID: {}", err), true));
+                    return;
+                }
+            },
             None => return,
         };
-        let pattern = builder.pattern.clone();
         let (backend, db_path) = self.resolve_db_target();
 
-        let (tx, rx) = mpsc::channel::<SampleEvalResult>(16);
+        let (tx, rx) = mpsc::sync_channel::<SampleEvalResult>(16);
         self.pending_sample_eval = Some(rx);
 
-        tokio::spawn(async move {
-            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+        std::thread::spawn(move || {
+            let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
                 None => {
-                    let _ = tx.send(SampleEvalResult::Error("Database error: failed to open".to_string())).await;
+                    let _ = tx.send(SampleEvalResult::Error("Database error: failed to open".to_string()));
                     return;
                 }
             };
@@ -5836,27 +5883,26 @@ impl App {
             let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
                 Ok(p) => p,
                 Err(err) => {
-                    let _ = tx.send(SampleEvalResult::Error(err)).await;
+                    let _ = tx.send(SampleEvalResult::Error(err));
                     return;
                 }
             };
             let matcher = match super::pattern_query::build_eval_matcher(&glob_pattern) {
                 Ok(m) => m,
                 Err(err) => {
-                    let _ = tx.send(SampleEvalResult::Error(err)).await;
+                    let _ = tx.send(SampleEvalResult::Error(err));
                     return;
                 }
             };
 
             let paths = super::pattern_query::sample_paths_for_eval(
                 &conn,
-                &source_id,
+                source_id,
                 &glob_pattern,
                 &matcher,
-            )
-            .await;
+            );
             if paths.is_empty() {
-                let _ = tx.send(SampleEvalResult::Error("No files to analyze".to_string())).await;
+                let _ = tx.send(SampleEvalResult::Error("No files to analyze".to_string()));
                 return;
             }
 
@@ -5870,13 +5916,13 @@ impl App {
                 naming_schemes: state.naming_schemes,
                 synonym_suggestions: state.synonym_suggestions,
                 paths_analyzed: paths.len(),
-            }).await;
+            });
         });
     }
 
     /// Start full schema evaluation as a background job.
     fn start_full_schema_eval(&mut self) {
-        let (pattern, source_id, full_eval_running) = match self.discover.rule_builder.as_ref() {
+        let (pattern, source_id_raw, full_eval_running) = match self.discover.rule_builder.as_ref() {
             Some(builder) => (
                 builder.pattern.clone(),
                 builder.source_id.clone(),
@@ -5889,9 +5935,15 @@ impl App {
             return;
         }
 
-        let source_id = match source_id.as_deref() {
-            Some(id) if !id.is_empty() => id.to_string(),
-            _ => {
+        let source_id = match source_id_raw.as_deref() {
+            Some(raw) => match SourceId::parse(raw) {
+                Ok(id) => id,
+                Err(err) => {
+                    self.discover.status_message = Some((format!("Invalid source ID: {}", err), true));
+                    return;
+                }
+            },
+            None => {
                 self.discover.status_message = Some(("No source selected".to_string(), true));
                 return;
             }
@@ -5907,19 +5959,19 @@ impl App {
         }
 
         // Channel for results
-        let (tx, rx) = mpsc::channel::<SchemaEvalResult>(16);
+        let (tx, rx) = mpsc::sync_channel::<SchemaEvalResult>(16);
         self.pending_schema_eval = Some(rx);
 
         // Spawn background task
         let (backend, db_path) = self.resolve_db_target();
 
-        tokio::spawn(async move {
-            let _ = tx.send(SchemaEvalResult::Started { job_id }).await;
+        std::thread::spawn(move || {
+            let _ = tx.send(SchemaEvalResult::Started { job_id });
 
-            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+            let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
                 None => {
-                    let _ = tx.send(SchemaEvalResult::Error("Database error: failed to open".to_string())).await;
+                    let _ = tx.send(SchemaEvalResult::Error("Database error: failed to open".to_string()));
                     return;
                 }
             };
@@ -5927,26 +5979,26 @@ impl App {
             let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
                 Ok(p) => p,
                 Err(err) => {
-                    let _ = tx.send(SchemaEvalResult::Error(err)).await;
+                    let _ = tx.send(SchemaEvalResult::Error(err));
                     return;
                 }
             };
             let matcher = match super::pattern_query::build_eval_matcher(&glob_pattern) {
                 Ok(m) => m,
                 Err(err) => {
-                    let _ = tx.send(SchemaEvalResult::Error(err)).await;
+                    let _ = tx.send(SchemaEvalResult::Error(err));
                     return;
                 }
             };
 
             let query = super::pattern_query::PatternQuery::from_glob(&glob_pattern);
-            let total_candidates = query.count_files(&conn, &source_id).await as usize;
+            let total_candidates = query.count_files(&conn, source_id) as usize;
 
             let _ = tx.send(SchemaEvalResult::Progress {
                 progress: 0,
                 paths_analyzed: 0,
                 total_paths: total_candidates,
-            }).await;
+            });
 
             let mut offset = 0usize;
             let batch_size = 1000usize;
@@ -5954,9 +6006,7 @@ impl App {
             let mut matched_paths: Vec<String> = Vec::new();
 
             loop {
-                let results = query
-                    .search_files(&conn, &source_id, batch_size, offset)
-                    .await;
+                let results = query.search_files(&conn, source_id, batch_size, offset);
 
                 if results.is_empty() {
                     break;
@@ -5981,12 +6031,12 @@ impl App {
                         progress,
                         paths_analyzed: processed,
                         total_paths: total_candidates,
-                    }).await;
+                    });
                 }
             }
 
             if matched_paths.is_empty() {
-                let _ = tx.send(SchemaEvalResult::Error("No files to analyze".to_string())).await;
+                let _ = tx.send(SchemaEvalResult::Error("No files to analyze".to_string()));
                 return;
             }
 
@@ -6001,7 +6051,7 @@ impl App {
                 naming_schemes: state.naming_schemes,
                 synonym_suggestions: state.synonym_suggestions,
                 paths_analyzed: matched_paths.len(),
-            }).await;
+            });
         });
 
         self.discover.status_message = Some((
@@ -6049,7 +6099,7 @@ impl App {
         self.discover.scan_error = None;
 
         // Channel for TUI scan results
-        let (tui_tx, tui_rx) = mpsc::channel::<TuiScanResult>(256);
+        let (tui_tx, tui_rx) = mpsc::sync_channel::<TuiScanResult>(256);
         self.pending_scan = Some(tui_rx);
 
         // Create scan job for tracking in Jobs view
@@ -6068,26 +6118,25 @@ impl App {
         let source_path = path_display;
         let scan_job_id = job_id; // Capture for async block
 
-        // Spawn async task for scanning
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             // Open database
             if let Some(parent) = db_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
 
-            let db = match ScoutDatabase::open(&db_path).await {
+            let db = match ScoutDatabase::open(&db_path) {
                 Ok(db) => db,
                 Err(e) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!("Failed to open database: {}", e))).await;
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Failed to open database: {}", e)));
                     return;
                 }
             };
 
             // Check if source with this path already exists (rescan case)
-            let existing_source = match db.get_source_by_path(&source_path).await {
+            let existing_source = match db.get_source_by_path(&source_path) {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!("Database error: {}", e))).await;
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Database error: {}", e)));
                     return;
                 }
             };
@@ -6103,17 +6152,17 @@ impl App {
                     .unwrap_or_else(|| source_path.clone());
 
                 // Check if a source with this name (but different path) already exists
-                if let Ok(Some(name_conflict)) = db.get_source_by_name(&source_name).await {
+                if let Ok(Some(name_conflict)) = db.get_source_by_name(&source_name) {
                     let _ = tui_tx.send(TuiScanResult::Error(format!(
                         "A source named '{}' already exists at '{}'. Use Sources Manager (M) to rename or delete it first.",
                         source_name, name_conflict.path
-                    ))).await;
+                    )));
                     return;
                 }
 
                 // Check for overlapping sources (parent/child relationships)
                 // This prevents duplicate file tracking and conflicting tags
-                if let Err(e) = db.check_source_overlap(std::path::Path::new(&source_path)).await {
+                if let Err(e) = db.check_source_overlap(std::path::Path::new(&source_path)) {
                     let suggestion = match &e {
                         casparian::scout::error::ScoutError::SourceIsChildOfExisting { existing_name, .. } => {
                             format!(
@@ -6132,11 +6181,12 @@ impl App {
                     let _ = tui_tx.send(TuiScanResult::Error(format!(
                         "{}\n\nSuggestion: {}",
                         e, suggestion
-                    ))).await;
+                    )));
                     return;
                 }
 
-                let source_id = format!("local:{}", source_path.replace(['/', '\\'], "_"));
+                // Create a new SourceId for the source
+                let source_id = SourceId::new();
 
                 let new_source = Source {
                     id: source_id,
@@ -6148,8 +6198,8 @@ impl App {
                 };
 
                 // Insert new source
-                if let Err(e) = db.upsert_source(&new_source).await {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!("Failed to save source: {}", e))).await;
+                if let Err(e) = db.upsert_source(&new_source) {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Failed to save source: {}", e)));
                     return;
                 }
 
@@ -6157,17 +6207,16 @@ impl App {
             };
 
             // Validation passed - notify TUI that scan is starting
-            let _ = tui_tx.send(TuiScanResult::Started { job_id: scan_job_id }).await;
+            let _ = tui_tx.send(TuiScanResult::Started { job_id: scan_job_id });
 
             // Create progress channel that sends directly to TUI
             // We wrap tui_tx in a channel adapter so scanner can use its existing interface
-            let (progress_tx, mut progress_rx) = mpsc::channel::<ScoutProgress>(512);
+            let (progress_tx, progress_rx) = mpsc::channel::<ScoutProgress>();
 
             // Spawn a task to forward progress - use spawn_blocking context awareness
             let tui_tx_progress = tui_tx.clone();
-            let forward_handle = tokio::spawn(async move {
-                while let Some(progress) = progress_rx.recv().await {
-                    // Send to TUI channel
+            let forward_handle = std::thread::spawn(move || {
+                while let Ok(progress) = progress_rx.recv() {
                     let _ = tui_tx_progress.try_send(TuiScanResult::Progress(progress));
                 }
             });
@@ -6176,46 +6225,29 @@ impl App {
             let scanner = ScoutScanner::new(db);
 
             // Run the scan in a blocking task so it doesn't block the runtime
-            let scan_result = {
-                let source_clone = source.clone();
-                tokio::task::spawn_blocking(move || {
-                    // Create a multi-threaded runtime for the blocking task
-                    // CRITICAL: Scanner uses tokio::spawn internally for concurrent persist task.
-                    // A current-thread runtime causes deadlock because the persist task can't
-                    // run concurrently with the walker's blocking_send().
-                    let rt = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(2) // Minimum for concurrent walker + persist
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    rt.block_on(scanner.scan(&source_clone, Some(progress_tx), None))
-                }).await
-            };
+            let scan_result = scanner.scan(&source, Some(progress_tx), None);
+            drop(scanner);
 
-            // Wait for forwarding to complete
-            let _ = forward_handle.await;
+            let _ = forward_handle.join();
 
             match scan_result {
-                Ok(Ok(result)) => {
+                Ok(result) => {
                     let persisted = result.stats.files_persisted as usize;
                     let discovered = result.stats.files_discovered as usize;
                     if persisted == 0 && discovered > 0 {
                         let _ = tui_tx.send(TuiScanResult::Error(
                             "Scan completed but no files were persisted. Check database health or locks.".to_string(),
-                        )).await;
+                        ));
                         return;
                     }
                     // Scan complete - TUI will load files from DB
                     let _ = tui_tx.send(TuiScanResult::Complete {
                         source_path,
                         files_persisted: persisted,
-                    }).await;
-                }
-                Ok(Err(e)) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!("Scan failed: {}", e))).await;
+                    });
                 }
                 Err(e) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!("Scan task panicked: {}", e))).await;
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Scan failed: {}", e)));
                 }
             }
         });
@@ -6324,7 +6356,7 @@ impl App {
     /// Files are filtered by the currently selected source. If no source is
     /// selected, the file list will be empty with a helpful message.
     /// When sources dropdown is open, uses preview_source for live preview.
-    async fn load_scout_files(&mut self) {
+    fn load_scout_files(&mut self) {
         // First check if we have a directly-set source ID (e.g., after scan completion)
         // This handles the case where sources list hasn't loaded yet
         let selected_source_id = if let Some(ref id) = self.discover.selected_source_id {
@@ -6354,7 +6386,7 @@ impl App {
             }
         };
 
-        let conn = match self.open_db_readonly().await {
+        let conn = match self.open_db_readonly() {
             Some(conn) => conn,
             None => {
                 self.discover.scan_error = Some("No Scout database found. Press 's' to scan a folder.".to_string());
@@ -6371,7 +6403,7 @@ impl App {
             LIMIT 1000
         "#;
 
-        let rows = match conn.query_all(query, &[DbValue::Text(selected_source_id.as_str().to_string())]).await {
+        let rows = match conn.query_all(query, &[DbValue::Integer(selected_source_id.as_i64())]) {
             Ok(rows) => rows,
             Err(e) => {
                 self.discover.scan_error = Some(format!("Query failed: {}", e));
@@ -6462,6 +6494,8 @@ impl App {
             None => return,
         };
 
+        let source_id_str = source_id.to_string();
+
         // Skip if already loading
         if self.pending_cache_load.is_some() {
             return;
@@ -6471,7 +6505,7 @@ impl App {
         if let Some(ref explorer) = self.discover.glob_explorer {
             if explorer.cache_loaded {
                 if let Some(ref cache_source) = explorer.cache_source_id {
-                    if cache_source == source_id.as_str() {
+                    if *cache_source == source_id {
                         // Cache already loaded for this source, no reload needed
                         self.discover.data_loaded = true;
                         return;
@@ -6491,8 +6525,6 @@ impl App {
             return;
         }
 
-        let source_id_str = source_id.as_str().to_string();
-
         // Get source name for progress display
         let source_name = self.discover.sources
             .iter()
@@ -6501,36 +6533,36 @@ impl App {
             .unwrap_or_else(|| source_id_str.clone());
 
         // Set up channel and progress tracking
-        let (tx, rx) = mpsc::channel::<CacheLoadMessage>(1);
+        let (tx, rx) = mpsc::sync_channel::<CacheLoadMessage>(1);
         self.pending_cache_load = Some(rx);
         self.cache_load_progress = Some(CacheLoadProgress::new(source_name));
 
         // Initialize empty cache in explorer
         if let Some(ref mut explorer) = self.discover.glob_explorer {
             explorer.folder_cache = HashMap::new();
-            explorer.cache_source_id = Some(source_id_str.clone());
+            explorer.cache_source_id = Some(source_id);
         }
 
         let (backend, db_path) = self.resolve_db_target();
 
         // Spawn background task for database queries (live folder derivation)
-        tokio::spawn(async move {
-            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+        std::thread::spawn(move || {
+            let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
                 None => {
                     let _ = tx.send(CacheLoadMessage::Error(
                         "Database error: failed to open".to_string()
-                    )).await;
+                    ));
                     return;
                 }
             };
 
-            let root_folders = match App::query_folder_counts(&conn, &source_id_str, "", None).await {
+            let root_folders = match App::query_folder_counts(&conn, source_id, "", None) {
                 Ok(folders) => folders,
                 Err(e) => {
                     let _ = tx.send(CacheLoadMessage::Error(
                         format!("Query error: {}", e)
-                    )).await;
+                    ));
                     return;
                 }
             };
@@ -6545,18 +6577,18 @@ impl App {
 
             let total_files: usize = conn.query_scalar::<i64>(
                 "SELECT file_count FROM scout_sources WHERE id = ?",
-                &[DbValue::Text(source_id_str.clone())],
-            ).await.unwrap_or(0) as usize;
+                &[DbValue::Integer(source_id.as_i64())],
+            ).unwrap_or(0) as usize;
 
             let tag_rows = conn.query_all(
                 "SELECT tag, COUNT(*) as count FROM scout_files WHERE source_id = ? AND tag IS NOT NULL GROUP BY tag ORDER BY count DESC, tag",
-                &[DbValue::Text(source_id_str.clone())],
-            ).await.unwrap_or_default();
+                &[DbValue::Integer(source_id.as_i64())],
+            ).unwrap_or_default();
 
             let untagged_count: i64 = conn.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND tag IS NULL",
-                &[DbValue::Text(source_id_str.clone())],
-            ).await.unwrap_or(0);
+                &[DbValue::Integer(source_id.as_i64())],
+            ).unwrap_or(0);
 
             // Build tags list
             let mut tags: Vec<TagInfo> = Vec::new();
@@ -6589,11 +6621,11 @@ impl App {
             }
 
             let _ = tx.send(CacheLoadMessage::Complete {
-                source_id: source_id_str,
+                source_id,
                 total_files,
                 tags,
                 cache,
-            }).await;
+            });
         });
     }
 }
@@ -6663,7 +6695,10 @@ impl App {
                 let pattern_for_search = pattern.clone();
 
                 // Get source ID for query
-                let source_id = explorer.cache_source_id.clone().unwrap_or_default();
+                let source_id = match explorer.cache_source_id {
+                    Some(id) => id,
+                    None => return,
+                };
 
                 // Show loading indicator immediately
                 let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
@@ -6672,25 +6707,25 @@ impl App {
                 let (backend, db_path) = self.resolve_db_target();
 
                 // Spawn async task for database query
-                let (tx, rx) = mpsc::channel(1);
+                let (tx, rx) = mpsc::sync_channel(1);
                 self.pending_glob_search = Some(rx);
 
-                tokio::spawn(async move {
-                    let conn = match App::open_db_readonly_with(backend, &db_path).await {
+                std::thread::spawn(move || {
+                    let conn = match App::open_db_readonly_with(backend, &db_path) {
                         Some(conn) => conn,
                         None => {
                             let _ = tx.send(GlobSearchResult {
                                 folders: vec![],
                                 total_count: 0,
                                 pattern: pattern_for_search,
-                            }).await;
+                            });
                             return;
                         }
                     };
 
-                    let count = query.count_files(&conn, &source_id).await;
+                    let count = query.count_files(&conn, source_id);
 
-                    let results = query.search_files(&conn, &source_id, 100, 0).await;
+                    let results = query.search_files(&conn, source_id, 100, 0);
 
                     // Convert to FsEntry for display
                     let folders: Vec<FsEntry> = results.into_iter()
@@ -6703,7 +6738,7 @@ impl App {
                         folders,
                         total_count: count as usize,
                         pattern: pattern_for_search,
-                    }).await;
+                    });
                 });
 
                 return;
@@ -6760,32 +6795,32 @@ impl App {
     }
 
     /// Start an async database query for a folder prefix
-    fn start_folder_query(&mut self, source_id: String, prefix: String, glob_pattern: String) {
+    fn start_folder_query(&mut self, source_id: SourceId, prefix: String, glob_pattern: String) {
         // Skip if already loading
         if self.pending_folder_query.is_some() {
             return;
         }
 
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::sync_channel(1);
         self.pending_folder_query = Some(rx);
 
         let glob_opt = if glob_pattern.is_empty() { None } else { Some(glob_pattern) };
 
         let (backend, db_path) = self.resolve_db_target();
 
-        tokio::spawn(async move {
-            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+        std::thread::spawn(move || {
+            let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
                 None => {
-                    let _ = tx.send(FolderQueryMessage::Error("Database error: failed to open".to_string())).await;
+                    let _ = tx.send(FolderQueryMessage::Error("Database error: failed to open".to_string()));
                     return;
                 }
             };
 
-            let rows = match App::query_folder_counts(&conn, &source_id, &prefix, glob_opt.as_deref()).await {
+            let rows = match App::query_folder_counts(&conn, source_id, &prefix, glob_opt.as_deref()) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(FolderQueryMessage::Error(format!("Query error: {}", e))).await;
+                    let _ = tx.send(FolderQueryMessage::Error(format!("Query error: {}", e)));
                     return;
                 }
             };
@@ -6801,7 +6836,7 @@ impl App {
                 prefix,
                 folders,
                 total_count,
-            }).await;
+            });
         });
     }
 
@@ -6854,9 +6889,9 @@ impl App {
         result
     }
 
-    async fn query_folder_counts(
+    fn query_folder_counts(
         conn: &DbConnection,
-        source_id: &str,
+        source_id: SourceId,
         prefix: &str,
         glob_pattern: Option<&str>,
     ) -> Result<Vec<(String, i64, bool)>, casparian_db::BackendError> {
@@ -6896,12 +6931,12 @@ impl App {
                     DbValue::Integer(prefix_len),
                     DbValue::Integer(prefix_len),
                     DbValue::Integer(prefix_len),
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(path_filter),
                     DbValue::Text(like_pattern),
                     DbValue::Integer(prefix_len),
                 ],
-            ).await?;
+            )?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -6920,10 +6955,10 @@ impl App {
             let cached_rows = conn.query_all(
                 "SELECT name, file_count, is_folder FROM scout_folders WHERE source_id = ? AND prefix = ? ORDER BY is_folder DESC, file_count DESC, name",
                 &[
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(prefix.to_string()),
                 ],
-            ).await?;
+            )?;
 
             if !cached_rows.is_empty() {
                 let mut results = Vec::new();
@@ -6940,10 +6975,10 @@ impl App {
         let files = conn.query_all(
             "SELECT name, size FROM scout_files WHERE source_id = ? AND parent_path = ? ORDER BY name LIMIT 200",
             &[
-                DbValue::Text(source_id.to_string()),
+                DbValue::Integer(source_id.as_i64()),
                 DbValue::Text(prefix.to_string()),
             ],
-        ).await?;
+        )?;
 
         let mut results: Vec<(String, i64, bool)> = Vec::new();
 
@@ -6962,8 +6997,8 @@ impl App {
                 ORDER BY file_count DESC
                 LIMIT 200
                 "#,
-                &[DbValue::Text(source_id.to_string())],
-            ).await?
+                &[DbValue::Integer(source_id.as_i64())],
+            )?
         } else {
             let folder_prefix = format!("{}/", prefix);
             conn.query_all(
@@ -6986,11 +7021,11 @@ impl App {
                     DbValue::Text(folder_prefix.clone()),
                     DbValue::Text(folder_prefix.clone()),
                     DbValue::Text(folder_prefix.clone()),
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(folder_prefix.clone()),
                     DbValue::Text(prefix.to_string()),
                 ],
-            ).await?
+            )?
         };
 
         for row in subfolders {
@@ -7024,12 +7059,12 @@ impl App {
             return;
         }
 
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::sync_channel(1);
         self.pending_sources_load = Some(rx);
 
         // Spawn background task for DB query
-        tokio::spawn(async move {
-            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+        std::thread::spawn(move || {
+            let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
                 None => return,
             };
@@ -7042,12 +7077,16 @@ impl App {
                 ORDER BY updated_at DESC
             "#;
 
-            if let Ok(rows) = conn.query_all(query, &[]).await {
+            if let Ok(rows) = conn.query_all(query, &[]) {
                 let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let id: String = match row.get(0) {
+                    let id_raw: String = match row.get(0) {
                         Ok(v) => v,
                         Err(_) => return,
+                    };
+                    let id = match SourceId::try_from(id_raw) {
+                        Ok(v) => v,
+                        Err(_) => continue,
                     };
                     let name: String = match row.get(1) {
                         Ok(v) => v,
@@ -7063,14 +7102,14 @@ impl App {
                     };
 
                     sources.push(SourceInfo {
-                        id: SourceId::from(id),
+                        id,
                         name,
                         path: std::path::PathBuf::from(path),
                         file_count: file_count as usize,
                     });
                 }
 
-                let _ = tx.send(sources).await;
+                let _ = tx.send(sources);
             }
         });
     }
@@ -7089,20 +7128,20 @@ impl App {
             return;
         }
 
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::sync_channel(1);
         self.pending_jobs_load = Some(rx);
 
         // Spawn background task for DB query
-        tokio::spawn(async move {
-            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+        std::thread::spawn(move || {
+            let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
                 None => return,
             };
 
-            let has_pipeline_runs = App::table_exists(&conn, "cf_pipeline_runs").await;
+            let has_pipeline_runs = App::table_exists(&conn, "cf_pipeline_runs");
             let has_quarantine_column =
-                App::column_exists(&conn, "cf_processing_queue", "quarantine_rows").await;
-            let has_quarantine_table = App::table_exists(&conn, "cf_quarantine").await;
+                App::column_exists(&conn, "cf_processing_queue", "quarantine_rows");
+            let has_quarantine_table = App::table_exists(&conn, "cf_quarantine");
 
             let (quarantine_select, quarantine_join) = if has_quarantine_column {
                 ("q.quarantine_rows", "")
@@ -7133,6 +7172,7 @@ impl App {
                     q.end_time,
                     q.result_summary,
                     q.error_message,
+                    q.completion_status,
                     q.pipeline_run_id,
                     pr.logical_date,
                     pr.selection_snapshot_hash,
@@ -7142,21 +7182,26 @@ impl App {
                 {quarantine_join}
                 ORDER BY
                     CASE q.status
-                        WHEN 'RUNNING' THEN 1
-                        WHEN 'QUEUED' THEN 2
-                        WHEN 'FAILED' THEN 3
-                        WHEN 'CANCELLED' THEN 4
-                        WHEN 'ABORTED' THEN 4
-                        WHEN 'PARTIAL_SUCCESS' THEN 5
-                        WHEN 'COMPLETED_WITH_WARNINGS' THEN 5
-                        WHEN 'SUCCESS' THEN 6
-                        WHEN 'COMPLETED' THEN 6
+                        WHEN '{running}' THEN 1
+                        WHEN '{staged}' THEN 1
+                        WHEN '{queued}' THEN 2
+                        WHEN '{pending}' THEN 2
+                        WHEN '{failed}' THEN 3
+                        WHEN '{completed}' THEN 4
+                        WHEN '{skipped}' THEN 5
                     END,
                     q.id DESC
                 LIMIT 100
                 "#,
                     quarantine_select = quarantine_select,
-                    quarantine_join = quarantine_join
+                    quarantine_join = quarantine_join,
+                    running = ProcessingStatus::Running.as_str(),
+                    staged = ProcessingStatus::Staged.as_str(),
+                    queued = ProcessingStatus::Queued.as_str(),
+                    pending = ProcessingStatus::Pending.as_str(),
+                    failed = ProcessingStatus::Failed.as_str(),
+                    completed = ProcessingStatus::Completed.as_str(),
+                    skipped = ProcessingStatus::Skipped.as_str(),
                 )
             } else {
                 format!(
@@ -7170,30 +7215,36 @@ impl App {
                     q.end_time,
                     q.result_summary,
                     q.error_message,
+                    q.completion_status,
                     {quarantine_select}
                 FROM cf_processing_queue q
                 {quarantine_join}
                 ORDER BY
                     CASE q.status
-                        WHEN 'RUNNING' THEN 1
-                        WHEN 'QUEUED' THEN 2
-                        WHEN 'FAILED' THEN 3
-                        WHEN 'CANCELLED' THEN 4
-                        WHEN 'ABORTED' THEN 4
-                        WHEN 'PARTIAL_SUCCESS' THEN 5
-                        WHEN 'COMPLETED_WITH_WARNINGS' THEN 5
-                        WHEN 'SUCCESS' THEN 6
-                        WHEN 'COMPLETED' THEN 6
+                        WHEN '{running}' THEN 1
+                        WHEN '{staged}' THEN 1
+                        WHEN '{queued}' THEN 2
+                        WHEN '{pending}' THEN 2
+                        WHEN '{failed}' THEN 3
+                        WHEN '{completed}' THEN 4
+                        WHEN '{skipped}' THEN 5
                     END,
                     q.id DESC
                 LIMIT 100
                 "#,
                     quarantine_select = quarantine_select,
-                    quarantine_join = quarantine_join
+                    quarantine_join = quarantine_join,
+                    running = ProcessingStatus::Running.as_str(),
+                    staged = ProcessingStatus::Staged.as_str(),
+                    queued = ProcessingStatus::Queued.as_str(),
+                    pending = ProcessingStatus::Pending.as_str(),
+                    failed = ProcessingStatus::Failed.as_str(),
+                    completed = ProcessingStatus::Completed.as_str(),
+                    skipped = ProcessingStatus::Skipped.as_str(),
                 )
             };
 
-            let rows = match conn.query_all(&query, &[]).await {
+            let rows = match conn.query_all(&query, &[]) {
                 Ok(rows) => rows,
                 Err(_) => return,
             };
@@ -7233,27 +7284,21 @@ impl App {
                         Ok(v) => v,
                         Err(_) => return,
                     };
+                    let completion_status: Option<String> = row.get(8).ok().flatten();
                     let (pipeline_run_id, logical_date, selection_snapshot_hash, quarantine_rows) =
                         if has_pipeline_runs {
                             (
-                                row.get(8).ok(),
                                 row.get(9).ok(),
                                 row.get(10).ok(),
                                 row.get(11).ok(),
+                                row.get(12).ok(),
                             )
                         } else {
-                            (None, None, None, row.get(8).ok())
+                            (None, None, None, row.get(9).ok())
                         };
 
-                    let status = match status_str.as_str() {
-                        "RUNNING" => JobStatus::Running,
-                        "QUEUED" | "PENDING" => JobStatus::Pending,
-                        "COMPLETED" | "SUCCESS" => JobStatus::Completed,
-                        "PARTIAL_SUCCESS" | "COMPLETED_WITH_WARNINGS" => JobStatus::PartialSuccess,
-                        "FAILED" => JobStatus::Failed,
-                        "CANCELLED" | "ABORTED" => JobStatus::Cancelled,
-                        _ => JobStatus::Pending,
-                    };
+                    // Map queue status + completion_status to UI status
+                    let status = JobStatus::from_db_status(&status_str, completion_status.as_deref());
 
                     let started_at = claim_time
                         .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
@@ -7297,7 +7342,7 @@ impl App {
                     });
                 }
 
-                let _ = tx.send(jobs).await;
+                let _ = tx.send(jobs);
             }
         });
     }
@@ -7342,33 +7387,33 @@ impl App {
             return;
         }
 
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::sync_channel(1);
         self.pending_stats_load = Some(rx);
 
         // Spawn background task for DB query
-        tokio::spawn(async move {
-            let conn = match App::open_db_readonly_with(backend, &db_path).await {
+        std::thread::spawn(move || {
+            let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
                 None => return,
             };
 
             let mut stats = HomeStats::default();
 
-            if let Ok(count) = conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_files", &[]).await {
+            if let Ok(count) = conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_files", &[]) {
                 stats.file_count = count as usize;
             }
 
             if let Ok(count) = conn.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM scout_sources WHERE enabled = 1",
                 &[],
-            ).await {
+            ) {
                 stats.source_count = count as usize;
             }
 
             if let Ok(rows) = conn.query_all(
                 "SELECT status, COUNT(*) as cnt FROM cf_processing_queue GROUP BY status",
                 &[],
-            ).await {
+            ) {
                 for row in rows {
                     let status: String = match row.get(0) {
                         Ok(v) => v,
@@ -7378,11 +7423,13 @@ impl App {
                         Ok(v) => v,
                         Err(_) => return,
                     };
-                    match status.as_str() {
-                        "RUNNING" => stats.running_jobs = count as usize,
-                        "QUEUED" => stats.pending_jobs = count as usize,
-                        "FAILED" => stats.failed_jobs = count as usize,
-                        _ => {}
+                    if let Ok(queue_status) = status.parse::<ProcessingStatus>() {
+                        match queue_status {
+                            ProcessingStatus::Running => stats.running_jobs = count as usize,
+                            ProcessingStatus::Queued => stats.pending_jobs = count as usize,
+                            ProcessingStatus::Failed => stats.failed_jobs = count as usize,
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -7390,16 +7437,16 @@ impl App {
             if let Ok(count) = conn.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM cf_plugin_manifest",
                 &[],
-            ).await {
+            ) {
                 stats.parser_count = count as usize;
             }
 
-            let _ = tx.send(stats).await;
+            let _ = tx.send(stats);
         });
     }
 
     /// Persist pending writes to the database
-    async fn persist_pending_writes(&mut self) {
+    fn persist_pending_writes(&mut self) {
         if self.db_read_only {
             return;
         }
@@ -7415,7 +7462,7 @@ impl App {
             return;
         }
 
-        let db = match self.open_scout_db_for_writes().await {
+        let db = match self.open_scout_db_for_writes() {
             Some(db) => db,
             None => return,
         };
@@ -7430,13 +7477,13 @@ impl App {
                     DbValue::Text(write.tag),
                     DbValue::Text(write.file_path),
                 ],
-            ).await;
+            );
         }
 
         // Persist rules to scout_tagging_rules
         let rule_writes = std::mem::take(&mut self.discover.pending_rule_writes);
         for write in rule_writes {
-            let rule_id = uuid::Uuid::new_v4().to_string();
+            let rule_id = TaggingRuleId::new();
             let rule_name = format!("{} → {}", write.pattern, write.tag);
             let now = chrono::Utc::now().timestamp();
 
@@ -7446,15 +7493,15 @@ impl App {
                    VALUES (?, ?, ?, ?, ?, 100, 1, ?, ?)"#
                 ,
                 &[
-                    DbValue::Text(rule_id),
+                    DbValue::Integer(rule_id.as_i64()),
                     DbValue::Text(rule_name),
-                    DbValue::Text(write.source_id.as_str().to_string()),
+                    DbValue::Integer(write.source_id.as_i64()),
                     DbValue::Text(write.pattern),
                     DbValue::Text(write.tag),
                     DbValue::Integer(now),
                     DbValue::Integer(now),
                 ],
-            ).await;
+            );
         }
 
         // Persist rule enabled toggles
@@ -7464,9 +7511,9 @@ impl App {
                 "UPDATE scout_tagging_rules SET enabled = ? WHERE id = ?",
                 &[
                     DbValue::Integer(if update.enabled { 1 } else { 0 }),
-                    DbValue::Text(update.id),
+                    DbValue::Integer(update.id.as_i64()),
                 ],
-            ).await;
+            );
         }
 
         // Persist rule deletes
@@ -7474,8 +7521,8 @@ impl App {
         for delete in rule_deletes {
             let _ = conn.execute(
                 "DELETE FROM scout_tagging_rules WHERE id = ?",
-                &[DbValue::Text(delete.id)],
-            ).await;
+                &[DbValue::Integer(delete.id.as_i64())],
+            );
         }
 
         let mut sources_changed = false;
@@ -7483,7 +7530,7 @@ impl App {
         // Persist source creates
         let source_creates = std::mem::take(&mut self.discover.pending_source_creates);
         for source in source_creates {
-            if db.upsert_source(&source).await.is_ok() {
+            if db.upsert_source(&source).is_ok() {
                 sources_changed = true;
             }
         }
@@ -7491,14 +7538,14 @@ impl App {
         // Persist source updates
         let source_updates = std::mem::take(&mut self.discover.pending_source_updates);
         for update in source_updates {
-            if let Ok(Some(mut source)) = db.get_source(&update.id).await {
+            if let Ok(Some(mut source)) = db.get_source(&update.id) {
                 if let Some(name) = update.name {
                     source.name = name;
                 }
                 if let Some(path) = update.path {
                     source.path = path;
                 }
-                if db.upsert_source(&source).await.is_ok() {
+                if db.upsert_source(&source).is_ok() {
                     sources_changed = true;
                 }
             }
@@ -7507,7 +7554,7 @@ impl App {
         // Persist source deletes
         let source_deletes = std::mem::take(&mut self.discover.pending_source_deletes);
         for delete in source_deletes {
-            if db.delete_source(&delete.id).await.unwrap_or(false) {
+            if db.delete_source(&delete.id).unwrap_or(false) {
                 sources_changed = true;
             }
         }
@@ -7519,9 +7566,9 @@ impl App {
                 "UPDATE scout_sources SET updated_at = ? WHERE id = ?",
                 &[
                     DbValue::Integer(now),
-                    DbValue::Text(source_id.clone()),
+                    DbValue::Integer(source_id.as_i64()),
                 ],
-            ).await;
+            );
             // Trigger sources reload to reflect new MRU ordering
             if result.is_ok() {
                 self.discover.sources_loaded = false;
@@ -7537,7 +7584,7 @@ impl App {
     }
 
     /// Load tagging rules for the Rules Manager dialog
-    async fn load_rules_for_manager(&mut self) {
+    fn load_rules_for_manager(&mut self) {
         // Get source ID for selected source
         let source_id = match self.discover.sources.get(self.discover.selected_source_index()) {
             Some(source) => source.id.clone(),
@@ -7547,7 +7594,7 @@ impl App {
             }
         };
 
-        let conn = match self.open_db_readonly().await {
+        let conn = match self.open_db_readonly() {
             Some(conn) => conn,
             None => return,
         };
@@ -7559,16 +7606,20 @@ impl App {
             ORDER BY priority DESC, pattern
         "#;
 
-        let rows = match conn.query_all(query, &[DbValue::Text(source_id.as_str().to_string())]).await {
+        let rows = match conn.query_all(query, &[DbValue::Integer(source_id.as_i64())]) {
             Ok(rows) => rows,
             Err(_) => return,
         };
 
         let mut rules: Vec<RuleInfo> = Vec::with_capacity(rows.len());
         for row in rows {
-            let id: String = match row.get(0) {
+            let id_raw: i64 = match row.get(0) {
                 Ok(v) => v,
                 Err(_) => return,
+            };
+            let id = match TaggingRuleId::try_from(id_raw) {
+                Ok(v) => v,
+                Err(_) => continue,
             };
             let pattern: String = match row.get(1) {
                 Ok(v) => v,
@@ -7666,10 +7717,9 @@ impl App {
             // Enter: Start scan job for selected source
             KeyCode::Enter => {
                 if source_count > 0 && self.home.selected_source_index < self.discover.sources.len() {
-                    // Get the selected source and trigger a scan
-                    let source = &self.discover.sources[self.home.selected_source_index];
-                    let source_id = source.id.clone();
-                    self.start_scan_for_source(&source_id.0);
+                    // Clone the source_id to avoid borrow conflict
+                    let source_id = self.discover.sources[self.home.selected_source_index].id;
+                    self.start_scan_for_source(source_id);
                 }
             }
             // /: Filter sources
@@ -7690,12 +7740,12 @@ impl App {
     }
 
     /// Start a scan job for the given source (called from Home)
-    fn start_scan_for_source(&mut self, source_id: &str) {
+    fn start_scan_for_source(&mut self, source_id: SourceId) {
         let path = self
             .discover
             .sources
             .iter()
-            .find(|s| s.id.as_str() == source_id)
+            .find(|s| s.id == source_id)
             .map(|s| s.path.display().to_string());
 
         if let Some(path) = path {
@@ -7815,9 +7865,9 @@ impl App {
             // r: Rescan source
             KeyCode::Char('r') => {
                 if source_count > 0 && self.sources_state.selected_index < source_count {
-                    let source = &self.discover.sources[self.sources_state.selected_index];
-                    let source_id = source.id.0.clone();
-                    self.start_scan_for_source(&source_id);
+                    // Clone the source_id to avoid borrow conflict
+                    let source_id = self.discover.sources[self.sources_state.selected_index].id;
+                    self.start_scan_for_source(source_id);
                 }
             }
             // d: Delete source (with confirmation)
@@ -8200,14 +8250,14 @@ impl App {
     }
 
     /// Periodic tick for updates
-    pub async fn tick(&mut self) {
+    pub fn tick(&mut self) {
         // Increment tick counter for animated UI elements
         self.tick_count = self.tick_count.wrapping_add(1);
 
-        self.check_db_health_once().await;
+        self.check_db_health_once();
 
         // Persist any queued writes regardless of current view.
-        self.persist_pending_writes().await;
+        self.persist_pending_writes();
 
         // Preload sources on startup (any mode) so they're ready when user goes to Discover
         // This prevents "no sources" on first open
@@ -8228,10 +8278,10 @@ impl App {
                     self.home.stats_loaded = true;
                     self.pending_stats_load = None;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // Still loading - that's fine
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     // Channel closed, mark as loaded (keep default stats)
                     self.home.stats_loaded = true;
                     self.pending_stats_load = None;
@@ -8261,8 +8311,9 @@ impl App {
                     if let (Some(ref mut builder), Some(ref source_id)) =
                         (self.discover.rule_builder.as_mut(), self.discover.selected_source_id.as_ref())
                     {
-                        if builder.source_id.as_deref() != Some(source_id.as_str()) {
-                            builder.source_id = Some(source_id.as_str().to_string());
+                        let source_id_str = source_id.to_string();
+                        if builder.source_id.as_deref() != Some(source_id_str.as_str()) {
+                            builder.source_id = Some(source_id_str);
                         }
                     }
                     if self.mode == TuiMode::Discover
@@ -8279,10 +8330,10 @@ impl App {
                     }
                     self.pending_sources_load = None;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // Still loading - that's fine
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     // Channel closed, mark as loaded (empty sources)
                     self.discover.sources_loaded = true;
                     self.pending_sources_load = None;
@@ -8327,10 +8378,10 @@ impl App {
                     self.update_home_recent_jobs();
                     self.pending_jobs_load = None;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // Still loading - that's fine
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     // Channel closed, mark as loaded (empty jobs)
                     self.jobs_state.jobs_loaded = true;
                     self.pending_jobs_load = None;
@@ -8393,7 +8444,7 @@ impl App {
                     // else: stale result, discard it
                     self.pending_glob_search = None;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // Still searching - update spinner
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
                         if explorer.folders.len() == 1 {
@@ -8406,7 +8457,7 @@ impl App {
                         }
                     }
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_glob_search = None;
                 }
             }
@@ -8443,10 +8494,10 @@ impl App {
                     // else: stale result, discard it
                     self.pending_rule_builder_search = None;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // Still searching - spinner is shown via builder.streaming flag
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_rule_builder_search = None;
                     if let Some(ref mut builder) = self.discover.rule_builder {
                         builder.is_streaming = false;
@@ -8523,10 +8574,10 @@ impl App {
                     self.pending_schema_eval = None;
                     self.discover.status_message = Some((format!("Schema eval failed: {}", err), true));
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // Still running - that's fine
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     // Channel closed unexpectedly
                     if let Some(ref mut builder) = self.discover.rule_builder {
                         builder.eval_state = super::extraction::EvalState::Idle;
@@ -8569,8 +8620,8 @@ impl App {
                     self.discover.status_message = Some((format!("Sample eval failed: {}", err), true));
                     self.pending_sample_eval = None;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_sample_eval = None;
                 }
             }
@@ -8636,10 +8687,10 @@ impl App {
                         explorer.folders.clear();
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // No message yet - still loading
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_cache_load = None;
                     self.cache_load_progress = None;
                 }
@@ -8673,7 +8724,7 @@ impl App {
                     }
                     self.pending_folder_query = None;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     // Still loading - update spinner
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
                         if explorer.folders.len() == 1 {
@@ -8691,7 +8742,7 @@ impl App {
                         }
                     }
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_folder_query = None;
                 }
             }
@@ -8713,13 +8764,13 @@ impl App {
                 if self.discover.rule_builder.is_none() && self.discover.view_state == DiscoverViewState::RuleBuilder {
                     let source_id = self.discover.selected_source_id
                         .as_ref()
-                        .map(|id| id.as_str().to_string());
+                        .map(|id| id.to_string());
                     let mut builder = super::extraction::RuleBuilderState::new(source_id);
                     builder.pattern = "**/*".to_string();
                     self.discover.rule_builder = Some(builder);
                 }
                 if self.discover.files.is_empty() {
-                    self.load_scout_files().await;
+                    self.load_scout_files();
                 }
 
                 // Check if cache is still loading (not yet loaded)
@@ -8761,7 +8812,7 @@ impl App {
             }
             // Load rules for Rules Manager if it's open
             if self.discover.view_state == DiscoverViewState::RulesManager && self.discover.rules.is_empty() {
-                self.load_rules_for_manager().await;
+                self.load_rules_for_manager();
             }
         }
 
@@ -8817,26 +8868,36 @@ impl App {
                                 // Use accurate count from scanner (not stale progress update)
                                 let final_file_count = files_persisted;
 
-                                // Generate source ID matching scanner's format
-                                let source_id = SourceId(format!(
-                                    "local:{}",
-                                    source_path.replace('/', "_").replace('\\', "_")
-                                ));
+                                let source_id = match self.open_scout_db_for_writes() {
+                                    Some(db) => match db.get_source_by_path(&source_path) {
+                                        Ok(Some(source)) => Some(source.id),
+                                        Ok(None) => None,
+                                        Err(_) => None,
+                                    },
+                                    None => None,
+                                };
 
                                 // Trigger sources reload (non-blocking, handled by tick())
                                 self.discover.sources_loaded = false;
                                 self.start_sources_load();
 
-                                // Select the newly scanned source
-                                self.discover.selected_source_id = Some(source_id.clone());
+                                if let Some(source_id) = source_id {
+                                    // Select the newly scanned source
+                                    self.discover.selected_source_id = Some(source_id);
 
-                                // Update rule builder with new source
-                                if let Some(ref mut builder) = self.discover.rule_builder {
-                                    builder.source_id = Some(source_id.as_str().to_string());
+                                    // Update rule builder with new source
+                                    if let Some(ref mut builder) = self.discover.rule_builder {
+                                        builder.source_id = Some(source_id.to_string());
+                                    }
+
+                                    // Load files for the new source (this sets data_loaded = true)
+                                    self.load_scout_files();
+                                } else {
+                                    self.discover.status_message = Some((
+                                        "Scan completed but source was not found".to_string(),
+                                        true,
+                                    ));
                                 }
-
-                                // Load files for the new source (this sets data_loaded = true)
-                                self.load_scout_files().await;
 
                                 // Reset cache state to force reload for the new source
                                 // IMPORTANT: Must be AFTER load_scout_files() because it sets data_loaded=true
@@ -8891,8 +8952,8 @@ impl App {
                             }
                         }
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
                         // Task ended without completion - mark job as failed
                         if let Some(job_id) = self.current_scan_job_id {
                             self.update_scan_job_status(
@@ -9186,6 +9247,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn test_args() -> TuiArgs {
         TuiArgs {
@@ -9202,45 +9264,27 @@ mod tests {
         assert!(matches!(app.mode, TuiMode::Home));
 
         // Key '1' should switch to Discover (per spec)
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::Discover));
 
         // In Discover mode, '2' controls panel focus (not view navigation)
         // So we need to go Home first with '0', then use '2'
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::Home));
 
         // Now '2' should switch to Parser Bench
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::ParserBench));
 
         // Return Home, then use 'P' to switch to Parser Bench
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::Home));
 
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::ParserBench));
 
         // Key '0' should return to Home (per spec)
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::Home));
     }
 
@@ -9250,13 +9294,13 @@ mod tests {
         // Add some test sources
         app.discover.sources = vec![
             SourceInfo {
-                id: SourceId("src1".to_string()),
+                id: SourceId::new(),
                 name: "Source 1".to_string(),
                 path: std::path::PathBuf::from("/test/source1"),
                 file_count: 10,
             },
             SourceInfo {
-                id: SourceId("src2".to_string()),
+                id: SourceId::new(),
                 name: "Source 2".to_string(),
                 path: std::path::PathBuf::from("/test/source2"),
                 file_count: 20,
@@ -9264,18 +9308,12 @@ mod tests {
         ];
         assert_eq!(app.home.selected_source_index, 0);
 
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
             // Down arrow should move to source 1
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.home.selected_source_index, 1);
 
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
             // Up arrow should move back to source 0
-            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.home.selected_source_index, 0);
     }
 
@@ -9284,10 +9322,7 @@ mod tests {
         let mut app = App::new(test_args());
         assert!(app.running);
 
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert!(!app.running);
     }
@@ -9298,10 +9333,7 @@ mod tests {
         // Start in Jobs mode
         app.mode = TuiMode::Jobs;
 
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         // Esc returns to Home when no dialog is open
         assert!(matches!(app.mode, TuiMode::Home));
@@ -9448,22 +9480,16 @@ mod tests {
         app.jobs_state.selected_index = 0;
 
         // Navigate down to last item
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
             for _ in 0..10 {
-                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                    .await;
+                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             }
-        });
         // Should stop at last valid index (2) for actionable list
         assert_eq!(app.jobs_state.selected_index, 2);
 
         // Navigate up past beginning
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
             for _ in 0..10 {
-                app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
-                    .await;
+                app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
             }
-        });
         // Should stop at 0
         assert_eq!(app.jobs_state.selected_index, 0);
     }
@@ -9480,10 +9506,7 @@ mod tests {
         assert_eq!(app.jobs_state.filtered_jobs().len(), 1);
 
         // Try to navigate - should stay at 0 since only 1 item
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.jobs_state.selected_index, 0);
     }
 
@@ -9495,8 +9518,8 @@ mod tests {
     // UI freezes occur when navigation triggers expensive operations like DB queries.
     // Navigation should be pure in-memory operations (< 1ms typical, < 10ms max).
 
-    #[tokio::test]
-    async fn test_sources_dropdown_navigation_latency() {
+    #[test]
+    fn test_sources_dropdown_navigation_latency() {
         use std::time::Instant;
 
         let mut app = App::new(test_args());
@@ -9505,7 +9528,7 @@ mod tests {
         // Set up sources (in-memory, no DB)
         app.discover.sources = (0..100)
             .map(|i| SourceInfo {
-                id: SourceId(format!("source_{}", i)),
+                id: SourceId::new(),
                 name: format!("Source {}", i),
                 path: std::path::PathBuf::from(format!("/data/source_{}", i)),
                 file_count: 1000,
@@ -9521,8 +9544,7 @@ mod tests {
         // Navigate through all 100 sources and measure time
         let start = Instant::now();
         for _ in 0..99 {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let elapsed = start.elapsed();
 
@@ -9543,8 +9565,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_file_list_navigation_latency() {
+    #[test]
+    fn test_file_list_navigation_latency() {
         use std::time::Instant;
 
         let mut app = App::new(test_args());
@@ -9567,8 +9589,7 @@ mod tests {
         // Navigate through 1000 files and measure time
         let start = Instant::now();
         for _ in 0..1000 {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let elapsed = start.elapsed();
 
@@ -9584,9 +9605,9 @@ mod tests {
         assert_eq!(app.discover.selected, 1000);
     }
 
-    #[tokio::test]
+    #[test]
     #[ignore = "Flaky under variable system load - run manually with --ignored"]
-    async fn test_jobs_list_navigation_latency() {
+    fn test_jobs_list_navigation_latency() {
         use std::time::Instant;
 
         let mut app = App::new(test_args());
@@ -9629,8 +9650,7 @@ mod tests {
         // Navigate through 500 jobs and measure time
         let start = Instant::now();
         for _ in 0..500 {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let elapsed = start.elapsed();
 
@@ -9647,8 +9667,8 @@ mod tests {
         assert_eq!(app.jobs_state.selected_index, 500);
     }
 
-    #[tokio::test]
-    async fn test_sources_filter_typing_latency() {
+    #[test]
+    fn test_sources_filter_typing_latency() {
         use std::time::Instant;
 
         let mut app = App::new(test_args());
@@ -9657,7 +9677,7 @@ mod tests {
         // Set up sources
         app.discover.sources = (0..100)
             .map(|i| SourceInfo {
-                id: SourceId(format!("source_{}", i)),
+                id: SourceId::new(),
                 name: format!("Source {}", i),
                 path: std::path::PathBuf::from(format!("/data/source_{}", i)),
                 file_count: 1000,
@@ -9673,8 +9693,7 @@ mod tests {
         // Type a filter string and measure time
         let start = Instant::now();
         for c in "Source 5".chars() {
-            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         let elapsed = start.elapsed();
 
@@ -9731,12 +9750,8 @@ mod tests {
         app.jobs_state.selected_index = 0;
 
         // Try to navigate - should not panic
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
-            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.jobs_state.selected_index, 0);
     }
 
@@ -9795,19 +9810,13 @@ mod tests {
         assert!(app.discover.filter.is_empty());
 
         // Press / to enter filter mode
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::Filtering);
 
         // Type filter text
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
             for c in "sales".chars() {
-                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                    .await;
+                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
             }
-        });
         assert_eq!(app.discover.filter, "sales");
 
         // Verify filtering works
@@ -9825,10 +9834,7 @@ mod tests {
         app.discover.filter = "test".to_string();
 
         // Esc should exit filter mode, NOT go to Home
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.filter.is_empty());
         // Still in Discover mode
@@ -9844,20 +9850,14 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 't' to open tag dialog
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::Tagging);
         assert!(app.discover.tag_input.is_empty());
 
         // Type tag name
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
             for c in "important".chars() {
-                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                    .await;
+                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
             }
-        });
         assert_eq!(app.discover.tag_input, "important");
     }
 
@@ -9870,10 +9870,7 @@ mod tests {
         app.discover.tag_input = "partial".to_string();
 
         // Esc should close tag dialog, NOT go to Home
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.tag_input.is_empty());
         // Still in Discover mode
@@ -9888,19 +9885,13 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 's' to open scan path dialog
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::EnteringPath);
 
         // Type path
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
             for c in "/tmp".chars() {
-                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
-                    .await;
+                app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
             }
-        });
         assert_eq!(app.discover.scan_path_input, "/tmp");
     }
 
@@ -9912,10 +9903,7 @@ mod tests {
         app.discover.scan_path_input = "/some/path".to_string();
 
         // Esc should close scan dialog, NOT go to Home
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.scan_path_input.is_empty());
         // Still in Discover mode
@@ -9930,10 +9918,7 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 'T' (Shift+t) to open bulk tag dialog
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
         assert_eq!(app.discover.view_state, DiscoverViewState::BulkTagging);
         assert!(app.discover.bulk_tag_input.is_empty());
         assert!(!app.discover.bulk_tag_save_as_rule);
@@ -9948,17 +9933,11 @@ mod tests {
         assert!(!app.discover.bulk_tag_save_as_rule);
 
         // Press Space to toggle save-as-rule
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(app.discover.bulk_tag_save_as_rule);
 
         // Press Space again to toggle back
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(!app.discover.bulk_tag_save_as_rule);
     }
 
@@ -9971,10 +9950,7 @@ mod tests {
         app.discover.bulk_tag_save_as_rule = true;
 
         // Esc should close bulk tag dialog, NOT go to Home
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.bulk_tag_input.is_empty());
         assert!(!app.discover.bulk_tag_save_as_rule);
@@ -9991,10 +9967,7 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Press 'S' (Shift+s) on a directory to create source
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
         assert_eq!(app.discover.view_state, DiscoverViewState::CreatingSource);
         assert!(app.discover.pending_source_path.is_some());
         assert!(app.discover.pending_source_path.as_ref().unwrap().contains("archives"));
@@ -10009,10 +9982,7 @@ mod tests {
         app.discover.pending_source_path = Some("/data/archives".to_string());
 
         // Esc should close create source dialog, NOT go to Home
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.source_name_input.is_empty());
         assert!(app.discover.pending_source_path.is_none());
@@ -10028,10 +9998,7 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
         // Esc should not change views
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::Home));
     }
 
@@ -10043,31 +10010,19 @@ mod tests {
         app.discover.selected = 0;
 
         // Navigate down with j
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.discover.selected, 1);
 
         // Navigate down again
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.discover.selected, 2);
 
         // Try to navigate past end
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.discover.selected, 2); // Stays at last
 
         // Navigate up
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.discover.selected, 1);
     }
 
@@ -10157,28 +10112,19 @@ mod tests {
         // Test backspace in scan path
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = "/tmp/test".to_string();
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.discover.scan_path_input, "/tmp/tes");
 
         // Reset and test backspace in tag input
         app.discover.view_state = DiscoverViewState::Tagging;
         app.discover.tag_input = "mytag".to_string();
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.discover.tag_input, "myta");
 
         // Reset and test backspace in bulk tag input
         app.discover.view_state = DiscoverViewState::BulkTagging;
         app.discover.bulk_tag_input = "bulktag".to_string();
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-                .await;
-        });
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(app.discover.bulk_tag_input, "bulkta");
     }
 
@@ -10186,8 +10132,8 @@ mod tests {
     // Scanning E2E Tests - Non-blocking scan with progress
     // =========================================================================
 
-    #[tokio::test]
-    async fn test_scan_valid_directory_enters_scanning_state() {
+    #[test]
+    fn test_scan_valid_directory_enters_scanning_state() {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args());
@@ -10203,8 +10149,7 @@ mod tests {
         app.discover.scan_path_input = temp_dir.path().display().to_string();
 
         // Press Enter to start scan
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // Should enter Scanning state (non-blocking)
         assert_eq!(
@@ -10222,8 +10167,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_invalid_path_shows_error() {
+    #[test]
+    fn test_scan_invalid_path_shows_error() {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
 
@@ -10232,8 +10177,7 @@ mod tests {
         app.discover.scan_path_input = "/nonexistent/path/that/does/not/exist".to_string();
 
         // Press Enter
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // Should NOT enter Scanning state - stays in Files with error
         assert_eq!(
@@ -10251,8 +10195,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_not_a_directory_shows_error() {
+    #[test]
+    fn test_scan_not_a_directory_shows_error() {
         use tempfile::NamedTempFile;
 
         let mut app = App::new(test_args());
@@ -10266,8 +10210,7 @@ mod tests {
         app.discover.scan_path_input = temp_file.path().display().to_string();
 
         // Press Enter
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // Should NOT enter Scanning state - stays in Files with error
         assert_eq!(
@@ -10285,8 +10228,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_cancel_with_esc() {
+    #[test]
+    fn test_scan_cancel_with_esc() {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args());
@@ -10299,14 +10242,12 @@ mod tests {
         // Start a scan
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = temp_dir.path().display().to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.discover.view_state, DiscoverViewState::Scanning);
 
         // Press Esc to cancel scan
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         // Should return to Files state
         assert_eq!(
@@ -10332,8 +10273,8 @@ mod tests {
     // Scan-as-Job Integration Tests
     // =========================================================================
 
-    #[tokio::test]
-    async fn test_scan_creates_job_with_running_status() {
+    #[test]
+    fn test_scan_creates_job_with_running_status() {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args());
@@ -10349,8 +10290,7 @@ mod tests {
         // Start a scan
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = temp_dir.path().display().to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // Should have created a job
         assert_eq!(app.jobs_state.jobs.len(), 1, "Should have created one job");
@@ -10368,8 +10308,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_cancel_sets_job_cancelled() {
+    #[test]
+    fn test_scan_cancel_sets_job_cancelled() {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args());
@@ -10382,16 +10322,14 @@ mod tests {
         // Start a scan
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = temp_dir.path().display().to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // Verify job was created with Running status
         assert_eq!(app.jobs_state.jobs.len(), 1);
         assert_eq!(app.jobs_state.jobs[0].status, JobStatus::Running);
 
         // Cancel with ESC
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         // Job should now be Cancelled
         assert_eq!(
@@ -10405,8 +10343,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_complete_sets_job_completed() {
+    #[test]
+    fn test_scan_complete_sets_job_completed() {
         use tempfile::TempDir;
         use std::time::Duration;
 
@@ -10420,8 +10358,7 @@ mod tests {
         // Start scan
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = temp_dir.path().display().to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // Verify job created with Running status
         assert_eq!(app.jobs_state.jobs.len(), 1);
@@ -10433,8 +10370,8 @@ mod tests {
             if start.elapsed() > Duration::from_secs(5) {
                 panic!("Scan did not complete within 5 seconds");
             }
-            app.tick().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         // Job should now be Completed
@@ -10449,8 +10386,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_completes_and_populates_files() {
+    #[test]
+    fn test_scan_completes_and_populates_files() {
         use tempfile::TempDir;
         use std::time::Duration;
 
@@ -10467,8 +10404,7 @@ mod tests {
         // Start scan
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = temp_dir.path().display().to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.discover.view_state, DiscoverViewState::Scanning);
 
@@ -10478,8 +10414,8 @@ mod tests {
             if start.elapsed() > Duration::from_secs(5) {
                 panic!("Scan did not complete within 5 seconds");
             }
-            app.tick().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         // Should be back in Files state with files populated
@@ -10504,8 +10440,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_progress_initialized_and_cleared() {
+    #[test]
+    fn test_scan_progress_initialized_and_cleared() {
         use tempfile::TempDir;
         use std::time::Duration;
 
@@ -10521,8 +10457,7 @@ mod tests {
         // Start scan
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = temp_dir.path().display().to_string();
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // Should have entered Scanning state with progress initialized
         assert_eq!(app.discover.view_state, DiscoverViewState::Scanning);
@@ -10537,8 +10472,8 @@ mod tests {
             if start.elapsed() > Duration::from_secs(10) {
                 panic!("Scan did not complete within 10 seconds");
             }
-            app.tick().await;
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            app.tick();
+            std::thread::sleep(Duration::from_millis(5));
         }
 
         // Verify scan completed successfully
@@ -10562,8 +10497,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_home_tilde_expansion() {
+    #[test]
+    fn test_scan_home_tilde_expansion() {
         let mut app = App::new(test_args());
         app.mode = TuiMode::Discover;
 
@@ -10571,8 +10506,7 @@ mod tests {
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = "~".to_string();
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         // If home dir exists and is readable, should enter Scanning
         // Otherwise should show error - but NOT panic
@@ -10841,8 +10775,8 @@ mod tests {
         assert!(c.saturating_sub(l) >= 100);
     }
 
-    #[tokio::test]
-    async fn test_scan_result_memory_efficiency() {
+    #[test]
+    fn test_scan_result_memory_efficiency() {
         // Test that scan results don't cause memory issues
         let temp_dir = tempfile::TempDir::new().unwrap();
 
@@ -10867,8 +10801,8 @@ mod tests {
 
         // Complete scan
         while app.discover.view_state == DiscoverViewState::Scanning {
-            app.tick().await;
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         // load_scout_files has LIMIT 1000 for memory efficiency
@@ -10889,8 +10823,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_scan_partial_batches_not_lost() {
+    #[test]
+    fn test_scan_partial_batches_not_lost() {
         // Test that partial batches (less than BATCH_SIZE=1000) are correctly flushed
         // This validates the FlushGuard drop behavior
         use std::time::Duration;
@@ -10916,8 +10850,8 @@ mod tests {
             if start.elapsed() > Duration::from_secs(10) {
                 panic!("Scan did not complete within 10 seconds");
             }
-            app.tick().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         // All 150 files should be present - partial batch was flushed

@@ -10,23 +10,22 @@
 
 ## 1. Purpose
 
-Define a single, swappable database abstraction in `casparian_db` that
-supports DuckDB (default), SQLite, and Postgres without duplicating logic.
-Add an append-only job event log that complements the mutable job queue,
-enabling audit trails without breaking atomic job claiming.
+Define a single database abstraction in `casparian_db` for DuckDB (v1).
+Future backends may be added later, but v1 is DuckDB-only. Add an append-only
+job event log that complements the mutable job queue, enabling audit trails
+without breaking atomic job claiming.
 
 ---
 
 ## 2. Constraints
 
 - **Single DB only.** No dual DB usage.
-- **DuckDB is default.** Local-first, air-gapped by default.
+- **DuckDB only (v1).** Local-first, air-gapped by default.
 - **Data-oriented design.** Explicit rows/values, no ORM, minimal surface.
 - **Control plane needs atomic job claiming.** Mutable queue table remains.
 - **Audit trail is required.** Append-only job events table required.
-- **Single-worker policy for embedded DBs.** DuckDB/SQLite deployments are
-  single-writer and single-worker by design. If a client needs concurrent
-  workers, they must use Postgres/SQL Server.
+- **Single-worker policy (v1).** DuckDB is single-writer; v1 uses one worker
+  per DB file. Multi-worker concurrency is deferred to a future server backend.
 
 ---
 
@@ -44,14 +43,12 @@ pub trait Dbx: Send + Sync {
 ```
 
 `DbConnection` is the concrete implementation and **the single entry point**
-for all database access. `create_pool()` is legacy and must not be used in
-application layers.
+for all database access. Pool-based APIs are not used in application layers.
 
 ### 3.2 Backend Implementations
 
-- **DuckDB (default):** single-writer enforced by db connection owner.
-- **SQLite:** tests or fallback builds only.
-- **Postgres:** enterprise deployments only (same interface).
+- **DuckDB (v1):** single-writer enforced by db connection owner.
+- **Future:** Postgres/SQL Server can be added later behind the same interface.
 
 ### 3.3 Write Discipline
 
@@ -62,8 +59,8 @@ application layers.
 ### 3.4 Implementation Approach (Simplified)
 
 Ship a single, concrete `DbConnection` that owns the async boundary via a
-single DB actor thread. Avoid trait-object adapters until we actually add a
-second backend (Postgres/SQL Server).
+single DB actor thread. Avoid trait-object adapters until a second backend is
+actually added.
 
 Key points:
 - `DbConnection` is cheap-cloneable (internal `Arc`).
@@ -71,7 +68,7 @@ Key points:
 - The actor owns the DB connection (thread affinity).
 - Only one transaction API: closure-based, to keep txn state on the actor thread.
 
-If we add Postgres later, either:
+If we add a server backend later, either:
 - Add `DbConnection::open_postgres()` and internally store an enum backend, or
 - Introduce a separate concrete type (no API break for existing callers).
 

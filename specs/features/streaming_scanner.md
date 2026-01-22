@@ -305,7 +305,7 @@ async fn persist_task(
 ```sql
 CREATE TABLE scout_folders (
     id INTEGER PRIMARY KEY,
-    source_id TEXT NOT NULL,
+    source_id BIGINT NOT NULL,
     -- Prefix path, e.g., "" for root, "logs/" for /logs folder
     prefix TEXT NOT NULL,
     -- Folder or file name at this level
@@ -716,9 +716,9 @@ Expected throughput: 50,000+ files/sec (bottleneck is filesystem, not SQLite).
 
 ## 8. Migration
 
-### 8.1 Deprecation
+### 8.1 Removal
 
-The following are deprecated and will be removed:
+The following are removed in v1; delete old cache artifacts and rescan:
 
 | Component | Replacement |
 |-----------|-------------|
@@ -727,106 +727,18 @@ The following are deprecated and will be removed:
 | `.bin.zst` cache files | SQLite table |
 | `build_folder_cache()` | Inline during persist |
 
-### 8.2 Migration from .bin.zst Files
+### 8.2 No Migration in v1
 
-Existing users have folder data in `.bin.zst` cache files. Migration strategy:
+v1 does not migrate `.bin.zst` cache files. Delete old cache files and rescan
+sources to populate `scout_folders`.
 
-**Option A: Lazy Migration (Recommended)**
-
-On first access to a source without `scout_folders` data:
-1. Check if `.bin.zst` file exists for source
-2. If exists, read and populate `scout_folders` table
-3. Delete `.bin.zst` file after successful migration
-4. If no cache file, trigger background rescan
-
-```rust
-async fn ensure_folder_data(
-    db: &Database,
-    source_id: &str,
-) -> Result<bool> {
-    // Check if we have folder data in SQLite
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scout_folders WHERE source_id = ?"
-    )
-    .bind(source_id)
-    .fetch_one(db.pool()).await?;
-
-    if count > 0 {
-        return Ok(true);  // Already migrated
-    }
-
-    // Try to migrate from .bin.zst
-    let cache_path = get_cache_path(source_id);
-    if cache_path.exists() {
-        let folder_cache = FolderCache::load(&cache_path)?;
-        migrate_folder_cache_to_duckdb(db, source_id, &folder_cache).await?;
-        std::fs::remove_file(&cache_path)?;
-        return Ok(true);
-    }
-
-    Ok(false)  // No data, needs rescan
-}
-
-async fn migrate_folder_cache_to_duckdb(
-    db: &Database,
-    source_id: &str,
-    cache: &FolderCache,
-) -> Result<()> {
-    let mut tx = db.pool().begin().await?;
-
-    for (prefix, children) in &cache.folders {
-        for child in children {
-            sqlx::query(r#"
-                INSERT INTO scout_folders (source_id, prefix, name, file_count, is_folder)
-                VALUES (?, ?, ?, ?, ?)
-            "#)
-            .bind(source_id)
-            .bind(prefix)
-            .bind(&child.name)
-            .bind(child.file_count as i64)
-            .bind(child.is_folder)
-            .execute(&mut *tx).await?;
-        }
-    }
-
-    tx.commit().await?;
-    Ok(())
-}
-```
-
-**Option B: Bulk Migration on Upgrade**
-
-Run migration script for all sources at application startup:
-
-```rust
-async fn migrate_all_folder_caches(db: &Database) -> Result<MigrationStats> {
-    let sources = get_all_sources(db).await?;
-    let mut stats = MigrationStats::default();
-
-    for source in sources {
-        match ensure_folder_data(db, &source.id).await {
-            Ok(true) => stats.migrated += 1,
-            Ok(false) => stats.needs_rescan += 1,
-            Err(e) => {
-                tracing::warn!("Migration failed for {}: {}", source.id, e);
-                stats.failed += 1;
-            }
-        }
-    }
-
-    Ok(stats)
-}
-```
-
-### 8.3 Migration Steps
+### 8.3 Implementation Steps
 
 1. Add `scout_folders` table to schema
 2. Add `last_scan_at`, `last_scan_status` columns to `scout_sources`
 3. Implement streaming `parallel_walk()`
-4. Add `ensure_folder_data()` lazy migration
-5. Update TUI to use on-demand queries
-6. Remove `FolderCache` code and files after deprecation period
-7. Clean up old `.bin.zst` cache files (delete after successful migration)
+4. Update TUI to use on-demand queries
+5. Remove `FolderCache` code and delete old `.bin.zst` cache files
 
 ---
 

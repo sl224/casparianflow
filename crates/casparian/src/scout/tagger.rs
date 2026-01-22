@@ -4,7 +4,7 @@
 //! Returns the tag to assign to each file.
 
 use super::error::{Result, ScoutError};
-use super::types::{ScannedFile, TaggingRule};
+use super::types::{ScannedFile, SourceId, TaggingRule, TaggingRuleId};
 use glob::Pattern;
 
 /// Compiled tagging rule for efficient matching
@@ -44,20 +44,20 @@ impl Tagger {
         self.rules
             .iter()
             .find(|cr| {
-                cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
+                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
             })
             .map(|cr| cr.rule.tag.as_str())
     }
 
     /// Find the tag and rule ID for a file based on matching rules
     /// Returns (tag, rule_id) for the first matching rule
-    pub fn get_tag_with_rule_id(&self, file: &ScannedFile) -> Option<(&str, &str)> {
+    pub fn get_tag_with_rule_id(&self, file: &ScannedFile) -> Option<(&str, TaggingRuleId)> {
         self.rules
             .iter()
             .find(|cr| {
-                cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
+                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
             })
-            .map(|cr| (cr.rule.tag.as_str(), cr.rule.id.as_str()))
+            .map(|cr| (cr.rule.tag.as_str(), cr.rule.id))
     }
 
     /// Find all matching rules for a file
@@ -65,7 +65,7 @@ impl Tagger {
         self.rules
             .iter()
             .filter(|cr| {
-                cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
+                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
             })
             .map(|cr| &cr.rule)
             .collect()
@@ -74,7 +74,7 @@ impl Tagger {
     /// Check if any rule matches a file
     pub fn has_match(&self, file: &ScannedFile) -> bool {
         self.rules.iter().any(|cr| {
-            cr.rule.source_id == *file.source_id && cr.pattern.matches(&file.rel_path)
+            cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
         })
     }
 
@@ -84,19 +84,19 @@ impl Tagger {
     }
 
     /// Get rules for a specific source
-    pub fn rules_for_source<'a>(&'a self, source_id: &'a str) -> impl Iterator<Item = &'a TaggingRule> {
+    pub fn rules_for_source<'a>(&'a self, source_id: &'a SourceId) -> impl Iterator<Item = &'a TaggingRule> {
         self.rules
             .iter()
-            .filter(move |cr| cr.rule.source_id == source_id)
+            .filter(move |cr| cr.rule.source_id == *source_id)
             .map(|cr| &cr.rule)
     }
 
     /// Get unique tags for a source
-    pub fn tags_for_source(&self, source_id: &str) -> Vec<&str> {
+    pub fn tags_for_source(&self, source_id: &SourceId) -> Vec<&str> {
         let mut tags: Vec<&str> = self
             .rules
             .iter()
-            .filter(|cr| cr.rule.source_id == source_id)
+            .filter(|cr| cr.rule.source_id == *source_id)
             .map(|cr| cr.rule.tag.as_str())
             .collect();
         tags.sort();
@@ -108,13 +108,13 @@ impl Tagger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::types::ScannedFile;
+    use crate::scout::types::{ScannedFile, TaggingRuleId};
 
-    fn create_test_rule(id: &str, source_id: &str, pattern: &str, tag: &str, priority: i32) -> TaggingRule {
+    fn create_test_rule(id: TaggingRuleId, source_id: &SourceId, pattern: &str, tag: &str, priority: i32) -> TaggingRule {
         TaggingRule {
-            id: id.to_string(),
-            name: id.to_string(),
-            source_id: source_id.to_string(),
+            id,
+            name: pattern.to_string(),
+            source_id: source_id.clone(),
             pattern: pattern.to_string(),
             tag: tag.to_string(),
             priority,
@@ -122,103 +122,112 @@ mod tests {
         }
     }
 
-    fn create_test_file(source_id: &str, rel_path: &str) -> ScannedFile {
-        ScannedFile::new(source_id, &format!("/data/{}", rel_path), rel_path, 1000, 12345)
+    fn create_test_file(source_id: &SourceId, rel_path: &str) -> ScannedFile {
+        ScannedFile::new(source_id.clone(), &format!("/data/{}", rel_path), rel_path, 1000, 12345)
     }
 
     #[test]
     fn test_simple_pattern_match() {
-        let rules = vec![create_test_rule("r1", "src-1", "*.csv", "csv_data", 10)];
+        let source_id = SourceId::new();
+        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "csv_data", 10)];
         let tagger = Tagger::new(rules).unwrap();
 
-        let file = create_test_file("src-1", "data.csv");
+        let file = create_test_file(&source_id, "data.csv");
         assert_eq!(tagger.get_tag(&file), Some("csv_data"));
     }
 
     #[test]
     fn test_glob_star_pattern() {
-        let rules = vec![create_test_rule("r1", "src-1", "**/*.csv", "csv_data", 10)];
+        let source_id = SourceId::new();
+        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "**/*.csv", "csv_data", 10)];
         let tagger = Tagger::new(rules).unwrap();
 
         // Should match at root
-        let file1 = create_test_file("src-1", "data.csv");
+        let file1 = create_test_file(&source_id, "data.csv");
         assert_eq!(tagger.get_tag(&file1), Some("csv_data"));
 
         // Should match in subdirectory
-        let file2 = create_test_file("src-1", "subdir/data.csv");
+        let file2 = create_test_file(&source_id, "subdir/data.csv");
         assert_eq!(tagger.get_tag(&file2), Some("csv_data"));
 
         // Should match in nested subdirectory
-        let file3 = create_test_file("src-1", "a/b/c/data.csv");
+        let file3 = create_test_file(&source_id, "a/b/c/data.csv");
         assert_eq!(tagger.get_tag(&file3), Some("csv_data"));
 
         // Should not match non-csv
-        let file4 = create_test_file("src-1", "data.json");
+        let file4 = create_test_file(&source_id, "data.json");
         assert!(tagger.get_tag(&file4).is_none());
     }
 
     #[test]
     fn test_source_filtering() {
+        let source_one = SourceId::new();
+        let source_two = SourceId::new();
         let rules = vec![
-            create_test_rule("r1", "src-1", "*.csv", "src1_csv", 10),
-            create_test_rule("r2", "src-2", "*.csv", "src2_csv", 10),
+            create_test_rule(TaggingRuleId::new(), &source_one, "*.csv", "src1_csv", 10),
+            create_test_rule(TaggingRuleId::new(), &source_two, "*.csv", "src2_csv", 10),
         ];
         let tagger = Tagger::new(rules).unwrap();
 
-        // File from src-1 should get src1 tag
-        let file1 = create_test_file("src-1", "data.csv");
+        // File from source one should get src1 tag
+        let file1 = create_test_file(&source_one, "data.csv");
         assert_eq!(tagger.get_tag(&file1), Some("src1_csv"));
 
-        // File from src-2 should get src2 tag
-        let file2 = create_test_file("src-2", "data.csv");
+        // File from source two should get src2 tag
+        let file2 = create_test_file(&source_two, "data.csv");
         assert_eq!(tagger.get_tag(&file2), Some("src2_csv"));
     }
 
     #[test]
     fn test_priority_order() {
         // Rules should be pre-sorted by priority (higher first)
+        let source_id = SourceId::new();
         let rules = vec![
-            create_test_rule("r1", "src-1", "data*.csv", "specific_data", 20),
-            create_test_rule("r2", "src-1", "*.csv", "generic_csv", 10),
+            create_test_rule(TaggingRuleId::new(), &source_id, "data*.csv", "specific_data", 20),
+            create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "generic_csv", 10),
         ];
         let tagger = Tagger::new(rules).unwrap();
 
         // Should match higher priority rule first
-        let file = create_test_file("src-1", "data_2024.csv");
+        let file = create_test_file(&source_id, "data_2024.csv");
         assert_eq!(tagger.get_tag(&file), Some("specific_data"));
     }
 
     #[test]
     fn test_no_match() {
-        let rules = vec![create_test_rule("r1", "src-1", "*.csv", "csv_data", 10)];
+        let source_id = SourceId::new();
+        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "csv_data", 10)];
         let tagger = Tagger::new(rules).unwrap();
 
-        let file = create_test_file("src-1", "data.json");
+        let file = create_test_file(&source_id, "data.json");
         assert!(tagger.get_tag(&file).is_none());
     }
 
     #[test]
     fn test_disabled_rule_not_matched() {
-        let mut rule = create_test_rule("r1", "src-1", "*.csv", "csv_data", 10);
+        let source_id = SourceId::new();
+        let mut rule = create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "csv_data", 10);
         rule.enabled = false;
         let rules = vec![rule];
         let tagger = Tagger::new(rules).unwrap();
 
-        let file = create_test_file("src-1", "data.csv");
+        let file = create_test_file(&source_id, "data.csv");
         assert!(tagger.get_tag(&file).is_none());
     }
 
     #[test]
     fn test_tags_for_source() {
+        let source_id = SourceId::new();
+        let other_source_id = SourceId::new();
         let rules = vec![
-            create_test_rule("r1", "src-1", "*.csv", "csv_data", 10),
-            create_test_rule("r2", "src-1", "*.json", "json_data", 10),
-            create_test_rule("r3", "src-1", "exports/*.csv", "csv_data", 20), // Same tag
-            create_test_rule("r4", "src-2", "*.csv", "other_csv", 10),
+            create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "csv_data", 10),
+            create_test_rule(TaggingRuleId::new(), &source_id, "*.json", "json_data", 10),
+            create_test_rule(TaggingRuleId::new(), &source_id, "exports/*.csv", "csv_data", 20), // Same tag
+            create_test_rule(TaggingRuleId::new(), &other_source_id, "*.csv", "other_csv", 10),
         ];
         let tagger = Tagger::new(rules).unwrap();
 
-        let tags = tagger.tags_for_source("src-1");
+        let tags = tagger.tags_for_source(&source_id);
         assert_eq!(tags.len(), 2); // csv_data and json_data (deduplicated)
         assert!(tags.contains(&"csv_data"));
         assert!(tags.contains(&"json_data"));
@@ -226,7 +235,8 @@ mod tests {
 
     #[test]
     fn test_invalid_pattern_error() {
-        let rules = vec![create_test_rule("r1", "src-1", "[invalid", "tag", 10)];
+        let source_id = SourceId::new();
+        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "[invalid", "tag", 10)];
         let result = Tagger::new(rules);
         assert!(result.is_err());
     }

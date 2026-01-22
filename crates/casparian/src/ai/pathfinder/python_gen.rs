@@ -5,15 +5,9 @@
 
 use super::analyzer::{PathPattern, SegmentType, VariablePattern};
 use super::{PathfinderError, Result};
-use std::future::Future;
-use std::pin::Pin;
-
-/// Type alias for async LLM generation function
-pub type LlmGenerateFn = Box<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = std::result::Result<String, String>> + Send>>
-        + Send
-        + Sync,
->;
+/// Type alias for LLM generation function
+pub type LlmGenerateFn =
+    Box<dyn Fn(String) -> std::result::Result<String, String> + Send + Sync>;
 
 /// Python code generator using LLM
 pub struct PythonGenerator {
@@ -30,7 +24,7 @@ impl PythonGenerator {
     }
 
     /// Generate Python extraction code
-    pub async fn generate(
+    pub fn generate(
         &self,
         paths: &[String],
         pattern: &PathPattern,
@@ -38,8 +32,8 @@ impl PythonGenerator {
     ) -> Result<String> {
         let prompt = self.build_prompt(paths, pattern, hints);
 
-        let result = (self.generate_fn)(prompt).await
-            .map_err(|e| PathfinderError::LlmError(e))?;
+        let result = (self.generate_fn)(prompt)
+            .map_err(PathfinderError::LlmError)?;
 
         // Extract code block from response
         let code = self.extract_code_block(&result);
@@ -199,9 +193,7 @@ mod tests {
 
     #[test]
     fn test_extract_code_block_with_markers() {
-        let gen = PythonGenerator::new(Box::new(|_| {
-            Box::pin(async { Ok("".to_string()) })
-        }));
+        let gen = PythonGenerator::new(Box::new(|_| Ok("".to_string())));
 
         let response = r#"Here's the code:
 
@@ -219,9 +211,7 @@ That's it!"#;
 
     #[test]
     fn test_extract_code_block_without_markers() {
-        let gen = PythonGenerator::new(Box::new(|_| {
-            Box::pin(async { Ok("".to_string()) })
-        }));
+        let gen = PythonGenerator::new(Box::new(|_| Ok("".to_string())));
 
         let response = r#"import re
 

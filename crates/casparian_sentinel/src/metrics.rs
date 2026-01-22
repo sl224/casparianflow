@@ -21,7 +21,6 @@ pub struct Metrics {
     pub jobs_completed: AtomicU64,
     pub jobs_failed: AtomicU64,
     pub jobs_rejected: AtomicU64,
-    pub jobs_requeued: AtomicU64,
     pub jobs_retried: AtomicU64,
 
     // Worker counters
@@ -54,7 +53,6 @@ impl Metrics {
             jobs_completed: AtomicU64::new(0),
             jobs_failed: AtomicU64::new(0),
             jobs_rejected: AtomicU64::new(0),
-            jobs_requeued: AtomicU64::new(0),
             jobs_retried: AtomicU64::new(0),
             workers_registered: AtomicU64::new(0),
             workers_cleaned_up: AtomicU64::new(0),
@@ -86,11 +84,6 @@ impl Metrics {
     #[inline]
     pub fn inc_jobs_rejected(&self) {
         self.jobs_rejected.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn inc_jobs_requeued(&self) {
-        self.jobs_requeued.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -149,7 +142,6 @@ impl Metrics {
             jobs_completed: self.jobs_completed.load(Ordering::Relaxed),
             jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
             jobs_rejected: self.jobs_rejected.load(Ordering::Relaxed),
-            jobs_requeued: self.jobs_requeued.load(Ordering::Relaxed),
             jobs_retried: self.jobs_retried.load(Ordering::Relaxed),
             workers_registered: self.workers_registered.load(Ordering::Relaxed),
             workers_cleaned_up: self.workers_cleaned_up.load(Ordering::Relaxed),
@@ -181,10 +173,6 @@ casparian_jobs_failed_total {}
 # HELP casparian_jobs_rejected_total Total jobs rejected by workers
 # TYPE casparian_jobs_rejected_total counter
 casparian_jobs_rejected_total {}
-
-# HELP casparian_jobs_requeued_total Total jobs requeued for retry
-# TYPE casparian_jobs_requeued_total counter
-casparian_jobs_requeued_total {}
 
 # HELP casparian_jobs_retried_total Total jobs retried with exponential backoff
 # TYPE casparian_jobs_retried_total counter
@@ -226,7 +214,6 @@ casparian_conclude_time_microseconds_total {}
             s.jobs_completed,
             s.jobs_failed,
             s.jobs_rejected,
-            s.jobs_requeued,
             s.jobs_retried,
             s.workers_registered,
             s.workers_cleaned_up,
@@ -247,7 +234,6 @@ pub struct MetricsSnapshot {
     pub jobs_completed: u64,
     pub jobs_failed: u64,
     pub jobs_rejected: u64,
-    pub jobs_requeued: u64,
     pub jobs_retried: u64,
     pub workers_registered: u64,
     pub workers_cleaned_up: u64,

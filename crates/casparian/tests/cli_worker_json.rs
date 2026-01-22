@@ -2,6 +2,7 @@ mod cli_support;
 
 use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use casparian_db::DbValue;
+use casparian_protocol::{ProcessingStatus, WorkerStatus};
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -18,7 +19,7 @@ fn test_worker_json_and_state_changes() {
     let home_dir = TempDir::new().expect("create temp home");
     let db_path = home_dir.path().join("casparian_flow.duckdb");
     init_scout_schema(&db_path);
-    with_duckdb(&db_path, |conn| async move {
+    with_duckdb(&db_path, |conn| {
         conn.execute_batch(
             r#"
             CREATE TABLE cf_worker_node (
@@ -26,8 +27,8 @@ fn test_worker_json_and_state_changes() {
                 pid INTEGER,
                 ip_address TEXT,
                 env_signature TEXT,
-                started_at TIMESTAMP,
-                last_heartbeat TIMESTAMP,
+                started_at TEXT NOT NULL,
+                last_heartbeat TEXT NOT NULL,
                 status TEXT,
                 current_job_id INTEGER
             );
@@ -35,13 +36,12 @@ fn test_worker_json_and_state_changes() {
             CREATE TABLE cf_processing_queue (
                 id BIGINT PRIMARY KEY,
                 status TEXT,
-                claim_time TIMESTAMP,
+                claim_time TEXT,
                 worker_host TEXT,
                 worker_pid INTEGER
             );
             "#,
         )
-        .await
         .expect("create worker tables");
 
         conn.execute(
@@ -54,11 +54,10 @@ fn test_worker_json_and_state_changes() {
                 DbValue::Null,
                 DbValue::from("2024-12-16T08:00:00Z"),
                 DbValue::from("2024-12-16T10:30:00Z"),
-                DbValue::from("busy"),
+                DbValue::from(WorkerStatus::Busy.as_str()),
                 DbValue::from(42i32),
             ],
         )
-        .await
         .unwrap();
         conn.execute(
             "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
@@ -70,11 +69,10 @@ fn test_worker_json_and_state_changes() {
                 DbValue::Null,
                 DbValue::from("2024-12-16T08:00:00Z"),
                 DbValue::from("2024-12-16T10:30:00Z"),
-                DbValue::from("idle"),
+                DbValue::from(WorkerStatus::Idle.as_str()),
                 DbValue::Null,
             ],
         )
-        .await
         .unwrap();
         conn.execute(
             "INSERT INTO cf_worker_node (hostname, pid, ip_address, env_signature, started_at, last_heartbeat, status, current_job_id)
@@ -86,24 +84,22 @@ fn test_worker_json_and_state_changes() {
                 DbValue::Null,
                 DbValue::from("2024-12-16T08:00:00Z"),
                 DbValue::from("2024-12-16T09:00:00Z"),
-                DbValue::from("draining"),
+                DbValue::from(WorkerStatus::Draining.as_str()),
                 DbValue::Null,
             ],
         )
-        .await
         .unwrap();
         conn.execute(
             "INSERT INTO cf_processing_queue (id, status, claim_time, worker_host, worker_pid)
              VALUES (?, ?, ?, ?, ?)",
             &[
                 DbValue::from(42i64),
-                DbValue::from("RUNNING"),
+                DbValue::from(ProcessingStatus::Running.as_str()),
                 DbValue::from("2024-12-16T10:30:05Z"),
                 DbValue::from("worker-1"),
                 DbValue::from(12345i32),
             ],
         )
-        .await
         .unwrap();
     });
 
@@ -129,7 +125,7 @@ fn test_worker_json_and_state_changes() {
         "--json".to_string(),
     ];
     let worker: WorkerOutput = run_cli_json(&show_args, &envs);
-    assert_eq!(worker.status, "BUSY");
+    assert_eq!(worker.status, WorkerStatus::Busy.as_str());
     assert_eq!(worker.current_job_id, Some(42));
 
     let drain_args = vec![
@@ -138,7 +134,10 @@ fn test_worker_json_and_state_changes() {
         "worker-2".to_string(),
     ];
     assert_cli_success(&run_cli(&drain_args, &envs), &drain_args);
-    assert_eq!(worker_status(&db_path, "worker-2"), Some("draining".to_string()));
+    assert_eq!(
+        worker_status(&db_path, "worker-2"),
+        Some(WorkerStatus::Draining.as_str().to_string())
+    );
 
     let remove_args = vec![
         "worker-cli".to_string(),
@@ -148,42 +147,42 @@ fn test_worker_json_and_state_changes() {
     ];
     assert_cli_success(&run_cli(&remove_args, &envs), &remove_args);
     assert_eq!(worker_status(&db_path, "worker-1"), None);
-    assert_eq!(job_status(&db_path, 42), Some("QUEUED".to_string()));
+    assert_eq!(
+        job_status(&db_path, 42),
+        Some(ProcessingStatus::Queued.as_str().to_string())
+    );
     assert!(job_worker_cleared(&db_path, 42));
 }
 
 fn worker_status(db_path: &Path, hostname: &str) -> Option<String> {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         conn.query_optional(
             "SELECT status FROM cf_worker_node WHERE hostname = ?",
             &[DbValue::from(hostname)],
         )
-        .await
         .ok()
         .and_then(|row| row.and_then(|r| r.get_by_name::<String>("status").ok()))
     })
 }
 
 fn job_status(db_path: &Path, job_id: i64) -> Option<String> {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         conn.query_optional(
             "SELECT status FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job_id)],
         )
-        .await
         .ok()
         .and_then(|row| row.and_then(|r| r.get_by_name::<String>("status").ok()))
     })
 }
 
 fn job_worker_cleared(db_path: &Path, job_id: i64) -> bool {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         let row = conn
             .query_optional(
                 "SELECT worker_host, worker_pid FROM cf_processing_queue WHERE id = ?",
                 &[DbValue::from(job_id)],
             )
-            .await
             .expect("query job worker");
         row.and_then(|r| {
             let host: Option<String> = r.get_by_name::<Option<String>>("worker_host").ok().flatten();

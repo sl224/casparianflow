@@ -147,31 +147,31 @@ Acceptance:
 
 ---
 
-## Prompt E: P0 FIX Demo Dataset + Quickstart + E2E
+## Prompt E: P0 EVTX Demo Dataset + Quickstart + E2E
 
 Worktree:
-- `git worktree add ../casparianflow-p0-fix-demo -b p0/fix-demo`
-- `cd ../casparianflow-p0-fix-demo`
+- `git worktree add ../casparianflow-p0-evtx-demo -b p0/evtx-demo`
+- `cd ../casparianflow-p0-evtx-demo`
 
 Goal:
-Add a small FIX demo dataset and a runnable walkthrough, and wire an E2E test
-that queries by `cl_ord_id`.
+Add a small EVTX demo dataset and a runnable walkthrough, and wire an E2E test
+that queries by event_id/time range.
 
 Checklist items:
 - Demo dataset + walkthrough scripted (P0)
-- Quickstart with demo FIX dataset and CLI commands (P0)
-- E2E: parse FIX logs -> lifecycle table -> query by ClOrdID (P0)
+- Quickstart with demo EVTX dataset and CLI commands (P0)
+- E2E: parse EVTX files -> events table -> query by event_id/time range (P0)
 
 Context:
 - `docs/v1_scope.md`
 - Existing tests in `crates/casparian/tests/*` for E2E patterns
 
 Tasks:
-1) Add a tiny FIX log fixture (<= 1MB) under `docs/demo/fix/` or `tests/fixtures/fix/`.
-2) Write a quickstart doc showing scan -> preview -> run -> query by cl_ord_id.
+1) Add a tiny EVTX fixture (<= 1MB) under `docs/demo/dfir/evtx/` or `tests/fixtures/evtx/`.
+2) Write a quickstart doc showing scan -> preview -> run -> query by event_id/time range.
 3) Add an E2E test that uses the fixture and asserts:
    - output table exists
-   - query by cl_ord_id returns expected rows
+   - query by event_id/time range returns expected rows
 
 Acceptance:
 - New doc readable and uses the fixture path.

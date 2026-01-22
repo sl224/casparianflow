@@ -13,11 +13,9 @@ casparian_worker = { path = "../casparian_worker" }
 casparian_protocol = { path = "../casparian_protocol" }
 casparian_sinks = { path = "../casparian_sinks" }
 casparian_security = { path = "../casparian_security" }
-casparian_logging = { path = "../casparian_logging" }
 casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
-
-# Async runtime
-tokio.workspace = true
+casparian_schema = { path = "../casparian_schema" }
+casparian_mcp = { path = "../casparian_mcp" }
 
 # Error handling
 anyhow.workspace = true
@@ -30,13 +28,18 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 
 # ZeroMQ
-zeromq.workspace = true
+zmq.workspace = true
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
 toml = "0.8"
 serde_yaml = "0.9"
+base64.workspace = true
+ed25519-dalek.workspace = true
+
+# Async runtime (for MCP)
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 
 # Utilities
 uuid = { version = "1.11", features = ["v4"] }
@@ -69,11 +72,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # TUI LLM Integration
-async-trait = "0.1"
-futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 thiserror.workspace = true
-tokio-stream = "0.1"
 
 # Local LLM (llama.cpp)
 llama-cpp-2 = { version = "0.1", optional = true }
@@ -93,8 +92,7 @@ ctrlc = "3.4"
 
 [features]
 default = ["profiling", "data-plane", "duckdb"]  # Profiling enabled by default for dev
-full = []  # Include slow tests (PTY, LLM, network)
-perf = []  # Performance regression tests
+full = []  # Gate slow/interactive tests
 local-llm = ["llama-cpp-2", "hf-hub"]  # Local LLM via llama.cpp
 profiling = ["dep:casparian_profiler"]  # TUI profiler overlay (` or F12 toggle)
 data-plane = ["dep:arrow", "dep:parquet", "dep:csv"]
@@ -106,7 +104,6 @@ sqlite = []
 
 [dev-dependencies]
 ureq = "2"
-futures = "0.3"
 portable-pty = "0.8"
 filetime = "0.2"
 criterion = "0.5"

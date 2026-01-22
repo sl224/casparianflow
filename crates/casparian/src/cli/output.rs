@@ -123,15 +123,6 @@ fn format_absolute_time(duration_ago: Duration) -> String {
     time.format("%Y-%m-%d %H:%M").to_string()
 }
 
-/// Format a system time as an absolute timestamp
-#[allow(dead_code)]
-pub fn format_time_absolute(time: SystemTime) -> String {
-    use chrono::{DateTime, Local};
-
-    let datetime: DateTime<Local> = time.into();
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
 /// Print a table with headers and rows
 pub fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
     let mut table = Table::new();

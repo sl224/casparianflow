@@ -14,13 +14,9 @@ path = "src/lib.rs"
 # Protocol
 casparian_protocol = { path = "../casparian_protocol" }
 casparian_sinks = { path = "../casparian_sinks", features = ["internal"] }
-casparian_logging = { path = "../casparian_logging" }
-
-# Async runtime
-tokio.workspace = true
 
 # ZeroMQ
-zeromq.workspace = true
+zmq.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -41,12 +37,12 @@ tracing.workspace = true
 clap.workspace = true
 
 # Utilities
-lasso = "0.7"
-regex = "1.10"
-walkdir = "2.5"
-which = "7.0"
 chrono = "0.4"
 base64 = "0.22"
 blake3 = "1"
+walkdir = "2.5"
+which = "7.0"
+dirs = "5"
+toml = "0.8"
 [dev-dependencies]
 tempfile = "3"

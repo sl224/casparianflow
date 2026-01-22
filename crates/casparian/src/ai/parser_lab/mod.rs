@@ -205,7 +205,7 @@ impl ParserLab {
     }
 
     /// Create a draft from the result
-    pub async fn create_draft(
+    pub fn create_draft(
         &self,
         result: &ParserLabResult,
         draft_manager: &DraftManager,
@@ -218,7 +218,7 @@ impl ParserLab {
                 context,
                 None, // No model needed - rule-based generation
             )
-            .await?;
+            ?;
 
         Ok(draft)
     }

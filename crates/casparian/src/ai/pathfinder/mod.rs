@@ -133,7 +133,7 @@ impl Pathfinder {
     }
 
     /// Analyze paths and generate extraction rule
-    pub async fn analyze(&self, paths: &[String], hints: Option<&str>) -> Result<PathfinderResult> {
+    pub fn analyze(&self, paths: &[String], hints: Option<&str>) -> Result<PathfinderResult> {
         if paths.is_empty() {
             return Err(PathfinderError::NoPaths);
         }
@@ -150,7 +150,7 @@ impl Pathfinder {
             (Some(rule), None, "Pattern can be expressed in YAML".to_string())
         } else {
             if let Some(ref gen) = self.python_gen {
-                let code = gen.generate(paths, &pattern, hints).await?;
+                let code = gen.generate(paths, &pattern, hints)?;
                 // Validate the generated Python
                 let validation = self.validator.validate(&code)?;
                 if !validation.is_valid {
@@ -221,7 +221,7 @@ impl Pathfinder {
     }
 
     /// Create a draft from the result
-    pub async fn create_draft(
+    pub fn create_draft(
         &self,
         result: &PathfinderResult,
         draft_manager: &DraftManager,
@@ -239,7 +239,7 @@ impl Pathfinder {
 
         let draft = draft_manager
             .create_draft(draft_type, &content, context, Some("qwen2.5-coder-1.5b"))
-            .await?;
+            ?;
 
         Ok(draft)
     }

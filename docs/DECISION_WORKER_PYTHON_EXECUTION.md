@@ -12,14 +12,23 @@ The worker spawns a Python subprocess to run `bridge_shim.py`, which loads and e
 ## Current Implementation
 
 ```
-1. Sentinel sends DISPATCH with: plugin_name, source_code, env_hash, file_path
+1. Sentinel sends DISPATCH with: plugin_name, source_code, env_hash, artifact_hash, file_path
 2. Worker constructs path: ~/.casparian_flow/venvs/{env_hash}/bin/python
 3. Worker spawns: {interpreter} bridge_shim.py (with env vars for socket, code, etc.)
 4. Python plugin runs, sends Arrow batches over Unix socket
 5. Worker collects results, sends CONCLUDE to Sentinel
 ```
 
-The `env_hash` is stored in the database alongside the plugin manifest. The assumption is that some external process has pre-created virtual environments at the expected paths.
+The `env_hash` is stored in the database alongside the plugin manifest and is
+the lockfile hash. The `artifact_hash` ties source + lockfile for auditability.
+The assumption is that some external process has pre-created virtual
+environments at the expected paths.
+
+## Decision (v1, ADR-018)
+
+- Environments are provisioned out-of-band; Sentinel and Worker do not create envs.
+- Workers fail fast with a permanent error if `env_hash` is missing locally.
+- The worker pool is homogeneous; every worker must have the same plugin envs installed.
 
 ## The Problem
 
@@ -35,6 +44,8 @@ Attempted solutions:
 This raises a deeper question: is the current venv-path model the right approach?
 
 ## Options
+
+**Note:** Options B-D are retained for future evaluation but are out of scope for v1.
 
 ### Option A: Keep Current Model (venv paths)
 
@@ -143,9 +154,9 @@ uv pip install -r requirements.txt --python ~/.casparian_flow/venvs/{env_hash}
 ## Current State
 
 - Project uses `uv` for development
-- Worker code assumes venv paths exist
-- No venv provisioning logic implemented yet
-- E2E test is blocked on this decision
+- Worker code assumes venv paths exist and fails if missing
+- No venv provisioning logic implemented (by design for v1)
+- E2E test requires a pre-provisioned env matching the test env_hash
 
 ## Question for Evaluation
 

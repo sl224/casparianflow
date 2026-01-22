@@ -1,14 +1,31 @@
 # Healthcare HL7 Market Strategy
 
-**Status:** Draft
+**Status:** Not v1 (Deferred)
 **Parent:** STRATEGY.md Section 2 (Target Market → Healthcare IT)
 **Related Spec:** [specs/parsers/hl7_parser.md](../specs/parsers/hl7_parser.md)
-**Version:** 0.3
-**Date:** January 14, 2026
+**Version:** 0.4
+**Date:** January 21, 2026
 
 ---
 
-## 1. Executive Summary
+## Why Healthcare HL7 is NOT v1
+
+| Factor | Assessment |
+|--------|------------|
+| **Problem domain** | Often message-transport/integration-engine (MLLP routing), not file-at-rest parsing |
+| **Incumbent coverage** | Mirth, Rhapsody already provide file polling connectors; integration is their core |
+| **Procurement cycle** | Hospital procurement is slow (12-18 months); need sharper wedge to justify timeline |
+| **v1 fit** | Batch file parsing fits, but differentiation vs. "just parse HL7" is weak without archive analytics story |
+
+**Decision:** Healthcare HL7 is attractive but gated by procurement cycles and incumbent coverage. Revisit after DFIR validation proves the platform.
+
+**What would change this:** Hospital system with explicit archive analytics budget and ≤6 month procurement.
+
+---
+
+## 1. Executive Summary (Reference Only)
+
+> **Note:** This strategy is deferred to post-v1. Preserved for future reference.
 
 This substrategy details how Casparian Flow captures the healthcare data **analytics** market by filling a gap that integration engines like Mirth Connect don't address: **querying historical HL7 archives**.
 
@@ -469,3 +486,4 @@ Note: Year 1 assumes Phase 4 timing (starts Month 12+). Revenue projections begi
 | 2026-01-08 | 0.1 | Initial draft |
 | 2026-01-08 | 0.2 | **Positioning fix:** Clarified Casparian is complementary to Mirth (archive analytics), not a replacement; Reframed competitive positioning as "Mirth + Casparian Stack"; Removed "Mirth alternative" language throughout |
 | 2026-01-14 | 0.3 | Maintenance workflow: Updated Mirth licensing section to reflect March 2025 change is complete; added community forks (OIE, BridgeLink); noted Mirth Command Center EU/UK unavailability |
+| 2026-01-21 | 0.4 | **Status changed to Not v1:** Added explicit gating reason section; Marked as deferred to post-v1; Preserved content for future reference |

@@ -175,9 +175,9 @@ fn test_data_type_validation() {
 // =============================================================================
 
 /// Test saving and retrieving contracts from real SQLite
-#[tokio::test]
-async fn test_storage_save_and_get() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_storage_save_and_get() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let schema = LockedSchema::new(
         "users",
@@ -189,10 +189,10 @@ async fn test_storage_save_and_get() {
     let contract = SchemaContract::new("test-scope", schema, "test_user");
 
     // Save
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     // Retrieve by ID
-    let retrieved = storage.get_contract(&contract.contract_id).await.unwrap();
+    let retrieved = storage.get_contract(&contract.contract_id).unwrap();
     assert!(retrieved.is_some());
     let retrieved = retrieved.unwrap();
 
@@ -203,9 +203,9 @@ async fn test_storage_save_and_get() {
 }
 
 /// Test getting contract by scope
-#[tokio::test]
-async fn test_storage_get_by_scope() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_storage_get_by_scope() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let scope_id = "my-scope";
 
@@ -213,29 +213,29 @@ async fn test_storage_get_by_scope() {
     let schema = LockedSchema::new("orders", vec![]);
     let contract = SchemaContract::new(scope_id, schema, "test_user");
 
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     // Retrieve by scope
-    let retrieved = storage.get_contract_for_scope(scope_id).await.unwrap();
+    let retrieved = storage.get_contract_for_scope(scope_id).unwrap();
     assert!(retrieved.is_some());
     assert_eq!(retrieved.unwrap().scope_id, scope_id);
 
     // Non-existent scope returns None
-    let not_found = storage.get_contract_for_scope("nonexistent").await.unwrap();
+    let not_found = storage.get_contract_for_scope("nonexistent").unwrap();
     assert!(not_found.is_none());
 }
 
 /// Test contract versioning
-#[tokio::test]
-async fn test_storage_versioning() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_storage_versioning() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let scope_id = "versioned-scope";
 
     // V1
     let schema_v1 = LockedSchema::new("data_v1", vec![]);
     let v1 = SchemaContract::new(scope_id, schema_v1, "test_user");
-    storage.save_contract(&v1).await.unwrap();
+    storage.save_contract(&v1).unwrap();
 
     // V2 - same scope, new contract
     let schema_v2 = LockedSchema::new(
@@ -246,53 +246,55 @@ async fn test_storage_versioning() {
     );
     let mut v2 = SchemaContract::new(scope_id, schema_v2, "test_user");
     v2.version = 2;
-    storage.save_contract(&v2).await.unwrap();
+    storage.save_contract(&v2).unwrap();
 
     // Latest should be V2
-    let latest = storage.get_contract_for_scope(scope_id).await.unwrap().unwrap();
+    let latest = storage.get_contract_for_scope(scope_id).unwrap().unwrap();
     assert_eq!(latest.version, 2);
     assert_eq!(latest.schemas[0].name, "data_v2");
 }
 
 /// Test listing all contracts
-#[tokio::test]
-async fn test_storage_list_contracts() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_storage_list_contracts() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // Create multiple contracts
     for i in 0..5 {
-        let schema = LockedSchema::new(format!("schema-{}", i), vec![]);
-        let contract = SchemaContract::new(format!("scope-{}", i), schema, "test_user");
-        storage.save_contract(&contract).await.unwrap();
+        let schema_name = format!("schema-{}", i);
+        let scope_id = format!("scope-{}", i);
+        let schema = LockedSchema::new(&schema_name, vec![]);
+        let contract = SchemaContract::new(&scope_id, schema, "test_user");
+        storage.save_contract(&contract).unwrap();
     }
 
     // List all
-    let contracts = storage.list_contracts(None).await.unwrap();
+    let contracts = storage.list_contracts(None).unwrap();
     assert_eq!(contracts.len(), 5);
 
     // List with limit
-    let limited = storage.list_contracts(Some(3)).await.unwrap();
+    let limited = storage.list_contracts(Some(3)).unwrap();
     assert_eq!(limited.len(), 3);
 }
 
 /// Test deleting contracts
-#[tokio::test]
-async fn test_storage_delete_contract() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_storage_delete_contract() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let schema = LockedSchema::new("to-delete", vec![]);
     let contract = SchemaContract::new("to-delete", schema, "test_user");
 
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     // Verify exists
-    assert!(storage.get_contract(&contract.contract_id).await.unwrap().is_some());
+    assert!(storage.get_contract(&contract.contract_id).unwrap().is_some());
 
     // Delete
-    storage.delete_contract(&contract.contract_id).await.unwrap();
+    storage.delete_contract(&contract.contract_id).unwrap();
 
     // Verify gone
-    assert!(storage.get_contract(&contract.contract_id).await.unwrap().is_none());
+    assert!(storage.get_contract(&contract.contract_id).unwrap().is_none());
 }
 
 // =============================================================================
@@ -300,9 +302,9 @@ async fn test_storage_delete_contract() {
 // =============================================================================
 
 /// Test basic schema approval
-#[tokio::test]
-async fn test_approval_basic() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_approval_basic() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let request = new_approval_request("approver")
         .with_schema(
@@ -314,7 +316,7 @@ async fn test_approval_basic() {
                 ])
         );
 
-    let result = approve_schema(&storage, request).await.unwrap();
+    let result = approve_schema(&storage, request).unwrap();
 
     // Should create a contract
     assert_eq!(result.contract.schemas.len(), 1);
@@ -322,14 +324,14 @@ async fn test_approval_basic() {
     assert_eq!(result.contract.schemas[0].columns.len(), 3);
 
     // Verify persisted
-    let retrieved = storage.get_contract(&result.contract.contract_id).await.unwrap();
+    let retrieved = storage.get_contract(&result.contract.contract_id).unwrap();
     assert!(retrieved.is_some());
 }
 
 /// Test approval with column rename
-#[tokio::test]
-async fn test_approval_with_rename() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_approval_with_rename() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let request = new_approval_request("approver")
         .with_schema(
@@ -340,7 +342,7 @@ async fn test_approval_with_rename() {
                 ])
         );
 
-    let result = approve_schema(&storage, request).await.unwrap();
+    let result = approve_schema(&storage, request).unwrap();
 
     // Check the renamed column in contract
     assert_eq!(result.contract.schemas[0].columns[0].name, "customer_id");
@@ -351,9 +353,9 @@ async fn test_approval_with_rename() {
 }
 
 /// Test approval with excluded files
-#[tokio::test]
-async fn test_approval_with_exclusions() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_approval_with_exclusions() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let request = new_approval_request("approver")
         .with_schema(
@@ -367,7 +369,7 @@ async fn test_approval_with_exclusions() {
             "/path/to/bad_file2.csv".to_string(),
         ]);
 
-    let result = approve_schema(&storage, request).await.unwrap();
+    let result = approve_schema(&storage, request).unwrap();
 
     // Should have warnings about excluded files
     assert!(result.warnings.iter().any(|w| w.message.contains("excluded")),
@@ -375,13 +377,13 @@ async fn test_approval_with_exclusions() {
 }
 
 /// Test approval failure - no schemas
-#[tokio::test]
-async fn test_approval_no_schemas() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_approval_no_schemas() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let request = new_approval_request("approver");
 
-    let result = approve_schema(&storage, request).await;
+    let result = approve_schema(&storage, request);
 
     // Should fail - can't approve empty schema
     assert!(result.is_err(), "Should fail with no schemas");
@@ -392,9 +394,9 @@ async fn test_approval_no_schemas() {
 // =============================================================================
 
 /// Test proposing type mismatch amendment
-#[tokio::test]
-async fn test_amendment_type_mismatch() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_amendment_type_mismatch() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // First create a contract
     let schema = LockedSchema::new(
@@ -405,7 +407,7 @@ async fn test_amendment_type_mismatch() {
         ],
     );
     let contract = SchemaContract::new("amend-scope", schema, "test_user");
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     // Propose amendment due to type mismatch
     let proposal = propose_type_mismatch_amendment(
@@ -428,9 +430,9 @@ async fn test_amendment_type_mismatch() {
 }
 
 /// Test proposing nullability amendment
-#[tokio::test]
-async fn test_amendment_nullability() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_amendment_nullability() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let schema = LockedSchema::new(
         "products",
@@ -439,7 +441,7 @@ async fn test_amendment_nullability() {
         ],
     );
     let contract = SchemaContract::new("null-scope", schema, "test_user");
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     let proposal = propose_nullability_amendment(
         &contract,
@@ -456,9 +458,9 @@ async fn test_amendment_nullability() {
 }
 
 /// Test proposing new columns amendment
-#[tokio::test]
-async fn test_amendment_new_columns() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_amendment_new_columns() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let schema = LockedSchema::new(
         "orders",
@@ -467,7 +469,7 @@ async fn test_amendment_new_columns() {
         ],
     );
     let contract = SchemaContract::new("newcol-scope", schema, "test_user");
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     let new_columns = vec![
         LockedColumn::optional("shipping_date", DataType::Date).with_format("YYYY-MM-DD"),
@@ -484,9 +486,9 @@ async fn test_amendment_new_columns() {
 }
 
 /// Test approving amendment as proposed
-#[tokio::test]
-async fn test_amendment_approve_as_proposed() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_amendment_approve_as_proposed() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let schema = LockedSchema::new(
         "metrics",
@@ -495,7 +497,7 @@ async fn test_amendment_approve_as_proposed() {
         ],
     );
     let contract = SchemaContract::new("approve-amend-scope", schema, "test_user");
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     // Propose amendment (type mismatch from Int64 to Float64)
     let proposal = propose_type_mismatch_amendment(
@@ -507,7 +509,7 @@ async fn test_amendment_approve_as_proposed() {
     ).unwrap();
 
     // Approve as proposed
-    let result = approve_amendment(&storage, &proposal, AmendmentAction::ApproveAsProposed, "reviewer").await.unwrap();
+    let result = approve_amendment(&storage, &proposal, AmendmentAction::ApproveAsProposed, "reviewer").unwrap();
 
     // Should create new contract version
     assert!(result.contract.is_some());
@@ -518,13 +520,13 @@ async fn test_amendment_approve_as_proposed() {
 }
 
 /// Test rejecting amendment
-#[tokio::test]
-async fn test_amendment_reject() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_amendment_reject() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let schema = LockedSchema::new("data", vec![LockedColumn::required("id", DataType::Int64)]);
     let contract = SchemaContract::new("reject-scope", schema, "test_user");
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     // Create a proposal for a new schema variant
     let proposed_schema = LockedSchema::new(
@@ -554,7 +556,7 @@ async fn test_amendment_reject() {
             reason: "We don't support this format".to_string(),
         },
         "reviewer",
-    ).await.unwrap();
+    ).unwrap();
 
     // Should not create new contract
     assert!(result.new_contract.is_none());
@@ -562,9 +564,9 @@ async fn test_amendment_reject() {
 }
 
 /// Test creating separate schema from amendment
-#[tokio::test]
-async fn test_amendment_create_separate_schema() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_amendment_create_separate_schema() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let schema = LockedSchema::new(
         "original",
@@ -573,13 +575,13 @@ async fn test_amendment_create_separate_schema() {
         ],
     );
     let contract = SchemaContract::new("separate-scope", schema, "test_user");
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     let proposed_schema = LockedSchema::new(
-        "legacy_format",
+        "alternate_format",
         vec![
             LockedColumn::required("id", DataType::String),
-            LockedColumn::optional("legacy_field", DataType::String),
+            LockedColumn::optional("alternate_field", DataType::String),
         ],
     );
 
@@ -588,7 +590,7 @@ async fn test_amendment_create_separate_schema() {
         AmendmentReason::NewSchemaVariant {
             variant_description: "Completely different format".to_string(),
             file_count: 100,
-            file_pattern: Some("legacy_*.csv".to_string()),
+            file_pattern: Some("alt_*.csv".to_string()),
         },
         contract.schemas[0].clone(),
         proposed_schema,
@@ -599,18 +601,18 @@ async fn test_amendment_create_separate_schema() {
         &storage,
         &proposal,
         AmendmentAction::CreateSeparateSchema {
-            name: "legacy_format".to_string(),
-            description: Some("Legacy format files".to_string()),
+            name: "alternate_format".to_string(),
+            description: Some("Alternate format files".to_string()),
         },
         "reviewer",
-    ).await.unwrap();
+    ).unwrap();
 
     // Should have new contract
     assert!(result.new_contract.is_some());
     let new_contract = result.new_contract.unwrap();
 
     // Should have the schema
-    assert_eq!(new_contract.schemas[0].name, "legacy_format");
+    assert_eq!(new_contract.schemas[0].name, "alternate_format");
 }
 
 // =============================================================================
@@ -618,9 +620,9 @@ async fn test_amendment_create_separate_schema() {
 // =============================================================================
 
 /// Test complete lifecycle: discovery -> approval -> violation -> amendment -> new contract
-#[tokio::test]
-async fn test_full_schema_lifecycle() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_full_schema_lifecycle() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // Step 1: Initial approval (simulating discovery result)
     let initial_request = new_approval_request("approver")
@@ -633,7 +635,7 @@ async fn test_full_schema_lifecycle() {
                 ])
         );
 
-    let result = approve_schema(&storage, initial_request).await.unwrap();
+    let result = approve_schema(&storage, initial_request).unwrap();
     let v1_contract = result.contract;
     assert_eq!(v1_contract.version, 1);
 
@@ -667,7 +669,7 @@ async fn test_full_schema_lifecycle() {
         &proposal,
         AmendmentAction::ApproveAsProposed,
         "reviewer",
-    ).await.unwrap();
+    ).unwrap();
 
     let v2_contract = amend_result.contract.unwrap();
     assert_eq!(v2_contract.version, 2);
@@ -679,7 +681,7 @@ async fn test_full_schema_lifecycle() {
     assert_eq!(amount_col.data_type, DataType::Float64, "amount should now be Float64");
 
     // Step 6: Verify we can retrieve latest contract
-    let latest = storage.get_contract_for_scope(&v1_contract.scope_id).await.unwrap().unwrap();
+    let latest = storage.get_contract_for_scope(&v1_contract.scope_id).unwrap().unwrap();
     assert_eq!(latest.version, 2);
     assert_eq!(latest.contract_id, v2_contract.contract_id);
 }
@@ -724,9 +726,9 @@ fn test_all_violation_types() {
 // =============================================================================
 
 /// Test SQL injection attempts in scope_id (parameterized queries should prevent)
-#[tokio::test]
-async fn test_sql_injection_in_scope_id() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_sql_injection_in_scope_id() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // SQL injection attempts in scope_id
     let injection_payloads = [
@@ -745,20 +747,20 @@ async fn test_sql_injection_in_scope_id() {
         let contract = SchemaContract::new(payload, schema, "attacker");
 
         // Should store safely (parameterized query)
-        let result = storage.save_contract(&contract).await;
+        let result = storage.save_contract(&contract);
         assert!(result.is_ok(), "Should handle SQL injection attempt safely: {}", payload);
 
         // Verify the payload is stored as literal text, not executed
-        let retrieved = storage.get_contract_for_scope(payload).await.unwrap();
+        let retrieved = storage.get_contract_for_scope(payload).unwrap();
         assert!(retrieved.is_some(), "Should find contract with literal scope_id");
         assert_eq!(retrieved.unwrap().scope_id, payload, "Scope ID should be stored literally");
     }
 }
 
 /// Test SQL injection in column names
-#[tokio::test]
-async fn test_sql_injection_in_column_names() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_sql_injection_in_column_names() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // SQL injection in column name
     let malicious_column = "id'; DROP TABLE schema_contracts; --";
@@ -769,18 +771,18 @@ async fn test_sql_injection_in_column_names() {
     let contract = SchemaContract::new("scope-1", schema, "attacker");
 
     // Should store safely
-    let result = storage.save_contract(&contract).await;
+    let result = storage.save_contract(&contract);
     assert!(result.is_ok(), "Should handle SQL injection in column name");
 
     // Verify stored literally
-    let retrieved = storage.get_contract_for_scope("scope-1").await.unwrap().unwrap();
+    let retrieved = storage.get_contract_for_scope("scope-1").unwrap().unwrap();
     assert_eq!(retrieved.schemas[0].columns[0].name, malicious_column);
 }
 
 /// Test SQL injection in approved_by field
-#[tokio::test]
-async fn test_sql_injection_in_user_name() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_sql_injection_in_user_name() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let malicious_user = "admin'; UPDATE schema_contracts SET approved_by='hacked' WHERE '1'='1";
     let schema = LockedSchema::new(
@@ -789,10 +791,10 @@ async fn test_sql_injection_in_user_name() {
     );
     let contract = SchemaContract::new("scope-sql", schema, malicious_user);
 
-    storage.save_contract(&contract).await.unwrap();
+    storage.save_contract(&contract).unwrap();
 
     // Verify stored literally
-    let retrieved = storage.get_contract_for_scope("scope-sql").await.unwrap().unwrap();
+    let retrieved = storage.get_contract_for_scope("scope-sql").unwrap().unwrap();
     assert_eq!(retrieved.approved_by, malicious_user);
 }
 
@@ -821,9 +823,9 @@ fn test_path_traversal_in_scope_id() {
 }
 
 /// Test extremely long string inputs (buffer overflow prevention)
-#[tokio::test]
-async fn test_extremely_long_strings() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_extremely_long_strings() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // Very long scope_id
     let long_scope_id = "x".repeat(10_000);
@@ -834,7 +836,7 @@ async fn test_extremely_long_strings() {
     let contract = SchemaContract::new(&long_scope_id, schema, "user");
 
     // Should handle without crashing
-    let result = storage.save_contract(&contract).await;
+    let result = storage.save_contract(&contract);
     assert!(result.is_ok(), "Should handle very long scope_id");
 
     // Very long column name
@@ -845,14 +847,14 @@ async fn test_extremely_long_strings() {
     );
     let contract2 = SchemaContract::new("long-col", schema2, "user");
 
-    let result2 = storage.save_contract(&contract2).await;
+    let result2 = storage.save_contract(&contract2);
     assert!(result2.is_ok(), "Should handle very long column name");
 }
 
 /// Test empty string inputs
-#[tokio::test]
-async fn test_empty_string_inputs() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_empty_string_inputs() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // Empty scope_id
     let schema = LockedSchema::new(
@@ -861,7 +863,7 @@ async fn test_empty_string_inputs() {
     );
     let contract = SchemaContract::new("", schema, "user");
 
-    let result = storage.save_contract(&contract).await;
+    let result = storage.save_contract(&contract);
     assert!(result.is_ok(), "Should handle empty scope_id");
 
     // Empty column name
@@ -871,14 +873,14 @@ async fn test_empty_string_inputs() {
     );
     let contract2 = SchemaContract::new("empty-col", schema2, "user");
 
-    let result2 = storage.save_contract(&contract2).await;
+    let result2 = storage.save_contract(&contract2);
     assert!(result2.is_ok(), "Should handle empty column name");
 }
 
 /// Test null bytes and special characters
-#[tokio::test]
-async fn test_null_bytes_and_special_chars() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_null_bytes_and_special_chars() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     let special_strings = [
         "scope\twith\ttabs",       // Tabs
@@ -894,11 +896,11 @@ async fn test_null_bytes_and_special_chars() {
         );
         let contract = SchemaContract::new(*payload, schema, "user");
 
-        let result = storage.save_contract(&contract).await;
+        let result = storage.save_contract(&contract);
         assert!(result.is_ok(), "Should handle special chars: {:?}", payload);
 
         // Verify round-trip
-        let retrieved = storage.get_contract(&contract.contract_id).await.unwrap();
+        let retrieved = storage.get_contract(&contract.contract_id).unwrap();
         if let Some(c) = retrieved {
             assert_eq!(&c.scope_id, *payload, "Special chars test {} failed", i);
         }
@@ -906,9 +908,9 @@ async fn test_null_bytes_and_special_chars() {
 }
 
 /// Test that deleting with SQL injection ID doesn't affect other records
-#[tokio::test]
-async fn test_delete_sql_injection_safety() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_delete_sql_injection_safety() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // Create legitimate contract
     let legit_schema = LockedSchema::new(
@@ -916,15 +918,15 @@ async fn test_delete_sql_injection_safety() {
         vec![LockedColumn::required("id", DataType::Int64)],
     );
     let legit_contract = SchemaContract::new("legitimate-scope", legit_schema, "real_user");
-    storage.save_contract(&legit_contract).await.unwrap();
+    storage.save_contract(&legit_contract).unwrap();
 
     // Try to delete with injection
     let malicious_id = ContractId::new();  // Random ID - won't match legitimate
-    let result = storage.delete_contract(&malicious_id).await;
+    let result = storage.delete_contract(&malicious_id);
     assert!(result.is_ok());
 
     // Legitimate contract should still exist
-    let still_exists = storage.get_contract_for_scope("legitimate-scope").await.unwrap();
+    let still_exists = storage.get_contract_for_scope("legitimate-scope").unwrap();
     assert!(still_exists.is_some(), "Legitimate contract should not be affected");
 }
 
@@ -951,9 +953,9 @@ fn test_content_hash_is_opaque() {
 }
 
 /// Test concurrent modifications don't corrupt data
-#[tokio::test]
-async fn test_concurrent_scope_updates() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_concurrent_scope_updates() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // Create initial contract
     let schema1 = LockedSchema::new(
@@ -961,7 +963,7 @@ async fn test_concurrent_scope_updates() {
         vec![LockedColumn::required("id", DataType::Int64)],
     );
     let contract1 = SchemaContract::new("concurrent-scope", schema1, "user1");
-    storage.save_contract(&contract1).await.unwrap();
+    storage.save_contract(&contract1).unwrap();
 
     // Create second version for same scope
     let schema2 = LockedSchema::new(
@@ -973,15 +975,15 @@ async fn test_concurrent_scope_updates() {
     );
     let mut contract2 = SchemaContract::new("concurrent-scope", schema2, "user2");
     contract2.version = 2;
-    storage.save_contract(&contract2).await.unwrap();
+    storage.save_contract(&contract2).unwrap();
 
     // Both should exist with correct versions (use get_contract_history)
-    let all = storage.get_contract_history("concurrent-scope").await.unwrap();
+    let all = storage.get_contract_history("concurrent-scope").unwrap();
     assert_eq!(all.len(), 2, "Should have two versions");
 
     // Get each contract to verify
-    let c1 = storage.get_contract(&contract1.contract_id).await.unwrap();
-    let c2 = storage.get_contract(&contract2.contract_id).await.unwrap();
+    let c1 = storage.get_contract(&contract1.contract_id).unwrap();
+    let c2 = storage.get_contract(&contract2.contract_id).unwrap();
     assert!(c1.is_some());
     assert!(c2.is_some());
     assert_eq!(c1.unwrap().version, 1);
@@ -1023,9 +1025,9 @@ fn test_data_type_validation_security() {
 }
 
 /// Test malicious schema names don't cause issues
-#[tokio::test]
-async fn test_malicious_schema_names() {
-    let storage = SchemaStorage::in_memory().await.unwrap();
+#[test]
+fn test_malicious_schema_names() {
+    let storage = SchemaStorage::in_memory().unwrap();
 
     // Malicious schema name with SQL injection
     let malicious_name = "test'; DROP TABLE schema_contracts; --";
@@ -1035,11 +1037,11 @@ async fn test_malicious_schema_names() {
     );
     let contract = SchemaContract::new("scope-malicious", schema, "user");
 
-    let result = storage.save_contract(&contract).await;
+    let result = storage.save_contract(&contract);
     assert!(result.is_ok(), "Should handle malicious schema name");
 
     // Verify stored literally
-    let retrieved = storage.get_contract_for_scope("scope-malicious").await.unwrap().unwrap();
+    let retrieved = storage.get_contract_for_scope("scope-malicious").unwrap().unwrap();
     assert_eq!(retrieved.schemas[0].name, malicious_name);
 }
 

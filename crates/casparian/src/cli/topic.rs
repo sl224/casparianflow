@@ -55,14 +55,14 @@ struct TopicStats {
 }
 
 /// Get all topics and their statistics from the database
-async fn get_topic_stats(db: &Database) -> HashMap<String, TopicStats> {
+fn get_topic_stats(db: &Database) -> HashMap<String, TopicStats> {
     let mut stats: HashMap<String, TopicStats> = HashMap::new();
 
     // Get all sources
-    let sources = db.list_sources().await.unwrap_or_default();
+    let sources = db.list_sources().unwrap_or_default();
 
     for source in sources {
-        let files = db.list_files_by_source(&source.id, 100000).await.unwrap_or_default();
+        let files = db.list_files_by_source(&source.id, 100000).unwrap_or_default();
         for file in files {
             let topic = file.tag.clone().unwrap_or_else(|| "(untagged)".to_string());
             let entry = stats.entry(topic).or_default();
@@ -85,33 +85,28 @@ async fn get_topic_stats(db: &Database) -> HashMap<String, TopicStats> {
 
 /// Execute the topic command
 pub fn run(action: TopicAction) -> anyhow::Result<()> {
-    // Create a runtime for async operations
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(run_async(action))
+    run_with_action(action)
 }
 
-async fn run_async(action: TopicAction) -> anyhow::Result<()> {
+fn run_with_action(action: TopicAction) -> anyhow::Result<()> {
     let db_path = active_db_path();
-    let db = Database::open(&db_path).await.map_err(|e| {
+    let db = Database::open(&db_path).map_err(|e| {
         HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
 
     match action {
-        TopicAction::List { json } => list_topics(&db, json).await,
-        TopicAction::Create { name, description: _ } => create_topic(&db, &name).await,
-        TopicAction::Show { name, json } => show_topic(&db, &name, json).await,
-        TopicAction::Delete { name, force } => delete_topic(&db, &name, force).await,
-        TopicAction::Files { name, limit } => list_topic_files(&db, &name, limit).await,
+        TopicAction::List { json } => list_topics(&db, json),
+        TopicAction::Create { name, description: _ } => create_topic(&db, &name),
+        TopicAction::Show { name, json } => show_topic(&db, &name, json),
+        TopicAction::Delete { name, force } => delete_topic(&db, &name, force),
+        TopicAction::Files { name, limit } => list_topic_files(&db, &name, limit),
     }
 }
 
-async fn list_topics(db: &Database, json: bool) -> anyhow::Result<()> {
-    let stats = get_topic_stats(db).await;
+fn list_topics(db: &Database, json: bool) -> anyhow::Result<()> {
+    let stats = get_topic_stats(db);
 
     if stats.is_empty() {
         println!("No topics found.");
@@ -164,12 +159,12 @@ async fn list_topics(db: &Database, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
+fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
     // Topics are implicit - they exist when files are tagged with them
     // But we can create a rule that uses this topic to make it "real"
 
     // Check if topic already has files
-    let stats = get_topic_stats(db).await;
+    let stats = get_topic_stats(db);
     if stats.contains_key(name) {
         return Err(HelpfulError::new(format!("Topic already exists: {}", name))
             .with_context(format!("{} files tagged with this topic", stats[name].total))
@@ -178,7 +173,7 @@ async fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
     }
 
     // Check if there's already a rule for this topic
-    let rules = db.list_tagging_rules().await?;
+    let rules = db.list_tagging_rules()?;
     let has_rule = rules.iter().any(|r| r.tag == name);
 
     if has_rule {
@@ -196,13 +191,13 @@ async fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
-    let stats = get_topic_stats(db).await;
+fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
+    let stats = get_topic_stats(db);
     let topic_stats = stats.get(name);
 
     if topic_stats.is_none() && name != "(untagged)" {
         // Check if there's a rule for this topic
-        let rules = db.list_tagging_rules().await?;
+        let rules = db.list_tagging_rules()?;
         let has_rule = rules.iter().any(|r| r.tag == name);
 
         if !has_rule {
@@ -214,11 +209,11 @@ async fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()>
     }
 
     // Get rules that produce this topic
-    let rules = db.list_tagging_rules().await?;
+    let rules = db.list_tagging_rules()?;
     let topic_rules: Vec<_> = rules.iter().filter(|r| r.tag == name).collect();
 
     // Get files with this topic
-    let files = db.list_files_by_tag(name, 1000).await.unwrap_or_default();
+    let files = db.list_files_by_tag(name, 1000).unwrap_or_default();
 
     let parser: Option<(String, Option<i64>)> = None;
 
@@ -268,7 +263,7 @@ async fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()>
             // Count matches for this rule
             let matched = files
                 .iter()
-                .filter(|f| f.rule_id.as_deref() == Some(&rule.id))
+            .filter(|f| f.rule_id.as_ref() == Some(&rule.id))
                 .count();
             println!("  {}     {} files matched", rule.pattern, matched);
         }
@@ -346,13 +341,13 @@ async fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
-    let stats = get_topic_stats(db).await;
+fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
+    let stats = get_topic_stats(db);
     let topic_stats = stats.get(name);
 
     if topic_stats.is_none() {
         // Check rules
-        let rules = db.list_tagging_rules().await?;
+        let rules = db.list_tagging_rules()?;
         let topic_rules: Vec<_> = rules.iter().filter(|r| r.tag == name).collect();
 
         if topic_rules.is_empty() {
@@ -363,7 +358,7 @@ async fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<
 
         // Delete rules
         for rule in topic_rules {
-            db.delete_tagging_rule(&rule.id).await.ok();
+            db.delete_tagging_rule(&rule.id).ok();
         }
         println!("Removed rules for topic '{}'", name);
         return Ok(());
@@ -379,16 +374,16 @@ async fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<
     }
 
     // Delete rules for this topic
-    let rules = db.list_tagging_rules().await?;
+    let rules = db.list_tagging_rules()?;
     for rule in rules.iter().filter(|r| r.tag == name) {
-        db.delete_tagging_rule(&rule.id).await.ok();
+        db.delete_tagging_rule(&rule.id).ok();
     }
 
     // Untag files (set tag to NULL, status to pending)
-    let files = db.list_files_by_tag(name, 100000).await.unwrap_or_default();
+    let files = db.list_files_by_tag(name, 100000).unwrap_or_default();
     for file in files {
         if let Some(id) = file.id {
-            db.untag_file(id).await.ok();
+            db.untag_file(id).ok();
         }
     }
 
@@ -398,8 +393,8 @@ async fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<
     Ok(())
 }
 
-async fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Result<()> {
-    let files = db.list_files_by_tag(name, limit).await.map_err(|e| {
+fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Result<()> {
+    let files = db.list_files_by_tag(name, limit).map_err(|e| {
         HelpfulError::new(format!("Failed to list files: {}", e))
     })?;
 
@@ -430,21 +425,22 @@ async fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian::scout::{ScannedFile, Source, SourceType, TaggingRule};
+    use casparian::scout::{ScannedFile, Source, SourceId, SourceType, TaggingRule, TaggingRuleId};
 
-    #[tokio::test]
-    async fn test_get_topic_stats() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_get_topic_stats() {
+        let db = Database::open_in_memory().unwrap();
+        let source_id = SourceId::new();
 
         let source = Source {
-            id: "src-1".to_string(),
+            id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         // Add files with different topics
         for (i, (name, topic)) in [
@@ -456,81 +452,83 @@ mod tests {
         .enumerate()
         {
             let file = ScannedFile::new(
-                "src-1",
+                source_id.clone(),
                 &format!("/data/{}", name),
                 name,
                 1000,
                 12345 + i as i64,
             );
-            let result = db.upsert_file(&file).await.unwrap();
-            db.tag_file(result.id, topic).await.unwrap();
+            let result = db.upsert_file(&file).unwrap();
+            db.tag_file(result.id, topic).unwrap();
         }
 
-        let stats = get_topic_stats(&db).await;
+        let stats = get_topic_stats(&db);
         assert_eq!(stats.get("sales").map(|s| s.total), Some(2));
         assert_eq!(stats.get("invoices").map(|s| s.total), Some(1));
     }
 
-    #[tokio::test]
-    async fn test_topic_with_rules() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_topic_with_rules() {
+        let db = Database::open_in_memory().unwrap();
+        let source_id = SourceId::new();
 
         let source = Source {
-            id: "src-1".to_string(),
+            id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         let rule = TaggingRule {
-            id: "rule-1".to_string(),
+            id: TaggingRuleId::new(),
             name: "CSV Files".to_string(),
-            source_id: "src-1".to_string(),
+            source_id: source_id.clone(),
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,
             enabled: true,
         };
-        db.upsert_tagging_rule(&rule).await.unwrap();
+        db.upsert_tagging_rule(&rule).unwrap();
 
         // Check that we can find rules for the topic
-        let rules = db.list_tagging_rules().await.unwrap();
+        let rules = db.list_tagging_rules().unwrap();
         let csv_rules: Vec<_> = rules.iter().filter(|r| r.tag == "csv_data").collect();
         assert_eq!(csv_rules.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_delete_topic_removes_rules() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_delete_topic_removes_rules() {
+        let db = Database::open_in_memory().unwrap();
+        let source_id = SourceId::new();
 
         let source = Source {
-            id: "src-1".to_string(),
+            id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         let rule = TaggingRule {
-            id: "rule-1".to_string(),
+            id: TaggingRuleId::new(),
             name: "CSV Files".to_string(),
-            source_id: "src-1".to_string(),
+            source_id: source_id.clone(),
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,
             enabled: true,
         };
-        db.upsert_tagging_rule(&rule).await.unwrap();
+        db.upsert_tagging_rule(&rule).unwrap();
 
         // Delete the rule
-        db.delete_tagging_rule("rule-1").await.unwrap();
+        db.delete_tagging_rule(&rule.id).unwrap();
 
-        let rules = db.list_tagging_rules().await.unwrap();
+        let rules = db.list_tagging_rules().unwrap();
         assert!(rules.is_empty());
     }
 }

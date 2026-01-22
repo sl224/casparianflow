@@ -150,14 +150,15 @@ impl SampleReader {
 
     /// Detect file format from extension and content
     fn detect_format(&self, path: &Path) -> super::Result<FileFormat> {
-        let extension = path.extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
 
-        match extension.as_str() {
-            "csv" => Ok(FileFormat::Csv),
-            "tsv" | "tab" => Ok(FileFormat::Tsv),
-            "json" => {
+        match extension.as_deref() {
+            Some("csv") => Ok(FileFormat::Csv),
+            Some("tsv") | Some("tab") => Ok(FileFormat::Tsv),
+            Some("json") => {
                 // Check if it's JSON array or NDJSON
                 let file = File::open(path)
                     .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
@@ -175,12 +176,9 @@ impl SampleReader {
                     Ok(FileFormat::Json)
                 }
             }
-            "ndjson" | "jsonl" => Ok(FileFormat::Ndjson),
-            "parquet" | "pq" => Ok(FileFormat::Parquet),
-            _ => {
-                // Try to detect from content
-                self.detect_format_from_content(path)
-            }
+            Some("ndjson") | Some("jsonl") => Ok(FileFormat::Ndjson),
+            Some("parquet") | Some("pq") => Ok(FileFormat::Parquet),
+            Some(_) | None => self.detect_format_from_content(path),
         }
     }
 
@@ -395,8 +393,12 @@ impl SampleReader {
         // Build sample rows
         for value in arr.iter().take(sample_count) {
             if let serde_json::Value::Object(obj) = value {
-                let row: Vec<String> = keys.iter()
-                    .map(|k| obj.get(k).map(|v| self.json_value_to_string(v)).unwrap_or_default())
+                let row: Vec<String> = keys
+                    .iter()
+                    .map(|k| match obj.get(k) {
+                        Some(serde_json::Value::Null) | None => "null".to_string(),
+                        Some(v) => self.json_value_to_string(v),
+                    })
                     .collect();
                 sample_rows.push(row);
             }

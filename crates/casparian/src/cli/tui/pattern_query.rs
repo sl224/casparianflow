@@ -1,3 +1,4 @@
+use casparian::scout::SourceId;
 use casparian_db::{DbConnection, DbValue};
 use globset::GlobMatcher;
 
@@ -59,12 +60,12 @@ impl PatternQuery {
         }
     }
 
-    pub async fn count_files(&self, conn: &DbConnection, source_id: &str) -> i64 {
+    pub fn count_files(&self, conn: &DbConnection, source_id: SourceId) -> i64 {
         let (sql, params) = match (self.extension.as_deref(), self.path_pattern.as_deref()) {
             (Some(ext), Some(path_pat)) => (
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND extension = ? AND rel_path LIKE ?",
                 vec![
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                     DbValue::Text(path_pat.to_string()),
                 ],
@@ -72,30 +73,30 @@ impl PatternQuery {
             (Some(ext), None) => (
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND extension = ?",
                 vec![
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                 ],
             ),
             (None, Some(path_pat)) => (
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND rel_path LIKE ?",
                 vec![
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(path_pat.to_string()),
                 ],
             ),
             (None, None) => (
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ?",
-                vec![DbValue::Text(source_id.to_string())],
+                vec![DbValue::Integer(source_id.as_i64())],
             ),
         };
 
-        conn.query_scalar::<i64>(sql, &params).await.unwrap_or(0)
+        conn.query_scalar::<i64>(sql, &params).unwrap_or(0)
     }
 
-    pub async fn search_files(
+    pub fn search_files(
         &self,
         conn: &DbConnection,
-        source_id: &str,
+        source_id: SourceId,
         limit: usize,
         offset: usize,
     ) -> Vec<(String, i64, i64)> {
@@ -105,7 +106,7 @@ impl PatternQuery {
                    WHERE source_id = ? AND extension = ? AND rel_path LIKE ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                     DbValue::Text(path_pat.to_string()),
                     DbValue::Integer(limit as i64),
@@ -117,7 +118,7 @@ impl PatternQuery {
                    WHERE source_id = ? AND extension = ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                     DbValue::Integer(limit as i64),
                     DbValue::Integer(offset as i64),
@@ -128,7 +129,7 @@ impl PatternQuery {
                    WHERE source_id = ? AND rel_path LIKE ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(path_pat.to_string()),
                     DbValue::Integer(limit as i64),
                     DbValue::Integer(offset as i64),
@@ -139,14 +140,14 @@ impl PatternQuery {
                    WHERE source_id = ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
-                    DbValue::Text(source_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
                     DbValue::Integer(limit as i64),
                     DbValue::Integer(offset as i64),
                 ],
             ),
         };
 
-        let rows = match conn.query_all(sql, &params).await {
+        let rows = match conn.query_all(sql, &params) {
             Ok(rows) => rows,
             Err(_) => return Vec::new(),
         };
@@ -202,16 +203,16 @@ pub fn build_eval_matcher(glob_pattern: &str) -> Result<GlobMatcher, String> {
         .map_err(|_| "Invalid pattern".to_string())
 }
 
-pub async fn sample_paths_for_eval(
+pub fn sample_paths_for_eval(
     conn: &DbConnection,
-    source_id: &str,
+    source_id: SourceId,
     glob_pattern: &str,
     matcher: &GlobMatcher,
 ) -> Vec<String> {
     let query = PatternQuery::from_glob(glob_pattern);
 
     let mut where_sql = String::from("source_id = ?");
-    let mut base_params: Vec<DbValue> = vec![DbValue::Text(source_id.to_string())];
+    let mut base_params: Vec<DbValue> = vec![DbValue::Integer(source_id.as_i64())];
 
     if let Some(ext) = query.extension.as_deref() {
         where_sql.push_str(" AND extension = ?");
@@ -228,7 +229,7 @@ pub async fn sample_paths_for_eval(
         where_sql
     );
 
-    let prefix_rows = match conn.query_all(&prefix_query, &base_params).await {
+    let prefix_rows = match conn.query_all(&prefix_query, &base_params) {
         Ok(rows) => rows,
         Err(_) => return Vec::new(),
     };
@@ -255,7 +256,7 @@ pub async fn sample_paths_for_eval(
             where_sql
         );
 
-        let rows = match conn.query_all(&paths_query, &params).await {
+        let rows = match conn.query_all(&paths_query, &params) {
             Ok(rows) => rows,
             Err(_) => continue,
         };

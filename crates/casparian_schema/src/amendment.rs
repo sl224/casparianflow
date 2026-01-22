@@ -587,7 +587,7 @@ fn propose_amendment_internal(
 }
 
 /// Approve an amendment and update the contract.
-pub async fn approve_amendment(
+pub fn approve_amendment(
     storage: &SchemaStorage,
     proposal: &SchemaAmendmentProposal,
     action: AmendmentAction,
@@ -603,7 +603,7 @@ pub async fn approve_amendment(
     match action {
         AmendmentAction::ApproveAsProposed => {
             // Get current contract
-            let current_contract = storage.get_contract(&proposal.contract_id).await?
+            let current_contract = storage.get_contract(&proposal.contract_id)?
                 .ok_or_else(|| AmendmentError::ContractNotFound(proposal.contract_id.to_string()))?;
 
             // Create new version with proposed schema
@@ -617,9 +617,10 @@ pub async fn approve_amendment(
                 new_schemas,
                 &processed_by,
             );
+            new_contract.quarantine_config = current_contract.quarantine_config.clone();
             new_contract.version = current_contract.version + 1;
 
-            storage.save_contract(&new_contract).await?;
+            storage.save_contract(&new_contract)?;
 
             Ok(AmendmentResult {
                 contract: Some(new_contract),
@@ -633,7 +634,7 @@ pub async fn approve_amendment(
 
         AmendmentAction::ApproveWithModifications { changes } => {
             // Apply custom changes
-            let current_contract = storage.get_contract(&proposal.contract_id).await?
+            let current_contract = storage.get_contract(&proposal.contract_id)?
                 .ok_or_else(|| AmendmentError::ContractNotFound(proposal.contract_id.to_string()))?;
 
             let current_schema = current_contract.schemas.first()
@@ -651,9 +652,10 @@ pub async fn approve_amendment(
                 new_schemas,
                 &processed_by,
             );
+            new_contract.quarantine_config = current_contract.quarantine_config.clone();
             new_contract.version = current_contract.version + 1;
 
-            storage.save_contract(&new_contract).await?;
+            storage.save_contract(&new_contract)?;
 
             Ok(AmendmentResult {
                 contract: Some(new_contract),
@@ -682,19 +684,16 @@ pub async fn approve_amendment(
             let source_pattern = proposed.source_pattern.clone();
             let mut new_schema = LockedSchema::new(&name, proposed.columns.clone());
             if let Some(pattern) = source_pattern {
-                new_schema = new_schema.with_source_pattern(pattern);
+                new_schema = new_schema.with_source_pattern(&pattern);
             }
 
-            let mut new_contract = SchemaContract::new(
-                format!("{}_{}", proposal.contract_id, name),
-                new_schema,
-                &processed_by,
-            );
+            let scope_id = format!("{}_{}", proposal.contract_id, name);
+            let mut new_contract = SchemaContract::new(&scope_id, new_schema, &processed_by);
             if let Some(desc) = description {
-                new_contract = new_contract.with_description(desc);
+                new_contract = new_contract.with_description(&desc);
             }
 
-            storage.save_contract(&new_contract).await?;
+            storage.save_contract(&new_contract)?;
 
             Ok(AmendmentResult {
                 contract: None,
@@ -888,11 +887,11 @@ mod tests {
     use super::*;
     use crate::storage::SchemaStorage;
 
-    async fn create_test_storage() -> SchemaStorage {
-        SchemaStorage::in_memory().await.unwrap()
+    fn create_test_storage() -> SchemaStorage {
+        SchemaStorage::in_memory().unwrap()
     }
 
-    async fn create_test_contract(storage: &SchemaStorage) -> SchemaContract {
+    fn create_test_contract(storage: &SchemaStorage) -> SchemaContract {
         let schema = LockedSchema::new(
             "test_table",
             vec![
@@ -903,7 +902,7 @@ mod tests {
         );
 
         let contract = SchemaContract::new("test_scope", schema, "admin");
-        storage.save_contract(&contract).await.unwrap();
+        storage.save_contract(&contract).unwrap();
         contract
     }
 
@@ -938,10 +937,10 @@ mod tests {
         assert!(!proposal.changes.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_propose_type_mismatch() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_propose_type_mismatch() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let proposal = propose_type_mismatch_amendment(
             &contract,
@@ -956,10 +955,10 @@ mod tests {
         assert!(proposal.changes.iter().any(|c| matches!(c, SchemaChange::ChangeType { .. })));
     }
 
-    #[tokio::test]
-    async fn test_propose_nullability_change() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_propose_nullability_change() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let proposal = propose_nullability_amendment(&contract, "name", 15.5).unwrap();
 
@@ -967,10 +966,10 @@ mod tests {
         assert!(proposal.changes.iter().any(|c| matches!(c, SchemaChange::ChangeNullability { .. })));
     }
 
-    #[tokio::test]
-    async fn test_propose_new_columns() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_propose_new_columns() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let new_cols = vec![
             LockedColumn::optional("extra1", DataType::String),
@@ -986,10 +985,10 @@ mod tests {
         assert_eq!(add_count, 2);
     }
 
-    #[tokio::test]
-    async fn test_approve_amendment_as_proposed() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_approve_amendment_as_proposed() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let proposed = LockedSchema::new(
             "test_table",
@@ -1016,7 +1015,7 @@ mod tests {
             AmendmentAction::ApproveAsProposed,
             "reviewer",
         )
-        .await
+        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Approved);
@@ -1027,10 +1026,10 @@ mod tests {
         assert!(updated.schemas[0].columns[1].nullable);
     }
 
-    #[tokio::test]
-    async fn test_approve_with_modifications() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_approve_with_modifications() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let proposal = SchemaAmendmentProposal::new(
             contract.contract_id,
@@ -1055,7 +1054,7 @@ mod tests {
             },
             "reviewer",
         )
-        .await
+        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Approved);
@@ -1064,10 +1063,10 @@ mod tests {
         assert_eq!(updated.schemas[0].columns[3].name, "new_col");
     }
 
-    #[tokio::test]
-    async fn test_reject_amendment() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_reject_amendment() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let proposal = SchemaAmendmentProposal::new(
             contract.contract_id,
@@ -1088,17 +1087,17 @@ mod tests {
             },
             "reviewer",
         )
-        .await
+        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Rejected);
         assert!(result.contract.is_none());
     }
 
-    #[tokio::test]
-    async fn test_create_separate_schema() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_create_separate_schema() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let proposed = LockedSchema::new(
             "new_variant",
@@ -1128,7 +1127,7 @@ mod tests {
             },
             "reviewer",
         )
-        .await
+        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::SeparatedSchema);
@@ -1139,10 +1138,10 @@ mod tests {
         assert_eq!(new_contract.schemas[0].name, "v2_data");
     }
 
-    #[tokio::test]
-    async fn test_exclude_affected_files() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_exclude_affected_files() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let mut proposal = SchemaAmendmentProposal::new(
             contract.contract_id,
@@ -1166,7 +1165,7 @@ mod tests {
             AmendmentAction::ExcludeAffectedFiles,
             "reviewer",
         )
-        .await
+        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::FilesExcluded);
@@ -1174,10 +1173,10 @@ mod tests {
         assert!(result.excluded_files.contains(&"bad1.csv".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_defer_amendment() {
-        let storage = create_test_storage().await;
-        let contract = create_test_contract(&storage).await;
+    #[test]
+    fn test_defer_amendment() {
+        let storage = create_test_storage();
+        let contract = create_test_contract(&storage);
 
         let proposal = SchemaAmendmentProposal::new(
             contract.contract_id,
@@ -1197,7 +1196,7 @@ mod tests {
             },
             "reviewer",
         )
-        .await
+        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Pending);
@@ -1272,7 +1271,8 @@ mod tests {
 
         let display = reason.to_string();
         assert!(display.contains("amount"));
-        assert!(display.contains("Float64"));
+        // DataType Display uses lowercase
+        assert!(display.contains("float64"));
     }
 
     #[test]
@@ -1285,8 +1285,9 @@ mod tests {
 
         let display = change.to_string();
         assert!(display.contains("value"));
-        assert!(display.contains("Int64"));
-        assert!(display.contains("String"));
+        // DataType Display uses lowercase
+        assert!(display.contains("int64"));
+        assert!(display.contains("string"));
     }
 
     #[test]

@@ -16,7 +16,6 @@ tracing.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 csv = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
 duckdb = "1.4"
 chrono.workspace = true
 rust_decimal = "1.40"

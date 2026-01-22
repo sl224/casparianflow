@@ -86,7 +86,7 @@ impl RealCsvParser {
 }
 
 impl ParserRunner for RealCsvParser {
-    async fn run(&self, file_path: &str) -> FileTestResult {
+    fn run(&self, file_path: &str) -> FileTestResult {
         // Check if this file should fail
         if self.fail_on_files.iter().any(|f| file_path.contains(f)) {
             return FileTestResult {
@@ -186,9 +186,9 @@ impl TrackingParser {
 }
 
 impl ParserRunner for TrackingParser {
-    async fn run(&self, file_path: &str) -> FileTestResult {
+    fn run(&self, file_path: &str) -> FileTestResult {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        self.inner.run(file_path).await
+        self.inner.run(file_path)
     }
 }
 
@@ -197,9 +197,9 @@ impl ParserRunner for TrackingParser {
 // =============================================================================
 
 /// Test recording failures in real SQLite database
-#[tokio::test]
-async fn test_high_failure_table_real_sqlite() {
-    let table = HighFailureTable::in_memory().await.unwrap();
+#[test]
+fn test_high_failure_table_real_sqlite() {
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     // Record a failure
@@ -210,19 +210,19 @@ async fn test_high_failure_table_real_sqlite() {
         "Expected int, got string",
     );
 
-    table.record_failure("/data/bad_file.csv", &scope_id, entry).await.unwrap();
+    table.record_failure("/data/bad_file.csv", &scope_id, entry).unwrap();
 
     // Verify recorded
-    let active = table.get_active(&scope_id).await.unwrap();
+    let active = table.get_active(&scope_id).unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].file_path, "/data/bad_file.csv");
     assert_eq!(active[0].consecutive_failures, 1);
 }
 
 /// Test that consecutive failures increment correctly
-#[tokio::test]
-async fn test_consecutive_failures_increment() {
-    let table = HighFailureTable::in_memory().await.unwrap();
+#[test]
+fn test_consecutive_failures_increment() {
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let file_path = "/data/problem_file.csv";
@@ -235,19 +235,19 @@ async fn test_consecutive_failures_increment() {
             FailureCategory::ParseError,
             format!("Failure #{}", i),
         );
-        table.record_failure(file_path, &scope_id, entry).await.unwrap();
+        table.record_failure(file_path, &scope_id, entry).unwrap();
     }
 
-    let active = table.get_active(&scope_id).await.unwrap();
+    let active = table.get_active(&scope_id).unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].consecutive_failures, 5, "Should have 5 consecutive failures");
     assert_eq!(active[0].failure_count, 5, "Total failures should be 5");
 }
 
 /// Test that success resets consecutive failures
-#[tokio::test]
-async fn test_success_resets_consecutive() {
-    let table = HighFailureTable::in_memory().await.unwrap();
+#[test]
+fn test_success_resets_consecutive() {
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let file_path = "/data/intermittent.csv";
@@ -260,31 +260,31 @@ async fn test_success_resets_consecutive() {
             FailureCategory::TypeMismatch,
             "Error",
         );
-        table.record_failure(file_path, &scope_id, entry).await.unwrap();
+        table.record_failure(file_path, &scope_id, entry).unwrap();
     }
 
     // Verify 3 consecutive
-    let before = table.get_active(&scope_id).await.unwrap();
+    let before = table.get_active(&scope_id).unwrap();
     assert_eq!(before[0].consecutive_failures, 3);
 
     // Record success
-    table.record_success(file_path, &scope_id).await.unwrap();
+    table.record_success(file_path, &scope_id).unwrap();
 
     // Consecutive should be 0, but total failures preserved
-    let after = table.get_active(&scope_id).await.unwrap();
+    let after = table.get_active(&scope_id).unwrap();
     assert!(after.is_empty(), "Should not be in active failures after success");
 
     // Check get_all list (resolved files have consecutive=0 but are still in get_all)
-    let all = table.get_all(&scope_id).await.unwrap();
+    let all = table.get_all(&scope_id).unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].failure_count, 3, "Total failures should still be 3");
     assert_eq!(all[0].consecutive_failures, 0, "Consecutive should be 0");
 }
 
 /// Test backtest ordering prioritizes high-failure files
-#[tokio::test]
-async fn test_backtest_order_prioritizes_high_failure() {
-    let table = HighFailureTable::in_memory().await.unwrap();
+#[test]
+fn test_backtest_order_prioritizes_high_failure() {
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     // Create high-failure entries with different failure counts
@@ -300,7 +300,7 @@ async fn test_backtest_order_prioritizes_high_failure() {
                 FailureCategory::TypeMismatch,
                 "Error",
             );
-            table.record_failure(path, &scope_id, entry).await.unwrap();
+            table.record_failure(path, &scope_id, entry).unwrap();
         }
     }
 
@@ -313,7 +313,7 @@ async fn test_backtest_order_prioritizes_high_failure() {
         FileInfo::new("/data/new.csv", 100),
     ];
 
-    let ordered = table.get_backtest_order(&all_files, &scope_id).await.unwrap();
+    let ordered = table.get_backtest_order(&all_files, &scope_id).unwrap();
 
     // First 3 should be high-failure files in descending order
     assert_eq!(ordered[0].path, "/data/worst.csv", "Worst should be first");
@@ -334,8 +334,8 @@ fn create_test_files(dir: &TempDir, files: &[(&str, &str)]) {
 }
 
 /// Test backtest with all passing files
-#[tokio::test]
-async fn test_backtest_all_pass() {
+#[test]
+fn test_backtest_all_pass() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create valid CSV files
@@ -358,7 +358,7 @@ async fn test_backtest_all_pass() {
         ))
         .collect();
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = FailFastConfig::default();
@@ -371,7 +371,7 @@ async fn test_backtest_all_pass() {
         1, // parser_version
         1, // iteration
         &config,
-    ).await.unwrap();
+    ).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -384,8 +384,8 @@ async fn test_backtest_all_pass() {
 }
 
 /// Test backtest with some failing files
-#[tokio::test]
-async fn test_backtest_some_fail() {
+#[test]
+fn test_backtest_some_fail() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create valid and invalid files
@@ -411,7 +411,7 @@ async fn test_backtest_some_fail() {
         ))
         .collect();
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = FailFastConfig {
@@ -420,7 +420,7 @@ async fn test_backtest_some_fail() {
         ..Default::default()
     };
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -432,8 +432,8 @@ async fn test_backtest_some_fail() {
 }
 
 /// Test early stopping when high-failure files fail
-#[tokio::test]
-async fn test_early_stop_on_high_failure() {
+#[test]
+fn test_early_stop_on_high_failure() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create many files
@@ -456,7 +456,7 @@ async fn test_early_stop_on_high_failure() {
         vec![ExpectedType::Integer, ExpectedType::Integer],
     );
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     // Pre-populate high-failure table with bad files
@@ -471,7 +471,7 @@ async fn test_early_stop_on_high_failure() {
             &temp_dir.path().join(name).to_string_lossy(),
             &scope_id,
             entry,
-        ).await.unwrap();
+        ).unwrap();
     }
 
     // Get files in backtest order (high-failure first)
@@ -483,7 +483,7 @@ async fn test_early_stop_on_high_failure() {
         ))
         .collect();
 
-    let ordered = table.get_backtest_order(&all_files, &scope_id).await.unwrap();
+    let ordered = table.get_backtest_order(&all_files, &scope_id).unwrap();
 
     let config = FailFastConfig {
         high_failure_threshold: 0.5, // Require 50% of high-failure files to pass
@@ -502,7 +502,7 @@ async fn test_early_stop_on_high_failure() {
         1,
         1,
         &config,
-    ).await.unwrap();
+    ).unwrap();
 
     match result {
         BacktestResult::EarlyStopped { reason, high_failure_pass_rate, files_tested, .. } => {
@@ -539,7 +539,7 @@ impl ImprovingParser {
 }
 
 impl ParserRunner for ImprovingParser {
-    async fn run(&self, file_path: &str) -> FileTestResult {
+    fn run(&self, file_path: &str) -> FileTestResult {
         let iteration = self.iteration.load(Ordering::SeqCst);
 
         // After iteration 3, all files pass
@@ -575,7 +575,7 @@ impl ParserRunner for ImprovingParser {
 }
 
 impl MutableParser for ImprovingParser {
-    async fn apply_fixes(&mut self, _result: &BacktestIteration) -> bool {
+    fn apply_fixes(&mut self, _result: &BacktestIteration) -> bool {
         // Increment iteration to simulate improvement
         self.iteration.fetch_add(1, Ordering::SeqCst);
         true
@@ -587,8 +587,8 @@ impl MutableParser for ImprovingParser {
 }
 
 /// Test backtest loop achieves pass rate
-#[tokio::test]
-async fn test_loop_achieves_pass_rate() {
+#[test]
+fn test_loop_achieves_pass_rate() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create test files
@@ -607,7 +607,7 @@ async fn test_loop_achieves_pass_rate() {
     // Parser that fails on file1 and file2 initially, then improves
     let mut parser = ImprovingParser::new(vec!["file1".to_string(), "file2".to_string()]);
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = IterationConfig {
@@ -625,7 +625,7 @@ async fn test_loop_achieves_pass_rate() {
         &table,
         &scope_id,
         &config,
-    ).await.unwrap();
+    ).unwrap();
 
     match result.termination_reason {
         TerminationReason::PassRateAchieved => {
@@ -640,8 +640,8 @@ async fn test_loop_achieves_pass_rate() {
 }
 
 /// Test loop respects max iterations
-#[tokio::test]
-async fn test_loop_max_iterations() {
+#[test]
+fn test_loop_max_iterations() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create a file that always fails
@@ -656,7 +656,7 @@ async fn test_loop_max_iterations() {
     // Parser that never improves
     struct NeverImprovesParser;
     impl ParserRunner for NeverImprovesParser {
-        async fn run(&self, file_path: &str) -> FileTestResult {
+        fn run(&self, file_path: &str) -> FileTestResult {
             FileTestResult {
                 file_path: file_path.to_string(),
                 passed: false,
@@ -666,13 +666,13 @@ async fn test_loop_max_iterations() {
         }
     }
     impl MutableParser for NeverImprovesParser {
-        async fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
+        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
         fn version(&self) -> usize { 0 }
     }
 
     let mut parser = NeverImprovesParser;
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = IterationConfig {
@@ -684,7 +684,7 @@ async fn test_loop_max_iterations() {
         failfast_config: FailFastConfig::default(),
     };
 
-    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.unwrap();
+    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).unwrap();
 
     assert!(matches!(result.termination_reason, TerminationReason::MaxIterations),
             "Should terminate due to max iterations");
@@ -692,8 +692,8 @@ async fn test_loop_max_iterations() {
 }
 
 /// Test plateau detection
-#[tokio::test]
-async fn test_loop_plateau_detection() {
+#[test]
+fn test_loop_plateau_detection() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create files - some pass, some fail
@@ -721,7 +721,7 @@ async fn test_loop_plateau_detection() {
     // Parser that never fixes the bad files
     struct PlateauParser;
     impl ParserRunner for PlateauParser {
-        async fn run(&self, path: &str) -> FileTestResult {
+        fn run(&self, path: &str) -> FileTestResult {
             if path.contains("bad") {
                 FileTestResult {
                     file_path: path.to_string(),
@@ -740,13 +740,13 @@ async fn test_loop_plateau_detection() {
         }
     }
     impl MutableParser for PlateauParser {
-        async fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
+        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
         fn version(&self) -> usize { 0 }
     }
 
     let mut parser = PlateauParser;
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = IterationConfig {
@@ -758,7 +758,7 @@ async fn test_loop_plateau_detection() {
         failfast_config: FailFastConfig::default(),
     };
 
-    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.unwrap();
+    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).unwrap();
 
     match result.termination_reason {
         TerminationReason::Plateau { no_improvement_for } => {
@@ -873,8 +873,8 @@ fn test_metrics_plateau_detection() {
 // =============================================================================
 
 /// Test complete backtest workflow: files -> high-failure tracking -> iterations -> completion
-#[tokio::test]
-async fn test_complete_backtest_workflow() {
+#[test]
+fn test_complete_backtest_workflow() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create a realistic dataset
@@ -919,12 +919,12 @@ async fn test_complete_backtest_workflow() {
         ))
         .collect();
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     // First backtest run
     let config = FailFastConfig::default();
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -939,13 +939,13 @@ async fn test_complete_backtest_workflow() {
     }
 
     // Verify high-failure table was updated
-    let active = table.get_active(&scope_id).await.unwrap();
+    let active = table.get_active(&scope_id).unwrap();
     assert_eq!(active.len(), 1, "Should have 1 file in high-failure table");
     assert!(active[0].file_path.contains("transactions_bad"),
             "Bad file should be tracked");
 
     // Second backtest - high-failure file should be tested first
-    let ordered = table.get_backtest_order(&files, &scope_id).await.unwrap();
+    let ordered = table.get_backtest_order(&files, &scope_id).unwrap();
     assert!(ordered[0].path.contains("transactions_bad"),
             "Bad file should be first in backtest order");
 
@@ -957,7 +957,7 @@ async fn test_complete_backtest_workflow() {
         min_high_failure_files: 1,
     };
 
-    let result2 = backtest_with_failfast(&parser, &ordered, &table, &scope_id, 1, 2, &strict_config).await.unwrap();
+    let result2 = backtest_with_failfast(&parser, &ordered, &table, &scope_id, 1, 2, &strict_config).unwrap();
 
     // Should stop early because high-failure file still fails
     match result2 {
@@ -976,8 +976,8 @@ async fn test_complete_backtest_workflow() {
 // =============================================================================
 
 /// Test handling of non-existent file paths
-#[tokio::test]
-async fn test_handles_missing_files_gracefully() {
+#[test]
+fn test_handles_missing_files_gracefully() {
     let parser = RealCsvParser::new(
         vec!["id", "value"],
         vec![ExpectedType::Integer, ExpectedType::Integer],
@@ -989,12 +989,12 @@ async fn test_handles_missing_files_gracefully() {
         FileInfo::new("/nonexistent/path/file2.csv".to_string(), 100),
     ];
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = FailFastConfig::default();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1006,8 +1006,8 @@ async fn test_handles_missing_files_gracefully() {
 }
 
 /// Test handling of empty file list
-#[tokio::test]
-async fn test_handles_empty_file_list() {
+#[test]
+fn test_handles_empty_file_list() {
     let parser = RealCsvParser::new(
         vec!["id", "value"],
         vec![ExpectedType::Integer, ExpectedType::Integer],
@@ -1015,12 +1015,12 @@ async fn test_handles_empty_file_list() {
 
     let files: Vec<FileInfo> = vec![];
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = FailFastConfig::default();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1033,8 +1033,8 @@ async fn test_handles_empty_file_list() {
 }
 
 /// Test handling of unreadable files (simulated via parser)
-#[tokio::test]
-async fn test_handles_unreadable_files() {
+#[test]
+fn test_handles_unreadable_files() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create a file that will fail to parse
@@ -1051,10 +1051,10 @@ async fn test_handles_unreadable_files() {
         0,
     )];
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1066,8 +1066,8 @@ async fn test_handles_unreadable_files() {
 }
 
 /// Test handling of malformed CSV content
-#[tokio::test]
-async fn test_handles_malformed_csv() {
+#[test]
+fn test_handles_malformed_csv() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create files with various malformed content
@@ -1090,10 +1090,10 @@ async fn test_handles_malformed_csv() {
         ))
         .collect();
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1104,8 +1104,8 @@ async fn test_handles_malformed_csv() {
 }
 
 /// Test that failures are properly categorized and recorded in high-failure table
-#[tokio::test]
-async fn test_failure_categories_recorded_correctly() {
+#[test]
+fn test_failure_categories_recorded_correctly() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create files that will fail for different reasons
@@ -1127,13 +1127,13 @@ async fn test_failure_categories_recorded_correctly() {
         ))
         .collect();
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let _ = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let _ = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
 
     // Check that failures were recorded with correct categories
-    let all_failures = table.get_all(&scope_id).await.unwrap();
+    let all_failures = table.get_all(&scope_id).unwrap();
     assert_eq!(all_failures.len(), 2, "Should have 2 files in failure table");
 
     // Verify categories are recorded
@@ -1143,8 +1143,8 @@ async fn test_failure_categories_recorded_correctly() {
 }
 
 /// Test backtest with extremely large file count (stress test)
-#[tokio::test]
-async fn test_handles_large_file_count() {
+#[test]
+fn test_handles_large_file_count() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create many small files
@@ -1165,10 +1165,10 @@ async fn test_handles_large_file_count() {
         ))
         .collect();
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).await.unwrap();
+    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1180,9 +1180,9 @@ async fn test_handles_large_file_count() {
 }
 
 /// Test that recording the same file twice updates correctly (not duplicates)
-#[tokio::test]
-async fn test_no_duplicate_failure_records() {
-    let table = HighFailureTable::in_memory().await.unwrap();
+#[test]
+fn test_no_duplicate_failure_records() {
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     // Record same file failing multiple times
@@ -1193,18 +1193,18 @@ async fn test_no_duplicate_failure_records() {
             FailureCategory::TypeMismatch,
             format!("Failure at iteration {}", i),
         );
-        table.record_failure("/data/repeated.csv", &scope_id, entry).await.unwrap();
+        table.record_failure("/data/repeated.csv", &scope_id, entry).unwrap();
     }
 
     // Should be only 1 file, not 5
-    let all = table.get_all(&scope_id).await.unwrap();
+    let all = table.get_all(&scope_id).unwrap();
     assert_eq!(all.len(), 1, "Should have exactly 1 file entry");
     assert_eq!(all[0].failure_count, 5, "Should have 5 failures recorded");
 }
 
 /// Test iteration loop with parser that panics (simulated via error)
-#[tokio::test]
-async fn test_loop_handles_parser_errors() {
+#[test]
+fn test_loop_handles_parser_errors() {
     let temp_dir = TempDir::new().unwrap();
 
     let content = "id,value\n1,100\n";
@@ -1213,7 +1213,7 @@ async fn test_loop_handles_parser_errors() {
     // Parser that always returns error
     struct ErrorParser;
     impl ParserRunner for ErrorParser {
-        async fn run(&self, file_path: &str) -> FileTestResult {
+        fn run(&self, file_path: &str) -> FileTestResult {
             FileTestResult {
                 file_path: file_path.to_string(),
                 passed: false,
@@ -1223,7 +1223,7 @@ async fn test_loop_handles_parser_errors() {
         }
     }
     impl MutableParser for ErrorParser {
-        async fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
+        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
         fn version(&self) -> usize { 0 }
     }
 
@@ -1234,7 +1234,7 @@ async fn test_loop_handles_parser_errors() {
         100,
     )];
 
-    let table = HighFailureTable::in_memory().await.unwrap();
+    let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
     let config = IterationConfig {
@@ -1247,7 +1247,7 @@ async fn test_loop_handles_parser_errors() {
     };
 
     // Should complete without crashing
-    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.unwrap();
+    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).unwrap();
 
     // Should terminate due to max iterations or plateau
     assert!(matches!(

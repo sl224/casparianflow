@@ -4,10 +4,8 @@
 //! - DevRunner: Development mode with terminal output, no DB writes
 //! - QueuedRunner: Production mode with file logging, DB integration
 
-use anyhow::Result;
-use async_trait::async_trait;
 use casparian_sinks::OutputBatch;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Where to send parser logs
 pub enum LogDestination {
@@ -29,18 +27,6 @@ pub struct ExecutionResult {
 pub enum ParserRef {
     /// Path to parser.py
     Path(PathBuf),
-}
-
-/// Runner trait for parser execution
-#[async_trait]
-pub trait Runner: Send + Sync {
-    /// Execute a parser against an input file
-    async fn execute(
-        &self,
-        parser: ParserRef,
-        input: &Path,
-        log_dest: LogDestination,
-    ) -> Result<ExecutionResult>;
 }
 
 mod dev;

@@ -81,25 +81,6 @@ DbConnection::open_postgres("postgres://localhost/mydb").await?
 DbConnection::open_from_url("sqlite:./data.db").await?
 ```
 
-### Legacy DbConfig (sqlx pool)
-
-Available via `casparian_db::legacy::DbConfig`.
-
-```rust
-pub struct DbConfig {
-    pub url: String,
-    pub db_type: DatabaseType,
-    pub max_connections: u32,
-    pub license: License,
-}
-
-// Constructors
-DbConfig::sqlite("./data.db")              // SQLite file
-DbConfig::sqlite_memory()                   // In-memory SQLite
-DbConfig::postgres(url, license)            // PostgreSQL (requires license)
-DbConfig::from_url(url, license)            // Auto-detect from URL
-```
-
 ### License
 
 ```rust
@@ -143,27 +124,6 @@ let conn = DbConnection::open_sqlite(Path::new("./data.db")).await?;
 conn.execute("SELECT 1", &[]).await?;
 ```
 
-### Legacy sqlx pool (deprecated)
-
-```rust
-use casparian_db::legacy::{create_pool, DbConfig};
-
-let config = DbConfig::sqlite("./data.db");
-let pool = create_pool(config).await?;
-```
-
-### PostgreSQL (License Required, legacy pool)
-
-```rust
-use casparian_db::legacy::{create_pool, load_license, DbConfig};
-
-let license = load_license();  // Loads from standard locations
-let config = DbConfig::postgres("postgres://localhost/mydb", license);
-
-// This will fail if license doesn't allow PostgreSQL
-let pool = create_pool(config).await?;
-```
-
 ### License File Format
 
 ```json
@@ -200,26 +160,17 @@ casparian_db = { path = "../casparian_db" }
 // Before
 let pool = SqlitePool::connect(&url).await?;
 
-// After (preferred)
+// After (v1)
 use casparian_db::DbConnection;
 
-let conn = DbConnection::open_sqlite(Path::new(&path)).await?;
-```
-
-3. If you still need a sqlx pool (legacy):
-```rust
-use casparian_db::legacy::{create_pool, DbConfig, DbPool};
-
-pub struct MyStorage {
-    pool: DbPool,  // Legacy sqlx pool
-}
+let conn = DbConnection::open_duckdb(Path::new(&path)).await?;
 ```
 
 ---
 
 ## Error Handling
 
-`DbConnection` returns `BackendError`. Legacy pool APIs return `legacy::DbError`.
+`DbConnection` returns `BackendError`. Pool-based APIs are not used in v1.
 
 ```rust
 pub enum BackendError {

@@ -1,0 +1,24 @@
+# Test fixture for FIX parser prefix handling and multi-message lines
+# Parser should find 8=FIX anywhere in line, supporting various log formats
+
+# Timestamped log format (gateway headers)
+2024-01-02T09:00:00.000Z INFO FIX-GW-001 8=FIX.4.4|9=70|35=A|49=CLIENT1|56=BROKER1|34=1|52=20240102-09:00:00.000|98=0|108=30|10=000
+2024-01-02T09:00:00.100Z INFO FIX-GW-001 8=FIX.4.4|9=70|35=A|49=BROKER1|56=CLIENT1|34=1|52=20240102-09:00:00.100|98=0|108=30|10=000
+
+# Syslog-style prefix
+Jan  2 09:30:00 fix-server fixengine[12345]: 8=FIX.4.4|9=120|35=D|49=CLIENT1|56=BROKER1|34=2|52=20240102-09:30:00.000|11=PREFIXED001|55=MSFT|54=2|38=50|44=375.25|40=2|59=0|60=20240102-09:30:00.000|10=000
+
+# JSON-wrapped log (prefix before 8=)
+{"level":"DEBUG","ts":"2024-01-02T09:30:00.150Z","msg":"8=FIX.4.4|9=140|35=8|49=BROKER1|56=CLIENT1|34=3|52=20240102-09:30:00.150|11=PREFIXED001|37=ORD002|17=EXEC003|150=0|39=0|55=MSFT|54=2|38=50|44=375.25|14=0|151=50|6=0|60=20240102-09:30:00.150|10=000"}
+
+# Multiple FIX messages on single line (rare but valid)
+[BATCH] 8=FIX.4.4|9=50|35=0|49=BROKER1|56=CLIENT1|34=4|52=20240102-09:30:15.000|10=000 8=FIX.4.4|9=50|35=0|49=CLIENT1|56=BROKER1|34=3|52=20240102-09:30:15.050|10=000
+
+# Plain format (no prefix) - standard case
+8=FIX.4.4|9=160|35=8|49=BROKER1|56=CLIENT1|34=5|52=20240102-09:31:00.000|11=PREFIXED001|37=ORD002|17=EXEC004|150=2|39=2|55=MSFT|54=2|38=50|44=375.25|14=50|151=0|31=375.30|32=50|6=375.30|60=20240102-09:31:00.000|10=000
+
+# Malformed line (no 8=FIX, but has = signs - should go to errors)
+This is not a FIX message but has key=value pairs that might confuse parsers
+
+# Session events with prefix
+[SESS] 8=FIX.4.4|9=60|35=5|49=CLIENT1|56=BROKER1|34=4|52=20240102-17:00:00.000|58=End of session|10=000

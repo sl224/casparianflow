@@ -45,6 +45,6 @@ pub mod types;
 
 // Re-export commonly used types
 pub use audit::AuditLogger;
-pub use config::AiConfig;
+pub use config::{AiConfig, AiProvider};
 pub use draft::DraftManager;
 pub use types::{Draft, DraftId, DraftStatus, DraftType, WizardType};

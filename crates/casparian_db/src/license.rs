@@ -34,11 +34,11 @@ pub enum LicenseError {
 /// License tier determines which features are available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LicenseTier {
-    /// Open source - SQLite only
+    /// Open source tier
     Community,
-    /// Professional - adds PostgreSQL
+    /// Professional tier
     Professional,
-    /// Enterprise - adds MSSQL, priority support
+    /// Enterprise tier
     Enterprise,
 }
 
@@ -46,14 +46,7 @@ impl LicenseTier {
     /// Check if this tier allows the given database type.
     pub fn allows(&self, db_type: DatabaseType) -> bool {
         match db_type {
-            #[cfg(feature = "sqlite")]
-            DatabaseType::Sqlite => true, // Always allowed
-
-            #[cfg(feature = "duckdb")]
-            DatabaseType::DuckDb => true, // Always allowed (open source)
-
-            #[cfg(feature = "postgres")]
-            DatabaseType::Postgres => matches!(self, Self::Professional | Self::Enterprise),
+            DatabaseType::DuckDb => true,
         }
     }
 }
@@ -166,11 +159,7 @@ mod tests {
         let license = License::community();
         assert_eq!(license.tier, LicenseTier::Community);
 
-        #[cfg(feature = "sqlite")]
-        assert!(license.allows(DatabaseType::Sqlite).is_ok());
-
-        #[cfg(feature = "postgres")]
-        assert!(license.allows(DatabaseType::Postgres).is_err());
+        assert!(license.allows(DatabaseType::DuckDb).is_ok());
     }
 
     #[test]
@@ -182,11 +171,7 @@ mod tests {
             license_id: "test".to_string(),
         };
 
-        #[cfg(feature = "sqlite")]
-        assert!(license.allows(DatabaseType::Sqlite).is_ok());
-
-        #[cfg(feature = "postgres")]
-        assert!(license.allows(DatabaseType::Postgres).is_ok());
+        assert!(license.allows(DatabaseType::DuckDb).is_ok());
     }
 
     #[test]

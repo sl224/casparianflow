@@ -1,8 +1,8 @@
 # RFC: Parser Schema Contract System
 
 **Status:** Working Draft (directional, not binding)
-**Version:** 0.3
-**Date:** 2026-01-16
+**Version:** 0.4
+**Date:** 2026-01-21
 **Authors:** Casparian Flow Team
 **Reviewers:** External LLM Review + 3-Round Spec Refinement Complete
 
@@ -20,11 +20,11 @@ This RFC proposes a strengthened schema contract system for Casparian Flow. Vers
 **v1 direction updates (PMF-driven):**
 - v1 contracts support primitives + Decimal + timestamp_tz; List/Struct are deferred to v1.1.
 - Rust validation is authoritative; parser `_cf_row_error` is optional and additive.
-- Job status uses PartialSuccess with per-output status; CompletedWithWarnings is a compat alias if needed.
+- Job status uses PartialSuccess with per-output status; if CompletedWithWarnings is encountered, treat it as success.
 - Minimum lineage is `_source_row` or `_output_row_index`; `__cf_row_id` is optional; domain provenance is optional.
 
 **Key changes in v0.3:**
-- Complete DataType serde with backward compatibility (Section 6.2)
+- Complete DataType serde with shorthand + object formats (Section 6.2)
 - Simplified logic hash (file-content SHA-256) for advisory change detection (Section 6.4)
 - Quarantine file naming convention defined (Section 6.7.1)
 - Schema approval state machine for Parser Bench (Section 6.9)
@@ -244,7 +244,7 @@ This section grounds the schema contract design in real user workflows and const
 │         │                   │                   │                        │
 │         ▼                   ▼                   ▼                        │
 │  Tag files by         Test parsers,       Query with SQL                │
-│  pattern/type         approve schemas     (DuckDB/SQLite)               │
+│  pattern/type         approve schemas     (DuckDB)                      │
 │                                                                          │
 │  ┌─────────────────────────────────────────────────────────┐            │
 │  │                    Schema Contracts                      │            │
@@ -505,7 +505,7 @@ Required: 9,999,999 valid rows written; 1 row quarantined.
 │     └─ User reviews diff, approves if acceptable                         │
 │     └─ Contract created with scope = parser_id + version + output_name  │
 │     └─ File hash stored as advisory metadata                            │
-│     └─ Contract stored in SQLite with audit metadata                     │
+│     └─ Contract stored in DuckDB with audit metadata                     │
 │                                                                          │
 │  5. RUNTIME (Production Execution)                                       │
 │     └─ Worker loads parser, resolves contract by scope                  │
@@ -614,6 +614,28 @@ class TradeParser:
     }
 ```
 
+**Decision (pre-v1)**:
+- Publish requires a `casparian.toml` manifest (name/version/protocol_version).
+- Schema-as-code is the only supported authoring path for publish (Registry/Vault eligible).
+- A canonical schema artifact (JSON/Arrow) is required for signing/registry and may be produced by tooling.
+- Hand-authored JSON sidecars are not supported for publish.
+- AST-extractable literals are required; no code execution at publish time.
+  - An import tool may exist for migration, but JSON is not a supported authoring format.
+
+**Publish manifest (required):**
+Each parser directory must include a `casparian.toml` with minimal metadata:
+
+```toml
+name = "trade_parser"
+version = "1.0.0"
+protocol_version = "0.1"
+# optional for Python; required for non-Python runtimes later
+entrypoint = "parser.py:parse"
+```
+
+The manifest is serialized to canonical JSON at publish time and included in the
+artifact hash for reproducibility and registry/Vault signing.
+
 **Safe Read Pattern (NEW):**
 - For financial data, avoid implicit float parsing in Python readers.
 - Recommended: read as strings, then parse to Decimal/Int explicitly.
@@ -705,25 +727,25 @@ Arrow provides efficient nested access via `StructArray` and `ListArray` accesso
 /// - Change `fn foo(dt: DataType)` to `fn foo(dt: &DataType)` or use `.clone()`
 /// - Use `ref` patterns in match arms: `DataType::Decimal { ref precision, .. }`
 ///
-/// # Serialization Compatibility
+/// # Serialization Formats
 ///
-/// This enum supports TWO serialization formats for backward compatibility:
+/// This enum supports two serialization formats:
 ///
-/// **Legacy format (primitive types only):**
+/// **Shorthand format (primitive types only):**
 /// ```json
 /// "float64"
 /// ```
 ///
-/// **New format (all types including parameterized):**
+/// **Object format (all types including parameterized):**
 /// ```json
 /// {"kind": "decimal", "precision": 18, "scale": 8}
 /// ```
 ///
-/// Deserialization accepts both formats. Serialization uses the appropriate
-/// format based on variant type (primitives use legacy, parameterized use new).
+/// Deserialization accepts both formats. Serialization uses shorthand for
+/// primitives and object form for parameterized/composite types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DataType {
-    // Primitive types (serialize as strings for backward compat)
+    // Primitive types (serialize as shorthand strings)
     Null,
     Boolean,
     String,
@@ -743,7 +765,7 @@ pub enum DataType {
     List { item: Box<DataType> },
     Struct { fields: Vec<StructField> },
 
-    // DEFERRED to v2: Union type for dirty legacy data
+    // DEFERRED to v2: Union type for dirty data
     // Union { variants: Vec<DataType> },
 }
 
@@ -756,10 +778,10 @@ pub struct StructField {
 }
 ```
 
-**Custom Serde Implementation (backward compatible):**
+**Custom Serde Implementation (shorthand + object):**
 
 ```rust
-// Primitives serialize as strings (legacy format)
+// Primitives serialize as strings (shorthand format)
 serde_json::to_string(&DataType::Float64)
 // => "\"float64\""
 
@@ -768,8 +790,8 @@ serde_json::to_string(&DataType::Decimal { precision: 18, scale: 8 })
 // => "{\"kind\":\"decimal\",\"precision\":18,\"scale\":8}"
 
 // Deserialization accepts BOTH formats
-serde_json::from_str::<DataType>("\"float64\"")  // Legacy
-serde_json::from_str::<DataType>("{\"kind\": \"float64\"}")  // New format for primitives
+serde_json::from_str::<DataType>("\"float64\"")  // Shorthand
+serde_json::from_str::<DataType>("{\"kind\": \"float64\"}")  // Object format for primitives
 serde_json::from_str::<DataType>("{\"kind\": \"decimal\", \"precision\": 18, \"scale\": 8}")
 ```
 
@@ -958,6 +980,206 @@ pub struct ViolationProvenance {
 - v1 quarantine output uses a coarse mapping of violation types (`schema`, `null_not_allowed`, `parser`, `unknown`) derived from `_cf_row_error`; richer ViolationType wiring is deferred.
 ```
 
+#### 6.6.1 ViolationContext for Machine-Readable Errors (NEW)
+
+**Added for AI agent iteration support.** See `docs/decisions/ADR-021-ai-agentic-iteration-workflow.md`.
+
+The `ViolationType` enum provides stable, human-facing error categories. For AI agents
+that need to learn from errors and converge on correct schemas/parsers, we add a
+structured `ViolationContext` payload with sampling and distributions.
+
+**Two-tier error model:**
+1. **Stable primary type** (`ViolationType`): For human UI and coarse categorization.
+2. **Machine context payload** (`ViolationContext`): For AI learning and deterministic fix suggestions.
+
+```rust
+/// Extended violation with machine-readable context for AI learning.
+pub struct ViolationWithContext {
+    /// Core violation (stable)
+    pub violation: SchemaViolation,
+
+    /// Machine-readable context (for AI iteration)
+    pub context: Option<ViolationContext>,
+}
+
+/// Machine-readable error context for AI agent learning.
+/// Designed to enable rapid convergence during agentic parser iteration.
+pub struct ViolationContext {
+    /// Expected canonical type from schema
+    pub expected_type: DataType,
+
+    /// Observed type distribution (what types were actually seen)
+    /// Maps observed kind → fraction of values (0.0 to 1.0)
+    pub observed_type_histogram: Vec<ObservedTypeEntry>,
+
+    /// Sample values that demonstrate the violation (max K, deduplicated, truncated)
+    pub sample_values: Vec<String>,
+
+    /// Optional sample row references for debugging
+    pub sample_rows: Vec<RowRef>,
+
+    /// Deterministic fix suggestions (heuristic-based, no LLM required)
+    pub suggestions: Vec<SuggestedFix>,
+
+    /// Statistics about the violation
+    pub stats: ViolationStats,
+}
+
+/// Entry in the observed type histogram
+pub struct ObservedTypeEntry {
+    /// Observed data kind
+    pub kind: ObservedKind,
+    /// Fraction of values (0.0 to 1.0)
+    pub fraction: f64,
+    /// Sample count
+    pub count: u64,
+}
+
+/// Observed data kinds for type distribution analysis
+pub enum ObservedKind {
+    /// Parseable as expected type
+    MatchesExpected,
+    /// Parseable as integer
+    ParseableInt,
+    /// Parseable as float/decimal
+    ParseableNumeric,
+    /// Looks like a date (various formats)
+    LooksLikeDate,
+    /// Looks like a timestamp
+    LooksLikeTimestamp,
+    /// Boolean-like values (true/false, yes/no, 1/0)
+    LooksLikeBoolean,
+    /// Null/empty values
+    NullOrEmpty,
+    /// Literal sentinel values (N/A, PENDING, NULL, etc.)
+    SentinelLiteral,
+    /// Arbitrary string (no pattern detected)
+    ArbitraryString,
+    /// Binary/unparseable
+    Unparseable,
+}
+
+/// Reference to a sample row
+pub struct RowRef {
+    /// Row index in output (always available)
+    pub output_row_index: u64,
+    /// Source row number (if lineage available)
+    pub source_row: Option<u64>,
+}
+
+/// Deterministic fix suggestion (heuristic-based)
+pub struct SuggestedFix {
+    /// Fix identifier for programmatic matching
+    pub fix_id: SuggestedFixId,
+    /// Human-readable description
+    pub description: String,
+    /// Confidence level (0.0 to 1.0)
+    pub confidence: f64,
+    /// Suggested schema change (if applicable)
+    pub schema_change: Option<SchemaChange>,
+}
+
+pub enum SuggestedFixId {
+    /// Treat sentinel literals as null
+    TreatSentinelsAsNull,
+    /// Make column nullable
+    MakeNullable,
+    /// Widen int to decimal
+    WidenIntToDecimal,
+    /// Widen int to float
+    WidenIntToFloat,
+    /// Change type entirely
+    ChangeType,
+    /// Add preprocessing to normalize values
+    AddPreprocessing,
+    /// Quarantine outliers (keep schema, accept loss)
+    QuarantineOutliers,
+}
+
+pub struct SchemaChange {
+    pub column: String,
+    pub from_type: DataType,
+    pub to_type: DataType,
+    pub from_nullable: bool,
+    pub to_nullable: bool,
+}
+
+/// Statistics about violations in a column
+pub struct ViolationStats {
+    /// Total rows in output
+    pub total_rows: u64,
+    /// Rows that violated this constraint
+    pub violation_count: u64,
+    /// Violation percentage
+    pub violation_pct: f64,
+    /// Null count (for nullability violations)
+    pub null_count: u64,
+}
+```
+
+**Computing observed distributions efficiently:**
+
+Do this in a single pass with bounded memory:
+
+```rust
+struct ColumnAnalyzer {
+    // Counters (O(1) memory)
+    parseable_as_expected: u64,
+    parseable_as_numeric: u64,
+    looks_like_date: u64,
+    null_or_empty: u64,
+    sentinel_count: u64,
+    arbitrary_string: u64,
+
+    // Top N literal values (bounded)
+    top_literals: BoundedHeap<String, 10>,
+
+    // Reservoir sampler for examples (bounded)
+    sample_reservoir: ReservoirSampler<String, 20>,
+
+    // Known sentinels
+    sentinels: HashSet<&'static str>,  // ["N/A", "PENDING", "NULL", "-", ""]
+}
+
+impl ColumnAnalyzer {
+    fn add_value(&mut self, value: &str) {
+        // Classify and count
+        // Reservoir sample for examples
+        // Track top literals
+    }
+
+    fn to_histogram(&self) -> Vec<ObservedTypeEntry> {
+        // Convert counters to fractions
+    }
+}
+```
+
+**Bounds for context payload:**
+- `sample_values`: max 20 values, deduplicated, truncated to 120 chars each.
+- `top_literals`: max 10 unique literals.
+- `sample_rows`: max 20 row references.
+- Total payload: bounded to <8KB per violation.
+
+**Deterministic suggestion heuristics (no LLM required):**
+
+| Observation | Suggestion |
+|-------------|------------|
+| Expected decimal, 1-5% are `N/A\|PENDING\|NULL` | `TreatSentinelsAsNull` or `MakeNullable` |
+| Expected int, some values have decimals | `WidenIntToDecimal` |
+| Expected int, >90% parseable as numeric | `ChangeType` to numeric + quarantine remainder |
+| Expected string, >90% parseable as date | `ChangeType` to date |
+| >10% nulls on non-nullable column | `MakeNullable` |
+| <1% violations | `QuarantineOutliers` |
+
+These heuristics are **deterministic** (same input → same suggestion) and require
+no external LLM call. This enables offline operation and reproducible agent behavior.
+
+**Integration with AI iteration loop:**
+
+See `docs/decisions/ADR-021-ai-agentic-iteration-workflow.md` for the full agentic
+workflow. ViolationContext is emitted during backtest runs and consumed by the
+agent to update its parser/schema proposals.
+
 ### 6.7 Quarantine Pattern (NEW)
 
 **Critical addition based on external review.**
@@ -1028,8 +1250,8 @@ The Quarantine pattern ensures one bad row doesn't block valid data:
 - Including job_id enables matching quarantine to its corresponding main output
 - Same directory simplifies filesystem layout
 
-**SQLite/DuckDB Special Case:**
-For SQLite and DuckDB sinks, quarantine goes to a separate table, not a separate file:
+**DuckDB Special Case:**
+For DuckDB sinks, quarantine goes to a separate table, not a separate file:
 ```sql
 -- Main output table
 CREATE TABLE trades (...);
@@ -1217,7 +1439,7 @@ pub enum OutputStatus {
 }
 ```
 
-**Compatibility:** `CompletedWithWarnings` may be treated as `PartialSuccess` during transition.
+**Note:** If `CompletedWithWarnings` is encountered, treat it as `PartialSuccess`. v1 emits `PartialSuccess`.
 
 #### 6.8.2 Per-Output Tracking
 
@@ -1345,9 +1567,10 @@ file:///var/casparian/output/trades.parquet
 - `file://` infers format from extension (`.parquet`, `.csv`)
 
 **Per-output vs job-level sinks (rationale):**
-- v1 supports a single job-level sink to keep the workflow simple for analysts (one command, one destination).
-- Per-output sinks are deferred to v1.1 for advanced workflows.
-- Precedence (v1): CLI `--sink` > global config > default output directory.
+- v1 supports job-level sinks for `casparian run` and per-output routing in the Sentinel/Worker path.
+- Per-output routing is configured via `cf_topic_config` where `topic_name` matches parser output names (not file tags).
+- If multiple sinks are configured, every output must match `topic_name` or an explicit default (`topic_name="*"`); otherwise the job fails.
+- Single-sink configs still apply to all outputs.
 
 **Global config + CLI:**
 - Global default sink is stored as `output_sink` in config.
@@ -1365,7 +1588,7 @@ casparian run parser.py input.csv --sink parquet:///var/casparian/output
 - `duckdb://` requires a `table` query param; omission is a validation error.
 
 **Multiple tables from one input (NEW):**
-- One input file may yield multiple outputs; each output maps to a separate table or file within the single job-level sink.
+- One input file may yield multiple outputs; each output maps to a separate table or file within the selected sink.
 - For DB sinks, the default table name is the `output_name` unless overridden by `?table=`.
 
 **Quarantine routing by sink:**
@@ -1378,16 +1601,18 @@ casparian run parser.py input.csv --sink parquet:///var/casparian/output
 
 ### 6.11 SDK (Optional Authoring Helper)
 
-The SDK is for **validation and codegen**, not inline use:
+The SDK is for **validation and codegen**, not runtime execution. It produces
+AST-extractable schema-as-code and a canonical schema artifact (JSON/Arrow).
+Hand-authored JSON sidecars are not accepted for publish.
 
 ```python
 # WRONG: Function calls not AST-extractable
 from casparian import schema
 outputs = {"trades": {"columns": [{"type": schema.decimal(18, 8)}]}}  # FAILS
 
-# RIGHT: SDK generates literal dict, user copies to file
+# RIGHT: SDK generates schema-as-code, user copies to file
 $ casparian schema generate trade_parser.py
-# Outputs:
+# Outputs (example in trade_parser.schema.py):
 outputs = {
     "trades": {
         "mode": "strict",
@@ -1403,6 +1628,7 @@ $ casparian parser validate trade_parser.py
 ✓ outputs manifest is valid
 ✓ All types recognized
 ✓ No variable references (AST-safe)
+✓ JSON sidecar schemas are rejected for publish
 ```
 
 ---
@@ -1513,26 +1739,21 @@ class TradeParser:
 
 **Trade-off**: PyArrow has rich types and IDE support, but breaks the non-execution constraint.
 
-### 8.2 Sidecar Manifest File
+### 8.2 JSON Sidecar Manifest File
 
 **Approach**: `trade_parser.schema.json` alongside `trade_parser.py`.
 
-```json
-{
-  "outputs": {
-    "trades": {
-      "columns": [...]
-    }
-  }
-}
-```
+**Rejected (as authoring path)**:
+- Publish/Registry/Vault are schema-as-code only (AST-extractable).
+- Hand-authored JSON sidecars are not supported for publish.
 
-**Partially adopted**:
-- Sidecar is fallback when AST extraction fails
-- Primary is in-parser `outputs` dict
-- Sidecar includes `parser_source_hash` for staleness detection
+**Canonical artifact (kept)**:
+- A canonical schema artifact (JSON/Arrow) is required for signing/registry and
+  may be produced by tooling from schema-as-code or other languages.
 
-**Trade-off**: Two files to maintain, but provides escape hatch for complex cases.
+**Migration note**:
+- A one-time import tool may exist to convert JSON to schema-as-code,
+  but JSON is not a supported authoring format.
 
 ### 8.3 String-Based Type Notation
 
@@ -1577,7 +1798,7 @@ class TradeParser:
 - Query engines (DuckDB, Pandas) have poor Union support
 - Quarantine pattern handles this case adequately for v1
 
-**Trade-off**: Cleaner data model vs. supporting dirty legacy data inline.
+**Trade-off**: Cleaner data model vs. supporting dirty data inline.
 
 ---
 
@@ -1652,7 +1873,7 @@ Future consideration: Add tooling to suggest compatible amendments.
 
 ### 10.1 Union Type (v2)
 
-For dirty legacy data where a column is "mostly Int, sometimes String":
+For dirty data where a column is "mostly Int, sometimes String":
 
 ```python
 {"kind": "union", "variants": [{"kind": "int64"}, {"kind": "string"}]}
@@ -1701,7 +1922,7 @@ class ADTParser:
 **Proposed path**:
 1. Parsers without `outputs` continue to work (inference mode)
 2. TUI shows warning: "Parser lacks outputs manifest. Schema inferred."
-3. CLI command: `casparian schema infer parser.py` generates manifest from sample
+3. CLI command: `casparian schema infer parser.py` generates schema-as-code + manifest from sample
 4. User adds generated manifest to parser
 5. Next approval creates contract from manifest
 
@@ -1716,6 +1937,15 @@ class ADTParser:
 **Goal**: Optional AST-normalized hashing for stronger change detection.
 
 **Reason for deferral**: Maintenance overhead outweighs v1 benefit; explicit versioning is primary.
+
+### 10.8 Language-Neutral Plugin Protocol (Future)
+
+If non-Python plugins are supported, the runtime contract becomes a **process protocol**:
+- Engine spawns a plugin subprocess (python_uv first; native/wasm later).
+- **stdout** streams Arrow IPC batches; **stderr** emits newline-delimited JSON control frames.
+- Output boundaries are explicit (`output_begin` / `output_end`) to support multi-output.
+- Publish remains **manifest-first**; canonical schema artifacts (JSON/Arrow) are language-neutral.
+- `casparian.toml` grows `runtime_kind` + `entrypoint`/`artifact` fields; Vault signing becomes mandatory for native binaries.
 
 
 ---
@@ -1877,11 +2107,12 @@ This is inherently nested - a flat schema loses semantics.
 |---------|------|---------|
 | 0.1 | 2026-01-16 | Initial RFC for external review |
 | 0.2 | 2026-01-16 | Incorporated external review feedback: Added Quarantine pattern (6.7); Changed "hard fail" to "explicit violations" philosophy; Added logic hashing for change detection (6.4); Resolved all open questions (9.x); Upgraded runtime validation to HIGH complexity; Added future considerations (10.x); Added multi-output and streaming notes |
-| 0.3 | 2026-01-16 | **Working Draft** after 3-round spec refinement. Key additions: Custom DataType serde for backward compatibility (6.2.4); Simplified file hash for advisory change detection (6.4); Scope ID binding uses explicit parser_id + version + output_name (6.4); Quarantine file naming convention (6.7.1); 4-level QuarantineConfig cascade (6.7.3); Per-contract quarantine policy (6.7.3); Quarantine directory override (6.7.3); Safe Read guidance (6.1); Multi-output handling with PartialSuccess status (6.8); Validation architecture in Rust/Arrow (5.4). PMF-driven updates: v1 subset of types and Rust validation authority. |
+| 0.3 | 2026-01-16 | **Working Draft** after 3-round spec refinement. Key additions: Custom DataType serde with shorthand/object formats (6.2.4); Simplified file hash for advisory change detection (6.4); Scope ID binding uses explicit parser_id + version + output_name (6.4); Quarantine file naming convention (6.7.1); 4-level QuarantineConfig cascade (6.7.3); Per-contract quarantine policy (6.7.3); Quarantine directory override (6.7.3); Safe Read guidance (6.1); Multi-output handling with PartialSuccess status (6.8); Validation architecture in Rust/Arrow (5.4). PMF-driven updates: v1 subset of types and Rust validation authority. |
+| 0.4 | 2026-01-21 | Added ViolationContext for AI agent learning (Section 6.6.1). Two-tier error model: stable ViolationType for human UI + ViolationContext payload for machine-readable error feedback. Includes observed type histograms, sample values, deterministic fix suggestions. Supports AI agentic iteration workflow per ADR-021. |
 
 ---
 
-## Summary of Key Decisions (v0.3)
+## Summary of Key Decisions (v0.4)
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
@@ -1903,6 +2134,9 @@ This is inherently nested - a flat schema loses semantics.
 | **Quarantine raw data** | Optional, off by default in prod | Reduce PII/PHI exposure |
 | **Quarantine directory** | Optional override | Supports retention policies |
 | **TUI state machine** | 4 states (REVIEW→CONFIRM→EDIT→DONE) | Clear approval workflow |
+| **ViolationContext** | Two-tier error model (ViolationType + Context) | Enables AI agent learning and convergence |
+| **Deterministic suggestions** | Heuristic-based fix suggestions (no LLM) | Offline operation, reproducible behavior |
+| **Ephemeral schema contracts** | Iteration path separate from publish | Fast AI iteration without compromising Vault |
 
 ---
 

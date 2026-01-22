@@ -4,14 +4,93 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::de;
 use serde::ser::SerializeMap;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use url::form_urlencoded;
+use thiserror::Error;
 
 // ============================================================================
 // Canonical Enums (used across all crates)
 // ============================================================================
+
+/// Canonical job identifier across the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, Default)]
+#[serde(transparent)]
+pub struct JobId(u64);
+
+impl JobId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub fn to_i64(self) -> Result<i64, JobIdError> {
+        i64::try_from(self.0).map_err(|_| JobIdError::Overflow(self.0))
+    }
+}
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u64> for JobId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<JobId> for u64 {
+    fn from(value: JobId) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<i64> for JobId {
+    type Error = JobIdError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        if value < 0 {
+            return Err(JobIdError::Negative(value));
+        }
+        Ok(JobId::new(value as u64))
+    }
+}
+
+impl TryFrom<JobId> for i64 {
+    type Error = JobIdError;
+
+    fn try_from(value: JobId) -> Result<Self, Self::Error> {
+        value.to_i64()
+    }
+}
+
+impl FromStr for JobId {
+    type Err = JobIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| JobIdError::Parse(s.to_string()))?;
+        Ok(JobId::new(value))
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum JobIdError {
+    #[error("job id cannot be negative: {0}")]
+    Negative(i64),
+    #[error("job id does not fit in i64: {0}")]
+    Overflow(u64),
+    #[error("invalid job id: {0}")]
+    Parse(String),
+}
 
 /// Sink write mode - how to handle existing data.
 /// This is the CANONICAL definition - use this everywhere.
@@ -81,6 +160,16 @@ pub enum ProcessingStatus {
 }
 
 impl ProcessingStatus {
+    pub const ALL: &'static [ProcessingStatus] = &[
+        ProcessingStatus::Pending,
+        ProcessingStatus::Queued,
+        ProcessingStatus::Running,
+        ProcessingStatus::Staged,
+        ProcessingStatus::Completed,
+        ProcessingStatus::Failed,
+        ProcessingStatus::Skipped,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             ProcessingStatus::Pending => "PENDING",
@@ -134,6 +223,158 @@ impl FromStr for ProcessingStatus {
             "FAILED" => Ok(ProcessingStatus::Failed),
             "SKIPPED" => Ok(ProcessingStatus::Skipped),
             _ => Err(format!("Invalid processing status: '{}'", s)),
+        }
+    }
+}
+
+// ============================================================================
+// Plugin Status (Canonical Definition)
+// ============================================================================
+
+/// Plugin manifest status - lifecycle of a plugin in the registry.
+/// This is the CANONICAL definition - use this everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PluginStatus {
+    /// Plugin created but not yet validated
+    #[default]
+    Pending,
+    /// Plugin is being staged/validated
+    Staging,
+    /// Plugin is active and ready for use
+    Active,
+    /// Plugin was rejected during validation
+    Rejected,
+    /// Plugin was superseded by a newer version
+    Superseded,
+    /// Plugin is deployed (legacy alias for Active)
+    Deployed,
+}
+
+impl PluginStatus {
+    pub const ALL: &'static [PluginStatus] = &[
+        PluginStatus::Pending,
+        PluginStatus::Staging,
+        PluginStatus::Active,
+        PluginStatus::Rejected,
+        PluginStatus::Superseded,
+        PluginStatus::Deployed,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PluginStatus::Pending => "PENDING",
+            PluginStatus::Staging => "STAGING",
+            PluginStatus::Active => "ACTIVE",
+            PluginStatus::Rejected => "REJECTED",
+            PluginStatus::Superseded => "SUPERSEDED",
+            PluginStatus::Deployed => "DEPLOYED",
+        }
+    }
+
+    /// Returns true if the plugin is usable (Active or Deployed)
+    pub fn is_usable(&self) -> bool {
+        matches!(self, PluginStatus::Active | PluginStatus::Deployed)
+    }
+
+    /// Normalize Deployed to Active for consistency
+    pub fn normalize(&self) -> Self {
+        match self {
+            PluginStatus::Deployed => PluginStatus::Active,
+            other => *other,
+        }
+    }
+}
+
+impl fmt::Display for PluginStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for PluginStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "PENDING" => Ok(PluginStatus::Pending),
+            "STAGING" => Ok(PluginStatus::Staging),
+            "ACTIVE" => Ok(PluginStatus::Active),
+            "REJECTED" => Ok(PluginStatus::Rejected),
+            "SUPERSEDED" => Ok(PluginStatus::Superseded),
+            "DEPLOYED" => Ok(PluginStatus::Deployed),
+            _ => Err(format!("Invalid plugin status: '{}'", s)),
+        }
+    }
+}
+
+// ============================================================================
+// Pipeline Run Status (Canonical Definition)
+// ============================================================================
+
+/// Pipeline run status - lifecycle of a pipeline execution.
+/// This is the CANONICAL definition - use this everywhere.
+/// Uses lowercase to match existing DB convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PipelineRunStatus {
+    /// Pipeline run is queued, waiting to start
+    #[default]
+    Queued,
+    /// Pipeline run is currently executing
+    Running,
+    /// Pipeline run resolved to zero files
+    NoOp,
+    /// Pipeline run failed
+    Failed,
+    /// Pipeline run completed successfully
+    Completed,
+}
+
+impl PipelineRunStatus {
+    pub const ALL: &'static [PipelineRunStatus] = &[
+        PipelineRunStatus::Queued,
+        PipelineRunStatus::Running,
+        PipelineRunStatus::NoOp,
+        PipelineRunStatus::Failed,
+        PipelineRunStatus::Completed,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PipelineRunStatus::Queued => "queued",
+            PipelineRunStatus::Running => "running",
+            PipelineRunStatus::NoOp => "no_op",
+            PipelineRunStatus::Failed => "failed",
+            PipelineRunStatus::Completed => "completed",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            PipelineRunStatus::Failed | PipelineRunStatus::Completed | PipelineRunStatus::NoOp
+        )
+    }
+}
+
+impl fmt::Display for PipelineRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for PipelineRunStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "queued" => Ok(PipelineRunStatus::Queued),
+            "running" => Ok(PipelineRunStatus::Running),
+            "no_op" => Ok(PipelineRunStatus::NoOp),
+            "failed" => Ok(PipelineRunStatus::Failed),
+            "completed" => Ok(PipelineRunStatus::Completed),
+            _ => Err(format!("Invalid pipeline run status: '{}'", s)),
         }
     }
 }
@@ -276,8 +517,8 @@ pub struct StructField {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum DataTypeRepr {
-    Legacy(String),
-    Modern(DataTypeObject),
+    Shorthand(String),
+    Object(DataTypeObject),
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,8 +588,8 @@ impl<'de> Deserialize<'de> for DataType {
     {
         let repr = DataTypeRepr::deserialize(deserializer)?;
         match repr {
-            DataTypeRepr::Legacy(raw) => DataType::from_str(&raw).map_err(de::Error::custom),
-            DataTypeRepr::Modern(obj) => DataType::from_object(obj).map_err(de::Error::custom),
+            DataTypeRepr::Shorthand(raw) => DataType::from_str(&raw).map_err(de::Error::custom),
+            DataTypeRepr::Object(obj) => DataType::from_object(obj).map_err(de::Error::custom),
         }
     }
 }
@@ -439,10 +680,7 @@ impl DataType {
             DataType::Int64 => value.parse::<i64>().is_ok(),
             DataType::Float64 => value.parse::<f64>().is_ok(),
             DataType::Date => {
-                // Common date formats
                 chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
-                    || chrono::NaiveDate::parse_from_str(value, "%m/%d/%Y").is_ok()
-                    || chrono::NaiveDate::parse_from_str(value, "%d/%m/%Y").is_ok()
             }
             DataType::Timestamp => {
                 chrono::DateTime::parse_from_rfc3339(value).is_ok()
@@ -568,21 +806,6 @@ impl DataType {
             other => Err(format!("Invalid data type kind: '{}'", other)),
         }
     }
-
-    /// Alias for Int64 (for backwards compatibility with type inference)
-    pub fn integer() -> Self {
-        DataType::Int64
-    }
-
-    /// Alias for Float64 (for backwards compatibility with type inference)
-    pub fn float() -> Self {
-        DataType::Float64
-    }
-
-    /// Alias for Timestamp (for backwards compatibility)
-    pub fn datetime() -> Self {
-        DataType::Timestamp
-    }
 }
 
 fn decimal_precision_scale(value: &str) -> Option<(usize, usize)> {
@@ -690,16 +913,50 @@ impl FromStr for DataType {
 // Sink Configuration
 // ============================================================================
 
+/// Quarantine policy applied to schema violations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuarantineConfig {
+    /// Whether violations are quarantined or hard-fail the job.
+    pub allow_quarantine: bool,
+    /// Maximum percentage of rows that can be quarantined before failing.
+    pub max_quarantine_pct: f64,
+    /// Maximum absolute count of quarantined rows before failing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_quarantine_count: Option<u64>,
+    /// Optional directory override for quarantine outputs (file-based sinks only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quarantine_dir: Option<String>,
+}
+
+impl Default for QuarantineConfig {
+    fn default() -> Self {
+        Self {
+            allow_quarantine: false,
+            max_quarantine_pct: 10.0,
+            max_quarantine_count: None,
+            quarantine_dir: None,
+        }
+    }
+}
+
 /// Configuration for a single data sink.
 /// Worker will use this to instantiate the appropriate sink.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SinkConfig {
     pub topic: String,
     pub uri: String,
     #[serde(default)]
     pub mode: SinkMode,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_def: Option<String>, // Renamed from schema_json to avoid conflicts
+    pub quarantine_config: Option<QuarantineConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<SchemaDefinition>,
+}
+
+/// Typed schema definition for an output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SchemaDefinition {
+    pub columns: Vec<SchemaColumnSpec>,
 }
 
 /// Supported sink URI schemes (job-level).
@@ -777,6 +1034,35 @@ impl ParsedSinkUri {
 // OpCode.DISPATCH (Sentinel -> Worker)
 // ============================================================================
 
+/// Runtime for executing a plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeKind {
+    PythonShim,
+    NativeExec,
+}
+
+impl RuntimeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RuntimeKind::PythonShim => "python_shim",
+            RuntimeKind::NativeExec => "native_exec",
+        }
+    }
+}
+
+impl std::str::FromStr for RuntimeKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "python_shim" => Ok(RuntimeKind::PythonShim),
+            "native_exec" => Ok(RuntimeKind::NativeExec),
+            _ => Err(format!("Unknown runtime_kind '{}'", value)),
+        }
+    }
+}
+
 /// Payload for OpCode.DISPATCH.
 /// Sentinel -> Worker: "Process this file in isolated venv with Bridge Mode."
 ///
@@ -790,11 +1076,24 @@ pub struct DispatchCommand {
     pub sinks: Vec<SinkConfig>,
     pub file_id: i64, // Required for lineage restoration
 
-    // Bridge Mode fields (now required)
-    pub env_hash: String, // SHA256 of lockfile - links to PluginEnvironment
-    pub source_code: String, // Plugin source code for subprocess execution
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_hash: Option<String>, // For signature verification (optional for legacy manifests)
+    // Runtime selection + entrypoint
+    pub runtime_kind: RuntimeKind,
+    pub entrypoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_arch: Option<String>,
+    #[serde(default)]
+    pub signature_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_id: Option<String>,
+
+    // Bridge Mode fields (optional for non-Python runtimes)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hash: Option<String>, // SHA256 of lockfile - links to PluginEnvironment
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_code: Option<String>, // Plugin source code for subprocess execution
+    pub artifact_hash: String, // SHA256(source + lockfile + manifest + schemas)
 }
 
 // ============================================================================
@@ -814,6 +1113,26 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    pub const ALL: &'static [JobStatus] = &[
+        JobStatus::Success,
+        JobStatus::PartialSuccess,
+        JobStatus::CompletedWithWarnings,
+        JobStatus::Failed,
+        JobStatus::Rejected,
+        JobStatus::Aborted,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Success => "SUCCESS",
+            JobStatus::PartialSuccess => "PARTIAL_SUCCESS",
+            JobStatus::CompletedWithWarnings => "COMPLETED_WITH_WARNINGS",
+            JobStatus::Failed => "FAILED",
+            JobStatus::Rejected => "REJECTED",
+            JobStatus::Aborted => "ABORTED",
+        }
+    }
+
     pub fn is_success(&self) -> bool {
         matches!(
             self,
@@ -824,6 +1143,98 @@ impl JobStatus {
     pub fn is_failure(&self) -> bool {
         !self.is_success()
     }
+
+    /// Convert JobStatus to ProcessingStatus for queue updates
+    pub fn to_processing_status(&self) -> ProcessingStatus {
+        match self {
+            JobStatus::Success | JobStatus::PartialSuccess | JobStatus::CompletedWithWarnings => {
+                ProcessingStatus::Completed
+            }
+            JobStatus::Failed | JobStatus::Aborted => ProcessingStatus::Failed,
+            JobStatus::Rejected => ProcessingStatus::Queued, // Requeue on rejection
+        }
+    }
+}
+
+impl fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for JobStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "SUCCESS" => Ok(JobStatus::Success),
+            "PARTIAL_SUCCESS" => Ok(JobStatus::PartialSuccess),
+            "COMPLETED_WITH_WARNINGS" => Ok(JobStatus::CompletedWithWarnings),
+            "FAILED" => Ok(JobStatus::Failed),
+            "REJECTED" => Ok(JobStatus::Rejected),
+            "ABORTED" => Ok(JobStatus::Aborted),
+            _ => Err(format!("Invalid job status: '{}'", s)),
+        }
+    }
+}
+
+// ============================================================================
+// Diagnostics (Worker -> Sentinel)
+// ============================================================================
+
+/// Structured diagnostics included with failures (optional).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct JobDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_mismatch: Option<SchemaMismatch>,
+}
+
+/// Mismatch between expected schema and observed output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaMismatch {
+    pub output_name: String,
+    pub expected_columns: Vec<SchemaColumnSpec>,
+    pub actual_columns: Vec<ObservedColumn>,
+    pub missing_columns: Vec<String>,
+    pub extra_columns: Vec<String>,
+    pub order_mismatches: Vec<ColumnOrderMismatch>,
+    pub type_mismatches: Vec<TypeMismatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SchemaColumnSpec {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservedColumn {
+    pub name: String,
+    pub data_type: ObservedDataType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedDataType {
+    Canonical { data_type: DataType },
+    Arrow { name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnOrderMismatch {
+    pub index: usize,
+    pub expected: String,
+    pub actual: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeMismatch {
+    pub name: String,
+    pub expected: DataType,
+    pub actual: ObservedDataType,
 }
 
 /// Payload for OpCode.CONCLUDE.
@@ -835,6 +1246,8 @@ pub struct JobReceipt {
     pub artifacts: Vec<HashMap<String, String>>, // e.g., [{"topic": "output", "uri": "s3://..."}]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>, // Populated if status is failure
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<JobDiagnostics>,
 }
 
 // ============================================================================
@@ -842,10 +1255,10 @@ pub struct JobReceipt {
 // ============================================================================
 
 /// Payload for OpCode.IDENTIFY.
-/// Worker -> Sentinel: Handshake with capabilities.
+/// Worker -> Sentinel: Handshake with capabilities (informational only in v1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentifyPayload {
-    pub capabilities: Vec<String>, // List of plugin names this worker can execute
+    pub capabilities: Vec<String>, // Informational; Sentinel assumes homogeneous worker pool
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>, // Optional stable worker ID
 }
@@ -877,15 +1290,12 @@ impl HeartbeatStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatPayload {
     pub status: HeartbeatStatus,
-    /// First active job ID (for backward compatibility)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_job_id: Option<i64>,
     /// Number of currently active jobs (0 to MAX_CONCURRENT_JOBS)
     #[serde(default, skip_serializing_if = "is_zero")]
     pub active_job_count: usize,
     /// All active job IDs (for monitoring/debugging)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub active_job_ids: Vec<i64>,
+    pub active_job_ids: Vec<JobId>,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -906,32 +1316,6 @@ pub struct ErrorPayload {
 }
 
 // ============================================================================
-// v5.0 Bridge Mode: Environment Provisioning
-// ============================================================================
-
-/// Payload for OpCode.PREPARE_ENV.
-/// Sentinel -> Worker: "Provision this environment before execution."
-///
-/// Enables Eager Provisioning to avoid network blocking during job execution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrepareEnvCommand {
-    pub env_hash: String, // SHA256 of lockfile content
-    pub lockfile_content: String, // Raw TOML content (uv.lock)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub python_version: Option<String>, // e.g., "3.11"
-}
-
-/// Payload for OpCode.ENV_READY.
-/// Worker -> Sentinel: "Environment is ready."
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnvReadyPayload {
-    pub env_hash: String,
-    pub interpreter_path: String, // Path to Python interpreter in venv
-    #[serde(default)]
-    pub cached: bool, // True if environment was already cached
-}
-
-// ============================================================================
 // v5.0 Bridge Mode: Artifact Deployment
 // ============================================================================
 
@@ -944,9 +1328,12 @@ pub struct DeployCommand {
     pub plugin_name: String,
     pub version: String,
     pub source_code: String,
-    pub lockfile_content: String, // uv.lock content (empty string for legacy mode)
+    pub lockfile_content: String, // uv.lock content (required)
     pub env_hash: String,         // SHA256(lockfile_content)
-    pub artifact_hash: String,    // SHA256(source_code + lockfile_content)
+    pub artifact_hash: String,    // SHA256(source + lockfile + manifest + schemas)
+    pub manifest_json: String,    // canonical plugin manifest (JSON)
+    pub protocol_version: String, // protocol version for runtime contract
+    pub schema_artifacts_json: String, // canonical schema artifacts (JSON)
     pub publisher_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publisher_email: Option<String>,
@@ -1199,7 +1586,8 @@ mod tests {
             topic: "output".to_string(),
             uri: "s3://bucket/key".to_string(),
             mode: SinkMode::Append,
-            schema_def: None,
+            quarantine_config: None,
+            schema: None,
         };
 
         let json = serde_json::to_string(&sink).unwrap();
@@ -1218,8 +1606,21 @@ mod tests {
 
     #[test]
     fn test_worker_status_from_str() {
-        assert_eq!("IDLE".parse::<WorkerStatus>().unwrap(), WorkerStatus::Idle);
-        assert_eq!("busy".parse::<WorkerStatus>().unwrap(), WorkerStatus::Busy);
+        assert_eq!(
+            WorkerStatus::Idle
+                .as_str()
+                .parse::<WorkerStatus>()
+                .unwrap(),
+            WorkerStatus::Idle
+        );
+        assert_eq!(
+            WorkerStatus::Busy
+                .as_str()
+                .to_ascii_lowercase()
+                .parse::<WorkerStatus>()
+                .unwrap(),
+            WorkerStatus::Busy
+        );
         assert!(WorkerStatus::Idle.is_available());
         assert!(!WorkerStatus::Busy.is_available());
     }
@@ -1241,15 +1642,13 @@ mod tests {
     fn test_heartbeat_payload_serialization() {
         let payload = HeartbeatPayload {
             status: HeartbeatStatus::Busy,
-            current_job_id: Some(12345),
             active_job_count: 3,
-            active_job_ids: vec![12345, 12346, 12347],
+            active_job_ids: vec![JobId::new(12345), JobId::new(12346), JobId::new(12347)],
         };
 
         let json = serde_json::to_string(&payload).expect("serialize heartbeat");
         let deserialized: HeartbeatPayload = serde_json::from_str(&json).expect("deserialize heartbeat");
         assert_eq!(payload.status, deserialized.status);
-        assert_eq!(payload.current_job_id, deserialized.current_job_id);
         assert_eq!(payload.active_job_count, deserialized.active_job_count);
         assert_eq!(payload.active_job_ids, deserialized.active_job_ids);
     }
@@ -1278,17 +1677,6 @@ mod tests {
     }
 
     #[test]
-    fn test_heartbeat_payload_backward_compat() {
-        // Old payload without new fields should deserialize with defaults
-        let old_json = r#"{"status":"ALIVE","current_job_id":123}"#;
-        let payload: HeartbeatPayload = serde_json::from_str(old_json).expect("deserialize old heartbeat");
-        assert_eq!(payload.status, HeartbeatStatus::Alive);
-        assert_eq!(payload.current_job_id, Some(123));
-        assert_eq!(payload.active_job_count, 0);
-        assert!(payload.active_job_ids.is_empty());
-    }
-
-    #[test]
     fn test_job_receipt_serialization() {
         let mut metrics = HashMap::new();
         metrics.insert("rows".to_string(), 1500);
@@ -1299,6 +1687,7 @@ mod tests {
             metrics,
             artifacts: vec![],
             error_message: None,
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&receipt).unwrap();
@@ -1439,7 +1828,7 @@ mod tests {
 
         // Date
         assert!(DataType::Date.validate_string("2024-01-15"));
-        assert!(DataType::Date.validate_string("01/15/2024"));
+        assert!(!DataType::Date.validate_string("01/15/2024"));
         assert!(!DataType::Date.validate_string("not-a-date"));
 
         // Timestamp
@@ -1473,7 +1862,7 @@ mod tests {
         let date_format = "%Y-%m-%d";
         assert!(DataType::Date.validate_string_with_format("2024-01-15", Some(date_format)));
         assert!(!DataType::Date.validate_string_with_format("01/15/2024", Some(date_format)));
-        assert!(DataType::Date.validate_string_with_format("01/15/2024", None));
+        assert!(!DataType::Date.validate_string_with_format("01/15/2024", None));
 
         let ts_format = "%Y-%m-%dT%H:%M:%S%:z";
         let ts_tz = DataType::TimestampTz { tz: "UTC".to_string() };
@@ -1498,7 +1887,7 @@ mod tests {
 
     #[test]
     fn test_datatype_serialization() {
-        // Test that primitive DataType serializes to legacy strings
+        // Test that primitive DataType serializes to shorthand strings
         assert_eq!(
             serde_json::to_string(&DataType::Int64).unwrap(),
             "\"int64\""
@@ -1577,10 +1966,149 @@ mod tests {
         assert_eq!(all.len(), 10); // All 10 primitive variants
     }
 
+    // ======================================================================
+    // PluginStatus tests
+    // ======================================================================
+
     #[test]
-    fn test_datatype_aliases() {
-        assert_eq!(DataType::integer(), DataType::Int64);
-        assert_eq!(DataType::float(), DataType::Float64);
-        assert_eq!(DataType::datetime(), DataType::Timestamp);
+    fn test_plugin_status_serialization() {
+        assert_eq!(
+            serde_json::to_string(&PluginStatus::Pending).unwrap(),
+            "\"PENDING\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PluginStatus::Active).unwrap(),
+            "\"ACTIVE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PluginStatus::Superseded).unwrap(),
+            "\"SUPERSEDED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PluginStatus::Deployed).unwrap(),
+            "\"DEPLOYED\""
+        );
+    }
+
+    #[test]
+    fn test_plugin_status_from_str() {
+        assert_eq!("PENDING".parse::<PluginStatus>().unwrap(), PluginStatus::Pending);
+        assert_eq!("staging".parse::<PluginStatus>().unwrap(), PluginStatus::Staging);
+        assert_eq!("ACTIVE".parse::<PluginStatus>().unwrap(), PluginStatus::Active);
+        assert_eq!("REJECTED".parse::<PluginStatus>().unwrap(), PluginStatus::Rejected);
+        assert_eq!("SUPERSEDED".parse::<PluginStatus>().unwrap(), PluginStatus::Superseded);
+        assert_eq!("DEPLOYED".parse::<PluginStatus>().unwrap(), PluginStatus::Deployed);
+        assert!("invalid".parse::<PluginStatus>().is_err());
+    }
+
+    #[test]
+    fn test_plugin_status_is_usable() {
+        assert!(!PluginStatus::Pending.is_usable());
+        assert!(!PluginStatus::Staging.is_usable());
+        assert!(PluginStatus::Active.is_usable());
+        assert!(!PluginStatus::Rejected.is_usable());
+        assert!(!PluginStatus::Superseded.is_usable());
+        assert!(PluginStatus::Deployed.is_usable()); // Deployed is alias for Active
+    }
+
+    #[test]
+    fn test_plugin_status_normalize() {
+        assert_eq!(PluginStatus::Deployed.normalize(), PluginStatus::Active);
+        assert_eq!(PluginStatus::Active.normalize(), PluginStatus::Active);
+        assert_eq!(PluginStatus::Pending.normalize(), PluginStatus::Pending);
+    }
+
+    // ======================================================================
+    // PipelineRunStatus tests
+    // ======================================================================
+
+    #[test]
+    fn test_pipeline_run_status_serialization() {
+        // Uses lowercase per enum_consolidation_plan.md
+        assert_eq!(
+            serde_json::to_string(&PipelineRunStatus::Queued).unwrap(),
+            "\"queued\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PipelineRunStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PipelineRunStatus::NoOp).unwrap(),
+            "\"no_op\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PipelineRunStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PipelineRunStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+    }
+
+    #[test]
+    fn test_pipeline_run_status_from_str() {
+        assert_eq!("queued".parse::<PipelineRunStatus>().unwrap(), PipelineRunStatus::Queued);
+        assert_eq!("RUNNING".parse::<PipelineRunStatus>().unwrap(), PipelineRunStatus::Running);
+        assert_eq!("no_op".parse::<PipelineRunStatus>().unwrap(), PipelineRunStatus::NoOp);
+        assert_eq!("failed".parse::<PipelineRunStatus>().unwrap(), PipelineRunStatus::Failed);
+        assert_eq!("completed".parse::<PipelineRunStatus>().unwrap(), PipelineRunStatus::Completed);
+        assert!("invalid".parse::<PipelineRunStatus>().is_err());
+    }
+
+    #[test]
+    fn test_pipeline_run_status_is_terminal() {
+        assert!(!PipelineRunStatus::Queued.is_terminal());
+        assert!(!PipelineRunStatus::Running.is_terminal());
+        assert!(PipelineRunStatus::NoOp.is_terminal());
+        assert!(PipelineRunStatus::Failed.is_terminal());
+        assert!(PipelineRunStatus::Completed.is_terminal());
+    }
+
+    // ======================================================================
+    // JobStatus enhanced method tests
+    // ======================================================================
+
+    #[test]
+    fn test_job_status_as_str() {
+        assert_eq!(JobStatus::Success.as_str(), "SUCCESS");
+        assert_eq!(JobStatus::PartialSuccess.as_str(), "PARTIAL_SUCCESS");
+        assert_eq!(JobStatus::CompletedWithWarnings.as_str(), "COMPLETED_WITH_WARNINGS");
+        assert_eq!(JobStatus::Failed.as_str(), "FAILED");
+        assert_eq!(JobStatus::Rejected.as_str(), "REJECTED");
+        assert_eq!(JobStatus::Aborted.as_str(), "ABORTED");
+    }
+
+    #[test]
+    fn test_job_status_from_str() {
+        assert_eq!("SUCCESS".parse::<JobStatus>().unwrap(), JobStatus::Success);
+        assert_eq!("partial_success".parse::<JobStatus>().unwrap(), JobStatus::PartialSuccess);
+        assert_eq!("COMPLETED_WITH_WARNINGS".parse::<JobStatus>().unwrap(), JobStatus::CompletedWithWarnings);
+        assert_eq!("FAILED".parse::<JobStatus>().unwrap(), JobStatus::Failed);
+        assert_eq!("rejected".parse::<JobStatus>().unwrap(), JobStatus::Rejected);
+        assert_eq!("ABORTED".parse::<JobStatus>().unwrap(), JobStatus::Aborted);
+        assert!("invalid".parse::<JobStatus>().is_err());
+    }
+
+    #[test]
+    fn test_job_status_to_processing_status() {
+        // Success outcomes -> Completed
+        assert_eq!(JobStatus::Success.to_processing_status(), ProcessingStatus::Completed);
+        assert_eq!(JobStatus::PartialSuccess.to_processing_status(), ProcessingStatus::Completed);
+        assert_eq!(JobStatus::CompletedWithWarnings.to_processing_status(), ProcessingStatus::Completed);
+
+        // Failure outcomes -> Failed
+        assert_eq!(JobStatus::Failed.to_processing_status(), ProcessingStatus::Failed);
+        assert_eq!(JobStatus::Aborted.to_processing_status(), ProcessingStatus::Failed);
+
+        // Rejected -> Queued (for requeue)
+        assert_eq!(JobStatus::Rejected.to_processing_status(), ProcessingStatus::Queued);
+    }
+
+    #[test]
+    fn test_job_status_display() {
+        assert_eq!(format!("{}", JobStatus::Success), "SUCCESS");
+        assert_eq!(format!("{}", JobStatus::PartialSuccess), "PARTIAL_SUCCESS");
     }
 }

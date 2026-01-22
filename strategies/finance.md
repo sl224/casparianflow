@@ -1,23 +1,40 @@
 # Financial Services Market Strategy
 
-**Status:** Draft
+**Status:** Deprioritized (P3)
 **Parent:** STRATEGY.md Section 2 (Target Market → Financial Services)
-**Version:** 0.3
-**Date:** January 14, 2026
+**Priority:** P3 (Consultant-Delivered Only)
+**Version:** 0.4
+**Date:** January 20, 2026
+
+---
+
+> **Strategic Decision (January 2026):** Trade Desk has been deprioritized from P0 to P3 based on strategic evaluation. See `docs/strategic_fork_evaluation.md` for full analysis.
+>
+> **Key Finding:** Trade Support Analysts don't write parsers (core Casparian value). Pursuing them directly risks becoming a "Service Trap" where Casparian writes and maintains parsers for customers.
+>
+> **New Approach:** Finance/Trade Desk is now a **consultant-delivered** market. Financial technology consultants use Casparian to build solutions for trading desks, rather than Casparian selling directly to Trade Support.
 
 ---
 
 ## 1. Executive Summary
 
-This substrategy details how Casparian Flow captures the financial services data analytics market by positioning against expensive enterprise solutions (Bloomberg Terminal, Refinitiv) and complex ETL tooling (Fivetran, Airbyte).
+This substrategy details the **deprioritized** approach to financial services, specifically targeting Trade Support/Middle Office via consultant delivery.
 
-**Core Insight:** Financial data is trapped in expensive terminals, proprietary formats, and regulatory filings. Teams with Python skills can't easily operationalize parsing for FIX, XBRL, or ISO 20022 without significant engineering investment.
+**Why Trade Desk Was Deprioritized:**
 
-**Primary Attack Vector:** "The Trade Break Workbench" - enable Trade Support Engineers to debug trade breaks in 5 minutes instead of 45 by reconstructing trade lifecycles from FIX logs into queryable SQL.
+| Factor | Trade Desk | eDiscovery/DFIR (contrast) |
+|--------|------------|---------------------------|
+| **Writes Python?** | NO (Excel/VBA users) | YES |
+| **Uses Parser Dev Loop?** | NO (consumes premade) | YES |
+| **Audit Trail Required?** | Nice-to-have | LEGALLY REQUIRED |
+| **Risk of Service Trap** | HIGH | LOW |
+| **Feedback Type** | Domain-specific (FIX tags) | Platform (backtest, lineage) |
 
-**Secondary Attack Vector:** "Quant Liberation" - give quantitative analysts and compliance teams direct access to alternative data, SEC filings, and trade data without $30K/year terminal subscriptions.
+**Original Insight (Still Valid):** Financial data is trapped in expensive terminals, proprietary formats, and regulatory filings. The Trade Break pain is real (30-45 min → 5 min).
 
-**Strategic Positioning:** Casparian is a **"Liability Shield"** (compliance/audit trail) and **"Risk Reducer"** (faster trade break resolution = less settlement risk).
+**Changed Approach:** Instead of selling directly to Trade Support (who don't write parsers), target **Financial Technology Consultants** who use Casparian as infrastructure to build Trade Break solutions.
+
+**Strategic Positioning:** Casparian enables **consultants** to deliver "Liability Shield" and "Risk Reducer" solutions to trading desks.
 
 ---
 
@@ -181,15 +198,53 @@ Post-November 2025, MX messages dominate:
 
 ## 4. Target Personas
 
-### 4.1 Primary: Trade Support Engineer (Tier 2 Support)
+### 4.1 Primary: Trade Support Analyst (Validated Jan 2026)
 
 | Attribute | Description |
 |-----------|-------------|
 | **Role** | Trade Support Analyst, Middle Office, Operations |
-| **Technical skill** | SQL, grep, basic scripting; NOT Python experts |
+| **Technical skill** | **Excel, VBA, SQL**; NOT command line users (see research below) |
 | **Pain** | Trade breaks take 30-45 minutes to debug; T+1 pressure |
 | **Goal** | Resolve trade breaks before settlement deadline |
 | **Buying power** | Operations budget; can approve tools that reduce risk |
+
+#### Critical Research Finding: CLI vs GUI (Jan 2026)
+
+**Original assumption:** Trade Support uses grep, command line, Unix tools.
+
+**Research finding:** **FALSE.** Trade Support Analysts are Excel/VBA users, not command line users.
+
+| Source | Finding |
+|--------|---------|
+| [Goodman Masson](https://www.goodmanmasson.com/the-insights-hub/a-day-in-the-life-of-a-trade-support-analyst) | "Strong Excel skills are highly sought after, so if you have experience of Macros (VBA)..." |
+| [Velvet Jobs](https://www.velvetjobs.com/job-descriptions/trade-support-analyst) | "Trade support analysts provide ad hoc analysis using SQL, Excel, VBA and internal utilities" |
+| [Wall Street Oasis](https://www.wallstreetoasis.com/forum/trading/trading-support-analyst-excel-vba-requirement) | "VBA definitely helps... you are dealing with a lot of spreadsheets and data manipulation" |
+| Job postings (JPM, Citi, SocGen) | Excel/VBA required; Unix/Linux NOT mentioned for Trade Support roles |
+
+**Implication:** A CLI-only product will face adoption friction. Trade Support Analysts expect GUI tools (Bloomberg Terminal, Excel, internal trading systems).
+
+**Important distinction:** "Application Support Analysts" (IT/Tech roles) DO use Unix/Linux and command line. These are different roles:
+
+| Role | Department | Tools | Our Target? |
+|------|------------|-------|-------------|
+| **Trade Support Analyst** | Operations/Middle Office | Excel, VBA, SQL, Bloomberg | **YES** |
+| Application Support Analyst | IT/Technology | Unix, shell scripting, Python | No |
+
+**Previous Decision:** Build Tauri GUI for Trade Support Analysts. See [ADR-020](../docs/decisions/ADR-020-tauri-gui.md).
+
+**Updated Decision (Jan 2026):** Tauri GUI development deprioritized. Instead, focus CLI on consultant users who deliver solutions to Trade Desks. See `docs/strategic_fork_evaluation.md` Section 20-21.
+
+#### Buyer Authority Chain
+
+| Role | Budget Authority | How to Reach | Sales Motion |
+|------|------------------|--------------|--------------|
+| **Trade Support Analyst** | Recommender only | LinkedIn DM, demo | Bottom-up |
+| **Manager of Trade Support** | $5K-$50K discretionary | Email, warm intro from analyst | Champion-led |
+| **Head of Operations / COO** | >$50K, strategic | Executive sponsorship | Top-down |
+
+**Key insight:** Operations budget (not IT budget) means faster approval. Operations managers can often approve tools under $25K without IT/procurement involvement.
+
+**Sales motion:** Bottom-up. Win the analyst first (they feel the pain daily), then the analyst champions to their manager ("This saves me 4 hours/day").
 
 **Current Workflow (painful):**
 1. Receive alert: "Trade break on order 12345"
@@ -247,6 +302,48 @@ Post-November 2025, MX messages dominate:
 | **Pain** | Custom FIX parsing for each venue; maintenance burden |
 | **Goal** | Standardize FIX log analysis across venues |
 | **Buying power** | Technical decision maker; budget for tools |
+
+---
+
+## 4.5 NEW TARGET: Financial Technology Consultant (Primary)
+
+> **Added January 2026:** Following the strategic pivot, FinTech Consultants are now the primary target for this vertical.
+
+| Attribute | Description |
+|-----------|-------------|
+| **Role** | Trading systems consultant, FIX integration specialist, FinTech boutique |
+| **Technical skill** | **Python, FIX protocol, SQL** - writes parsers |
+| **Pain** | Rebuilding FIX parsing infrastructure for each client |
+| **Goal** | Reusable tooling; demonstrate governance to clients |
+| **Buying power** | Monthly subscription; passes cost to clients |
+
+**Why Consultants Are the Right Target:**
+
+| Factor | Trade Support Direct | Consultant-Delivered |
+|--------|---------------------|---------------------|
+| Writes parsers? | NO | YES |
+| Uses parser dev loop? | NO | YES |
+| Platform feedback? | Domain (FIX tags) | Platform (backtest, lineage) |
+| Sales cycle | Medium (Operations budget) | Fast (Individual decision) |
+| Ongoing maintenance | YOU do it | CONSULTANT does it |
+
+**The Model:**
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    CONSULTANT-DELIVERED MODEL                        │
+│                                                                     │
+│   [Casparian]  ──►  [FinTech Consultant]  ──►  [Trading Desk]      │
+│    (Platform)        (Writes FIX parser)       (Consumes output)   │
+│                      (Maintains solution)      (Pays consultant)   │
+│                      (Uses full platform)                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Benefits:**
+- Casparian validates platform value (consultant uses backtest, lineage)
+- No "Service Trap" (consultant handles domain expertise)
+- Scalable (one consultant serves multiple desks)
+- Recurring revenue (consultant subscription + client passthrough)
 
 ---
 
@@ -485,39 +582,51 @@ ORDER BY last_update DESC;
 
 ---
 
-## 8. Go-to-Market
+## 8. Go-to-Market (Updated: Consultant-First)
 
-### 8.1 Channels
+> **Changed January 2026:** Direct sales to Trade Support deprioritized. Focus on FinTech Consultants who deliver solutions to Trading Desks.
+
+### 8.1 Primary Channel: FinTech Consultants
 
 | Channel | Approach | Timeline |
 |---------|----------|----------|
-| **Quant communities** | QuantConnect, Quantopian alumni, r/algotrading | Month 1-3 |
-| **Fintech developers** | Dev.to, Medium, GitHub | Month 1-6 |
-| **Compliance conferences** | SIFMA, FIA, RegTech events | Month 6-12 |
-| **Trading tech firms** | Direct outreach to hedge funds | Month 3-9 |
+| **FIX integration consultants** | LinkedIn outreach, partnerships | Month 1-3 |
+| **Trading systems boutiques** | Direct sales | Month 3-6 |
+| **FIX protocol vendors** | Partner program | Month 6-12 |
 
-### 8.2 Content Strategy
+### 8.2 Secondary Channel: Quant/Developer (Longer Term)
+
+| Channel | Approach | Timeline |
+|---------|----------|----------|
+| **Quant communities** | QuantConnect, Quantopian alumni, r/algotrading | Month 6-12 |
+| **Fintech developers** | Dev.to, Medium, GitHub | Month 6-12 |
+
+### 8.3 Content Strategy
 
 | Content | Purpose | Priority |
 |---------|---------|----------|
-| "Parse SEC 10-K in 5 minutes" video | Top-of-funnel | High |
-| "FIX log analysis tutorial" | Developer education | High |
-| "ISO 20022 for analysts" guide | Post-migration audience | Medium |
-| "Bloomberg alternatives" blog | SEO, cost-conscious buyers | Medium |
+| "FIX log analysis for consultants" tutorial | Consultant education | High |
+| "Parse SEC 10-K in 5 minutes" video | Developer funnel | Medium |
+| "ISO 20022 for analysts" guide | Post-migration audience | Low |
+| "Bloomberg alternatives" blog | SEO | Low |
 
-#### Killer Demo Clips (Cash-First)
+### 8.4 Demo for Consultants
 
-**Flagship: "Trade Break in 60 Seconds (Local-First)"**
-- Hook: "T+1 is live. Here's a break resolved in 60 seconds, offline."
-- Scan + auto-tag: `casparian scan /logs --auto-tag` (show AI tags and patterns)
-- Parse: `casparian process --tag fix_logs` (show tables created)
-- Query: pull a trade timeline, highlight missing step
-- Export: `casparian export --format csv` (share with compliance)
-- Close: "No cloud. No pipeline. $X saved per break."
+**"Trade Break Pipeline for Your Clients"**
+- Hook: "Your trading desk clients have T+1 pressure. Here's infrastructure to build them a solution."
+- Show: Casparian platform with FIX parser example
+- Emphasize: YOU write the parser, platform handles governance
+- Close: "Ship defensible FIX log analysis to clients, not throwaway scripts."
 
-**Secondary: "No-IT Audit Trail"**
-- Scan a week of logs, parse, run compliance query
-- Emphasize: local-first, no dependencies, auditable outputs
+### 8.5 If Direct Trade Desk Sales Required (Survival Mode)
+
+> See `docs/strategic_fork_evaluation.md` Section 20 for detailed "Survival Mode" approach.
+
+If cash flow requires Trade Desk sales:
+1. **Treat as NRE** - Charge high upfront setup fee ($15K+)
+2. **Don't replace Excel** - Output CSV/Parquet that Excel reads
+3. **Ignore domain feature requests** - Keep UI generic
+4. **Minimal delivery** - CLI + premade parser + CSV output (no custom GUI)
 
 ### 8.3 Pricing (Finance Vertical) - Value-Based
 
@@ -618,3 +727,4 @@ Finance revenue scenarios should be maintained in a dedicated model that referen
 | 2026-01-08 | 0.1 | Initial draft |
 | 2026-01-08 | 0.2 | Gap analysis integration: Trade Break Workbench as primary attack; T+1 urgency section; Trade Support Engineer persona; fix_order_lifecycle table; updated positioning |
 | 2026-01-14 | 0.3 | Maintenance workflow: Updated T+1 to reflect live status (May 2024); added global T+1 expansion (EU/UK Oct 2027); updated ISO 20022 to post-migration reality with Nov 2026 structured address deadline |
+| 2026-01-20 | 0.4 | **Major strategic pivot:** Trade Desk deprioritized from P0 to P3; Added consultant-delivered model (Section 4.5); Updated GTM to consultant-first; Marked Tauri GUI as deprioritized; See `docs/strategic_fork_evaluation.md` for full analysis |

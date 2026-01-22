@@ -13,14 +13,14 @@
 
 use super::db::Database;
 use super::error::{Result, ScoutError};
-use super::types::{ScanStats, ScannedFile, Source};
+use super::types::{ScanStats, ScannedFile, Source, SourceId};
 use chrono::Utc;
 use ignore::WalkBuilder;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tracing::info;
 
 /// GAP-SCAN-003: Normalize a path to use forward slashes consistently.
@@ -157,8 +157,8 @@ impl Scanner {
     /// Scan a source directory and update the database.
     ///
     /// Convenience wrapper for `scan()` with no progress reporting or tagging.
-    pub async fn scan_source(&self, source: &Source) -> Result<ScanResult> {
-        self.scan(source, None, None).await
+    pub fn scan_source(&self, source: &Source) -> Result<ScanResult> {
+        self.scan(source, None, None)
     }
 
     /// Scan a source with optional progress updates and tagging.
@@ -169,7 +169,7 @@ impl Scanner {
     /// - Bounded channel with backpressure prevents memory blowup
     /// - Optional progress updates via channel for TUI
     /// - Optional tagging of all discovered files
-    pub async fn scan(
+    pub fn scan(
         &self,
         source: &Source,
         progress_tx: Option<mpsc::Sender<ScanProgress>>,
@@ -185,7 +185,7 @@ impl Scanner {
 
         // Send initial progress so UI shows something immediately
         if let Some(ref tx) = progress_tx {
-            let _ = tx.try_send(ScanProgress {
+            let _ = tx.send(ScanProgress {
                 dirs_scanned: 0,
                 files_found: 0,
                 files_persisted: 0,
@@ -198,7 +198,7 @@ impl Scanner {
 
         // Create bounded channel for backpressure (GAP-006)
         // 10 batches in flight = batch_size * 10 files max in memory
-        let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<ScannedFile>>(10);
+        let (batch_tx, batch_rx) = mpsc::sync_channel::<Vec<ScannedFile>>(10);
 
         // Shared counter for files_persisted (updated by persist task, read by walker for progress)
         let files_persisted_counter = Arc::new(AtomicUsize::new(0));
@@ -209,44 +209,10 @@ impl Scanner {
         let scan_ok = Arc::new(AtomicBool::new(true));
         let scan_ok_for_persist = scan_ok.clone();
 
-        // Spawn the persist task that processes batches as they arrive
+        // Spawn the walk task; persistence happens on the calling thread
         let db = self.db.clone();
         let tag_owned = tag.map(|t| t.to_string());
         let batch_size = self.config.batch_size;
-
-        let persist_handle = tokio::spawn(async move {
-            let mut stats = ScanStats::default();
-
-            while let Some(batch) = batch_rx.recv().await {
-                let batch_len = batch.len();
-
-                // GAP-SCAN-005: Track files_discovered as total files received (including failed)
-                // This represents what the walker found, regardless of persist success
-                stats.files_discovered += batch_len as u64;
-
-                // GAP-002: Transactional batch persist
-                match Self::persist_batch_streaming(&db, batch, tag_owned.as_deref()).await {
-                    Ok(batch_stats) => {
-                        stats.files_new += batch_stats.files_new;
-                        stats.files_changed += batch_stats.files_changed;
-                        stats.files_unchanged += batch_stats.files_unchanged;
-                        // GAP-SCAN-005: Track files_persisted separately from files_discovered
-                        stats.files_persisted += batch_len as u64;
-
-                        // Update shared counter for progress reporting
-                        files_persisted_for_persist.fetch_add(batch_len, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        stats.errors += batch_len as u64;
-                        // GAP-SCAN-001: Mark scan as failed so we don't incorrectly mark files as deleted
-                        scan_ok_for_persist.store(false, Ordering::Relaxed);
-                        tracing::warn!(error = %e, "Batch persist failed - will skip mark_deleted_files");
-                    }
-                }
-            }
-
-            stats
-        });
 
         // Run the parallel walk in a blocking task, sending batches to channel
         let walk_source_path = source_path.to_path_buf();
@@ -261,7 +227,7 @@ impl Scanner {
         let walk_exclude_dir_names = self.config.exclude_dir_names.clone();
         let walk_exclude_path_patterns = self.config.exclude_path_patterns.clone();
 
-        let walk_handle = tokio::task::spawn_blocking(move || {
+        let walk_handle = std::thread::spawn(move || {
             Self::parallel_walk(
                 &walk_source_path,
                 &walk_source_id,
@@ -278,15 +244,39 @@ impl Scanner {
             )
         });
 
-        // Wait for walk to complete (this drops the sender, signaling persist task)
-        let (walk_stats, walk_errors) = walk_handle
-            .await
-            .map_err(|e| ScoutError::Config(format!("Walk task panicked: {}", e)))??;
+        let mut persist_stats = ScanStats::default();
+        while let Ok(batch) = batch_rx.recv() {
+            let batch_len = batch.len();
 
-        // Wait for persist task to finish processing remaining batches
-        let persist_stats = persist_handle
-            .await
-            .map_err(|e| ScoutError::Config(format!("Persist task panicked: {}", e)))?;
+            // GAP-SCAN-005: Track files_discovered as total files received (including failed)
+            // This represents what the walker found, regardless of persist success
+            persist_stats.files_discovered += batch_len as u64;
+
+            // GAP-002: Transactional batch persist
+            match Self::persist_batch_streaming(&db, batch, tag_owned.as_deref()) {
+                Ok(batch_stats) => {
+                    persist_stats.files_new += batch_stats.files_new;
+                    persist_stats.files_changed += batch_stats.files_changed;
+                    persist_stats.files_unchanged += batch_stats.files_unchanged;
+                    // GAP-SCAN-005: Track files_persisted separately from files_discovered
+                    persist_stats.files_persisted += batch_len as u64;
+
+                    // Update shared counter for progress reporting
+                    files_persisted_for_persist.fetch_add(batch_len, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    persist_stats.errors += batch_len as u64;
+                    // GAP-SCAN-001: Mark scan as failed so we don't incorrectly mark files as deleted
+                    scan_ok_for_persist.store(false, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "Batch persist failed - will skip mark_deleted_files");
+                }
+            }
+        }
+
+        let walk_result = walk_handle
+            .join()
+            .map_err(|_| ScoutError::InvalidState("Walk task panicked".to_string()))?;
+        let (walk_stats, walk_errors) = walk_result?;
 
         // Combine stats
         let mut final_stats = persist_stats;
@@ -295,7 +285,7 @@ impl Scanner {
 
         // Send final progress
         if let Some(ref tx) = progress_tx {
-            let _ = tx.try_send(ScanProgress {
+            let _ = tx.send(ScanProgress {
                 dirs_scanned: final_stats.dirs_scanned as usize,
                 files_found: final_stats.files_discovered as usize,
                 files_persisted: files_persisted_counter.load(Ordering::Relaxed),
@@ -307,7 +297,7 @@ impl Scanner {
         // If any batch failed, files in that batch weren't updated with last_seen_at,
         // so marking them deleted would be incorrect (data loss)
         let deleted = if scan_ok.load(Ordering::Relaxed) {
-            self.db.mark_deleted_files(&source.id, scan_start).await?
+            self.db.mark_deleted_files(&source.id, scan_start)?
         } else {
             tracing::warn!(
                 source = %source.name,
@@ -322,12 +312,12 @@ impl Scanner {
 
         // Update denormalized file_count on source for fast TUI queries
         // GAP-SCAN-005: Use files_persisted (actual count in DB) not files_discovered
-        if let Err(e) = self.db.update_source_file_count(&source.id, final_stats.files_persisted as usize).await {
+        if let Err(e) = self.db.update_source_file_count(&source.id, final_stats.files_persisted as usize) {
             tracing::warn!(source_id = %source.id, error = %e, "Failed to update source file_count");
         }
 
         // Populate folder cache for O(1) TUI navigation (avoids 20+ second root folder query)
-        if let Err(e) = self.db.populate_folder_cache(&source.id).await {
+        if let Err(e) = self.db.populate_folder_cache(&source.id) {
             tracing::warn!(source_id = %source.id, error = %e, "Failed to populate folder cache");
         }
 
@@ -358,8 +348,8 @@ impl Scanner {
     #[allow(clippy::too_many_arguments)]
     fn parallel_walk(
         source_path: &Path,
-        source_id: &str,
-        batch_tx: mpsc::Sender<Vec<ScannedFile>>,
+        source_id: &SourceId,
+        batch_tx: mpsc::SyncSender<Vec<ScannedFile>>,
         batch_size: usize,
         threads: usize,
         include_hidden: bool,
@@ -370,8 +360,7 @@ impl Scanner {
         exclude_dir_names: Vec<String>,
         exclude_path_patterns: Vec<String>,
     ) -> Result<(ScanStats, Vec<ScanError>)> {
-        // Shared state for errors only (batches go to channel)
-        let all_errors: Arc<Mutex<Vec<ScanError>>> = Arc::new(Mutex::new(Vec::new()));
+        let (error_tx, error_rx) = std::sync::mpsc::channel::<ScanError>();
 
         // Atomic counters for progress
         // GAP-SCAN-007: Use AtomicU64 for bytes to prevent overflow on 32-bit systems
@@ -379,8 +368,6 @@ impl Scanner {
         let total_dirs = Arc::new(AtomicUsize::new(0));
         let total_bytes = Arc::new(AtomicU64::new(0));
         let last_progress_at = Arc::new(AtomicUsize::new(0));
-        let current_dir_hint: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-
         // Counter for skipped directories (for logging)
         let dirs_skipped = Arc::new(AtomicUsize::new(0));
 
@@ -436,19 +423,18 @@ impl Scanner {
             })
             .build_parallel();
 
-        let source_id_arc: Arc<str> = Arc::from(source_id);
+        let source_id_arc = source_id.clone();
         let source_path_owned = source_path.to_path_buf();
-        let batch_tx = Arc::new(batch_tx);
+        let batch_tx = batch_tx.clone();
 
         walker.run(|| {
             let source_path = source_path_owned.clone();
             let source_id = source_id_arc.clone();
-            let all_errors = all_errors.clone();
+            let error_tx = error_tx.clone();
             let total_files = total_files.clone();
             let total_dirs = total_dirs.clone();
             let total_bytes = total_bytes.clone();
             let last_progress_at = last_progress_at.clone();
-            let current_dir_hint = current_dir_hint.clone();
             let progress_tx = progress_tx.clone();
             let batch_tx = batch_tx.clone();
             let files_persisted = files_persisted.clone();
@@ -460,7 +446,7 @@ impl Scanner {
                 batch: Vec<ScannedFile>,
                 batch_size: usize,
                 byte_count: u64,
-                batch_tx: Arc<mpsc::Sender<Vec<ScannedFile>>>,
+                batch_tx: mpsc::SyncSender<Vec<ScannedFile>>,
                 total_files: Arc<AtomicUsize>,
                 total_bytes: Arc<AtomicU64>,
             }
@@ -471,8 +457,7 @@ impl Scanner {
                     if !self.batch.is_empty() {
                         let batch = std::mem::take(&mut self.batch);
                         let batch_len = batch.len();
-                        // Use blocking_send for sync context
-                        let _ = self.batch_tx.blocking_send(batch);
+                        let _ = self.batch_tx.send(batch);
                         self.total_files.fetch_add(batch_len, Ordering::Relaxed);
                     }
                     // Always flush byte count (GAP-SCAN-006)
@@ -491,17 +476,16 @@ impl Scanner {
                 total_files: total_files.clone(),
                 total_bytes: total_bytes.clone(),
             };
+            let mut current_dir_hint: Option<String> = None;
 
             Box::new(move |entry| {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
-                        if let Ok(mut errors) = all_errors.lock() {
-                            errors.push(ScanError {
-                                path: "unknown".to_string(),
-                                message: e.to_string(),
-                            });
-                        }
+                        let _ = error_tx.send(ScanError {
+                            path: "unknown".to_string(),
+                            message: e.to_string(),
+                        });
                         return ignore::WalkState::Continue;
                     }
                 };
@@ -515,12 +499,10 @@ impl Scanner {
                 let metadata = match entry.metadata() {
                     Ok(m) => m,
                     Err(e) => {
-                        if let Ok(mut errors) = all_errors.lock() {
-                            errors.push(ScanError {
-                                path: file_path.display().to_string(),
-                                message: e.to_string(),
-                            });
-                        }
+                        let _ = error_tx.send(ScanError {
+                            path: file_path.display().to_string(),
+                            message: e.to_string(),
+                        });
                         return ignore::WalkState::Continue;
                     }
                 };
@@ -531,12 +513,10 @@ impl Scanner {
                     total_dirs.fetch_add(1, Ordering::Relaxed);
                     let dir_count = total_dirs.load(Ordering::Relaxed);
                     if dir_count % 100 == 0 {
-                        if let Ok(mut hint) = current_dir_hint.try_lock() {
-                            *hint = file_path
-                                .strip_prefix(&source_path)
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default();
-                        }
+                        current_dir_hint = file_path
+                            .strip_prefix(&source_path)
+                            .map(|p| p.display().to_string())
+                            .ok();
                     }
                     return ignore::WalkState::Continue;
                 }
@@ -585,10 +565,8 @@ impl Scanner {
                         Ordering::Relaxed
                     ).is_ok() {
                         if let Some(tx) = &progress_tx {
-                            let dir_hint = current_dir_hint.try_lock()
-                                .ok()
-                                .map(|h| h.clone());
-                            let _ = tx.try_send(ScanProgress {
+                            let dir_hint = current_dir_hint.clone();
+                            let _ = tx.send(ScanProgress {
                                 dirs_scanned: total_dirs.load(Ordering::Relaxed),
                                 files_found: current_total,
                                 files_persisted: files_persisted.load(Ordering::Relaxed),
@@ -606,8 +584,8 @@ impl Scanner {
                     );
                     let batch_len = batch.len();
 
-                    // blocking_send provides backpressure - waits if channel full
-                    if guard.batch_tx.blocking_send(batch).is_err() {
+                    // send provides backpressure with sync_channel (waits if channel full)
+                    if guard.batch_tx.send(batch).is_err() {
                         // Channel closed - persist task exited early
                         return ignore::WalkState::Quit;
                     }
@@ -620,21 +598,19 @@ impl Scanner {
                     // Send progress update
                     let last = last_progress_at.load(Ordering::Relaxed);
                     if new_total.saturating_sub(last) >= progress_interval {
-                        if last_progress_at.compare_exchange(
-                            last,
-                            new_total,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed
-                        ).is_ok() {
-                            if let Some(tx) = &progress_tx {
-                                let dir_hint = current_dir_hint.try_lock()
-                                    .ok()
-                                    .map(|h| h.clone());
-                                let _ = tx.try_send(ScanProgress {
-                                    dirs_scanned: total_dirs.load(Ordering::Relaxed),
-                                    files_found: new_total,
-                                    files_persisted: files_persisted.load(Ordering::Relaxed),
-                                    current_dir: dir_hint,
+                    if last_progress_at.compare_exchange(
+                        last,
+                        new_total,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed
+                    ).is_ok() {
+                        if let Some(tx) = &progress_tx {
+                            let dir_hint = current_dir_hint.clone();
+                            let _ = tx.send(ScanProgress {
+                                dirs_scanned: total_dirs.load(Ordering::Relaxed),
+                                files_found: new_total,
+                                files_persisted: files_persisted.load(Ordering::Relaxed),
+                                current_dir: dir_hint,
                                 });
                             }
                         }
@@ -645,10 +621,8 @@ impl Scanner {
             })
         });
 
-        let errors = match Arc::try_unwrap(all_errors) {
-            Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-            Err(arc) => arc.lock().unwrap().clone(),
-        };
+        drop(error_tx);
+        let errors: Vec<ScanError> = error_rx.into_iter().collect();
 
         let stats = ScanStats {
             files_discovered: 0, // Will be updated by persist task
@@ -674,7 +648,7 @@ impl Scanner {
     ///
     /// GAP-SCAN-001 FIX: Propagates transaction errors to caller so `scan_ok`
     /// can be set to false, preventing incorrect `mark_deleted_files` calls.
-    async fn persist_batch_streaming(
+    fn persist_batch_streaming(
         db: &Database,
         files: Vec<ScannedFile>,
         tag: Option<&str>,
@@ -683,7 +657,7 @@ impl Scanner {
 
         // Persist entire batch in one transaction
         // Note: batch_upsert_files handles per-file errors internally
-        let result = db.batch_upsert_files(&files, tag).await?;
+        let result = db.batch_upsert_files(&files, tag)?;
 
         stats.files_new = result.new;
         stats.files_changed = result.changed;
@@ -697,25 +671,25 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::types::{FileStatus, SourceType};
+    use crate::scout::types::{FileStatus, SourceId, SourceType};
     use tempfile::TempDir;
     use std::fs::File;
     use std::io::Write;
     use filetime::{FileTime, set_file_mtime};
 
-    async fn create_test_env() -> (TempDir, Database, Source) {
+    fn create_test_env() -> (TempDir, Database, Source) {
         let temp_dir = TempDir::new().unwrap();
-        let db = Database::open_in_memory().await.unwrap();
+        let db = Database::open_in_memory().unwrap();
 
         let source = Source {
-            id: "test-src".to_string(),
+            id: SourceId::new(),
             name: "Test Source".to_string(),
             source_type: SourceType::Local,
             path: temp_dir.path().to_string_lossy().to_string(),
             poll_interval_secs: 30,
             enabled: true,
         };
-        db.upsert_source(&source).await.unwrap();
+        db.upsert_source(&source).unwrap();
 
         (temp_dir, db, source)
     }
@@ -730,20 +704,20 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_scan_empty_directory() {
-        let (_temp_dir, db, source) = create_test_env().await;
+    #[test]
+    fn test_scan_empty_directory() {
+        let (_temp_dir, db, source) = create_test_env();
         let scanner = Scanner::new(db);
 
-        let result = scanner.scan_source(&source).await.unwrap();
+        let result = scanner.scan_source(&source).unwrap();
         assert_eq!(result.stats.files_discovered, 0);
         assert_eq!(result.stats.files_new, 0);
         assert_eq!(result.stats.errors, 0);
     }
 
-    #[tokio::test]
-    async fn test_scan_discovers_files() {
-        let (temp_dir, db, source) = create_test_env().await;
+    #[test]
+    fn test_scan_discovers_files() {
+        let (temp_dir, db, source) = create_test_env();
 
         // Create some test files
         create_test_file(temp_dir.path(), "file1.csv", "a,b,c\n1,2,3").unwrap();
@@ -751,7 +725,7 @@ mod tests {
         create_test_file(temp_dir.path(), "subdir/file3.txt", "hello").unwrap();
 
         let scanner = Scanner::new(db.clone());
-        let result = scanner.scan_source(&source).await.unwrap();
+        let result = scanner.scan_source(&source).unwrap();
 
         assert_eq!(result.stats.files_discovered, 3);
         assert_eq!(result.stats.files_new, 3);
@@ -759,13 +733,13 @@ mod tests {
         assert_eq!(result.stats.errors, 0);
 
         // Verify files are in database
-        let pending = db.list_pending_files(&source.id, 10).await.unwrap();
+        let pending = db.list_pending_files(&source.id, 10).unwrap();
         assert_eq!(pending.len(), 3);
     }
 
-    #[tokio::test]
-    async fn test_scan_detects_changes() {
-        let (temp_dir, db, source) = create_test_env().await;
+    #[test]
+    fn test_scan_detects_changes() {
+        let (temp_dir, db, source) = create_test_env();
 
         // Create initial file with explicit old mtime
         let file_path = temp_dir.path().join("data.csv");
@@ -776,11 +750,11 @@ mod tests {
         let scanner = Scanner::new(db.clone());
 
         // First scan
-        let result = scanner.scan_source(&source).await.unwrap();
+        let result = scanner.scan_source(&source).unwrap();
         assert_eq!(result.stats.files_new, 1);
 
         // Second scan - no changes
-        let result = scanner.scan_source(&source).await.unwrap();
+        let result = scanner.scan_source(&source).unwrap();
         assert_eq!(result.stats.files_new, 0);
         assert_eq!(result.stats.files_unchanged, 1);
         assert_eq!(result.stats.files_changed, 0);
@@ -791,14 +765,14 @@ mod tests {
         set_file_mtime(&file_path, new_mtime).unwrap();
 
         // Third scan - should detect change
-        let result = scanner.scan_source(&source).await.unwrap();
+        let result = scanner.scan_source(&source).unwrap();
         assert_eq!(result.stats.files_new, 0);
         assert_eq!(result.stats.files_changed, 1);
     }
 
-    #[tokio::test]
-    async fn test_scan_detects_deleted_files() {
-        let (temp_dir, db, source) = create_test_env().await;
+    #[test]
+    fn test_scan_detects_deleted_files() {
+        let (temp_dir, db, source) = create_test_env();
 
         // Create files
         create_test_file(temp_dir.path(), "keep.csv", "data").unwrap();
@@ -807,7 +781,7 @@ mod tests {
         let scanner = Scanner::new(db.clone());
 
         // First scan
-        let result = scanner.scan_source(&source).await.unwrap();
+        let result = scanner.scan_source(&source).unwrap();
         assert_eq!(result.stats.files_new, 2);
 
         // Delete one file
@@ -818,21 +792,21 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
 
         // Second scan
-        let result = scanner.scan_source(&source).await.unwrap();
+        let result = scanner.scan_source(&source).unwrap();
         assert_eq!(result.stats.files_discovered, 1);
         assert_eq!(result.stats.files_deleted, 1);
 
         // Verify deleted file is marked in database
-        let deleted = db.list_files_by_status(FileStatus::Deleted, 10).await.unwrap();
+        let deleted = db.list_files_by_status(FileStatus::Deleted, 10).unwrap();
         assert_eq!(deleted.len(), 1);
         assert!(deleted[0].path.contains("delete.csv"));
     }
 
-    #[tokio::test]
-    async fn test_scan_nonexistent_source() {
-        let db = Database::open_in_memory().await.unwrap();
+    #[test]
+    fn test_scan_nonexistent_source() {
+        let db = Database::open_in_memory().unwrap();
         let source = Source {
-            id: "missing".to_string(),
+            id: SourceId::new(),
             name: "Missing".to_string(),
             source_type: SourceType::Local,
             path: "/nonexistent/path".to_string(),
@@ -841,7 +815,7 @@ mod tests {
         };
 
         let scanner = Scanner::new(db);
-        let result = scanner.scan_source(&source).await;
+        let result = scanner.scan_source(&source);
         assert!(result.is_err());
     }
 
@@ -849,9 +823,9 @@ mod tests {
     // Streaming scan tests (GAP-006)
     // ========================================================================
 
-    #[tokio::test]
-    async fn test_scan_streaming_discovers_files() {
-        let (temp_dir, db, source) = create_test_env().await;
+    #[test]
+    fn test_scan_streaming_discovers_files() {
+        let (temp_dir, db, source) = create_test_env();
 
         // Create some test files
         create_test_file(temp_dir.path(), "file1.csv", "a,b,c\n1,2,3").unwrap();
@@ -861,7 +835,7 @@ mod tests {
         let scanner = Scanner::new(db.clone());
 
         // Use streaming scan
-        let result = scanner.scan(&source, None, None).await.unwrap();
+        let result = scanner.scan(&source, None, None).unwrap();
 
         assert_eq!(result.stats.files_discovered, 3);
         assert_eq!(result.stats.files_new, 3);
@@ -869,7 +843,7 @@ mod tests {
         assert_eq!(result.stats.errors, 0);
 
         // Verify files are in database
-        let pending = db.list_pending_files(&source.id, 10).await.unwrap();
+        let pending = db.list_pending_files(&source.id, 10).unwrap();
         assert_eq!(pending.len(), 3);
     }
 }

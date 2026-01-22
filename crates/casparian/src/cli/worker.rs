@@ -7,7 +7,7 @@ use crate::cli::error::HelpfulError;
 use crate::cli::jobs::get_db_path;
 use crate::cli::output::print_table_colored;
 use casparian_db::{DbConnection, DbValue};
-use casparian_protocol::WorkerStatus;
+use casparian_protocol::{ProcessingStatus, WorkerStatus};
 use clap::Subcommand;
 use comfy_table::Color;
 use serde::Serialize;
@@ -59,9 +59,11 @@ fn worker_status_color(status: &WorkerStatus) -> Color {
     }
 }
 
-/// Parse worker status from string (handles case-insensitive matching)
-fn parse_worker_status(s: &str) -> WorkerStatus {
-    s.parse().unwrap_or(WorkerStatus::Offline)
+/// Parse worker status from string with explicit error for unknown values.
+/// Returns Err for invalid status strings to surface data corruption issues.
+fn parse_worker_status(s: &str) -> anyhow::Result<WorkerStatus> {
+    s.parse::<WorkerStatus>()
+        .map_err(|e| anyhow::anyhow!("Invalid worker status '{}': {}", s, e))
 }
 
 /// Worker information
@@ -98,25 +100,19 @@ pub fn run(action: WorkerAction) -> anyhow::Result<()> {
             .into());
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async {
-        match action {
-            WorkerAction::List { json } => run_list(&db_path, json).await,
-            WorkerAction::Show { id, json } => run_show(&db_path, &id, json).await,
-            WorkerAction::Drain { id } => run_drain(&db_path, &id).await,
-            WorkerAction::Remove { id, force } => run_remove(&db_path, &id, force).await,
-            WorkerAction::Status => run_status(&db_path).await,
-        }
-    })
+    match action {
+        WorkerAction::List { json } => run_list(&db_path, json),
+        WorkerAction::Show { id, json } => run_show(&db_path, &id, json),
+        WorkerAction::Drain { id } => run_drain(&db_path, &id),
+        WorkerAction::Remove { id, force } => run_remove(&db_path, &id, force),
+        WorkerAction::Status => run_status(&db_path),
+    }
 }
 
 /// List all workers
-async fn run_list(db_path: &PathBuf, json: bool) -> anyhow::Result<()> {
-    let conn = connect_db(db_path).await?;
-    let workers = get_all_workers(&conn).await?;
+fn run_list(db_path: &PathBuf, json: bool) -> anyhow::Result<()> {
+    let conn = connect_db_readonly(db_path)?;
+    let workers = get_all_workers(&conn)?;
 
     if json {
         let output = serde_json::to_string_pretty(&workers)?;
@@ -129,9 +125,9 @@ async fn run_list(db_path: &PathBuf, json: bool) -> anyhow::Result<()> {
 }
 
 /// Show worker details
-async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()> {
-    let conn = connect_db(db_path).await?;
-    let worker = get_worker_by_id(&conn, id).await?;
+fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()> {
+    let conn = connect_db_readonly(db_path)?;
+    let worker = get_worker_by_id(&conn, id)?;
 
     let Some(worker) = worker else {
         return Err(HelpfulError::new(format!("Worker '{}' not found", id))
@@ -150,11 +146,11 @@ async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()>
 }
 
 /// Drain a worker (stop accepting new jobs)
-async fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
-    let conn = connect_db(db_path).await?;
+fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
+    let conn = connect_db_write(db_path)?;
 
     // Check worker exists
-    let worker = get_worker_by_id(&conn, id).await?;
+    let worker = get_worker_by_id(&conn, id)?;
     let Some(worker) = worker else {
         return Err(HelpfulError::new(format!("Worker '{}' not found", id))
             .with_suggestion("TRY: casparian worker-cli list   # List all workers")
@@ -178,10 +174,13 @@ async fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
     // Update worker status to draining
     conn.execute(
-        "UPDATE cf_worker_node SET status = 'draining' WHERE hostname = ?",
-        &[DbValue::from(worker.hostname.as_str())],
+        "UPDATE cf_worker_node SET status = ? WHERE hostname = ?",
+        &[
+            DbValue::from(WorkerStatus::Draining.as_str()),
+            DbValue::from(worker.hostname.as_str()),
+        ],
     )
-    .await?;
+    ?;
 
     println!("Worker '{}' set to DRAINING", id);
     println!();
@@ -198,11 +197,11 @@ async fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 }
 
 /// Remove a worker
-async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<()> {
-    let conn = connect_db(db_path).await?;
+fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<()> {
+    let conn = connect_db_write(db_path)?;
 
     // Check worker exists
-    let worker = get_worker_by_id(&conn, id).await?;
+    let worker = get_worker_by_id(&conn, id)?;
     let Some(worker) = worker else {
         return Err(HelpfulError::new(format!("Worker '{}' not found", id))
             .with_suggestion("TRY: casparian worker-cli list   # List all workers")
@@ -234,15 +233,18 @@ async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<
         conn.execute(
             r#"
             UPDATE cf_processing_queue
-            SET status = 'QUEUED',
+            SET status = ?,
                 claim_time = NULL,
                 worker_host = NULL,
                 worker_pid = NULL
             WHERE id = ?
             "#,
-            &[DbValue::from(job_id)],
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(job_id),
+            ],
         )
-        .await?;
+        ?;
 
         println!("Requeued job #{}", job_id);
     }
@@ -252,7 +254,7 @@ async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<
         "DELETE FROM cf_worker_node WHERE hostname = ?",
         &[DbValue::from(worker.hostname.as_str())],
     )
-    .await?;
+    ?;
 
     println!("Worker '{}' removed", id);
 
@@ -260,15 +262,15 @@ async fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<
 }
 
 /// Show worker status summary
-async fn run_status(db_path: &PathBuf) -> anyhow::Result<()> {
-    let conn = connect_db(db_path).await?;
+fn run_status(db_path: &PathBuf) -> anyhow::Result<()> {
+    let conn = connect_db_readonly(db_path)?;
 
     // Get worker stats
-    let workers = get_all_workers(&conn).await?;
+    let workers = get_all_workers(&conn)?;
     let stats = calculate_stats(&workers);
 
     // Get queue stats
-    let queue_stats = get_queue_stats(&conn).await?;
+    let queue_stats = get_queue_stats(&conn)?;
 
     println!("WORKER STATUS");
     println!();
@@ -309,13 +311,18 @@ async fn run_status(db_path: &PathBuf) -> anyhow::Result<()> {
 }
 
 /// Connect to the database
-fn db_url_for_path(db_path: &PathBuf) -> String {
-    format!("duckdb:{}", db_path.display())
+fn connect_db_readonly(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
+    DbConnection::open_duckdb_readonly(db_path).map_err(|e| {
+        HelpfulError::new("Failed to connect to database")
+            .with_context(format!("Database: {}", db_path.display()))
+            .with_suggestion(format!("Error: {}", e))
+            .into()
+    })
 }
 
-async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
-    let db_url = db_url_for_path(db_path);
-    DbConnection::open_from_url(&db_url).await.map_err(|e| {
+fn connect_db_write(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
+    let url = format!("duckdb:{}", db_path.display());
+    DbConnection::open_from_url(&url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(format!("Database: {}", db_path.display()))
             .with_suggestion(format!("Error: {}", e))
@@ -324,8 +331,8 @@ async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
 }
 
 /// Get all workers from the database
-async fn get_all_workers(conn: &DbConnection) -> anyhow::Result<Vec<Worker>> {
-    if !table_exists(conn, "cf_worker_node").await? {
+fn get_all_workers(conn: &DbConnection) -> anyhow::Result<Vec<Worker>> {
+    if !table_exists(conn, "cf_worker_node")? {
         return Ok(Vec::new());
     }
 
@@ -346,28 +353,31 @@ async fn get_all_workers(conn: &DbConnection) -> anyhow::Result<Vec<Worker>> {
         "#,
         &[],
         )
-        .await?;
+        ?;
 
     let workers: Vec<Worker> = rows
         .into_iter()
-        .map(|row| Worker {
-            hostname: row.get(0).unwrap_or_default(),
-            pid: row.get(1).unwrap_or_default(),
-            ip_address: row.get(2).ok(),
-            env_signature: row.get(3).ok(),
-            started_at: row.get(4).unwrap_or_default(),
-            last_heartbeat: row.get(5).unwrap_or_default(),
-            status: parse_worker_status(&row.get::<String>(6).unwrap_or_default()),
-            current_job_id: row.get(7).ok(),
+        .map(|row| -> anyhow::Result<Worker> {
+            let status_str: String = row.get(6)?;
+            Ok(Worker {
+                hostname: row.get(0)?,
+                pid: row.get(1)?,
+                ip_address: row.get(2).ok(),
+                env_signature: row.get(3).ok(),
+                started_at: row.get(4)?,
+                last_heartbeat: row.get(5)?,
+                status: parse_worker_status(&status_str)?,
+                current_job_id: row.get(7).ok(),
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     Ok(workers)
 }
 
 /// Get a worker by hostname or worker_id
-async fn get_worker_by_id(conn: &DbConnection, id: &str) -> anyhow::Result<Option<Worker>> {
-    if !table_exists(conn, "cf_worker_node").await? {
+fn get_worker_by_id(conn: &DbConnection, id: &str) -> anyhow::Result<Option<Worker>> {
+    if !table_exists(conn, "cf_worker_node")? {
         return Ok(None);
     }
 
@@ -389,39 +399,51 @@ async fn get_worker_by_id(conn: &DbConnection, id: &str) -> anyhow::Result<Optio
         "#,
         &[DbValue::from(id), DbValue::from(format!("%{}%", id))],
         )
-        .await?;
+        ?;
 
-    Ok(row.map(|r| Worker {
-        hostname: r.get(0).unwrap_or_default(),
-        pid: r.get(1).unwrap_or_default(),
-        ip_address: r.get(2).ok(),
-        env_signature: r.get(3).ok(),
-        started_at: r.get(4).unwrap_or_default(),
-        last_heartbeat: r.get(5).unwrap_or_default(),
-        status: parse_worker_status(&r.get::<String>(6).unwrap_or_default()),
-        current_job_id: r.get(7).ok(),
-    }))
+    match row {
+        Some(r) => {
+            let status_str: String = r.get(6)?;
+            Ok(Some(Worker {
+                hostname: r.get(0)?,
+                pid: r.get(1)?,
+                ip_address: r.get(2).ok(),
+                env_signature: r.get(3).ok(),
+                started_at: r.get(4)?,
+                last_heartbeat: r.get(5)?,
+                status: parse_worker_status(&status_str)?,
+                current_job_id: r.get(7).ok(),
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Get queue statistics
-async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, i64)> {
-    if !table_exists(conn, "cf_processing_queue").await? {
+fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, i64)> {
+    if !table_exists(conn, "cf_processing_queue")? {
         return Ok((0, 0, 0, 0));
     }
 
     let row = conn
         .query_one(
-        r#"
+            &format!(
+                r#"
         SELECT
-            COALESCE(SUM(CASE WHEN status = 'QUEUED' THEN 1 ELSE 0 END), 0) as pending,
-            COALESCE(SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END), 0) as running,
-            COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END), 0) as completed,
-            COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0) as failed
+            COALESCE(SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END), 0) as pending,
+            COALESCE(SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END), 0) as running,
+            COALESCE(SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END), 0) as completed,
+            COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed
         FROM cf_processing_queue
         "#,
-        &[],
+                queued = ProcessingStatus::Queued.as_str(),
+                running = ProcessingStatus::Running.as_str(),
+                completed = ProcessingStatus::Completed.as_str(),
+                failed = ProcessingStatus::Failed.as_str(),
+            ),
+            &[],
         )
-        .await?;
+        ?;
 
     Ok((
         row.get(0).unwrap_or_default(),
@@ -431,13 +453,13 @@ async fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, 
     ))
 }
 
-async fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
+fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
     let row = conn
         .query_optional(
             "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
             &[DbValue::from(table)],
         )
-        .await?;
+        ?;
     Ok(row.is_some())
 }
 
@@ -585,11 +607,24 @@ mod tests {
     #[test]
     fn test_worker_status_from_str() {
         // Protocol's from_str returns Result, unwrap for valid cases
-        assert_eq!(WorkerStatus::from_str("idle").unwrap(), WorkerStatus::Idle);
-        assert_eq!(WorkerStatus::from_str("BUSY").unwrap(), WorkerStatus::Busy);
-        assert_eq!(WorkerStatus::from_str("DRAINING").unwrap(), WorkerStatus::Draining);
-        // Unknown returns error, parse_worker_status falls back to Offline
-        assert_eq!(parse_worker_status("unknown"), WorkerStatus::Offline);
+        assert_eq!(
+            WorkerStatus::from_str(WorkerStatus::Idle.as_str()).unwrap(),
+            WorkerStatus::Idle
+        );
+        assert_eq!(
+            WorkerStatus::from_str(WorkerStatus::Busy.as_str()).unwrap(),
+            WorkerStatus::Busy
+        );
+        assert_eq!(
+            WorkerStatus::from_str(WorkerStatus::Draining.as_str()).unwrap(),
+            WorkerStatus::Draining
+        );
+        // parse_worker_status now propagates errors for invalid status strings
+        assert_eq!(
+            parse_worker_status(WorkerStatus::Idle.as_str()).unwrap(),
+            WorkerStatus::Idle
+        );
+        assert!(parse_worker_status("unknown").is_err(), "Unknown status should return error");
     }
 
     #[test]

@@ -17,7 +17,7 @@ The **Rule Builder** is the Discover mode workbench for **Scope → Compose → 
 It uses the global **Audit-First Shell** and centers on a step band with a
 tabbed results panel and persistent inspector.
 
-It subsumes the legacy Files view; preview, backtest, and tagging live in the
+It subsumes the previous Files view; preview, backtest, and tagging live in the
 Validate panel.
 
 ### 1.1 Current Behavior Summary

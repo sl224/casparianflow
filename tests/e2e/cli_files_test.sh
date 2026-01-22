@@ -30,7 +30,7 @@ duckdb "$DB_PATH" <<'EOF'
 -- Create schema
 CREATE TABLE scout_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id TEXT NOT NULL,
+    source_id BIGINT NOT NULL,
     path TEXT NOT NULL,
     rel_path TEXT NOT NULL,
     size INTEGER NOT NULL,
@@ -39,7 +39,7 @@ CREATE TABLE scout_files (
     status TEXT DEFAULT 'pending',
     tag TEXT,
     tag_source TEXT,
-    rule_id TEXT,
+    rule_id BIGINT,
     manual_plugin TEXT,
     error TEXT,
     first_seen_at INTEGER,
@@ -50,21 +50,21 @@ CREATE TABLE scout_files (
 
 -- Insert test files with various statuses and tags
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag)
-    VALUES ('src-1', '/data/sales/report.csv', 'sales/report.csv', 10000, 'pending', NULL);
+    VALUES (1, '/data/sales/report.csv', 'sales/report.csv', 10000, 'pending', NULL);
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag)
-    VALUES ('src-1', '/data/sales/q1.csv', 'sales/q1.csv', 5000, 'tagged', 'sales');
+    VALUES (1, '/data/sales/q1.csv', 'sales/q1.csv', 5000, 'tagged', 'sales');
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag)
-    VALUES ('src-1', '/data/sales/q2.csv', 'sales/q2.csv', 6000, 'processed', 'sales');
+    VALUES (1, '/data/sales/q2.csv', 'sales/q2.csv', 6000, 'processed', 'sales');
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag)
-    VALUES ('src-1', '/data/invoices/jan.json', 'invoices/jan.json', 2500, 'processed', 'invoices');
+    VALUES (1, '/data/invoices/jan.json', 'invoices/jan.json', 2500, 'processed', 'invoices');
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag)
-    VALUES ('src-1', '/data/invoices/corrupt.json', 'invoices/corrupt.json', 1200, 'failed', 'invoices');
+    VALUES (1, '/data/invoices/corrupt.json', 'invoices/corrupt.json', 1200, 'failed', 'invoices');
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag, error)
-    VALUES ('src-1', '/data/sales/bad.csv', 'sales/bad.csv', 800, 'failed', 'sales', 'Row 15: invalid date format');
+    VALUES (1, '/data/sales/bad.csv', 'sales/bad.csv', 800, 'failed', 'sales', 'Row 15: invalid date format');
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag)
-    VALUES ('src-1', '/data/logs/access.log', 'logs/access.log', 50000, 'pending', NULL);
+    VALUES (1, '/data/logs/access.log', 'logs/access.log', 50000, 'pending', NULL);
 INSERT INTO scout_files (source_id, path, rel_path, size, status, tag)
-    VALUES ('src-1', '/data/logs/error.log', 'logs/error.log', 25000, 'pending', NULL);
+    VALUES (1, '/data/logs/error.log', 'logs/error.log', 25000, 'pending', NULL);
 EOF
 
 echo "Test database created."

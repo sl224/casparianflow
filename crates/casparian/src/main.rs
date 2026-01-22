@@ -13,10 +13,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -122,6 +121,16 @@ enum Commands {
         json: bool,
     },
 
+    /// Show parser schema
+    Schema {
+        /// Parser name or path (e.g., fix or parsers/fix/fix_parser.py)
+        parser: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     // === W2: Tagging Commands (stubs) ===
 
     /// Assign a topic to file(s)
@@ -192,6 +201,12 @@ enum Commands {
     Parser {
         #[command(subcommand)]
         action: cli::parser::ParserAction,
+    },
+
+    /// Manage native plugins
+    Plugin {
+        #[command(subcommand)]
+        action: cli::plugin::PluginAction,
     },
 
     // === W4: Job Commands (stubs) ===
@@ -377,6 +392,12 @@ enum Commands {
         #[command(flatten)]
         args: cli::tui::TuiArgs,
     },
+
+    /// MCP (Model Context Protocol) server for AI tool integration
+    Mcp {
+        #[command(subcommand)]
+        action: cli::mcp::McpAction,
+    },
 }
 
 /// Get the default IPC address for the current platform.
@@ -409,34 +430,9 @@ fn get_default_ipc_addr() -> String {
     }
 }
 
-/// Build the Control Plane runtime (low latency, single thread)
-fn build_control_runtime() -> Result<Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("control-plane")
-        .enable_all()
-        .build()
-        .context("Failed to build Control Plane runtime")
-}
-
-/// Build the Data Plane runtime (high throughput, N-1 threads)
-fn build_data_runtime(threads: Option<usize>) -> Result<Runtime> {
-    let num_cpus = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-    let worker_threads = threads.unwrap_or_else(|| num_cpus.saturating_sub(1).max(1));
-
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .thread_name("data-plane")
-        .enable_all()
-        .build()
-        .context("Failed to build Data Plane runtime")
-}
-
 /// Sentinel handle for shutdown coordination
 struct SentinelHandle {
-    stop_tx: oneshot::Sender<()>,
+    stop_tx: mpsc::Sender<()>,
     join_handle: std::thread::JoinHandle<Result<()>>,
 }
 
@@ -451,14 +447,15 @@ impl SentinelHandle {
 
 /// Worker handle for shutdown coordination
 struct UnifiedWorkerHandle {
-    shutdown_tx: mpsc::Sender<()>,
+    handle: casparian_worker::WorkerHandle,
     join_handle: std::thread::JoinHandle<Result<()>>,
 }
 
 impl UnifiedWorkerHandle {
-    async fn shutdown(self) -> Result<()> {
-        let _ = self.shutdown_tx.send(()).await;
-        // Wait for thread to finish
+    fn shutdown(self) -> Result<()> {
+        self.handle
+            .shutdown_gracefully(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS))
+            .map_err(anyhow::Error::new)?;
         self.join_handle
             .join()
             .map_err(|_| anyhow::anyhow!("Worker thread panicked"))?
@@ -469,12 +466,14 @@ fn command_wants_json(command: &Commands) -> bool {
     match command {
         Commands::Scan { json, .. } => *json,
         Commands::Preview { json, .. } => *json,
+        Commands::Schema { json, .. } => *json,
         Commands::Files { json, .. } => *json,
         Commands::Jobs { json, .. } => *json,
         Commands::Backfill { json, .. } => *json,
         Commands::Config { json } => *json,
         Commands::Run(args) => args.json,
         Commands::Parser { action } => parser_action_wants_json(action),
+        Commands::Plugin { action } => plugin_action_wants_json(action),
         Commands::Rule { action } => rule_action_wants_json(action),
         Commands::Topic { action } => topic_action_wants_json(action),
         Commands::Source { action } => source_action_wants_json(action),
@@ -490,8 +489,14 @@ fn parser_action_wants_json(action: &cli::parser::ParserAction) -> bool {
         cli::parser::ParserAction::Show { json, .. } => *json,
         cli::parser::ParserAction::Test { json, .. } => *json,
         cli::parser::ParserAction::Backtest { json, .. } => *json,
-        cli::parser::ParserAction::Register { json, .. } => *json,
         cli::parser::ParserAction::Health { json, .. } => *json,
+        _ => false,
+    }
+}
+
+fn plugin_action_wants_json(action: &cli::plugin::PluginAction) -> bool {
+    match action {
+        cli::plugin::PluginAction::List { json } => *json,
         _ => false,
     }
 }
@@ -552,23 +557,19 @@ fn run_command(cli: Cli) -> Result<()> {
             interactive,
             tag,
         } => {
-            let rt = Runtime::new().context("Failed to create runtime")?;
-            rt.block_on(async {
-                cli::scan::run(cli::scan::ScanArgs {
-                    path,
-                    types,
-                    patterns,
-                    recursive,
-                    depth,
-                    min_size,
-                    max_size,
-                    json,
-                    stats,
-                    quiet,
-                    interactive,
-                    tag,
-                })
-                .await
+            cli::scan::run(cli::scan::ScanArgs {
+                path,
+                types,
+                patterns,
+                recursive,
+                depth,
+                min_size,
+                max_size,
+                json,
+                stats,
+                quiet,
+                interactive,
+                tag,
             })
         }
 
@@ -589,6 +590,10 @@ fn run_command(cli: Cli) -> Result<()> {
             delimiter,
             json,
         }),
+
+        Commands::Schema { parser, json } => {
+            cli::schema::run(cli::schema::SchemaArgs { parser, json })
+        }
 
         // === W2: Tagging Commands (stubs) ===
         Commands::Tag {
@@ -616,30 +621,26 @@ fn run_command(cli: Cli) -> Result<()> {
             limit,
             json,
         } => {
-            let rt = Runtime::new().context("Failed to create runtime")?;
-            rt.block_on(async {
-                cli::files::run(cli::files::FilesArgs {
-                    source,
-                    all,
-                    topic,
-                    status,
-                    untagged,
-                    patterns,
-                    tag,
-                    limit,
-                    json,
-                })
-                .await
+            cli::files::run(cli::files::FilesArgs {
+                source,
+                all,
+                topic,
+                status,
+                untagged,
+                patterns,
+                tag,
+                limit,
+                json,
             })
         }
 
         // === W3: Parser Commands (stubs) ===
         Commands::Parser { action } => cli::parser::run(action),
+        Commands::Plugin { action } => cli::plugin::run(action),
 
         // === W4: Job Commands (stubs) ===
         Commands::Run(args) => {
-            let rt = Runtime::new().context("Failed to create runtime")?;
-            rt.block_on(cli::run::cmd_run(args))
+            cli::run::cmd_run(args)
         }
 
         Commands::Jobs {
@@ -681,16 +682,12 @@ fn run_command(cli: Cli) -> Result<()> {
             json,
             force,
         } => {
-            let rt = Runtime::new().context("Failed to create runtime")?;
-            rt.block_on(async {
-                cli::backfill::run(cli::backfill::BackfillArgs {
-                    parser_name: parser,
-                    execute,
-                    limit,
-                    json,
-                    force,
-                })
-                .await
+            cli::backfill::run(cli::backfill::BackfillArgs {
+                parser_name: parser,
+                execute,
+                limit,
+                json,
+                force,
             })
         }
 
@@ -718,17 +715,10 @@ fn run_command(cli: Cli) -> Result<()> {
             addr,
             publisher,
             email,
-        } => {
-            // Publish runs synchronously (no need for tokio runtime)
-            tokio::runtime::Runtime::new()?.block_on(async {
-                run_publish(file, version, addr, publisher, email).await
-            })
-        }
+        } => run_publish(file, version, addr, publisher, email),
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
-        Commands::Tui { args } => {
-            let rt = Runtime::new().context("Failed to create runtime")?;
-            rt.block_on(async { cli::tui::run(args).await })
-        }
+        Commands::Tui { args } => cli::tui::run(args),
+        Commands::Mcp { action } => cli::mcp::run(action),
     }
 }
 
@@ -832,50 +822,30 @@ fn run_unified(
         })?;
     }
 
-    // Build separate runtimes
-    let control_rt = build_control_runtime()?;
-    let data_rt = build_data_runtime(data_threads)?;
-
-    info!(
-        "Control Plane: 1 thread | Data Plane: {} threads",
-        data_threads.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|p| p.get().saturating_sub(1).max(1))
-                .unwrap_or(3)
-        })
-    );
+    let _ = data_threads;
 
     // Channel for Sentinel ready signal
-    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     // Channel for Sentinel stop signal
-    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-    // Start Sentinel on Control Plane runtime (in its own thread)
+    // Start Sentinel (in its own thread)
     let sentinel_addr = addr.clone();
     let sentinel_db = format!("duckdb:{}", db_path.display());
     let sentinel_thread = std::thread::spawn(move || {
-        control_rt.block_on(async move {
-            let config = SentinelConfig {
-                bind_addr: sentinel_addr,
-                database_url: sentinel_db,
-            };
+        let config = SentinelConfig {
+            bind_addr: sentinel_addr,
+            database_url: sentinel_db,
+            max_workers: 1,
+        };
 
-            let mut sentinel = Sentinel::bind(config).await?;
+        let mut sentinel = Sentinel::bind(config)?;
 
-            // Signal ready
-            let _ = ready_tx.send(());
+        // Signal ready
+        let _ = ready_tx.send(());
 
-            // Run until stop signal
-            tokio::select! {
-                result = sentinel.run() => result,
-                _ = stop_rx => {
-                    info!("Sentinel received stop signal");
-                    sentinel.stop();
-                    Ok(())
-                }
-            }
-        })
+        sentinel.run_with_shutdown(stop_rx)
     });
 
     let sentinel_handle = SentinelHandle {
@@ -899,35 +869,21 @@ fn run_unified(
         venvs_dir,
     };
 
-    // Channel for Worker shutdown
-    let (worker_shutdown_tx, worker_shutdown_rx) = mpsc::channel::<()>(1);
+    // Wait for Sentinel to be ready
+    ready_rx
+        .recv()
+        .map_err(|_| anyhow::anyhow!("Sentinel failed to start"))?;
 
-    // Start Worker on Data Plane runtime (in its own thread)
+    // Start Worker (in its own thread)
+    let (worker, worker_handle) = Worker::connect(worker_config)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let worker_thread = std::thread::spawn(move || {
-        data_rt.block_on(async move {
-            // Wait for Sentinel to be ready
-            if ready_rx.await.is_err() {
-                anyhow::bail!("Sentinel failed to start");
-            }
-
-            let (worker, worker_handle) = Worker::connect(worker_config)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            // Forward external shutdown to internal shutdown
-            let mut external_rx = worker_shutdown_rx;
-            tokio::spawn(async move {
-                if external_rx.recv().await.is_some() {
-                    let _ = worker_handle.shutdown().await;
-                }
-            });
-
-            worker.run().await.map_err(|e| anyhow::anyhow!(e))
-        })
+        worker.run().map_err(|e| anyhow::anyhow!(e))
     });
 
     let worker_handle = UnifiedWorkerHandle {
-        shutdown_tx: worker_shutdown_tx,
+        handle: worker_handle,
         join_handle: worker_thread,
     };
 
@@ -954,20 +910,9 @@ fn run_unified(
 
     // Step 1: Shutdown Worker first (drain jobs)
     info!("Stopping Worker (waiting for active jobs to complete)...");
-
-    // Create a small runtime for the async shutdown
-    let shutdown_rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    let worker_result = shutdown_rt.block_on(async {
-        tokio::time::timeout(timeout, worker_handle.shutdown()).await
-    });
-
-    match worker_result {
-        Ok(Ok(())) => info!("Worker stopped gracefully"),
-        Ok(Err(e)) => warn!("Worker shutdown error: {}", e),
-        Err(_) => warn!("Worker shutdown timed out"),
+    match worker_handle.shutdown() {
+        Ok(()) => info!("Worker stopped gracefully"),
+        Err(e) => warn!("Worker shutdown error: {}", e),
     }
 
     // Step 2: Stop Sentinel
@@ -989,8 +934,6 @@ fn run_unified(
 
 /// Run Sentinel standalone (for distributed deployment)
 fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
-    let rt = build_control_runtime()?;
-
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_handler = shutdown_flag.clone();
 
@@ -1008,50 +951,35 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
         });
     }
 
-    rt.block_on(async move {
-        // Resolve database URL: if it's the default, use config module resolution
-        let database_url = if args.database == "duckdb:casparian_flow.duckdb" {
-            let db_path = cli::config::active_db_path();
-            format!("duckdb:{}", db_path.display())
-        } else {
-            args.database
-        };
+    // Resolve database URL: if it's the default, use config module resolution
+    let database_url = if args.database == "duckdb:casparian_flow.duckdb" {
+        let db_path = cli::config::active_db_path();
+        format!("duckdb:{}", db_path.display())
+    } else {
+        args.database
+    };
 
-        let config = SentinelConfig {
-            bind_addr: args.bind,
-            database_url,
-        };
-        let mut sentinel = Sentinel::bind(config).await?;
+    let config = SentinelConfig {
+        bind_addr: args.bind,
+        database_url,
+        max_workers: args.max_workers,
+    };
+    let mut sentinel = Sentinel::bind(config)?;
 
-        // Run with shutdown check
-        loop {
-            if shutdown_flag.load(Ordering::SeqCst) {
-                sentinel.stop();
-                break;
-            }
-
-            // Run one iteration of the event loop
-            tokio::select! {
-                result = sentinel.run() => {
-                    return result;
-                }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    // Check shutdown flag periodically
-                    if shutdown_flag.load(Ordering::SeqCst) {
-                        sentinel.stop();
-                        break;
-                    }
-                }
-            }
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let flag = shutdown_flag.clone();
+    std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100));
         }
-        Ok(())
-    })
+        let _ = stop_tx.send(());
+    });
+
+    sentinel.run_with_shutdown(stop_rx)
 }
 
 /// Run Worker standalone (for distributed deployment)
 fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
-    let rt = build_data_runtime(None)?;
-
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shutdown_flag_handler = shutdown_flag.clone();
 
@@ -1069,44 +997,40 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
         });
     }
 
-    rt.block_on(async move {
-        // Materialize embedded bridge shim to disk (single binary distribution)
-        let shim_path = bridge::materialize_bridge_shim().map_err(|e| anyhow::anyhow!(e))?;
-        let worker_id = args.worker_id.unwrap_or_else(|| {
-            format!(
-                "rust-{}",
-                &uuid::Uuid::new_v4().to_string()[..8]  // First 8 hex chars of UUID
-            )
-        });
+    // Materialize embedded bridge shim to disk (single binary distribution)
+    let shim_path = bridge::materialize_bridge_shim().map_err(|e| anyhow::anyhow!(e))?;
+    let worker_id = args.worker_id.unwrap_or_else(|| {
+        format!(
+            "rust-{}",
+            &uuid::Uuid::new_v4().to_string()[..8] // First 8 hex chars of UUID
+        )
+    });
 
-        let config = WorkerConfig {
-            sentinel_addr: args.connect,
-            parquet_root: args.output,
-            worker_id,
-            shim_path,
-            capabilities: vec!["*".to_string()],
-            venvs_dir: None, // Use default ~/.casparian_flow/venvs
-        };
+    let config = WorkerConfig {
+        sentinel_addr: args.connect,
+        parquet_root: args.output,
+        worker_id,
+        shim_path,
+        capabilities: vec!["*".to_string()],
+        venvs_dir: None, // Use default ~/.casparian_flow/venvs
+    };
 
-        let (worker, worker_handle) = Worker::connect(config)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+    let (worker, worker_handle) = Worker::connect(config)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
-        // Spawn shutdown monitor
-        let flag = shutdown_flag.clone();
-        tokio::spawn(async move {
-            while !flag.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            let _ = worker_handle.shutdown().await;
-        });
+    let flag = shutdown_flag.clone();
+    std::thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = worker_handle.shutdown();
+    });
 
-        worker.run().await.map_err(|e| anyhow::anyhow!(e))
-    })
+    worker.run().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Publish a plugin to the Sentinel registry
-async fn run_publish(
+fn run_publish(
     file: std::path::PathBuf,
     version: String,
     addr: Option<String>,
@@ -1114,62 +1038,22 @@ async fn run_publish(
     email: Option<String>,
 ) -> Result<()> {
     use casparian_protocol::types::DeployCommand;
-    use casparian_protocol::{Message, OpCode};
-    use casparian_security::signing::sha256;
-    use casparian_security::Gatekeeper;
-    use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
+    use casparian_protocol::{JobId, Message, OpCode};
+    use zmq::Context;
+    use casparian::prepare_publish;
 
     info!("Publishing plugin: {:?} v{}", file, version);
 
-    // 1. Read plugin source code
-    let source_code = std::fs::read_to_string(&file)
-        .with_context(|| format!("Failed to read plugin file: {:?}", file))?;
-
-    // 2. Validate with Gatekeeper (AST-based security checks)
-    let gatekeeper = Gatekeeper::new();
-    gatekeeper
-        .validate(&source_code)
-        .context("Plugin failed security validation")?;
-    info!("✓ Security validation passed");
-
-    // 3. Check for uv.lock, run `uv lock` if missing
-    let plugin_dir = file
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Plugin file has no parent directory"))?;
-    let lockfile_path = plugin_dir.join("uv.lock");
-
-    if !lockfile_path.exists() {
-        info!("No uv.lock found, running `uv lock` in {:?}...", plugin_dir);
-        let output = std::process::Command::new("uv")
-            .arg("lock")
-            .current_dir(plugin_dir)
-            .output()
-            .context("Failed to run `uv lock` (is uv installed?)")?;
-
-        if !output.status.success() {
-            anyhow::bail!(
-                "uv lock failed:\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        info!("✓ Generated uv.lock");
+    let artifact = prepare_publish(&file)?;
+    if artifact.manifest.version != version {
+        anyhow::bail!(
+            "Version mismatch: CLI version '{}' does not match manifest version '{}'",
+            version,
+            artifact.manifest.version
+        );
     }
 
-    let lockfile_content = std::fs::read_to_string(&lockfile_path)
-        .context("Failed to read uv.lock after generation")?;
-
-    // 4. Compute hashes
-    let env_hash = sha256(lockfile_content.as_bytes());
-    let artifact_content = format!("{}{}", source_code, lockfile_content);
-    let artifact_hash = sha256(artifact_content.as_bytes());
-    info!("✓ Computed hashes (env: {}..., artifact: {}...)", &env_hash[..8], &artifact_hash[..8]);
-
-    // 5. Extract plugin name from file
-    let plugin_name = file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Could not extract plugin name from file path"))?
-        .to_string();
+    let plugin_name = artifact.plugin_name.clone();
 
     // Get publisher name (default to system username)
     let publisher_name = publisher.unwrap_or_else(|| {
@@ -1182,10 +1066,13 @@ async fn run_publish(
     let deploy_cmd = DeployCommand {
         plugin_name: plugin_name.clone(),
         version: version.clone(),
-        source_code,
-        lockfile_content,
-        env_hash,
-        artifact_hash,
+        source_code: artifact.source_code,
+        lockfile_content: artifact.lockfile_content,
+        env_hash: artifact.env_hash,
+        artifact_hash: artifact.artifact_hash,
+        manifest_json: artifact.manifest_json,
+        protocol_version: artifact.manifest.protocol_version,
+        schema_artifacts_json: artifact.schema_artifacts_json,
         publisher_name,
         publisher_email: email,
         azure_oid: None,
@@ -1196,32 +1083,46 @@ async fn run_publish(
     let sentinel_addr = addr.unwrap_or_else(get_default_ipc_addr);
     info!("Connecting to Sentinel at {}", sentinel_addr);
 
-    let mut socket = zeromq::DealerSocket::new();
-    socket.connect(&sentinel_addr).await?;
+    let context = Context::new();
+    let socket = context
+        .socket(zmq::DEALER)
+        .map_err(|e| anyhow::anyhow!("Failed to create DEALER socket: {}", e))?;
+    socket
+        .connect(&sentinel_addr)
+        .map_err(|e| anyhow::anyhow!("Failed to connect to sentinel: {}", e))?;
     info!("✓ Connected to Sentinel");
 
     // Serialize payload
     let payload = serde_json::to_vec(&deploy_cmd)?;
 
     // Create protocol message
-    let msg = Message::new(OpCode::Deploy, 0, payload)?;
+    let msg = Message::new(OpCode::Deploy, JobId::new(0), payload)?;
     let (header_bytes, payload_bytes) = msg.pack()?;
 
     // Send message (multipart)
-    let mut multipart = ZmqMessage::from(header_bytes);
-    multipart.push_back(payload_bytes.into());
-    socket.send(multipart).await?;
+    let frames = [header_bytes.as_slice(), payload_bytes.as_slice()];
+    socket
+        .send_multipart(&frames, 0)
+        .map_err(|e| anyhow::anyhow!("ZMQ send error: {}", e))?;
     info!("✓ Sent deployment request");
 
     // 8. Await ACK/ERR response
-    let response_frames: ZmqMessage = socket.recv().await?;
-    let response_msg = Message::unpack(
-        &response_frames
-            .into_vec()
-            .iter()
-            .map(|f| f.to_vec())
-            .collect::<Vec<_>>(),
-    )?;
+    let response_frames = socket
+        .recv_multipart(0)
+        .map_err(|e| anyhow::anyhow!("ZMQ recv error: {}", e))?;
+    let (header, payload) = match response_frames.len() {
+        2 => (response_frames[0].clone(), response_frames[1].clone()),
+        3 if response_frames[0].is_empty() => {
+            (response_frames[1].clone(), response_frames[2].clone())
+        }
+        count => {
+            return Err(anyhow::anyhow!(
+                "Expected 2 frames [header, payload], got {}",
+                count
+            ));
+        }
+    };
+    let response_msg = Message::unpack(&[header, payload])?;
 
     match response_msg.header.opcode {
         OpCode::Ack => {
@@ -1298,39 +1199,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_build_control_runtime() {
-        let rt = build_control_runtime().expect("Failed to build control runtime");
-        // Control runtime should be created successfully
-        // We can't easily verify thread count, but we can verify it runs
-        rt.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        });
-    }
-
-    #[test]
-    fn test_build_data_runtime_default_threads() {
-        let rt = build_data_runtime(None).expect("Failed to build data runtime");
-        rt.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        });
-    }
-
-    #[test]
-    fn test_build_data_runtime_explicit_threads() {
-        let rt = build_data_runtime(Some(2)).expect("Failed to build data runtime with 2 threads");
-        rt.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        });
-    }
-
-    #[test]
-    fn test_build_data_runtime_minimum_one_thread() {
-        // Even with 0 threads requested, should get at least 1
-        // (saturating_sub handles this)
-        let rt = build_data_runtime(Some(1)).expect("Failed to build data runtime with 1 thread");
-        rt.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        });
-    }
 }

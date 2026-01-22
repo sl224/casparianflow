@@ -18,8 +18,6 @@ casparian_db = { path = "../casparian_db", default-features = false, features = 
 # Shared IDs
 casparian_ids = { path = "../casparian_ids" }
 
-# Async runtime
-tokio = { workspace = true }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
@@ -29,5 +27,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tempfile = "3"

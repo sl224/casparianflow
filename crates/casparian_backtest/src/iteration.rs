@@ -8,7 +8,6 @@ use crate::high_failure::{FileInfo, HighFailureError, HighFailureTable};
 use crate::metrics::{BacktestMetrics, IterationMetrics};
 use crate::ScopeId;
 use serde::{Deserialize, Serialize};
-use std::future::Future;
 use std::time::{Duration, Instant};
 
 /// Configuration for the backtest iteration loop
@@ -224,12 +223,12 @@ pub trait MutableParser: ParserRunner {
 
     /// Apply fixes based on iteration results (called between iterations)
     /// This is where LLM refinement would be triggered
-    fn apply_fixes(&mut self, iteration_result: &BacktestIteration) -> impl Future<Output = bool> + Send;
+    fn apply_fixes(&mut self, iteration_result: &BacktestIteration) -> bool;
 }
 
 /// Run the backtest loop with automatic parser refinement
 /// F-009: Take files by reference to avoid cloning
-pub async fn run_backtest_loop<P: MutableParser>(
+pub fn run_backtest_loop<P: MutableParser>(
     parser: &mut P,
     files: &[FileInfo],
     high_failure_table: &HighFailureTable,
@@ -254,7 +253,7 @@ pub async fn run_backtest_loop<P: MutableParser>(
             parser_version,
             iteration_num,
             &config.failfast_config,
-        ).await?;
+        )?;
 
         // Extract iteration info
         let iteration = match &result {
@@ -305,7 +304,7 @@ pub async fn run_backtest_loop<P: MutableParser>(
         }
 
         // Apply fixes for next iteration
-        if !parser.apply_fixes(&iteration).await {
+        if !parser.apply_fixes(&iteration) {
             // No more fixes possible
             let final_pass_rate = iterations.last().map(|i| i.pass_rate).unwrap_or(0.0);
 
@@ -324,7 +323,7 @@ pub async fn run_backtest_loop<P: MutableParser>(
 
 /// Simple backtest runner (single iteration, no loop)
 /// F-009: Take files by reference
-pub async fn run_single_backtest<P: ParserRunner>(
+pub fn run_single_backtest<P: ParserRunner>(
     parser: &P,
     files: &[FileInfo],
     high_failure_table: &HighFailureTable,
@@ -332,7 +331,7 @@ pub async fn run_single_backtest<P: ParserRunner>(
     parser_version: usize,
     config: &FailFastConfig,
 ) -> Result<BacktestResult, HighFailureError> {
-    backtest_with_failfast(parser, files, high_failure_table, scope_id, parser_version, 1, config).await
+    backtest_with_failfast(parser, files, high_failure_table, scope_id, parser_version, 1, config)
 }
 
 #[cfg(test)]
@@ -348,7 +347,7 @@ mod tests {
     }
 
     impl ParserRunner for TestParser {
-        async fn run(&self, file_path: &str) -> FileTestResult {
+        fn run(&self, file_path: &str) -> FileTestResult {
             if self.failing_files.contains(&file_path.to_string()) {
                 FileTestResult {
                     file_path: file_path.to_string(),
@@ -372,7 +371,7 @@ mod tests {
             self.version
         }
 
-        async fn apply_fixes(&mut self, _result: &BacktestIteration) -> bool {
+        fn apply_fixes(&mut self, _result: &BacktestIteration) -> bool {
             if self.fix_one_per_iteration && !self.failing_files.is_empty() {
                 self.failing_files.pop();
                 self.version += 1;
@@ -383,8 +382,8 @@ mod tests {
         }
     }
 
-    async fn create_test_table() -> HighFailureTable {
-        HighFailureTable::in_memory().await.expect("create high failure table")
+    fn create_test_table() -> HighFailureTable {
+        HighFailureTable::in_memory().expect("create high failure table")
     }
 
     #[test]
@@ -461,9 +460,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_loop_achieves_pass_rate() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_loop_achieves_pass_rate() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         // Parser starts with 2 failing files, fixes one per iteration
@@ -485,7 +484,7 @@ mod tests {
             FileInfo::new("/path/c.csv", 100),
         ];
 
-        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.expect("run backtest loop");
+        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).expect("run backtest loop");
 
         // Should complete in 3 iterations (start with 2 failing, fix one each time)
         assert_eq!(result.termination_reason, TerminationReason::PassRateAchieved);
@@ -493,9 +492,9 @@ mod tests {
         assert!((result.final_pass_rate - 1.0).abs() < 0.001);
     }
 
-    #[tokio::test]
-    async fn test_loop_hits_max_iterations() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_loop_hits_max_iterations() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         // Parser never improves
@@ -516,7 +515,7 @@ mod tests {
             FileInfo::new("/path/b.csv", 100),
         ];
 
-        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).await.expect("run backtest loop");
+        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).expect("run backtest loop");
 
         // Should stop after 1 iteration (no fixes possible)
         assert!(matches!(
@@ -525,9 +524,9 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_single_backtest() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_single_backtest() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         let parser = TestParser {
@@ -550,7 +549,7 @@ mod tests {
             1,
             &FailFastConfig::no_early_stop(),
         )
-        .await
+        
         .expect("run single backtest");
 
         assert!(result.is_complete());

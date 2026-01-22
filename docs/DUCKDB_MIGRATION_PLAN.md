@@ -1,11 +1,14 @@
-# DuckDB Migration Plan
+# DuckDB Migration Plan (Archived)
 
 **Status Update (2026-01-18):** async-duckdb is no longer used. Casparian now
 owns the async boundary with a dedicated DuckDB actor thread and a synchronous
 `duckdb::Connection` on that thread. References to async-duckdb below are
-historical and should be treated as deprecated guidance.
+historical and should not be treated as current guidance.
 
-**Status:** Draft
+**v1 Direction:** DuckDB-only, no migration work. Reset the local DB instead of
+carrying forward SQLite state. This document is kept as historical context.
+
+**Status:** Archived
 **Author:** AI Assistant
 **Date:** January 16, 2026
 **Version:** 1.0
@@ -341,7 +344,7 @@ DuckDB supports the same ON CONFLICT syntax.
 - Current: RFC3339 strings (`2024-01-15T10:30:00Z`)
 - DuckDB: Native TIMESTAMP preferred, but VARCHAR works
 
-**Decision:** Keep VARCHAR for backward compatibility; can optimize later.
+**Decision:** Keep VARCHAR for simplicity; can optimize later.
 
 ### 3.5 SQLite-Specific PRAGMAs
 

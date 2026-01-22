@@ -6,7 +6,7 @@ use crate::cli::error::HelpfulError;
 use crate::cli::jobs::{column_exists, get_db_path, table_exists, Job};
 use crate::cli::output::format_number_signed;
 use casparian_db::{DbConnection, DbValue};
-use casparian_protocol::ProcessingStatus;
+use casparian_protocol::{JobId, ProcessingStatus};
 use clap::Subcommand;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -90,33 +90,27 @@ pub fn run(action: JobAction) -> anyhow::Result<()> {
             .into());
     }
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async {
-        match action {
-            JobAction::Show { id, json } => run_show(&db_path, &id, json).await,
-            JobAction::Logs { id, follow, tail } => run_logs(&db_path, &id, follow, tail).await,
-            JobAction::Retry { id } => run_retry(&db_path, &id).await,
-            JobAction::RetryAll { topic } => run_retry_all(&db_path, topic.as_deref()).await,
-            JobAction::Cancel { id } => run_cancel(&db_path, &id).await,
-        }
-    })
+    match action {
+        JobAction::Show { id, json } => run_show(&db_path, &id, json),
+        JobAction::Logs { id, follow, tail } => run_logs(&db_path, &id, follow, tail),
+        JobAction::Retry { id } => run_retry(&db_path, &id),
+        JobAction::RetryAll { topic } => run_retry_all(&db_path, topic.as_deref()),
+        JobAction::Cancel { id } => run_cancel(&db_path, &id),
+    }
 }
 
 /// Show detailed job information
-async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()> {
-    let job_id: i64 = id.parse().map_err(|_| {
+fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()> {
+    let job_id: JobId = id.parse().map_err(|_| {
         HelpfulError::new(format!("Invalid job ID: '{}'", id))
             .with_context("Job ID must be a positive integer")
             .with_suggestion("TRY: casparian jobs   # List jobs to find valid IDs")
     })?;
 
-    let conn = connect_db(db_path).await?;
+    let conn = connect_db_readonly(db_path)?;
 
     // Get job details
-    let job = get_job_by_id(&conn, job_id).await?;
+    let job = get_job_by_id(&conn, job_id)?;
     let Some(job) = job else {
         return Err(HelpfulError::new(format!("Job {} not found", job_id))
             .with_suggestion("TRY: casparian jobs   # List available jobs")
@@ -125,7 +119,7 @@ async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()>
 
     // Get failure details if job failed
     let failure = if job.status == ProcessingStatus::Failed {
-        get_job_failure(&conn, job_id).await?
+        get_job_failure(&conn, job_id)?
     } else {
         None
     };
@@ -150,7 +144,7 @@ async fn run_show(db_path: &PathBuf, id: &str, json: bool) -> anyhow::Result<()>
 }
 
 /// View job logs (not implemented for SQLite backend)
-async fn run_logs(
+fn run_logs(
     _db_path: &PathBuf,
     id: &str,
     _follow: bool,
@@ -169,17 +163,17 @@ async fn run_logs(
 }
 
 /// Retry a single failed job
-async fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
-    let job_id: i64 = id.parse().map_err(|_| {
+fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
+    let job_id: JobId = id.parse().map_err(|_| {
         HelpfulError::new(format!("Invalid job ID: '{}'", id))
             .with_context("Job ID must be a positive integer")
             .with_suggestion("TRY: casparian jobs --failed   # List failed jobs")
     })?;
 
-    let conn = connect_db(db_path).await?;
+    let conn = connect_db(db_path)?;
 
     // Check job exists and is failed
-    let job = get_job_by_id(&conn, job_id).await?;
+    let job = get_job_by_id(&conn, job_id)?;
     let Some(job) = job else {
         return Err(HelpfulError::new(format!("Job {} not found", job_id))
             .with_suggestion("TRY: casparian jobs --failed   # List failed jobs")
@@ -188,20 +182,25 @@ async fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
     if job.status != ProcessingStatus::Failed {
         return Err(HelpfulError::new(format!(
-            "Job {} is {}, not FAILED",
+            "Job {} is {}, not {}",
             job_id,
-            job.status.as_str()
+            job.status.as_str(),
+            ProcessingStatus::Failed.as_str()
         ))
         .with_context("Only failed jobs can be retried")
         .with_suggestion("TRY: casparian jobs --failed   # List failed jobs")
         .into());
     }
 
+    let job_id_db = job_id.to_i64().map_err(|err| {
+        HelpfulError::new(format!("Invalid job ID: {}", err))
+    })?;
+
     // Reset job to QUEUED
     conn.execute(
         r#"
         UPDATE cf_processing_queue
-        SET status = 'QUEUED',
+        SET status = ?,
             claim_time = NULL,
             end_time = NULL,
             error_message = NULL,
@@ -209,11 +208,18 @@ async fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             retry_count = retry_count + 1
         WHERE id = ?
         "#,
-        &[DbValue::from(job_id)],
+        &[
+            DbValue::from(ProcessingStatus::Queued.as_str()),
+            DbValue::from(job_id_db),
+        ],
     )
-    .await?;
+    ?;
 
-    println!("Job {} reset to QUEUED for retry", job_id);
+    println!(
+        "Job {} reset to {} for retry",
+        job_id,
+        ProcessingStatus::Queued.as_str()
+    );
     println!();
     println!("The job will be picked up by the next available worker.");
     println!("TRY: casparian jobs --running   # Monitor job progress");
@@ -222,39 +228,46 @@ async fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 }
 
 /// Retry all failed jobs
-async fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
-    let conn = connect_db(db_path).await?;
+fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
+    let conn = connect_db(db_path)?;
 
     let rows_affected = if let Some(t) = topic {
         conn.execute(
             r#"
             UPDATE cf_processing_queue
-            SET status = 'QUEUED',
+            SET status = ?,
                 claim_time = NULL,
                 end_time = NULL,
                 error_message = NULL,
                 result_summary = NULL,
                 retry_count = retry_count + 1
-            WHERE status = 'FAILED' AND plugin_name = ?
+            WHERE status = ? AND plugin_name = ?
             "#,
-            &[DbValue::from(t)],
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+                DbValue::from(t),
+            ],
         )
-        .await?
+        ?
     } else {
         conn.execute(
             r#"
             UPDATE cf_processing_queue
-            SET status = 'QUEUED',
+            SET status = ?,
                 claim_time = NULL,
                 end_time = NULL,
                 error_message = NULL,
                 result_summary = NULL,
                 retry_count = retry_count + 1
-            WHERE status = 'FAILED'
+            WHERE status = ?
             "#,
-            &[],
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+            ],
         )
-        .await?
+        ?
     };
 
     if rows_affected == 0 {
@@ -263,7 +276,11 @@ async fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result
             println!("TRY: casparian jobs --failed   # List all failed jobs");
         }
     } else {
-        println!("{} job(s) reset to QUEUED for retry", rows_affected);
+        println!(
+            "{} job(s) reset to {} for retry",
+            rows_affected,
+            ProcessingStatus::Queued.as_str()
+        );
         println!();
         println!("The jobs will be picked up by available workers.");
         println!("TRY: casparian jobs   # Monitor queue status");
@@ -273,16 +290,16 @@ async fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result
 }
 
 /// Cancel a pending or running job
-async fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
-    let job_id: i64 = id.parse().map_err(|_| {
+fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
+    let job_id: JobId = id.parse().map_err(|_| {
         HelpfulError::new(format!("Invalid job ID: '{}'", id))
             .with_context("Job ID must be a positive integer")
     })?;
 
-    let conn = connect_db(db_path).await?;
+    let conn = connect_db(db_path)?;
 
     // Check job exists
-    let job = get_job_by_id(&conn, job_id).await?;
+    let job = get_job_by_id(&conn, job_id)?;
     let Some(job) = job else {
         return Err(HelpfulError::new(format!("Job {} not found", job_id))
             .with_suggestion("TRY: casparian jobs   # List available jobs")
@@ -317,24 +334,34 @@ async fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
     // Cancel the job
     let now = chrono::Utc::now().to_rfc3339();
+    let job_id_db = job_id.to_i64().map_err(|err| {
+        HelpfulError::new(format!("Invalid job ID: {}", err))
+    })?;
     conn.execute(
         r#"
         UPDATE cf_processing_queue
-        SET status = 'FAILED',
+        SET status = ?,
             end_time = ?,
             error_message = 'Cancelled by user'
         WHERE id = ?
         "#,
-        &[DbValue::from(now), DbValue::from(job_id)],
+        &[
+            DbValue::from(ProcessingStatus::Failed.as_str()),
+            DbValue::from(now),
+            DbValue::from(job_id_db),
+        ],
     )
-    .await?;
+    ?;
 
     println!("Job {} cancelled", job_id);
 
     // If the job was running, warn about potential side effects
     if job.status == ProcessingStatus::Running {
         println!();
-        println!("WARNING: Job was RUNNING when cancelled.");
+        println!(
+            "WARNING: Job was {} when cancelled.",
+            ProcessingStatus::Running.as_str()
+        );
         println!("The worker may have partially processed the file.");
         println!("Check output files for incomplete data.");
     }
@@ -347,9 +374,18 @@ fn db_url_for_path(db_path: &PathBuf) -> String {
     format!("duckdb:{}", db_path.display())
 }
 
-async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
+fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
     let db_url = db_url_for_path(db_path);
-    DbConnection::open_from_url(&db_url).await.map_err(|e| {
+    DbConnection::open_from_url(&db_url).map_err(|e| {
+        HelpfulError::new("Failed to connect to database")
+            .with_context(format!("Database: {}", db_path.display()))
+            .with_suggestion(format!("Error: {}", e))
+            .into()
+    })
+}
+
+fn connect_db_readonly(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
+    DbConnection::open_duckdb_readonly(db_path).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(format!("Database: {}", db_path.display()))
             .with_suggestion(format!("Error: {}", e))
@@ -358,10 +394,11 @@ async fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
 }
 
 /// Get a single job by ID
-async fn get_job_by_id(conn: &DbConnection, job_id: i64) -> anyhow::Result<Option<Job>> {
+fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Job>> {
+    let job_id_db = job_id.to_i64().map_err(|err| anyhow::anyhow!(err))?;
     let has_quarantine_column =
-        column_exists(conn, "cf_processing_queue", "quarantine_rows").await?;
-    let has_quarantine_table = table_exists(conn, "cf_quarantine").await?;
+        column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
+    let has_quarantine_table = table_exists(conn, "cf_quarantine")?;
     let quarantine_select = if has_quarantine_column {
         ", COALESCE(q.quarantine_rows, 0) as quarantine_rows"
     } else if has_quarantine_table {
@@ -405,33 +442,47 @@ async fn get_job_by_id(conn: &DbConnection, job_id: i64) -> anyhow::Result<Optio
     );
 
     let row = conn
-        .query_optional(&query, &[DbValue::from(job_id)])
-        .await?;
+        .query_optional(&query, &[DbValue::from(job_id_db)])
+        ?;
 
-    Ok(row.map(|r| Job {
-        id: r.get(0).unwrap_or_default(),
-        file_path: r.get(1).unwrap_or_default(),
-        plugin_name: r.get(2).unwrap_or_default(),
-        status: r.get::<String>(3).unwrap_or_default().parse().unwrap_or_default(),
-        priority: r.get(4).unwrap_or_default(),
-        claim_time: r.get(5).ok(),
-        end_time: r.get(6).ok(),
-        error_message: r.get(7).ok(),
-        result_summary: r.get(8).ok(),
-        retry_count: r.get(9).unwrap_or_default(),
-        quarantine_rows: r.get(10).ok(),
-    }))
+    let job = match row {
+        Some(r) => {
+            let raw_id: i64 = r.get(0)?;
+            let id = JobId::try_from(raw_id)
+                .map_err(|err| anyhow::anyhow!("Invalid job id {}: {}", raw_id, err))?;
+            let status_str: String = r.get(3)?;
+            let status = status_str.parse::<ProcessingStatus>()
+                .map_err(|e| anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e))?;
+            Some(Job {
+                id,
+                file_path: r.get(1)?,
+                plugin_name: r.get(2)?,
+                status,
+                priority: r.get(4)?,
+                claim_time: r.get(5).ok(),
+                end_time: r.get(6).ok(),
+                error_message: r.get(7).ok(),
+                result_summary: r.get(8).ok(),
+                retry_count: r.get(9)?,
+                quarantine_rows: r.get(10).ok(),
+            })
+        }
+        None => None,
+    };
+
+    Ok(job)
 }
 
 /// Get failure details for a job
-async fn get_job_failure(conn: &DbConnection, job_id: i64) -> anyhow::Result<Option<JobFailure>> {
-    if !table_exists(conn, "cf_job_failures").await? {
+fn get_job_failure(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<JobFailure>> {
+    let job_id_db = job_id.to_i64().map_err(|err| anyhow::anyhow!(err))?;
+    if !table_exists(conn, "cf_job_failures")? {
         let error = conn
             .query_optional(
                 "SELECT error_message FROM cf_processing_queue WHERE id = ?",
-                &[DbValue::from(job_id)],
+                &[DbValue::from(job_id_db)],
             )
-            .await?;
+            ?;
         return Ok(error.and_then(|row| row.get(0).ok()).map(|msg| JobFailure {
             error_type: None,
             error_message: msg,
@@ -450,9 +501,9 @@ async fn get_job_failure(conn: &DbConnection, job_id: i64) -> anyhow::Result<Opt
             ORDER BY id DESC
             LIMIT 1
             "#,
-            &[DbValue::from(job_id)],
+            &[DbValue::from(job_id_db)],
         )
-        .await?;
+        ?;
 
     Ok(row.map(|r| JobFailure {
         error_type: r.get(0).ok(),
@@ -600,7 +651,7 @@ mod tests {
     #[test]
     fn test_build_timeline() {
         let job = Job {
-            id: 1,
+            id: JobId::new(1),
             file_path: "/test/file.csv".to_string(),
             plugin_name: "test".to_string(),
             status: ProcessingStatus::Completed,

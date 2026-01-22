@@ -6,6 +6,8 @@ use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
 
+const SOURCE_ID: i64 = 1;
+
 #[derive(Debug, Deserialize)]
 struct RuleListItem {
     pattern: String,
@@ -30,12 +32,12 @@ fn test_rule_json_and_lifecycle() {
     init_scout_schema(&db_path);
 
     let now = 1_737_187_200_000i64;
-    with_duckdb(&db_path, |conn| async move {
-        insert_source(&conn, "src-1", "test_source", "/data", now).await;
+    with_duckdb(&db_path, |conn| {
+        insert_source(&conn, SOURCE_ID, "test_source", "/data", now);
         insert_file(
             &conn,
             1,
-            "src-1",
+            SOURCE_ID,
             "/data/sample.csv",
             "sample.csv",
             100,
@@ -43,8 +45,7 @@ fn test_rule_json_and_lifecycle() {
             None,
             None,
             now,
-        )
-        .await;
+        );
     });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
@@ -101,7 +102,7 @@ fn test_rule_json_and_lifecycle() {
     assert_eq!(rule_count(&db_path), 0);
 }
 
-async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, now: i64) {
+fn insert_source(conn: &DbConnection, id: i64, name: &str, path: &str, now: i64) {
     let source_type = serde_json::json!({ "type": "local" }).to_string();
     conn.execute(
         "INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
@@ -115,14 +116,13 @@ async fn insert_source(conn: &DbConnection, id: &str, name: &str, path: &str, no
             DbValue::from(now),
         ],
     )
-    .await
     .expect("insert source");
 }
 
-async fn insert_file(
+fn insert_file(
     conn: &DbConnection,
     id: i64,
-    source_id: &str,
+    source_id: i64,
     path: &str,
     rel_path: &str,
     size: i64,
@@ -156,7 +156,6 @@ async fn insert_file(
             DbValue::from(now),
         ],
     )
-    .await
     .expect("insert file");
 }
 
@@ -171,9 +170,8 @@ fn split_rel_path(rel_path: &str) -> (String, String) {
 }
 
 fn rule_count(db_path: &Path) -> i64 {
-    with_duckdb(db_path, |conn| async move {
+    with_duckdb(db_path, |conn| {
         conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_tagging_rules", &[])
-            .await
             .expect("count rules")
     })
 }

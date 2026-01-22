@@ -139,7 +139,7 @@ impl AuditLogger {
     }
 
     /// Log an audit entry
-    pub async fn log(&self, entry: &AuditEntry) -> Result<()> {
+    pub fn log(&self, entry: &AuditEntry) -> Result<()> {
         let redactions_json = serde_json::to_string(&entry.redactions)?;
 
         self.conn
@@ -171,13 +171,13 @@ impl AuditLogger {
                     DbValue::from(entry.created_at.timestamp_millis()),
                 ],
             )
-            .await?;
+            ?;
 
         Ok(())
     }
 
     /// Query recent audit entries
-    pub async fn query_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
+    pub fn query_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
         let rows = self
             .conn
             .query_all(
@@ -192,7 +192,7 @@ impl AuditLogger {
                 "#,
                 &[DbValue::from(limit as i64)],
             )
-            .await?;
+            ?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -202,7 +202,7 @@ impl AuditLogger {
     }
 
     /// Query entries by wizard type
-    pub async fn query_by_wizard(&self, wizard_type: WizardType, limit: usize) -> Result<Vec<AuditEntry>> {
+    pub fn query_by_wizard(&self, wizard_type: WizardType, limit: usize) -> Result<Vec<AuditEntry>> {
         let rows = self
             .conn
             .query_all(
@@ -221,7 +221,7 @@ impl AuditLogger {
                     DbValue::from(limit as i64),
                 ],
             )
-            .await?;
+            ?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -231,7 +231,7 @@ impl AuditLogger {
     }
 
     /// Query entries by status
-    pub async fn query_by_status(&self, status: AuditStatus, limit: usize) -> Result<Vec<AuditEntry>> {
+    pub fn query_by_status(&self, status: AuditStatus, limit: usize) -> Result<Vec<AuditEntry>> {
         let rows = self
             .conn
             .query_all(
@@ -247,7 +247,7 @@ impl AuditLogger {
                 "#,
                 &[DbValue::from(status.as_str()), DbValue::from(limit as i64)],
             )
-            .await?;
+            ?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -257,7 +257,7 @@ impl AuditLogger {
     }
 
     /// Count entries by status
-    pub async fn count_by_status(&self) -> Result<Vec<(AuditStatus, i64)>> {
+    pub fn count_by_status(&self) -> Result<Vec<(AuditStatus, i64)>> {
         let rows = self
             .conn
             .query_all(
@@ -268,7 +268,7 @@ impl AuditLogger {
                 "#,
                 &[],
             )
-            .await?;
+            ?;
 
         let mut counts = Vec::new();
         for row in rows {
@@ -285,7 +285,7 @@ impl AuditLogger {
     ///
     /// Keeps entries newer than `retention_days` for success status,
     /// and longer for errors (2x retention for errors, 3x for critical).
-    pub async fn cleanup_old(&self, retention_days: u32) -> Result<usize> {
+    pub fn cleanup_old(&self, retention_days: u32) -> Result<usize> {
         let now = Utc::now();
         let success_cutoff = (now - chrono::Duration::days(retention_days as i64)).timestamp_millis();
         let error_cutoff = (now - chrono::Duration::days(retention_days as i64 * 2)).timestamp_millis();
@@ -296,11 +296,14 @@ impl AuditLogger {
             .execute(
                 r#"
                 DELETE FROM cf_ai_audit_log
-                WHERE status = 'success' AND created_at < ?
+                WHERE status = ? AND created_at < ?
                 "#,
-                &[DbValue::from(success_cutoff)],
+                &[
+                    DbValue::from(AuditStatus::Success.as_str()),
+                    DbValue::from(success_cutoff),
+                ],
             )
-            .await?;
+            ?;
 
         // Delete old error entries (longer retention)
         let result2 = self
@@ -308,11 +311,15 @@ impl AuditLogger {
             .execute(
                 r#"
                 DELETE FROM cf_ai_audit_log
-                WHERE status IN ('error', 'timeout') AND created_at < ?
+                WHERE status IN (?, ?) AND created_at < ?
                 "#,
-                &[DbValue::from(error_cutoff)],
+                &[
+                    DbValue::from(AuditStatus::Error.as_str()),
+                    DbValue::from(AuditStatus::Timeout.as_str()),
+                    DbValue::from(error_cutoff),
+                ],
             )
-            .await?;
+            ?;
 
         Ok((result1 + result2) as usize)
     }
@@ -375,10 +382,10 @@ mod tests {
     use casparian_db::DbConnection;
     use tempfile::TempDir;
 
-    async fn setup() -> (AuditLogger, TempDir) {
+    fn setup() -> (AuditLogger, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("audit.duckdb");
-        let conn = DbConnection::open_duckdb(&db_path).await.unwrap();
+        let conn = DbConnection::open_duckdb(&db_path).unwrap();
 
         // Create the audit table
         conn.execute_batch(
@@ -398,19 +405,19 @@ mod tests {
                 status TEXT NOT NULL,
                 error_message TEXT,
                 attempt_number INTEGER DEFAULT 1,
-                created_at INTEGER NOT NULL
+                created_at BIGINT NOT NULL
             )
             "#,
         )
-        .await
+        
         .unwrap();
 
         (AuditLogger::new(conn), temp_dir)
     }
 
-    #[tokio::test]
-    async fn test_log_and_query() {
-        let (logger, _temp) = setup().await;
+    #[test]
+    fn test_log_and_query() {
+        let (logger, _temp) = setup();
 
         let entry = AuditEntry::new(
             WizardType::Pathfinder,
@@ -423,49 +430,49 @@ mod tests {
         .with_duration(1500)
         .with_status(AuditStatus::Success);
 
-        logger.log(&entry).await.unwrap();
+        logger.log(&entry).unwrap();
 
-        let recent = logger.query_recent(10).await.unwrap();
+        let recent = logger.query_recent(10).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].wizard_type, WizardType::Pathfinder);
         assert_eq!(recent[0].model_name, "qwen2.5-coder:7b");
     }
 
-    #[tokio::test]
-    async fn test_query_by_wizard() {
-        let logger = setup().await;
+    #[test]
+    fn test_query_by_wizard() {
+        let (logger, _temp) = setup();
 
         // Log entries for different wizards
         for wt in [WizardType::Pathfinder, WizardType::ParserLab, WizardType::Pathfinder] {
             let entry = AuditEntry::new(wt, "model", "input", "hash");
-            logger.log(&entry).await.unwrap();
+            logger.log(&entry).unwrap();
         }
 
         let pathfinder_entries = logger
             .query_by_wizard(WizardType::Pathfinder, 10)
-            .await
+            
             .unwrap();
         assert_eq!(pathfinder_entries.len(), 2);
 
         let parser_entries = logger
             .query_by_wizard(WizardType::ParserLab, 10)
-            .await
+            
             .unwrap();
         assert_eq!(parser_entries.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_count_by_status() {
-        let logger = setup().await;
+    #[test]
+    fn test_count_by_status() {
+        let (logger, _temp) = setup();
 
         // Log entries with different statuses
         for status in [AuditStatus::Success, AuditStatus::Success, AuditStatus::Error] {
             let entry = AuditEntry::new(WizardType::Pathfinder, "model", "input", "hash")
                 .with_status(status);
-            logger.log(&entry).await.unwrap();
+            logger.log(&entry).unwrap();
         }
 
-        let counts = logger.count_by_status().await.unwrap();
+        let counts = logger.count_by_status().unwrap();
         assert!(counts.iter().any(|(s, c)| *s == AuditStatus::Success && *c == 2));
         assert!(counts.iter().any(|(s, c)| *s == AuditStatus::Error && *c == 1));
     }

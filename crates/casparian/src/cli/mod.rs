@@ -31,6 +31,7 @@ pub mod preview {
     }
 }
 pub mod run;
+pub mod schema;
 pub mod backfill;
 pub mod pipeline;
 
@@ -66,6 +67,7 @@ pub mod files;
 
 // W3: Parser commands (stubs)
 pub mod parser;
+pub mod plugin;
 
 // W4: Job commands (stubs)
 pub mod jobs;
@@ -79,6 +81,9 @@ pub mod topic;
 
 // W8: TUI
 pub mod tui;
+
+// W9: MCP (Model Context Protocol)
+pub mod mcp;
 
 // Configuration and context
 pub mod config;

@@ -235,6 +235,7 @@ fn extract_parser_metadata(dir: &Path) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser_metadata::extract_attribute;
     use tempfile::TempDir;
 
     #[test]

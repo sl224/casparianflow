@@ -1,25 +1,41 @@
 # V1 Execution Plan (Synthesized)
 
 Status: Working Draft (directional, not binding)
-Purpose: Align v1 delivery with PMF priorities and current code, while preserving the legacy execution plan for reference.
+Purpose: Align v1 delivery with PMF priorities and current code, while preserving the archived execution plan for reference.
 
 Inputs:
 - docs/v1_scope.md
 - docs/v1_checklist.md
 - docs/schema_rfc.md (directional)
-- docs/execution_plan.md (legacy, below)
+- docs/execution_plan.md (archived, below)
 
 Constraints:
 - Disk space is limited; avoid large artifacts and long-running local builds.
-- v1 is finance-first (trade break workbench); keep scope tight.
+- v1 is DFIR-first (artifact workbench); keep scope tight.
 - DuckDB + Parquet only for v1 sinks.
+- Schema-as-code is the authoring path for publish (Registry/Vault eligible). Hand-authored JSON sidecars are not supported.
+- Canonical schema artifacts (JSON/Arrow) are required for signing/registry and may be produced by tooling.
 
 Current status snapshot (from checklist + recent code work):
-- DataType extended (Decimal, timestamp_tz, list/struct) with backward-compatible serde; tzdb validation added.
+- DataType extended (Decimal, timestamp_tz, list/struct) with shorthand/object serde; tzdb validation added.
 - DuckDB sink supports DECIMAL + TIMESTAMPTZ.
 - Worker validation/quarantine policy + quarantine schema metadata are implemented; lineage injection + fallback warnings/metrics are implemented.
-- JobStatus PartialSuccess wired; scope_id derivation remains a gap.
+- JobStatus PartialSuccess wired; scope_id derivation + logic_hash persistence implemented; quarantine_config_json remains a gap.
 - CLI preview exists; Parser Bench and Jobs view need alignment with v1 semantics.
+
+## Schema-as-Code Only (Decision + Execution Plan)
+Decision:
+- Publish/Registry/Vault accept schema-as-code only (AST-extractable).
+- JSON sidecar schemas are rejected for publish.
+- Import-from-JSON may exist as a one-time migration utility only.
+
+Execution plan (pre-v1, DB reset acceptable):
+- Require `casparian.toml` manifest for `casparian publish` (name/version/protocol_version).
+- Add schema compiler (AST-based) that produces Rust `SchemaDefinition` + canonical schema artifact (JSON/Arrow) from schema-as-code.
+- Store compiled schema in `schema_contracts` at publish time; enforce "schema change => version bump" for same version.
+- Add `casparian schema generate` and `casparian schema infer` to emit schema-as-code + manifest + canonical artifact.
+- Update docs/specs to remove JSON *authoring* path and document canonical schema artifacts as the language-neutral interchange format.
+- (Post-v1) Define a language-neutral subprocess protocol for non-Python plugins (Arrow IPC + control frames) and extend manifest with `runtime_kind` + `entrypoint`/`artifact`.
 
 ## Parallel Tracks (v1)
 Aim to run these in parallel with minimal cross-blocking, using feature flags where needed.
@@ -37,7 +53,7 @@ Owner: Eng Core
 Deliverables:
 - Inject lineage columns into outputs.
 - Support __cf_row_id when present; otherwise emit lineage warnings.
-- JobStatus -> PartialSuccess with per-output metrics; keep CompletedWithWarnings as compat alias.
+- JobStatus -> PartialSuccess with per-output metrics; treat CompletedWithWarnings as success if encountered.
 Dependencies: Can proceed in parallel with Track 1; integrate at the worker output boundary.
 
 ### Track 3: Contract Identity + Storage (P0)
@@ -46,7 +62,7 @@ Deliverables:
 - scope_id = parser_id + parser_version + output_name.
 - Store logic_hash with contracts for advisory warnings.
 - Update schema contract storage to include quarantine_config_json.
-Dependencies: Minimal; can land in parallel with Tracks 1/2. Requires migration plan.
+Dependencies: Minimal; can land in parallel with Tracks 1/2. DB reset is acceptable in v1 (no migrations).
 
 ### Track 4: CLI/TUI + Workflow (P1)
 Owner: Eng Product
@@ -59,8 +75,8 @@ Dependencies: Needs Track 1/2 semantics to display real metrics.
 ### Track 5: Demo + PMF Enablement (P0)
 Owner: Product/Eng
 Deliverables:
-- Small FIX demo dataset + walkthrough (trade break by ClOrdID).
-- Pilot onboarding guide and success criteria.
+- Small EVTX demo dataset + walkthrough (timeline query).
+- Productized onboarding sprint kit (scope, acceptance criteria, handoff checklist).
 - E2E test that mirrors demo flow.
 Dependencies: Needs Track 1/2 to be meaningful; can draft docs early.
 
@@ -72,13 +88,13 @@ Dependencies: Needs Track 1/2 to be meaningful; can draft docs early.
 - M4: CLI/TUI + demo workflow (Tracks 4/5).
 
 ## Disk Space Guidance
-- Keep demo datasets small (<10MB). Prefer synthetic FIX logs.
+- Keep demo datasets small (<10MB). Prefer small EVTX samples.
 - Avoid large Parquet artifacts in repo; write to temp dirs and clean up.
-- Defer full 10M-row performance tests until storage is available.
+- Defer multi-GB performance tests until storage is available.
 
 ---
 
-# Legacy Execution Plan (Archived)
+# Archived Execution Plan
 
 Purpose: Provide an end-to-end implementation plan for remaining phases/features, with enough context for another LLM to execute without split-brain.
 
@@ -115,7 +131,7 @@ Goal: Map spec requirements to concrete code touch points and data model changes
 - Identify existing data structures in protocol and storage:
   - casparian_protocol::types (sink config, job status, lineage fields)
   - duckdb schema in casparian storage (jobs, artifacts, quarantine)
-- Determine migration needs and backward compatibility (product not launched; no compat required).
+- Determine migration needs (product not launched; reset state acceptable).
 - Decide where validation logic lives (worker vs library). Target: worker owns validation after bridge IPC, before sink write.
 
 Output:
@@ -227,7 +243,6 @@ Files likely touched:
 
 ## Non-Goals (v1)
 - Deep nested validation (defer to v1.1)
-- Per-output sinks within a job
 - Cross-sink atomic commits
 
 ## Implementation Order (Recommended)
@@ -266,6 +281,11 @@ Files likely touched:
 - Logical date support + backfill resume (DONE)
 - Pipeline enqueueing + run status updates (DONE)
 - Pipeline E2E test for enqueueing (DONE)
+- Output materialization ledger (`cf_output_materializations`) with idempotent enqueue skip by parser fingerprint + output target key (DONE)
+
+**Notes:**
+- Idempotency is output-target scoped: topic + sink URI + sink mode + schema hash + table name.
+- Schema changes should be paired with a new table or output replacement (pre-v1: delete old outputs).
 
 ## Track B: Validation + Quarantine (Eng 2)
 **Goal:** Worker-side validation split + quarantine outputs.

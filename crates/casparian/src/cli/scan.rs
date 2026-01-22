@@ -8,7 +8,7 @@
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{color_for_extension, format_size, format_time, print_table_colored};
 use casparian::scout::scan_path;
-use casparian::scout::{Database, ScannedFile, Scanner, Source, SourceType};
+use casparian::scout::{Database, ScannedFile, Scanner, Source, SourceId, SourceType};
 use comfy_table::Color;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -137,7 +137,7 @@ fn matches_patterns(
 ///
 /// Uses the consolidated Scanner for file discovery, storage, and cache building.
 /// CLI-specific filters are applied post-scan for display and tagging.
-pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
+pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     if args.json && args.interactive {
         return Err(HelpfulError::new("Cannot combine --json and --interactive")
             .with_context("Interactive mode renders a TUI, not JSON output")
@@ -166,25 +166,25 @@ pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
     let db_dir = db_path.parent().unwrap();
     fs::create_dir_all(db_dir)?;
 
-    let db = Database::open(&db_path).await
+    let db = Database::open(&db_path)
         .map_err(|e| HelpfulError::new(format!("Failed to open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display())))?;
 
     // Get or create source
-    let source = get_or_create_source(&db, &scan_path).await?;
+    let source = get_or_create_source(&db, &scan_path)?;
 
     // Use Scanner for discovery, storage, and cache building
     // Note: Scanner scans ALL files; CLI filters are applied post-scan
     let scanner = Scanner::new(db.clone());
     let scan_result = scanner
         .scan(&source, None, None)
-        .await
+        
         .map_err(|e| HelpfulError::new(format!("Scan failed: {}", e)))?;
 
     // Query all files from database
     let db_files = db
         .list_files_by_source(&source.id, 1_000_000)
-        .await
+        
         .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
 
     // Convert to DiscoveredFile and apply CLI filters
@@ -192,7 +192,7 @@ pub async fn run(args: ScanArgs) -> anyhow::Result<()> {
 
     // Tag filtered files if requested (only tags files matching filters)
     let tagged_count = if let Some(ref tag) = args.tag {
-        tag_filtered_files(&db, &source.id, &files, tag).await?
+        tag_filtered_files(&db, &source.id, &files, tag)?
     } else {
         0
     };
@@ -345,9 +345,9 @@ fn apply_cli_filters(
 }
 
 /// Tag only the filtered files
-async fn tag_filtered_files(
+fn tag_filtered_files(
     db: &Database,
-    source_id: &str,
+    source_id: &SourceId,
     files: &[DiscoveredFile],
     tag: &str,
 ) -> anyhow::Result<usize> {
@@ -357,9 +357,9 @@ async fn tag_filtered_files(
     // This is not ideal but maintains the CLI behavior of only tagging filtered files.
     for file in files {
         let path_str = file.path.display().to_string();
-        if let Ok(Some(db_file)) = db.get_file_by_path(source_id, &path_str).await {
+        if let Ok(Some(db_file)) = db.get_file_by_path(source_id, &path_str) {
             if let Some(id) = db_file.id {
-                if db.tag_file(id, tag).await.is_ok() {
+                if db.tag_file(id, tag).is_ok() {
                     tagged += 1;
                 }
             }
@@ -370,11 +370,11 @@ async fn tag_filtered_files(
 }
 
 /// Get or create a source for the scan path
-async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<Source> {
+fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<Source> {
     let path_str = path.display().to_string();
 
     // Try to find existing source by path
-    let sources = db.list_sources().await
+    let sources = db.list_sources()
         .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
     for source in sources {
@@ -384,7 +384,7 @@ async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<S
     }
 
     // Create new source
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = SourceId::new();
     let name = path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("scan")
@@ -399,7 +399,7 @@ async fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<S
         enabled: true,
     };
 
-    db.upsert_source(&source).await
+    db.upsert_source(&source)
         .map_err(|e| HelpfulError::new(format!("Failed to create source: {}", e)))?;
 
     Ok(source)
@@ -892,8 +892,8 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn test_scan_basic() {
+    #[test]
+    fn test_scan_basic() {
         let _env = TestEnv::new();
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
@@ -913,11 +913,11 @@ mod tests {
             tag: None,
         };
 
-        run(args).await.unwrap();
+        run(args).unwrap();
     }
 
-    #[tokio::test]
-    async fn test_scan_type_filter() {
+    #[test]
+    fn test_scan_type_filter() {
         let _env = TestEnv::new();
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
@@ -937,11 +937,11 @@ mod tests {
             tag: None,
         };
 
-        run(args).await.unwrap();
+        run(args).unwrap();
     }
 
-    #[tokio::test]
-    async fn test_scan_non_recursive() {
+    #[test]
+    fn test_scan_non_recursive() {
         let _env = TestEnv::new();
         let temp_dir = TempDir::new().unwrap();
         create_test_files(temp_dir.path());
@@ -961,11 +961,11 @@ mod tests {
             tag: None,
         };
 
-        run(args).await.unwrap();
+        run(args).unwrap();
     }
 
-    #[tokio::test]
-    async fn test_scan_nonexistent_path() {
+    #[test]
+    fn test_scan_nonexistent_path() {
         let _env = TestEnv::new();
         let args = ScanArgs {
             path: PathBuf::from("/nonexistent/path/that/does/not/exist"),
@@ -982,12 +982,12 @@ mod tests {
             tag: None,
         };
 
-        let result = run(args).await;
+        let result = run(args);
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_scan_file_instead_of_dir() {
+    #[test]
+    fn test_scan_file_instead_of_dir() {
         let temp_dir = TempDir::new().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         File::create(&file_path)
@@ -1010,7 +1010,7 @@ mod tests {
             tag: None,
         };
 
-        let result = run(args).await;
+        let result = run(args);
         assert!(result.is_err());
     }
 

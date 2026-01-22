@@ -9,22 +9,17 @@ description = "Database abstraction layer for Casparian Flow"
 
 [features]
 default = ["duckdb"]
-sqlite = ["sqlx/sqlite"]
-postgres = ["sqlx/postgres"]
 # DuckDB: use system libduckdb (fast dev builds, requires: brew install duckdb)
 duckdb = ["dep:duckdb", "dep:fs2"]
 # DuckDB bundled: compile from source (slow, but self-contained for releases)
 duckdb-bundled = ["duckdb", "duckdb/bundled"]
-# mssql = ["tiberius"]  # Future: MSSQL support via tiberius
 
 [dependencies]
-sqlx = { workspace = true, default-features = false, features = ["runtime-tokio-native-tls", "chrono", "macros"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-tokio = { workspace = true }
 
 # DuckDB support (columnar OLAP database)
 # Note: No "bundled" feature by default - uses system libduckdb for fast dev builds
@@ -37,5 +32,4 @@ duckdb = { version = "1.4", optional = true }
 fs2 = { version = "0.4", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = "3.10"

@@ -19,7 +19,9 @@
 
 use anyhow::{Context, Result};
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
+use casparian_protocol::JobId;
 use casparian_sinks::OutputBatch;
 use serde::Deserialize;
 use std::io::{Read, Write};
@@ -84,27 +86,18 @@ pub enum BridgeError {
     Source {
         message: String,
         #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
+        source: anyhow::Error,
     },
 }
 
 pub type BridgeExecResult<T> = std::result::Result<T, BridgeError>;
 
-impl BridgeError {
-    fn with_source(
-        message: impl Into<String>,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        BridgeError::Source {
-            message: message.into(),
-            source: Box::new(source),
-        }
-    }
-}
-
 impl From<anyhow::Error> for BridgeError {
     fn from(err: anyhow::Error) -> Self {
-        BridgeError::with_source(err.to_string(), err)
+        BridgeError::Source {
+            message: err.to_string(),
+            source: err,
+        }
     }
 }
 
@@ -120,12 +113,15 @@ struct JobLogWriter {
 impl JobLogWriter {
     /// Create a new log writer for the given job.
     /// Creates the log directory if needed.
-    fn new(job_id: u64) -> Result<Self> {
-        let log_dir = PathBuf::from("/tmp/casparian_logs");
+    /// Uses both job_id and process ID to ensure uniqueness when running tests in parallel.
+    fn new(job_id: JobId) -> Result<Self> {
+        let mut log_dir = std::env::temp_dir();
+        log_dir.push("casparian_logs");
         std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
 
-        let path = log_dir.join(format!("{}.log", job_id));
+        // Include process ID to avoid collisions when tests run in parallel with same job_id
+        let path = log_dir.join(format!("{}_{}.log", job_id, std::process::id()));
         let file = std::fs::File::create(&path)
             .with_context(|| format!("Failed to create log file: {}", path.display()))?;
 
@@ -202,7 +198,7 @@ pub struct BridgeConfig {
     pub interpreter_path: PathBuf,
     pub source_code: String,
     pub file_path: String,
-    pub job_id: u64,
+    pub job_id: JobId,
     pub file_id: i64,
     pub shim_path: PathBuf,
     pub inherit_stdio: bool,
@@ -235,17 +231,9 @@ struct StreamResult {
 }
 
 /// Execute a bridge job. This is the only public entry point.
-/// Runs blocking I/O in a separate thread pool.
 /// Returns both the data batches and captured logs.
-pub async fn execute_bridge(config: BridgeConfig) -> BridgeExecResult<BridgeResult> {
-    execute_bridge_inner(config).await.map_err(BridgeError::from)
-}
-
-async fn execute_bridge_inner(config: BridgeConfig) -> Result<BridgeResult> {
-    // Move all blocking work to spawn_blocking
-    tokio::task::spawn_blocking(move || execute_bridge_sync(config))
-        .await
-        .context("Bridge task panicked")?
+pub fn execute_bridge(config: BridgeConfig) -> BridgeExecResult<BridgeResult> {
+    execute_bridge_sync(config).map_err(BridgeError::from)
 }
 
 /// Synchronous bridge execution - no async lies here
@@ -344,22 +332,12 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     }
 
     let output_batches = stream_result.output_batches;
-    let metrics_json = stream_result.metrics_json;
-
-    // Capture stdout (legacy metrics fallback)
-    let stdout_output = collect_stdout(&mut process);
+    let metrics_json = stream_result
+        .metrics_json
+        .ok_or_else(|| anyhow::anyhow!("[Job {}] Missing metrics payload from bridge", job_id))?;
 
     // Parse output_info from JSON metrics
-    let output_info = match metrics_json {
-        Some(json) => parse_output_info(job_id, "socket", &json),
-        None => {
-            if stdout_output.is_empty() {
-                Vec::new()
-            } else {
-                parse_output_info(job_id, "stdout", &stdout_output)
-            }
-        }
-    };
+    let output_info = parse_output_info(job_id, "socket", &metrics_json);
 
     // TCP socket cleanup is automatic when listener goes out of scope
 
@@ -408,7 +386,7 @@ fn accept_with_timeout(
     listener: &TcpListener,
     timeout: Duration,
     process: &mut Child,
-    job_id: u64,
+    job_id: JobId,
 ) -> Result<TcpStream> {
     // Use non-blocking mode with polling
     listener.set_nonblocking(true)
@@ -520,20 +498,7 @@ fn collect_stderr(process: &mut Child) -> String {
     }
 }
 
-/// Collect stdout from process (consumes the stdout handle)
-fn collect_stdout(process: &mut Child) -> String {
-    if let Some(mut stdout) = process.stdout.take() {
-        let mut output = String::new();
-        match stdout.read_to_string(&mut output) {
-            Ok(_) => output.trim().to_string(),
-            Err(e) => format!("(failed to read stdout: {})", e),
-        }
-    } else {
-        String::new()
-    }
-}
-
-fn parse_output_info(job_id: u64, source: &str, json_text: &str) -> Vec<OutputInfo> {
+fn parse_output_info(job_id: JobId, source: &str, json_text: &str) -> Vec<OutputInfo> {
     match serde_json::from_str::<serde_json::Value>(json_text) {
         Ok(json) => {
             if let Some(info_array) = json.get("output_info").and_then(|v| v.as_array()) {
@@ -631,12 +596,14 @@ fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
 /// Read Arrow IPC batches from TCP stream, handling sideband log messages
 fn read_arrow_batches(
     stream: &mut TcpStream,
-    job_id: u64,
+    job_id: JobId,
     log_writer: &mut JobLogWriter,
 ) -> Result<StreamResult> {
     let mut outputs: Vec<Vec<RecordBatch>> = Vec::new();
     let mut metrics_json: Option<String> = None;
     let mut current_output: Option<Vec<RecordBatch>> = None;
+    let mut current_output_index: Option<u32> = None;
+    let mut current_output_schema: Option<SchemaRef> = None;
     let mut batch_count = 0u32;
     let mut log_count = 0u32;
 
@@ -714,12 +681,15 @@ fn read_arrow_batches(
             let output_index = u32::from_be_bytes(index_buf);
             if current_output.is_some() {
                 anyhow::bail!(
-                    "[Job {}] Received OUTPUT_START for output {} while another output is open",
+                    "[Job {}] Received OUTPUT_START for output {} while another output is open (index {:?})",
                     job_id,
-                    output_index
+                    output_index,
+                    current_output_index
                 );
             }
             current_output = Some(Vec::new());
+            current_output_index = Some(output_index);
+            current_output_schema = None;
             debug!("[Job {}] Output {} started", job_id, output_index);
             continue;
         }
@@ -728,15 +698,30 @@ fn read_arrow_batches(
             let mut index_buf = [0u8; HEADER_SIZE];
             stream.read_exact(&mut index_buf)
                 .with_context(|| format!("[Job {}] Failed to read output end index", job_id))?;
-            let output_index = u32::from_be_bytes(index_buf);
+            let end_index = u32::from_be_bytes(index_buf);
+
+            // Validate index matches the active output
+            if let Some(start_index) = current_output_index {
+                if start_index != end_index {
+                    anyhow::bail!(
+                        "[Job {}] OUTPUT_END index {} does not match OUTPUT_START index {} - protocol error",
+                        job_id,
+                        end_index,
+                        start_index
+                    );
+                }
+            }
+
             if let Some(output_batches) = current_output.take() {
                 outputs.push(output_batches);
-                debug!("[Job {}] Output {} ended", job_id, output_index);
+                current_output_index = None;
+                current_output_schema = None;
+                debug!("[Job {}] Output {} ended", job_id, end_index);
             } else {
                 anyhow::bail!(
                     "[Job {}] Received OUTPUT_END for output {} without active output",
                     job_id,
-                    output_index
+                    end_index
                 );
             }
             continue;
@@ -772,6 +757,23 @@ fn read_arrow_batches(
                 job_id, batch_count
             ))?;
 
+        if current_output.is_some() {
+            let schema = reader.schema();
+            match &current_output_schema {
+                Some(expected) if expected.as_ref() != schema.as_ref() => {
+                    anyhow::bail!(
+                        "[Job {}] Schema mismatch within output {:?}: expected {:?}, got {:?}",
+                        job_id,
+                        current_output_index,
+                        expected,
+                        schema
+                    );
+                }
+                Some(_) => {}
+                None => current_output_schema = Some(schema.clone()),
+            }
+        }
+
         let mut ipc_batches: Vec<RecordBatch> = Vec::new();
         for batch_result in reader {
             let batch = batch_result
@@ -794,8 +796,9 @@ fn read_arrow_batches(
 
     if let Some(output_batches) = current_output.take() {
         warn!(
-            "[Job {}] Output stream ended without OUTPUT_END; closing open output",
-            job_id
+            "[Job {}] Output stream ended without OUTPUT_END (index {:?}); closing open output",
+            job_id,
+            current_output_index
         );
         outputs.push(output_batches);
     }
@@ -810,7 +813,7 @@ fn read_arrow_batches(
 /// Protocol: [LEVEL:1][LENGTH:4][MESSAGE]
 fn read_and_write_log(
     stream: &mut TcpStream,
-    job_id: u64,
+    job_id: JobId,
     log_writer: &mut JobLogWriter,
 ) -> Result<()> {
     // Read 1-byte log level
@@ -851,7 +854,7 @@ fn read_and_write_log(
 /// Read error message after ERROR_SIGNAL with size limit
 fn read_error_message(
     stream: &mut TcpStream,
-    job_id: u64,
+    job_id: JobId,
 ) -> Result<String> {
     let mut len_buf = [0u8; HEADER_SIZE];
     stream.read_exact(&mut len_buf)
@@ -881,7 +884,7 @@ fn read_error_message(
 }
 
 /// Read metrics JSON after METRICS_SIGNAL with size limit
-fn read_metrics_payload(stream: &mut TcpStream, job_id: u64) -> Result<String> {
+fn read_metrics_payload(stream: &mut TcpStream, job_id: JobId) -> Result<String> {
     let mut len_buf = [0u8; HEADER_SIZE];
     stream.read_exact(&mut len_buf)
         .with_context(|| format!("[Job {}] Failed to read metrics length", job_id))?;
@@ -1019,18 +1022,15 @@ fn materialize_bridge_shim_inner() -> Result<PathBuf> {
     Ok(shim_path)
 }
 
-/// Deprecated: Use `materialize_bridge_shim()` instead.
-///
-/// This function is kept for backward compatibility but now delegates
-/// to the new materialization logic.
-#[deprecated(since = "0.2.0", note = "Use materialize_bridge_shim() instead")]
-pub fn find_bridge_shim() -> BridgeExecResult<PathBuf> {
-    materialize_bridge_shim()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
 
     #[test]
     fn test_materialize_bridge_shim() {
@@ -1126,6 +1126,66 @@ mod tests {
     fn test_header_size_constant() {
         // Header is 4 bytes for length prefix (u32 big-endian)
         assert_eq!(HEADER_SIZE, 4);
+    }
+
+    #[test]
+    fn test_schema_mismatch_within_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+
+            stream.write_all(&OUTPUT_START_SIGNAL.to_be_bytes()).unwrap();
+            stream.write_all(&1u32.to_be_bytes()).unwrap();
+
+            let batch1 = make_int_batch();
+            write_ipc_batch(&mut stream, &batch1);
+
+            let batch2 = make_string_batch();
+            write_ipc_batch(&mut stream, &batch2);
+
+            stream.write_all(&OUTPUT_END_SIGNAL.to_be_bytes()).unwrap();
+            stream.write_all(&1u32.to_be_bytes()).unwrap();
+        });
+
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        let mut log_writer = JobLogWriter::new(JobId::new(1)).unwrap();
+        let result = read_arrow_batches(&mut stream, JobId::new(1), &mut log_writer);
+
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("Schema mismatch"),
+            "Expected schema mismatch error, got: {}",
+            err
+        );
+
+        writer.join().unwrap();
+    }
+
+    fn write_ipc_batch(stream: &mut TcpStream, batch: &RecordBatch) {
+        let mut sink = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut sink, &batch.schema()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+
+        stream.write_all(&(sink.len() as u32).to_be_bytes()).unwrap();
+        stream.write_all(&sink).unwrap();
+    }
+
+    fn make_int_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let array = Int64Array::from(vec![1, 2, 3]);
+        RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
+    }
+
+    fn make_string_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let array = StringArray::from(vec!["a", "b", "c"]);
+        RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
     }
 
     #[test]

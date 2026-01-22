@@ -1,10 +1,15 @@
 mod cli_support;
 
 use casparian_db::{DbConnection, DbValue};
+use casparian::scout::FileStatus;
 use cli_support::with_duckdb;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use tempfile::TempDir;
+
+const SOURCE_ID: i64 = 1;
+const RULE_CSV_ID: i64 = 2;
+const RULE_JSON_ID: i64 = 3;
 
 fn casparian_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_casparian"))
@@ -29,13 +34,13 @@ fn assert_cli_success(output: Output, args: &[String]) {
     );
 }
 
-async fn create_tag_schema(conn: &DbConnection) {
-    conn.execute_batch(
+fn create_tag_schema(conn: &DbConnection) {
+    let schema = format!(
         r#"
         CREATE TABLE scout_tagging_rules (
-            id TEXT PRIMARY KEY,
+            id BIGINT PRIMARY KEY,
             name TEXT,
-            source_id TEXT NOT NULL,
+            source_id BIGINT NOT NULL,
             pattern TEXT NOT NULL,
             tag TEXT NOT NULL,
             priority INTEGER DEFAULT 0,
@@ -45,17 +50,17 @@ async fn create_tag_schema(conn: &DbConnection) {
         );
 
         CREATE TABLE scout_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_id TEXT NOT NULL,
+            id BIGINT PRIMARY KEY,
+            source_id BIGINT NOT NULL,
             path TEXT NOT NULL,
             rel_path TEXT NOT NULL,
             size INTEGER NOT NULL,
             mtime INTEGER,
             content_hash TEXT,
-            status TEXT DEFAULT 'pending',
+            status TEXT DEFAULT '{}',
             tag TEXT,
             tag_source TEXT,
-            rule_id TEXT,
+            rule_id BIGINT,
             manual_plugin TEXT,
             error TEXT,
             first_seen_at INTEGER,
@@ -64,9 +69,9 @@ async fn create_tag_schema(conn: &DbConnection) {
             sentinel_job_id INTEGER
         );
         "#,
-    )
-    .await
-    .expect("create tag schema");
+        FileStatus::Pending.as_str()
+    );
+    conn.execute_batch(&schema).expect("create tag schema");
 }
 
 #[test]
@@ -79,54 +84,54 @@ fn test_tag_and_untag_update_sqlite_db() {
     ];
 
     {
-        with_duckdb(&db_path, |conn| async move {
-            create_tag_schema(&conn).await;
+        with_duckdb(&db_path, |conn| {
+            create_tag_schema(&conn);
 
             conn.execute(
                 "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
                  VALUES (?, ?, ?, ?, ?, 1)",
                 &[
-                    DbValue::from("r1"),
-                    DbValue::from("src-1"),
+                    DbValue::from(RULE_CSV_ID),
+                    DbValue::from(SOURCE_ID),
                     DbValue::from("*.csv"),
                     DbValue::from("csv_data"),
                     DbValue::from(10i32),
                 ],
             )
-            .await
             .unwrap();
             conn.execute(
                 "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
                  VALUES (?, ?, ?, ?, ?, 1)",
                 &[
-                    DbValue::from("r2"),
-                    DbValue::from("src-1"),
+                    DbValue::from(RULE_JSON_ID),
+                    DbValue::from(SOURCE_ID),
                     DbValue::from("*.json"),
                     DbValue::from("json_data"),
                     DbValue::from(5i32),
                 ],
             )
-            .await
             .unwrap();
 
             let files = [
-                ("/data/sales.csv", "sales.csv", 1000),
-                ("/data/invoices.csv", "invoices.csv", 2000),
-                ("/data/config.json", "config.json", 500),
-                ("/data/readme.txt", "readme.txt", 100),
-                ("/data/unknown.xyz", "unknown.xyz", 50),
+                (1i64, "/data/sales.csv", "sales.csv", 1000),
+                (2i64, "/data/invoices.csv", "invoices.csv", 2000),
+                (3i64, "/data/config.json", "config.json", 500),
+                (4i64, "/data/readme.txt", "readme.txt", 100),
+                (5i64, "/data/unknown.xyz", "unknown.xyz", 50),
             ];
-            for (path, rel_path, size) in files {
+            for (id, path, rel_path, size) in files {
                 conn.execute(
-                    "INSERT INTO scout_files (source_id, path, rel_path, size, status)
-                     VALUES ('src-1', ?, ?, ?, 'pending')",
+                    "INSERT INTO scout_files (id, source_id, path, rel_path, size, status)
+                     VALUES (?, ?, ?, ?, ?, ?)",
                     &[
+                        DbValue::from(id),
+                        DbValue::from(SOURCE_ID),
                         DbValue::from(path),
                         DbValue::from(rel_path),
                         DbValue::from(size),
+                        DbValue::from(FileStatus::Pending.as_str()),
                     ],
                 )
-                .await
                 .unwrap();
             }
         });
@@ -136,27 +141,24 @@ fn test_tag_and_untag_update_sqlite_db() {
     assert_cli_success(run_cli(&tag_args, &envs), &tag_args);
 
     {
-        let (csv_count, json_count, untagged_count) = with_duckdb(&db_path, |conn| async move {
+        let (csv_count, json_count, untagged_count) = with_duckdb(&db_path, |conn| {
             let csv_count = conn
                 .query_scalar::<i64>(
                     "SELECT COUNT(*) FROM scout_files WHERE tag = 'csv_data'",
                     &[],
                 )
-                .await
                 .unwrap();
             let json_count = conn
                 .query_scalar::<i64>(
                     "SELECT COUNT(*) FROM scout_files WHERE tag = 'json_data'",
                     &[],
                 )
-                .await
                 .unwrap();
             let untagged_count = conn
                 .query_scalar::<i64>(
                     "SELECT COUNT(*) FROM scout_files WHERE tag IS NULL",
                     &[],
                 )
-                .await
                 .unwrap();
             (csv_count, json_count, untagged_count)
         });
@@ -173,13 +175,12 @@ fn test_tag_and_untag_update_sqlite_db() {
     assert_cli_success(run_cli(&manual_args, &envs), &manual_args);
 
     {
-        let (tag, tag_source) = with_duckdb(&db_path, |conn| async move {
+        let (tag, tag_source) = with_duckdb(&db_path, |conn| {
             let row = conn
                 .query_optional(
                     "SELECT tag, tag_source FROM scout_files WHERE path = ?",
                     &[DbValue::from("/data/unknown.xyz")],
                 )
-                .await
                 .unwrap();
             row.and_then(|r| {
                 let tag: Option<String> = r.get_by_name("tag").ok().flatten();
@@ -196,13 +197,12 @@ fn test_tag_and_untag_update_sqlite_db() {
     assert_cli_success(run_cli(&untag_args, &envs), &untag_args);
 
     {
-        let (final_tag, status) = with_duckdb(&db_path, |conn| async move {
+        let (final_tag, status) = with_duckdb(&db_path, |conn| {
             let row = conn
                 .query_optional(
                     "SELECT tag, status FROM scout_files WHERE path = ?",
                     &[DbValue::from("/data/unknown.xyz")],
                 )
-                .await
                 .unwrap();
             row.and_then(|r| {
                 let final_tag: Option<String> = r.get_by_name("tag").ok().flatten();
@@ -212,7 +212,7 @@ fn test_tag_and_untag_update_sqlite_db() {
             .unwrap_or((None, String::new()))
         });
         assert!(final_tag.is_none());
-        assert_eq!(status, "pending");
+        assert_eq!(status, FileStatus::Pending.as_str());
     }
 }
 
@@ -226,37 +226,42 @@ fn test_pipeline_run_enqueues_jobs() {
     ];
 
     {
-        with_duckdb(&db_path, |conn| async move {
-            conn.execute_batch(
+        with_duckdb(&db_path, |conn| {
+            let schema = format!(
                 r#"
                 CREATE TABLE scout_files (
-                    id BIGINT,
-                    source_id TEXT NOT NULL,
+                    id BIGINT PRIMARY KEY,
+                    source_id BIGINT NOT NULL,
                     path TEXT NOT NULL,
                     rel_path TEXT NOT NULL,
                     size BIGINT NOT NULL,
                     mtime BIGINT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
+                    status TEXT NOT NULL DEFAULT '{}',
                     tag TEXT,
                     extension TEXT
                 );
                 "#,
-            )
-            .await
-            .unwrap();
+                FileStatus::Pending.as_str()
+            );
+            conn.execute_batch(&schema).unwrap();
 
             let files = [
-                ("/data/demo/a.csv", "a.csv"),
-                ("/data/demo/b.csv", "b.csv"),
-                ("/data/demo/c.csv", "c.csv"),
+                (1i64, "/data/demo/a.csv", "a.csv"),
+                (2i64, "/data/demo/b.csv", "b.csv"),
+                (3i64, "/data/demo/c.csv", "c.csv"),
             ];
-            for (path, rel_path) in files {
+            for (id, path, rel_path) in files {
                 conn.execute(
-                    "INSERT INTO scout_files (source_id, path, rel_path, size, mtime, status, tag, extension)
-                     VALUES ('src-1', ?, ?, 100, 1737187200000, 'pending', 'demo', 'csv')",
-                    &[DbValue::from(path), DbValue::from(rel_path)],
+                    "INSERT INTO scout_files (id, source_id, path, rel_path, size, mtime, status, tag, extension)
+                     VALUES (?, ?, ?, ?, 100, 1737187200000, ?, 'demo', 'csv')",
+                    &[
+                        DbValue::from(id),
+                        DbValue::from(SOURCE_ID),
+                        DbValue::from(path),
+                        DbValue::from(rel_path),
+                        DbValue::from(FileStatus::Pending.as_str()),
+                    ],
                 )
-                .await
                 .unwrap();
             }
         });
@@ -291,12 +296,11 @@ fn test_pipeline_run_enqueues_jobs() {
     ];
     assert_cli_success(run_cli(&run_args, &envs), &run_args);
 
-    let queued_count = with_duckdb(&db_path, |conn| async move {
+    let queued_count = with_duckdb(&db_path, |conn| {
         conn.query_scalar::<i64>(
             "SELECT COUNT(*) FROM cf_processing_queue WHERE plugin_name = 'demo_parser'",
             &[],
         )
-        .await
         .unwrap()
     });
     assert_eq!(queued_count, 3);

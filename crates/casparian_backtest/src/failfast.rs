@@ -7,7 +7,6 @@ use crate::high_failure::{FailureHistoryEntry, FileInfo, HighFailureError, HighF
 use crate::metrics::{FailureCategory, IterationMetrics};
 use crate::ScopeId;
 use serde::{Deserialize, Serialize};
-use std::future::Future;
 
 /// Configuration for fail-fast backtest
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,12 +113,12 @@ pub struct FileTestResult {
 /// Trait for running parser on a file
 pub trait ParserRunner: Send + Sync {
     /// Run the parser on a file and return the result
-    fn run(&self, file_path: &str) -> impl Future<Output = FileTestResult> + Send;
+    fn run(&self, file_path: &str) -> FileTestResult;
 }
 
 /// Run a fail-fast backtest
 /// F-009: Take files by reference instead of by value to avoid cloning in iteration loop
-pub async fn backtest_with_failfast<P: ParserRunner>(
+pub fn backtest_with_failfast<P: ParserRunner>(
     parser: &P,
     files: &[FileInfo],
     high_failure_table: &HighFailureTable,
@@ -129,7 +128,7 @@ pub async fn backtest_with_failfast<P: ParserRunner>(
     config: &FailFastConfig,
 ) -> Result<BacktestResult, HighFailureError> {
     // Get files in optimal order
-    let ordered_files = high_failure_table.get_backtest_order(files, scope_id).await?;
+    let ordered_files = high_failure_table.get_backtest_order(files, scope_id)?;
 
     let total_files = ordered_files.len();
     if total_files == 0 {
@@ -150,11 +149,11 @@ pub async fn backtest_with_failfast<P: ParserRunner>(
 
     for (idx, file) in ordered_files.iter().enumerate() {
         // Run parser on file
-        let result = parser.run(&file.path).await;
+        let result = parser.run(&file.path);
 
         if result.passed {
             metrics.record_pass();
-            high_failure_table.record_success(&file.path, scope_id).await?;
+            high_failure_table.record_success(&file.path, scope_id)?;
 
             if file.is_high_failure {
                 high_failure_passed += 1;
@@ -168,7 +167,7 @@ pub async fn backtest_with_failfast<P: ParserRunner>(
 
             // Record failure in high-failure table
             let entry = FailureHistoryEntry::new(iteration, parser_version, category, error_msg);
-            high_failure_table.record_failure(&file.path, scope_id, entry).await?;
+            high_failure_table.record_failure(&file.path, scope_id, entry)?;
         }
 
         // Track high-failure vs remaining
@@ -248,7 +247,7 @@ mod tests {
     }
 
     impl ParserRunner for MockParser {
-        async fn run(&self, file_path: &str) -> FileTestResult {
+        fn run(&self, file_path: &str) -> FileTestResult {
             if self.failing_files.contains(&file_path.to_string()) {
                 FileTestResult {
                     file_path: file_path.to_string(),
@@ -267,13 +266,13 @@ mod tests {
         }
     }
 
-    async fn create_test_table() -> HighFailureTable {
-        HighFailureTable::in_memory().await.unwrap()
+    fn create_test_table() -> HighFailureTable {
+        HighFailureTable::in_memory().unwrap()
     }
 
-    #[tokio::test]
-    async fn test_backtest_all_pass() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_backtest_all_pass() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
         let parser = MockParser {
             failing_files: vec![],
@@ -287,15 +286,15 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
         assert!(result.is_complete());
         assert!((result.pass_rate() - 1.0).abs() < 0.001);
     }
 
-    #[tokio::test]
-    async fn test_backtest_some_fail() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_backtest_some_fail() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
         let parser = MockParser {
             failing_files: vec!["/path/a.csv".to_string()],
@@ -309,15 +308,15 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
         assert!(result.is_complete());
         assert!((result.pass_rate() - 0.666).abs() < 0.01);
     }
 
-    #[tokio::test]
-    async fn test_backtest_early_stop() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_backtest_early_stop() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         // Record some prior failures
@@ -326,7 +325,7 @@ mod tests {
                 FailureHistoryEntry::new(0, 1, FailureCategory::TypeMismatch, "Prior failure");
             table
                 .record_failure(&format!("/path/high{}.csv", i), &scope_id, entry)
-                .await
+                
                 .unwrap();
         }
 
@@ -359,15 +358,15 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
         // Should have stopped early because high-failure pass rate < 80%
         assert!(result.is_early_stopped());
     }
 
-    #[tokio::test]
-    async fn test_backtest_continues_if_high_failure_passes() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_backtest_continues_if_high_failure_passes() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         // Record some prior failures
@@ -376,7 +375,7 @@ mod tests {
                 FailureHistoryEntry::new(0, 1, FailureCategory::TypeMismatch, "Prior failure");
             table
                 .record_failure(&format!("/path/high{}.csv", i), &scope_id, entry)
-                .await
+                
                 .unwrap();
         }
 
@@ -400,15 +399,15 @@ mod tests {
         ];
 
         let result =
-            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &config).unwrap();
 
         // Should complete because high-failure files passed
         assert!(result.is_complete());
     }
 
-    #[tokio::test]
-    async fn test_empty_files() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_empty_files() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
         let parser = MockParser {
             failing_files: vec![],
@@ -416,7 +415,7 @@ mod tests {
         let config = FailFastConfig::default();
 
         let result =
-            backtest_with_failfast(&parser, &[], &table, &scope_id, 1, 1, &config).await.unwrap();
+            backtest_with_failfast(&parser, &[], &table, &scope_id, 1, 1, &config).unwrap();
 
         assert!(result.is_complete());
         assert!((result.pass_rate() - 0.0).abs() < 0.001); // 0/0 defaults to 0

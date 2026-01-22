@@ -151,26 +151,26 @@ pub struct HighFailureTable {
 
 impl HighFailureTable {
     /// Create a new high-failure table with the given pool.
-    pub async fn new(conn: DbConnection) -> Result<Self, HighFailureError> {
+    pub fn new(conn: DbConnection) -> Result<Self, HighFailureError> {
         let table = Self { conn };
-        table.init_schema().await?;
+        table.init_schema()?;
         Ok(table)
     }
 
     /// Open from a file path.
-    pub async fn open(path: &str) -> Result<Self, HighFailureError> {
-        let conn = DbConnection::open_duckdb(Path::new(path)).await?;
-        Self::new(conn).await
+    pub fn open(path: &str) -> Result<Self, HighFailureError> {
+        let conn = DbConnection::open_duckdb(Path::new(path))?;
+        Self::new(conn)
     }
 
     /// Create an in-memory table (for testing).
-    pub async fn in_memory() -> Result<Self, HighFailureError> {
-        let conn = DbConnection::open_duckdb_memory().await?;
-        Self::new(conn).await
+    pub fn in_memory() -> Result<Self, HighFailureError> {
+        let conn = DbConnection::open_duckdb_memory()?;
+        Self::new(conn)
     }
 
     /// Initialize the database schema
-    async fn init_schema(&self) -> Result<(), HighFailureError> {
+    fn init_schema(&self) -> Result<(), HighFailureError> {
         let create_sql = r#"
             CREATE TABLE IF NOT EXISTS high_failure_files (
                 file_id TEXT PRIMARY KEY,
@@ -189,13 +189,13 @@ impl HighFailureTable {
             CREATE INDEX IF NOT EXISTS idx_high_failure_consecutive ON high_failure_files(scope_id, consecutive_failures DESC);
         "#;
 
-        self.conn.execute_batch(create_sql).await?;
+        self.conn.execute_batch(create_sql)?;
 
         Ok(())
     }
 
     /// Record a failure for a file
-    pub async fn record_failure(
+    pub fn record_failure(
         &self,
         file_path: &str,
         scope_id: &ScopeId,
@@ -214,7 +214,7 @@ impl HighFailureTable {
                 "#,
                 &[DbValue::from(file_path), DbValue::from(scope_id.as_str())],
             )
-            .await?;
+            ?;
         let existing = existing.map(row_to_existing).transpose()?;
 
         if let Some(existing) = existing {
@@ -244,7 +244,7 @@ impl HighFailureTable {
                         DbValue::from(scope_id.as_str()),
                     ],
                 )
-                .await?;
+                ?;
 
             let first_failure_at =
                 parse_timestamp(&existing.first_failure_at, "first_failure_at")?;
@@ -284,7 +284,7 @@ impl HighFailureTable {
                         DbValue::from(history_json),
                     ],
                 )
-                .await?;
+                ?;
 
             Ok(HighFailureFile {
                 file_id,
@@ -301,7 +301,7 @@ impl HighFailureTable {
     }
 
     /// Record a success for a file (resets consecutive failures)
-    pub async fn record_success(
+    pub fn record_success(
         &self,
         file_path: &str,
         scope_id: &ScopeId,
@@ -315,7 +315,7 @@ impl HighFailureTable {
                 "SELECT failure_history_json FROM high_failure_files WHERE file_path = ? AND scope_id = ?",
                 &[DbValue::from(file_path), DbValue::from(scope_id.as_str())],
             )
-            .await?;
+            ?;
 
         if let Some(row) = existing {
             let history_json: String = row.get_by_name("failure_history_json")?;
@@ -344,14 +344,14 @@ impl HighFailureTable {
                         DbValue::from(scope_id.as_str()),
                     ],
                 )
-                .await?;
+                ?;
         }
 
         Ok(())
     }
 
     /// Get all active high-failure files for a scope (consecutive_failures > 0)
-    pub async fn get_active(
+    pub fn get_active(
         &self,
         scope_id: &ScopeId,
     ) -> Result<Vec<HighFailureFile>, HighFailureError> {
@@ -367,13 +367,13 @@ impl HighFailureTable {
                 "#,
                 &[DbValue::from(scope_id.as_str())],
             )
-            .await?;
+            ?;
 
         rows.into_iter().map(row_to_high_failure).collect()
     }
 
     /// Get all files for a scope (including resolved)
-    pub async fn get_all(
+    pub fn get_all(
         &self,
         scope_id: &ScopeId,
     ) -> Result<Vec<HighFailureFile>, HighFailureError> {
@@ -389,7 +389,7 @@ impl HighFailureTable {
                 "#,
                 &[DbValue::from(scope_id.as_str())],
             )
-            .await?;
+            ?;
 
         rows.into_iter().map(row_to_high_failure).collect()
     }
@@ -401,13 +401,13 @@ impl HighFailureTable {
     /// 2. Resolved files (had failures but now passing)
     /// 3. Untested files (never been tested)
     /// 4. Passing files (tested and passed, never failed)
-    pub async fn get_backtest_order(
+    pub fn get_backtest_order(
         &self,
         all_files: &[FileInfo],
         scope_id: &ScopeId,
     ) -> Result<Vec<FileInfo>, HighFailureError> {
         // Get all high-failure info
-        let high_failure_files = self.get_all(scope_id).await?;
+        let high_failure_files = self.get_all(scope_id)?;
         // F-010: Use &str keys instead of String to avoid cloning
         let high_failure_map: std::collections::HashMap<&str, &HighFailureFile> = high_failure_files
             .iter()
@@ -455,14 +455,14 @@ impl HighFailureTable {
     }
 
     /// Clear all entries for a scope (useful for fresh backtest)
-    pub async fn clear_scope(&self, scope_id: &ScopeId) -> Result<usize, HighFailureError> {
+    pub fn clear_scope(&self, scope_id: &ScopeId) -> Result<usize, HighFailureError> {
         let result = self
             .conn
             .execute(
                 "DELETE FROM high_failure_files WHERE scope_id = ?",
                 &[DbValue::from(scope_id.as_str())],
             )
-            .await?;
+            ?;
         Ok(result as usize)
     }
 }
@@ -552,13 +552,13 @@ fn parse_timestamp(raw: &str, label: &str) -> Result<DbTimestamp, HighFailureErr
 mod tests {
     use super::*;
 
-    async fn create_test_table() -> HighFailureTable {
-        HighFailureTable::in_memory().await.unwrap()
+    fn create_test_table() -> HighFailureTable {
+        HighFailureTable::in_memory().unwrap()
     }
 
-    #[tokio::test]
-    async fn test_record_failure() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_record_failure() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         let entry = FailureHistoryEntry::new(
@@ -570,7 +570,7 @@ mod tests {
 
         let hf = table
             .record_failure("/path/to/file.csv", &scope_id, entry)
-            .await
+            
             .unwrap();
 
         assert_eq!(hf.file_path, "/path/to/file.csv");
@@ -579,23 +579,23 @@ mod tests {
         assert_eq!(hf.failure_history.len(), 1);
     }
 
-    #[tokio::test]
-    async fn test_multiple_failures_increment() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_multiple_failures_increment() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         // First failure
         let entry1 = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error 1");
         table
             .record_failure("/path/to/file.csv", &scope_id, entry1)
-            .await
+            
             .unwrap();
 
         // Second failure
         let entry2 = FailureHistoryEntry::new(2, 2, FailureCategory::NullNotAllowed, "Error 2");
         let hf = table
             .record_failure("/path/to/file.csv", &scope_id, entry2)
-            .await
+            
             .unwrap();
 
         assert_eq!(hf.failure_count, 2);
@@ -603,67 +603,67 @@ mod tests {
         assert_eq!(hf.failure_history.len(), 2);
     }
 
-    #[tokio::test]
-    async fn test_success_resets_consecutive() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_success_resets_consecutive() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         // Record failures
         let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
         table
             .record_failure("/path/to/file.csv", &scope_id, entry)
-            .await
+            
             .unwrap();
 
         // Record success
         table
             .record_success("/path/to/file.csv", &scope_id)
-            .await
+            
             .unwrap();
 
         // Should have no active high-failure files
-        let active = table.get_active(&scope_id).await.unwrap();
+        let active = table.get_active(&scope_id).unwrap();
         assert!(active.is_empty());
 
         // But should still be in all (with consecutive = 0)
-        let all = table.get_all(&scope_id).await.unwrap();
+        let all = table.get_all(&scope_id).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].consecutive_failures, 0);
         assert_eq!(all[0].failure_count, 1); // Still tracked total failures
     }
 
-    #[tokio::test]
-    async fn test_backtest_order() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_backtest_order() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
 
         // Record some failures
         let entry1 = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
         table
             .record_failure("/path/high1.csv", &scope_id, entry1.clone())
-            .await
+            
             .unwrap();
         table
             .record_failure("/path/high1.csv", &scope_id, entry1.clone())
-            .await
+            
             .unwrap();
         table
             .record_failure("/path/high1.csv", &scope_id, entry1.clone())
-            .await
+            
             .unwrap(); // 3 consecutive
 
         table
             .record_failure("/path/high2.csv", &scope_id, entry1.clone())
-            .await
+            
             .unwrap(); // 1 consecutive
 
         table
             .record_failure("/path/resolved.csv", &scope_id, entry1.clone())
-            .await
+            
             .unwrap();
         table
             .record_success("/path/resolved.csv", &scope_id)
-            .await
+            
             .unwrap(); // resolved
 
         // Create file list
@@ -679,7 +679,7 @@ mod tests {
             FileInfo::new("/path/resolved.csv", 100),
         ];
 
-        let ordered = table.get_backtest_order(&files, &scope_id).await.unwrap();
+        let ordered = table.get_backtest_order(&files, &scope_id).unwrap();
 
         // High failure (most consecutive first)
         assert_eq!(ordered[0].path, "/path/high1.csv");
@@ -692,31 +692,31 @@ mod tests {
         assert_eq!(ordered[2].consecutive_failures, 0);
     }
 
-    #[tokio::test]
-    async fn test_clear_scope() {
-        let table = create_test_table().await;
+    #[test]
+    fn test_clear_scope() {
+        let table = create_test_table();
         let scope_id = ScopeId::new();
         let other_scope = ScopeId::new();
 
         let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
         table
             .record_failure("/path/file1.csv", &scope_id, entry.clone())
-            .await
+            
             .unwrap();
         table
             .record_failure("/path/file2.csv", &scope_id, entry.clone())
-            .await
+            
             .unwrap();
         table
             .record_failure("/path/other.csv", &other_scope, entry)
-            .await
+            
             .unwrap();
 
-        let cleared = table.clear_scope(&scope_id).await.unwrap();
+        let cleared = table.clear_scope(&scope_id).unwrap();
         assert_eq!(cleared, 2);
 
         // Other scope unaffected
-        let all = table.get_all(&other_scope).await.unwrap();
+        let all = table.get_all(&other_scope).unwrap();
         assert_eq!(all.len(), 1);
     }
 }

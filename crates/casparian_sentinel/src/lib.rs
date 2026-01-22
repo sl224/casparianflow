@@ -20,4 +20,8 @@ pub struct SentinelArgs {
     /// Database connection string
     #[arg(long, default_value = "duckdb:casparian_flow.duckdb")]
     pub database: String,
+
+    /// Maximum number of workers (default 4, hard cap 8)
+    #[arg(long, default_value_t = 4)]
+    pub max_workers: usize,
 }

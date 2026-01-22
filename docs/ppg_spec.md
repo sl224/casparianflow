@@ -1,14 +1,16 @@
 # Parameterizable Parser Generator (PPG) Specification
 
-**Status:** Draft (Second Review Fixes Applied)
+**Status:** Reference (post-v1)
 **Version:** 1.3.0
 **Date:** 2026-01-16
-**Parent:** `specs/parser_schema_contract_rfc_refined.md` (v0.5)
+**Parent:** `docs/schema_rfc.md`
 **Related:** `specs/parsers/hl7_parser.md`, `strategies/healthcare_hl7.md`
 
 ---
 
 ## 1. Overview
+
+**Note:** PPG is not in v1 scope; this spec is kept for future design work.
 
 ### 1.1 Purpose
 
@@ -1210,7 +1212,7 @@ With `segment_traversal: "recursive"`, this correctly finds OBX segments inside 
 
 ```bash
 # Analyze existing parser and suggest PPG config
-casparian ppg infer parsers/legacy_parser.py --output suggested_config.json
+casparian ppg infer parsers/example_parser.py --output suggested_config.json
 ```
 
 This:
@@ -1504,4 +1506,3 @@ Allow user-defined transforms in config:
 | `binary` | - | `pa.binary()` | `{"kind": "binary"}` |
 | `list` | `item`, `item_nullable` | `pa.list_(item)` | `{"kind": "list", "item": {"kind": "string"}}` |
 | `struct` | `fields` | `pa.struct(fields)` | See RFC 6.2.1 |
-
