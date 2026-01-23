@@ -1,283 +1,395 @@
 //! Job Manager - Job Lifecycle Management
 //!
-//! Manages job creation, execution, and cleanup.
+//! Manages job creation, execution, and cleanup (DB-backed).
 
-use super::{
-    Job, JobId, JobProgress, JobState, JobStore, JobType, DEFAULT_MAX_CONCURRENT,
-    DEFAULT_TIMEOUT_MS, JOB_TTL_HOURS, STALL_THRESHOLD_MS,
-};
+use super::{Job, JobId, JobProgress, JobSpec, JobState, JobType};
+use crate::types::PluginRef;
 use anyhow::{Context, Result};
+use casparian_db::DbConnection;
+use casparian_protocol::{HttpJobStatus, HttpJobType};
+use casparian_sentinel::ApiStorage;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 
 /// Job manager for tracking and executing jobs
 pub struct JobManager {
-    /// Job store for persistence
-    store: JobStore,
-
-    /// In-memory job cache
-    jobs: HashMap<JobId, Job>,
-
-    /// Currently running job (if any)
-    running_job: Option<JobId>,
-
-    /// Maximum concurrent jobs
-    max_concurrent: usize,
-
-    /// Job timeout in milliseconds
-    timeout_ms: u64,
+    /// Database path (open per operation to avoid long-lived locks)
+    db_path: PathBuf,
 }
 
 impl JobManager {
-    /// Create a new job manager
-    pub fn new(jobs_dir: PathBuf) -> Result<Self> {
-        let store = JobStore::new(jobs_dir)?;
+    /// Create a new job manager backed by DuckDB at the given path.
+    pub fn new(db_path: PathBuf) -> Result<Self> {
+        let conn = DbConnection::open_duckdb(&db_path)
+            .with_context(|| format!("Failed to open DB at {}", db_path.display()))?;
+        let storage = ApiStorage::new(conn);
+        storage.init_schema().context("Failed to init schema")?;
 
-        // Load existing jobs from store
-        let jobs = store.load_all()?;
-        let jobs: HashMap<JobId, Job> = jobs.into_iter().map(|j| (j.id.clone(), j)).collect();
-
-        Ok(Self {
-            store,
-            jobs,
-            running_job: None,
-            max_concurrent: DEFAULT_MAX_CONCURRENT,
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-        })
+        Ok(Self { db_path })
     }
 
-    /// Create a new job
-    pub fn create_job(&mut self, job_type: JobType) -> Result<Job> {
-        let job = Job::new(job_type);
-        self.store.save(&job)?;
-        self.jobs.insert(job.id.clone(), job.clone());
+    fn storage(&self) -> Result<ApiStorage> {
+        let conn = DbConnection::open_duckdb(&self.db_path)
+            .with_context(|| format!("Failed to open DB at {}", self.db_path.display()))?;
+        let storage = ApiStorage::new(conn);
+        storage.init_schema().context("Failed to init schema")?;
+        Ok(storage)
+    }
+
+    /// Create a new job with a fully-specified JobSpec.
+    pub fn create_job(&self, spec: JobSpec, approval_id: Option<String>) -> Result<Job> {
+        let (job_type, plugin_ref, input_dir, output_sink) = job_spec_components(&spec);
+        let (plugin_name, plugin_version) = plugin_ref_to_parts(&plugin_ref);
+
+        let spec_json = serde_json::to_string(&spec).context("Failed to serialize job spec")?;
+
+        let storage = self.storage()?;
+        let job_id = storage.create_job(
+            job_type,
+            &plugin_name,
+            plugin_version.as_deref(),
+            &input_dir,
+            output_sink.as_deref(),
+            approval_id.as_deref(),
+            Some(&spec_json),
+        )?;
+
+        let protocol_job = storage
+            .get_job(job_id)?
+            .context("Job missing after create")?;
+        let job = from_protocol_job(protocol_job)?;
         info!("Created job: {} ({})", job.id, job.job_type);
         Ok(job)
     }
 
     /// Get a job by ID
-    pub fn get_job(&self, id: &JobId) -> Option<&Job> {
-        self.jobs.get(id)
-    }
-
-    /// Get a mutable reference to a job
-    pub fn get_job_mut(&mut self, id: &JobId) -> Option<&mut Job> {
-        self.jobs.get_mut(id)
+    pub fn get_job(&self, id: &JobId) -> Result<Option<Job>> {
+        let storage = self.storage()?;
+        let job = storage.get_job(id.to_proto())?;
+        match job {
+            Some(protocol_job) => Ok(Some(from_protocol_job(protocol_job)?)),
+            None => Ok(None),
+        }
     }
 
     /// Start a job (transition from queued to running)
-    pub fn start_job(&mut self, id: &JobId) -> Result<()> {
-        // Check if we can start another job
-        if self.running_job.is_some() {
-            anyhow::bail!("A job is already running");
+    pub fn start_job(&self, id: &JobId) -> Result<()> {
+        let storage = self.storage()?;
+        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+
+        match job.status {
+            HttpJobStatus::Queued => {}
+            HttpJobStatus::Running => anyhow::bail!("Job is already running"),
+            HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled => {
+                anyhow::bail!("Job is already terminal")
+            }
         }
 
-        let job = self
-            .jobs
-            .get_mut(id)
-            .context("Job not found")?;
-
-        job.start();
-        self.running_job = Some(id.clone());
-        self.store.save(job)?;
+        storage.update_job_status(id.to_proto(), HttpJobStatus::Running)?;
+        storage.update_job_progress(id.to_proto(), "running", 0, None, None)?;
 
         info!("Started job: {}", id);
         Ok(())
     }
 
     /// Update job progress
-    pub fn update_progress(&mut self, id: &JobId, progress: JobProgress) -> Result<()> {
-        let job = self
-            .jobs
-            .get_mut(id)
-            .context("Job not found")?;
+    pub fn update_progress(&self, id: &JobId, progress: JobProgress) -> Result<()> {
+        let storage = self.storage()?;
+        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+        if job.status != HttpJobStatus::Running {
+            anyhow::bail!("Cannot update progress for non-running job");
+        }
 
-        job.update_progress(progress);
-        self.store.save(job)?;
+        storage.update_job_progress(
+            id.to_proto(),
+            progress.phase.as_deref().unwrap_or("running"),
+            progress.items_done,
+            progress.items_total,
+            None,
+        )?;
 
         debug!("Updated progress for job: {}", id);
         Ok(())
     }
 
     /// Complete a job
-    pub fn complete_job(&mut self, id: &JobId, result: serde_json::Value) -> Result<()> {
-        let job = self
-            .jobs
-            .get_mut(id)
-            .context("Job not found")?;
-
-        job.complete(result);
-        self.store.save(job)?;
-
-        if self.running_job.as_ref() == Some(id) {
-            self.running_job = None;
+    pub fn complete_job(&self, id: &JobId, result: serde_json::Value) -> Result<()> {
+        // Persist result (must be parseable)
+        let wrapper: JobResultWrapper =
+            serde_json::from_value(result).context("Invalid job result payload")?;
+        let storage = self.storage()?;
+        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+        if job.status != HttpJobStatus::Running {
+            anyhow::bail!("Cannot complete a non-running job");
         }
+        storage.update_job_result(id.to_proto(), &wrapper.into())?;
+        storage.update_job_status(id.to_proto(), HttpJobStatus::Completed)?;
 
         info!("Completed job: {}", id);
         Ok(())
     }
 
     /// Fail a job
-    pub fn fail_job(&mut self, id: &JobId, error: impl Into<String>) -> Result<()> {
-        let job = self
-            .jobs
-            .get_mut(id)
-            .context("Job not found")?;
-
+    pub fn fail_job(&self, id: &JobId, error: impl Into<String>) -> Result<()> {
         let error = error.into();
-        job.fail(&error);
-        self.store.save(job)?;
-
-        if self.running_job.as_ref() == Some(id) {
-            self.running_job = None;
+        let storage = self.storage()?;
+        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+        if matches!(
+            job.status,
+            HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled
+        ) {
+            anyhow::bail!("Cannot fail a terminal job");
         }
+        storage.update_job_status(id.to_proto(), HttpJobStatus::Failed)?;
+        storage.update_job_error(id.to_proto(), &error)?;
 
         warn!("Failed job {}: {}", id, error);
         Ok(())
     }
 
     /// Cancel a job
-    pub fn cancel_job(&mut self, id: &JobId) -> Result<bool> {
-        let job = match self.jobs.get_mut(id) {
-            Some(j) => j,
-            None => return Ok(false),
-        };
-
-        if job.state.is_terminal() {
-            return Ok(false);
+    pub fn cancel_job(&self, id: &JobId) -> Result<bool> {
+        let storage = self.storage()?;
+        let cancelled = storage.cancel_job(id.to_proto())?;
+        if cancelled {
+            info!("Cancelled job: {}", id);
         }
-
-        job.cancel();
-        self.store.save(job)?;
-
-        if self.running_job.as_ref() == Some(id) {
-            self.running_job = None;
-        }
-
-        info!("Cancelled job: {}", id);
-        Ok(true)
+        Ok(cancelled)
     }
 
     /// List jobs with optional filter
-    pub fn list_jobs(&self, status_filter: Option<&str>, limit: usize) -> Vec<&Job> {
-        let mut jobs: Vec<&Job> = self
-            .jobs
-            .values()
-            .filter(|j| {
-                status_filter
-                    .map(|s| j.state.status_str() == s)
-                    .unwrap_or(true)
-            })
-            .collect();
-
-        // Sort by created_at descending (newest first)
-        jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-        jobs.into_iter().take(limit).collect()
-    }
-
-    /// Check for stalled jobs and mark them
-    pub fn check_stalled(&mut self) -> Result<Vec<JobId>> {
-        let now = Utc::now();
-        let mut stalled = Vec::new();
-
-        for (id, job) in &mut self.jobs {
-            if let JobState::Running { started_at, progress } = &job.state {
-                let elapsed = (now - progress.updated_at).num_milliseconds() as u64;
-
-                if elapsed > STALL_THRESHOLD_MS {
-                    job.state = JobState::Stalled {
-                        started_at: *started_at,
-                        last_progress_at: progress.updated_at,
-                        progress: progress.clone(),
-                    };
-                    stalled.push(id.clone());
-                    warn!("Job {} appears stalled (no progress for {}ms)", id, elapsed);
-                }
-            }
-        }
-
-        // Persist changes
-        for id in &stalled {
-            if let Some(job) = self.jobs.get(id) {
-                self.store.save(job)?;
-            }
-        }
-
-        Ok(stalled)
-    }
-
-    /// Clean up old completed jobs
-    pub fn cleanup_old_jobs(&mut self) -> Result<usize> {
-        let now = Utc::now();
-        let cutoff = now - chrono::Duration::hours(JOB_TTL_HOURS);
-
-        let to_remove: Vec<JobId> = self
-            .jobs
-            .iter()
-            .filter(|(_, job)| {
-                job.state.is_terminal() && job.created_at < cutoff
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        let count = to_remove.len();
-
-        for id in to_remove {
-            self.jobs.remove(&id);
-            self.store.delete(&id)?;
-        }
-
-        if count > 0 {
-            info!("Cleaned up {} old jobs", count);
-        }
-
-        Ok(count)
-    }
-
-    /// Check if a job can be started
-    pub fn can_start_job(&self) -> bool {
-        self.running_job.is_none()
-    }
-
-    /// Get the currently running job ID
-    pub fn running_job_id(&self) -> Option<&JobId> {
-        self.running_job.as_ref()
+    pub fn list_jobs(&self, status_filter: Option<&str>, limit: usize) -> Result<Vec<Job>> {
+        let storage = self.storage()?;
+        let status = match status_filter {
+            Some("queued") => Some(HttpJobStatus::Queued),
+            Some("running") => Some(HttpJobStatus::Running),
+            Some("completed") => Some(HttpJobStatus::Completed),
+            Some("failed") => Some(HttpJobStatus::Failed),
+            Some("cancelled") => Some(HttpJobStatus::Cancelled),
+            Some(other) => anyhow::bail!("Unsupported status filter: {}", other),
+            None => None,
+        };
+        let jobs = storage.list_jobs(status, limit)?;
+        jobs.into_iter().map(from_protocol_job).collect()
     }
 }
 
-/// Handle for interacting with a running job
-pub struct JobHandle {
-    pub id: JobId,
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn job_spec_components(spec: &JobSpec) -> (HttpJobType, PluginRef, String, Option<String>) {
+    match spec {
+        JobSpec::Backtest {
+            plugin_ref,
+            input_dir,
+            ..
+        } => (
+            HttpJobType::Backtest,
+            plugin_ref.clone(),
+            input_dir.clone(),
+            None,
+        ),
+        JobSpec::Run {
+            plugin_ref,
+            input_dir,
+            output_dir,
+            ..
+        } => (
+            HttpJobType::Run,
+            plugin_ref.clone(),
+            input_dir.clone(),
+            output_dir.clone(),
+        ),
+    }
 }
 
-impl JobHandle {
-    /// Create a new job handle
-    pub fn new(id: JobId) -> Self {
-        Self { id }
+fn plugin_ref_to_parts(plugin_ref: &PluginRef) -> (String, Option<String>) {
+    match plugin_ref {
+        PluginRef::Registered { plugin, version } => (plugin.clone(), version.clone()),
+        PluginRef::Path { path } => (path.to_string_lossy().to_string(), None),
+    }
+}
+
+fn from_protocol_job(pj: casparian_protocol::Job) -> Result<Job> {
+    let job_type = match pj.job_type {
+        HttpJobType::Backtest => JobType::Backtest,
+        HttpJobType::Run | HttpJobType::Preview => JobType::Run,
+    };
+
+    let created_at = pj
+        .created_at
+        .parse()
+        .context("Invalid created_at timestamp")?;
+
+    let state = match pj.status {
+        HttpJobStatus::Queued => JobState::Queued {
+            queued_at: created_at,
+        },
+        HttpJobStatus::Running => {
+            let started_at_str = pj
+                .started_at
+                .as_ref()
+                .context("Missing started_at for running job")?;
+            let started_at = started_at_str
+                .parse()
+                .context("Invalid started_at timestamp")?;
+            let progress = pj
+                .progress
+                .map(|p| JobProgress {
+                    phase: Some(p.phase),
+                    items_done: p.items_done,
+                    items_total: p.items_total,
+                    elapsed_ms: 0,
+                    eta_ms: None,
+                    updated_at: Utc::now(),
+                    extra: serde_json::Value::Null,
+                })
+                .unwrap_or_else(JobProgress::new);
+            JobState::Running {
+                started_at,
+                progress,
+            }
+        }
+        HttpJobStatus::Completed => {
+            let started_at_str = pj
+                .started_at
+                .as_ref()
+                .context("Missing started_at for completed job")?;
+            let completed_at_str = pj
+                .finished_at
+                .as_ref()
+                .context("Missing finished_at for completed job")?;
+            let started_at = started_at_str
+                .parse()
+                .context("Invalid started_at timestamp")?;
+            let completed_at = completed_at_str
+                .parse()
+                .context("Invalid finished_at timestamp")?;
+            let result = pj.result.context("Missing result for completed job")?;
+            let result = serde_json::to_value(result).context("Invalid job result JSON")?;
+            JobState::Completed {
+                started_at,
+                completed_at,
+                result,
+            }
+        }
+        HttpJobStatus::Failed => {
+            let started_at = match pj.started_at.as_ref() {
+                Some(value) => Some(value.parse().context("Invalid started_at timestamp")?),
+                None => None,
+            };
+            let failed_at_str = pj
+                .finished_at
+                .as_ref()
+                .context("Missing finished_at for failed job")?;
+            let failed_at = failed_at_str
+                .parse()
+                .context("Invalid finished_at timestamp")?;
+            JobState::Failed {
+                started_at,
+                failed_at,
+                error: pj
+                    .error_message
+                    .context("Missing error_message for failed job")?,
+            }
+        }
+        HttpJobStatus::Cancelled => {
+            let cancelled_at_str = pj
+                .finished_at
+                .as_ref()
+                .context("Missing finished_at for cancelled job")?;
+            let cancelled_at = cancelled_at_str
+                .parse()
+                .context("Invalid finished_at timestamp")?;
+            JobState::Cancelled { cancelled_at }
+        }
+    };
+
+    let spec = match pj.spec_json {
+        Some(json) => Some(serde_json::from_str(&json).context("Invalid job_spec_json")?),
+        None => None,
+    };
+
+    if !state.is_terminal() && spec.is_none() {
+        anyhow::bail!("Non-terminal job missing job_spec_json");
+    }
+
+    let plugin_ref = spec
+        .as_ref()
+        .map(|s| match s {
+            JobSpec::Backtest { plugin_ref, .. } => plugin_ref.clone(),
+            JobSpec::Run { plugin_ref, .. } => plugin_ref.clone(),
+        })
+        .or_else(|| {
+            Some(PluginRef::Registered {
+                plugin: pj.plugin_name.clone(),
+                version: pj.plugin_version.clone(),
+            })
+        });
+
+    Ok(Job {
+        id: JobId::new(pj.job_id.as_u64()),
+        job_type,
+        state,
+        created_at,
+        plugin_ref,
+        input: Some(pj.input_dir),
+        approval_id: pj.approval_id,
+        spec,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct JobResultWrapper {
+    #[serde(default)]
+    rows_processed: u64,
+    #[serde(default)]
+    bytes_written: Option<u64>,
+    #[serde(default)]
+    outputs: Vec<casparian_protocol::OutputInfo>,
+    #[serde(default)]
+    metrics: HashMap<String, i64>,
+}
+
+impl From<JobResultWrapper> for casparian_protocol::JobResult {
+    fn from(w: JobResultWrapper) -> Self {
+        casparian_protocol::JobResult {
+            rows_processed: w.rows_processed,
+            bytes_written: w.bytes_written,
+            outputs: w.outputs,
+            metrics: w.metrics,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use tempfile::TempDir;
 
     fn create_test_manager() -> (JobManager, TempDir) {
         let temp = TempDir::new().unwrap();
-        let manager = JobManager::new(temp.path().to_path_buf()).unwrap();
+        let db_path = temp.path().join("test.duckdb");
+        let manager = JobManager::new(db_path).unwrap();
         (manager, temp)
     }
 
     #[test]
     fn test_create_job() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
-        let job = manager.create_job(JobType::Backtest).unwrap();
+        let spec = JobSpec::Backtest {
+            plugin_ref: PluginRef::registered("test_parser"),
+            input_dir: "/data/input".to_string(),
+            schemas: None,
+            redaction: None,
+        };
+
+        let job = manager.create_job(spec, None).unwrap();
 
         assert!(matches!(job.state, JobState::Queued { .. }));
         assert_eq!(job.job_type, JobType::Backtest);
@@ -285,54 +397,77 @@ mod tests {
 
     #[test]
     fn test_job_lifecycle() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
-        // Create
-        let job = manager.create_job(JobType::Backtest).unwrap();
-        let id = job.id.clone();
+        let spec = JobSpec::Backtest {
+            plugin_ref: PluginRef::registered("test_parser"),
+            input_dir: "/data/input".to_string(),
+            schemas: None,
+            redaction: None,
+        };
 
-        // Start
+        let job = manager.create_job(spec, None).unwrap();
+        let id = job.id;
+
         manager.start_job(&id).unwrap();
-        let job = manager.get_job(&id).unwrap();
+        let job = manager.get_job(&id).unwrap().unwrap();
         assert!(matches!(job.state, JobState::Running { .. }));
 
-        // Update progress
         let progress = JobProgress::new().with_items(50, Some(100));
         manager.update_progress(&id, progress).unwrap();
 
-        // Complete
         manager
             .complete_job(&id, serde_json::json!({"pass_rate": 0.95}))
             .unwrap();
-        let job = manager.get_job(&id).unwrap();
+        let job = manager.get_job(&id).unwrap().unwrap();
         assert!(matches!(job.state, JobState::Completed { .. }));
     }
 
     #[test]
     fn test_cancel_job() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
-        let job = manager.create_job(JobType::Run).unwrap();
-        let id = job.id.clone();
+        let spec = JobSpec::Run {
+            plugin_ref: PluginRef::registered("test_parser"),
+            input_dir: "/data/input".to_string(),
+            output_dir: None,
+            schemas: None,
+        };
+
+        let job = manager.create_job(spec, None).unwrap();
+        let id = job.id;
 
         let cancelled = manager.cancel_job(&id).unwrap();
         assert!(cancelled);
 
-        let job = manager.get_job(&id).unwrap();
+        let job = manager.get_job(&id).unwrap().unwrap();
         assert!(matches!(job.state, JobState::Cancelled { .. }));
     }
 
     #[test]
     fn test_list_jobs() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
-        manager.create_job(JobType::Backtest).unwrap();
-        manager.create_job(JobType::Run).unwrap();
+        let spec1 = JobSpec::Backtest {
+            plugin_ref: PluginRef::registered("test_parser"),
+            input_dir: "/data/input".to_string(),
+            schemas: None,
+            redaction: None,
+        };
+        let spec2 = JobSpec::Run {
+            plugin_ref: PluginRef::registered("test_parser"),
+            input_dir: "/data/input".to_string(),
+            output_dir: None,
+            schemas: None,
+        };
 
-        let jobs = manager.list_jobs(None, 10);
+        manager.create_job(spec1, None).unwrap();
+        manager.create_job(spec2, None).unwrap();
+
+        let jobs = manager.list_jobs(None, 10).unwrap();
         assert_eq!(jobs.len(), 2);
 
-        let jobs = manager.list_jobs(Some("queued"), 10);
+        let jobs = manager.list_jobs(Some("queued"), 10).unwrap();
         assert_eq!(jobs.len(), 2);
     }
 }

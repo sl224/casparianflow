@@ -5,12 +5,12 @@
 
 use anyhow::{Context, Result};
 use casparian_protocol::types::{
-    self, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, RuntimeKind,
-    SchemaColumnSpec, SchemaDefinition, SinkConfig, SinkMode,
+    self, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, RuntimeKind, SchemaColumnSpec,
+    SchemaDefinition, SinkConfig, SinkMode,
 };
 use casparian_protocol::{
-    materialization_key, output_target_key, schema_hash, table_name_with_schema,
-    JobId, Message, OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
+    materialization_key, output_target_key, schema_hash, table_name_with_schema, JobId, Message,
+    OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
 };
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{LockedColumn, LockedSchema, SchemaContract, SchemaStorage};
@@ -21,10 +21,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use zmq::{Context as ZmqContext, Socket};
 
+use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
 use crate::db::{models::*, JobQueue};
-use crate::db::queue::{MAX_RETRY_COUNT, OutputMaterialization};
-use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
 use crate::metrics::METRICS;
+use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
 
 /// Workers are considered stale after this many seconds without heartbeat
 const WORKER_TIMEOUT_SECS: f64 = 60.0;
@@ -154,7 +154,7 @@ pub struct Sentinel {
     socket: Socket,
     workers: HashMap<Vec<u8>, ConnectedWorker>,
     queue: JobQueue,
-    conn: DbConnection,  // Database connection for queries
+    conn: DbConnection, // Database connection for queries
     schema_storage: SchemaStorage,
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     topic_map_last_refresh: f64,
@@ -185,8 +185,8 @@ impl Sentinel {
         queue.init_registry_schema()?;
         queue.init_error_handling_schema()?;
 
-        let schema_storage = SchemaStorage::new(conn.clone())
-            .context("Failed to initialize schema storage")?;
+        let schema_storage =
+            SchemaStorage::new(conn.clone()).context("Failed to initialize schema storage")?;
 
         // Load topic configs into memory after schema is present.
         let topic_map = Self::load_topic_configs(&conn)?;
@@ -238,12 +238,8 @@ impl Sentinel {
     }
 
     /// Load topic configurations from database into memory (non-blocking cache)
-    fn load_topic_configs(
-        conn: &DbConnection,
-    ) -> Result<HashMap<String, Vec<SinkConfig>>> {
-        let rows = conn
-            .query_all("SELECT * FROM cf_topic_config ORDER BY id ASC", &[])
-            ?;
+    fn load_topic_configs(conn: &DbConnection) -> Result<HashMap<String, Vec<SinkConfig>>> {
+        let rows = conn.query_all("SELECT * FROM cf_topic_config ORDER BY id ASC", &[])?;
         let mut configs = Vec::with_capacity(rows.len());
         for row in rows {
             configs.push(TopicConfig::from_row(&row)?);
@@ -317,12 +313,7 @@ impl Sentinel {
             .schemas
             .iter()
             .find(|s| s.name == output_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "schema contract missing output '{}'",
-                    output_name
-                )
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("schema contract missing output '{}'", output_name))?;
 
         let columns = schema
             .columns
@@ -359,11 +350,13 @@ impl Sentinel {
             let contract = self
                 .schema_storage
                 .get_contract_for_scope(&scope_id)
-                
                 .map_err(|e| anyhow::anyhow!(e))?;
 
             if let Some(contract) = contract {
-                sink.schema = Some(Self::schema_definition_from_contract(&contract, &sink.topic)?);
+                sink.schema = Some(Self::schema_definition_from_contract(
+                    &contract,
+                    &sink.topic,
+                )?);
                 if contract.quarantine_config.is_some() {
                     sink.quarantine_config = contract.quarantine_config.clone();
                 }
@@ -408,11 +401,7 @@ impl Sentinel {
         Ok(Some((mtime, size)))
     }
 
-    fn record_materializations_for_job(
-        &self,
-        job_id: i64,
-        receipt: &JobReceipt,
-    ) -> Result<()> {
+    fn record_materializations_for_job(&self, job_id: i64, receipt: &JobReceipt) -> Result<()> {
         let Some(dispatch) = self.queue.get_dispatch_metadata(job_id)? else {
             return Ok(());
         };
@@ -466,16 +455,17 @@ impl Sentinel {
 
         for (output_name, rows) in &output_rows {
             let Some(sink) = Self::select_sink_for_output(&sinks, output_name) else {
-                warn!("No sink config found for output '{}' (job {})", output_name, job_id);
+                warn!(
+                    "No sink config found for output '{}' (job {})",
+                    output_name, job_id
+                );
                 continue;
             };
             let schema_hash = schema_hash(sink.schema.as_ref());
-            let table_name = artifact_tables.get(output_name).cloned().or_else(|| {
-                Some(table_name_with_schema(
-                    output_name,
-                    schema_hash.as_deref(),
-                ))
-            });
+            let table_name = artifact_tables
+                .get(output_name)
+                .cloned()
+                .or_else(|| Some(table_name_with_schema(output_name, schema_hash.as_deref())));
             let target_key = output_target_key(
                 output_name,
                 &sink.uri,
@@ -520,15 +510,15 @@ impl Sentinel {
             self.queue.insert_output_materialization(&record)?;
         }
 
-        for sink in sinks.iter().filter(|sink| !Self::is_default_sink(&sink.topic)) {
+        for sink in sinks
+            .iter()
+            .filter(|sink| !Self::is_default_sink(&sink.topic))
+        {
             if output_rows.contains_key(&sink.topic) {
                 continue;
             }
             let schema_hash = schema_hash(sink.schema.as_ref());
-            let table_name = Some(table_name_with_schema(
-                &sink.topic,
-                schema_hash.as_deref(),
-            ));
+            let table_name = Some(table_name_with_schema(&sink.topic, schema_hash.as_deref()));
             let target_key = output_target_key(
                 &sink.topic,
                 &sink.uri,
@@ -623,7 +613,10 @@ impl Sentinel {
                     let job_id_db = match job_id.to_i64() {
                         Ok(value) => value,
                         Err(err) => {
-                            error!("Failed to convert orphaned job {} to storage id: {}", job_id, err);
+                            error!(
+                                "Failed to convert orphaned job {} to storage id: {}",
+                                job_id, err
+                            );
                             continue;
                         }
                     };
@@ -669,7 +662,8 @@ impl Sentinel {
         let before_count = self.workers.len();
 
         // Collect stale workers and their current jobs before removing
-        let stale_workers: Vec<(Vec<u8>, String, Option<JobId>)> = self.workers
+        let stale_workers: Vec<(Vec<u8>, String, Option<JobId>)> = self
+            .workers
             .iter()
             .filter(|(_, w)| w.last_seen < cutoff)
             .map(|(id, w)| (id.clone(), w.worker_id.clone(), w.current_job_id))
@@ -720,10 +714,16 @@ impl Sentinel {
         };
 
         let (identity, header, payload) = match multipart.len() {
-            3 => (multipart[0].clone(), multipart[1].clone(), multipart[2].clone()),
-            4 if multipart[1].is_empty() => {
-                (multipart[0].clone(), multipart[2].clone(), multipart[3].clone())
-            }
+            3 => (
+                multipart[0].clone(),
+                multipart[1].clone(),
+                multipart[2].clone(),
+            ),
+            4 if multipart[1].is_empty() => (
+                multipart[0].clone(),
+                multipart[2].clone(),
+                multipart[3].clone(),
+            ),
             count => {
                 warn!(
                     "Expected 3 frames [identity, header, payload], got {}",
@@ -747,8 +747,7 @@ impl Sentinel {
 
             OpCode::Conclude => {
                 let receipt: JobReceipt = serde_json::from_slice(&msg.payload)?;
-                self.handle_conclude(identity, msg.header.job_id, receipt)
-                    ?;
+                self.handle_conclude(identity, msg.header.job_id, receipt)?;
             }
 
             OpCode::Err => {
@@ -811,7 +810,10 @@ impl Sentinel {
             let mut hasher = Sha256::new();
             hasher.update(&identity);
             let hash = hasher.finalize();
-            format!("worker-{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3])
+            format!(
+                "worker-{:02x}{:02x}{:02x}{:02x}",
+                hash[0], hash[1], hash[2], hash[3]
+            )
         });
 
         // Vec instead of HashSet - linear scan is faster for small N
@@ -881,20 +883,25 @@ impl Sentinel {
                 // Map protocol JobStatus to completion_status string using enum helpers
                 let (completion_status, summary) = match receipt.status {
                     JobStatus::Success => (JobStatus::Success.as_str(), "Success"),
-                    JobStatus::PartialSuccess => (JobStatus::PartialSuccess.as_str(), "Partial success"),
-                    JobStatus::CompletedWithWarnings => {
-                        (JobStatus::CompletedWithWarnings.as_str(), "Completed with warnings")
+                    JobStatus::PartialSuccess => {
+                        (JobStatus::PartialSuccess.as_str(), "Partial success")
                     }
+                    JobStatus::CompletedWithWarnings => (
+                        JobStatus::CompletedWithWarnings.as_str(),
+                        "Completed with warnings",
+                    ),
                     other => unreachable!("Non-success status in success branch: {:?}", other),
                 };
                 let quarantine_rows = receipt.metrics.get("quarantine_rows").copied();
                 self.queue
-                    .complete_job(job_id, completion_status, summary, quarantine_rows)
-                    ?;
+                    .complete_job(job_id, completion_status, summary, quarantine_rows)?;
                 METRICS.inc_jobs_completed();
 
                 if let Err(err) = self.record_materializations_for_job(job_id, &receipt) {
-                    warn!("Failed to record materializations for job {}: {}", job_id, err);
+                    warn!(
+                        "Failed to record materializations for job {}: {}",
+                        job_id, err
+                    );
                 }
 
                 // Record success for circuit breaker
@@ -903,10 +910,15 @@ impl Sentinel {
                 }
             }
             JobStatus::Failed => {
-                let error = receipt.error_message.clone().unwrap_or_else(|| "Unknown error".to_string());
+                let error = receipt
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "Unknown error".to_string());
 
                 // Check if error is transient (from receipt metrics)
-                let is_transient = receipt.metrics.get("is_transient")
+                let is_transient = receipt
+                    .metrics
+                    .get("is_transient")
                     .map(|v| *v == 1)
                     .unwrap_or(true); // Default to transient (conservative)
 
@@ -923,14 +935,20 @@ impl Sentinel {
             }
             JobStatus::Rejected => {
                 // Worker was at capacity - requeue the job (always retry)
-                warn!("Job {} rejected by worker (at capacity), requeueing", job_id);
+                warn!(
+                    "Job {} rejected by worker (at capacity), requeueing",
+                    job_id
+                );
                 METRICS.inc_jobs_rejected();
                 self.queue.requeue_job(job_id)?;
             }
             JobStatus::Aborted => {
-                let error = receipt.error_message.unwrap_or_else(|| "Aborted".to_string());
+                let error = receipt
+                    .error_message
+                    .unwrap_or_else(|| "Aborted".to_string());
                 warn!("Job {} aborted: {}", job_id, error);
-                self.queue.fail_job(job_id, JobStatus::Aborted.as_str(), &error)?;
+                self.queue
+                    .fail_job(job_id, JobStatus::Aborted.as_str(), &error)?;
                 METRICS.inc_jobs_failed();
 
                 // Record failure for circuit breaker
@@ -942,7 +960,10 @@ impl Sentinel {
 
         METRICS.record_conclude_time(conclude_start);
         if let Err(err) = self.update_pipeline_run_status_for_job(job_id) {
-            warn!("Failed to update pipeline run status for job {}: {}", job_id, err);
+            warn!(
+                "Failed to update pipeline run status for job {}: {}",
+                job_id, err
+            );
         }
         Ok(())
     }
@@ -971,9 +992,13 @@ impl Sentinel {
             anyhow::anyhow!("Job ID {} is not representable in storage: {}", job_id, err)
         })?;
 
-        self.queue.fail_job(job_id, JobStatus::Failed.as_str(), &err.message)?;
+        self.queue
+            .fail_job(job_id, JobStatus::Failed.as_str(), &err.message)?;
         if let Err(err) = self.update_pipeline_run_status_for_job(job_id) {
-            warn!("Failed to update pipeline run status for job {}: {}", job_id, err);
+            warn!(
+                "Failed to update pipeline run status for job {}: {}",
+                job_id, err
+            );
         }
         Ok(())
     }
@@ -1035,7 +1060,8 @@ impl Sentinel {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64 % DISPATCH_BACKOFF_JITTER_MS)
             .unwrap_or(0);
-        self.dispatch_cooldown_until = Some(Instant::now() + Duration::from_millis(next + jitter_ms));
+        self.dispatch_cooldown_until =
+            Some(Instant::now() + Duration::from_millis(next + jitter_ms));
     }
 
     fn update_pipeline_run_status_for_job(&self, job_id: i64) -> Result<()> {
@@ -1044,8 +1070,7 @@ impl Sentinel {
             .query_optional(
                 "SELECT pipeline_run_id FROM cf_processing_queue WHERE id = ?",
                 &[DbValue::from(job_id)],
-            )
-            ?
+            )?
             .and_then(|row| row.get_by_name::<String>("pipeline_run_id").ok());
         let Some(run_id) = run_id else {
             return Ok(());
@@ -1057,20 +1082,18 @@ impl Sentinel {
         if !self.table_exists("cf_pipeline_runs")? {
             return Ok(());
         }
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_pipeline_runs
                 SET status = ?,
                     started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(PipelineRunStatus::Running.as_str()),
-                    DbValue::from(run_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(PipelineRunStatus::Running.as_str()),
+                DbValue::from(run_id),
+            ],
+        )?;
         Ok(())
     }
 
@@ -1079,11 +1102,9 @@ impl Sentinel {
             return Ok(());
         }
 
-        let row = self
-            .conn
-            .query_optional(
-                &format!(
-                    r#"
+        let row = self.conn.query_optional(
+            &format!(
+                r#"
                 SELECT
                     SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END) AS failed,
                     SUM(CASE WHEN status IN ('{queued}', '{running}') THEN 1 ELSE 0 END) AS active,
@@ -1091,14 +1112,13 @@ impl Sentinel {
                 FROM cf_processing_queue
                 WHERE pipeline_run_id = ?
                 "#,
-                    failed = ProcessingStatus::Failed.as_str(),
-                    queued = ProcessingStatus::Queued.as_str(),
-                    running = ProcessingStatus::Running.as_str(),
-                    completed = ProcessingStatus::Completed.as_str(),
-                ),
-                &[DbValue::from(run_id)],
-            )
-            ?;
+                failed = ProcessingStatus::Failed.as_str(),
+                queued = ProcessingStatus::Queued.as_str(),
+                running = ProcessingStatus::Running.as_str(),
+                completed = ProcessingStatus::Completed.as_str(),
+            ),
+            &[DbValue::from(run_id)],
+        )?;
 
         let Some(row) = row else {
             return Ok(());
@@ -1172,9 +1192,8 @@ impl Sentinel {
                 job.id
             );
         }
-        let job_id = JobId::try_from(job.id).map_err(|err| {
-            anyhow::anyhow!("Invalid job id from queue ({}): {}", job.id, err)
-        })?;
+        let job_id = JobId::try_from(job.id)
+            .map_err(|err| anyhow::anyhow!("Invalid job id from queue ({}): {}", job.id, err))?;
 
         info!("Assigning job {} to worker", job.id);
 
@@ -1190,8 +1209,7 @@ impl Sentinel {
         if configured_count > 0 {
             debug!(
                 "Using {} sink configs for plugin '{}'",
-                configured_count,
-                job.plugin_name
+                configured_count, job.plugin_name
             );
         }
 
@@ -1225,7 +1243,6 @@ impl Sentinel {
                     DbValue::from(job.file_id),
                 ],
             )
-            
             .context("Failed to load dispatch data")?;
 
         let dispatch_row = dispatch_row.ok_or_else(|| anyhow::anyhow!("Dispatch data missing"))?;
@@ -1272,10 +1289,7 @@ impl Sentinel {
                 }
             }
             RuntimeKind::NativeExec => {
-                let platform_os = platform_os
-                    .as_ref()
-                    .map(|value| value.trim())
-                    .unwrap_or("");
+                let platform_os = platform_os.as_ref().map(|value| value.trim()).unwrap_or("");
                 let platform_arch = platform_arch
                     .as_ref()
                     .map(|value| value.trim())
@@ -1289,9 +1303,7 @@ impl Sentinel {
             }
         }
 
-        let sinks = self
-            .apply_contract_overrides(&job.plugin_name, &parser_version, sinks)
-            ?;
+        let sinks = self.apply_contract_overrides(&job.plugin_name, &parser_version, sinks)?;
 
         let sink_config_json = serde_json::to_string(&sinks)?;
         if let Err(err) = self.queue.record_dispatch_metadata(
@@ -1300,7 +1312,10 @@ impl Sentinel {
             &artifact_hash,
             &sink_config_json,
         ) {
-            warn!("Failed to persist dispatch metadata for job {}: {}", job.id, err);
+            warn!(
+                "Failed to persist dispatch metadata for job {}: {}",
+                job.id, err
+            );
         }
 
         let cmd = DispatchCommand {
@@ -1348,11 +1363,7 @@ impl Sentinel {
     }
 
     /// Handle DEPLOY command - register a new plugin version
-    fn handle_deploy(
-        &mut self,
-        identity: &[u8],
-        cmd: types::DeployCommand,
-    ) -> Result<()> {
+    fn handle_deploy(&mut self, identity: &[u8], cmd: types::DeployCommand) -> Result<()> {
         info!(
             "Deploying plugin {} v{} from {}",
             cmd.plugin_name, cmd.version, cmd.publisher_name
@@ -1386,8 +1397,8 @@ impl Sentinel {
             );
         }
 
-        let manifest: PluginManifestPayload = serde_json::from_str(&cmd.manifest_json)
-            .context("Failed to parse manifest_json")?;
+        let manifest: PluginManifestPayload =
+            serde_json::from_str(&cmd.manifest_json).context("Failed to parse manifest_json")?;
         if manifest.name != cmd.plugin_name {
             anyhow::bail!(
                 "Manifest name '{}' does not match plugin_name '{}'",
@@ -1503,7 +1514,7 @@ impl Sentinel {
                         DbValue::from(now.clone()),
                     ],
                 )
-                
+
             {
                 let _ = self.conn.execute("ROLLBACK", &[]);
                 return Err(e.into());
@@ -1528,10 +1539,8 @@ impl Sentinel {
             .map(DbValue::from)
             .unwrap_or(DbValue::Null);
 
-        if let Err(e) = self
-            .conn
-            .execute(
-                r#"
+        if let Err(e) = self.conn.execute(
+            r#"
                 INSERT INTO cf_plugin_manifest
                 (plugin_name, version, runtime_kind, entrypoint, platform_os, platform_arch,
                  source_code, source_hash, status,
@@ -1541,42 +1550,40 @@ impl Sentinel {
                  publisher_name, publisher_email, azure_oid, system_requirements)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
-                &[
-                    DbValue::from(cmd.plugin_name.as_str()),
-                    DbValue::from(cmd.version.as_str()),
-                    DbValue::from(manifest.runtime_kind.as_str()),
-                    DbValue::from(manifest.entrypoint.as_str()),
-                    manifest
-                        .platform_os
-                        .as_deref()
-                        .map(DbValue::from)
-                        .unwrap_or(DbValue::Null),
-                    manifest
-                        .platform_arch
-                        .as_deref()
-                        .map(DbValue::from)
-                        .unwrap_or(DbValue::Null),
-                    DbValue::from(cmd.source_code.as_str()),
-                    DbValue::from(source_hash.as_str()),
-                    DbValue::from(PluginStatus::Active.as_str()),
-                    DbValue::from(cmd.env_hash.as_str()),
-                    DbValue::from(cmd.artifact_hash.as_str()),
-                    DbValue::from(cmd.manifest_json.as_str()),
-                    DbValue::from(cmd.protocol_version.as_str()),
-                    DbValue::from(cmd.schema_artifacts_json.as_str()),
-                    DbValue::from(cmd.schema_artifacts_json.as_str()),
-                    DbValue::from(false),
-                    DbValue::Null,
-                    DbValue::from(now.clone()),
-                    DbValue::from(now.clone()),
-                    DbValue::from(cmd.publisher_name.as_str()),
-                    publisher_email,
-                    azure_oid,
-                    system_requirements,
-                ],
-            )
-            
-        {
+            &[
+                DbValue::from(cmd.plugin_name.as_str()),
+                DbValue::from(cmd.version.as_str()),
+                DbValue::from(manifest.runtime_kind.as_str()),
+                DbValue::from(manifest.entrypoint.as_str()),
+                manifest
+                    .platform_os
+                    .as_deref()
+                    .map(DbValue::from)
+                    .unwrap_or(DbValue::Null),
+                manifest
+                    .platform_arch
+                    .as_deref()
+                    .map(DbValue::from)
+                    .unwrap_or(DbValue::Null),
+                DbValue::from(cmd.source_code.as_str()),
+                DbValue::from(source_hash.as_str()),
+                DbValue::from(PluginStatus::Active.as_str()),
+                DbValue::from(cmd.env_hash.as_str()),
+                DbValue::from(cmd.artifact_hash.as_str()),
+                DbValue::from(cmd.manifest_json.as_str()),
+                DbValue::from(cmd.protocol_version.as_str()),
+                DbValue::from(cmd.schema_artifacts_json.as_str()),
+                DbValue::from(cmd.schema_artifacts_json.as_str()),
+                DbValue::from(false),
+                DbValue::Null,
+                DbValue::from(now.clone()),
+                DbValue::from(now.clone()),
+                DbValue::from(cmd.publisher_name.as_str()),
+                publisher_email,
+                azure_oid,
+                system_requirements,
+            ],
+        ) {
             let _ = self.conn.execute("ROLLBACK", &[]);
             return Err(e.into());
         }
@@ -1611,8 +1618,9 @@ Delete the database to republish.",
                 );
             }
 
-            let contract = SchemaContract::new(scope_id, locked_schema.clone(), &cmd.publisher_name)
-                .with_logic_hash(Some(source_hash.clone()));
+            let contract =
+                SchemaContract::new(scope_id, locked_schema.clone(), &cmd.publisher_name)
+                    .with_logic_hash(Some(source_hash.clone()));
             if let Err(e) = self.schema_storage.save_contract(&contract) {
                 let _ = self.conn.execute("ROLLBACK", &[]);
                 return Err(anyhow::anyhow!(e));
@@ -1620,23 +1628,19 @@ Delete the database to republish.",
         }
 
         // 3d. Deactivate previous versions
-        if let Err(e) = self
-            .conn
-            .execute(
-                r#"
+        if let Err(e) = self.conn.execute(
+            r#"
                 UPDATE cf_plugin_manifest
                 SET status = ?
                 WHERE plugin_name = ? AND version != ? AND status = ?
                 "#,
-                &[
-                    DbValue::from(PluginStatus::Superseded.as_str()),
-                    DbValue::from(cmd.plugin_name.as_str()),
-                    DbValue::from(cmd.version.as_str()),
-                    DbValue::from(PluginStatus::Active.as_str()),
-                ],
-            )
-            
-        {
+            &[
+                DbValue::from(PluginStatus::Superseded.as_str()),
+                DbValue::from(cmd.plugin_name.as_str()),
+                DbValue::from(cmd.version.as_str()),
+                DbValue::from(PluginStatus::Active.as_str()),
+            ],
+        ) {
             let _ = self.conn.execute("ROLLBACK", &[]);
             return Err(e.into());
         }
@@ -1750,13 +1754,11 @@ Delete the database to republish.",
             );
 
             let now = DbTimestamp::now();
-            let scheduled_at = DbTimestamp::from_unix_millis(
-                now.unix_millis() + (backoff_secs as i64 * 1_000),
-            )
-            .unwrap_or_else(|_| now.clone());
+            let scheduled_at =
+                DbTimestamp::from_unix_millis(now.unix_millis() + (backoff_secs as i64 * 1_000))
+                    .unwrap_or_else(|_| now.clone());
             self.queue
-                .schedule_retry(job_id, retry_count + 1, error, scheduled_at)
-                ?;
+                .schedule_retry(job_id, retry_count + 1, error, scheduled_at)?;
 
             METRICS.inc_jobs_retried();
         } else {
@@ -1779,18 +1781,14 @@ Delete the database to republish.",
         Ok(())
     }
 
-
     /// Check if parser is healthy (circuit breaker not tripped).
     ///
     /// Returns true if parser can accept jobs, false if paused.
     pub fn check_circuit_breaker(&self, parser_name: &str) -> Result<bool> {
-        let health = self
-            .conn
-            .query_optional(
-                "SELECT * FROM cf_parser_health WHERE parser_name = ?",
-                &[DbValue::from(parser_name)],
-            )
-            ?;
+        let health = self.conn.query_optional(
+            "SELECT * FROM cf_parser_health WHERE parser_name = ?",
+            &[DbValue::from(parser_name)],
+        )?;
         let health = health.map(|row| ParserHealth::from_row(&row)).transpose()?;
 
         if let Some(h) = health {
@@ -1850,7 +1848,10 @@ Delete the database to republish.",
             )
             ?;
 
-        debug!(parser = parser_name, "Recorded success, reset consecutive_failures");
+        debug!(
+            parser = parser_name,
+            "Recorded success, reset consecutive_failures"
+        );
         Ok(())
     }
 
@@ -1892,7 +1893,6 @@ Delete the database to republish.",
                 "SELECT plugin_name FROM cf_processing_queue WHERE id = ?",
                 &[DbValue::from(job_id)],
             )
-            
             .ok()
             .flatten();
 
@@ -1907,7 +1907,6 @@ Delete the database to republish.",
                 "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
                 &[DbValue::from(job_id)],
             )
-            
             .ok()
             .flatten();
 
@@ -1955,7 +1954,10 @@ fn locked_schema_from_definition(
         );
     }
     if schema_def.columns.is_empty() {
-        anyhow::bail!("Schema for '{}' must include at least one column", output_name);
+        anyhow::bail!(
+            "Schema for '{}' must include at least one column",
+            output_name
+        );
     }
 
     let mut seen = HashSet::new();
@@ -2014,10 +2016,7 @@ mod tests {
 
     #[test]
     fn test_connected_worker() {
-        let worker = ConnectedWorker::new(
-            "test-worker".to_string(),
-            vec!["*".to_string()],
-        );
+        let worker = ConnectedWorker::new("test-worker".to_string(), vec!["*".to_string()]);
 
         assert_eq!(worker.status, WorkerStatus::Idle);
         assert_eq!(worker.capabilities, vec!["*".to_string()]);
@@ -2091,13 +2090,11 @@ mod tests {
             "#,
             &[],
         )
-        
         .unwrap();
         conn.execute(
             "CREATE UNIQUE INDEX ux_topic_unique ON cf_topic_config(plugin_name, topic_name)",
             &[],
         )
-        
         .unwrap();
 
         conn.execute(
@@ -2113,7 +2110,6 @@ mod tests {
                 DbValue::from("append"),
             ],
         )
-        
         .unwrap();
 
         let configs = Sentinel::load_topic_configs(&conn).unwrap();
@@ -2141,7 +2137,6 @@ mod tests {
             "#,
             &[],
         )
-        
         .unwrap();
 
         conn.execute(
@@ -2153,7 +2148,6 @@ mod tests {
             "#,
             &[],
         )
-        
         .unwrap();
 
         let err = Sentinel::load_topic_configs(&conn).unwrap_err();

@@ -24,7 +24,9 @@ fn test_llm_model_exists() {
     // This test verifies the model was downloaded
     let path = model_path();
     if path.is_none() {
-        println!("LLM model not found. Run: cargo run --features local-llm --example download_model");
+        println!(
+            "LLM model not found. Run: cargo run --features local-llm --example download_model"
+        );
         println!("Skipping model verification test");
         return;
     }
@@ -100,7 +102,10 @@ fn test_yaml_rule_generator() {
     // Verify YAML structure
     assert!(yaml_output.contains("name:"), "YAML should have name field");
     assert!(yaml_output.contains("glob:"), "YAML should have glob field");
-    assert!(yaml_output.contains("extract:"), "YAML should have extract field");
+    assert!(
+        yaml_output.contains("extract:"),
+        "YAML should have extract field"
+    );
 }
 
 #[test]
@@ -163,7 +168,8 @@ def extract(path: str) -> dict:
             'version': match.group(3),
         }
     return {}
-```"#.to_string())
+```"#
+            .to_string())
     });
 
     let python_gen = PythonGenerator::new(mock_llm);
@@ -177,8 +183,7 @@ def extract(path: str) -> dict:
     let analyzer = PathAnalyzer::new();
     let pattern = analyzer.analyze(&paths).expect("Analysis failed");
 
-    let result = python_gen
-        .generate(&paths, &pattern, Some("extract date, node, and version"));
+    let result = python_gen.generate(&paths, &pattern, Some("extract date, node, and version"));
 
     match result {
         Ok(code) => {
@@ -216,7 +221,10 @@ fn test_complex_path_patterns() {
     println!("  Confidence: {:.2}", pattern.confidence);
 
     // Should have high confidence for this structured pattern
-    assert!(pattern.confidence > 0.6, "Confidence should be high for structured paths");
+    assert!(
+        pattern.confidence > 0.6,
+        "Confidence should be high for structured paths"
+    );
 
     // Test extraction
     let extracted: Vec<(String, String)> =
@@ -227,7 +235,12 @@ fn test_complex_path_patterns() {
     }
 
     // Should extract project ID and year
-    let has_project = extracted.iter().any(|(_, v)| v.contains("PROJECT") || v.contains("123"));
+    let has_project = extracted
+        .iter()
+        .any(|(_, v)| v.contains("PROJECT") || v.contains("123"));
     let has_year = extracted.iter().any(|(_, v)| v == "2024");
-    assert!(has_project || has_year, "Should extract project or year from path");
+    assert!(
+        has_project || has_year,
+        "Should extract project or year from path"
+    );
 }

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
-use casparian_worker::{Worker, WorkerConfig};
 use casparian_protocol::types::{self};
 use casparian_protocol::{JobId, Message, OpCode};
+use casparian_worker::{Worker, WorkerConfig};
 use std::time::{Duration, Instant};
 use zmq::Context;
 
@@ -78,8 +78,7 @@ fn test_worker_heartbeat_responsiveness() -> Result<()> {
         venvs_dir: Some(venvs_dir),
     };
 
-    let (worker, worker_handle) = Worker::connect(config)
-        .expect("Worker failed to connect");
+    let (worker, worker_handle) = Worker::connect(config).expect("Worker failed to connect");
     let worker_thread = std::thread::spawn(move || {
         worker.run().expect("Worker run failed");
     });
@@ -106,9 +105,14 @@ fn test_worker_heartbeat_responsiveness() -> Result<()> {
             active_job_count: 0,
             active_job_ids: vec![],
         };
-        let hb_msg = Message::new(OpCode::Heartbeat, JobId::new(0), serde_json::to_vec(&heartbeat_payload)?)
-            .map_err(|e| anyhow::anyhow!("Failed to create message: {}", e))?;
-        let (h, p) = hb_msg.pack()
+        let hb_msg = Message::new(
+            OpCode::Heartbeat,
+            JobId::new(0),
+            serde_json::to_vec(&heartbeat_payload)?,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create message: {}", e))?;
+        let (h, p) = hb_msg
+            .pack()
             .map_err(|e| anyhow::anyhow!("Failed to pack message: {}", e))?;
         let frames = vec![identity.clone(), h.to_vec(), p.to_vec()];
 
@@ -239,8 +243,7 @@ fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     let payload = serde_json::to_vec(&dispatch_cmd)?;
     let dispatch_msg = Message::new(OpCode::Dispatch, JobId::new(42), payload)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let (h, p) = dispatch_msg.pack()
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let (h, p) = dispatch_msg.pack().map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let frames = vec![identity.clone(), h.to_vec(), p.to_vec()];
     sentinel.send_multipart(&frames, 0)?;
@@ -249,9 +252,7 @@ fn test_graceful_shutdown_sends_conclude() -> Result<()> {
     std::thread::sleep(Duration::from_millis(100));
 
     // 8. Send shutdown signal
-    shutdown_handle
-        .shutdown_gracefully(Duration::from_secs(5))
-        ?;
+    shutdown_handle.shutdown_gracefully(Duration::from_secs(5))?;
 
     // 9. Worker should send CONCLUDE before exiting (even for failed job)
     let start = Instant::now();

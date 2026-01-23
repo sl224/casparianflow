@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use casparian_db::{DbConnection, DbValue};
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -49,10 +49,7 @@ fn test_rule_json_and_lifecycle() {
     });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let add_args = vec![
         "rule".to_string(),
@@ -65,11 +62,7 @@ fn test_rule_json_and_lifecycle() {
     ];
     assert_cli_success(&run_cli(&add_args, &envs), &add_args);
 
-    let list_args = vec![
-        "rule".to_string(),
-        "list".to_string(),
-        "--json".to_string(),
-    ];
+    let list_args = vec!["rule".to_string(), "list".to_string(), "--json".to_string()];
     let rules: Vec<RuleListItem> = run_cli_json(&list_args, &envs);
     let rule = rules
         .iter()
@@ -161,10 +154,7 @@ fn insert_file(
 
 fn split_rel_path(rel_path: &str) -> (String, String) {
     match rel_path.rfind('/') {
-        Some(idx) => (
-            rel_path[..idx].to_string(),
-            rel_path[idx + 1..].to_string(),
-        ),
+        Some(idx) => (rel_path[..idx].to_string(), rel_path[idx + 1..].to_string()),
         None => ("".to_string(), rel_path.to_string()),
     }
 }

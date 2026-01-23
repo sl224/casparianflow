@@ -44,8 +44,12 @@ impl HelpfulError {
     }
 
     /// Add multiple suggestions
-    pub fn with_suggestions(mut self, suggestions: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.suggestions.extend(suggestions.into_iter().map(|s| s.into()));
+    pub fn with_suggestions(
+        mut self,
+        suggestions: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.suggestions
+            .extend(suggestions.into_iter().map(|s| s.into()));
         self
     }
 
@@ -67,9 +71,16 @@ impl HelpfulError {
         Self::new(format!("Not a directory: {}", path.display()))
             .with_context("The scan command expects a directory, not a file")
             .with_suggestions([
-                format!("TRY: Use 'preview' to inspect a single file: casparian preview {}", path.display()),
-                format!("TRY: Scan the parent directory: casparian scan {}",
-                    path.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".to_string())),
+                format!(
+                    "TRY: Use 'preview' to inspect a single file: casparian preview {}",
+                    path.display()
+                ),
+                format!(
+                    "TRY: Scan the parent directory: casparian scan {}",
+                    path.parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| ".".to_string())
+                ),
             ])
     }
 
@@ -79,15 +90,20 @@ impl HelpfulError {
             .with_context("The specified file does not exist")
             .with_suggestions([
                 format!("TRY: Check if the file exists: ls -la {}", path.display()),
-                format!("TRY: Look for similar files: ls {}",
-                    path.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".to_string())),
+                format!(
+                    "TRY: Look for similar files: ls {}",
+                    path.parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| ".".to_string())
+                ),
             ])
     }
 
     /// File type is not recognized
     #[allow(dead_code)]
     pub fn unknown_file_type(path: &Path) -> Self {
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("(no extension)");
 
@@ -128,7 +144,11 @@ impl HelpfulError {
             .with_suggestions([
                 "TRY: Check if the delimiter is correct (use --delimiter)".to_string(),
                 "TRY: Verify the CSV file is well-formed".to_string(),
-                format!("TRY: Inspect the raw file: head -n {} {}", line + 5, path.display()),
+                format!(
+                    "TRY: Inspect the raw file: head -n {} {}",
+                    line + 5,
+                    path.display()
+                ),
             ])
     }
 

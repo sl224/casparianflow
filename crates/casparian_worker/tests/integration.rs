@@ -83,13 +83,13 @@ fn test_conclude_message_format() {
     let mut metrics = std::collections::HashMap::new();
     metrics.insert("rows".to_string(), 1500i64);
 
-        let receipt = types::JobReceipt {
-            status: types::JobStatus::Success,
-            metrics,
-            artifacts: vec![],
-            error_message: None,
-            diagnostics: None,
-        };
+    let receipt = types::JobReceipt {
+        status: types::JobStatus::Success,
+        metrics,
+        artifacts: vec![],
+        error_message: None,
+        diagnostics: None,
+    };
 
     let payload = serde_json::to_vec(&receipt).unwrap();
     let msg = Message::new(OpCode::Conclude, JobId::new(99999), payload).unwrap();

@@ -167,7 +167,8 @@ fn matches_patterns(
 /// Execute the files command (async version)
 pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Validate status if provided
-    let validated_status = args.status
+    let validated_status = args
+        .status
         .as_ref()
         .map(|s| validate_status(s))
         .transpose()?;
@@ -175,26 +176,34 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Open database
     let db_path = get_db_path();
     if !db_path.exists() {
-        return Err(HelpfulError::new(format!("Database not found: {}", db_path.display()))
-            .with_context("The Scout database has not been initialized yet")
-            .with_suggestions([
-                "TRY: Run `casparian scan <directory>` to discover files".to_string(),
-                "TRY: Run `casparian source add /path/to/data` to add a source".to_string(),
-            ])
-            .into());
+        return Err(
+            HelpfulError::new(format!("Database not found: {}", db_path.display()))
+                .with_context("The Scout database has not been initialized yet")
+                .with_suggestions([
+                    "TRY: Run `casparian scan <directory>` to discover files".to_string(),
+                    "TRY: Run `casparian source add /path/to/data` to add a source".to_string(),
+                ])
+                .into(),
+        );
     }
 
-    let db = Database::open(&db_path)
-        .map_err(|e| HelpfulError::new(format!("Cannot open database: {}", e))
+    let db = Database::open(&db_path).map_err(|e| {
+        HelpfulError::new(format!("Cannot open database: {}", e))
             .with_context(format!("Database path: {}", db_path.display()))
-            .with_suggestion("TRY: Ensure the database file is not corrupted or locked"))?;
+            .with_suggestion("TRY: Ensure the database file is not corrupted or locked")
+    })?;
 
     // Determine which source(s) to query
     // Priority: explicit --source > --all > default context > all sources (with hint)
-    let sources = db.list_sources()
+    let sources = db
+        .list_sources()
         .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
-    let (source_ids, source_context_name, source_context_msg): (Vec<SourceId>, Option<String>, Option<String>) = if let Some(ref source_name) = args.source {
+    let (source_ids, source_context_name, source_context_msg): (
+        Vec<SourceId>,
+        Option<String>,
+        Option<String>,
+    ) = if let Some(ref source_name) = args.source {
         // Explicit --source flag
         let source = find_source(&sources, source_name);
         match source {
@@ -204,9 +213,11 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
                 Some(format!("[{}]", s.name)),
             ),
             None => {
-                return Err(HelpfulError::new(format!("Source not found: {}", source_name))
-                    .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
-                    .into());
+                return Err(
+                    HelpfulError::new(format!("Source not found: {}", source_name))
+                        .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
+                        .into(),
+                );
             }
         }
     } else if args.all {
@@ -235,23 +246,28 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Query files based on filters, restricted to selected sources
     let all_files: Vec<ScannedFile> = if let Some(topic) = &args.topic {
         // Filter by topic - this queries across all sources, then we filter
-        let topic_files = db.list_files_by_tag(topic, 10000)
+        let topic_files = db
+            .list_files_by_tag(topic, 10000)
             .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
-        topic_files.into_iter()
+        topic_files
+            .into_iter()
             .filter(|f| source_ids.iter().any(|s| s == &f.source_id))
             .collect()
     } else if let Some(status) = &validated_status {
         // Filter by status - queries across all sources, then we filter
-        let status_files = db.list_files_by_status(*status, 10000)
+        let status_files = db
+            .list_files_by_status(*status, 10000)
             .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
-        status_files.into_iter()
+        status_files
+            .into_iter()
             .filter(|f| source_ids.iter().any(|s| s == &f.source_id))
             .collect()
     } else if args.untagged {
         // Get untagged files from selected sources
         let mut untagged_files = Vec::new();
         for source_id in &source_ids {
-            let files = db.list_untagged_files(source_id, 10000)
+            let files = db
+                .list_untagged_files(source_id, 10000)
                 .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
             untagged_files.extend(files);
         }
@@ -260,7 +276,8 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
         // Get all files from selected sources
         let mut all = Vec::new();
         for source_id in &source_ids {
-            let files = db.list_files_by_source(source_id, 10000)
+            let files = db
+                .list_files_by_source(source_id, 10000)
                 .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
             all.extend(files);
         }
@@ -301,7 +318,9 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     let total_matching = filtered_files.len();
     let files: Vec<ScannedFile> = filtered_files.into_iter().take(args.limit).collect();
 
-    let normalized_status = validated_status.as_ref().map(|status| status.as_str().to_string());
+    let normalized_status = validated_status
+        .as_ref()
+        .map(|status| status.as_str().to_string());
     let all_sources = args.all || (args.source.is_none() && source_context_name.is_none());
     let source_id_filter = if all_sources {
         None
@@ -358,16 +377,23 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
         }
 
         // Get total file count
-        let stats = db.get_stats()
+        let stats = db
+            .get_stats()
             .map_err(|e| HelpfulError::new(format!("Failed to get stats: {}", e)))?;
 
         if stats.total_files > 0 {
             println!();
             if source_context_msg.is_some() {
-                println!("Hint: There are {} total files across all sources.", stats.total_files);
+                println!(
+                    "Hint: There are {} total files across all sources.",
+                    stats.total_files
+                );
                 println!("TRY: casparian files --all   (to see files from all sources)");
             } else {
-                println!("Hint: There are {} total files in the database.", stats.total_files);
+                println!(
+                    "Hint: There are {} total files in the database.",
+                    stats.total_files
+                );
                 println!("TRY: casparian files   (to see all files)");
             }
         }
@@ -378,13 +404,11 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     // Tag files if requested
     let tagged_count = if let Some(ref new_tag) = args.tag {
         let ids: Vec<i64> = files.iter().filter_map(|f| f.id).collect();
-        let tagged = db.tag_files(&ids, new_tag)
+        let tagged = db
+            .tag_files(&ids, new_tag)
             .map_err(|e| HelpfulError::new(format!("Failed to tag files: {}", e)))?;
         if !args.json {
-            println!(
-                "Tagged {} files with: \x1b[36m{}\x1b[0m",
-                tagged, new_tag
-            );
+            println!("Tagged {} files with: \x1b[36m{}\x1b[0m", tagged, new_tag);
             println!();
         }
         Some(tagged as usize)
@@ -489,7 +513,14 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
                 (format_size(f.size), None),
                 (topic_display, Some(Color::Cyan)),
                 (status_str.to_string(), Some(color_for_status(status_str))),
-                (error_truncated, if f.error.is_some() { Some(Color::Red) } else { None }),
+                (
+                    error_truncated,
+                    if f.error.is_some() {
+                        Some(Color::Red)
+                    } else {
+                        None
+                    },
+                ),
             ]
         })
         .collect();
@@ -502,7 +533,10 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
 
     if files.len() >= args.limit {
         println!();
-        println!("Hint: Results limited to {}. Use --limit to see more.", args.limit);
+        println!(
+            "Hint: Results limited to {}. Use --limit to see more.",
+            args.limit
+        );
     }
 
     Ok(())

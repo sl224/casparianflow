@@ -13,7 +13,9 @@ impl fmt::Display for ScanPathError {
         match self {
             ScanPathError::NotFound(path) => write!(f, "Path not found: {}", path.display()),
             ScanPathError::NotDirectory(path) => write!(f, "Not a directory: {}", path.display()),
-            ScanPathError::NotReadable(path) => write!(f, "Cannot read directory: {}", path.display()),
+            ScanPathError::NotReadable(path) => {
+                write!(f, "Cannot read directory: {}", path.display())
+            }
         }
     }
 }

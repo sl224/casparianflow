@@ -10,7 +10,10 @@ use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
-#[command(name = "casparian-sentinel", about = "Rust Sentinel for Casparian Flow")]
+#[command(
+    name = "casparian-sentinel",
+    about = "Rust Sentinel for Casparian Flow"
+)]
 struct Args {
     /// ZMQ bind address for workers
     #[arg(long, default_value = "tcp://127.0.0.1:5555")]
@@ -62,8 +65,5 @@ fn default_db_url() -> String {
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".casparian_flow")))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    format!(
-        "duckdb:{}",
-        home.join("casparian_flow.duckdb").display()
-    )
+    format!("duckdb:{}", home.join("casparian_flow.duckdb").display())
 }

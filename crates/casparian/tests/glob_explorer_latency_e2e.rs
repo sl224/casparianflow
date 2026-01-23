@@ -16,8 +16,8 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// Helper struct for managing PTY reads via channel
 struct PtyReader {
@@ -197,7 +197,10 @@ fn test_glob_explorer_navigation_latency() {
             println!("    FAILED: {}", e);
             // Try to see what we got
             let output = pty_reader.read_for(Duration::from_secs(2));
-            println!("    Output: {}", output.chars().take(300).collect::<String>());
+            println!(
+                "    Output: {}",
+                output.chars().take(300).collect::<String>()
+            );
         }
     }
 
@@ -233,7 +236,10 @@ fn test_glob_explorer_navigation_latency() {
         Err(e) => {
             println!("    FAILED: {}", e);
             let output = pty_reader.read_for(Duration::from_secs(2));
-            println!("    Output: {}", output.chars().take(500).collect::<String>());
+            println!(
+                "    Output: {}",
+                output.chars().take(500).collect::<String>()
+            );
         }
     }
 
@@ -336,7 +342,10 @@ fn test_glob_explorer_navigation_latency() {
 
     // Summary
     println!("SUMMARY:");
-    println!("  - Initial cache load: One-time O(n) operation for {} files", 442306);
+    println!(
+        "  - Initial cache load: One-time O(n) operation for {} files",
+        442306
+    );
     println!("  - Expected cache load time: 5-10 seconds");
     println!("  - Expected navigation time: <50ms (O(1) HashMap lookup)");
     println!("");
@@ -366,7 +375,12 @@ fn test_cache_operations_direct() {
         }
         cache.insert(prefix, entries);
     }
-    cache.insert(String::new(), (0..100).map(|i| (format!("folder{}", i), 10000, false)).collect());
+    cache.insert(
+        String::new(),
+        (0..100)
+            .map(|i| (format!("folder{}", i), 10000, false))
+            .collect(),
+    );
 
     println!("Cache size: {} prefixes", cache.len());
 
@@ -381,7 +395,11 @@ fn test_cache_operations_direct() {
     let elapsed = start.elapsed();
     let per_lookup = elapsed / (iterations * 3);
 
-    println!("Lookup performance: {:?} per lookup ({} iterations)", per_lookup, iterations * 3);
+    println!(
+        "Lookup performance: {:?} per lookup ({} iterations)",
+        per_lookup,
+        iterations * 3
+    );
 
     if per_lookup > Duration::from_micros(10) {
         println!("WARNING: HashMap lookup slower than expected");

@@ -60,10 +60,8 @@ impl ConstraintSolver {
             possible_types.insert(dtype);
         }
 
-        let date_format_candidates: HashSet<String> = DATE_FORMATS
-            .iter()
-            .map(|f| f.pattern.to_string())
-            .collect();
+        let date_format_candidates: HashSet<String> =
+            DATE_FORMATS.iter().map(|f| f.pattern.to_string()).collect();
 
         Self {
             column_name: column_name.into(),
@@ -116,7 +114,10 @@ impl ConstraintSolver {
             || value.eq_ignore_ascii_case("false")
             || value.eq_ignore_ascii_case("yes")
             || value.eq_ignore_ascii_case("no")
-            || matches!(value, "y" | "Y" | "n" | "N" | "1" | "0" | "t" | "T" | "f" | "F");
+            || matches!(
+                value,
+                "y" | "Y" | "n" | "N" | "1" | "0" | "t" | "T" | "f" | "F"
+            );
 
         if !is_boolean {
             self.eliminate_type(
@@ -507,7 +508,9 @@ impl ConstraintSolver {
         let first_char = value.chars().next();
         if matches!(first_char, Some('p') | Some('P')) {
             // Check for duration markers in rest of string
-            let has_duration_marker = value[1..].chars().any(|c| matches!(c, 't' | 'T' | 'y' | 'Y' | 'm' | 'M' | 'd' | 'D'));
+            let has_duration_marker = value[1..]
+                .chars()
+                .any(|c| matches!(c, 't' | 'T' | 'y' | 'Y' | 'm' | 'M' | 'd' | 'D'));
             if has_duration_marker {
                 return; // Looks like ISO 8601 duration
             }
@@ -519,7 +522,10 @@ impl ConstraintSolver {
         // Helper to check if slice contains substring case-insensitively
         fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
             haystack.windows(needle.len()).any(|window| {
-                window.iter().zip(needle.iter()).all(|(h, n)| h.to_ascii_lowercase() == *n)
+                window
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(h, n)| h.to_ascii_lowercase() == *n)
             })
         }
 
@@ -527,7 +533,17 @@ impl ConstraintSolver {
         let has_min = contains_ignore_case(value_bytes, b"min");
         let has_sec = contains_ignore_case(value_bytes, b"sec");
         let has_day = contains_ignore_case(value_bytes, b"day");
-        let ends_with_unit = matches!(value_bytes.last(), Some(b'h') | Some(b'H') | Some(b'm') | Some(b'M') | Some(b's') | Some(b'S') | Some(b'd') | Some(b'D'));
+        let ends_with_unit = matches!(
+            value_bytes.last(),
+            Some(b'h')
+                | Some(b'H')
+                | Some(b'm')
+                | Some(b'M')
+                | Some(b's')
+                | Some(b'S')
+                | Some(b'd')
+                | Some(b'D')
+        );
 
         if has_hour || has_min || has_sec || has_day || ends_with_unit {
             return; // Looks like human-readable duration
@@ -535,7 +551,9 @@ impl ConstraintSolver {
 
         // Check for short form like "1h30m" or "2h" - check for digits AND duration chars
         let has_digit = value.chars().any(|c| c.is_ascii_digit());
-        let has_duration_char = value.chars().any(|c| matches!(c, 'h' | 'H' | 'm' | 'M' | 's' | 'S'));
+        let has_duration_char = value
+            .chars()
+            .any(|c| matches!(c, 'h' | 'H' | 'm' | 'M' | 's' | 'S'));
 
         if has_digit && has_duration_char {
             return; // Looks like short duration format
@@ -921,9 +939,10 @@ mod tests {
 
         assert!(!solver.elimination_evidence.is_empty());
 
-        let integer_elimination = solver.elimination_evidence.iter().find(|e| {
-            matches!(&e.eliminated, EliminatedItem::Type(DataType::Integer))
-        });
+        let integer_elimination = solver
+            .elimination_evidence
+            .iter()
+            .find(|e| matches!(&e.eliminated, EliminatedItem::Type(DataType::Integer)));
 
         assert!(integer_elimination.is_some());
     }

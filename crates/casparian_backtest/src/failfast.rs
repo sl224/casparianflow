@@ -74,10 +74,7 @@ pub enum BacktestResult {
     },
 
     /// Backtest had an error
-    Error {
-        files_tested: usize,
-        error: String,
-    },
+    Error { files_tested: usize, error: String },
 }
 
 impl BacktestResult {
@@ -325,7 +322,6 @@ mod tests {
                 FailureHistoryEntry::new(0, 1, FailureCategory::TypeMismatch, "Prior failure");
             table
                 .record_failure(&format!("/path/high{}.csv", i), &scope_id, entry)
-                
                 .unwrap();
         }
 
@@ -375,7 +371,6 @@ mod tests {
                 FailureHistoryEntry::new(0, 1, FailureCategory::TypeMismatch, "Prior failure");
             table
                 .record_failure(&format!("/path/high{}.csv", i), &scope_id, entry)
-                
                 .unwrap();
         }
 

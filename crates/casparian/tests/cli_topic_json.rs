@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{init_scout_schema, run_cli_json, with_duckdb};
 use casparian_db::{DbConnection, DbValue};
+use cli_support::{init_scout_schema, run_cli_json, with_duckdb};
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -45,33 +45,61 @@ fn test_topic_json_outputs() {
         insert_source(&conn, SOURCE_ID, "test_source", "/data", now);
 
         let files = [
-            (1, "/data/sales/a.csv", "sales/a.csv", 100, "processed", Some("sales"), None),
-            (2, "/data/sales/b.csv", "sales/b.csv", 120, "failed", Some("sales"), Some("bad row")),
-            (3, "/data/invoices/one.json", "invoices/one.json", 90, "pending", Some("invoices"), None),
-            (4, "/data/invoices/two.json", "invoices/two.json", 95, "processed", Some("invoices"), None),
-            (5, "/data/logs/untagged.log", "logs/untagged.log", 80, "pending", None, None),
+            (
+                1,
+                "/data/sales/a.csv",
+                "sales/a.csv",
+                100,
+                "processed",
+                Some("sales"),
+                None,
+            ),
+            (
+                2,
+                "/data/sales/b.csv",
+                "sales/b.csv",
+                120,
+                "failed",
+                Some("sales"),
+                Some("bad row"),
+            ),
+            (
+                3,
+                "/data/invoices/one.json",
+                "invoices/one.json",
+                90,
+                "pending",
+                Some("invoices"),
+                None,
+            ),
+            (
+                4,
+                "/data/invoices/two.json",
+                "invoices/two.json",
+                95,
+                "processed",
+                Some("invoices"),
+                None,
+            ),
+            (
+                5,
+                "/data/logs/untagged.log",
+                "logs/untagged.log",
+                80,
+                "pending",
+                None,
+                None,
+            ),
         ];
         for (id, path, rel_path, size, status, tag, error) in files {
             insert_file(
-                &conn,
-                id,
-                SOURCE_ID,
-                path,
-                rel_path,
-                size,
-                status,
-                tag,
-                error,
-                now,
+                &conn, id, SOURCE_ID, path, rel_path, size, status, tag, error, now,
             );
         }
     });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let list_args = vec![
         "topic".to_string(),
@@ -79,7 +107,10 @@ fn test_topic_json_outputs() {
         "--json".to_string(),
     ];
     let topics: Vec<TopicListItem> = run_cli_json(&list_args, &envs);
-    let sales = topics.iter().find(|t| t.topic == "sales").expect("sales topic");
+    let sales = topics
+        .iter()
+        .find(|t| t.topic == "sales")
+        .expect("sales topic");
     let invoices = topics
         .iter()
         .find(|t| t.topic == "invoices")
@@ -164,10 +195,7 @@ fn insert_file(
 
 fn split_rel_path(rel_path: &str) -> (String, String) {
     match rel_path.rfind('/') {
-        Some(idx) => (
-            rel_path[..idx].to_string(),
-            rel_path[idx + 1..].to_string(),
-        ),
+        Some(idx) => (rel_path[..idx].to_string(), rel_path[idx + 1..].to_string()),
         None => ("".to_string(), rel_path.to_string()),
     }
 }

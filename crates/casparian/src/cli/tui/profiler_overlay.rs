@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, Gauge, Paragraph, Row, Sparkline, Table},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Row, Sparkline, Table},
     Frame,
 };
 
@@ -83,7 +83,10 @@ fn render_header(frame: &mut Frame, profiler: &Profiler, area: Rect) {
         .percent(percent)
         .label(format!(
             "Frame: {}  {:.0}ms / {}ms ({:.0}%)",
-            frame_count, last_time, budget_ms, utilization * 100.0
+            frame_count,
+            last_time,
+            budget_ms,
+            utilization * 100.0
         ));
 
     frame.render_widget(gauge, area);
@@ -128,7 +131,10 @@ fn render_sparkline(frame: &mut Frame, profiler: &Profiler, area: Rect) {
             }),
         ),
         Span::raw("  min: "),
-        Span::styled(format!("{:.0}ms", min_val), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("{:.0}ms", min_val),
+            Style::default().fg(Color::White),
+        ),
     ]));
 
     // Split area for sparkline and stats
@@ -154,7 +160,11 @@ fn render_zones(frame: &mut Frame, profiler: &Profiler, area: Rect) {
             // Indent based on dot count (hierarchy)
             let indent = name.matches('.').count();
             let display_name = if indent > 1 {
-                format!("{}{}", "  ".repeat(indent - 1), name.rsplit('.').next().unwrap_or(name))
+                format!(
+                    "{}{}",
+                    "  ".repeat(indent - 1),
+                    name.rsplit('.').next().unwrap_or(name)
+                )
             } else {
                 (*name).to_string()
             };
@@ -182,8 +192,11 @@ fn render_zones(frame: &mut Frame, profiler: &Profiler, area: Rect) {
         })
         .collect();
 
-    let header = Row::new(vec!["Zone", "Time", "%", ""])
-        .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan));
+    let header = Row::new(vec!["Zone", "Time", "%", ""]).style(
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
+    );
 
     let widths = [
         Constraint::Min(20),

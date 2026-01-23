@@ -90,9 +90,8 @@ pub fn load_ai_config(config_path: &Path) -> Result<AiConfig> {
 
 /// Load AI configuration from the default location
 pub fn load_default_ai_config() -> Result<AiConfig> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        ConfigError::NotFound("Could not find home directory".to_string())
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| ConfigError::NotFound("Could not find home directory".to_string()))?;
     let config_path = home.join(".casparian_flow").join("config.toml");
     load_ai_config(&config_path)
 }

@@ -150,10 +150,9 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
         return Err(match err {
             scan_path::ScanPathError::NotFound(path) => HelpfulError::path_not_found(&path),
             scan_path::ScanPathError::NotDirectory(path) => HelpfulError::not_a_directory(&path),
-            scan_path::ScanPathError::NotReadable(path) => HelpfulError::new(format!(
-                "Cannot read directory: {}",
-                path.display()
-            )),
+            scan_path::ScanPathError::NotReadable(path) => {
+                HelpfulError::new(format!("Cannot read directory: {}", path.display()))
+            }
         }
         .into());
     }
@@ -166,9 +165,10 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     let db_dir = db_path.parent().unwrap();
     fs::create_dir_all(db_dir)?;
 
-    let db = Database::open(&db_path)
-        .map_err(|e| HelpfulError::new(format!("Failed to open database: {}", e))
-            .with_context(format!("Database path: {}", db_path.display())))?;
+    let db = Database::open(&db_path).map_err(|e| {
+        HelpfulError::new(format!("Failed to open database: {}", e))
+            .with_context(format!("Database path: {}", db_path.display()))
+    })?;
 
     // Get or create source
     let source = get_or_create_source(&db, &scan_path)?;
@@ -178,13 +178,11 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     let scanner = Scanner::new(db.clone());
     let scan_result = scanner
         .scan(&source, None, None)
-        
         .map_err(|e| HelpfulError::new(format!("Scan failed: {}", e)))?;
 
     // Query all files from database
     let db_files = db
         .list_files_by_source(&source.id, 1_000_000)
-        
         .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
 
     // Convert to DiscoveredFile and apply CLI filters
@@ -374,7 +372,8 @@ fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<Source>
     let path_str = path.display().to_string();
 
     // Try to find existing source by path
-    let sources = db.list_sources()
+    let sources = db
+        .list_sources()
         .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
     for source in sources {
@@ -385,7 +384,8 @@ fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<Source>
 
     // Create new source
     let id = SourceId::new();
-    let name = path.file_name()
+    let name = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("scan")
         .to_string();
@@ -414,11 +414,7 @@ fn build_summary(files: &[DiscoveredFile], directories_scanned: usize) -> ScanSu
     for file in files {
         total_size += file.size;
 
-        let ext = file
-            .extension
-            .as_deref()
-            .unwrap_or("(no ext)")
-            .to_string();
+        let ext = file.extension.as_deref().unwrap_or("(no ext)").to_string();
 
         *files_by_type.entry(ext.clone()).or_insert(0) += 1;
         *size_by_type.entry(ext).or_insert(0) += file.size;
@@ -460,7 +456,12 @@ fn output_stats(result: &ScanResult) {
 
         for (ext, count) in types {
             let size = summary.size_by_type.get(ext).copied().unwrap_or(0);
-            println!("  {:<12} {:>6} files  {:>10}", ext, count, format_size(size));
+            println!(
+                "  {:<12} {:>6} files  {:>10}",
+                ext,
+                count,
+                format_size(size)
+            );
         }
     }
 }
@@ -553,7 +554,10 @@ fn print_next_steps(result: &ScanResult, tag: Option<&str>) {
 
     if tag.is_some() {
         // Already tagged, show how to view and process
-        println!("  \x1b[36mView tagged files:\x1b[0m casparian files --topic {}", tag.unwrap());
+        println!(
+            "  \x1b[36mView tagged files:\x1b[0m casparian files --topic {}",
+            tag.unwrap()
+        );
         println!("  \x1b[36mList all files:\x1b[0m    casparian files");
     } else {
         // Not tagged, show how to filter and tag
@@ -775,10 +779,7 @@ fn draw_interactive(frame: &mut Frame, state: &mut InteractiveState) {
                 .to_string();
 
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<4} ", ext_display),
-                    ext_style,
-                ),
+                Span::styled(format!("{:<4} ", ext_display), ext_style),
                 Span::raw(format!("{:>8}  ", format_size(file.size))),
                 Span::raw(display_path),
             ]))

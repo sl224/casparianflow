@@ -3,15 +3,16 @@
 //! Tools for monitoring approval requests.
 
 use super::McpTool;
-use crate::approvals::{ApprovalId, ApprovalManager, ApprovalStatus};
-use crate::jobs::JobManager;
+use crate::approvals::{ApprovalId, ApprovalOperation, ApprovalStatus};
+use crate::core::CoreHandle;
+use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
-use anyhow::Result;
+use crate::types::{ApprovalDecision, ApprovalStatusFilter};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use tracing::info;
 
 // ============================================================================
 // casparian_approval_status
@@ -43,7 +44,6 @@ struct ApprovalStatusResult {
     expires_at: String,
 }
 
-#[async_trait::async_trait]
 impl McpTool for ApprovalStatusTool {
     fn name(&self) -> &'static str {
         "casparian_approval_status"
@@ -65,20 +65,19 @@ impl McpTool for ApprovalStatusTool {
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         _security: &SecurityConfig,
-        _jobs: &Arc<Mutex<JobManager>>,
-        approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         _config: &McpServerConfig,
+        _executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: ApprovalStatusArgs = serde_json::from_value(args)?;
         let approval_id = ApprovalId::from_string(&args.approval_id);
 
-        let approval_manager = approvals.lock().await;
-        let approval = approval_manager
-            .get_approval(&approval_id)
+        let approval = core
+            .get_approval(approval_id)?
             .ok_or_else(|| anyhow::anyhow!("Approval not found: {}", args.approval_id))?;
 
         let result = ApprovalStatusResult {
@@ -106,12 +105,8 @@ pub struct ApprovalListTool;
 
 #[derive(Debug, Deserialize)]
 struct ApprovalListArgs {
-    #[serde(default = "default_status")]
-    status: String,
-}
-
-fn default_status() -> String {
-    "pending".to_string()
+    #[serde(default)]
+    status: ApprovalStatusFilter,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,7 +123,6 @@ struct ApprovalListResult {
     approvals: Vec<ApprovalListEntry>,
 }
 
-#[async_trait::async_trait]
 impl McpTool for ApprovalListTool {
     fn name(&self) -> &'static str {
         "casparian_approval_list"
@@ -144,34 +138,28 @@ impl McpTool for ApprovalListTool {
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "all"],
+                    "enum": ["pending", "all", "approved", "rejected", "expired"],
                     "default": "pending"
                 }
             }
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         _security: &SecurityConfig,
-        _jobs: &Arc<Mutex<JobManager>>,
-        approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         _config: &McpServerConfig,
+        _executor: &JobExecutorHandle,
     ) -> Result<Value> {
-        let args: ApprovalListArgs = serde_json::from_value(args).unwrap_or(ApprovalListArgs {
-            status: default_status(),
-        });
+        // Parse args with proper error handling (no unwrap_or_default)
+        let args: ApprovalListArgs =
+            serde_json::from_value(args).map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let approval_manager = approvals.lock().await;
+        let status_filter = args.status.as_filter_str();
 
-        let status_filter = if args.status == "all" {
-            None
-        } else {
-            Some(args.status.as_str())
-        };
-
-        let approvals = approval_manager.list_approvals(status_filter);
+        let approvals = core.list_approvals(status_filter)?;
 
         let entries: Vec<ApprovalListEntry> = approvals
             .into_iter()
@@ -192,5 +180,198 @@ impl McpTool for ApprovalListTool {
         let result = ApprovalListResult { approvals: entries };
 
         Ok(serde_json::to_value(result)?)
+    }
+}
+
+// ============================================================================
+// casparian_approval_decide
+// ============================================================================
+
+pub struct ApprovalDecideTool;
+
+#[derive(Debug, Deserialize)]
+struct ApprovalDecideArgs {
+    approval_id: String,
+    /// Strongly-typed decision enum - no more stringly-typed "approve"/"reject"
+    decision: ApprovalDecision,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalDecideResult {
+    approval_id: String,
+    decision: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl McpTool for ApprovalDecideTool {
+    fn name(&self) -> &'static str {
+        "casparian_approval_decide"
+    }
+
+    fn description(&self) -> &'static str {
+        "Approve or reject a pending approval request"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "approval_id": {
+                    "type": "string",
+                    "description": "The approval ID to decide on"
+                },
+                "decision": {
+                    "type": "string",
+                    "enum": ["approve", "reject"],
+                    "description": "Whether to approve or reject the request"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional reason (required for rejection)"
+                }
+            },
+            "required": ["approval_id", "decision"]
+        })
+    }
+
+    fn execute(
+        &self,
+        args: Value,
+        _security: &SecurityConfig,
+        core: &CoreHandle,
+        _config: &McpServerConfig,
+        executor: &JobExecutorHandle,
+    ) -> Result<Value> {
+        // Parse args - serde will validate the decision enum automatically
+        let args: ApprovalDecideArgs = serde_json::from_value(args).map_err(|e| {
+            anyhow!(
+                "Invalid arguments: {}. Decision must be 'approve' or 'reject'.",
+                e
+            )
+        })?;
+
+        let approval_id = ApprovalId::from_string(&args.approval_id);
+
+        // Get approval via Core
+        let approval = match core.get_approval(approval_id.clone())? {
+            Some(a) => a,
+            None => {
+                return Ok(serde_json::to_value(ApprovalDecideResult {
+                    approval_id: args.approval_id.clone(),
+                    decision: args.decision.to_string(),
+                    status: "not_found".to_string(),
+                    job_id: None,
+                    error: Some("Approval not found".to_string()),
+                })?);
+            }
+        };
+
+        // Check if already decided
+        match &approval.status {
+            ApprovalStatus::Approved { .. } => {
+                return Ok(serde_json::to_value(ApprovalDecideResult {
+                    approval_id: args.approval_id.clone(),
+                    decision: args.decision.to_string(),
+                    status: "already_approved".to_string(),
+                    job_id: approval.job_id.clone(),
+                    error: None,
+                })?);
+            }
+            ApprovalStatus::Rejected { .. } => {
+                return Ok(serde_json::to_value(ApprovalDecideResult {
+                    approval_id: args.approval_id.clone(),
+                    decision: args.decision.to_string(),
+                    status: "already_rejected".to_string(),
+                    job_id: None,
+                    error: None,
+                })?);
+            }
+            ApprovalStatus::Expired => {
+                return Ok(serde_json::to_value(ApprovalDecideResult {
+                    approval_id: args.approval_id.clone(),
+                    decision: args.decision.to_string(),
+                    status: "expired".to_string(),
+                    job_id: None,
+                    error: Some("Approval has expired".to_string()),
+                })?);
+            }
+            ApprovalStatus::Pending => {
+                // Continue with decision
+            }
+        }
+
+        // Apply decision via Core
+        match args.decision {
+            ApprovalDecision::Reject => {
+                core.reject(approval_id, args.reason.clone())?;
+                Ok(serde_json::to_value(ApprovalDecideResult {
+                    approval_id: args.approval_id,
+                    decision: args.decision.to_string(),
+                    status: "rejected".to_string(),
+                    job_id: None,
+                    error: None,
+                })?)
+            }
+            ApprovalDecision::Approve => {
+                let operation = approval.operation.clone();
+                core.approve(approval_id.clone())?;
+
+                // Create job via Core
+                let (job_id, job_id_for_enqueue): (Option<String>, Option<crate::jobs::JobId>) =
+                    match &operation {
+                        ApprovalOperation::Run {
+                            plugin_ref,
+                            input_dir,
+                            output,
+                        } => {
+                            let job_spec = crate::jobs::JobSpec::Run {
+                                plugin_ref: plugin_ref.clone(),
+                                input_dir: input_dir.display().to_string(),
+                                output_dir: Some(output.clone()),
+                                schemas: None,
+                            };
+                            let approval_id_clone = args.approval_id.clone();
+                            let job = core.create_job(job_spec, Some(approval_id_clone))?;
+                            let job_id_str = job.id.to_string();
+                            (Some(job_id_str), Some(job.id))
+                        }
+                        ApprovalOperation::SchemaPromote { .. } => {
+                            info!(
+                                "Schema promotion approved but not yet implemented: {}",
+                                args.approval_id
+                            );
+                            (None, None)
+                        }
+                    };
+
+                // Enqueue to executor
+                if let Some(job_id_to_enqueue) = job_id_for_enqueue {
+                    executor.enqueue(job_id_to_enqueue)?;
+                    info!(
+                        "Enqueued run job {:?} from approval {}",
+                        job_id, args.approval_id
+                    );
+                }
+
+                // Update approval with job_id via Core
+                if let Some(ref jid) = job_id {
+                    core.set_approval_job_id(approval_id, jid.clone())?;
+                }
+
+                Ok(serde_json::to_value(ApprovalDecideResult {
+                    approval_id: args.approval_id,
+                    decision: args.decision.to_string(),
+                    status: "approved".to_string(),
+                    job_id,
+                    error: None,
+                })?)
+            }
+        }
     }
 }

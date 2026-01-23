@@ -4,16 +4,14 @@
 //! Returns immediately with a job_id; poll job_status for progress.
 
 use super::McpTool;
-use crate::approvals::ApprovalManager;
-use crate::jobs::{Job, JobManager, JobType};
+use crate::core::CoreHandle;
+use crate::jobs::{JobExecutorHandle, JobSpec};
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
 use crate::types::{PluginRef, RedactionPolicy, SchemasMap};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 pub struct BacktestStartTool;
 
@@ -33,7 +31,6 @@ struct BacktestStartResult {
     status: String,
 }
 
-#[async_trait::async_trait]
 impl McpTool for BacktestStartTool {
     fn name(&self) -> &'static str {
         "casparian_backtest_start"
@@ -93,44 +90,36 @@ impl McpTool for BacktestStartTool {
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         security: &SecurityConfig,
-        jobs: &Arc<Mutex<JobManager>>,
-        _approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         _config: &McpServerConfig,
+        executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: BacktestArgs = serde_json::from_value(args)?;
 
         // Validate input_dir path
         security.validate_path(std::path::Path::new(&args.input_dir))?;
 
-        // Create job
-        let mut job_manager = jobs.lock().await;
-
-        let mut job = job_manager.create_job(JobType::Backtest)?;
-        job = job.with_plugin(args.plugin_ref.clone());
-        job = job.with_input(&args.input_dir);
-
-        let job_id = job.id.clone();
-
-        // Check if we can start immediately
-        let status = if job_manager.can_start_job() {
-            job_manager.start_job(&job_id)?;
-
-            // TODO: Spawn actual backtest execution task
-            // For now, the job is started but not executed
-            // tokio::spawn(run_backtest(job_id.clone(), args, config.clone()));
-
-            "running"
-        } else {
-            "queued"
+        let spec = JobSpec::Backtest {
+            plugin_ref: args.plugin_ref.clone(),
+            input_dir: args.input_dir.clone(),
+            schemas: args.schemas.clone(),
+            redaction: args.redaction.clone(),
         };
+
+        // Create job via Core
+        let job = core.create_job(spec, None)?;
+        let job_id = job.id;
+
+        // Enqueue for execution - executor will start when ready
+        executor.enqueue(job_id.clone())?;
 
         let result = BacktestStartResult {
             job_id: job_id.to_string(),
-            status: status.to_string(),
+            status: "queued".to_string(),
         };
 
         Ok(serde_json::to_value(result)?)

@@ -1,8 +1,8 @@
 use casparian_protocol::idempotency::schema_hash;
 use casparian_protocol::types::SchemaDefinition;
+use casparian_protocol::JobId;
 use casparian_worker::native_runtime::NativeSubprocessRuntime;
 use casparian_worker::runtime::{PluginRuntime, RunContext};
-use casparian_protocol::JobId;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,8 +21,7 @@ fn test_evtx_native_subprocess_e2e() {
         }
     };
 
-    let plugin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../parsers/evtx_native");
+    let plugin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../parsers/evtx_native");
     let schema_dir = plugin_dir.join("schemas");
 
     let status = Command::new("cargo")
@@ -75,8 +74,8 @@ fn test_evtx_native_subprocess_e2e() {
 
 #[cfg(unix)]
 fn resolve_sample_path() -> Option<PathBuf> {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/evtx/sample.evtx");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/evtx/sample.evtx");
     if fixture.exists() {
         return Some(fixture);
     }

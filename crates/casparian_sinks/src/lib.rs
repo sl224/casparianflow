@@ -152,11 +152,7 @@ pub fn plan_outputs(
             .iter()
             .flat_map(|group| group.iter().cloned())
             .collect();
-        return Ok(vec![OutputPlan::new(
-            default_name,
-            None,
-            batches,
-        )]);
+        return Ok(vec![OutputPlan::new(default_name, None, batches)]);
     }
 
     if descriptors.len() != output_batches.len() {
@@ -198,7 +194,11 @@ pub fn artifact_uri_for_output(
             format!("file://{}", path.display())
         }
         SinkScheme::Duckdb => {
-            format!("duckdb://{}?table={}", parsed_sink.path.display(), table_name)
+            format!(
+                "duckdb://{}?table={}",
+                parsed_sink.path.display(),
+                table_name
+            )
         }
         SinkScheme::File => {
             let ext = parsed_sink
@@ -229,12 +229,7 @@ pub fn write_output_plan(
     let mut registry = SinkRegistry::new();
 
     for output in outputs {
-        let sink = create_sink_from_uri(
-            sink_uri,
-            output.name(),
-            output.table(),
-            job_id,
-        )?;
+        let sink = create_sink_from_uri(sink_uri, output.name(), output.table(), job_id)?;
         registry.add(output.name(), sink);
     }
 
@@ -254,12 +249,7 @@ pub fn write_output_plan(
             rows += batch.num_rows() as u64;
         }
 
-        let uri = artifact_uri_for_output(
-            &parsed,
-            output.name(),
-            output.table(),
-            job_id,
-        )?;
+        let uri = artifact_uri_for_output(&parsed, output.name(), output.table(), job_id)?;
 
         artifacts.push(OutputArtifact {
             name: output.name().to_string(),
@@ -291,8 +281,12 @@ pub struct ParquetSink {
 impl ParquetSink {
     pub fn new(output_dir: PathBuf, output_name: &str, job_id: &str) -> Result<Self> {
         // Ensure output directory exists
-        std::fs::create_dir_all(&output_dir)
-            .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
+        std::fs::create_dir_all(&output_dir).with_context(|| {
+            format!(
+                "Failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
 
         Ok(Self {
             output_dir,
@@ -317,18 +311,27 @@ impl ParquetSink {
         let temp_filename = format!("{}.tmp", temp_filename);
         let temp_path = self.output_dir.join(&temp_filename);
 
-        info!("Initializing Parquet sink: {} (temp: {})", final_path.display(), temp_path.display());
+        info!(
+            "Initializing Parquet sink: {} (temp: {})",
+            final_path.display(),
+            temp_path.display()
+        );
 
-        let file = std::fs::File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp parquet file: {}", temp_path.display()))?;
+        let file = std::fs::File::create(&temp_path).with_context(|| {
+            format!(
+                "Failed to create temp parquet file: {}",
+                temp_path.display()
+            )
+        })?;
 
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
 
         let arrow_schema = Arc::new(schema.clone());
-        let writer = parquet::arrow::arrow_writer::ArrowWriter::try_new(file, arrow_schema, Some(props))
-            .context("Failed to create Parquet writer")?;
+        let writer =
+            parquet::arrow::arrow_writer::ArrowWriter::try_new(file, arrow_schema, Some(props))
+                .context("Failed to create Parquet writer")?;
 
         self.writer = Some(writer);
         self.temp_path = Some(temp_path);
@@ -337,14 +340,21 @@ impl ParquetSink {
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let writer = self.writer.as_mut()
+        let writer = self
+            .writer
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Parquet sink not initialized"))?;
 
-        writer.write(batch).context("Failed to write batch to Parquet")?;
+        writer
+            .write(batch)
+            .context("Failed to write batch to Parquet")?;
 
         let rows = batch.num_rows() as u64;
         self.rows_written += rows;
-        debug!("Wrote {} rows to Parquet (total: {})", rows, self.rows_written);
+        debug!(
+            "Wrote {} rows to Parquet (total: {})",
+            rows, self.rows_written
+        );
 
         Ok(rows)
     }
@@ -355,18 +365,22 @@ impl ParquetSink {
 
             // Atomic rename: temp -> final
             if let (Some(temp_path), Some(final_path)) = (&self.temp_path, &self.final_path) {
-                std::fs::rename(temp_path, final_path)
-                    .with_context(|| format!(
+                std::fs::rename(temp_path, final_path).with_context(|| {
+                    format!(
                         "Failed to rename {} -> {}",
                         temp_path.display(),
                         final_path.display()
-                    ))?;
-                info!("Committed Parquet sink: {} ({} rows)", final_path.display(), self.rows_written);
+                    )
+                })?;
+                info!(
+                    "Committed Parquet sink: {} ({} rows)",
+                    final_path.display(),
+                    self.rows_written
+                );
             }
         }
         Ok(())
     }
-
 }
 
 impl Drop for ParquetSink {
@@ -398,8 +412,12 @@ pub struct CsvSink {
 
 impl CsvSink {
     pub fn new(output_dir: PathBuf, output_name: &str, job_id: &str) -> Result<Self> {
-        std::fs::create_dir_all(&output_dir)
-            .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
+        std::fs::create_dir_all(&output_dir).with_context(|| {
+            format!(
+                "Failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
 
         Ok(Self {
             output_dir,
@@ -424,7 +442,11 @@ impl CsvSink {
         let temp_filename = format!("{}.tmp", temp_filename);
         let temp_path = self.output_dir.join(&temp_filename);
 
-        info!("Initializing CSV sink: {} (temp: {})", final_path.display(), temp_path.display());
+        info!(
+            "Initializing CSV sink: {} (temp: {})",
+            final_path.display(),
+            temp_path.display()
+        );
 
         let file = std::fs::File::create(&temp_path)
             .with_context(|| format!("Failed to create temp CSV file: {}", temp_path.display()))?;
@@ -440,10 +462,14 @@ impl CsvSink {
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let writer = self.writer.as_mut()
+        let writer = self
+            .writer
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("CSV sink not initialized"))?;
 
-        writer.write(batch).context("Failed to write batch to CSV")?;
+        writer
+            .write(batch)
+            .context("Failed to write batch to CSV")?;
 
         let rows = batch.num_rows() as u64;
         self.rows_written += rows;
@@ -458,17 +484,21 @@ impl CsvSink {
 
         // Atomic rename: temp -> final
         if let (Some(temp_path), Some(final_path)) = (&self.temp_path, &self.final_path) {
-            std::fs::rename(temp_path, final_path)
-                .with_context(|| format!(
+            std::fs::rename(temp_path, final_path).with_context(|| {
+                format!(
                     "Failed to rename {} -> {}",
                     temp_path.display(),
                     final_path.display()
-                ))?;
-            info!("Committed CSV sink: {} ({} rows)", final_path.display(), self.rows_written);
+                )
+            })?;
+            info!(
+                "Committed CSV sink: {} ({} rows)",
+                final_path.display(),
+                self.rows_written
+            );
         }
         Ok(())
     }
-
 }
 
 impl Drop for CsvSink {
@@ -495,8 +525,9 @@ pub struct DuckDbSink {
 impl DuckDbSink {
     pub fn new(db_path: PathBuf, table_name: &str) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create database directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create database directory: {}", parent.display())
+            })?;
         }
 
         let conn = duckdb::Connection::open(&db_path)
@@ -554,7 +585,11 @@ impl DuckDbSink {
 
 impl DuckDbSink {
     fn init(&mut self, schema: &Schema) -> Result<()> {
-        info!("Initializing DuckDB sink: {} (table: {})", self.db_path.display(), self.table_name);
+        info!(
+            "Initializing DuckDB sink: {} (table: {})",
+            self.db_path.display(),
+            self.table_name
+        );
 
         let columns: Vec<String> = schema
             .fields()
@@ -562,7 +597,12 @@ impl DuckDbSink {
             .map(|f| {
                 let sql_type = Self::arrow_to_duckdb_type(f.data_type());
                 let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
-                format!("\"{}\" {}{}", f.name().replace('"', "\"\""), sql_type, nullable)
+                format!(
+                    "\"{}\" {}{}",
+                    f.name().replace('"', "\"\""),
+                    sql_type,
+                    nullable
+                )
             })
             .collect();
 
@@ -603,9 +643,13 @@ impl DuckDbSink {
         );
 
         self.with_conn_mut(|conn| {
-            let tx = conn.transaction().context("Failed to begin DuckDB transaction")?;
+            let tx = conn
+                .transaction()
+                .context("Failed to begin DuckDB transaction")?;
             {
-                let mut stmt = tx.prepare(&insert_sql).context("Failed to prepare DuckDB INSERT")?;
+                let mut stmt = tx
+                    .prepare(&insert_sql)
+                    .context("Failed to prepare DuckDB INSERT")?;
                 for row_idx in 0..num_rows {
                     let params: Vec<duckdb::types::Value> = (0..num_cols)
                         .map(|col_idx| {
@@ -624,7 +668,10 @@ impl DuckDbSink {
         })?;
 
         self.rows_written += num_rows as u64;
-        debug!("Wrote {} rows to DuckDB (total: {})", num_rows, self.rows_written);
+        debug!(
+            "Wrote {} rows to DuckDB (total: {})",
+            num_rows, self.rows_written
+        );
 
         Ok(num_rows as u64)
     }
@@ -638,12 +685,11 @@ impl DuckDbSink {
         info!("Closed DuckDB sink: {} total rows", self.rows_written);
         Ok(())
     }
-
 }
 
 enum Sink {
     Parquet(ParquetSink),
-    Csv(CsvSink),
+    Csv(Box<CsvSink>),
     DuckDb(DuckDbSink),
 }
 
@@ -761,18 +807,27 @@ fn arrow_value_to_duckdb(array: &ArrayRef, row: usize) -> duckdb::types::Value {
                 Value::BigInt(arr.value(row) as i64)
             }
             arrow::datatypes::TimeUnit::Millisecond => {
-                let arr = array.as_any().downcast_ref::<Time32MillisecondArray>().unwrap();
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Time32MillisecondArray>()
+                    .unwrap();
                 Value::BigInt(arr.value(row) as i64)
             }
             _ => Value::Text(format!("{:?}", array.slice(row, 1))),
         },
         DataType::Time64(unit) => match unit {
             arrow::datatypes::TimeUnit::Microsecond => {
-                let arr = array.as_any().downcast_ref::<Time64MicrosecondArray>().unwrap();
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Time64MicrosecondArray>()
+                    .unwrap();
                 Value::BigInt(arr.value(row))
             }
             arrow::datatypes::TimeUnit::Nanosecond => {
-                let arr = array.as_any().downcast_ref::<Time64NanosecondArray>().unwrap();
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Time64NanosecondArray>()
+                    .unwrap();
                 Value::BigInt(arr.value(row))
             }
             _ => Value::Text(format!("{:?}", array.slice(row, 1))),
@@ -780,19 +835,31 @@ fn arrow_value_to_duckdb(array: &ArrayRef, row: usize) -> duckdb::types::Value {
         DataType::Timestamp(unit, _) => {
             let (duck_unit, value) = match unit {
                 arrow::datatypes::TimeUnit::Second => {
-                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .unwrap();
                     (duckdb::types::TimeUnit::Second, arr.value(row))
                 }
                 arrow::datatypes::TimeUnit::Millisecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap();
                     (duckdb::types::TimeUnit::Millisecond, arr.value(row))
                 }
                 arrow::datatypes::TimeUnit::Microsecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap();
                     (duckdb::types::TimeUnit::Microsecond, arr.value(row))
                 }
                 arrow::datatypes::TimeUnit::Nanosecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap();
                     (duckdb::types::TimeUnit::Nanosecond, arr.value(row))
                 }
             };
@@ -817,6 +884,12 @@ fn arrow_value_to_duckdb(array: &ArrayRef, row: usize) -> duckdb::types::Value {
 /// Sink registry - manages multiple sinks for a run
 pub struct SinkRegistry {
     sinks: HashMap<String, Sink>,
+}
+
+impl Default for SinkRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SinkRegistry {
@@ -887,12 +960,20 @@ pub(crate) fn validate_batch_schema(
     }
 
     // Check each field
-    for (i, (batch_field, declared_field)) in batch_schema.fields().iter().zip(declared_schema.fields().iter()).enumerate() {
+    for (i, (batch_field, declared_field)) in batch_schema
+        .fields()
+        .iter()
+        .zip(declared_schema.fields().iter())
+        .enumerate()
+    {
         // Check name
         if batch_field.name() != declared_field.name() {
             bail!(
                 "Schema mismatch for sink '{}' column {}: expected name '{}', got '{}'",
-                sink_name, i, declared_field.name(), batch_field.name()
+                sink_name,
+                i,
+                declared_field.name(),
+                batch_field.name()
             );
         }
 
@@ -900,7 +981,10 @@ pub(crate) fn validate_batch_schema(
         if !types_compatible(batch_field.data_type(), declared_field.data_type()) {
             bail!(
                 "Schema mismatch for sink '{}' column '{}': expected type {:?}, got {:?}",
-                sink_name, declared_field.name(), declared_field.data_type(), batch_field.data_type()
+                sink_name,
+                declared_field.name(),
+                declared_field.data_type(),
+                batch_field.data_type()
             );
         }
 
@@ -968,11 +1052,18 @@ pub fn inject_lineage_columns(
     // Create lineage column arrays
     let source_hash_array: ArrayRef = Arc::new(StringArray::from(vec![source_hash; num_rows]));
     let job_id_array: ArrayRef = Arc::new(StringArray::from(vec![job_id; num_rows]));
-    let processed_at_array: ArrayRef = Arc::new(StringArray::from(vec![processed_at.as_str(); num_rows]));
-    let parser_version_array: ArrayRef = Arc::new(StringArray::from(vec![parser_version; num_rows]));
+    let processed_at_array: ArrayRef =
+        Arc::new(StringArray::from(vec![processed_at.as_str(); num_rows]));
+    let parser_version_array: ArrayRef =
+        Arc::new(StringArray::from(vec![parser_version; num_rows]));
 
     // Build new schema with lineage columns
-    let mut fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     fields.push(Field::new("_cf_source_hash", DataType::Utf8, false));
     fields.push(Field::new("_cf_job_id", DataType::Utf8, false));
     fields.push(Field::new("_cf_processed_at", DataType::Utf8, false));
@@ -999,37 +1090,51 @@ pub(crate) fn create_sink_from_uri(
     output_table: Option<&str>,
     job_id: &str,
 ) -> Result<Sink> {
-    let parsed = casparian_protocol::types::ParsedSinkUri::parse(uri)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let parsed =
+        casparian_protocol::types::ParsedSinkUri::parse(uri).map_err(|e| anyhow::anyhow!(e))?;
     let table_name = output_table.unwrap_or(output_name);
 
     match parsed.scheme {
-        casparian_protocol::types::SinkScheme::Parquet => {
-            Ok(Sink::Parquet(ParquetSink::new(parsed.path, output_name, job_id)?))
-        }
-        casparian_protocol::types::SinkScheme::Csv => {
-            Ok(Sink::Csv(CsvSink::new(parsed.path, output_name, job_id)?))
-        }
+        casparian_protocol::types::SinkScheme::Parquet => Ok(Sink::Parquet(ParquetSink::new(
+            parsed.path,
+            output_name,
+            job_id,
+        )?)),
+        casparian_protocol::types::SinkScheme::Csv => Ok(Sink::Csv(Box::new(CsvSink::new(
+            parsed.path,
+            output_name,
+            job_id,
+        )?))),
         casparian_protocol::types::SinkScheme::Duckdb => {
             Ok(Sink::DuckDb(DuckDbSink::new(parsed.path, table_name)?))
         }
         casparian_protocol::types::SinkScheme::File => {
             // File sink: infer by extension
-            let ext = parsed.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let ext = parsed
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
             match ext {
                 "parquet" => Ok(Sink::Parquet(ParquetSink::new(
-                    parsed.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
+                    parsed
+                        .path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf(),
                     output_name,
                     job_id,
                 )?)),
-                "csv" => Ok(Sink::Csv(CsvSink::new(
-                    parsed.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
+                "csv" => Ok(Sink::Csv(Box::new(CsvSink::new(
+                    parsed
+                        .path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."))
+                        .to_path_buf(),
                     output_name,
                     job_id,
-                )?)),
-                "duckdb" | "db" => {
-                    Ok(Sink::DuckDb(DuckDbSink::new(parsed.path, table_name)?))
-                }
+                )?))),
+                "duckdb" | "db" => Ok(Sink::DuckDb(DuckDbSink::new(parsed.path, table_name)?)),
                 _ => bail!("Unsupported file sink extension: '{}'", ext),
             }
         }
@@ -1040,11 +1145,7 @@ pub(crate) fn create_sink_from_uri(
 mod tests {
     use super::*;
     use arrow::array::{
-        Array,
-        Decimal128Array,
-        Decimal128Builder,
-        Int64Array,
-        StringArray,
+        Array, Decimal128Array, Decimal128Builder, Int64Array, StringArray,
         TimestampMicrosecondArray,
     };
     use arrow::datatypes::{Field, TimeUnit};
@@ -1094,7 +1195,8 @@ mod tests {
     fn test_parquet_sink_decimal_timestamp_tz_roundtrip() {
         let dir = tempdir().unwrap();
         let job_id = "12345678-abcd-1234-abcd-123456789abc";
-        let mut sink = ParquetSink::new(dir.path().to_path_buf(), "test_decimal_tz", job_id).unwrap();
+        let mut sink =
+            ParquetSink::new(dir.path().to_path_buf(), "test_decimal_tz", job_id).unwrap();
 
         let mut dec_builder =
             Decimal128Builder::with_capacity(3).with_data_type(DataType::Decimal128(10, 2));
@@ -1266,16 +1368,24 @@ mod tests {
     #[test]
     fn test_inject_lineage_columns() {
         let batch = OutputBatch::from_record_batch(create_test_batch());
-        let with_lineage =
-            inject_lineage_columns(&batch, "abc123", "job-456", "1.0.0").unwrap();
+        let with_lineage = inject_lineage_columns(&batch, "abc123", "job-456", "1.0.0").unwrap();
         let with_lineage = with_lineage.record_batch();
 
         // Original 2 columns + 4 lineage columns
         assert_eq!(with_lineage.num_columns(), 6);
-        assert!(with_lineage.schema().field_with_name("_cf_source_hash").is_ok());
+        assert!(with_lineage
+            .schema()
+            .field_with_name("_cf_source_hash")
+            .is_ok());
         assert!(with_lineage.schema().field_with_name("_cf_job_id").is_ok());
-        assert!(with_lineage.schema().field_with_name("_cf_processed_at").is_ok());
-        assert!(with_lineage.schema().field_with_name("_cf_parser_version").is_ok());
+        assert!(with_lineage
+            .schema()
+            .field_with_name("_cf_processed_at")
+            .is_ok());
+        assert!(with_lineage
+            .schema()
+            .field_with_name("_cf_parser_version")
+            .is_ok());
 
         // Verify source_hash values
         let hash_col = with_lineage

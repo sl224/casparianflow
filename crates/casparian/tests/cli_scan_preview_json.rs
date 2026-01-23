@@ -21,15 +21,13 @@ fn run_cli(args: &[String], envs: &[(&str, &str)]) -> Output {
 
 fn parse_json_output(output: &Output) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json_start = stdout
-        .find(|c| c == '{' || c == '[')
-        .unwrap_or_else(|| {
-            panic!(
-                "no JSON payload found in output\nstdout:\n{}\nstderr:\n{}",
-                stdout,
-                String::from_utf8_lossy(&output.stderr)
-            )
-        });
+    let json_start = stdout.find(|c| c == '{' || c == '[').unwrap_or_else(|| {
+        panic!(
+            "no JSON payload found in output\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
     let json_text = &stdout[json_start..];
     let mut deserializer = serde_json::Deserializer::from_str(json_text);
     serde_json::Value::deserialize(&mut deserializer).unwrap_or_else(|err| {
@@ -106,10 +104,7 @@ fn test_scan_json_filters() {
     fs::write(data_dir.path().join("big.bin"), vec![0u8; 120_000]).unwrap();
 
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let scan_csv_args = vec![
         "scan".to_string(),
@@ -135,10 +130,7 @@ fn test_scan_json_filters() {
     ];
     let scan_min_size: ScanResult = run_cli_json(&scan_min_size_args, &envs);
     assert_eq!(scan_min_size.summary.total_files, 1);
-    assert_eq!(
-        scan_min_size.summary.files_by_type.get("bin"),
-        Some(&1)
-    );
+    assert_eq!(scan_min_size.summary.files_by_type.get("bin"), Some(&1));
 
     let scan_depth_args = vec![
         "scan".to_string(),
@@ -160,10 +152,7 @@ fn test_scan_json_error_invalid_path() {
     let home_dir = TempDir::new().expect("create temp home");
     let missing_path = home_dir.path().join("missing");
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let args = vec![
         "scan".to_string(),
@@ -236,18 +225,9 @@ fn test_preview_json_outputs() {
         .map(|col| (col.name, col.inferred_type))
         .collect();
     assert_eq!(csv_types.get("id").map(String::as_str), Some("integer"));
-    assert_eq!(
-        csv_types.get("price").map(String::as_str),
-        Some("float")
-    );
-    assert_eq!(
-        csv_types.get("active").map(String::as_str),
-        Some("boolean")
-    );
-    assert_eq!(
-        csv_types.get("name").map(String::as_str),
-        Some("string")
-    );
+    assert_eq!(csv_types.get("price").map(String::as_str), Some("float"));
+    assert_eq!(csv_types.get("active").map(String::as_str), Some("boolean"));
+    assert_eq!(csv_types.get("name").map(String::as_str), Some("string"));
 
     let json_args = vec![
         "preview".to_string(),
@@ -258,9 +238,9 @@ fn test_preview_json_outputs() {
     assert_eq!(json_result.file_type, "Json");
     assert_eq!(json_result.row_count, 3);
     let json_schema = json_result.schema.expect("json schema");
-    assert!(json_schema.iter().any(|col| {
-        col.name == "name" && col.inferred_type == "string"
-    }));
+    assert!(json_schema
+        .iter()
+        .any(|col| { col.name == "name" && col.inferred_type == "string" }));
 
     let ndjson_args = vec![
         "preview".to_string(),

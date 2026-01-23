@@ -23,7 +23,10 @@ pub struct OutputBudget {
 impl OutputBudget {
     /// Create a new output budget
     pub fn new(max_bytes: usize, max_rows: usize) -> Self {
-        Self { max_bytes, max_rows }
+        Self {
+            max_bytes,
+            max_rows,
+        }
     }
 
     /// Default budget (1MB, 10K rows)
@@ -124,7 +127,10 @@ mod tests {
         let result = budget.check_size(2000);
         assert!(matches!(
             result,
-            Err(SecurityError::OutputTooLarge { size: 2000, max: 1000 })
+            Err(SecurityError::OutputTooLarge {
+                size: 2000,
+                max: 1000
+            })
         ));
     }
 
@@ -135,7 +141,10 @@ mod tests {
         let result = budget.check_rows(200);
         assert!(matches!(
             result,
-            Err(SecurityError::TooManyRows { count: 200, max: 100 })
+            Err(SecurityError::TooManyRows {
+                count: 200,
+                max: 100
+            })
         ));
     }
 

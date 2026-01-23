@@ -1,6 +1,6 @@
 //! Job Subsystem
 //!
-//! Manages async job lifecycle for long-running operations:
+//! Manages job lifecycle for long-running operations (synchronous, no async runtime):
 //! - Job creation and tracking
 //! - Progress reporting
 //! - Cancellation
@@ -16,36 +16,85 @@
 //! Default: 1 concurrent job (serialized execution).
 //! Jobs are queued and executed in order.
 
+mod executor;
 mod manager;
+#[cfg(test)]
 mod store;
 
-pub use manager::{JobManager, JobHandle};
-pub use store::JobStore;
+pub use executor::{JobExecutor, JobExecutorHandle};
+pub use manager::JobManager;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use uuid::Uuid;
+use std::str::FromStr;
 
-/// Unique job identifier
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct JobId(pub String);
+// ============================================================================
+// JobSpec - Persisted job execution details
+// ============================================================================
 
-impl JobId {
-    /// Create a new random job ID
-    pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
-    }
-
-    /// Create from an existing string
-    pub fn from_string(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
+/// Job specification - contains all details needed to execute/restart a job.
+///
+/// Persisted with the job so the executor can run it even after server restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum JobSpec {
+    /// Backtest job specification
+    Backtest {
+        /// Plugin to run
+        plugin_ref: crate::types::PluginRef,
+        /// Directory containing input files
+        input_dir: String,
+        /// Optional per-output schemas for validation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schemas: Option<crate::types::SchemasMap>,
+        /// Redaction policy for sample values
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        redaction: Option<crate::types::RedactionPolicy>,
+    },
+    /// Run job specification
+    Run {
+        /// Plugin to run
+        plugin_ref: crate::types::PluginRef,
+        /// Directory containing input files
+        input_dir: String,
+        /// Output directory (optional)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_dir: Option<String>,
+        /// Optional per-output schemas for validation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schemas: Option<crate::types::SchemasMap>,
+    },
 }
 
-impl Default for JobId {
-    fn default() -> Self {
-        Self::new()
+// ============================================================================
+// JobId - Unique job identifier
+// ============================================================================
+
+/// Unique job identifier (numeric, DB-backed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct JobId(pub u64);
+
+impl JobId {
+    /// Create from an existing numeric ID
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Parse from string (MCP inputs)
+    pub fn parse(s: &str) -> Result<Self, std::num::ParseIntError> {
+        Ok(Self(u64::from_str(s)?))
+    }
+
+    /// Convert to protocol JobId
+    pub const fn to_proto(self) -> casparian_protocol::JobId {
+        casparian_protocol::JobId::new(self.0)
+    }
+
+    /// Convert from protocol JobId
+    pub const fn from_proto(id: casparian_protocol::JobId) -> Self {
+        Self(id.as_u64())
     }
 }
 
@@ -55,20 +104,12 @@ impl fmt::Display for JobId {
     }
 }
 
-impl AsRef<str> for JobId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
 /// Job state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum JobState {
     /// Job is queued, waiting to run
-    Queued {
-        queued_at: DateTime<Utc>,
-    },
+    Queued { queued_at: DateTime<Utc> },
     /// Job is currently running
     Running {
         started_at: DateTime<Utc>,
@@ -87,9 +128,7 @@ pub enum JobState {
         error: String,
     },
     /// Job was cancelled
-    Cancelled {
-        cancelled_at: DateTime<Utc>,
-    },
+    Cancelled { cancelled_at: DateTime<Utc> },
     /// Job appears stalled (no progress for >30s)
     Stalled {
         started_at: DateTime<Utc>,
@@ -235,21 +274,32 @@ pub struct Job {
     /// Approval ID (if this job was created from an approval)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
+
+    /// Job specification - contains all details needed to execute/restart the job
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<JobSpec>,
 }
 
 impl Job {
-    /// Create a new queued job
-    pub fn new(job_type: JobType) -> Self {
+    /// Create a new queued job with a known ID
+    pub fn new(id: JobId, job_type: JobType) -> Self {
         let now = Utc::now();
         Self {
-            id: JobId::new(),
+            id,
             job_type,
             state: JobState::Queued { queued_at: now },
             created_at: now,
             plugin_ref: None,
             input: None,
             approval_id: None,
+            spec: None,
         }
+    }
+
+    /// Set the job specification
+    pub fn with_spec(mut self, spec: JobSpec) -> Self {
+        self.spec = Some(spec);
+        self
     }
 
     /// Set the plugin reference

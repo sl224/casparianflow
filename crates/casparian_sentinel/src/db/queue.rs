@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result};
 use casparian_db::{DbConnection, DbTimestamp, DbValue};
-use casparian_protocol::{JobStatus, PluginStatus, ProcessingStatus};
 use casparian_protocol::types::{ObservedDataType, SchemaMismatch};
+use casparian_protocol::{JobStatus, PluginStatus, ProcessingStatus};
 
 use super::models::{DeadLetterJob, ParserHealth, ProcessingJob, QuarantinedRow};
 
@@ -158,7 +158,6 @@ impl JobQueue {
 
         self.conn
             .execute_batch(&create_sql)
-            
             .context("Failed to initialize cf_processing_queue schema")?;
         self.require_columns(
             "cf_processing_queue",
@@ -169,8 +168,7 @@ impl JobQueue {
                 "parser_fingerprint",
                 "sink_config_json",
             ],
-        )
-        ?;
+        )?;
         Ok(())
     }
 
@@ -244,7 +242,6 @@ impl JobQueue {
 
         self.conn
             .execute_batch(&create_sql)
-            
             .context("Failed to initialize registry schema")?;
         self.require_columns(
             "cf_plugin_manifest",
@@ -260,8 +257,7 @@ impl JobQueue {
                 "signer_id",
                 "outputs_json",
             ],
-        )
-        ?;
+        )?;
         self.require_columns(
             "cf_topic_config",
             &[
@@ -270,8 +266,7 @@ impl JobQueue {
                 "quarantine_max_count",
                 "quarantine_dir",
             ],
-        )
-        ?;
+        )?;
         Ok(())
     }
 
@@ -280,10 +275,8 @@ impl JobQueue {
     /// Tries production path (JOIN through file_id) first,
     /// then falls back to input_file column for CLI/test jobs.
     pub fn get_job_details(&self, job_id: i64) -> Result<Option<JobDetails>> {
-        let row = self
-            .conn
-            .query_optional(
-                r#"
+        let row = self.conn.query_optional(
+            r#"
                 SELECT
                     pq.plugin_name,
                     sf.path as full_path
@@ -291,9 +284,8 @@ impl JobQueue {
                 JOIN scout_files sf ON pq.file_id = sf.id
                 WHERE pq.id = ?
                 "#,
-                &[DbValue::from(job_id)],
-            )
-            ?;
+            &[DbValue::from(job_id)],
+        )?;
 
         if let Some(row) = row {
             return Ok(Some(JobDetails {
@@ -304,82 +296,85 @@ impl JobQueue {
             }));
         }
 
-        let row = self
-            .conn
-            .query_optional(
-                r#"
+        let row = self.conn.query_optional(
+            r#"
                 SELECT plugin_name, input_file
                 FROM cf_processing_queue
                 WHERE id = ? AND input_file IS NOT NULL
                 "#,
-                &[DbValue::from(job_id)],
-            )
-            ?;
+            &[DbValue::from(job_id)],
+        )?;
 
-        Ok(row.map(|row| {
-            let plugin_name: String = row.get_by_name("plugin_name").unwrap_or_default();
-            let input_file: String = row.get_by_name("input_file").unwrap_or_default();
-            JobDetails {
+        row.map(|row| {
+            let plugin_name: String = row
+                .get_by_name("plugin_name")
+                .context("Failed to read 'plugin_name' from cf_processing_queue")?;
+            let input_file: String = row
+                .get_by_name("input_file")
+                .context("Failed to read 'input_file' from cf_processing_queue")?;
+            Ok(JobDetails {
                 job_id,
                 plugin_name,
                 file_path: input_file.clone(),
                 input_file: Some(input_file),
-            }
-        }))
+            })
+        })
+        .transpose()
     }
 
     /// Claim a job by setting status to RUNNING.
     pub fn claim_job(&self, job_id: i64) -> Result<()> {
         let now = now_ts();
-        self.conn
-            .execute(
-                "UPDATE cf_processing_queue SET status = ?, claim_time = ? WHERE id = ?",
-                &[
-                    DbValue::from(ProcessingStatus::Running.as_str()),
-                    DbValue::from(now),
-                    DbValue::from(job_id),
-                ],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE cf_processing_queue SET status = ?, claim_time = ? WHERE id = ?",
+            &[
+                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(now),
+                DbValue::from(job_id),
+            ],
+        )?;
         Ok(())
     }
 
     /// Get plugin source code and env_hash from manifest.
     pub fn get_plugin_details(&self, plugin_name: &str) -> Result<Option<PluginDetails>> {
-        let row = self
-            .conn
-            .query_optional(
-                r#"
+        let row = self.conn.query_optional(
+            r#"
                 SELECT source_code, env_hash
                 FROM cf_plugin_manifest
                 WHERE plugin_name = ? AND status IN (?, ?)
                 ORDER BY deployed_at DESC
                 LIMIT 1
                 "#,
-                &[
-                    DbValue::from(plugin_name),
-                    DbValue::from(PluginStatus::Active.as_str()),
-                    DbValue::from(PluginStatus::Deployed.as_str()),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(plugin_name),
+                DbValue::from(PluginStatus::Active.as_str()),
+                DbValue::from(PluginStatus::Deployed.as_str()),
+            ],
+        )?;
 
-        Ok(row.map(|row| PluginDetails {
-            source_code: row.get_by_name("source_code").unwrap_or_default(),
-            env_hash: row.get_by_name("env_hash").ok(),
-        }))
+        row.map(|row| {
+            Ok(PluginDetails {
+                source_code: row
+                    .get_by_name("source_code")
+                    .context("Failed to read 'source_code' from cf_parsers")?,
+                env_hash: row.get_by_name("env_hash").ok(),
+            })
+        })
+        .transpose()
     }
 
     /// Get lockfile content from plugin environment.
     pub fn get_lockfile(&self, env_hash: &str) -> Result<Option<String>> {
-        let row = self
-            .conn
-            .query_optional(
-                "SELECT lockfile_content FROM cf_plugin_environment WHERE hash = ?",
-                &[DbValue::from(env_hash)],
-            )
-            ?;
-        Ok(row.map(|row| row.get_by_name("lockfile_content").unwrap_or_default()))
+        let row = self.conn.query_optional(
+            "SELECT lockfile_content FROM cf_plugin_environment WHERE hash = ?",
+            &[DbValue::from(env_hash)],
+        )?;
+        row.map(|row| {
+            row.get_by_name("lockfile_content")
+                .context("Failed to read 'lockfile_content' from cf_plugin_environment")
+        })
+        .transpose()
     }
 
     /// Peek at the next job without claiming it.
@@ -420,10 +415,7 @@ impl JobQueue {
             )
         };
 
-        let row = self
-            .conn
-            .query_optional(query, &params)
-            ?;
+        let row = self.conn.query_optional(query, &params)?;
         Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
 
@@ -559,9 +551,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     ) -> Result<()> {
         let now = now_ts();
         if let Some(rows) = quarantine_rows {
-            self.conn
-                .execute(
-                    r#"
+            self.conn.execute(
+                r#"
                     UPDATE cf_processing_queue
                     SET status = ?,
                         completion_status = ?,
@@ -570,20 +561,18 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         quarantine_rows = ?
                     WHERE id = ?
                     "#,
-                    &[
-                        DbValue::from(ProcessingStatus::Completed.as_str()),
-                        DbValue::from(completion_status),
-                        DbValue::from(now),
-                        DbValue::from(summary),
-                        DbValue::from(rows),
-                        DbValue::from(job_id),
-                    ],
-                )
-                ?;
+                &[
+                    DbValue::from(ProcessingStatus::Completed.as_str()),
+                    DbValue::from(completion_status),
+                    DbValue::from(now),
+                    DbValue::from(summary),
+                    DbValue::from(rows),
+                    DbValue::from(job_id),
+                ],
+            )?;
         } else {
-            self.conn
-                .execute(
-                    r#"
+            self.conn.execute(
+                r#"
                     UPDATE cf_processing_queue
                     SET status = ?,
                         completion_status = ?,
@@ -591,15 +580,14 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         result_summary = ?
                     WHERE id = ?
                     "#,
-                    &[
-                        DbValue::from(ProcessingStatus::Completed.as_str()),
-                        DbValue::from(completion_status),
-                        DbValue::from(now),
-                        DbValue::from(summary),
-                        DbValue::from(job_id),
-                    ],
-                )
-                ?;
+                &[
+                    DbValue::from(ProcessingStatus::Completed.as_str()),
+                    DbValue::from(completion_status),
+                    DbValue::from(now),
+                    DbValue::from(summary),
+                    DbValue::from(job_id),
+                ],
+            )?;
         }
         Ok(())
     }
@@ -612,21 +600,19 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         parser_fingerprint: &str,
         sink_config_json: &str,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_processing_queue
                 SET parser_version = ?, parser_fingerprint = ?, sink_config_json = ?
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(parser_version),
-                    DbValue::from(parser_fingerprint),
-                    DbValue::from(sink_config_json),
-                    DbValue::from(job_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(parser_version),
+                DbValue::from(parser_fingerprint),
+                DbValue::from(sink_config_json),
+                DbValue::from(job_id),
+            ],
+        )?;
         Ok(())
     }
 
@@ -641,20 +627,26 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             &[DbValue::from(job_id)],
         )?;
 
-        Ok(row.map(|row| DispatchMetadata {
-            file_id: row.get_by_name("file_id").unwrap_or_default(),
-            plugin_name: row.get_by_name("plugin_name").unwrap_or_default(),
-            parser_version: row.get_by_name("parser_version").ok().flatten(),
-            parser_fingerprint: row.get_by_name("parser_fingerprint").ok().flatten(),
-            sink_config_json: row.get_by_name("sink_config_json").ok().flatten(),
-        }))
+        row.map(|row| {
+            Ok(DispatchMetadata {
+                file_id: row
+                    .get_by_name("file_id")
+                    .context("Failed to read 'file_id' from cf_processing_queue")?,
+                plugin_name: row
+                    .get_by_name("plugin_name")
+                    .context("Failed to read 'plugin_name' from cf_processing_queue")?,
+                parser_version: row.get_by_name("parser_version").ok().flatten(),
+                parser_fingerprint: row.get_by_name("parser_fingerprint").ok().flatten(),
+                sink_config_json: row.get_by_name("sink_config_json").ok().flatten(),
+            })
+        })
+        .transpose()
     }
 
     /// Record a completed output materialization (idempotent insert).
     pub fn insert_output_materialization(&self, record: &OutputMaterialization) -> Result<()> {
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO cf_output_materializations (
                     materialization_key,
                     output_target_key,
@@ -676,38 +668,37 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(materialization_key) DO NOTHING
                 "#,
-                &[
-                    DbValue::from(record.materialization_key.as_str()),
-                    DbValue::from(record.output_target_key.as_str()),
-                    DbValue::from(record.file_id),
-                    DbValue::from(record.file_mtime),
-                    DbValue::from(record.file_size),
-                    DbValue::from(record.plugin_name.as_str()),
-                    record
-                        .parser_version
-                        .as_deref()
-                        .map(DbValue::from)
-                        .unwrap_or(DbValue::Null),
-                    DbValue::from(record.parser_fingerprint.as_str()),
-                    DbValue::from(record.output_name.as_str()),
-                    DbValue::from(record.sink_uri.as_str()),
-                    DbValue::from(record.sink_mode.as_str()),
-                    record
-                        .table_name
-                        .as_deref()
-                        .map(DbValue::from)
-                        .unwrap_or(DbValue::Null),
-                    record
-                        .schema_hash
-                        .as_deref()
-                        .map(DbValue::from)
-                        .unwrap_or(DbValue::Null),
-                    DbValue::from(record.status.as_str()),
-                    DbValue::from(record.rows),
-                    DbValue::from(record.job_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(record.materialization_key.as_str()),
+                DbValue::from(record.output_target_key.as_str()),
+                DbValue::from(record.file_id),
+                DbValue::from(record.file_mtime),
+                DbValue::from(record.file_size),
+                DbValue::from(record.plugin_name.as_str()),
+                record
+                    .parser_version
+                    .as_deref()
+                    .map(DbValue::from)
+                    .unwrap_or(DbValue::Null),
+                DbValue::from(record.parser_fingerprint.as_str()),
+                DbValue::from(record.output_name.as_str()),
+                DbValue::from(record.sink_uri.as_str()),
+                DbValue::from(record.sink_mode.as_str()),
+                record
+                    .table_name
+                    .as_deref()
+                    .map(DbValue::from)
+                    .unwrap_or(DbValue::Null),
+                record
+                    .schema_hash
+                    .as_deref()
+                    .map(DbValue::from)
+                    .unwrap_or(DbValue::Null),
+                DbValue::from(record.status.as_str()),
+                DbValue::from(record.rows),
+                DbValue::from(record.job_id),
+            ],
+        )?;
         Ok(())
     }
 
@@ -716,9 +707,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// `completion_status` should be one of: FAILED, REJECTED, ABORTED
     pub fn fail_job(&self, job_id: i64, completion_status: &str, error: &str) -> Result<()> {
         let now = now_ts();
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_processing_queue
                 SET status = ?,
                     completion_status = ?,
@@ -726,15 +716,14 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     error_message = ?
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(ProcessingStatus::Failed.as_str()),
-                    DbValue::from(completion_status),
-                    DbValue::from(now),
-                    DbValue::from(error),
-                    DbValue::from(job_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+                DbValue::from(completion_status),
+                DbValue::from(now),
+                DbValue::from(error),
+                DbValue::from(job_id),
+            ],
+        )?;
         Ok(())
     }
 
@@ -742,26 +731,21 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// Clears terminal fields (completion_status, end_time, result_summary, error_message)
     /// when transitioning back to QUEUED state.
     pub fn requeue_job(&self, job_id: i64) -> Result<()> {
-        let row = self
-            .conn
-            .query_optional(
-                "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
-                &[DbValue::from(job_id)],
-            )
-            ?;
+        let row = self.conn.query_optional(
+            "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job_id)],
+        )?;
 
         if let Some(row) = row {
             let retry_count: i32 = row.get_by_name("retry_count")?;
             if retry_count >= MAX_RETRY_COUNT {
-                self.move_to_dead_letter(job_id, "max_retries_exceeded", "max_retries_exceeded")
-                    ?;
+                self.move_to_dead_letter(job_id, "max_retries_exceeded", "max_retries_exceeded")?;
                 return Ok(());
             }
         }
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_processing_queue
                 SET status = ?,
                     completion_status = NULL,
@@ -773,13 +757,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     retry_count = retry_count + 1
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(ProcessingStatus::Queued.as_str()),
-                    DbValue::from(now_ts()),
-                    DbValue::from(job_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(now_ts()),
+                DbValue::from(job_id),
+            ],
+        )?;
         Ok(())
     }
 
@@ -791,9 +774,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         scheduled_at: DbTimestamp,
         reason: Option<&str>,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_processing_queue
                 SET status = ?,
                     completion_status = NULL,
@@ -804,14 +786,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     error_message = ?
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(ProcessingStatus::Queued.as_str()),
-                    DbValue::from(scheduled_at),
-                    DbValue::from(reason),
-                    DbValue::from(job_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(scheduled_at),
+                DbValue::from(reason),
+                DbValue::from(job_id),
+            ],
+        )?;
         Ok(())
     }
 
@@ -825,9 +806,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         error: &str,
         scheduled_at: DbTimestamp,
     ) -> Result<()> {
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_processing_queue
                 SET status = ?,
                     completion_status = NULL,
@@ -839,25 +819,22 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     error_message = ?
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(ProcessingStatus::Queued.as_str()),
-                    DbValue::from(next_retry_count),
-                    DbValue::from(scheduled_at),
-                    DbValue::from(error),
-                    DbValue::from(job_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(next_retry_count),
+                DbValue::from(scheduled_at),
+                DbValue::from(error),
+                DbValue::from(job_id),
+            ],
+        )?;
         Ok(())
     }
 
     /// Queue stats for monitoring.
     pub fn stats(&self) -> Result<QueueStats> {
-        let row = self
-            .conn
-            .query_one(
-                &format!(
-                    r#"
+        let row = self.conn.query_one(
+            &format!(
+                r#"
                 SELECT
                     SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END) AS queued,
                     SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END) AS running,
@@ -865,14 +842,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END) AS failed
                 FROM cf_processing_queue
                 "#,
-                    queued = ProcessingStatus::Queued.as_str(),
-                    running = ProcessingStatus::Running.as_str(),
-                    completed = ProcessingStatus::Completed.as_str(),
-                    failed = ProcessingStatus::Failed.as_str(),
-                ),
-                &[],
-            )
-            ?;
+                queued = ProcessingStatus::Queued.as_str(),
+                running = ProcessingStatus::Running.as_str(),
+                completed = ProcessingStatus::Completed.as_str(),
+                failed = ProcessingStatus::Failed.as_str(),
+            ),
+            &[],
+        )?;
 
         Ok(QueueStats {
             queued: row.get_by_name("queued")?,
@@ -885,7 +861,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// Initialize dead-letter, health, quarantine tables.
     pub fn init_error_handling_schema(&self) -> Result<()> {
         let sql = match self.conn.backend_name() {
-            "DuckDB" => r#"
+            "DuckDB" => {
+                r#"
                 CREATE SEQUENCE IF NOT EXISTS seq_cf_dead_letter;
                 CREATE SEQUENCE IF NOT EXISTS seq_cf_quarantine;
                 CREATE SEQUENCE IF NOT EXISTS seq_cf_job_schema_mismatch;
@@ -937,8 +914,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
                 CREATE INDEX IF NOT EXISTS ix_schema_mismatch_job
                     ON cf_job_schema_mismatch(job_id);
-                "#,
-            _ => r#"
+                "#
+            }
+            _ => {
+                r#"
                 CREATE TABLE IF NOT EXISTS cf_dead_letter (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     original_job_id INTEGER NOT NULL,
@@ -986,12 +965,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
                 CREATE INDEX IF NOT EXISTS ix_schema_mismatch_job
                     ON cf_job_schema_mismatch(job_id);
-                "#,
+                "#
+            }
         };
 
         self.conn
             .execute(sql, &[])
-            
             .context("Failed to initialize error handling schema")?;
         Ok(())
     }
@@ -1011,8 +990,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 None,
                 None,
                 now.clone(),
-            )
-            ?;
+            )?;
         }
 
         for name in &mismatch.extra_columns {
@@ -1027,8 +1005,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 None,
                 None,
                 now.clone(),
-            )
-            ?;
+            )?;
         }
 
         for order in &mismatch.order_mismatches {
@@ -1050,8 +1027,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 Some(expected_index),
                 None,
                 now.clone(),
-            )
-            ?;
+            )?;
         }
 
         for type_mismatch in &mismatch.type_mismatches {
@@ -1068,8 +1044,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 None,
                 None,
                 now.clone(),
-            )
-            ?;
+            )?;
         }
 
         Ok(())
@@ -1114,17 +1089,14 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     /// Move a job to dead letter.
     pub fn move_to_dead_letter(&self, job_id: i64, error: &str, reason: &str) -> Result<()> {
-        let row = self
-            .conn
-            .query_optional(
-                r#"
+        let row = self.conn.query_optional(
+            r#"
                 SELECT file_id, plugin_name, retry_count
                 FROM cf_processing_queue
                 WHERE id = ?
                 "#,
-                &[DbValue::from(job_id)],
-            )
-            ?;
+            &[DbValue::from(job_id)],
+        )?;
 
         let Some(row) = row else {
             return Ok(());
@@ -1155,9 +1127,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             ?;
 
         // Mark the job as FAILED with FAILED completion_status (dead-lettered)
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_processing_queue
                 SET status = ?,
                     completion_status = ?,
@@ -1165,49 +1136,49 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     error_message = ?
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(ProcessingStatus::Failed.as_str()),
-                    DbValue::from(JobStatus::Failed.as_str()),
-                    DbValue::from(now_ts()),
-                    DbValue::from(full_error.as_str()),
-                    DbValue::from(job_id),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+                DbValue::from(JobStatus::Failed.as_str()),
+                DbValue::from(now_ts()),
+                DbValue::from(full_error.as_str()),
+                DbValue::from(job_id),
+            ],
+        )?;
 
         Ok(())
     }
 
     pub fn get_dead_letter_jobs(&self, limit: i64) -> Result<Vec<DeadLetterJob>> {
-        let rows = self
-            .conn
-            .query_all(
-                "SELECT * FROM cf_dead_letter ORDER BY moved_at DESC LIMIT ?",
-                &[DbValue::from(limit)],
-            )
-            ?;
-        rows.iter().map(DeadLetterJob::from_row).collect::<Result<_, _>>().map_err(Into::into)
+        let rows = self.conn.query_all(
+            "SELECT * FROM cf_dead_letter ORDER BY moved_at DESC LIMIT ?",
+            &[DbValue::from(limit)],
+        )?;
+        rows.iter()
+            .map(DeadLetterJob::from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
     }
 
-    pub fn get_dead_letter_jobs_by_plugin(&self, plugin: &str, limit: i64) -> Result<Vec<DeadLetterJob>> {
-        let rows = self
-            .conn
-            .query_all(
-                "SELECT * FROM cf_dead_letter WHERE plugin_name = ? ORDER BY moved_at DESC LIMIT ?",
-                &[DbValue::from(plugin), DbValue::from(limit)],
-            )
-            ?;
-        rows.iter().map(DeadLetterJob::from_row).collect::<Result<_, _>>().map_err(Into::into)
+    pub fn get_dead_letter_jobs_by_plugin(
+        &self,
+        plugin: &str,
+        limit: i64,
+    ) -> Result<Vec<DeadLetterJob>> {
+        let rows = self.conn.query_all(
+            "SELECT * FROM cf_dead_letter WHERE plugin_name = ? ORDER BY moved_at DESC LIMIT ?",
+            &[DbValue::from(plugin), DbValue::from(limit)],
+        )?;
+        rows.iter()
+            .map(DeadLetterJob::from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
     }
 
     pub fn replay_dead_letter(&self, dead_letter_id: i64) -> Result<i64> {
-        let row = self
-            .conn
-            .query_optional(
-                "SELECT original_job_id, file_id, plugin_name FROM cf_dead_letter WHERE id = ?",
-                &[DbValue::from(dead_letter_id)],
-            )
-            ?;
+        let row = self.conn.query_optional(
+            "SELECT original_job_id, file_id, plugin_name FROM cf_dead_letter WHERE id = ?",
+            &[DbValue::from(dead_letter_id)],
+        )?;
         let Some(row) = row else {
             return Ok(0);
         };
@@ -1228,19 +1199,21 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     DbValue::from(plugin_name),
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                 ],
-            )
-            ?
+            )?
             .get_by_name::<i64>("id")?;
 
-        self.conn
-            .execute("DELETE FROM cf_dead_letter WHERE id = ?", &[DbValue::from(dead_letter_id)])
-            ?;
+        self.conn.execute(
+            "DELETE FROM cf_dead_letter WHERE id = ?",
+            &[DbValue::from(dead_letter_id)],
+        )?;
 
         Ok(new_id)
     }
 
     pub fn count_dead_letter_jobs(&self) -> Result<i64> {
-        let row = self.conn.query_one("SELECT COUNT(*) AS cnt FROM cf_dead_letter", &[])?;
+        let row = self
+            .conn
+            .query_one("SELECT COUNT(*) AS cnt FROM cf_dead_letter", &[])?;
         Ok(row.get_by_name("cnt")?)
     }
 
@@ -1298,38 +1271,31 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     pub fn pause_parser(&self, parser_name: &str) -> Result<()> {
         let now = now_ts();
-        self.conn
-            .execute(
-                "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
-                &[
-                    DbValue::from(now.clone()),
-                    DbValue::from(now),
-                    DbValue::from(parser_name),
-                ],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
+            &[
+                DbValue::from(now.clone()),
+                DbValue::from(now),
+                DbValue::from(parser_name),
+            ],
+        )?;
         Ok(())
     }
 
     pub fn resume_parser(&self, parser_name: &str) -> Result<()> {
         let now = now_ts();
-        self.conn
-            .execute(
-                "UPDATE cf_parser_health SET paused_at = NULL, updated_at = ? WHERE parser_name = ?",
-                &[DbValue::from(now), DbValue::from(parser_name)],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE cf_parser_health SET paused_at = NULL, updated_at = ? WHERE parser_name = ?",
+            &[DbValue::from(now), DbValue::from(parser_name)],
+        )?;
         Ok(())
     }
 
     pub fn is_parser_paused(&self, parser_name: &str) -> Result<bool> {
-        let row = self
-            .conn
-            .query_optional(
-                "SELECT paused_at FROM cf_parser_health WHERE parser_name = ?",
-                &[DbValue::from(parser_name)],
-            )
-            ?;
+        let row = self.conn.query_optional(
+            "SELECT paused_at FROM cf_parser_health WHERE parser_name = ?",
+            &[DbValue::from(parser_name)],
+        )?;
         Ok(row
             .and_then(|r| r.get_by_name::<Option<DbTimestamp>>("paused_at").ok())
             .flatten()
@@ -1337,62 +1303,69 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     pub fn get_parser_health(&self, parser_name: &str) -> Result<Option<ParserHealth>> {
-        let row = self
-            .conn
-            .query_optional(
-                "SELECT * FROM cf_parser_health WHERE parser_name = ?",
-                &[DbValue::from(parser_name)],
-            )
-            ?;
+        let row = self.conn.query_optional(
+            "SELECT * FROM cf_parser_health WHERE parser_name = ?",
+            &[DbValue::from(parser_name)],
+        )?;
         Ok(row.map(|row| ParserHealth::from_row(&row)).transpose()?)
     }
 
     pub fn get_all_parser_health(&self) -> Result<Vec<ParserHealth>> {
         let rows = self.conn.query_all("SELECT * FROM cf_parser_health", &[])?;
-        rows.iter().map(ParserHealth::from_row).collect::<Result<_, _>>().map_err(Into::into)
+        rows.iter()
+            .map(ParserHealth::from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
     }
 
-    pub fn quarantine_row(&self, job_id: i64, row_index: i32, error: &str, raw: Option<&[u8]>) -> Result<()> {
+    pub fn quarantine_row(
+        &self,
+        job_id: i64,
+        row_index: i32,
+        error: &str,
+        raw: Option<&[u8]>,
+    ) -> Result<()> {
         let now = now_ts();
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO cf_quarantine (job_id, row_index, error_reason, raw_data, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 "#,
-                &[
-                    DbValue::from(job_id),
-                    DbValue::from(row_index),
-                    DbValue::from(error),
-                    DbValue::from(raw.map(|v| v.to_vec())),
-                    DbValue::from(now),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(job_id),
+                DbValue::from(row_index),
+                DbValue::from(error),
+                DbValue::from(raw.map(|v| v.to_vec())),
+                DbValue::from(now),
+            ],
+        )?;
         Ok(())
     }
 
     pub fn get_quarantined_rows(&self, job_id: i64) -> Result<Vec<QuarantinedRow>> {
-        let rows = self
-            .conn
-            .query_all("SELECT * FROM cf_quarantine WHERE job_id = ? ORDER BY row_index", &[DbValue::from(job_id)])
-            ?;
-        rows.iter().map(QuarantinedRow::from_row).collect::<Result<_, _>>().map_err(Into::into)
+        let rows = self.conn.query_all(
+            "SELECT * FROM cf_quarantine WHERE job_id = ? ORDER BY row_index",
+            &[DbValue::from(job_id)],
+        )?;
+        rows.iter()
+            .map(QuarantinedRow::from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
     }
 
     pub fn count_quarantined_rows(&self, job_id: i64) -> Result<i64> {
-        let row = self
-            .conn
-            .query_one("SELECT COUNT(*) AS cnt FROM cf_quarantine WHERE job_id = ?", &[DbValue::from(job_id)])
-            ?;
+        let row = self.conn.query_one(
+            "SELECT COUNT(*) AS cnt FROM cf_quarantine WHERE job_id = ?",
+            &[DbValue::from(job_id)],
+        )?;
         Ok(row.get_by_name("cnt")?)
     }
 
     pub fn delete_quarantined_rows(&self, job_id: i64) -> Result<u64> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM cf_quarantine WHERE job_id = ?", &[DbValue::from(job_id)])
-            ?;
+        let affected = self.conn.execute(
+            "DELETE FROM cf_quarantine WHERE job_id = ?",
+            &[DbValue::from(job_id)],
+        )?;
         Ok(affected)
     }
 }

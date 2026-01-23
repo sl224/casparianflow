@@ -19,7 +19,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check if already downloaded
     if model_path.exists() {
         println!("Model already exists at: {:?}", model_path);
-        println!("Size: {} MB", std::fs::metadata(&model_path)?.len() / 1_000_000);
+        println!(
+            "Size: {} MB",
+            std::fs::metadata(&model_path)?.len() / 1_000_000
+        );
         return Ok(());
     }
 
@@ -28,7 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Models directory: {:?}", models_dir);
 
     // Download from HuggingFace
-    println!("Downloading from HuggingFace: {}/{}", model_repo, model_file);
+    println!(
+        "Downloading from HuggingFace: {}/{}",
+        model_repo, model_file
+    );
     println!("This may take a few minutes (~1GB)...\n");
 
     let api = hf_hub::api::sync::Api::new()?;

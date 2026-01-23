@@ -1,13 +1,13 @@
 # MCP Server Execution Plan
 
-**Status:** Phase 0 Complete
-**Date:** 2026-01-21 (Implemented)
+**Status:** Phase 0 Complete + Control Plane API Complete
+**Date:** 2026-01-22 (Updated)
 **Owner:** Platform
-**Related:** `docs/v1_scope.md`, `docs/decisions/ADR-021-ai-agentic-iteration-workflow.md`, `specs/jobs_progress.md`
+**Related:** `docs/v1_scope.md`, `docs/decisions/ADR-021-ai-agentic-iteration-workflow.md`, `specs/jobs_progress.md`, `docs/local_control_plane_api_plan.md`
 
 ---
 
-## Implementation Status (2026-01-21)
+## Implementation Status (2026-01-22)
 
 ### Phase 0: Foundation - COMPLETE
 
@@ -22,33 +22,52 @@ All Phase 0 components have been implemented in `crates/casparian_mcp/`:
 | **Security Subsystem** | DONE | Path allowlist, output budget, audit logging |
 | **Job Subsystem** | DONE | `JobManager`, `JobStore`, states: Queued/Running/Completed/Failed/Cancelled/Stalled |
 | **Approval Subsystem** | DONE | `ApprovalManager`, `ApprovalStore`, file-based persistence |
-| **Core Tools** | DONE | plugins, scan, preview, query (with SQL allowlist) |
+| **Core Tools** | DONE | plugins, scan, preview, query (with SQL allowlist + read-only DuckDB) |
 | **Job Tools** | DONE | backtest_start, run_request, job_status/cancel/list |
-| **Approval Tools** | DONE | approval_status, approval_list |
+| **Approval Tools** | DONE | approval_status, approval_list, approval_decide |
+
+### Control Plane API Integration - COMPLETE
+
+MCP now integrates with `casparian_sentinel`'s `ApiStorage` for persistent job/event/approval management:
+
+| Component | Status | Implementation Notes |
+|-----------|--------|---------------------|
+| **Protocol HTTP Types** | DONE | `casparian_protocol/src/http_types.rs` - Job, Event, Approval, Query types |
+| **ApiStorage** | DONE | `casparian_sentinel/src/db/api_storage.rs` - DuckDB-backed storage |
+| **Bridge Layer** | DONE | `casparian_mcp/src/db_store.rs` - DbJobStore, DbApprovalStore |
+| **Redaction Module** | DONE | `casparian_mcp/src/redaction.rs` - hash/truncate/none modes |
+| **Query Hardening** | DONE | Read-only DuckDB, SQL allowlist, redaction applied |
+
+**Architecture Decision:** MCP calls Rust crates directly (no HTTP server). See `docs/local_control_plane_api_plan.md`.
 
 ### Key Implementation Decisions
 
-1. **No Circular Dependencies**: `casparian_mcp` depends on sub-crates (`casparian_db`, `casparian_schema`, etc.) but NOT the main `casparian` crate. The main crate depends on `casparian_mcp`.
+1. **No Circular Dependencies**: `casparian_mcp` depends on sub-crates (`casparian_db`, `casparian_schema`, `casparian_sentinel`) but NOT the main `casparian` crate. The main crate depends on `casparian_mcp`.
 
-2. **Tool Execution Placeholders**: Tool execute methods currently return placeholder responses. They will be wired to actual crate functionality in subsequent work.
+2. **Direct Crate Calls (No HTTP)**: MCP server calls `casparian_sentinel::ApiStorage` directly for job/event/approval management. No separate HTTP server.
 
-3. **File-Based State**: Jobs and approvals use JSON file persistence (not database) for simplicity and portability.
+3. **DuckDB Storage**: Jobs, events, and approvals are stored in DuckDB tables (`cf_api_jobs`, `cf_api_events`, `cf_api_approvals`) for persistence and queryability.
 
-4. **Security First**: Path validation, SQL allowlist, and output budgets are implemented and enforced.
+4. **Monotonic Event IDs**: Events use per-job monotonic IDs for strict ordering and efficient polling.
+
+5. **Security First**: Path validation, SQL allowlist, read-only query connections, and output budgets are enforced.
 
 ### File Structure (Implemented)
 
 ```
 crates/casparian_mcp/
+├── CLAUDE.md                     # Crate-specific Claude Code instructions
 ├── Cargo.toml                    # Dependencies: tokio, serde, uuid, sha2, walkdir, etc.
 ├── src/
 │   ├── lib.rs                    # Crate root with re-exports
 │   ├── protocol.rs               # JSON-RPC 2.0 + MCP message types
 │   ├── types.rs                  # PluginRef, DataType, SchemaDefinition, RedactionPolicy
 │   ├── server.rs                 # McpServer + McpServerConfig
+│   ├── db_store.rs               # Bridge to sentinel's ApiStorage (DbJobStore, DbApprovalStore)
+│   ├── redaction.rs              # Value redaction (hash/truncate/none modes)
 │   ├── security/
 │   │   ├── mod.rs                # SecurityConfig, SecurityError
-│   │   ├── path_allowlist.rs     # PathAllowlist with canonicalization
+│   │   ├── path_allowlist.rs     # PathAllowlist with canonicalization + symlink handling
 │   │   ├── output_budget.rs      # OutputBudget (max_bytes, max_rows)
 │   │   └── audit.rs              # AuditLog (NDJSON to file)
 │   ├── jobs/
@@ -65,18 +84,75 @@ crates/casparian_mcp/
 │       ├── plugins.rs            # casparian_plugins
 │       ├── scan.rs               # casparian_scan
 │       ├── preview.rs            # casparian_preview
-│       ├── query.rs              # casparian_query (SQL allowlist)
+│       ├── query.rs              # casparian_query (SQL allowlist + read-only DuckDB + redaction)
 │       ├── backtest.rs           # casparian_backtest_start
 │       ├── run.rs                # casparian_run_request
 │       ├── job.rs                # job_status, job_cancel, job_list
-│       └── approval.rs           # approval_status, approval_list
+│       └── approval.rs           # approval_status, approval_list, approval_decide
+
+crates/casparian_sentinel/
+├── CLAUDE.md                     # Crate-specific Claude Code instructions
+├── src/
+│   └── db/
+│       └── api_storage.rs        # ApiStorage - DuckDB storage for Control Plane API
+
+crates/casparian_protocol/
+├── CLAUDE.md                     # Crate-specific Claude Code instructions
+├── src/
+│   └── http_types.rs             # HTTP API types (Job, Event, Approval, Query, Redaction)
 ```
+
+### E2E Test Infrastructure (2026-01-22)
+
+Comprehensive E2E test infrastructure in `tests/e2e/mcp/`:
+
+| File | Purpose |
+|------|---------|
+| `test_mcp_server.sh` | Smoke test only - verifies server starts and tools/list works |
+| `run_with_claude.sh` | **Authoritative E2E tests** via Claude Code CLI |
+| `claude_prompt.md` | Backtest flow test instructions |
+| `claude_prompt_approval.md` | Approval flow test instructions |
+| `result.schema.json` | JSON schema for test results |
+
+Also created `.mcp.json` at project root for project-scoped MCP server configuration.
+
+**Authentication:**
+- Uses Claude CLI session authentication by default (no API key required)
+- Run `claude login` to authenticate if needed
+- Falls back to `ANTHROPIC_API_KEY` env var if CLI not authenticated
+
+**Running smoke test (quick validation):**
+```bash
+./tests/e2e/mcp/test_mcp_server.sh
+```
+
+**Running Claude Code E2E tests (authoritative):**
+```bash
+# Backtest flow test
+./tests/e2e/mcp/run_with_claude.sh
+
+# Approval flow test
+./tests/e2e/mcp/run_with_claude.sh approval
+
+# Dry run (preview)
+./tests/e2e/mcp/run_with_claude.sh --dry-run
+```
+
+**Test Results:**
+- Results saved to `tests/e2e/mcp/results/`
+- Each run generates a timestamped JSON result file
+- Raw Claude output saved alongside for debugging
 
 ### Next Steps
 
-1. **Wire Tools to Actual Functionality**: Connect placeholder implementations to real crate calls
-2. **Integration Tests**: Add `tests/` with protocol conformance and tool integration tests
-3. **Phase 1**: Implement ephemeral contracts and schema tools for AI iteration
+1. **Phase 1**: Implement ephemeral contracts and schema tools for AI iteration
+   - `EphemeralSchemaContract` in `casparian_schema`
+   - `casparian_schema_propose` and `casparian_schema_promote` tools
+   - Enhanced `ViolationContext` with `SuggestedFix` generation
+
+2. **Enhanced Progress Reporting**: Detailed progress with per-output metrics and stall detection
+
+3. **Phase 2 Polish**: Additional tools, advanced security, performance optimization
 
 ---
 

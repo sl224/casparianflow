@@ -93,7 +93,10 @@ pub fn run(action: McpAction) -> Result<()> {
             database,
             output,
         ),
-        McpAction::Approve { approval_id, reject } => run_approve(approval_id, reject),
+        McpAction::Approve {
+            approval_id,
+            reject,
+        } => run_approve(approval_id, reject),
         McpAction::List { all, json } => run_list(all, json),
     }
 }
@@ -106,8 +109,8 @@ fn run_serve(
     database: Option<PathBuf>,
     _output: Option<PathBuf>,
 ) -> Result<()> {
-    use casparian_mcp::{McpServer, McpServerConfig};
     use super::config;
+    use casparian_mcp::{McpServer, McpServerConfig};
 
     // Build config with sensible defaults
     let allowed_paths = if allow_paths.is_empty() {
@@ -117,13 +120,10 @@ fn run_serve(
         allow_paths
     };
 
-    let audit_log_path = Some(audit_log.unwrap_or_else(|| {
-        config::casparian_home().join("mcp_audit.ndjson")
-    }));
+    let audit_log_path =
+        Some(audit_log.unwrap_or_else(|| config::casparian_home().join("mcp_audit.ndjson")));
 
     let db_path = database.unwrap_or_else(config::active_db_path);
-    let casparian_home = config::casparian_home();
-
     let mcp_config = McpServerConfig {
         server_name: "casparian-mcp".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -132,26 +132,21 @@ fn run_serve(
         max_rows,
         audit_log_path,
         db_path,
-        approvals_dir: casparian_home.join("mcp_approvals"),
-        jobs_dir: casparian_home.join("mcp_jobs"),
     };
 
     info!("Starting MCP server (stdio)");
 
-    // Run the async server
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let mut server = McpServer::new(mcp_config)?;
-        server.run().await
-    })
+    // Run the synchronous server (no async runtime required)
+    let mut server = McpServer::new(mcp_config)?;
+    server.run()
 }
 
 fn run_approve(approval_id: String, reject: bool) -> Result<()> {
-    use casparian_mcp::approvals::{ApprovalId, ApprovalManager};
     use super::config;
+    use casparian_mcp::approvals::{ApprovalId, ApprovalManager};
 
-    let approvals_dir = config::casparian_home().join("mcp_approvals");
-    let mut manager = ApprovalManager::new(approvals_dir)?;
+    let db_path = config::active_db_path();
+    let manager = ApprovalManager::new(db_path)?;
 
     let id = ApprovalId::from_string(&approval_id);
 
@@ -163,7 +158,7 @@ fn run_approve(approval_id: String, reject: bool) -> Result<()> {
         println!("Approved: {}", approval_id);
 
         // Get the approval to show what was approved
-        if let Some(approval) = manager.get_approval(&id) {
+        if let Some(approval) = manager.get_approval(&id)? {
             println!("Operation: {}", approval.operation.description());
             println!("Target: {}", approval.summary.target_path);
         }
@@ -173,14 +168,14 @@ fn run_approve(approval_id: String, reject: bool) -> Result<()> {
 }
 
 fn run_list(all: bool, json: bool) -> Result<()> {
-    use casparian_mcp::approvals::ApprovalManager;
     use super::config;
+    use casparian_mcp::approvals::ApprovalManager;
 
-    let approvals_dir = config::casparian_home().join("mcp_approvals");
-    let manager = ApprovalManager::new(approvals_dir)?;
+    let db_path = config::active_db_path();
+    let manager = ApprovalManager::new(db_path)?;
 
     let status_filter = if all { None } else { Some("pending") };
-    let approvals = manager.list_approvals(status_filter);
+    let approvals = manager.list_approvals(status_filter)?;
 
     if json {
         let output: Vec<serde_json::Value> = approvals
@@ -206,7 +201,10 @@ fn run_list(all: bool, json: bool) -> Result<()> {
             return Ok(());
         }
 
-        println!("{:<36} {:<10} {:<40} {}", "APPROVAL ID", "STATUS", "OPERATION", "EXPIRES");
+        println!(
+            "{:<36} {:<10} {:<40} {}",
+            "APPROVAL ID", "STATUS", "OPERATION", "EXPIRES"
+        );
         println!("{}", "-".repeat(100));
 
         for a in &approvals {

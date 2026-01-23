@@ -1,7 +1,7 @@
 //! Error types for the Scout system
 
-use std::io;
 use super::types::IdParseError;
+use std::io;
 use thiserror::Error;
 
 /// Scout error type
@@ -58,14 +58,18 @@ pub enum ScoutError {
     #[error("Extractor error: {0}")]
     Extractor(String),
 
-    #[error("Source path '{new_path}' is inside existing source '{existing_name}' ({existing_path})")]
+    #[error(
+        "Source path '{new_path}' is inside existing source '{existing_name}' ({existing_path})"
+    )]
     SourceIsChildOfExisting {
         new_path: String,
         existing_name: String,
         existing_path: String,
     },
 
-    #[error("Source path '{new_path}' encompasses existing source '{existing_name}' ({existing_path})")]
+    #[error(
+        "Source path '{new_path}' encompasses existing source '{existing_name}' ({existing_path})"
+    )]
     SourceIsParentOfExisting {
         new_path: String,
         existing_name: String,

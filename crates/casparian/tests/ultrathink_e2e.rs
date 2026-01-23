@@ -284,7 +284,9 @@ data: {"type":"message_stop"}
             let response = ureq::post(&format!("{}/v1/messages", addr))
                 .timeout(Duration::from_secs(2))
                 .set("Content-Type", "application/json")
-                .send_string(r#"{"model":"claude-sonnet-4-20250514","messages":[],"max_tokens":100}"#);
+                .send_string(
+                    r#"{"model":"claude-sonnet-4-20250514","messages":[],"max_tokens":100}"#,
+                );
 
             match response {
                 Ok(resp) => {
@@ -314,9 +316,11 @@ data: {"type":"message_stop"}
 
         // If all attempts failed, print what we got but don't fail the test
         // This is a best-effort test for the mock server
-        println!("Mock server test inconclusive after {} attempts: {:?}", attempts, last_error);
+        println!(
+            "Mock server test inconclusive after {} attempts: {:?}",
+            attempts, last_error
+        );
     }
-
 }
 
 // =============================================================================
@@ -416,7 +420,6 @@ def process(input_path: str) -> pd.DataFrame:
             }
         }
     }
-
 }
 
 // =============================================================================
@@ -465,5 +468,4 @@ mod integration_boundaries {
             }
         }
     }
-
 }

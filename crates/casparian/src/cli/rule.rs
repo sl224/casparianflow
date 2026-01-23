@@ -41,10 +41,7 @@ pub enum RuleAction {
         force: bool,
     },
     /// Test a rule against a path
-    Test {
-        id: String,
-        path: String,
-    },
+    Test { id: String, path: String },
 }
 
 /// Validate a glob pattern
@@ -53,7 +50,9 @@ fn validate_pattern(pattern: &str) -> Result<Pattern, HelpfulError> {
         HelpfulError::new(format!("Invalid glob pattern: {}", e))
             .with_context(format!("Pattern: {}", pattern))
             .with_suggestion("TRY: Examples: *.csv, sales/**/*.json, data_????.log")
-            .with_suggestion("TRY: Use * for any characters, ** for directories, ? for single character")
+            .with_suggestion(
+                "TRY: Use * for any characters, ** for directories, ? for single character",
+            )
     })
 }
 
@@ -82,7 +81,9 @@ fn count_matching_files(db: &Database, pattern: &str) -> u64 {
     let mut matched = 0u64;
 
     for source in sources {
-        let files = db.list_files_by_source(&source.id, 100000).unwrap_or_default();
+        let files = db
+            .list_files_by_source(&source.id, 100000)
+            .unwrap_or_default();
         for file in files {
             // Match against relative path
             if pat.matches(&file.rel_path) {
@@ -114,7 +115,11 @@ fn run_with_action(action: RuleAction) -> anyhow::Result<()> {
 
     match action {
         RuleAction::List { json } => list_rules(&db, json),
-        RuleAction::Add { pattern, topic, priority } => add_rule(&db, pattern, topic, priority),
+        RuleAction::Add {
+            pattern,
+            topic,
+            priority,
+        } => add_rule(&db, pattern, topic, priority),
         RuleAction::Show { id, json } => show_rule(&db, &id, json),
         RuleAction::Remove { id, force } => remove_rule(&db, &id, force),
         RuleAction::Test { id, path } => test_rule(&db, &id, &path),
@@ -122,9 +127,9 @@ fn run_with_action(action: RuleAction) -> anyhow::Result<()> {
 }
 
 fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules().map_err(|e| {
-        HelpfulError::new(format!("Failed to list rules: {}", e))
-    })?;
+    let rules = db
+        .list_tagging_rules()
+        .map_err(|e| HelpfulError::new(format!("Failed to list rules: {}", e)))?;
 
     if rules.is_empty() {
         println!("No tagging rules configured.");
@@ -187,11 +192,15 @@ fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> any
     // Check if pattern already exists
     let existing = db.list_tagging_rules()?;
     for rule in &existing {
-                if rule.pattern == pattern {
-            return Err(HelpfulError::new(format!("Pattern already exists: {}", pattern))
-                .with_context(format!("Rule ID: {}, Topic: {}", rule.id, rule.tag))
-                .with_suggestion("TRY: Use 'casparian rule rm' to remove the existing rule first")
-                .into());
+        if rule.pattern == pattern {
+            return Err(
+                HelpfulError::new(format!("Pattern already exists: {}", pattern))
+                    .with_context(format!("Rule ID: {}, Topic: {}", rule.id, rule.tag))
+                    .with_suggestion(
+                        "TRY: Use 'casparian rule rm' to remove the existing rule first",
+                    )
+                    .into(),
+            );
         }
     }
 
@@ -209,9 +218,8 @@ fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> any
         enabled: true,
     };
 
-    db.upsert_tagging_rule(&rule).map_err(|e| {
-        HelpfulError::new(format!("Failed to create rule: {}", e))
-    })?;
+    db.upsert_tagging_rule(&rule)
+        .map_err(|e| HelpfulError::new(format!("Failed to create rule: {}", e)))?;
 
     // Count existing matches
     let matched = count_matching_files(db, &pattern);
@@ -275,7 +283,9 @@ fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
         println!();
         println!("SAMPLE MATCHES (first 5):");
         let pat = Pattern::new(&rule.pattern).unwrap();
-        let files = db.list_files_by_source(&rule.source_id, 1000).unwrap_or_default();
+        let files = db
+            .list_files_by_source(&rule.source_id, 1000)
+            .unwrap_or_default();
         let mut count = 0;
         for file in files {
             if pat.matches(&file.rel_path) {
@@ -305,29 +315,31 @@ fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()> {
     };
 
     // Count files that were tagged by this rule
-    let files = db.list_files_by_source(&rule.source_id, 100000).unwrap_or_default();
+    let files = db
+        .list_files_by_source(&rule.source_id, 100000)
+        .unwrap_or_default();
     let tagged_by_rule: Vec<_> = files
         .iter()
         .filter(|f| f.rule_id.as_ref() == Some(&rule.id))
         .collect();
 
     if !tagged_by_rule.is_empty() && !force {
-        return Err(HelpfulError::new(format!(
-            "Rule has tagged {} files",
-            tagged_by_rule.len()
-        ))
-        .with_context("Removing this rule will leave files without a tag assignment rule")
-        .with_suggestion("TRY: Use --force to remove anyway")
-        .with_suggestion("TRY: Files will keep their current tags but won't be re-tagged automatically")
-        .into());
+        return Err(
+            HelpfulError::new(format!("Rule has tagged {} files", tagged_by_rule.len()))
+                .with_context("Removing this rule will leave files without a tag assignment rule")
+                .with_suggestion("TRY: Use --force to remove anyway")
+                .with_suggestion(
+                    "TRY: Files will keep their current tags but won't be re-tagged automatically",
+                )
+                .into(),
+        );
     }
 
     let rule_id = rule.id.clone();
     let rule_pattern = rule.pattern.clone();
 
-    db.delete_tagging_rule(&rule_id).map_err(|e| {
-        HelpfulError::new(format!("Failed to remove rule: {}", e))
-    })?;
+    db.delete_tagging_rule(&rule_id)
+        .map_err(|e| HelpfulError::new(format!("Failed to remove rule: {}", e)))?;
 
     println!("Removed rule: {}", rule_pattern);
     if !tagged_by_rule.is_empty() {
@@ -357,7 +369,10 @@ fn test_rule(db: &Database, id: &str, path: &str) -> anyhow::Result<()> {
         println!("MATCH: '{}' matches pattern '{}'", path, rule.pattern);
         println!("  Would be tagged as: {}", rule.tag);
     } else {
-        println!("NO MATCH: '{}' does not match pattern '{}'", path, rule.pattern);
+        println!(
+            "NO MATCH: '{}' does not match pattern '{}'",
+            path, rule.pattern
+        );
         println!();
         println!("Pattern expects:");
         println!("  {}", rule.pattern);

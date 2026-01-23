@@ -6,8 +6,7 @@
 use super::analyzer::{PathPattern, SegmentType, VariablePattern};
 use super::{PathfinderError, Result};
 /// Type alias for LLM generation function
-pub type LlmGenerateFn =
-    Box<dyn Fn(String) -> std::result::Result<String, String> + Send + Sync>;
+pub type LlmGenerateFn = Box<dyn Fn(String) -> std::result::Result<String, String> + Send + Sync>;
 
 /// Python code generator using LLM
 pub struct PythonGenerator {
@@ -32,8 +31,7 @@ impl PythonGenerator {
     ) -> Result<String> {
         let prompt = self.build_prompt(paths, pattern, hints);
 
-        let result = (self.generate_fn)(prompt)
-            .map_err(PathfinderError::LlmError)?;
+        let result = (self.generate_fn)(prompt).map_err(PathfinderError::LlmError)?;
 
         // Extract code block from response
         let code = self.extract_code_block(&result);
@@ -59,7 +57,10 @@ impl PythonGenerator {
         for (i, segment) in pattern.segments.iter().enumerate() {
             let desc = match &segment.segment_type {
                 SegmentType::Fixed(s) => format!("Fixed: \"{}\"", s),
-                SegmentType::Variable { pattern_type, examples } => {
+                SegmentType::Variable {
+                    pattern_type,
+                    examples,
+                } => {
                     let type_desc = match pattern_type {
                         VariablePattern::Date { format } => format!("Date ({:?})", format),
                         VariablePattern::Year => "Year".to_string(),
@@ -71,7 +72,11 @@ impl PythonGenerator {
                         }
                         VariablePattern::FreeText => "Free text".to_string(),
                     };
-                    format!("Variable: {} (examples: {:?})", type_desc, examples.iter().take(3).collect::<Vec<_>>())
+                    format!(
+                        "Variable: {} (examples: {:?})",
+                        type_desc,
+                        examples.iter().take(3).collect::<Vec<_>>()
+                    )
                 }
                 SegmentType::Regex(r) => format!("Regex: {}", r),
                 SegmentType::Filename { extension } => {
@@ -138,7 +143,10 @@ impl PythonGenerator {
         let mut indent_level = 0;
 
         for line in lines {
-            if line.trim().starts_with("def extract") || line.trim().starts_with("import ") || line.trim().starts_with("from ") {
+            if line.trim().starts_with("def extract")
+                || line.trim().starts_with("import ")
+                || line.trim().starts_with("from ")
+            {
                 in_function = true;
             }
 
@@ -150,7 +158,10 @@ impl PythonGenerator {
                     let current_indent = line.len() - line.trim_start().len();
                     if line.trim().starts_with("def ") {
                         indent_level = current_indent;
-                    } else if current_indent <= indent_level && !line.trim().is_empty() && code_lines.len() > 1 {
+                    } else if current_indent <= indent_level
+                        && !line.trim().is_empty()
+                        && code_lines.len() > 1
+                    {
                         // Back to base indent, function probably ended
                         if !line.trim().starts_with("def ") && !line.trim().starts_with("import ") {
                             break;
@@ -179,7 +190,10 @@ pub fn default_template(fields: &[(String, String)]) -> String {
     code.push_str("    parts = p.parts\n\n");
 
     for (name, _pattern) in fields {
-        code.push_str(&format!("    result['{}'] = None  # TODO: implement extraction\n", name));
+        code.push_str(&format!(
+            "    result['{}'] = None  # TODO: implement extraction\n",
+            name
+        ));
     }
 
     code.push_str("\n    return result\n");

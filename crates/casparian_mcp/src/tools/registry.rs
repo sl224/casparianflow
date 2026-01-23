@@ -3,16 +3,14 @@
 //! Maintains the list of available tools and dispatches calls by name.
 
 use super::*;
-use crate::approvals::ApprovalManager;
-use crate::jobs::JobManager;
+use crate::core::CoreHandle;
+use crate::jobs::JobExecutorHandle;
 use crate::protocol::ToolDefinition;
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::debug;
 
 /// Registry of available MCP tools
@@ -39,6 +37,48 @@ impl ToolRegistry {
         registry.register(Box::new(job::JobListTool));
         registry.register(Box::new(approval::ApprovalStatusTool));
         registry.register(Box::new(approval::ApprovalListTool));
+        registry.register(Box::new(approval::ApprovalDecideTool));
+
+        // Intent pipeline tools (§7.1-7.9)
+        // Session lifecycle
+        registry.register(Box::new(intent_session::SessionCreateTool));
+        registry.register(Box::new(intent_session::SessionStatusTool));
+        registry.register(Box::new(intent_session::SessionListTool));
+
+        // FileSet tools
+        registry.register(Box::new(intent_fileset::FileSetSampleTool));
+        registry.register(Box::new(intent_fileset::FileSetPageTool));
+        registry.register(Box::new(intent_fileset::FileSetInfoTool));
+
+        // Selection tools
+        registry.register(Box::new(intent_select::SelectProposeTool));
+        registry.register(Box::new(intent_select::SelectApproveTool));
+
+        // Tag rules tools
+        registry.register(Box::new(intent_tags::TagsProposeRulesTool));
+        registry.register(Box::new(intent_tags::TagsApplyRulesTool));
+
+        // Path fields tools
+        registry.register(Box::new(intent_path_fields::PathFieldsProposeTool));
+        registry.register(Box::new(intent_path_fields::PathFieldsApplyTool));
+
+        // Schema intent tools
+        registry.register(Box::new(intent_schema::SchemaInferIntentTool));
+        registry.register(Box::new(intent_schema::SchemaResolveAmbiguityTool));
+
+        // Backtest loop tools
+        registry.register(Box::new(intent_backtest::ParserGenerateDraftTool));
+        registry.register(Box::new(intent_backtest::IntentBacktestStartTool));
+        registry.register(Box::new(intent_backtest::IntentBacktestStatusTool));
+        registry.register(Box::new(intent_backtest::IntentBacktestReportTool));
+        registry.register(Box::new(intent_backtest::PatchApplyTool));
+
+        // Publish/run tools
+        registry.register(Box::new(intent_publish::SchemaPromoteTool));
+        registry.register(Box::new(intent_publish::PublishPlanTool));
+        registry.register(Box::new(intent_publish::PublishExecuteTool));
+        registry.register(Box::new(intent_publish::RunPlanTool));
+        registry.register(Box::new(intent_publish::RunExecuteTool));
 
         debug!("Registered {} tools", registry.tools.len());
 
@@ -57,22 +97,22 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.definition()).collect()
     }
 
-    /// Call a tool by name
-    pub async fn call_tool(
+    /// Call a tool by name (synchronous)
+    pub fn call_tool(
         &self,
         name: &str,
         args: Value,
         security: &SecurityConfig,
-        jobs: &Arc<Mutex<JobManager>>,
-        approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         config: &McpServerConfig,
+        executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| anyhow!("Unknown tool: {}", name))?;
 
-        tool.execute(args, security, jobs, approvals, config).await
+        tool.execute(args, security, core, config, executor)
     }
 
     /// Get a tool by name
@@ -111,6 +151,7 @@ mod tests {
         assert!(registry.has_tool("casparian_job_list"));
         assert!(registry.has_tool("casparian_approval_status"));
         assert!(registry.has_tool("casparian_approval_list"));
+        assert!(registry.has_tool("casparian_approval_decide"));
     }
 
     #[test]

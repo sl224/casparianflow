@@ -43,9 +43,7 @@ impl Tagger {
     pub fn get_tag(&self, file: &ScannedFile) -> Option<&str> {
         self.rules
             .iter()
-            .find(|cr| {
-                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
-            })
+            .find(|cr| cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path))
             .map(|cr| cr.rule.tag.as_str())
     }
 
@@ -54,9 +52,7 @@ impl Tagger {
     pub fn get_tag_with_rule_id(&self, file: &ScannedFile) -> Option<(&str, TaggingRuleId)> {
         self.rules
             .iter()
-            .find(|cr| {
-                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
-            })
+            .find(|cr| cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path))
             .map(|cr| (cr.rule.tag.as_str(), cr.rule.id))
     }
 
@@ -64,18 +60,16 @@ impl Tagger {
     pub fn match_file(&self, file: &ScannedFile) -> Vec<&TaggingRule> {
         self.rules
             .iter()
-            .filter(|cr| {
-                cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
-            })
+            .filter(|cr| cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path))
             .map(|cr| &cr.rule)
             .collect()
     }
 
     /// Check if any rule matches a file
     pub fn has_match(&self, file: &ScannedFile) -> bool {
-        self.rules.iter().any(|cr| {
-            cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path)
-        })
+        self.rules
+            .iter()
+            .any(|cr| cr.rule.source_id == file.source_id && cr.pattern.matches(&file.rel_path))
     }
 
     /// Get all rules
@@ -84,7 +78,10 @@ impl Tagger {
     }
 
     /// Get rules for a specific source
-    pub fn rules_for_source<'a>(&'a self, source_id: &'a SourceId) -> impl Iterator<Item = &'a TaggingRule> {
+    pub fn rules_for_source<'a>(
+        &'a self,
+        source_id: &'a SourceId,
+    ) -> impl Iterator<Item = &'a TaggingRule> {
         self.rules
             .iter()
             .filter(move |cr| cr.rule.source_id == *source_id)
@@ -110,7 +107,13 @@ mod tests {
     use super::*;
     use crate::scout::types::{ScannedFile, TaggingRuleId};
 
-    fn create_test_rule(id: TaggingRuleId, source_id: &SourceId, pattern: &str, tag: &str, priority: i32) -> TaggingRule {
+    fn create_test_rule(
+        id: TaggingRuleId,
+        source_id: &SourceId,
+        pattern: &str,
+        tag: &str,
+        priority: i32,
+    ) -> TaggingRule {
         TaggingRule {
             id,
             name: pattern.to_string(),
@@ -123,13 +126,25 @@ mod tests {
     }
 
     fn create_test_file(source_id: &SourceId, rel_path: &str) -> ScannedFile {
-        ScannedFile::new(source_id.clone(), &format!("/data/{}", rel_path), rel_path, 1000, 12345)
+        ScannedFile::new(
+            source_id.clone(),
+            &format!("/data/{}", rel_path),
+            rel_path,
+            1000,
+            12345,
+        )
     }
 
     #[test]
     fn test_simple_pattern_match() {
         let source_id = SourceId::new();
-        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "csv_data", 10)];
+        let rules = vec![create_test_rule(
+            TaggingRuleId::new(),
+            &source_id,
+            "*.csv",
+            "csv_data",
+            10,
+        )];
         let tagger = Tagger::new(rules).unwrap();
 
         let file = create_test_file(&source_id, "data.csv");
@@ -139,7 +154,13 @@ mod tests {
     #[test]
     fn test_glob_star_pattern() {
         let source_id = SourceId::new();
-        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "**/*.csv", "csv_data", 10)];
+        let rules = vec![create_test_rule(
+            TaggingRuleId::new(),
+            &source_id,
+            "**/*.csv",
+            "csv_data",
+            10,
+        )];
         let tagger = Tagger::new(rules).unwrap();
 
         // Should match at root
@@ -183,7 +204,13 @@ mod tests {
         // Rules should be pre-sorted by priority (higher first)
         let source_id = SourceId::new();
         let rules = vec![
-            create_test_rule(TaggingRuleId::new(), &source_id, "data*.csv", "specific_data", 20),
+            create_test_rule(
+                TaggingRuleId::new(),
+                &source_id,
+                "data*.csv",
+                "specific_data",
+                20,
+            ),
             create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "generic_csv", 10),
         ];
         let tagger = Tagger::new(rules).unwrap();
@@ -196,7 +223,13 @@ mod tests {
     #[test]
     fn test_no_match() {
         let source_id = SourceId::new();
-        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "csv_data", 10)];
+        let rules = vec![create_test_rule(
+            TaggingRuleId::new(),
+            &source_id,
+            "*.csv",
+            "csv_data",
+            10,
+        )];
         let tagger = Tagger::new(rules).unwrap();
 
         let file = create_test_file(&source_id, "data.json");
@@ -222,8 +255,20 @@ mod tests {
         let rules = vec![
             create_test_rule(TaggingRuleId::new(), &source_id, "*.csv", "csv_data", 10),
             create_test_rule(TaggingRuleId::new(), &source_id, "*.json", "json_data", 10),
-            create_test_rule(TaggingRuleId::new(), &source_id, "exports/*.csv", "csv_data", 20), // Same tag
-            create_test_rule(TaggingRuleId::new(), &other_source_id, "*.csv", "other_csv", 10),
+            create_test_rule(
+                TaggingRuleId::new(),
+                &source_id,
+                "exports/*.csv",
+                "csv_data",
+                20,
+            ), // Same tag
+            create_test_rule(
+                TaggingRuleId::new(),
+                &other_source_id,
+                "*.csv",
+                "other_csv",
+                10,
+            ),
         ];
         let tagger = Tagger::new(rules).unwrap();
 
@@ -236,7 +281,13 @@ mod tests {
     #[test]
     fn test_invalid_pattern_error() {
         let source_id = SourceId::new();
-        let rules = vec![create_test_rule(TaggingRuleId::new(), &source_id, "[invalid", "tag", 10)];
+        let rules = vec![create_test_rule(
+            TaggingRuleId::new(),
+            &source_id,
+            "[invalid",
+            "tag",
+            10,
+        )];
         let result = Tagger::new(rules);
         assert!(result.is_err());
     }

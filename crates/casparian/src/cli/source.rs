@@ -78,10 +78,15 @@ fn find_source<'a>(sources: &'a [Source], input: &str) -> Option<&'a Source> {
 /// Get stats for a source from the database
 fn get_source_stats(db: &Database, source_id: &SourceId) -> SourceStats {
     // Query file count and total size for this source
-    let files = db.list_files_by_source(source_id, 100000).unwrap_or_default();
+    let files = db
+        .list_files_by_source(source_id, 100000)
+        .unwrap_or_default();
     let file_count = files.len() as u64;
     let total_size = files.iter().map(|f| f.size).sum();
-    SourceStats { file_count, total_size }
+    SourceStats {
+        file_count,
+        total_size,
+    }
 }
 
 /// Execute the source command
@@ -104,8 +109,17 @@ fn run_with_action(action: SourceAction) -> anyhow::Result<()> {
 
     match action {
         SourceAction::List { json } => list_sources(&db, json),
-        SourceAction::Add { path, name, recursive: _ } => add_source(&db, path, name),
-        SourceAction::Show { name, files, limit, json } => show_source(&db, &name, files, limit, json),
+        SourceAction::Add {
+            path,
+            name,
+            recursive: _,
+        } => add_source(&db, path, name),
+        SourceAction::Show {
+            name,
+            files,
+            limit,
+            json,
+        } => show_source(&db, &name, files, limit, json),
         SourceAction::Remove { name, force } => remove_source(&db, &name, force),
         SourceAction::Sync { name, all } => sync_sources(&db, name, all),
         SourceAction::Use { .. } => unreachable!(), // Handled above
@@ -113,9 +127,9 @@ fn run_with_action(action: SourceAction) -> anyhow::Result<()> {
 }
 
 fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
-    let sources = db.list_sources().map_err(|e| {
-        HelpfulError::new(format!("Failed to list sources: {}", e))
-    })?;
+    let sources = db
+        .list_sources()
+        .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
     if sources.is_empty() {
         println!("No sources configured.");
@@ -182,10 +196,12 @@ fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Res
     }
 
     if !path.is_dir() {
-        return Err(HelpfulError::new(format!("Not a directory: {}", path.display()))
-            .with_context("Sources must be directories")
-            .with_suggestion("TRY: Specify a directory path instead of a file")
-            .into());
+        return Err(
+            HelpfulError::new(format!("Not a directory: {}", path.display()))
+                .with_context("Sources must be directories")
+                .with_suggestion("TRY: Specify a directory path instead of a file")
+                .into(),
+        );
     }
 
     // Canonicalize path
@@ -207,15 +223,21 @@ fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Res
     let existing = db.list_sources()?;
     for s in &existing {
         if s.path == canonical.display().to_string() {
-            return Err(HelpfulError::new(format!("Source already exists: {}", s.name))
-                .with_context(format!("Path: {}", s.path))
-                .with_suggestion("TRY: Use 'casparian source sync' to refresh the existing source")
-                .into());
+            return Err(
+                HelpfulError::new(format!("Source already exists: {}", s.name))
+                    .with_context(format!("Path: {}", s.path))
+                    .with_suggestion(
+                        "TRY: Use 'casparian source sync' to refresh the existing source",
+                    )
+                    .into(),
+            );
         }
         if s.name == source_name {
-            return Err(HelpfulError::new(format!("Source name already exists: {}", source_name))
-                .with_suggestion(format!("TRY: Use --name to specify a different name"))
-                .into());
+            return Err(
+                HelpfulError::new(format!("Source name already exists: {}", source_name))
+                    .with_suggestion(format!("TRY: Use --name to specify a different name"))
+                    .into(),
+            );
         }
     }
 
@@ -229,9 +251,8 @@ fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Res
         enabled: true,
     };
 
-    db.upsert_source(&source).map_err(|e| {
-        HelpfulError::new(format!("Failed to create source: {}", e))
-    })?;
+    db.upsert_source(&source)
+        .map_err(|e| HelpfulError::new(format!("Failed to create source: {}", e)))?;
 
     println!("Added source '{}'", source_name);
     println!("  Path: {}", canonical.display());
@@ -244,7 +265,13 @@ fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Res
     Ok(())
 }
 
-fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: bool) -> anyhow::Result<()> {
+fn show_source(
+    db: &Database,
+    name: &str,
+    show_files: bool,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
     let sources = db.list_sources()?;
     let source = find_source(&sources, name);
 
@@ -274,14 +301,17 @@ fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: 
         // Include files in JSON output if requested
         if show_files {
             let files = db.list_files_by_source(&source.id, limit)?;
-            let files_json: Vec<serde_json::Value> = files.iter().map(|f| {
-                serde_json::json!({
-                    "path": f.rel_path,
-                    "size": f.size,
-                    "status": f.status.as_str(),
-                    "tag": f.tag,
+            let files_json: Vec<serde_json::Value> = files
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "path": f.rel_path,
+                        "size": f.size,
+                        "status": f.status.as_str(),
+                        "tag": f.tag,
+                    })
                 })
-            }).collect();
+                .collect();
             output["file_list"] = serde_json::Value::Array(files_json);
         }
 
@@ -323,23 +353,29 @@ fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: 
             println!("  TRY: casparian source sync {}", source.name);
         } else {
             println!("FILES");
-            let rows: Vec<Vec<String>> = files.iter().map(|f| {
-                vec![
-                    if f.rel_path.len() > 50 {
-                        format!("...{}", &f.rel_path[f.rel_path.len().saturating_sub(47)..])
-                    } else {
-                        f.rel_path.clone()
-                    },
-                    format_size(f.size),
-                    f.tag.as_deref().unwrap_or("-").to_string(),
-                    f.status.as_str().to_string(),
-                ]
-            }).collect();
+            let rows: Vec<Vec<String>> = files
+                .iter()
+                .map(|f| {
+                    vec![
+                        if f.rel_path.len() > 50 {
+                            format!("...{}", &f.rel_path[f.rel_path.len().saturating_sub(47)..])
+                        } else {
+                            f.rel_path.clone()
+                        },
+                        format_size(f.size),
+                        f.tag.as_deref().unwrap_or("-").to_string(),
+                        f.status.as_str().to_string(),
+                    ]
+                })
+                .collect();
             print_table(&["PATH", "SIZE", "TAG", "STATUS"], rows);
 
             if files.len() >= limit {
                 println!();
-                println!("Showing {} of {} files. Use --limit to see more.", limit, stats.file_count);
+                println!(
+                    "Showing {} of {} files. Use --limit to see more.",
+                    limit, stats.file_count
+                );
             }
         }
     }
@@ -376,9 +412,8 @@ fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
     let source_id = source.id.clone();
     let source_name = source.name.clone();
 
-    db.delete_source(&source_id).map_err(|e| {
-        HelpfulError::new(format!("Failed to remove source: {}", e))
-    })?;
+    db.delete_source(&source_id)
+        .map_err(|e| HelpfulError::new(format!("Failed to remove source: {}", e)))?;
 
     println!("Removed source '{}'", source_name);
     if stats.file_count > 0 {
@@ -486,9 +521,11 @@ fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
     let source = match source {
         Some(s) => s,
         None => {
-            return Err(HelpfulError::new(format!("Source not found: {}", source_name))
-                .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
-                .into());
+            return Err(
+                HelpfulError::new(format!("Source not found: {}", source_name))
+                    .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
+                    .into(),
+            );
         }
     };
 
@@ -497,7 +534,10 @@ fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
     println!("Default source set to: {}", source.name);
     println!();
     println!("Now you can run:");
-    println!("  casparian files              # Files from '{}'", source.name);
+    println!(
+        "  casparian files              # Files from '{}'",
+        source.name
+    );
     println!("  casparian files --all        # Files from all sources");
 
     Ok(())

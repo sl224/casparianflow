@@ -25,8 +25,8 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::mpsc;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 /// Helper to read from PTY with timeout using a background thread
 fn read_with_timeout(
@@ -238,7 +238,10 @@ fn test_tui_starts_in_pty() {
     match result {
         Ok(output) => {
             println!("TUI started successfully!");
-            println!("First 500 chars: {}", output.chars().take(500).collect::<String>());
+            println!(
+                "First 500 chars: {}",
+                output.chars().take(500).collect::<String>()
+            );
             assert!(
                 output.contains("Home") || output.contains("Casparian"),
                 "TUI should show the home screen"
@@ -318,7 +321,10 @@ fn test_tui_view_switching() {
     if output.contains("Monitor") || output.contains("Jobs") {
         println!("SUCCESS: F2 switched to Monitor view");
     } else {
-        println!("View switching output: {}", output.chars().take(500).collect::<String>());
+        println!(
+            "View switching output: {}",
+            output.chars().take(500).collect::<String>()
+        );
         println!("Note: View switching test inconclusive");
     }
 }
@@ -415,7 +421,8 @@ fn test_sources_load_on_startup() {
     }
 
     // Output preview for debugging
-    let preview: String = output.chars()
+    let preview: String = output
+        .chars()
         .filter(|c| !c.is_control() || *c == '\n')
         .take(500)
         .collect();
@@ -527,7 +534,8 @@ fn test_folder_navigation() {
     let _ = child.wait();
 
     // Output preview
-    let preview: String = initial_output.chars()
+    let preview: String = initial_output
+        .chars()
         .filter(|c| !c.is_control() || *c == '\n')
         .take(400)
         .collect();

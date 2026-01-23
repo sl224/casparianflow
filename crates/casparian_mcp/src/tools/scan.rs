@@ -3,17 +3,15 @@
 //! Scans a directory and returns file metadata. Path must be within allowed roots.
 
 use super::{require_param, McpTool};
-use crate::approvals::ApprovalManager;
-use crate::jobs::JobManager;
+use crate::core::CoreHandle;
+use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::sync::Mutex;
 
 pub struct ScanTool;
 
@@ -51,7 +49,8 @@ enum HashMode {
 struct FileInfo {
     path: String,
     size: u64,
-    modified: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hash: Option<String>,
 }
@@ -64,7 +63,6 @@ struct ScanResult {
     truncated: bool,
 }
 
-#[async_trait::async_trait]
 impl McpTool for ScanTool {
     fn name(&self) -> &'static str {
         "casparian_scan"
@@ -105,13 +103,13 @@ impl McpTool for ScanTool {
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         security: &SecurityConfig,
-        _jobs: &Arc<Mutex<JobManager>>,
-        _approvals: &Arc<Mutex<ApprovalManager>>,
+        _core: &CoreHandle,
         _config: &McpServerConfig,
+        _executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: ScanArgs = serde_json::from_value(args)?;
 
@@ -149,14 +147,12 @@ impl McpTool for ScanTool {
 
             let modified = metadata
                 .modified()
-                .unwrap_or(SystemTime::UNIX_EPOCH)
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| {
+                .ok()
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .and_then(|d| {
                     chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
-                        .map(|dt| dt.to_rfc3339())
-                        .unwrap_or_default()
                 })
-                .unwrap_or_default();
+                .map(|dt| dt.to_rfc3339());
 
             let hash = match args.hash_mode {
                 HashMode::None => None,

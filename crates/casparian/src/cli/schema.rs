@@ -108,8 +108,8 @@ print(json.dumps(output))
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let schemas: SchemaMap = serde_json::from_str(&stdout)
-        .context("Failed to parse schema JSON from parser")?;
+    let schemas: SchemaMap =
+        serde_json::from_str(&stdout).context("Failed to parse schema JSON from parser")?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&schemas)?);

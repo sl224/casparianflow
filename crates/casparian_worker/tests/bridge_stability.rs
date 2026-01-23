@@ -9,9 +9,8 @@ use std::path::PathBuf;
 
 fn make_test_config(job_id: JobId, python_code: &str) -> BridgeConfig {
     let shim_path = materialize_bridge_shim().expect("Failed to materialize shim");
-    let interpreter_path = PathBuf::from(
-        std::env::var("PYTHON_PATH").unwrap_or_else(|_| "python3".to_string())
-    );
+    let interpreter_path =
+        PathBuf::from(std::env::var("PYTHON_PATH").unwrap_or_else(|_| "python3".to_string()));
 
     BridgeConfig {
         interpreter_path,
@@ -51,10 +50,18 @@ def parse(file_path):
     let config = make_test_config(JobId::new(1001), code);
     let result = execute_bridge(config);
 
-    assert!(result.is_ok(), "Multi-batch should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Multi-batch should succeed: {:?}",
+        result.err()
+    );
 
     let bridge_result = result.unwrap();
-    assert_eq!(bridge_result.output_batches.len(), 5, "Should have 5 outputs");
+    assert_eq!(
+        bridge_result.output_batches.len(),
+        5,
+        "Should have 5 outputs"
+    );
 
     // Verify batches arrived in order with correct data
     for (i, output) in bridge_result.output_batches.iter().enumerate() {
@@ -94,7 +101,11 @@ def parse(file_path):
     let config = make_test_config(JobId::new(1002), code);
     let result = execute_bridge(config);
 
-    assert!(result.is_ok(), "Data integrity test should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Data integrity test should succeed: {:?}",
+        result.err()
+    );
 
     let bridge_result = result.unwrap();
     assert_eq!(bridge_result.output_batches.len(), 1);
@@ -105,7 +116,9 @@ def parse(file_path):
     assert_eq!(batch.as_record_batch().num_columns(), 4);
 
     // Verify int column
-    let int_col = batch.as_record_batch().column(0)
+    let int_col = batch
+        .as_record_batch()
+        .column(0)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .expect("int_col should be i64");
@@ -115,7 +128,9 @@ def parse(file_path):
     assert_eq!(int_col.value(3), -2147483648);
 
     // Verify string column
-    let str_col = batch.as_record_batch().column(2)
+    let str_col = batch
+        .as_record_batch()
+        .column(2)
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .expect("str_col should be string");
@@ -143,7 +158,11 @@ def parse(file_path):
     let config = make_test_config(JobId::new(1003), code);
     let result = execute_bridge(config);
 
-    assert!(result.is_ok(), "Large batch should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Large batch should succeed: {:?}",
+        result.err()
+    );
 
     let bridge_result = result.unwrap();
     assert_eq!(bridge_result.output_batches.len(), 1);
@@ -191,8 +210,14 @@ def parse(file_path):
     let handle1 = std::thread::spawn(move || execute_bridge(config1));
     let handle2 = std::thread::spawn(move || execute_bridge(config2));
 
-    let result1 = handle1.join().expect("job 1 panicked").expect("job 1 failed");
-    let result2 = handle2.join().expect("job 2 panicked").expect("job 2 failed");
+    let result1 = handle1
+        .join()
+        .expect("job 1 panicked")
+        .expect("job 1 failed");
+    let result2 = handle2
+        .join()
+        .expect("job 2 panicked")
+        .expect("job 2 failed");
 
     // Verify each job got its own data
     let job1_col = result1.output_batches[0][0]
@@ -229,7 +254,11 @@ def parse(file_path):
 
     assert!(result.is_err(), "Should fail on exception");
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("ValueError") || err.contains("crashed"), "Error: {}", err);
+    assert!(
+        err.contains("ValueError") || err.contains("crashed"),
+        "Error: {}",
+        err
+    );
 }
 
 /// Test handler timeout - hung process detection.
@@ -280,5 +309,8 @@ def parse(file_path):
     let config = make_test_config(job_id, code);
     let _ = execute_bridge(config);
 
-    assert!(!std::path::Path::new(&socket_path).exists(), "Socket should be cleaned up");
+    assert!(
+        !std::path::Path::new(&socket_path).exists(),
+        "Socket should be cleaned up"
+    );
 }

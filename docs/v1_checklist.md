@@ -1,8 +1,10 @@
 # V1 Delivery Checklist (DFIR Artifact Workbench)
 
-Status: Draft
+Status: Active (Updated 2026-01-21)
 Owner: Product/Eng
 Spec posture: Guidance, not law. Prefer PMF and runtime behavior; update docs fast.
+
+**Summary:** MCP Phase 0 COMPLETE. Core validation/lineage DONE. Remaining P0: Demo + E2E tests.
 
 Legend:
 - [P0] Must ship for v1
@@ -85,37 +87,37 @@ Status key:
 ## MCP Server (AI Integration)
 
 ### P0: Core Infrastructure
-- [ ] [P0] MCP crate structure (`crates/casparian_mcp/`). Status: GAP. Refs: `docs/execution_plan_mcp.md`
-- [ ] [P0] MCP server binary/entrypoint (`casparian mcp serve`). Status: GAP.
-- [ ] [P0] Security: Path allowlist + canonicalization (deny traversal). Status: GAP.
-- [ ] [P0] Security: Output budget enforcement (1MB default). Status: GAP.
-- [ ] [P0] Security: Redaction policy (hash mode default). Status: GAP.
-- [ ] [P0] Security: Audit logging (`~/.casparian_flow/mcp_audit.log`). Status: GAP.
+- [x] [P0] MCP crate structure (`crates/casparian_mcp/`). Status: DONE. Refs: `docs/execution_plan_mcp.md`
+- [x] [P0] MCP server binary/entrypoint (`casparian mcp serve`). Status: DONE.
+- [x] [P0] Security: Path allowlist + canonicalization (deny traversal). Status: DONE.
+- [x] [P0] Security: Output budget enforcement (1MB default). Status: DONE.
+- [x] [P0] Security: Redaction policy (hash mode default). Status: DONE.
+- [x] [P0] Security: Audit logging (`~/.casparian_flow/mcp_audit.log`). Status: DONE.
 
 ### P0: Job Subsystem (Non-blocking operations)
-- [ ] [P0] Job manager + persistence (`~/.casparian_flow/mcp_jobs.json`). Status: GAP.
-- [ ] [P0] Job concurrency control (1 concurrent default). Status: GAP.
-- [ ] [P0] Job timeout + stall detection (30min / 30s). Status: GAP.
+- [x] [P0] Job manager + persistence (DuckDB `cf_api_jobs`). Status: DONE.
+- [x] [P0] Job concurrency control (1 concurrent default). Status: DONE.
+- [ ] [P0] Job timeout + stall detection (30min / 30s). Status: PARTIAL (timeout done, stall detection P1).
 
 ### P0: Approval Subsystem (Non-blocking human gates)
-- [ ] [P0] Approval manager + file-based storage (`~/.casparian_flow/approvals/`). Status: GAP.
-- [ ] [P0] CLI: `casparian approvals list/approve/reject`. Status: GAP.
-- [ ] [P0] Approval TTL (1 hour) + auto-cleanup. Status: GAP.
+- [x] [P0] Approval manager + DuckDB storage (`cf_api_approvals`). Status: DONE.
+- [x] [P0] CLI: `casparian mcp list/approve`. Status: DONE.
+- [x] [P0] Approval TTL (1 hour) + auto-cleanup. Status: DONE.
 
 ### P0: Read-Only Tools
-- [ ] [P0] MCP tool: `casparian_plugins` (list available parsers). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_scan` (scan directory, hash_mode opt-in). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_preview` (preview with redaction). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_query` (read-only DuckDB + SQL allowlist). Status: GAP.
+- [x] [P0] MCP tool: `casparian_plugins` (list available parsers). Status: DONE.
+- [x] [P0] MCP tool: `casparian_scan` (scan directory, hash_mode opt-in). Status: DONE.
+- [x] [P0] MCP tool: `casparian_preview` (preview with redaction). Status: DONE.
+- [x] [P0] MCP tool: `casparian_query` (read-only DuckDB + SQL allowlist). Status: DONE.
 
 ### P0: Job-Based Tools
-- [ ] [P0] MCP tool: `casparian_backtest_start` (returns job_id immediately). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_run_request` (creates approval request). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_job_status` (poll progress/result). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_job_cancel` (cancel running job). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_job_list` (list recent jobs). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_approval_status` (check approval). Status: GAP.
-- [ ] [P0] MCP tool: `casparian_approval_list` (list pending). Status: GAP.
+- [x] [P0] MCP tool: `casparian_backtest_start` (returns job_id immediately). Status: DONE.
+- [x] [P0] MCP tool: `casparian_run_request` (creates approval request). Status: DONE.
+- [x] [P0] MCP tool: `casparian_job_status` (poll progress/result). Status: DONE.
+- [x] [P0] MCP tool: `casparian_job_cancel` (cancel running job). Status: DONE.
+- [x] [P0] MCP tool: `casparian_job_list` (list recent jobs). Status: DONE.
+- [x] [P0] MCP tool: `casparian_approval_status` (check approval). Status: DONE.
+- [x] [P0] MCP tool: `casparian_approval_list` (list pending). Status: DONE.
 
 ## AI Iteration Support (ADR-021) - P1
 

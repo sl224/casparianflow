@@ -1,5 +1,5 @@
-use casparian_protocol::PipelineRunStatus;
 use crate::scout::SourceId;
+use casparian_protocol::PipelineRunStatus;
 
 /// A resolved snapshot of files for a logical execution date.
 #[derive(Debug, Clone)]

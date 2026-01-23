@@ -25,8 +25,8 @@ use std::process::Command;
 
 use crate::cli::error::HelpfulError;
 use casparian::runner::{DevRunner, LogDestination, ParserRef};
-use casparian_sinks::{plan_outputs, write_output_plan, OutputDescriptor};
 use casparian_security::signing::sha256;
+use casparian_sinks::{plan_outputs, write_output_plan, OutputDescriptor};
 
 /// Arguments for the `run` command
 #[derive(Debug, Args)]
@@ -86,22 +86,26 @@ struct RunResult {
 pub fn cmd_run(args: RunArgs) -> Result<()> {
     // Validate paths
     if !args.parser.exists() {
-        return Err(HelpfulError::new(format!("Parser not found: {}", args.parser.display()))
-            .with_context("The parser file does not exist")
-            .with_suggestion(format!(
-                "TRY: Verify the parser path: ls -la {}",
-                args.parser.display()
-            ))
-            .into());
+        return Err(
+            HelpfulError::new(format!("Parser not found: {}", args.parser.display()))
+                .with_context("The parser file does not exist")
+                .with_suggestion(format!(
+                    "TRY: Verify the parser path: ls -la {}",
+                    args.parser.display()
+                ))
+                .into(),
+        );
     }
     if !args.input.exists() {
-        return Err(HelpfulError::new(format!("Input file not found: {}", args.input.display()))
-            .with_context("The input file does not exist")
-            .with_suggestion(format!(
-                "TRY: Verify the input path: ls -la {}",
-                args.input.display()
-            ))
-            .into());
+        return Err(
+            HelpfulError::new(format!("Input file not found: {}", args.input.display()))
+                .with_context("The input file does not exist")
+                .with_suggestion(format!(
+                    "TRY: Verify the input path: ls -la {}",
+                    args.input.display()
+                ))
+                .into(),
+        );
     }
 
     if args.whatif {
@@ -144,13 +148,11 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
     let runner = DevRunner::new().context("Failed to initialize runner")?;
 
     // Execute
-    let result = runner
-        .execute(
-            ParserRef::Path(args.parser.clone()),
-            &args.input,
-            LogDestination::Terminal,
-        )
-        ?;
+    let result = runner.execute(
+        ParserRef::Path(args.parser.clone()),
+        &args.input,
+        LogDestination::Terminal,
+    )?;
 
     let batches = result
         .output_batches
@@ -366,6 +368,6 @@ fn is_stdlib_module(module: &str) -> bool {
             | "copy" | "enum" | "dataclasses" | "abc" | "contextlib"
             | "decimal" | "stat"  // Used by FIX parser for DECIMAL types and file stat
             | "zoneinfo"  // Python 3.9+ stdlib
-            | "casparian_types"  // Bridge shim module, not a pip package
+            | "casparian_types" // Bridge shim module, not a pip package
     )
 }

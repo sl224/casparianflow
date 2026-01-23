@@ -54,7 +54,9 @@ impl ParserValidator {
 
         // Check required imports
         for import in &self.required_imports {
-            if !code.contains(&format!("import {}", import)) && !code.contains(&format!("import {} ", import)) {
+            if !code.contains(&format!("import {}", import))
+                && !code.contains(&format!("import {} ", import))
+            {
                 import_errors.push(format!("Missing required import: {}", import));
             }
         }
@@ -145,9 +147,7 @@ except SyntaxError as e:
                     Err(errors)
                 }
             }
-            Err(e) => {
-                Err(vec![format!("Could not run Python syntax check: {}", e)])
-            }
+            Err(e) => Err(vec![format!("Could not run Python syntax check: {}", e)]),
         }
     }
 
@@ -169,7 +169,9 @@ except SyntaxError as e:
         ];
 
         for pattern in forbidden_imports {
-            if code.contains(&format!("import {}", pattern)) || code.contains(&format!("from {} ", pattern)) {
+            if code.contains(&format!("import {}", pattern))
+                || code.contains(&format!("from {} ", pattern))
+            {
                 errors.push(format!("Forbidden import: {}", pattern));
             }
         }
@@ -189,7 +191,11 @@ except SyntaxError as e:
     }
 
     /// Run the parser against a sample file
-    fn run_parser_test(&self, code: &str, sample_path: &str) -> Result<(String, usize), Vec<String>> {
+    fn run_parser_test(
+        &self,
+        code: &str,
+        sample_path: &str,
+    ) -> Result<(String, usize), Vec<String>> {
         // Create temporary test script with unique name
         let temp_dir = std::env::temp_dir();
         let script_name = format!("casparian_parser_test_{}.py", std::process::id());
@@ -252,10 +258,13 @@ except Exception as e:
         if !output.status.success() {
             let mut errors = Vec::new();
             if stdout.contains("ERROR:") {
-                errors.push(stdout.lines()
-                    .find(|l| l.starts_with("ERROR:"))
-                    .unwrap_or("Unknown error")
-                    .to_string());
+                errors.push(
+                    stdout
+                        .lines()
+                        .find(|l| l.starts_with("ERROR:"))
+                        .unwrap_or("Unknown error")
+                        .to_string(),
+                );
             }
             if !stderr.is_empty() {
                 errors.push(stderr);
@@ -267,7 +276,8 @@ except Exception as e:
         }
 
         // Extract row count from output
-        let row_count = stdout.lines()
+        let row_count = stdout
+            .lines()
             .find(|l| l.starts_with("ROW_COUNT:"))
             .and_then(|l| l.strip_prefix("ROW_COUNT:"))
             .and_then(|s| s.parse::<usize>().ok())
@@ -311,7 +321,11 @@ class TestParser:
 "#;
 
         let result = validator.validate_syntax(code).unwrap();
-        assert!(result.is_valid, "Expected valid: {:?}", result.syntax_errors);
+        assert!(
+            result.is_valid,
+            "Expected valid: {:?}",
+            result.syntax_errors
+        );
     }
 
     #[test]
@@ -347,7 +361,10 @@ def parse(ctx):
 
         let result = validator.validate_syntax(code).unwrap();
         assert!(!result.is_valid);
-        assert!(result.import_errors.iter().any(|e| e.contains("subprocess")));
+        assert!(result
+            .import_errors
+            .iter()
+            .any(|e| e.contains("subprocess")));
     }
 
     #[test]

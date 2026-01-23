@@ -3,15 +3,14 @@
 //! Tools for monitoring and managing jobs.
 
 use super::McpTool;
-use crate::approvals::ApprovalManager;
-use crate::jobs::{JobId, JobManager};
+use crate::core::CoreHandle;
+use crate::jobs::{JobExecutorHandle, JobId};
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
-use anyhow::Result;
+use crate::types::JobStatusFilter;
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 // ============================================================================
 // casparian_job_status
@@ -48,7 +47,6 @@ struct JobStatusResult {
     error: Option<String>,
 }
 
-#[async_trait::async_trait]
 impl McpTool for JobStatusTool {
     fn name(&self) -> &'static str {
         "casparian_job_status"
@@ -70,20 +68,20 @@ impl McpTool for JobStatusTool {
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         _security: &SecurityConfig,
-        jobs: &Arc<Mutex<JobManager>>,
-        _approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         _config: &McpServerConfig,
+        _executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: JobStatusArgs = serde_json::from_value(args)?;
-        let job_id = JobId::from_string(&args.job_id);
+        let job_id = JobId::parse(&args.job_id)
+            .map_err(|e| anyhow::anyhow!("Invalid job_id '{}': {}", args.job_id, e))?;
 
-        let job_manager = jobs.lock().await;
-        let job = job_manager
-            .get_job(&job_id)
+        let job = core
+            .get_job(job_id)?
             .ok_or_else(|| anyhow::anyhow!("Job not found: {}", args.job_id))?;
 
         let (progress, result, error) = match &job.state {
@@ -143,7 +141,6 @@ struct JobCancelResult {
     status: String,
 }
 
-#[async_trait::async_trait]
 impl McpTool for JobCancelTool {
     fn name(&self) -> &'static str {
         "casparian_job_cancel"
@@ -165,43 +162,41 @@ impl McpTool for JobCancelTool {
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         _security: &SecurityConfig,
-        jobs: &Arc<Mutex<JobManager>>,
-        _approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         _config: &McpServerConfig,
+        executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: JobCancelArgs = serde_json::from_value(args)?;
-        let job_id = JobId::from_string(&args.job_id);
+        let job_id = JobId::parse(&args.job_id)
+            .map_err(|e| anyhow::anyhow!("Invalid job_id '{}': {}", args.job_id, e))?;
 
-        let mut job_manager = jobs.lock().await;
+        // Check if job exists and its state
+        let job = match core.get_job(job_id)? {
+            Some(job) => job,
+            None => {
+                return Ok(serde_json::to_value(JobCancelResult {
+                    job_id: args.job_id,
+                    status: "not_found".to_string(),
+                })?);
+            }
+        };
 
-        // Check if job exists first
-        let exists = job_manager.get_job(&job_id).is_some();
-        if !exists {
-            return Ok(serde_json::to_value(JobCancelResult {
-                job_id: args.job_id,
-                status: "not_found".to_string(),
-            })?);
-        }
-
-        // Check if already completed
-        let is_terminal = job_manager
-            .get_job(&job_id)
-            .map(|j| j.state.is_terminal())
-            .unwrap_or(false);
-
-        if is_terminal {
+        if job.state.is_terminal() {
             return Ok(serde_json::to_value(JobCancelResult {
                 job_id: args.job_id,
                 status: "already_completed".to_string(),
             })?);
         }
 
-        // Cancel
-        job_manager.cancel_job(&job_id)?;
+        // Send cancel signal to executor (for running jobs)
+        executor.cancel(&job_id)?;
+
+        // Also mark as cancelled in Core (for queued jobs or belt-and-suspenders)
+        core.cancel_job(job_id)?;
 
         let result = JobCancelResult {
             job_id: args.job_id,
@@ -220,14 +215,11 @@ pub struct JobListTool;
 
 #[derive(Debug, Deserialize)]
 struct JobListArgs {
-    #[serde(default = "default_status")]
-    status: String,
+    /// Strongly-typed status filter - replaces stringly-typed status strings
+    #[serde(default)]
+    status: JobStatusFilter,
     #[serde(default = "default_limit")]
     limit: usize,
-}
-
-fn default_status() -> String {
-    "all".to_string()
 }
 
 fn default_limit() -> usize {
@@ -250,7 +242,6 @@ struct JobListResult {
     jobs: Vec<JobListEntry>,
 }
 
-#[async_trait::async_trait]
 impl McpTool for JobListTool {
     fn name(&self) -> &'static str {
         "casparian_job_list"
@@ -266,7 +257,7 @@ impl McpTool for JobListTool {
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["all", "running", "completed", "failed"],
+                    "enum": ["all", "running", "completed", "failed", "queued", "cancelled"],
                     "default": "all"
                 },
                 "limit": {
@@ -277,39 +268,41 @@ impl McpTool for JobListTool {
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         _security: &SecurityConfig,
-        jobs: &Arc<Mutex<JobManager>>,
-        _approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         _config: &McpServerConfig,
+        _executor: &JobExecutorHandle,
     ) -> Result<Value> {
-        let args: JobListArgs = serde_json::from_value(args).unwrap_or(JobListArgs {
-            status: default_status(),
-            limit: default_limit(),
-        });
+        // Parse args with proper error handling (no unwrap_or_default)
+        let args: JobListArgs =
+            serde_json::from_value(args).map_err(|e| anyhow!("Invalid arguments: {}", e))?;
 
-        let job_manager = jobs.lock().await;
+        // Use the typed enum's conversion method for Core
+        let status_filter = args.status.as_filter_str();
 
-        let status_filter = if args.status == "all" {
-            None
-        } else {
-            Some(args.status.as_str())
-        };
-
-        let jobs = job_manager.list_jobs(status_filter, args.limit);
+        let jobs = core.list_jobs(status_filter, args.limit)?;
 
         let entries: Vec<JobListEntry> = jobs
             .into_iter()
-            .map(|j| JobListEntry {
-                job_id: j.id.to_string(),
-                job_type: j.job_type.to_string(),
-                status: j.state.status_str().to_string(),
-                created_at: j.created_at.to_rfc3339(),
-                plugin_ref: j.plugin_ref.as_ref().map(|pr| serde_json::to_value(pr).unwrap()),
+            .map(|j| {
+                let plugin_ref = match j.plugin_ref.as_ref() {
+                    Some(pr) => {
+                        Some(serde_json::to_value(pr).context("Failed to serialize plugin_ref")?)
+                    }
+                    None => None,
+                };
+                Ok(JobListEntry {
+                    job_id: j.id.to_string(),
+                    job_type: j.job_type.to_string(),
+                    status: j.state.status_str().to_string(),
+                    created_at: j.created_at.to_rfc3339(),
+                    plugin_ref,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let result = JobListResult { jobs: entries };
 

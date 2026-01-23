@@ -121,8 +121,7 @@ impl SchemaStorage {
                 "quarantine_max_count",
                 "quarantine_dir",
             ],
-        )
-        ?;
+        )?;
 
         Ok(())
     }
@@ -176,10 +175,14 @@ impl SchemaStorage {
         let (allow_quarantine, max_quarantine_pct, max_quarantine_count, quarantine_dir) =
             if let Some(config) = &contract.quarantine_config {
                 let max_count = match config.max_quarantine_count {
-                    Some(count) => Some(i64::try_from(count).map_err(|_| StorageError::Serialization {
-                        message: "quarantine max_quarantine_count out of range".to_string(),
-                        source: None,
-                    })?),
+                    Some(count) => {
+                        Some(
+                            i64::try_from(count).map_err(|_| StorageError::Serialization {
+                                message: "quarantine max_quarantine_count out of range".to_string(),
+                                source: None,
+                            })?,
+                        )
+                    }
                     None => None,
                 };
                 (
@@ -192,9 +195,8 @@ impl SchemaStorage {
                 (None, None, None, None)
             };
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO schema_contracts
                     (
                         contract_id,
@@ -223,28 +225,30 @@ impl SchemaStorage {
                     quarantine_max_count = excluded.quarantine_max_count,
                     quarantine_dir = excluded.quarantine_dir
                 "#,
-                &[
-                    DbValue::from(contract.contract_id.to_string()),
-                    DbValue::from(contract.scope_id.as_str()),
-                    DbValue::from(contract.scope_description.clone()),
-                    DbValue::from(contract.logic_hash.clone()),
-                    DbValue::from(contract.approved_at.as_str()),
-                    DbValue::from(contract.approved_by.as_str()),
-                    DbValue::from(contract.version as i64),
-                    DbValue::from(schemas_json),
-                    DbValue::from(allow_quarantine),
-                    DbValue::from(max_quarantine_pct),
-                    DbValue::from(max_quarantine_count),
-                    DbValue::from(quarantine_dir),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(contract.contract_id.to_string()),
+                DbValue::from(contract.scope_id.as_str()),
+                DbValue::from(contract.scope_description.clone()),
+                DbValue::from(contract.logic_hash.clone()),
+                DbValue::from(contract.approved_at.as_str()),
+                DbValue::from(contract.approved_by.as_str()),
+                DbValue::from(contract.version as i64),
+                DbValue::from(schemas_json),
+                DbValue::from(allow_quarantine),
+                DbValue::from(max_quarantine_pct),
+                DbValue::from(max_quarantine_count),
+                DbValue::from(quarantine_dir),
+            ],
+        )?;
 
         Ok(())
     }
 
     /// Get a contract by its ID.
-    pub fn get_contract(&self, contract_id: &ContractId) -> Result<Option<SchemaContract>, StorageError> {
+    pub fn get_contract(
+        &self,
+        contract_id: &ContractId,
+    ) -> Result<Option<SchemaContract>, StorageError> {
         let row = self
             .conn
             .query_optional(
@@ -262,7 +266,10 @@ impl SchemaStorage {
     }
 
     /// Get the latest contract for a scope.
-    pub fn get_contract_for_scope(&self, scope_id: &str) -> Result<Option<SchemaContract>, StorageError> {
+    pub fn get_contract_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<Option<SchemaContract>, StorageError> {
         let row = self
             .conn
             .query_optional(
@@ -282,7 +289,10 @@ impl SchemaStorage {
     }
 
     /// Get all contract versions for a scope.
-    pub fn get_contract_history(&self, scope_id: &str) -> Result<Vec<SchemaContract>, StorageError> {
+    pub fn get_contract_history(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<SchemaContract>, StorageError> {
         let rows = self
             .conn
             .query_all(
@@ -297,25 +307,23 @@ impl SchemaStorage {
             )
             ?;
 
-        rows.into_iter()
-            .map(row_to_contract)
-            .collect()
+        rows.into_iter().map(row_to_contract).collect()
     }
 
     /// Delete a contract by its ID.
     pub fn delete_contract(&self, contract_id: &ContractId) -> Result<bool, StorageError> {
-        let result = self
-            .conn
-            .execute(
-                "DELETE FROM schema_contracts WHERE contract_id = ?",
-                &[DbValue::from(contract_id.as_str())],
-            )
-            ?;
+        let result = self.conn.execute(
+            "DELETE FROM schema_contracts WHERE contract_id = ?",
+            &[DbValue::from(contract_id.as_str())],
+        )?;
         Ok(result > 0)
     }
 
     /// List all contracts, optionally limited.
-    pub fn list_contracts(&self, limit: Option<usize>) -> Result<Vec<SchemaContract>, StorageError> {
+    pub fn list_contracts(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<SchemaContract>, StorageError> {
         let rows = match limit {
             Some(n) => {
                 self.conn
@@ -346,9 +354,7 @@ impl SchemaStorage {
             }
         };
 
-        rows.into_iter()
-            .map(row_to_contract)
-            .collect()
+        rows.into_iter().map(row_to_contract).collect()
     }
 
     // === Discovery Results ===
@@ -386,7 +392,10 @@ impl SchemaStorage {
     }
 
     /// Get pending discovery results for a scope.
-    pub fn get_pending_discoveries(&self, scope_id: &str) -> Result<Vec<DiscoveryResult>, StorageError> {
+    pub fn get_pending_discoveries(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<DiscoveryResult>, StorageError> {
         let rows = self
             .conn
             .query_all(
@@ -403,35 +412,30 @@ impl SchemaStorage {
             )
             ?;
 
-        rows.into_iter()
-            .map(row_to_discovery)
-            .collect()
+        rows.into_iter().map(row_to_discovery).collect()
     }
 
     /// Reject a discovery result.
     pub fn reject_discovery(&self, discovery_id: &DiscoveryId) -> Result<bool, StorageError> {
-        let result = self
-            .conn
-            .execute(
-                "UPDATE schema_discovery_results SET status = ? WHERE discovery_id = ?",
-                &[
-                    DbValue::from(DiscoveryStatus::Rejected.as_str()),
-                    DbValue::from(discovery_id.as_str()),
-                ],
-            )
-            ?;
+        let result = self.conn.execute(
+            "UPDATE schema_discovery_results SET status = ? WHERE discovery_id = ?",
+            &[
+                DbValue::from(DiscoveryStatus::Rejected.as_str()),
+                DbValue::from(discovery_id.as_str()),
+            ],
+        )?;
         Ok(result > 0)
     }
 }
 
 fn row_to_contract(row: UnifiedDbRow) -> Result<SchemaContract, StorageError> {
     let contract_id_raw: String = row.get_by_name("contract_id")?;
-    let contract_id = ContractId::parse(&contract_id_raw)
-        .map_err(|e| StorageError::Parse(e.to_string()))?;
+    let contract_id =
+        ContractId::parse(&contract_id_raw).map_err(|e| StorageError::Parse(e.to_string()))?;
 
     let approved_at_raw: String = row.get_by_name("approved_at")?;
-    let approved_at = SchemaTimestamp::parse(&approved_at_raw)
-        .map_err(|e| StorageError::Parse(e.to_string()))?;
+    let approved_at =
+        SchemaTimestamp::parse(&approved_at_raw).map_err(|e| StorageError::Parse(e.to_string()))?;
 
     let schemas_json: String = row.get_by_name("schemas_json")?;
     let schemas: Vec<LockedSchema> = serde_json::from_str(&schemas_json)?;
@@ -452,8 +456,9 @@ fn row_to_contract(row: UnifiedDbRow) -> Result<SchemaContract, StorageError> {
         has_quarantine_config = true;
     }
     if let Some(value) = max_quarantine_count {
-        let count = u64::try_from(value)
-            .map_err(|_| StorageError::Parse("quarantine max_quarantine_count out of range".to_string()))?;
+        let count = u64::try_from(value).map_err(|_| {
+            StorageError::Parse("quarantine max_quarantine_count out of range".to_string())
+        })?;
         quarantine_config.max_quarantine_count = Some(count);
         has_quarantine_config = true;
     }
@@ -483,17 +488,16 @@ fn row_to_contract(row: UnifiedDbRow) -> Result<SchemaContract, StorageError> {
 
 fn row_to_discovery(row: UnifiedDbRow) -> Result<DiscoveryResult, StorageError> {
     let discovery_id_raw: String = row.get_by_name("discovery_id")?;
-    let discovery_id = DiscoveryId::parse(&discovery_id_raw)
-        .map_err(|e| StorageError::Parse(e.to_string()))?;
+    let discovery_id =
+        DiscoveryId::parse(&discovery_id_raw).map_err(|e| StorageError::Parse(e.to_string()))?;
 
     let discovered_at_raw: String = row.get_by_name("discovered_at")?;
     let discovered_at = SchemaTimestamp::parse(&discovered_at_raw)
         .map_err(|e| StorageError::Parse(e.to_string()))?;
 
     let status_str: String = row.get_by_name("status")?;
-    let status = DiscoveryStatus::parse(&status_str).ok_or_else(|| {
-        StorageError::Parse(format!("Invalid discovery status: {}", status_str))
-    })?;
+    let status = DiscoveryStatus::parse(&status_str)
+        .ok_or_else(|| StorageError::Parse(format!("Invalid discovery status: {}", status_str)))?;
 
     Ok(DiscoveryResult {
         discovery_id,
@@ -588,7 +592,10 @@ mod tests {
 
         storage.save_contract(&contract).unwrap();
 
-        let loaded = storage.get_contract(&contract.contract_id).unwrap().unwrap();
+        let loaded = storage
+            .get_contract(&contract.contract_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.scope_id, "parser_abc");
         assert_eq!(loaded.logic_hash.as_deref(), Some("logic-1"));
         assert_eq!(loaded.approved_by, "user_123");
@@ -622,16 +629,22 @@ mod tests {
         storage.save_contract(&contract1).unwrap();
 
         // Second version
-        let schema2 = LockedSchema::new("v2", vec![
-            LockedColumn::required("a", DataType::String),
-            LockedColumn::required("b", DataType::Int64),
-        ]);
+        let schema2 = LockedSchema::new(
+            "v2",
+            vec![
+                LockedColumn::required("a", DataType::String),
+                LockedColumn::required("b", DataType::Int64),
+            ],
+        );
         let mut contract2 = SchemaContract::new("versioned_scope", schema2, "user");
         contract2.version = 2;
         storage.save_contract(&contract2).unwrap();
 
         // Get latest should return v2
-        let latest = storage.get_contract_for_scope("versioned_scope").unwrap().unwrap();
+        let latest = storage
+            .get_contract_for_scope("versioned_scope")
+            .unwrap()
+            .unwrap();
         assert_eq!(latest.version, 2);
         assert_eq!(latest.schemas[0].columns.len(), 2);
 
@@ -650,7 +663,6 @@ mod tests {
         let proposed = vec![create_test_schema()];
         let discovery_id = storage
             .save_discovery_result("scope_xyz", Some("data.csv"), &proposed)
-            
             .unwrap();
 
         // Get pending discoveries
@@ -675,12 +687,18 @@ mod tests {
         let contract = SchemaContract::new("to_delete", schema, "user");
         storage.save_contract(&contract).unwrap();
 
-        assert!(storage.get_contract(&contract.contract_id).unwrap().is_some());
+        assert!(storage
+            .get_contract(&contract.contract_id)
+            .unwrap()
+            .is_some());
 
         let deleted = storage.delete_contract(&contract.contract_id).unwrap();
         assert!(deleted);
 
-        assert!(storage.get_contract(&contract.contract_id).unwrap().is_none());
+        assert!(storage
+            .get_contract(&contract.contract_id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

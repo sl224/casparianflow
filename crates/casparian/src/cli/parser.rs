@@ -10,12 +10,13 @@
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{print_table, print_table_colored};
+use anyhow::Context;
+use casparian_db::{DbConnection, DbTimestamp, DbValue};
+use casparian_protocol::PluginStatus;
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use comfy_table::Color;
 use serde::{Deserialize, Serialize};
-use casparian_db::{DbConnection, DbTimestamp, DbValue};
-use casparian_protocol::PluginStatus;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -182,9 +183,7 @@ fn run_with_action(action: ParserAction) -> anyhow::Result<()> {
             json,
         } => cmd_test(&parser, &input, rows, json),
         ParserAction::Unpublish { name } => cmd_unpublish(&name),
-        ParserAction::Backtest { name, limit, json } => {
-            cmd_backtest(&name, limit, json)
-        }
+        ParserAction::Backtest { name, limit, json } => cmd_backtest(&name, limit, json),
         ParserAction::Resume { name } => cmd_resume(&name),
         ParserAction::Health { name, json } => cmd_health(&name, json),
     }
@@ -244,12 +243,10 @@ fn connect_db_readonly() -> anyhow::Result<DbConnection> {
 }
 
 fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
-    let row = conn
-        .query_optional(
-            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
-            &[DbValue::from(table)],
-        )
-        ?;
+    let row = conn.query_optional(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+        &[DbValue::from(table)],
+    )?;
     Ok(row.is_some())
 }
 
@@ -261,16 +258,14 @@ fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
 fn cmd_list(json_output: bool) -> anyhow::Result<()> {
     let conn = connect_db_readonly()?;
 
-    let rows = conn
-        .query_all(
-            r#"
+    let rows = conn.query_all(
+        r#"
             SELECT plugin_name, version, status, source_hash, env_hash, artifact_hash, created_at
             FROM cf_plugin_manifest
             ORDER BY created_at DESC
             "#,
-            &[],
-        )
-        ?;
+        &[],
+    )?;
 
     let mut parsers = Vec::new();
     for row in rows {
@@ -280,28 +275,25 @@ fn cmd_list(json_output: bool) -> anyhow::Result<()> {
         let artifact_hash_value: String = row.get_by_name("artifact_hash")?;
 
         if source_hash_value.trim().is_empty() {
-            return Err(HelpfulError::new(format!(
-                "Parser '{}' is missing source_hash",
-                name
-            ))
-            .with_context("Registry data is incomplete")
-            .into());
+            return Err(
+                HelpfulError::new(format!("Parser '{}' is missing source_hash", name))
+                    .with_context("Registry data is incomplete")
+                    .into(),
+            );
         }
         if env_hash_value.trim().is_empty() {
-            return Err(HelpfulError::new(format!(
-                "Parser '{}' is missing env_hash",
-                name
-            ))
-            .with_context("Registry data is incomplete")
-            .into());
+            return Err(
+                HelpfulError::new(format!("Parser '{}' is missing env_hash", name))
+                    .with_context("Registry data is incomplete")
+                    .into(),
+            );
         }
         if artifact_hash_value.trim().is_empty() {
-            return Err(HelpfulError::new(format!(
-                "Parser '{}' is missing artifact_hash",
-                name
-            ))
-            .with_context("Registry data is incomplete")
-            .into());
+            return Err(
+                HelpfulError::new(format!("Parser '{}' is missing artifact_hash", name))
+                    .with_context("Registry data is incomplete")
+                    .into(),
+            );
         }
 
         let parser = Parser {
@@ -399,28 +391,25 @@ fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
     let artifact_hash_value: String = row.get_by_name("artifact_hash")?;
 
     if source_hash_value.trim().is_empty() {
-        return Err(HelpfulError::new(format!(
-            "Parser '{}' is missing source_hash",
-            name
-        ))
-        .with_context("Registry data is incomplete")
-        .into());
+        return Err(
+            HelpfulError::new(format!("Parser '{}' is missing source_hash", name))
+                .with_context("Registry data is incomplete")
+                .into(),
+        );
     }
     if env_hash_value.trim().is_empty() {
-        return Err(HelpfulError::new(format!(
-            "Parser '{}' is missing env_hash",
-            name
-        ))
-        .with_context("Registry data is incomplete")
-        .into());
+        return Err(
+            HelpfulError::new(format!("Parser '{}' is missing env_hash", name))
+                .with_context("Registry data is incomplete")
+                .into(),
+        );
     }
     if artifact_hash_value.trim().is_empty() {
-        return Err(HelpfulError::new(format!(
-            "Parser '{}' is missing artifact_hash",
-            name
-        ))
-        .with_context("Registry data is incomplete")
-        .into());
+        return Err(
+            HelpfulError::new(format!("Parser '{}' is missing artifact_hash", name))
+                .with_context("Registry data is incomplete")
+                .into(),
+        );
     }
 
     let parser = Parser {
@@ -485,27 +474,36 @@ fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
 }
 
 /// Test a parser against a file
-fn cmd_test(parser_path: &PathBuf, input_path: &PathBuf, rows: usize, json_output: bool) -> anyhow::Result<()> {
+fn cmd_test(
+    parser_path: &PathBuf,
+    input_path: &PathBuf,
+    rows: usize,
+    json_output: bool,
+) -> anyhow::Result<()> {
     // Validate parser file exists
     if !parser_path.exists() {
-        return Err(HelpfulError::new(format!("Parser file not found: {}", parser_path.display()))
-            .with_context("The specified parser file does not exist")
-            .with_suggestions([
-                format!("TRY: ls -la {}", parser_path.display()),
-                "TRY: Provide the full path to the parser file".to_string(),
-            ])
-            .into());
+        return Err(
+            HelpfulError::new(format!("Parser file not found: {}", parser_path.display()))
+                .with_context("The specified parser file does not exist")
+                .with_suggestions([
+                    format!("TRY: ls -la {}", parser_path.display()),
+                    "TRY: Provide the full path to the parser file".to_string(),
+                ])
+                .into(),
+        );
     }
 
     // Validate input file exists
     if !input_path.exists() {
-        return Err(HelpfulError::new(format!("Input file not found: {}", input_path.display()))
-            .with_context("The specified input file does not exist")
-            .with_suggestions([
-                format!("TRY: ls -la {}", input_path.display()),
-                "TRY: Provide the full path to the input file".to_string(),
-            ])
-            .into());
+        return Err(
+            HelpfulError::new(format!("Input file not found: {}", input_path.display()))
+                .with_context("The specified input file does not exist")
+                .with_suggestions([
+                    format!("TRY: ls -la {}", input_path.display()),
+                    "TRY: Provide the full path to the input file".to_string(),
+                ])
+                .into(),
+        );
     }
 
     // Validate parser is a Python file
@@ -576,7 +574,10 @@ fn cmd_test(parser_path: &PathBuf, input_path: &PathBuf, rows: usize, json_outpu
     // Show preview
     if !test_result.preview_rows.is_empty() {
         println!();
-        println!("Output Preview (first {} rows):", test_result.preview_rows.len());
+        println!(
+            "Output Preview (first {} rows):",
+            test_result.preview_rows.len()
+        );
         let headers: Vec<&str> = test_result.headers.iter().map(|s| s.as_str()).collect();
         print_table(&headers, test_result.preview_rows.clone());
     }
@@ -590,23 +591,24 @@ fn cmd_unpublish(name: &str) -> anyhow::Result<()> {
 
     // Mark the active/deployed plugin as SUPERSEDED (the canonical status for deactivated plugins)
     // Handle both ACTIVE and DEPLOYED since DEPLOYED is a legacy alias for ACTIVE
-    let updated = conn
-        .execute(
-            "UPDATE cf_plugin_manifest SET status = ? WHERE plugin_name = ? AND status IN (?, ?)",
-            &[
-                DbValue::from(PluginStatus::Superseded.as_str()),
-                DbValue::from(name),
-                DbValue::from(PluginStatus::Active.as_str()),
-                DbValue::from(PluginStatus::Deployed.as_str()),
-            ],
-        )
-        ?;
+    let updated = conn.execute(
+        "UPDATE cf_plugin_manifest SET status = ? WHERE plugin_name = ? AND status IN (?, ?)",
+        &[
+            DbValue::from(PluginStatus::Superseded.as_str()),
+            DbValue::from(name),
+            DbValue::from(PluginStatus::Active.as_str()),
+            DbValue::from(PluginStatus::Deployed.as_str()),
+        ],
+    )?;
 
     if updated == 0 {
-        return Err(HelpfulError::new(format!("Parser not found or already unpublished: {}", name))
-            .with_context("No active plugin with this name exists")
-            .with_suggestion("TRY: casparian parser ls  (list all parsers)")
-            .into());
+        return Err(HelpfulError::new(format!(
+            "Parser not found or already unpublished: {}",
+            name
+        ))
+        .with_context("No active plugin with this name exists")
+        .with_suggestion("TRY: casparian parser ls  (list all parsers)")
+        .into());
     }
 
     println!("Unpublished parser: {}", name);
@@ -617,13 +619,16 @@ fn cmd_unpublish(name: &str) -> anyhow::Result<()> {
 /// Run backtest against all files for a parser's topic
 fn cmd_backtest(name: &str, limit: Option<usize>, json_output: bool) -> anyhow::Result<()> {
     let _ = (limit, json_output);
-    Err(HelpfulError::new(format!("Backtest is not available in v1: {}", name))
-        .with_context("The parser lab registry was removed in favor of the plugin manifest")
-        .with_suggestions([
-            "TRY: casparian run <parser.py> <input> for manual testing".to_string(),
-            "TRY: casparian publish <parser.py> --version <v> then run jobs via Sentinel".to_string(),
-        ])
-        .into())
+    Err(
+        HelpfulError::new(format!("Backtest is not available in v1: {}", name))
+            .with_context("The parser lab registry was removed in favor of the plugin manifest")
+            .with_suggestions([
+                "TRY: casparian run <parser.py> <input> for manual testing".to_string(),
+                "TRY: casparian publish <parser.py> --version <v> then run jobs via Sentinel"
+                    .to_string(),
+            ])
+            .into(),
+    )
 }
 
 /// Resume a paused parser (reset circuit breaker)
@@ -639,16 +644,16 @@ fn cmd_resume(name: &str) -> anyhow::Result<()> {
     }
 
     // Check if parser exists in health table
-    let health = conn
-        .query_optional(
-            "SELECT consecutive_failures, paused_at FROM cf_parser_health WHERE parser_name = ?",
-            &[DbValue::from(name)],
-        )
-        ?;
+    let health = conn.query_optional(
+        "SELECT consecutive_failures, paused_at FROM cf_parser_health WHERE parser_name = ?",
+        &[DbValue::from(name)],
+    )?;
 
     match health {
         Some(row) => {
-            let failures: i64 = row.get_by_name("consecutive_failures").unwrap_or_default();
+            let failures: i64 = row
+                .get_by_name("consecutive_failures")
+                .context("Failed to read 'consecutive_failures' from cf_parser_health")?;
             let paused_at: Option<String> = row.get_by_name("paused_at").ok();
             if paused_at.is_none() && failures == 0 {
                 println!("Parser '{}' is already healthy (not paused)", name);
@@ -669,13 +674,15 @@ fn cmd_resume(name: &str) -> anyhow::Result<()> {
             println!("The parser will now accept new jobs.");
         }
         None => {
-            return Err(HelpfulError::new(format!("No health data for parser: {}", name))
-                .with_context("This parser has never been executed")
-                .with_suggestions([
-                    "TRY: casparian jobs create --parser <name> --input <file>".to_string(),
-                    "TRY: casparian parser ls  (list all parsers)".to_string(),
-                ])
-                .into());
+            return Err(
+                HelpfulError::new(format!("No health data for parser: {}", name))
+                    .with_context("This parser has never been executed")
+                    .with_suggestions([
+                        "TRY: casparian jobs create --parser <name> --input <file>".to_string(),
+                        "TRY: casparian parser ls  (list all parsers)".to_string(),
+                    ])
+                    .into(),
+            );
         }
     }
 
@@ -695,24 +702,30 @@ fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
     }
 
     // Get parser health data
-    let health = conn
-        .query_optional(
-            r#"
+    let health = conn.query_optional(
+        r#"
             SELECT parser_name, total_executions, successful_executions, consecutive_failures,
                    last_failure_reason, paused_at
             FROM cf_parser_health
             WHERE parser_name = ?
             "#,
-            &[DbValue::from(name)],
-        )
-        ?;
+        &[DbValue::from(name)],
+    )?;
 
     match health {
         Some(row) => {
-            let parser_name: String = row.get_by_name("parser_name").unwrap_or_default();
-            let total: i64 = row.get_by_name("total_executions").unwrap_or_default();
-            let success: i64 = row.get_by_name("successful_executions").unwrap_or_default();
-            let failures: i64 = row.get_by_name("consecutive_failures").unwrap_or_default();
+            let parser_name: String = row
+                .get_by_name("parser_name")
+                .context("Failed to read 'parser_name' from cf_parser_health")?;
+            let total: i64 = row
+                .get_by_name("total_executions")
+                .context("Failed to read 'total_executions' from cf_parser_health")?;
+            let success: i64 = row
+                .get_by_name("successful_executions")
+                .context("Failed to read 'successful_executions' from cf_parser_health")?;
+            let failures: i64 = row
+                .get_by_name("consecutive_failures")
+                .context("Failed to read 'consecutive_failures' from cf_parser_health")?;
             let last_error: Option<String> = row.get_by_name("last_failure_reason").ok();
             let paused_at: Option<String> = row.get_by_name("paused_at").ok();
             let success_rate = if total > 0 {
@@ -771,13 +784,15 @@ fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
             }
         }
         None => {
-            return Err(HelpfulError::new(format!("No health data for parser: {}", name))
-                .with_context("This parser has never been executed")
-                .with_suggestions([
-                    "TRY: casparian jobs create --parser <name> --input <file>".to_string(),
-                    "TRY: casparian parser ls  (list all parsers)".to_string(),
-                ])
-                .into());
+            return Err(
+                HelpfulError::new(format!("No health data for parser: {}", name))
+                    .with_context("This parser has never been executed")
+                    .with_suggestions([
+                        "TRY: casparian jobs create --parser <name> --input <file>".to_string(),
+                        "TRY: casparian parser ls  (list all parsers)".to_string(),
+                    ])
+                    .into(),
+            );
         }
     }
 
@@ -794,7 +809,15 @@ fn run_parser_test(
     parser_path: &PathBuf,
     input_path: &PathBuf,
     preview_rows: usize,
-) -> anyhow::Result<(bool, usize, Option<Vec<SchemaColumn>>, Vec<Vec<String>>, Vec<String>, Vec<String>, Option<String>)> {
+) -> anyhow::Result<(
+    bool,
+    usize,
+    Option<Vec<SchemaColumn>>,
+    Vec<Vec<String>>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+)> {
     // Create a wrapper script that runs the parser
     let wrapper = format!(
         r#"
@@ -947,18 +970,16 @@ except Exception as e:
         let success = result["success"].as_bool().unwrap_or(false);
         let total_rows = result["total_rows"].as_u64().unwrap_or(0) as usize;
 
-        let schema: Option<Vec<SchemaColumn>> = result["schema"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        Some(SchemaColumn {
-                            name: v["name"].as_str()?.to_string(),
-                            dtype: v["dtype"].as_str()?.to_string(),
-                        })
+        let schema: Option<Vec<SchemaColumn>> = result["schema"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    Some(SchemaColumn {
+                        name: v["name"].as_str()?.to_string(),
+                        dtype: v["dtype"].as_str()?.to_string(),
                     })
-                    .collect()
-            });
+                })
+                .collect()
+        });
 
         let headers: Vec<String> = schema
             .as_ref()
@@ -999,11 +1020,11 @@ except Exception as e:
             .unwrap_or_default();
 
         // Extract structured error code from Python
-        let error_code: Option<String> = result["error_code"]
-            .as_str()
-            .map(|s| s.to_string());
+        let error_code: Option<String> = result["error_code"].as_str().map(|s| s.to_string());
 
-        Ok((success, total_rows, schema, rows, headers, errors, error_code))
+        Ok((
+            success, total_rows, schema, rows, headers, errors, error_code,
+        ))
     } else {
         // Failed to parse output
         let mut errors = vec![];
@@ -1114,5 +1135,4 @@ def transform(df):
         let result = cmd_test(&parser_path, &input_path, 10, false);
         assert!(result.is_err());
     }
-
 }

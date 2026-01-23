@@ -112,7 +112,9 @@ impl ExtractorResult {
             ExtractorResult::Timeout { timeout, .. } => {
                 Some(format!("Extraction timed out after {:?}", timeout))
             }
-            ExtractorResult::Crash { stderr, exit_code, .. } => {
+            ExtractorResult::Crash {
+                stderr, exit_code, ..
+            } => {
                 let code_str = exit_code
                     .map(|c| format!(" (exit code: {})", c))
                     .unwrap_or_default();
@@ -186,11 +188,7 @@ impl ExtractorRunner {
     /// 2. Extract metadata from the path
     /// 3. Print JSON metadata to stdout
     /// 4. Exit with code 0 on success, non-zero on failure
-    pub fn run_extractor(
-        &self,
-        extractor: &Extractor,
-        file_path: &str,
-    ) -> ExtractorResult {
+    pub fn run_extractor(&self, extractor: &Extractor, file_path: &str) -> ExtractorResult {
         let start = Instant::now();
         let timeout = Duration::from_secs(extractor.timeout_secs as u64);
 
@@ -407,10 +405,7 @@ impl BatchExtractor {
         files: &[ScannedFile],
     ) -> Result<(usize, usize, bool)> {
         if !extractor.enabled || extractor.is_paused() {
-            info!(
-                "Skipping disabled/paused extractor: {}",
-                extractor.name
-            );
+            info!("Skipping disabled/paused extractor: {}", extractor.name);
             return Ok((0, 0, false));
         }
 
@@ -454,8 +449,7 @@ impl BatchExtractor {
                 // Update file metadata in database
                 if let Some(file_id) = file.id {
                     if let Some(metadata) = result.metadata() {
-                        self.update_file_metadata(file_id, metadata, ExtractionStatus::Extracted)
-                            ?;
+                        self.update_file_metadata(file_id, metadata, ExtractionStatus::Extracted)?;
                     }
                 }
 
@@ -467,12 +461,7 @@ impl BatchExtractor {
 
                 // Update file status to reflect extraction failure
                 if let Some(file_id) = file.id {
-                    self.update_file_metadata(
-                        file_id,
-                        "{}",
-                        result.to_status(),
-                    )
-                    ?;
+                    self.update_file_metadata(file_id, "{}", result.to_status())?;
                 }
 
                 error!(
@@ -484,8 +473,7 @@ impl BatchExtractor {
 
         // Update consecutive failures in database (but don't pause)
         extractor.consecutive_failures = consecutive_failures;
-        self.update_extractor_failures(&extractor.id, consecutive_failures)
-            ?;
+        self.update_extractor_failures(&extractor.id, consecutive_failures)?;
 
         info!(
             "Batch complete for '{}': {} successes, {} failures",
@@ -512,8 +500,7 @@ impl BatchExtractor {
                 continue;
             }
 
-            let (successes, failures, was_paused) =
-                self.run_batch(&mut extractor, &files)?;
+            let (successes, failures, was_paused) = self.run_batch(&mut extractor, &files)?;
 
             results.push((extractor.id.clone(), successes, failures, was_paused));
         }
@@ -527,14 +514,9 @@ impl BatchExtractor {
     }
 
     /// Update extractor consecutive failure count
-    fn update_extractor_failures(
-        &self,
-        extractor_id: &str,
-        failures: u32,
-    ) -> Result<()> {
+    fn update_extractor_failures(&self, extractor_id: &str, failures: u32) -> Result<()> {
         self.db
             .update_extractor_consecutive_failures(extractor_id, failures)
-            
     }
 
     /// Log an extraction attempt
@@ -544,16 +526,14 @@ impl BatchExtractor {
         extractor_id: &str,
         result: &ExtractorResult,
     ) -> Result<()> {
-        self.db
-            .log_extraction(
-                file_id,
-                extractor_id,
-                result.to_log_status(),
-                Some(result.duration_ms()),
-                result.error_message().as_deref(),
-                result.metadata(),
-            )
-            
+        self.db.log_extraction(
+            file_id,
+            extractor_id,
+            result.to_log_status(),
+            Some(result.duration_ms()),
+            result.error_message().as_deref(),
+            result.metadata(),
+        )
     }
 
     /// Update file metadata after extraction
@@ -565,7 +545,6 @@ impl BatchExtractor {
     ) -> Result<()> {
         self.db
             .update_file_extraction(file_id, metadata_raw, status)
-            
     }
 }
 

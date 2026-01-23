@@ -7,11 +7,11 @@
 //! - Pre-detection algorithm: Fast algorithmic confidence scoring
 //! - YAML rule generation: Declarative extraction rules
 
-pub mod primitives;
 pub mod detector;
+pub mod primitives;
 
-use std::path::Path;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Recognized semantic primitive types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

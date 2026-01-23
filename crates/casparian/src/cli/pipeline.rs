@@ -3,18 +3,20 @@
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use anyhow::{Context, Result};
-use casparian_db::{DbConnection, DbValue};
 use casparian::scout::SourceId;
-use casparian::storage::{DuckDbPipelineStore, Pipeline, SelectionFilters, SelectionResolution, WatermarkField};
-use casparian_protocol::{
-    materialization_key, output_target_key, schema_hash, table_name_with_schema,
-    PipelineRunStatus, ProcessingStatus, SchemaColumnSpec, SinkConfig, SinkMode,
+use casparian::storage::{
+    DuckDbPipelineStore, Pipeline, SelectionFilters, SelectionResolution, WatermarkField,
 };
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::types::SchemaDefinition;
+use casparian_protocol::{
+    materialization_key, output_target_key, schema_hash, table_name_with_schema, PipelineRunStatus,
+    ProcessingStatus, SchemaColumnSpec, SinkConfig, SinkMode,
+};
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{SchemaContract, SchemaStorage};
-use clap::Subcommand;
 use chrono::TimeZone;
+use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -162,7 +164,6 @@ impl PipelineStoreHandle {
     ) -> Result<String> {
         self.store
             .create_selection_snapshot(spec_id, snapshot_hash, logical_date, watermark_value)
-            
     }
 
     fn insert_snapshot_files(&self, snapshot_id: &str, file_ids: &[i64]) -> Result<()> {
@@ -186,16 +187,14 @@ impl PipelineStoreHandle {
         logical_date: &str,
         status: PipelineRunStatus,
     ) -> Result<String> {
-        self.store
-            .create_pipeline_run(
-                pipeline_id,
-                selection_spec_id,
-                selection_snapshot_hash,
-                context_snapshot_hash,
-                logical_date,
-                status,
-            )
-            
+        self.store.create_pipeline_run(
+            pipeline_id,
+            selection_spec_id,
+            selection_snapshot_hash,
+            context_snapshot_hash,
+            logical_date,
+            status,
+        )
     }
 
     fn set_pipeline_run_status(&self, run_id: &str, status: PipelineRunStatus) -> Result<()> {
@@ -211,9 +210,7 @@ impl PipelineStoreHandle {
         filters: &SelectionFilters,
         logical_date_ms: i64,
     ) -> Result<SelectionResolution> {
-        self.store
-            .resolve_selection_files(filters, logical_date_ms)
-            
+        self.store.resolve_selection_files(filters, logical_date_ms)
     }
 }
 
@@ -231,9 +228,7 @@ fn apply_pipeline(file: PathBuf) -> Result<()> {
     let config_json = serde_json::to_string(&stored).context("Failed to serialize pipeline")?;
     let latest = store.get_latest_pipeline(&stored.pipeline.name)?;
     let next_version = latest.map(|p| p.version + 1).unwrap_or(1);
-    let pipeline_id = store
-        .create_pipeline(&stored.pipeline.name, next_version, &config_json)
-        ?;
+    let pipeline_id = store.create_pipeline(&stored.pipeline.name, next_version, &config_json)?;
 
     println!(
         "Applied pipeline '{}' v{} (id: {})",
@@ -247,12 +242,11 @@ fn run_pipeline(name: &str, logical_date: Option<String>, dry_run: bool) -> Resu
     let store = PipelineStoreHandle::open()?;
     let conn = store.open_db_connection()?;
     let pipeline = store
-        .get_latest_pipeline(name)
-        ?
+        .get_latest_pipeline(name)?
         .ok_or_else(|| HelpfulError::new(format!("Pipeline '{}' not found", name)))?;
 
-    let spec: PipelineFile = serde_json::from_str(&pipeline.config_json)
-        .context("Failed to parse pipeline config")?;
+    let spec: PipelineFile =
+        serde_json::from_str(&pipeline.config_json).context("Failed to parse pipeline config")?;
     let selection_spec_id = spec
         .pipeline
         .selection_spec_id
@@ -260,10 +254,7 @@ fn run_pipeline(name: &str, logical_date: Option<String>, dry_run: bool) -> Resu
         .ok_or_else(|| anyhow::anyhow!("Pipeline config missing selection_spec_id"))?;
 
     let (logical_date_str, logical_date_ms) = parse_logical_date(logical_date.as_deref())?;
-    if store
-        .pipeline_run_exists(&pipeline.id, &logical_date_str)
-        ?
-    {
+    if store.pipeline_run_exists(&pipeline.id, &logical_date_str)? {
         println!("Pipeline '{}' already ran for {}", name, logical_date_str);
         return Ok(());
     }
@@ -273,9 +264,7 @@ fn run_pipeline(name: &str, logical_date: Option<String>, dry_run: bool) -> Resu
         since_ms,
         ..filters
     };
-    let resolution = store
-        .resolve_selection_files(&filters, logical_date_ms)
-        ?;
+    let resolution = store.resolve_selection_files(&filters, logical_date_ms)?;
     let snapshot_hash = snapshot_hash(&selection_spec_id, &logical_date_str, &resolution.file_ids);
 
     if dry_run {
@@ -286,42 +275,39 @@ fn run_pipeline(name: &str, logical_date: Option<String>, dry_run: bool) -> Resu
         return Ok(());
     }
 
-    let snapshot_id = store
-        .create_selection_snapshot(
-            &selection_spec_id,
-            &snapshot_hash,
-            &logical_date_str,
-            resolution.watermark_value.as_deref(),
-        )
-        ?;
+    let snapshot_id = store.create_selection_snapshot(
+        &selection_spec_id,
+        &snapshot_hash,
+        &logical_date_str,
+        resolution.watermark_value.as_deref(),
+    )?;
 
-    store
-        .insert_snapshot_files(&snapshot_id, &resolution.file_ids)
-        ?;
+    store.insert_snapshot_files(&snapshot_id, &resolution.file_ids)?;
 
     let status = if resolution.file_ids.is_empty() {
         PipelineRunStatus::NoOp
     } else {
         PipelineRunStatus::Queued
     };
-    let run_id = store
-        .create_pipeline_run(
-            &pipeline.id,
-            &selection_spec_id,
-            &snapshot_hash,
-            None,
-            &logical_date_str,
-            status,
-        )
-        ?;
+    let run_id = store.create_pipeline_run(
+        &pipeline.id,
+        &selection_spec_id,
+        &snapshot_hash,
+        None,
+        &logical_date_str,
+        status,
+    )?;
 
     let summary = if status == PipelineRunStatus::NoOp {
-        store
-            .set_pipeline_run_status(&run_id, PipelineRunStatus::NoOp)
-            ?;
+        store.set_pipeline_run_status(&run_id, PipelineRunStatus::NoOp)?;
         EnqueueSummary::default()
     } else {
-        enqueue_jobs(&conn, &run_id, &spec.pipeline.run.parser, &resolution.file_ids)?
+        enqueue_jobs(
+            &conn,
+            &run_id,
+            &spec.pipeline.run.parser,
+            &resolution.file_ids,
+        )?
     };
 
     println!("Pipeline '{}' queued (run id: {})", name, run_id);
@@ -346,7 +332,9 @@ fn backfill_pipeline(name: &str, start: &str, end: &str, dry_run: bool) -> Resul
     while current <= end_date {
         let date_str = current.format("%Y-%m-%d").to_string();
         run_pipeline(name, Some(date_str), dry_run)?;
-        current = current.succ_opt().ok_or_else(|| anyhow::anyhow!("Invalid date increment"))?;
+        current = current
+            .succ_opt()
+            .ok_or_else(|| anyhow::anyhow!("Invalid date increment"))?;
     }
     Ok(())
 }
@@ -498,7 +486,10 @@ fn load_parser_manifest(conn: &DbConnection, parser: &str) -> Result<ParserManif
         artifact_hash
     };
 
-    Ok(ParserManifest { version, fingerprint })
+    Ok(ParserManifest {
+        version,
+        fingerprint,
+    })
 }
 
 fn schema_definition_from_contract(
@@ -577,7 +568,9 @@ fn load_sink_configs(
         )?;
         for row in rows {
             let mode_raw: String = row.get_by_name("mode")?;
-            let mode = mode_raw.parse::<SinkMode>().map_err(|e| anyhow::anyhow!(e))?;
+            let mode = mode_raw
+                .parse::<SinkMode>()
+                .map_err(|e| anyhow::anyhow!(e))?;
             let allow_quarantine: Option<bool> = row.get_by_name("quarantine_allow")?;
             let max_quarantine_pct: Option<f64> = row.get_by_name("quarantine_max_pct")?;
             let max_quarantine_count: Option<i64> = row.get_by_name("quarantine_max_count")?;
@@ -608,7 +601,11 @@ fn load_sink_configs(
                 topic: row.get_by_name("topic_name")?,
                 uri: row.get_by_name("uri")?,
                 mode,
-                quarantine_config: if has_quarantine { Some(quarantine_config) } else { None },
+                quarantine_config: if has_quarantine {
+                    Some(quarantine_config)
+                } else {
+                    None
+                },
                 schema: None,
             });
         }
@@ -650,10 +647,7 @@ fn load_existing_output_targets(
         .collect())
 }
 
-fn load_file_generation(
-    conn: &DbConnection,
-    file_ids: &[i64],
-) -> Result<HashMap<i64, (i64, i64)>> {
+fn load_file_generation(conn: &DbConnection, file_ids: &[i64]) -> Result<HashMap<i64, (i64, i64)>> {
     if file_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -706,9 +700,7 @@ fn load_existing_materialization_keys(
     Ok(existing)
 }
 
-fn output_target_keys_for_sinks(
-    sinks: &[SinkConfig],
-) -> Vec<String> {
+fn output_target_keys_for_sinks(sinks: &[SinkConfig]) -> Vec<String> {
     sinks
         .iter()
         .filter(|sink| !is_default_sink(&sink.topic))
@@ -762,7 +754,8 @@ fn enqueue_jobs(
             };
             let mut keys = Vec::with_capacity(output_targets.len());
             for target_key in &output_targets {
-                let key = materialization_key(*file_id, *mtime, *size, &manifest.fingerprint, target_key);
+                let key =
+                    materialization_key(*file_id, *mtime, *size, &manifest.fingerprint, target_key);
                 keys.push(key.clone());
                 all_keys.push(key);
             }
@@ -792,7 +785,7 @@ fn enqueue_jobs(
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                 ],
             )
-            
+
             .context("Failed to enqueue job")?;
             summary.queued += 1;
         } else {

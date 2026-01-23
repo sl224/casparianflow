@@ -15,7 +15,7 @@ use super::{Job, JobId};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Persistent job store
 pub struct JobStore {
@@ -27,9 +27,8 @@ impl JobStore {
     /// Create a new job store
     pub fn new(dir: PathBuf) -> Result<Self> {
         // Ensure directory exists
-        fs::create_dir_all(&dir).with_context(|| {
-            format!("Failed to create job store directory: {}", dir.display())
-        })?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create job store directory: {}", dir.display()))?;
 
         Ok(Self { dir })
     }
@@ -44,9 +43,8 @@ impl JobStore {
         let path = self.job_path(&job.id);
         let json = serde_json::to_string_pretty(job)?;
 
-        fs::write(&path, json).with_context(|| {
-            format!("Failed to write job file: {}", path.display())
-        })?;
+        atomic_write(&path, json.as_bytes())
+            .with_context(|| format!("Failed to write job file: {}", path.display()))?;
 
         debug!("Saved job {} to {}", job.id, path.display());
         Ok(())
@@ -60,13 +58,11 @@ impl JobStore {
             return Ok(None);
         }
 
-        let json = fs::read_to_string(&path).with_context(|| {
-            format!("Failed to read job file: {}", path.display())
-        })?;
+        let json = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read job file: {}", path.display()))?;
 
-        let job: Job = serde_json::from_str(&json).with_context(|| {
-            format!("Failed to parse job file: {}", path.display())
-        })?;
+        let job: Job = serde_json::from_str(&json)
+            .with_context(|| format!("Failed to parse job file: {}", path.display()))?;
 
         Ok(Some(job))
     }
@@ -87,19 +83,11 @@ impl JobStore {
                 continue;
             }
 
-            match fs::read_to_string(&path) {
-                Ok(json) => match serde_json::from_str::<Job>(&json) {
-                    Ok(job) => {
-                        jobs.push(job);
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse job file {}: {}", path.display(), e);
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to read job file {}: {}", path.display(), e);
-                }
-            }
+            let json = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read job file: {}", path.display()))?;
+            let job: Job = serde_json::from_str(&json)
+                .with_context(|| format!("Failed to parse job file: {}", path.display()))?;
+            jobs.push(job);
         }
 
         debug!("Loaded {} jobs from {}", jobs.len(), self.dir.display());
@@ -114,9 +102,8 @@ impl JobStore {
             return Ok(false);
         }
 
-        fs::remove_file(&path).with_context(|| {
-            format!("Failed to delete job file: {}", path.display())
-        })?;
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to delete job file: {}", path.display()))?;
 
         debug!("Deleted job {} from {}", id, path.display());
         Ok(true)
@@ -126,6 +113,17 @@ impl JobStore {
     pub fn dir(&self) -> &PathBuf {
         &self.dir
     }
+}
+
+/// Atomic write via temp file + rename
+fn atomic_write(path: &PathBuf, content: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let temp_path = parent.join(format!(".tmp_{}", uuid::Uuid::new_v4()));
+    fs::write(&temp_path, content)
+        .with_context(|| format!("Failed to write temp file: {}", temp_path.display()))?;
+    fs::rename(&temp_path, path)
+        .with_context(|| format!("Failed to rename temp file to {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -139,7 +137,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = JobStore::new(temp.path().to_path_buf()).unwrap();
 
-        let job = Job::new(JobType::Backtest);
+        let job = Job::new(JobId::new(1), JobType::Backtest);
         let id = job.id.clone();
 
         store.save(&job).unwrap();
@@ -154,7 +152,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = JobStore::new(temp.path().to_path_buf()).unwrap();
 
-        let id = JobId::from_string("nonexistent");
+        let id = JobId::new(9999);
         let loaded = store.load(&id).unwrap();
         assert!(loaded.is_none());
     }
@@ -165,8 +163,8 @@ mod tests {
         let store = JobStore::new(temp.path().to_path_buf()).unwrap();
 
         // Save multiple jobs
-        for _ in 0..3 {
-            let job = Job::new(JobType::Backtest);
+        for i in 0..3 {
+            let job = Job::new(JobId::new(i + 1), JobType::Backtest);
             store.save(&job).unwrap();
         }
 
@@ -179,7 +177,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = JobStore::new(temp.path().to_path_buf()).unwrap();
 
-        let job = Job::new(JobType::Backtest);
+        let job = Job::new(JobId::new(1), JobType::Backtest);
         let id = job.id.clone();
 
         store.save(&job).unwrap();

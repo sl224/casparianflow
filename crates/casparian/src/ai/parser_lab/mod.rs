@@ -40,12 +40,12 @@ pub mod generator;
 pub mod sample_reader;
 pub mod validator;
 
-pub use generator::{ParserGenerator, GeneratedParser, ParserOptions};
-pub use sample_reader::{SampleReader, SampleAnalysis, FileFormat, ColumnInfo};
-pub use validator::{ParserValidator, ParserValidationResult};
+pub use generator::{GeneratedParser, ParserGenerator, ParserOptions};
+pub use sample_reader::{ColumnInfo, FileFormat, SampleAnalysis, SampleReader};
+pub use validator::{ParserValidationResult, ParserValidator};
 
-use crate::ai::types::{Draft, DraftContext, DraftType};
 use crate::ai::draft::DraftManager;
+use crate::ai::types::{Draft, DraftContext, DraftType};
 
 /// Result of Parser Lab analysis and generation
 #[derive(Debug, Clone)]
@@ -152,7 +152,8 @@ impl ParserLab {
 
         // Step 2: Generate parser code
         let (parser_code, parser_name, special_columns, warnings) =
-            self.generator.generate(&analysis, options.unwrap_or_default(), hints)?;
+            self.generator
+                .generate(&analysis, options.unwrap_or_default(), hints)?;
 
         // Step 3: Assess complexity
         let complexity = self.assess_complexity(&analysis, &special_columns);
@@ -186,14 +187,23 @@ impl ParserLab {
     }
 
     /// Assess complexity based on analysis
-    fn assess_complexity(&self, analysis: &SampleAnalysis, special_columns: &[String]) -> Complexity {
-        let has_dates = special_columns.iter().any(|c| c.contains("date") || c.contains("time"));
+    fn assess_complexity(
+        &self,
+        analysis: &SampleAnalysis,
+        special_columns: &[String],
+    ) -> Complexity {
+        let has_dates = special_columns
+            .iter()
+            .any(|c| c.contains("date") || c.contains("time"));
         let has_nulls = analysis.columns.iter().any(|c| c.nullable);
         let column_count = analysis.columns.len();
 
         // Check for nested structures (JSON)
         let is_nested = matches!(analysis.format, FileFormat::Json | FileFormat::Ndjson)
-            && analysis.columns.iter().any(|c| c.data_type.contains("struct") || c.data_type.contains("list"));
+            && analysis
+                .columns
+                .iter()
+                .any(|c| c.data_type.contains("struct") || c.data_type.contains("list"));
 
         if is_nested || column_count > 20 {
             Complexity::Complex
@@ -211,14 +221,12 @@ impl ParserLab {
         draft_manager: &DraftManager,
         context: DraftContext,
     ) -> Result<Draft> {
-        let draft = draft_manager
-            .create_draft(
-                DraftType::Parser,
-                &result.parser_code,
-                context,
-                None, // No model needed - rule-based generation
-            )
-            ?;
+        let draft = draft_manager.create_draft(
+            DraftType::Parser,
+            &result.parser_code,
+            context,
+            None, // No model needed - rule-based generation
+        )?;
 
         Ok(draft)
     }
@@ -237,7 +245,13 @@ mod tests {
     #[test]
     fn test_complexity_description() {
         assert_eq!(Complexity::Simple.description(), "Simple flat structure");
-        assert_eq!(Complexity::Moderate.description(), "Moderate (dates, nulls, conversions)");
-        assert_eq!(Complexity::Complex.description(), "Complex (nested, custom logic)");
+        assert_eq!(
+            Complexity::Moderate.description(),
+            "Moderate (dates, nulls, conversions)"
+        );
+        assert_eq!(
+            Complexity::Complex.description(),
+            "Complex (nested, custom logic)"
+        );
     }
 }

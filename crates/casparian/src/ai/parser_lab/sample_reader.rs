@@ -3,9 +3,9 @@
 //! Reads sample files and detects format, schema, and data types.
 //! Supports CSV, TSV, JSON, NDJSON, and Parquet files.
 
-use std::path::Path;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 use super::ParserLabError;
 
@@ -141,9 +141,10 @@ impl SampleReader {
             FileFormat::Ndjson => self.analyze_ndjson(path),
             FileFormat::Parquet => self.analyze_parquet(path),
             FileFormat::Unknown => Err(ParserLabError::UnsupportedFormat(
-                file_path.extension()
+                file_path
+                    .extension()
                     .map(|e| e.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "no extension".to_string())
+                    .unwrap_or_else(|| "no extension".to_string()),
             )),
         }
     }
@@ -160,11 +161,12 @@ impl SampleReader {
             Some("tsv") | Some("tab") => Ok(FileFormat::Tsv),
             Some("json") => {
                 // Check if it's JSON array or NDJSON
-                let file = File::open(path)
-                    .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
+                let file =
+                    File::open(path).map_err(|e| ParserLabError::ReadError(e.to_string()))?;
                 let mut reader = BufReader::new(file);
                 let mut first_line = String::new();
-                reader.read_line(&mut first_line)
+                reader
+                    .read_line(&mut first_line)
                     .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
 
                 let trimmed = first_line.trim();
@@ -184,11 +186,11 @@ impl SampleReader {
 
     /// Detect format by examining file content
     fn detect_format_from_content(&self, path: &Path) -> super::Result<FileFormat> {
-        let file = File::open(path)
-            .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
+        let file = File::open(path).map_err(|e| ParserLabError::ReadError(e.to_string()))?;
         let mut reader = BufReader::new(file);
         let mut first_line = String::new();
-        reader.read_line(&mut first_line)
+        reader
+            .read_line(&mut first_line)
             .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
 
         let trimmed = first_line.trim();
@@ -222,8 +224,7 @@ impl SampleReader {
 
     /// Analyze CSV/TSV file
     fn analyze_csv(&self, path: &str, format: FileFormat) -> super::Result<SampleAnalysis> {
-        let file = File::open(path)
-            .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
+        let file = File::open(path).map_err(|e| ParserLabError::ReadError(e.to_string()))?;
         let reader = BufReader::new(file);
 
         let delimiter = if format == FileFormat::Tsv { '\t' } else { ',' };
@@ -232,7 +233,8 @@ impl SampleReader {
         let mut total_lines = 0;
 
         // Read first line for header
-        let header_line = lines.next()
+        let header_line = lines
+            .next()
             .ok_or_else(|| ParserLabError::ReadError("Empty file".to_string()))?
             .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
 
@@ -317,22 +319,20 @@ impl SampleReader {
 
     /// Analyze JSON file
     fn analyze_json(&self, path: &str) -> super::Result<SampleAnalysis> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| ParserLabError::ReadError(e.to_string()))?;
 
         let value: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| ParserLabError::ReadError(format!("Invalid JSON: {}", e)))?;
 
         match value {
-            serde_json::Value::Array(arr) => {
-                self.analyze_json_array(&arr)
-            }
+            serde_json::Value::Array(arr) => self.analyze_json_array(&arr),
             serde_json::Value::Object(obj) => {
                 // Single object - treat as one row
                 self.analyze_json_array(&[serde_json::Value::Object(obj)])
             }
             _ => Err(ParserLabError::SchemaInferenceFailed(
-                "JSON must be an array or object".to_string()
+                "JSON must be an array or object".to_string(),
             )),
         }
     }
@@ -422,7 +422,11 @@ impl SampleReader {
             serde_json::Value::Null => "null",
             serde_json::Value::Bool(_) => "boolean",
             serde_json::Value::Number(n) => {
-                if n.is_i64() { "int64" } else { "float64" }
+                if n.is_i64() {
+                    "int64"
+                } else {
+                    "float64"
+                }
             }
             serde_json::Value::String(_) => "string",
             serde_json::Value::Array(_) => "list",
@@ -440,8 +444,7 @@ impl SampleReader {
 
     /// Analyze NDJSON file
     fn analyze_ndjson(&self, path: &str) -> super::Result<SampleAnalysis> {
-        let file = File::open(path)
-            .map_err(|e| ParserLabError::ReadError(e.to_string()))?;
+        let file = File::open(path).map_err(|e| ParserLabError::ReadError(e.to_string()))?;
         let reader = BufReader::new(file);
 
         let mut objects: Vec<serde_json::Value> = Vec::new();
@@ -477,32 +480,42 @@ impl SampleReader {
     }
 
     /// Infer column types from sample data
-    fn infer_column_types(&self, headers: &[String], sample_rows: &[Vec<String>]) -> Vec<ColumnInfo> {
-        headers.iter().enumerate().map(|(i, name)| {
-            let values: Vec<&str> = sample_rows.iter()
-                .filter_map(|row| row.get(i).map(|s| s.as_str()))
-                .collect();
+    fn infer_column_types(
+        &self,
+        headers: &[String],
+        sample_rows: &[Vec<String>],
+    ) -> Vec<ColumnInfo> {
+        headers
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let values: Vec<&str> = sample_rows
+                    .iter()
+                    .filter_map(|row| row.get(i).map(|s| s.as_str()))
+                    .collect();
 
-            let (data_type, format) = self.infer_type(&values);
-            let nullable = values.iter().any(|v| v.is_empty() || *v == "null" || *v == "NULL" || *v == "NA");
-            let sample_values: Vec<String> = values.iter()
-                .take(5)
-                .map(|s| s.to_string())
-                .collect();
+                let (data_type, format) = self.infer_type(&values);
+                let nullable = values
+                    .iter()
+                    .any(|v| v.is_empty() || *v == "null" || *v == "NULL" || *v == "NA");
+                let sample_values: Vec<String> =
+                    values.iter().take(5).map(|s| s.to_string()).collect();
 
-            ColumnInfo {
-                name: name.clone(),
-                data_type,
-                nullable,
-                sample_values,
-                format,
-            }
-        }).collect()
+                ColumnInfo {
+                    name: name.clone(),
+                    data_type,
+                    nullable,
+                    sample_values,
+                    format,
+                }
+            })
+            .collect()
     }
 
     /// Infer type from sample values
     fn infer_type(&self, values: &[&str]) -> (String, Option<String>) {
-        let non_empty: Vec<&str> = values.iter()
+        let non_empty: Vec<&str> = values
+            .iter()
             .copied()
             .filter(|v| !v.is_empty() && v != &"null" && v != &"NULL" && v != &"NA")
             .collect();
@@ -592,7 +605,8 @@ impl SampleReader {
             *counts.entry(t).or_insert(0) += 1;
         }
 
-        counts.into_iter()
+        counts
+            .into_iter()
             .max_by_key(|(_, count)| *count)
             .map(|(t, _)| t)
             .unwrap_or("string")
@@ -639,7 +653,9 @@ mod tests {
         std::fs::write(&path, "name,age,active\nAlice,30,true\nBob,25,false").unwrap();
 
         let reader = SampleReader::new();
-        let analysis = reader.analyze(&[path.to_string_lossy().to_string()]).unwrap();
+        let analysis = reader
+            .analyze(&[path.to_string_lossy().to_string()])
+            .unwrap();
 
         assert_eq!(analysis.format, FileFormat::Csv);
         assert!(analysis.has_header);

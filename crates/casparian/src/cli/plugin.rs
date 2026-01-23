@@ -8,9 +8,11 @@
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::print_table;
-use casparian::trust::{load_default_trust_config, PublicKeyBase64, SignerId, TrustConfig, TrustMode};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
+use casparian::trust::{
+    load_default_trust_config, PublicKeyBase64, SignerId, TrustConfig, TrustMode,
+};
 use casparian_db::{DbConnection, DbTimestamp, DbValue};
 use casparian_protocol::{PluginStatus, RuntimeKind, SchemaDefinition};
 use casparian_schema::approval::derive_scope_id;
@@ -122,8 +124,7 @@ fn cmd_import(bundle_root: PathBuf) -> Result<()> {
         );
     }
 
-    let trust = load_default_trust_config()
-        .context("Failed to load trust configuration")?;
+    let trust = load_default_trust_config().context("Failed to load trust configuration")?;
     let (signature_verified, signer_id) =
         verify_bundle_signature(&index_bytes, bundle_root.join("bundle.sig"), &trust)?;
 
@@ -137,12 +138,8 @@ fn cmd_import(bundle_root: PathBuf) -> Result<()> {
     let source_code = format!("binary_sha256:{}", binary_hash);
     let manifest_json =
         serde_json::to_string(&manifest).context("Failed to serialize manifest JSON")?;
-    let artifact_hash = compute_artifact_hash(
-        &source_code,
-        "",
-        &manifest_json,
-        &schema_artifacts_json,
-    );
+    let artifact_hash =
+        compute_artifact_hash(&source_code, "", &manifest_json, &schema_artifacts_json);
 
     let install_root = install_path(&manifest)?;
     if install_root.exists() {
@@ -183,9 +180,7 @@ fn cmd_import(bundle_root: PathBuf) -> Result<()> {
 
     println!(
         "✓ Imported {} v{} ({})",
-        manifest.name,
-        manifest.version,
-        manifest.entrypoint
+        manifest.name, manifest.version, manifest.entrypoint
     );
     Ok(())
 }
@@ -225,14 +220,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
     }
 
     let headers = [
-        "Plugin",
-        "Version",
-        "Runtime",
-        "Platform",
-        "Signed",
-        "Signer",
-        "Status",
-        "Created",
+        "Plugin", "Version", "Runtime", "Platform", "Signed", "Signer", "Status", "Created",
     ];
     let rows = plugins
         .into_iter()
@@ -297,8 +285,7 @@ fn cmd_verify(target: &str, os: Option<String>, arch: Option<String>) -> Result<
         for row in rows {
             let row_os: Option<String> = row.get_by_name("platform_os")?;
             let row_arch: Option<String> = row.get_by_name("platform_arch")?;
-            if row_os.as_deref() == Some(os.as_str())
-                && row_arch.as_deref() == Some(arch.as_str())
+            if row_os.as_deref() == Some(os.as_str()) && row_arch.as_deref() == Some(arch.as_str())
             {
                 let runtime: String = row.get_by_name("runtime_kind")?;
                 matched = Some((runtime, row_os, row_arch));
@@ -326,8 +313,7 @@ fn cmd_verify(target: &str, os: Option<String>, arch: Option<String>) -> Result<
     let (index, index_bytes) = load_bundle_index(&bundle_root)?;
     verify_bundle_files(&bundle_root, &index)?;
 
-    let trust = load_default_trust_config()
-        .context("Failed to load trust configuration")?;
+    let trust = load_default_trust_config().context("Failed to load trust configuration")?;
     let (signature_verified, signer_id) =
         verify_bundle_signature(&index_bytes, bundle_root.join("bundle.sig"), &trust)?;
 
@@ -353,8 +339,8 @@ fn load_bundle_index(bundle_root: &Path) -> Result<(BundleIndex, Vec<u8>)> {
     }
     let index_bytes = fs::read(&index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
-    let index: BundleIndex = serde_json::from_slice(&index_bytes)
-        .context("Failed to parse bundle.index.json")?;
+    let index: BundleIndex =
+        serde_json::from_slice(&index_bytes).context("Failed to parse bundle.index.json")?;
     if index.files.is_empty() {
         anyhow::bail!("bundle.index.json must list at least one file");
     }
@@ -368,15 +354,19 @@ fn verify_bundle_files(bundle_root: &Path, index: &BundleIndex) -> Result<()> {
             anyhow::bail!("bundle.index.json has an empty file path");
         }
         let rel = Path::new(&file.path);
-        if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             anyhow::bail!("bundle.index.json contains an unsafe path: {}", file.path);
         }
         let path = bundle_root.join(rel);
         if !path.exists() {
             anyhow::bail!("Bundle file missing: {}", path.display());
         }
-        let bytes = fs::read(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
         let hash = sha256(&bytes);
         if hash != file.sha256 {
             anyhow::bail!(
@@ -401,8 +391,8 @@ fn verify_bundle_signature(
     sig_path: PathBuf,
     trust: &TrustConfig,
 ) -> Result<(bool, Option<SignerId>)> {
-    let require_signature = matches!(trust.mode, TrustMode::VaultSignedOnly)
-        && !trust.allow_unsigned_native;
+    let require_signature =
+        matches!(trust.mode, TrustMode::VaultSignedOnly) && !trust.allow_unsigned_native;
     if !sig_path.exists() {
         if require_signature {
             anyhow::bail!("bundle.sig is required but missing");
@@ -440,15 +430,15 @@ fn verify_bundle_signature(
     hasher.update(index_bytes);
     let index_digest = hasher.finalize();
 
-    let candidates: Vec<(&SignerId, &PublicKeyBase64)> =
-        if trust.allowed_signers.is_empty() {
-            trust.keys.iter().collect()
-        } else {
-            trust.allowed_signers
-                .iter()
-                .filter_map(|signer| trust.keys.get_key_value(signer))
-                .collect()
-        };
+    let candidates: Vec<(&SignerId, &PublicKeyBase64)> = if trust.allowed_signers.is_empty() {
+        trust.keys.iter().collect()
+    } else {
+        trust
+            .allowed_signers
+            .iter()
+            .filter_map(|signer| trust.keys.get_key_value(signer))
+            .collect()
+    };
 
     for (signer_id, key) in candidates {
         let key_bytes = general_purpose::STANDARD
@@ -479,8 +469,8 @@ fn load_manifest(path: &Path) -> Result<BundleManifest> {
     if !path.exists() {
         anyhow::bail!("casparian.toml missing from bundle");
     }
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let manifest: BundleManifest =
         toml::from_str(&content).context("Failed to parse casparian.toml")?;
 
@@ -570,7 +560,10 @@ fn load_schema_definitions(bundle_root: &Path) -> Result<BTreeMap<String, Schema
 
 fn install_path(manifest: &BundleManifest) -> Result<PathBuf> {
     let home = config::casparian_home();
-    let base = home.join("plugins").join(&manifest.name).join(&manifest.version);
+    let base = home
+        .join("plugins")
+        .join(&manifest.name)
+        .join(&manifest.version);
     match manifest.runtime_kind {
         RuntimeKind::NativeExec => {
             let os = manifest
@@ -588,8 +581,7 @@ fn install_path(manifest: &BundleManifest) -> Result<PathBuf> {
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .with_context(|| format!("Failed to create {}", dst.display()))?;
+    fs::create_dir_all(dst).with_context(|| format!("Failed to create {}", dst.display()))?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -598,8 +590,9 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         if file_type.is_dir() {
             copy_dir_all(&from, &to)?;
         } else if file_type.is_file() {
-            fs::copy(&from, &to)
-                .with_context(|| format!("Failed to copy {} to {}", from.display(), to.display()))?;
+            fs::copy(&from, &to).with_context(|| {
+                format!("Failed to copy {} to {}", from.display(), to.display())
+            })?;
         }
     }
     Ok(())
@@ -759,9 +752,7 @@ fn register_schema_contracts(
     version: &str,
     signer_id: Option<&SignerId>,
 ) -> Result<()> {
-    let approved_by = signer_id
-        .map(|id| id.as_str())
-        .unwrap_or("bundle_import");
+    let approved_by = signer_id.map(|id| id.as_str()).unwrap_or("bundle_import");
 
     for (output_name, schema_def) in schema_defs {
         let locked_schema = locked_schema_from_definition(output_name, schema_def)?;
@@ -822,7 +813,10 @@ fn locked_schema_from_definition(
         );
     }
     if schema_def.columns.is_empty() {
-        anyhow::bail!("Schema for '{}' must include at least one column", output_name);
+        anyhow::bail!(
+            "Schema for '{}' must include at least one column",
+            output_name
+        );
     }
 
     let mut seen = HashSet::new();
@@ -874,10 +868,16 @@ fn compute_artifact_hash(
 
 fn parse_target(target: &str) -> Result<(String, String)> {
     let (name, version) = target.split_once('@').ok_or_else(|| {
-        anyhow::anyhow!("Target must be in the format name@version (got '{}')", target)
+        anyhow::anyhow!(
+            "Target must be in the format name@version (got '{}')",
+            target
+        )
     })?;
     if name.trim().is_empty() || version.trim().is_empty() {
-        anyhow::bail!("Target must be in the format name@version (got '{}')", target);
+        anyhow::bail!(
+            "Target must be in the format name@version (got '{}')",
+            target
+        );
     }
     Ok((name.to_string(), version.to_string()))
 }
@@ -937,10 +937,7 @@ mod tests {
         } else {
             "native_plugin_basic"
         };
-        let binary_path = fixture_dir
-            .join("target")
-            .join("release")
-            .join(binary_name);
+        let binary_path = fixture_dir.join("target").join("release").join(binary_name);
         assert!(binary_path.exists(), "fixture binary missing");
 
         let bundle_dir = TempDir::new().unwrap();
@@ -1020,10 +1017,7 @@ test_signer = "{pub_key}"
         let row = conn
             .query_optional(
                 "SELECT 1 FROM cf_plugin_manifest WHERE plugin_name = ? AND version = ?",
-                &[
-                    DbValue::from("native_plugin_basic"),
-                    DbValue::from("0.1.0"),
-                ],
+                &[DbValue::from("native_plugin_basic"), DbValue::from("0.1.0")],
             )
             .unwrap();
         assert!(row.is_some(), "plugin manifest row missing");

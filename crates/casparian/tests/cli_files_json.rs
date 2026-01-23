@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use casparian_db::{DbConnection, DbValue};
+use cli_support::{init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -47,36 +47,88 @@ fn test_files_json_filters_and_limits() {
         insert_source(&conn, SOURCE_ID, "test_source", "/data", now);
 
         let files = [
-            (1, "/data/sales/report.csv", "sales/report.csv", 10_000, "pending", None, None),
-            (2, "/data/sales/q1.csv", "sales/q1.csv", 5_000, "tagged", Some("sales"), None),
-            (3, "/data/sales/q2.csv", "sales/q2.csv", 6_000, "processed", Some("sales"), None),
-            (4, "/data/invoices/jan.json", "invoices/jan.json", 2_500, "processed", Some("invoices"), None),
-            (5, "/data/invoices/corrupt.json", "invoices/corrupt.json", 1_200, "failed", Some("invoices"), None),
-            (6, "/data/sales/bad.csv", "sales/bad.csv", 800, "failed", Some("sales"), Some("Row 15: invalid date format")),
-            (7, "/data/logs/access.log", "logs/access.log", 50_000, "pending", None, None),
-            (8, "/data/logs/error.log", "logs/error.log", 25_000, "pending", None, None),
+            (
+                1,
+                "/data/sales/report.csv",
+                "sales/report.csv",
+                10_000,
+                "pending",
+                None,
+                None,
+            ),
+            (
+                2,
+                "/data/sales/q1.csv",
+                "sales/q1.csv",
+                5_000,
+                "tagged",
+                Some("sales"),
+                None,
+            ),
+            (
+                3,
+                "/data/sales/q2.csv",
+                "sales/q2.csv",
+                6_000,
+                "processed",
+                Some("sales"),
+                None,
+            ),
+            (
+                4,
+                "/data/invoices/jan.json",
+                "invoices/jan.json",
+                2_500,
+                "processed",
+                Some("invoices"),
+                None,
+            ),
+            (
+                5,
+                "/data/invoices/corrupt.json",
+                "invoices/corrupt.json",
+                1_200,
+                "failed",
+                Some("invoices"),
+                None,
+            ),
+            (
+                6,
+                "/data/sales/bad.csv",
+                "sales/bad.csv",
+                800,
+                "failed",
+                Some("sales"),
+                Some("Row 15: invalid date format"),
+            ),
+            (
+                7,
+                "/data/logs/access.log",
+                "logs/access.log",
+                50_000,
+                "pending",
+                None,
+                None,
+            ),
+            (
+                8,
+                "/data/logs/error.log",
+                "logs/error.log",
+                25_000,
+                "pending",
+                None,
+                None,
+            ),
         ];
         for (id, path, rel_path, size, status, tag, error) in files {
             insert_file(
-                &conn,
-                id,
-                SOURCE_ID,
-                path,
-                rel_path,
-                size,
-                status,
-                tag,
-                error,
-                now,
+                &conn, id, SOURCE_ID, path, rel_path, size, status, tag, error, now,
             );
         }
     });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let base_args = vec!["files".to_string(), "--json".to_string()];
     let all_output: FilesOutput = run_cli_json(&base_args, &envs);
@@ -92,7 +144,10 @@ fn test_files_json_filters_and_limits() {
     ];
     let sales_output: FilesOutput = run_cli_json(&sales_args, &envs);
     assert_eq!(sales_output.summary.total, 3);
-    assert!(sales_output.files.iter().all(|f| f.tag.as_deref() == Some("sales")));
+    assert!(sales_output
+        .files
+        .iter()
+        .all(|f| f.tag.as_deref() == Some("sales")));
 
     let failed_args = vec![
         "files".to_string(),
@@ -223,10 +278,7 @@ fn insert_file(
 
 fn split_rel_path(rel_path: &str) -> (String, String) {
     match rel_path.rfind('/') {
-        Some(idx) => (
-            rel_path[..idx].to_string(),
-            rel_path[idx + 1..].to_string(),
-        ),
+        Some(idx) => (rel_path[..idx].to_string(), rel_path[idx + 1..].to_string()),
         None => ("".to_string(), rel_path.to_string()),
     }
 }

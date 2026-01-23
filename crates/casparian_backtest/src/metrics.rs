@@ -146,7 +146,11 @@ impl FailureSummary {
         self.by_category[idx] += 1;
 
         // Track failing files
-        if let Some(pos) = self.top_failing_files.iter().position(|(p, _)| p == file_path) {
+        if let Some(pos) = self
+            .top_failing_files
+            .iter()
+            .position(|(p, _)| p == file_path)
+        {
             self.top_failing_files[pos].1 += 1;
         } else {
             self.top_failing_files.push((file_path.to_string(), 1));
@@ -308,7 +312,8 @@ impl IterationMetrics {
     pub fn record_fail(&mut self, file_path: &str, category: FailureCategory, error_msg: &str) {
         self.files_tested += 1;
         self.files_failed += 1;
-        self.failure_summary.record_failure(file_path, category, error_msg);
+        self.failure_summary
+            .record_failure(file_path, category, error_msg);
         self.update_pass_rate();
     }
 
@@ -456,7 +461,10 @@ mod tests {
         // F-013: Use category_count() instead of HashMap indexing
         assert_eq!(summary.category_count(FailureCategory::TypeMismatch), 2);
         assert_eq!(summary.category_count(FailureCategory::NullNotAllowed), 1);
-        assert_eq!(summary.most_common_category(), Some(FailureCategory::TypeMismatch));
+        assert_eq!(
+            summary.most_common_category(),
+            Some(FailureCategory::TypeMismatch)
+        );
 
         summary.finalize(10);
         assert_eq!(summary.top_failing_files[0], ("/path/a.csv".to_string(), 2));

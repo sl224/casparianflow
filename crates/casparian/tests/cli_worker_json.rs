@@ -1,8 +1,8 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use casparian_db::DbValue;
 use casparian_protocol::{ProcessingStatus, WorkerStatus};
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use serde::Deserialize;
 use std::path::Path;
 use tempfile::TempDir;
@@ -104,10 +104,7 @@ fn test_worker_json_and_state_changes() {
     });
 
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let list_args = vec![
         "worker-cli".to_string(),
@@ -185,7 +182,10 @@ fn job_worker_cleared(db_path: &Path, job_id: i64) -> bool {
             )
             .expect("query job worker");
         row.and_then(|r| {
-            let host: Option<String> = r.get_by_name::<Option<String>>("worker_host").ok().flatten();
+            let host: Option<String> = r
+                .get_by_name::<Option<String>>("worker_host")
+                .ok()
+                .flatten();
             let pid: Option<i32> = r.get_by_name::<Option<i32>>("worker_pid").ok().flatten();
             Some(host.is_none() && pid.is_none())
         })

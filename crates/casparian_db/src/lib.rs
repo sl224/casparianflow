@@ -22,13 +22,13 @@ mod license;
 pub mod lock;
 
 pub use backend::{
-    AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbTimestamp,
-    DbTimestampError, DbTransaction, DbValue, FromDbValue,
+    AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbTimestamp, DbTimestampError,
+    DbTransaction, DbValue, FromDbValue,
 };
 pub use license::{License, LicenseError, LicenseTier};
-pub use lock::{lock_path_for, DbLockGuard, LockError};
 #[cfg(feature = "duckdb")]
 pub use lock::{is_locked, lock_exclusive, try_lock_exclusive, try_lock_shared};
+pub use lock::{lock_path_for, DbLockGuard, LockError};
 /// Database backend type.
 ///
 /// DuckDB is the only supported backend in v1.

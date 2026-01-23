@@ -14,6 +14,7 @@ members = [
     "crates/casparian_profiler",
     "crates/casparian_db",
     "crates/casparian_mcp",
+    "tauri-ui/src-tauri",
 ]
 default-members = [
     "crates/casparian",

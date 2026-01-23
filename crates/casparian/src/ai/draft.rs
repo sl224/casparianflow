@@ -98,27 +98,25 @@ impl DraftManager {
 
         // Insert into database
         let file_path_str = file_path.to_string_lossy().to_string();
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO cf_ai_drafts (
                     id, draft_type, file_path, status, source_context_json,
                     model_name, created_at, expires_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
-                &[
-                    DbValue::from(id.as_str()),
-                    DbValue::from(draft_type.as_str()),
-                    DbValue::from(file_path_str),
-                    DbValue::from(DraftStatus::Pending.as_str()),
-                    DbValue::from(context_json),
-                    DbValue::from(model_name),
-                    DbValue::from(now.timestamp_millis()),
-                    DbValue::from(expires_at.timestamp_millis()),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(id.as_str()),
+                DbValue::from(draft_type.as_str()),
+                DbValue::from(file_path_str),
+                DbValue::from(DraftStatus::Pending.as_str()),
+                DbValue::from(context_json),
+                DbValue::from(model_name),
+                DbValue::from(now.timestamp_millis()),
+                DbValue::from(expires_at.timestamp_millis()),
+            ],
+        )?;
 
         Ok(Draft {
             id,
@@ -136,18 +134,15 @@ impl DraftManager {
 
     /// Get a draft by ID
     pub fn get_draft(&self, id: &DraftId) -> Result<Option<Draft>> {
-        let row = self
-            .conn
-            .query_optional(
-                r#"
+        let row = self.conn.query_optional(
+            r#"
                 SELECT id, draft_type, file_path, status, source_context_json,
                        model_name, created_at, expires_at, approved_at, approved_by
                 FROM cf_ai_drafts
                 WHERE id = ?
                 "#,
-                &[DbValue::from(id.as_str())],
-            )
-            ?;
+            &[DbValue::from(id.as_str())],
+        )?;
 
         match row {
             Some(row) => Ok(Some(self.row_to_draft(&row)?)),
@@ -159,22 +154,19 @@ impl DraftManager {
     pub fn list_pending(&self) -> Result<Vec<Draft>> {
         let now_millis = Utc::now().timestamp_millis();
 
-        let rows = self
-            .conn
-            .query_all(
-                r#"
+        let rows = self.conn.query_all(
+            r#"
                 SELECT id, draft_type, file_path, status, source_context_json,
                        model_name, created_at, expires_at, approved_at, approved_by
                 FROM cf_ai_drafts
                 WHERE status = ? AND expires_at > ?
                 ORDER BY created_at DESC
                 "#,
-                &[
-                    DbValue::from(DraftStatus::Pending.as_str()),
-                    DbValue::from(now_millis),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(DraftStatus::Pending.as_str()),
+                DbValue::from(now_millis),
+            ],
+        )?;
 
         let mut drafts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -185,19 +177,16 @@ impl DraftManager {
 
     /// List drafts by type
     pub fn list_by_type(&self, draft_type: DraftType) -> Result<Vec<Draft>> {
-        let rows = self
-            .conn
-            .query_all(
-                r#"
+        let rows = self.conn.query_all(
+            r#"
                 SELECT id, draft_type, file_path, status, source_context_json,
                        model_name, created_at, expires_at, approved_at, approved_by
                 FROM cf_ai_drafts
                 WHERE draft_type = ?
                 ORDER BY created_at DESC
                 "#,
-                &[DbValue::from(draft_type.as_str())],
-            )
-            ?;
+            &[DbValue::from(draft_type.as_str())],
+        )?;
 
         let mut drafts = Vec::with_capacity(rows.len());
         for row in rows {
@@ -212,8 +201,7 @@ impl DraftManager {
     /// The actual commit to runtime configuration is handled by the caller.
     pub fn approve_draft(&self, id: &DraftId, approved_by: &str) -> Result<Draft> {
         let draft = self
-            .get_draft(id)
-            ?
+            .get_draft(id)?
             .ok_or_else(|| DraftError::NotFound(id.to_string()))?;
 
         if draft.status != DraftStatus::Pending {
@@ -227,21 +215,19 @@ impl DraftManager {
         let now = Utc::now();
         let now_millis = now.timestamp_millis();
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_ai_drafts
                 SET status = ?, approved_at = ?, approved_by = ?
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(DraftStatus::Approved.as_str()),
-                    DbValue::from(now_millis),
-                    DbValue::from(approved_by),
-                    DbValue::from(id.as_str()),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(DraftStatus::Approved.as_str()),
+                DbValue::from(now_millis),
+                DbValue::from(approved_by),
+                DbValue::from(id.as_str()),
+            ],
+        )?;
 
         Ok(Draft {
             status: DraftStatus::Approved,
@@ -254,27 +240,24 @@ impl DraftManager {
     /// Reject a draft
     pub fn reject_draft(&self, id: &DraftId) -> Result<()> {
         let draft = self
-            .get_draft(id)
-            ?
+            .get_draft(id)?
             .ok_or_else(|| DraftError::NotFound(id.to_string()))?;
 
         if draft.status != DraftStatus::Pending {
             return Err(DraftError::NotPending(draft.status.to_string()));
         }
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE cf_ai_drafts
                 SET status = ?
                 WHERE id = ?
                 "#,
-                &[
-                    DbValue::from(DraftStatus::Rejected.as_str()),
-                    DbValue::from(id.as_str()),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(DraftStatus::Rejected.as_str()),
+                DbValue::from(id.as_str()),
+            ],
+        )?;
 
         // Optionally delete the file
         if draft.file_path.exists() {
@@ -291,19 +274,16 @@ impl DraftManager {
         let now_millis = Utc::now().timestamp_millis();
 
         // Get expired drafts to delete their files
-        let expired_rows = self
-            .conn
-            .query_all(
-                r#"
+        let expired_rows = self.conn.query_all(
+            r#"
                 SELECT file_path FROM cf_ai_drafts
                 WHERE status = ? AND expires_at <= ?
                 "#,
-                &[
-                    DbValue::from(DraftStatus::Pending.as_str()),
-                    DbValue::from(now_millis),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(DraftStatus::Pending.as_str()),
+                DbValue::from(now_millis),
+            ],
+        )?;
 
         // Delete files
         for row in &expired_rows {
@@ -315,21 +295,18 @@ impl DraftManager {
         }
 
         // Update status in database
-        let result = self
-            .conn
-            .execute(
-                r#"
+        let result = self.conn.execute(
+            r#"
                 UPDATE cf_ai_drafts
                 SET status = ?
                 WHERE status = ? AND expires_at <= ?
                 "#,
-                &[
-                    DbValue::from(DraftStatus::Expired.as_str()),
-                    DbValue::from(DraftStatus::Pending.as_str()),
-                    DbValue::from(now_millis),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(DraftStatus::Expired.as_str()),
+                DbValue::from(DraftStatus::Pending.as_str()),
+                DbValue::from(now_millis),
+            ],
+        )?;
 
         Ok(result as usize)
     }
@@ -373,12 +350,11 @@ impl DraftManager {
             .transpose()?
             .unwrap_or_default();
 
-        let created_at = chrono::DateTime::from_timestamp_millis(created_at_millis)
-            .unwrap_or_else(Utc::now);
-        let expires_at = chrono::DateTime::from_timestamp_millis(expires_at_millis)
-            .unwrap_or_else(Utc::now);
-        let approved_at = approved_at_millis
-            .and_then(chrono::DateTime::from_timestamp_millis);
+        let created_at =
+            chrono::DateTime::from_timestamp_millis(created_at_millis).unwrap_or_else(Utc::now);
+        let expires_at =
+            chrono::DateTime::from_timestamp_millis(expires_at_millis).unwrap_or_else(Utc::now);
+        let approved_at = approved_at_millis.and_then(chrono::DateTime::from_timestamp_millis);
 
         Ok(Draft {
             id: DraftId::from_str(&id),
@@ -450,7 +426,6 @@ mod tests {
                 context.clone(),
                 Some("qwen2.5-coder:7b"),
             )
-            
             .unwrap();
 
         assert_eq!(draft.draft_type, DraftType::Extractor);
@@ -473,13 +448,9 @@ mod tests {
                 DraftContext::default(),
                 None,
             )
-            
             .unwrap();
 
-        let approved = manager
-            .approve_draft(&draft.id, "test_user")
-            
-            .unwrap();
+        let approved = manager.approve_draft(&draft.id, "test_user").unwrap();
 
         assert_eq!(approved.status, DraftStatus::Approved);
         assert_eq!(approved.approved_by, Some("test_user".to_string()));
@@ -497,7 +468,6 @@ mod tests {
                 DraftContext::default(),
                 None,
             )
-            
             .unwrap();
 
         assert!(draft.file_path.exists());
@@ -522,7 +492,6 @@ mod tests {
                     DraftContext::default(),
                     None,
                 )
-                
                 .unwrap();
         }
 

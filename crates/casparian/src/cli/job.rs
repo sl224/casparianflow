@@ -192,9 +192,9 @@ fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
         .into());
     }
 
-    let job_id_db = job_id.to_i64().map_err(|err| {
-        HelpfulError::new(format!("Invalid job ID: {}", err))
-    })?;
+    let job_id_db = job_id
+        .to_i64()
+        .map_err(|err| HelpfulError::new(format!("Invalid job ID: {}", err)))?;
 
     // Reset job to QUEUED
     conn.execute(
@@ -212,8 +212,7 @@ fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             DbValue::from(ProcessingStatus::Queued.as_str()),
             DbValue::from(job_id_db),
         ],
-    )
-    ?;
+    )?;
 
     println!(
         "Job {} reset to {} for retry",
@@ -248,8 +247,7 @@ fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
                 DbValue::from(ProcessingStatus::Failed.as_str()),
                 DbValue::from(t),
             ],
-        )
-        ?
+        )?
     } else {
         conn.execute(
             r#"
@@ -266,8 +264,7 @@ fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
                 DbValue::from(ProcessingStatus::Queued.as_str()),
                 DbValue::from(ProcessingStatus::Failed.as_str()),
             ],
-        )
-        ?
+        )?
     };
 
     if rows_affected == 0 {
@@ -315,14 +312,16 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             // Staged jobs can also be cancelled
         }
         ProcessingStatus::Completed => {
-            return Err(HelpfulError::new(format!("Job {} already completed", job_id))
-                .with_context("Cannot cancel a completed job")
-                .into());
+            return Err(
+                HelpfulError::new(format!("Job {} already completed", job_id))
+                    .with_context("Cannot cancel a completed job")
+                    .into(),
+            );
         }
         ProcessingStatus::Failed => {
             return Err(HelpfulError::new(format!("Job {} already failed", job_id))
                 .with_context("Cannot cancel a failed job")
-                .with_suggestion("TRY: casparian job retry {}   # Retry the job instead", )
+                .with_suggestion("TRY: casparian job retry {}   # Retry the job instead")
                 .into());
         }
         ProcessingStatus::Skipped => {
@@ -334,9 +333,9 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
     // Cancel the job
     let now = chrono::Utc::now().to_rfc3339();
-    let job_id_db = job_id.to_i64().map_err(|err| {
-        HelpfulError::new(format!("Invalid job ID: {}", err))
-    })?;
+    let job_id_db = job_id
+        .to_i64()
+        .map_err(|err| HelpfulError::new(format!("Invalid job ID: {}", err)))?;
     conn.execute(
         r#"
         UPDATE cf_processing_queue
@@ -350,8 +349,7 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             DbValue::from(now),
             DbValue::from(job_id_db),
         ],
-    )
-    ?;
+    )?;
 
     println!("Job {} cancelled", job_id);
 
@@ -396,8 +394,7 @@ fn connect_db_readonly(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
 /// Get a single job by ID
 fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Job>> {
     let job_id_db = job_id.to_i64().map_err(|err| anyhow::anyhow!(err))?;
-    let has_quarantine_column =
-        column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
+    let has_quarantine_column = column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
     let has_quarantine_table = table_exists(conn, "cf_quarantine")?;
     let quarantine_select = if has_quarantine_column {
         ", COALESCE(q.quarantine_rows, 0) as quarantine_rows"
@@ -441,9 +438,7 @@ fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Jo
         quarantine_join = quarantine_join
     );
 
-    let row = conn
-        .query_optional(&query, &[DbValue::from(job_id_db)])
-        ?;
+    let row = conn.query_optional(&query, &[DbValue::from(job_id_db)])?;
 
     let job = match row {
         Some(r) => {
@@ -451,8 +446,9 @@ fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Jo
             let id = JobId::try_from(raw_id)
                 .map_err(|err| anyhow::anyhow!("Invalid job id {}: {}", raw_id, err))?;
             let status_str: String = r.get(3)?;
-            let status = status_str.parse::<ProcessingStatus>()
-                .map_err(|e| anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e))?;
+            let status = status_str.parse::<ProcessingStatus>().map_err(|e| {
+                anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e)
+            })?;
             Some(Job {
                 id,
                 file_path: r.get(1)?,
@@ -477,12 +473,10 @@ fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Jo
 fn get_job_failure(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<JobFailure>> {
     let job_id_db = job_id.to_i64().map_err(|err| anyhow::anyhow!(err))?;
     if !table_exists(conn, "cf_job_failures")? {
-        let error = conn
-            .query_optional(
-                "SELECT error_message FROM cf_processing_queue WHERE id = ?",
-                &[DbValue::from(job_id_db)],
-            )
-            ?;
+        let error = conn.query_optional(
+            "SELECT error_message FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job_id_db)],
+        )?;
         return Ok(error.and_then(|row| row.get(0).ok()).map(|msg| JobFailure {
             error_type: None,
             error_message: msg,
@@ -492,18 +486,16 @@ fn get_job_failure(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<
         }));
     }
 
-    let row = conn
-        .query_optional(
-            r#"
+    let row = conn.query_optional(
+        r#"
             SELECT error_type, error_message, stack_trace, line_number, context
             FROM cf_job_failures
             WHERE job_id = ?
             ORDER BY id DESC
             LIMIT 1
             "#,
-            &[DbValue::from(job_id_db)],
-        )
-        ?;
+        &[DbValue::from(job_id_db)],
+    )?;
 
     Ok(row.map(|r| JobFailure {
         error_type: r.get(0).ok(),
@@ -601,13 +593,16 @@ fn print_job_details(job: &Job, failure: &Option<JobFailure>, timeline: &JobTime
     println!();
     println!("TRY:");
     if job.status == ProcessingStatus::Failed {
-        println!("  casparian job retry {}            # Retry this job", job.id);
         println!(
-            "  casparian preview {}   # Inspect the file",
-            job.file_path
+            "  casparian job retry {}            # Retry this job",
+            job.id
         );
+        println!("  casparian preview {}   # Inspect the file", job.file_path);
     } else if job.status == ProcessingStatus::Queued || job.status == ProcessingStatus::Running {
-        println!("  casparian job cancel {}           # Cancel this job", job.id);
+        println!(
+            "  casparian job cancel {}           # Cancel this job",
+            job.id
+        );
     }
     println!("  casparian jobs                    # View all jobs");
 }

@@ -165,7 +165,14 @@ pub fn analyze_plugin(path: &Path) -> Result<PluginAnalysis> {
                 .filter(|l| l.starts_with("- ") || l.contains("Banned") || l.contains("error"))
                 .map(|s| s.to_string())
                 .collect();
-            (false, if errors.is_empty() { vec![error_str] } else { errors })
+            (
+                false,
+                if errors.is_empty() {
+                    vec![error_str]
+                } else {
+                    errors
+                },
+            )
         }
     };
 
@@ -242,7 +249,7 @@ fn detect_topic_registrations(source: &str) -> Vec<String> {
     for line in source.lines() {
         if let Some(pos) = line.find("register_topic(") {
             let after = &line[pos + 15..]; // Skip "register_topic("
-            // Find the quoted string
+                                           // Find the quoted string
             if let Some(quote_start) = after.find('"').or_else(|| after.find('\'')) {
                 let quote_char = after.chars().nth(quote_start).unwrap();
                 let rest = &after[quote_start + 1..];
@@ -518,8 +525,7 @@ pub fn prepare_publish(path: &Path) -> Result<PreparedArtifact> {
     let lockfile_path = plugin_dir.join("uv.lock");
 
     let lockfile_content = if lockfile_path.exists() {
-        std::fs::read_to_string(&lockfile_path)
-            .context("Failed to read uv.lock")?
+        std::fs::read_to_string(&lockfile_path).context("Failed to read uv.lock")?
     } else {
         // Run uv lock (Real I/O)
         tracing::info!("No uv.lock found, running `uv lock` in {:?}...", plugin_dir);
@@ -622,7 +628,9 @@ class Handler:
     fn test_analyze_plugin_valid() {
         let temp_dir = TempDir::new().unwrap();
         let plugin_path = temp_dir.path().join("my_plugin.py");
-        std::fs::write(&plugin_path, r#"
+        std::fs::write(
+            &plugin_path,
+            r#"
 import pandas as pd
 
 class Handler:
@@ -632,7 +640,9 @@ class Handler:
     def execute(self, file_path):
         df = pd.read_csv(file_path)
         self.context.publish(self.handle, df)
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let analysis = analyze_plugin(&plugin_path).unwrap();
         assert_eq!(analysis.plugin_name, "my_plugin");
@@ -647,14 +657,18 @@ class Handler:
     fn test_analyze_plugin_invalid() {
         let temp_dir = TempDir::new().unwrap();
         let plugin_path = temp_dir.path().join("bad_plugin.py");
-        std::fs::write(&plugin_path, r#"
+        std::fs::write(
+            &plugin_path,
+            r#"
 import os
 import subprocess
 
 class Handler:
     def execute(self, path):
         os.system("rm -rf /")
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let analysis = analyze_plugin(&plugin_path).unwrap();
         assert!(!analysis.is_valid);

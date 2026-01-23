@@ -3,17 +3,100 @@
 //! Uses DbConnection to keep the actor boundary intact and reuse DuckDB
 //! query paths already in casparian_db.
 
+use crate::scout::FileStatus;
 use anyhow::{Context, Result};
 use casparian_protocol::{JobId, PipelineRunStatus};
-use crate::scout::FileStatus;
 use std::path::Path;
 
-use casparian_db::{DbConnection, DbValue};
+use casparian_db::{DbConnection, DbValue, UnifiedDbRow as DbRow};
 
 use super::types::{
     Pipeline, PipelineRun, SelectionFilters, SelectionResolution, SelectionSnapshot, WatermarkField,
 };
 use uuid::Uuid;
+
+/// Convert a database row to a PipelineRun. Errors on NULL for required fields.
+fn row_to_pipeline_run(row: DbRow) -> Result<PipelineRun> {
+    let status_raw: String = row
+        .get_by_name("status")
+        .context("Failed to read 'status' column from pipeline run")?;
+    let status = status_raw
+        .parse()
+        .map_err(|err| anyhow::anyhow!("Invalid pipeline run status '{}': {}", status_raw, err))?;
+
+    Ok(PipelineRun {
+        id: row
+            .get_by_name("id")
+            .context("Failed to read 'id' column from pipeline run")?,
+        pipeline_id: row
+            .get_by_name("pipeline_id")
+            .context("Failed to read 'pipeline_id' column from pipeline run")?,
+        selection_spec_id: row
+            .get_by_name("selection_spec_id")
+            .context("Failed to read 'selection_spec_id' column from pipeline run")?,
+        selection_snapshot_hash: row
+            .get_by_name("selection_snapshot_hash")
+            .context("Failed to read 'selection_snapshot_hash' column from pipeline run")?,
+        context_snapshot_hash: row
+            .get_by_name::<Option<String>>("context_snapshot_hash")
+            .context("Failed to read 'context_snapshot_hash' column from pipeline run")?,
+        logical_date: row
+            .get_by_name("logical_date")
+            .context("Failed to read 'logical_date' column from pipeline run")?,
+        status,
+        started_at: row
+            .get_by_name::<Option<String>>("started_at")
+            .context("Failed to read 'started_at' column from pipeline run")?,
+        completed_at: row
+            .get_by_name::<Option<String>>("completed_at")
+            .context("Failed to read 'completed_at' column from pipeline run")?,
+    })
+}
+
+/// Convert a database row to a SelectionSnapshot. Errors on NULL for required fields.
+fn row_to_selection_snapshot(row: &DbRow) -> Result<SelectionSnapshot> {
+    Ok(SelectionSnapshot {
+        id: row
+            .get_by_name("id")
+            .context("Failed to read 'id' column from selection snapshot")?,
+        spec_id: row
+            .get_by_name("spec_id")
+            .context("Failed to read 'spec_id' column from selection snapshot")?,
+        snapshot_hash: row
+            .get_by_name("snapshot_hash")
+            .context("Failed to read 'snapshot_hash' column from selection snapshot")?,
+        logical_date: row
+            .get_by_name("logical_date")
+            .context("Failed to read 'logical_date' column from selection snapshot")?,
+        watermark_value: row
+            .get_by_name::<Option<String>>("watermark_value")
+            .context("Failed to read 'watermark_value' column from selection snapshot")?,
+        created_at: row
+            .get_by_name("created_at")
+            .context("Failed to read 'created_at' column from selection snapshot")?,
+    })
+}
+
+/// Convert a database row to a Pipeline. Errors on NULL for required fields.
+fn row_to_pipeline(row: DbRow) -> Result<Pipeline> {
+    Ok(Pipeline {
+        id: row
+            .get_by_name("id")
+            .context("Failed to read 'id' column from pipeline")?,
+        name: row
+            .get_by_name("name")
+            .context("Failed to read 'name' column from pipeline")?,
+        version: row
+            .get_by_name("version")
+            .context("Failed to read 'version' column from pipeline")?,
+        config_json: row
+            .get_by_name("config_json")
+            .context("Failed to read 'config_json' column from pipeline")?,
+        created_at: row
+            .get_by_name("created_at")
+            .context("Failed to read 'created_at' column from pipeline")?,
+    })
+}
 
 pub struct DuckDbPipelineStore {
     conn: DbConnection,
@@ -22,8 +105,7 @@ pub struct DuckDbPipelineStore {
 impl DuckDbPipelineStore {
     pub fn open(db_path: &Path) -> Result<Self> {
         let db_url = format!("duckdb:{}", db_path.display());
-        let conn = DbConnection::open_from_url(&db_url)
-            .context("Failed to connect to DuckDB")?;
+        let conn = DbConnection::open_from_url(&db_url).context("Failed to connect to DuckDB")?;
         let store = Self { conn };
         store.initialize_tables()?;
         Ok(store)
@@ -57,31 +139,9 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(run_id)],
             )
-            
             .context("Failed to fetch pipeline run")?;
 
-        let run = match row {
-            Some(row) => {
-                let status_raw: String = row.get_by_name("status").unwrap_or_default();
-                let status = status_raw
-                    .parse()
-                    .map_err(|err| anyhow::anyhow!("Invalid pipeline run status '{}': {}", status_raw, err))?;
-                Some(PipelineRun {
-                    id: row.get_by_name("id").unwrap_or_default(),
-                    pipeline_id: row.get_by_name("pipeline_id").unwrap_or_default(),
-                    selection_spec_id: row.get_by_name("selection_spec_id").unwrap_or_default(),
-                    selection_snapshot_hash: row.get_by_name("selection_snapshot_hash").unwrap_or_default(),
-                    context_snapshot_hash: row.get_by_name("context_snapshot_hash").ok().flatten(),
-                    logical_date: row.get_by_name("logical_date").unwrap_or_default(),
-                    status,
-                    started_at: row.get_by_name("started_at").ok().flatten(),
-                    completed_at: row.get_by_name("completed_at").ok().flatten(),
-                })
-            }
-            None => None,
-        };
-
-        Ok(run)
+        row.map(row_to_pipeline_run).transpose()
     }
 
     pub fn get_pipeline_run_for_job(&self, job_id: JobId) -> Result<Option<PipelineRun>> {
@@ -97,31 +157,9 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(job_id)],
             )
-            
             .context("Failed to fetch pipeline run for job")?;
 
-        let run = match row {
-            Some(row) => {
-                let status_raw: String = row.get_by_name("status").unwrap_or_default();
-                let status = status_raw
-                    .parse()
-                    .map_err(|err| anyhow::anyhow!("Invalid pipeline run status '{}': {}", status_raw, err))?;
-                Some(PipelineRun {
-                    id: row.get_by_name("id").unwrap_or_default(),
-                    pipeline_id: row.get_by_name("pipeline_id").unwrap_or_default(),
-                    selection_spec_id: row.get_by_name("selection_spec_id").unwrap_or_default(),
-                    selection_snapshot_hash: row.get_by_name("selection_snapshot_hash").unwrap_or_default(),
-                    context_snapshot_hash: row.get_by_name("context_snapshot_hash").ok().flatten(),
-                    logical_date: row.get_by_name("logical_date").unwrap_or_default(),
-                    status,
-                    started_at: row.get_by_name("started_at").ok().flatten(),
-                    completed_at: row.get_by_name("completed_at").ok().flatten(),
-                })
-            }
-            None => None,
-        };
-
-        Ok(run)
+        row.map(row_to_pipeline_run).transpose()
     }
 
     pub fn get_selection_snapshot_by_hash(
@@ -146,17 +184,9 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(snapshot_hash)],
             )
-            
             .context("Failed to fetch selection snapshot")?;
 
-        Ok(row.map(|row| SelectionSnapshot {
-            id: row.get_by_name("id").unwrap_or_default(),
-            spec_id: row.get_by_name("spec_id").unwrap_or_default(),
-            snapshot_hash: row.get_by_name("snapshot_hash").unwrap_or_default(),
-            logical_date: row.get_by_name("logical_date").unwrap_or_default(),
-            watermark_value: row.get_by_name("watermark_value").ok().flatten(),
-            created_at: row.get_by_name("created_at").unwrap_or_default(),
-        }))
+        row.map(|r| row_to_selection_snapshot(&r)).transpose()
     }
 
     pub fn get_selection_snapshots_for_file(
@@ -183,21 +213,9 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(file_id), DbValue::from(limit)],
             )
-            
             .context("Failed to fetch selection snapshots for file")?;
 
-        rows.iter()
-            .map(|row| {
-                Ok(SelectionSnapshot {
-                    id: row.get_by_name("id")?,
-                    spec_id: row.get_by_name("spec_id")?,
-                    snapshot_hash: row.get_by_name("snapshot_hash")?,
-                    logical_date: row.get_by_name("logical_date")?,
-                    watermark_value: row.get_by_name("watermark_value").ok().flatten(),
-                    created_at: row.get_by_name("created_at")?,
-                })
-            })
-            .collect()
+        rows.iter().map(row_to_selection_snapshot).collect()
     }
 
     fn initialize_tables(&self) -> Result<()> {
@@ -267,7 +285,6 @@ impl DuckDbPipelineStore {
         );
         self.conn
             .execute_batch(&create_sql)
-            
             .context("Failed to initialize pipeline tables")?;
 
         Ok(())
@@ -282,7 +299,6 @@ impl DuckDbPipelineStore {
                 "INSERT INTO cf_selection_specs (id, spec_json) VALUES (?, ?)",
                 &[DbValue::from(id.as_str()), DbValue::from(spec_json)],
             )
-            
             .context("Failed to insert selection spec")?;
         Ok(id)
     }
@@ -311,7 +327,6 @@ impl DuckDbPipelineStore {
                     DbValue::from(watermark_value),
                 ],
             )
-            
             .context("Failed to insert selection snapshot")?;
         Ok(id)
     }
@@ -323,7 +338,6 @@ impl DuckDbPipelineStore {
                     "INSERT INTO cf_selection_snapshot_files (snapshot_id, file_id) VALUES (?, ?)",
                     &[DbValue::from(snapshot_id), DbValue::from(*file_id)],
                 )
-                
                 .context("Failed to insert snapshot file")?;
         }
         Ok(())
@@ -341,7 +355,6 @@ impl DuckDbPipelineStore {
                     DbValue::from(config_json),
                 ],
             )
-            
             .context("Failed to insert pipeline")?;
         Ok(id)
     }
@@ -359,16 +372,9 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(name)],
             )
-            
             .context("Failed to fetch latest pipeline")?;
 
-        Ok(row.map(|row| Pipeline {
-            id: row.get_by_name("id").unwrap_or_default(),
-            name: row.get_by_name("name").unwrap_or_default(),
-            version: row.get_by_name("version").unwrap_or_default(),
-            config_json: row.get_by_name("config_json").unwrap_or_default(),
-            created_at: row.get_by_name("created_at").unwrap_or_default(),
-        }))
+        row.map(row_to_pipeline).transpose()
     }
 
     pub fn create_pipeline_run(
@@ -405,7 +411,6 @@ impl DuckDbPipelineStore {
                     DbValue::from(status.as_str()),
                 ],
             )
-            
             .context("Failed to insert pipeline run")?;
         Ok(id)
     }
@@ -429,8 +434,10 @@ impl DuckDbPipelineStore {
         query.push_str(" WHERE id = ?");
 
         self.conn
-            .execute(&query, &[DbValue::from(status.as_str()), DbValue::from(run_id)])
-            
+            .execute(
+                &query,
+                &[DbValue::from(status.as_str()), DbValue::from(run_id)],
+            )
             .context("Failed to update pipeline run status")?;
         Ok(())
     }
@@ -446,7 +453,6 @@ impl DuckDbPipelineStore {
                 "#,
                 &[DbValue::from(pipeline_id), DbValue::from(logical_date)],
             )
-            
             .context("Failed to query pipeline runs")?;
         Ok(row.is_some())
     }
@@ -481,7 +487,6 @@ impl DuckDbPipelineStore {
         let rows = self
             .conn
             .query_all(&sql, &params)
-            
             .context("Failed to resolve selection files")?;
 
         let mut file_ids = Vec::with_capacity(rows.len());

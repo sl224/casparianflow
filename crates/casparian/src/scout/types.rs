@@ -45,7 +45,10 @@ fn parse_i64_id(label: &str, value: &str) -> Result<i64, IdParseError> {
 
 fn validate_i64_id(label: &str, value: i64) -> Result<i64, IdParseError> {
     if value <= 0 {
-        return Err(IdParseError::new(format!("Invalid {}: must be positive", label)));
+        return Err(IdParseError::new(format!(
+            "Invalid {}: must be positive",
+            label
+        )));
     }
     Ok(value)
 }
@@ -497,7 +500,7 @@ fn split_rel_path(rel_path: &str) -> (&str, &str) {
 /// - "README" → None
 fn extract_extension(name: &str) -> Option<String> {
     name.rsplit_once('.')
-        .filter(|(base, _)| !base.is_empty())  // Skip dotfiles like ".gitignore"
+        .filter(|(base, _)| !base.is_empty()) // Skip dotfiles like ".gitignore"
         .map(|(_, ext)| ext.to_lowercase())
 }
 
@@ -576,7 +579,6 @@ impl ScannedFile {
             extracted_at: None,
         }
     }
-
 }
 
 // ============================================================================

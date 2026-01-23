@@ -403,7 +403,9 @@ fn schema_sql(is_duckdb: bool) -> String {
         ("scout_extraction_log", "seq_scout_extraction_log"),
     ];
     for (table, seq) in replacements {
-        let needle = format!("CREATE TABLE IF NOT EXISTS {table} (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,");
+        let needle = format!(
+            "CREATE TABLE IF NOT EXISTS {table} (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        );
         let replace = format!(
             "CREATE TABLE IF NOT EXISTS {table} (\n    id BIGINT DEFAULT nextval('{seq}'),"
         );
@@ -542,7 +544,10 @@ impl Database {
         conn.execute_batch(&schema_sql)?;
         Self::validate_schema(&conn)?;
 
-        Ok(Self { conn, _temp_dir: None })
+        Ok(Self {
+            conn,
+            _temp_dir: None,
+        })
     }
 
     /// Validate schema columns and fail loud if the DB is outdated (pre-v1 policy).
@@ -634,24 +639,20 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// Called when a source is scanned or selected to bring it to the top of the list
     pub fn touch_source(&self, id: &SourceId) -> Result<()> {
         let now = now_millis();
-        self.conn
-            .execute(
-                "UPDATE scout_sources SET updated_at = ? WHERE id = ?",
-                &[now.into(), id.as_i64().into()],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE scout_sources SET updated_at = ? WHERE id = ?",
+            &[now.into(), id.as_i64().into()],
+        )?;
         Ok(())
     }
 
     /// Update the file_count for a source (called after scanning)
     /// This is stored directly in scout_sources so listing sources is O(sources) not O(files)
     pub fn update_source_file_count(&self, id: &SourceId, file_count: usize) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE scout_sources SET file_count = ? WHERE id = ?",
-                &[(file_count as i64).into(), id.as_i64().into()],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE scout_sources SET file_count = ? WHERE id = ?",
+            &[(file_count as i64).into(), id.as_i64().into()],
+        )?;
         Ok(())
     }
 
@@ -659,12 +660,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// This pre-computes the folder hierarchy so get_folder_counts doesn't need to scan all files
     pub fn populate_folder_cache(&self, source_id: &SourceId) -> Result<()> {
         // Clear existing folder cache for this source
-        self.conn
-            .execute(
-                "DELETE FROM scout_folders WHERE source_id = ?",
-                &[source_id.as_i64().into()],
-            )
-            ?;
+        self.conn.execute(
+            "DELETE FROM scout_folders WHERE source_id = ?",
+            &[source_id.as_i64().into()],
+        )?;
 
         // Compute root-level folders (most expensive query, but run once per scan)
         let root_folders = self.conn.query_all(
@@ -764,13 +763,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         if folder_rows.is_empty() && prefix.is_empty() {
             // No cache for root level - return None to trigger live query
             // But first check if source exists at all
-            let source_exists = self
-                .conn
-                .query_optional(
-                    "SELECT 1 FROM scout_sources WHERE id = ?",
-                    &[source_id.as_i64().into()],
-                )
-                ?;
+            let source_exists = self.conn.query_optional(
+                "SELECT 1 FROM scout_sources WHERE id = ?",
+                &[source_id.as_i64().into()],
+            )?;
 
             if source_exists.is_some() {
                 return Ok(None); // Source exists but no cache
@@ -877,16 +873,18 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// Delete a source and all associated data
     pub fn delete_source(&self, id: &SourceId) -> Result<bool> {
         // Delete associated files and tagging rules first
-        self.conn
-            .execute("DELETE FROM scout_files WHERE source_id = ?", &[id.as_i64().into()])
-            ?;
-        self.conn
-            .execute("DELETE FROM scout_tagging_rules WHERE source_id = ?", &[id.as_i64().into()])
-            ?;
-        let result = self
-            .conn
-            .execute("DELETE FROM scout_sources WHERE id = ?", &[id.as_i64().into()])
-            ?;
+        self.conn.execute(
+            "DELETE FROM scout_files WHERE source_id = ?",
+            &[id.as_i64().into()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM scout_tagging_rules WHERE source_id = ?",
+            &[id.as_i64().into()],
+        )?;
+        let result = self.conn.execute(
+            "DELETE FROM scout_sources WHERE id = ?",
+            &[id.as_i64().into()],
+        )?;
 
         Ok(result > 0)
     }
@@ -1060,10 +1058,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     /// Delete a tagging rule
     pub fn delete_tagging_rule(&self, id: &TaggingRuleId) -> Result<bool> {
-        let result = self
-            .conn
-            .execute("DELETE FROM scout_tagging_rules WHERE id = ?", &[id.as_i64().into()])
-            ?;
+        let result = self.conn.execute(
+            "DELETE FROM scout_tagging_rules WHERE id = ?",
+            &[id.as_i64().into()],
+        )?;
 
         Ok(result > 0)
     }
@@ -1094,13 +1092,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// If the file exists and mtime/size changed, resets status to pending.
     pub fn upsert_file(&self, file: &ScannedFile) -> Result<UpsertResult> {
         // Check if file exists
-        let existing = self
-            .conn
-            .query_optional(
-                "SELECT id, size, mtime, status FROM scout_files WHERE source_id = ? AND path = ?",
-                &[file.source_id.as_i64().into(), file.path.as_str().into()],
-            )
-            ?;
+        let existing = self.conn.query_optional(
+            "SELECT id, size, mtime, status FROM scout_files WHERE source_id = ? AND path = ?",
+            &[file.source_id.as_i64().into(), file.path.as_str().into()],
+        )?;
 
         let now = now_millis();
         match existing {
@@ -1130,13 +1125,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 )
                 ?;
 
-                let id: i64 = self
-                    .conn
-                    .query_scalar(
-                        "SELECT id FROM scout_files WHERE source_id = ? AND path = ?",
-                        &[file.source_id.as_i64().into(), file.path.as_str().into()],
-                    )
-                    ?;
+                let id: i64 = self.conn.query_scalar(
+                    "SELECT id FROM scout_files WHERE source_id = ? AND path = ?",
+                    &[file.source_id.as_i64().into(), file.path.as_str().into()],
+                )?;
 
                 Ok(UpsertResult {
                     id,
@@ -1153,8 +1145,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
                 if changed {
                     // File changed - reset to pending, clear tag
-                    self.conn
-                        .execute(
+                    self.conn.execute(
                         r#"
                         UPDATE scout_files SET
                             size = ?,
@@ -1175,16 +1166,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                             now.into(),
                             id.into(),
                         ],
-                    )
-                    ?;
+                    )?;
                 } else {
                     // Just update last_seen_at
-                    self.conn
-                        .execute(
-                            "UPDATE scout_files SET last_seen_at = ? WHERE id = ?",
-                            &[now.into(), id.into()],
-                        )
-                        ?;
+                    self.conn.execute(
+                        "UPDATE scout_files SET last_seen_at = ? WHERE id = ?",
+                        &[now.into(), id.into()],
+                    )?;
                 }
 
                 Ok(UpsertResult {
@@ -1278,7 +1266,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
                 Ok(stats)
             })
-            
+
             .map_err(ScoutError::from)
     }
 
@@ -1480,7 +1468,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         tx: &mut casparian_db::DbTransaction<'_>,
         source_id: &SourceId,
         files: &[ScannedFile],
-    ) -> std::result::Result<std::collections::HashMap<String, (i64, i64)>, casparian_db::BackendError> {
+    ) -> std::result::Result<
+        std::collections::HashMap<String, (i64, i64)>,
+        casparian_db::BackendError,
+    > {
         let mut existing = std::collections::HashMap::with_capacity(files.len());
 
         // Chunk the SELECT query too (999 params, 1 for source_id + N for paths)
@@ -1694,7 +1685,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     /// Get a file by path
-    pub fn get_file_by_path(&self, source_id: &SourceId, path: &str) -> Result<Option<ScannedFile>> {
+    pub fn get_file_by_path(
+        &self,
+        source_id: &SourceId,
+        path: &str,
+    ) -> Result<Option<ScannedFile>> {
         let row = self
             .conn
             .query_optional(
@@ -1714,7 +1709,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     /// List all files for a source (regardless of status)
-    pub fn list_files_by_source(&self, source_id: &SourceId, limit: usize) -> Result<Vec<ScannedFile>> {
+    pub fn list_files_by_source(
+        &self,
+        source_id: &SourceId,
+        limit: usize,
+    ) -> Result<Vec<ScannedFile>> {
         let rows = self
             .conn
             .query_all(
@@ -1733,7 +1732,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     /// List files with a specific status
-    pub fn list_files_by_status(&self, status: FileStatus, limit: usize) -> Result<Vec<ScannedFile>> {
+    pub fn list_files_by_status(
+        &self,
+        status: FileStatus,
+        limit: usize,
+    ) -> Result<Vec<ScannedFile>> {
         let rows = self
             .conn
             .query_all(
@@ -1752,17 +1755,29 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     /// List pending (untagged) files for a source
-    pub fn list_pending_files(&self, source_id: &SourceId, limit: usize) -> Result<Vec<ScannedFile>> {
+    pub fn list_pending_files(
+        &self,
+        source_id: &SourceId,
+        limit: usize,
+    ) -> Result<Vec<ScannedFile>> {
         self.list_files_by_source_and_status(source_id, FileStatus::Pending, limit)
     }
 
     /// List tagged files ready for processing
-    pub fn list_tagged_files(&self, source_id: &SourceId, limit: usize) -> Result<Vec<ScannedFile>> {
+    pub fn list_tagged_files(
+        &self,
+        source_id: &SourceId,
+        limit: usize,
+    ) -> Result<Vec<ScannedFile>> {
         self.list_files_by_source_and_status(source_id, FileStatus::Tagged, limit)
     }
 
     /// List untagged files (files that have no tag assigned)
-    pub fn list_untagged_files(&self, source_id: &SourceId, limit: usize) -> Result<Vec<ScannedFile>> {
+    pub fn list_untagged_files(
+        &self,
+        source_id: &SourceId,
+        limit: usize,
+    ) -> Result<Vec<ScannedFile>> {
         let rows = self
             .conn
             .query_all(
@@ -1871,91 +1886,87 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     /// Tag a file via a tagging rule (sets tag_source = 'rule')
     pub fn tag_file_by_rule(&self, id: i64, tag: &str, rule_id: &TaggingRuleId) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE scout_files SET tag = ?, tag_source = ?, rule_id = ?, status = ? WHERE id = ?",
-                &[
-                    tag.into(),
-                    TagSource::Rule.as_str().into(),
-                    rule_id.as_i64().into(),
-                    FileStatus::Tagged.as_str().into(),
-                    id.into(),
-                ],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE scout_files SET tag = ?, tag_source = ?, rule_id = ?, status = ? WHERE id = ?",
+            &[
+                tag.into(),
+                TagSource::Rule.as_str().into(),
+                rule_id.as_i64().into(),
+                FileStatus::Tagged.as_str().into(),
+                id.into(),
+            ],
+        )?;
         Ok(())
     }
 
     /// Update file status
-    pub fn update_file_status(&self, id: i64, status: FileStatus, error: Option<&str>) -> Result<()> {
+    pub fn update_file_status(
+        &self,
+        id: i64,
+        status: FileStatus,
+        error: Option<&str>,
+    ) -> Result<()> {
         if status == FileStatus::Processed {
-            self.conn
-                .execute(
-                    "UPDATE scout_files SET status = ?, error = ?, processed_at = ? WHERE id = ?",
-                    &[
-                        status.as_str().into(),
-                        error.into(),
-                        now_millis().into(),
-                        id.into(),
-                    ],
-                )
-                ?;
+            self.conn.execute(
+                "UPDATE scout_files SET status = ?, error = ?, processed_at = ? WHERE id = ?",
+                &[
+                    status.as_str().into(),
+                    error.into(),
+                    now_millis().into(),
+                    id.into(),
+                ],
+            )?;
         } else {
-            self.conn
-                .execute(
-                    "UPDATE scout_files SET status = ?, error = ? WHERE id = ?",
-                    &[status.as_str().into(), error.into(), id.into()],
-                )
-                ?;
+            self.conn.execute(
+                "UPDATE scout_files SET status = ?, error = ? WHERE id = ?",
+                &[status.as_str().into(), error.into(), id.into()],
+            )?;
         }
         Ok(())
     }
 
     /// Untag a file (clear tag, tag_source, rule_id, manual_plugin and reset to pending)
     pub fn untag_file(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE scout_files SET tag = NULL, tag_source = NULL, rule_id = NULL, \
+        self.conn.execute(
+            "UPDATE scout_files SET tag = NULL, tag_source = NULL, rule_id = NULL, \
                  manual_plugin = NULL, status = ?, sentinel_job_id = NULL WHERE id = ?",
-                &[FileStatus::Pending.as_str().into(), id.into()],
-            )
-            ?;
+            &[FileStatus::Pending.as_str().into(), id.into()],
+        )?;
         Ok(())
     }
 
     /// Mark file as queued for processing
     pub fn mark_file_queued(&self, id: i64, sentinel_job_id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE scout_files SET status = ?, sentinel_job_id = ? WHERE id = ?",
-                &[
-                    FileStatus::Queued.as_str().into(),
-                    sentinel_job_id.into(),
-                    id.into(),
-                ],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE scout_files SET status = ?, sentinel_job_id = ? WHERE id = ?",
+            &[
+                FileStatus::Queued.as_str().into(),
+                sentinel_job_id.into(),
+                id.into(),
+            ],
+        )?;
         Ok(())
     }
 
     /// Mark files as deleted if not seen recently
-    pub fn mark_deleted_files(&self, source_id: &SourceId, seen_before: DateTime<Utc>) -> Result<u64> {
+    pub fn mark_deleted_files(
+        &self,
+        source_id: &SourceId,
+        seen_before: DateTime<Utc>,
+    ) -> Result<u64> {
         let seen_before_millis = seen_before.timestamp_millis();
-        let result = self
-            .conn
-            .execute(
-                r#"
+        let result = self.conn.execute(
+            r#"
                 UPDATE scout_files SET status = ?
                 WHERE source_id = ? AND last_seen_at < ? AND status != ?
                 "#,
-                &[
-                    FileStatus::Deleted.as_str().into(),
-                    source_id.as_i64().into(),
-                    seen_before_millis.into(),
-                    FileStatus::Deleted.as_str().into(),
-                ],
-            )
-            ?;
+            &[
+                FileStatus::Deleted.as_str().into(),
+                source_id.as_i64().into(),
+                seen_before_millis.into(),
+                FileStatus::Deleted.as_str().into(),
+            ],
+        )?;
 
         Ok(result)
     }
@@ -1970,8 +1981,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         // 18:processed_at, 19:sentinel_job_id, 20:metadata_raw, 21:extraction_status, 22:extracted_at
 
         let status_str: String = row.get(10)?;
-        let status = FileStatus::parse(&status_str)
-            .ok_or_else(|| ScoutError::InvalidState(format!("Invalid file status: {}", status_str)))?;
+        let status = FileStatus::parse(&status_str).ok_or_else(|| {
+            ScoutError::InvalidState(format!("Invalid file status: {}", status_str))
+        })?;
 
         let first_seen_millis: i64 = row.get(16)?;
         let last_seen_millis: i64 = row.get(17)?;
@@ -1980,8 +1992,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         // Parse extraction status (Phase 6)
         let extraction_status_str: Option<String> = row.get(21)?;
         let extraction_status = match extraction_status_str.as_deref() {
-            Some(raw) => ExtractionStatus::parse(raw)
-                .ok_or_else(|| ScoutError::InvalidState(format!("Invalid extraction status: {}", raw)))?,
+            Some(raw) => ExtractionStatus::parse(raw).ok_or_else(|| {
+                ScoutError::InvalidState(format!("Invalid extraction status: {}", raw))
+            })?,
             None => ExtractionStatus::Pending,
         };
         let extracted_at_millis: Option<i64> = row.get(22)?;
@@ -1990,13 +2003,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let source_id = SourceId::try_from(source_id_raw)?;
 
         let tag_source_raw: Option<String> = row.get(12)?;
-        let tag_source = match tag_source_raw {
-            Some(raw) => Some(
-                TagSource::parse(&raw)
-                    .ok_or_else(|| ScoutError::InvalidState(format!("Invalid tag source: {}", raw)))?,
-            ),
-            None => None,
-        };
+        let tag_source =
+            match tag_source_raw {
+                Some(raw) => Some(TagSource::parse(&raw).ok_or_else(|| {
+                    ScoutError::InvalidState(format!("Invalid tag source: {}", raw))
+                })?),
+                None => None,
+            };
 
         let rule_id_raw: Option<i64> = row.get(13)?;
         let rule_id = match rule_id_raw {
@@ -2066,33 +2079,40 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             )
             ?;
 
-        let (total_files, files_pending, files_tagged, files_queued, files_processing, files_processed, files_failed, bytes_pending, bytes_processed) =
-            if let Some(row) = row {
-                (
-                    row.get::<i64>(0)?,
-                    row.get::<i64>(1)?,
-                    row.get::<i64>(2)?,
-                    row.get::<i64>(3)?,
-                    row.get::<i64>(4)?,
-                    row.get::<i64>(5)?,
-                    row.get::<i64>(6)?,
-                    row.get::<i64>(7)?,
-                    row.get::<i64>(8)?,
-                )
-            } else {
-                (0, 0, 0, 0, 0, 0, 0, 0, 0)
-            };
+        let (
+            total_files,
+            files_pending,
+            files_tagged,
+            files_queued,
+            files_processing,
+            files_processed,
+            files_failed,
+            bytes_pending,
+            bytes_processed,
+        ) = if let Some(row) = row {
+            (
+                row.get::<i64>(0)?,
+                row.get::<i64>(1)?,
+                row.get::<i64>(2)?,
+                row.get::<i64>(3)?,
+                row.get::<i64>(4)?,
+                row.get::<i64>(5)?,
+                row.get::<i64>(6)?,
+                row.get::<i64>(7)?,
+                row.get::<i64>(8)?,
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0, 0)
+        };
 
         let total_sources = self
             .conn
             .query_scalar::<i64>("SELECT COUNT(*) FROM scout_sources", &[])
-            
             .unwrap_or(0);
 
         let total_tagging_rules = self
             .conn
             .query_scalar::<i64>("SELECT COUNT(*) FROM scout_tagging_rules", &[])
-            
             .unwrap_or(0);
 
         Ok(DbStats {
@@ -2283,7 +2303,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         };
 
         // Query matching files and extract immediate child at prefix level
-        let prefix_len = if prefix.is_empty() { 0 } else { prefix.len() as i32 + 1 };
+        let prefix_len = if prefix.is_empty() {
+            0
+        } else {
+            prefix.len() as i32 + 1
+        };
 
         let rows = self.conn.query_all(
             r#"
@@ -2351,8 +2375,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
         let rows = if let Some(pattern) = glob_pattern {
             let like_pattern = glob_to_like_pattern(pattern);
-            self.conn
-                .query_all(
+            self.conn.query_all(
                 r#"
                 SELECT rel_path, size, mtime
                 FROM scout_files
@@ -2368,11 +2391,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     like_pattern.as_str().into(),
                     (limit as i64).into(),
                 ],
-            )
-            ?
+            )?
         } else {
-            self.conn
-                .query_all(
+            self.conn.query_all(
                 r#"
                 SELECT rel_path, size, mtime
                 FROM scout_files
@@ -2386,8 +2407,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     prefix_pattern.as_str().into(),
                     (limit as i64).into(),
                 ],
-            )
-            ?
+            )?
         };
 
         let mut results = Vec::with_capacity(rows.len());
@@ -2418,8 +2438,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
         let count = if let Some(pattern) = glob_pattern {
             let like_pattern = glob_to_like_pattern(pattern);
-            self.conn
-                .query_scalar::<i64>(
+            self.conn.query_scalar::<i64>(
                 r#"
                 SELECT COUNT(*)
                 FROM scout_files
@@ -2432,11 +2451,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     prefix_pattern.as_str().into(),
                     like_pattern.as_str().into(),
                 ],
-            )
-            ?
+            )?
         } else {
-            self.conn
-                .query_scalar::<i64>(
+            self.conn.query_scalar::<i64>(
                 r#"
                 SELECT COUNT(*)
                 FROM scout_files
@@ -2444,8 +2461,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                   AND rel_path LIKE ?
                 "#,
                 &[source_id.as_i64().into(), prefix_pattern.as_str().into()],
-            )
-            ?
+            )?
         };
 
         Ok(count)
@@ -2475,66 +2491,50 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         offset: usize,
     ) -> Result<Vec<(String, i64, i64)>> {
         let rows = match (extension, path_pattern) {
-            (Some(ext), Some(path_pat)) => {
-                self.conn
-                    .query_all(
-                        r#"SELECT rel_path, size, mtime FROM scout_files
+            (Some(ext), Some(path_pat)) => self.conn.query_all(
+                r#"SELECT rel_path, size, mtime FROM scout_files
                            WHERE source_id = ? AND extension = ? AND rel_path LIKE ?
                            ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
-                        &[
-                            source_id.as_i64().into(),
-                            ext.into(),
-                            path_pat.into(),
-                            (limit as i64).into(),
-                            (offset as i64).into(),
-                        ],
-                    )
-                    ?
-            }
-            (Some(ext), None) => {
-                self.conn
-                    .query_all(
-                        r#"SELECT rel_path, size, mtime FROM scout_files
+                &[
+                    source_id.as_i64().into(),
+                    ext.into(),
+                    path_pat.into(),
+                    (limit as i64).into(),
+                    (offset as i64).into(),
+                ],
+            )?,
+            (Some(ext), None) => self.conn.query_all(
+                r#"SELECT rel_path, size, mtime FROM scout_files
                            WHERE source_id = ? AND extension = ?
                            ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
-                        &[
-                            source_id.as_i64().into(),
-                            ext.into(),
-                            (limit as i64).into(),
-                            (offset as i64).into(),
-                        ],
-                    )
-                    ?
-            }
-            (None, Some(path_pat)) => {
-                self.conn
-                    .query_all(
-                        r#"SELECT rel_path, size, mtime FROM scout_files
+                &[
+                    source_id.as_i64().into(),
+                    ext.into(),
+                    (limit as i64).into(),
+                    (offset as i64).into(),
+                ],
+            )?,
+            (None, Some(path_pat)) => self.conn.query_all(
+                r#"SELECT rel_path, size, mtime FROM scout_files
                            WHERE source_id = ? AND rel_path LIKE ?
                            ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
-                        &[
-                            source_id.as_i64().into(),
-                            path_pat.into(),
-                            (limit as i64).into(),
-                            (offset as i64).into(),
-                        ],
-                    )
-                    ?
-            }
-            (None, None) => {
-                self.conn
-                    .query_all(
-                        r#"SELECT rel_path, size, mtime FROM scout_files
+                &[
+                    source_id.as_i64().into(),
+                    path_pat.into(),
+                    (limit as i64).into(),
+                    (offset as i64).into(),
+                ],
+            )?,
+            (None, None) => self.conn.query_all(
+                r#"SELECT rel_path, size, mtime FROM scout_files
                            WHERE source_id = ?
                            ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
-                        &[
-                            source_id.as_i64().into(),
-                            (limit as i64).into(),
-                            (offset as i64).into(),
-                        ],
-                    )
-                    ?
-            }
+                &[
+                    source_id.as_i64().into(),
+                    (limit as i64).into(),
+                    (offset as i64).into(),
+                ],
+            )?,
         };
 
         let mut results = Vec::with_capacity(rows.len());
@@ -2558,42 +2558,26 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         path_pattern: Option<&str>,
     ) -> Result<i64> {
         let count = match (extension, path_pattern) {
-            (Some(ext), Some(path_pat)) => {
-                self.conn
-                    .query_scalar::<i64>(
-                        r#"SELECT COUNT(*) FROM scout_files
+            (Some(ext), Some(path_pat)) => self.conn.query_scalar::<i64>(
+                r#"SELECT COUNT(*) FROM scout_files
                            WHERE source_id = ? AND extension = ? AND rel_path LIKE ?"#,
-                        &[source_id.as_i64().into(), ext.into(), path_pat.into()],
-                    )
-                    ?
-            }
-            (Some(ext), None) => {
-                self.conn
-                    .query_scalar::<i64>(
-                        r#"SELECT COUNT(*) FROM scout_files
+                &[source_id.as_i64().into(), ext.into(), path_pat.into()],
+            )?,
+            (Some(ext), None) => self.conn.query_scalar::<i64>(
+                r#"SELECT COUNT(*) FROM scout_files
                            WHERE source_id = ? AND extension = ?"#,
-                        &[source_id.as_i64().into(), ext.into()],
-                    )
-                    ?
-            }
-            (None, Some(path_pat)) => {
-                self.conn
-                    .query_scalar::<i64>(
-                        r#"SELECT COUNT(*) FROM scout_files
+                &[source_id.as_i64().into(), ext.into()],
+            )?,
+            (None, Some(path_pat)) => self.conn.query_scalar::<i64>(
+                r#"SELECT COUNT(*) FROM scout_files
                            WHERE source_id = ? AND rel_path LIKE ?"#,
-                        &[source_id.as_i64().into(), path_pat.into()],
-                    )
-                    ?
-            }
-            (None, None) => {
-                self.conn
-                    .query_scalar::<i64>(
-                        r#"SELECT COUNT(*) FROM scout_files
+                &[source_id.as_i64().into(), path_pat.into()],
+            )?,
+            (None, None) => self.conn.query_scalar::<i64>(
+                r#"SELECT COUNT(*) FROM scout_files
                            WHERE source_id = ?"#,
-                        &[source_id.as_i64().into()],
-                    )
-                    ?
-            }
+                &[source_id.as_i64().into()],
+            )?,
         };
         Ok(count)
     }
@@ -2686,7 +2670,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         }
 
         // Combine results: folders first, then files
-        let mut results: Vec<(String, bool, u64)> = Vec::with_capacity(files.len() + subfolders.len());
+        let mut results: Vec<(String, bool, u64)> =
+            Vec::with_capacity(files.len() + subfolders.len());
 
         for folder_name in subfolder_rows {
             if !folder_name.is_empty() {
@@ -2704,13 +2689,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// Count files directly in a folder (not recursive).
     /// O(1) lookup via index on (source_id, parent_path).
     pub fn count_files_in_folder(&self, source_id: &SourceId, parent_path: &str) -> Result<i64> {
-        let count = self
-            .conn
-            .query_scalar::<i64>(
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND parent_path = ?",
-                &[source_id.as_i64().into(), parent_path.into()],
-            )
-            ?;
+        let count = self.conn.query_scalar::<i64>(
+            "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND parent_path = ?",
+            &[source_id.as_i64().into(), parent_path.into()],
+        )?;
 
         Ok(count)
     }
@@ -2721,21 +2703,19 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     /// Set a setting value
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO scout_settings (key, value) VALUES (?, ?)",
-                &[key.into(), value.into()],
-            )
-            ?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scout_settings (key, value) VALUES (?, ?)",
+            &[key.into(), value.into()],
+        )?;
         Ok(())
     }
 
     /// Get a setting value
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let row = self
-            .conn
-            .query_optional("SELECT value FROM scout_settings WHERE key = ?", &[key.into()])
-            ?;
+        let row = self.conn.query_optional(
+            "SELECT value FROM scout_settings WHERE key = ?",
+            &[key.into()],
+        )?;
         match row {
             Some(row) => Ok(Some(row.get(0)?)),
             None => Ok(None),
@@ -2839,12 +2819,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     pub fn pause_extractor(&self, id: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
 
-        self.conn
-            .execute(
-                "UPDATE scout_extractors SET paused_at = ?, updated_at = ? WHERE id = ?",
-                &[now.into(), now.into(), id.into()],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE scout_extractors SET paused_at = ?, updated_at = ? WHERE id = ?",
+            &[now.into(), now.into(), id.into()],
+        )?;
 
         Ok(())
     }
@@ -2864,19 +2842,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     /// Update extractor consecutive failure count
-    pub fn update_extractor_consecutive_failures(
-        &self,
-        id: &str,
-        failures: u32,
-    ) -> Result<()> {
+    pub fn update_extractor_consecutive_failures(&self, id: &str, failures: u32) -> Result<()> {
         let now = Utc::now().timestamp_millis();
 
-        self.conn
-            .execute(
-                "UPDATE scout_extractors SET consecutive_failures = ?, updated_at = ? WHERE id = ?",
-                &[(failures as i64).into(), now.into(), id.into()],
-            )
-            ?;
+        self.conn.execute(
+            "UPDATE scout_extractors SET consecutive_failures = ?, updated_at = ? WHERE id = ?",
+            &[(failures as i64).into(), now.into(), id.into()],
+        )?;
 
         Ok(())
     }
@@ -2885,8 +2857,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     pub fn delete_extractor(&self, id: &str) -> Result<bool> {
         let result = self
             .conn
-            .execute("DELETE FROM scout_extractors WHERE id = ?", &[id.into()])
-            ?;
+            .execute("DELETE FROM scout_extractors WHERE id = ?", &[id.into()])?;
 
         Ok(result > 0)
     }
@@ -2907,7 +2878,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             )
             ?;
 
-        Ok(rows.iter().map(Self::row_to_file).filter_map(|r| r.ok()).collect())
+        Ok(rows
+            .iter()
+            .map(Self::row_to_file)
+            .filter_map(|r| r.ok())
+            .collect())
     }
 
     /// Log an extraction attempt
@@ -2952,32 +2927,28 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     ) -> Result<()> {
         let now = Utc::now().timestamp_millis();
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 UPDATE scout_files
                 SET metadata_raw = ?, extraction_status = ?, extracted_at = ?, last_seen_at = ?
                 WHERE id = ?
                 "#,
-                &[
-                    metadata_raw.into(),
-                    status.as_str().into(),
-                    now.into(),
-                    now.into(),
-                    file_id.into(),
-                ],
-            )
-            ?;
+            &[
+                metadata_raw.into(),
+                status.as_str().into(),
+                now.into(),
+                now.into(),
+                file_id.into(),
+            ],
+        )?;
 
         Ok(())
     }
 
     /// Mark extraction as stale for files with a given extractor
     pub fn mark_extractions_stale(&self, extractor_id: &str) -> Result<u64> {
-        let result = self
-            .conn
-            .execute(
-                r#"
+        let result = self.conn.execute(
+            r#"
                 UPDATE scout_files
                 SET extraction_status = 'stale'
                 WHERE id IN (
@@ -2985,9 +2956,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 )
                 AND extraction_status = 'extracted'
                 "#,
-                &[extractor_id.into()],
-            )
-            ?;
+            &[extractor_id.into()],
+        )?;
 
         Ok(result)
     }
@@ -3121,7 +3091,7 @@ mod tests {
                     now_ms.into(),
                 ],
             )
-            
+
             .unwrap();
         let file = ScannedFile::new(source_id.clone(), "/data/test.csv", "test.csv", 1000, 12345);
         let result = db.upsert_file(&file).unwrap();
@@ -3186,7 +3156,10 @@ mod tests {
         // Initial MRU order: C (most recent), B, A (oldest)
         let sources = db.list_sources_by_mru().unwrap();
         assert_eq!(sources.len(), 3);
-        assert_eq!(sources[0].id, source_c_id, "Most recently created should be first");
+        assert_eq!(
+            sources[0].id, source_c_id,
+            "Most recently created should be first"
+        );
         assert_eq!(sources[1].id, source_b_id);
         assert_eq!(sources[2].id, source_a_id, "Oldest should be last");
 
@@ -3196,7 +3169,10 @@ mod tests {
 
         // New MRU order: A (touched), C, B
         let sources = db.list_sources_by_mru().unwrap();
-        assert_eq!(sources[0].id, source_a_id, "Touched source should move to top");
+        assert_eq!(
+            sources[0].id, source_a_id,
+            "Touched source should move to top"
+        );
         assert_eq!(sources[1].id, source_c_id);
         assert_eq!(sources[2].id, source_b_id);
 
@@ -3206,7 +3182,10 @@ mod tests {
 
         // New MRU order: B, A, C
         let sources = db.list_sources_by_mru().unwrap();
-        assert_eq!(sources[0].id, source_b_id, "Most recently touched should be first");
+        assert_eq!(
+            sources[0].id, source_b_id,
+            "Most recently touched should be first"
+        );
         assert_eq!(sources[1].id, source_a_id);
         assert_eq!(sources[2].id, source_c_id);
 
@@ -3224,7 +3203,6 @@ mod tests {
                 "SELECT updated_at FROM scout_sources WHERE id = ?",
                 &[source_a_id.as_i64().into()],
             )
-            
             .unwrap_or(0);
         let ts_b: i64 = db
             .conn()
@@ -3232,7 +3210,6 @@ mod tests {
                 "SELECT updated_at FROM scout_sources WHERE id = ?",
                 &[source_b_id.as_i64().into()],
             )
-            
             .unwrap_or(0);
         let ts_c: i64 = db
             .conn()
@@ -3240,7 +3217,6 @@ mod tests {
                 "SELECT updated_at FROM scout_sources WHERE id = ?",
                 &[source_c_id.as_i64().into()],
             )
-            
             .unwrap_or(0);
         assert!(ts_b > ts_a, "B should have newer timestamp than A");
         assert!(ts_a > ts_c, "A should have newer timestamp than C");
@@ -3264,7 +3240,15 @@ mod tests {
 
         // Create 150 files (tests chunking since limit is 100)
         let files: Vec<ScannedFile> = (0..150)
-            .map(|i| ScannedFile::new(source_id.clone(), &format!("/data/file{}.txt", i), &format!("file{}.txt", i), 1000 + i, 12345))
+            .map(|i| {
+                ScannedFile::new(
+                    source_id.clone(),
+                    &format!("/data/file{}.txt", i),
+                    &format!("file{}.txt", i),
+                    1000 + i,
+                    12345,
+                )
+            })
             .collect();
 
         // First batch insert - all new
@@ -3290,15 +3274,29 @@ mod tests {
             .map(|i| {
                 if i < 50 {
                     // First 50 files: change size
-                    ScannedFile::new(source_id.clone(), &format!("/data/file{}.txt", i), &format!("file{}.txt", i), 2000 + i, 12345)
+                    ScannedFile::new(
+                        source_id.clone(),
+                        &format!("/data/file{}.txt", i),
+                        &format!("file{}.txt", i),
+                        2000 + i,
+                        12345,
+                    )
                 } else {
                     // Remaining 100 files: unchanged
-                    ScannedFile::new(source_id.clone(), &format!("/data/file{}.txt", i), &format!("file{}.txt", i), 1000 + i, 12345)
+                    ScannedFile::new(
+                        source_id.clone(),
+                        &format!("/data/file{}.txt", i),
+                        &format!("file{}.txt", i),
+                        1000 + i,
+                        12345,
+                    )
                 }
             })
             .collect();
 
-        let result = db.batch_upsert_files(&modified_files, Some("test_tag")).unwrap();
+        let result = db
+            .batch_upsert_files(&modified_files, Some("test_tag"))
+            .unwrap();
         assert_eq!(result.new, 0);
         assert_eq!(result.changed, 50, "Should have 50 changed files");
         assert_eq!(result.unchanged, 100, "Should have 100 unchanged files");
@@ -3330,8 +3328,15 @@ mod tests {
         let result = db.batch_upsert_files(&[file.clone()], None).unwrap();
         assert_eq!(result.unchanged, 1);
 
-        let fetched = db.get_file_by_path(&source_id, "/data/test.txt").unwrap().unwrap();
-        assert_eq!(fetched.tag, Some("original_tag".to_string()), "Tag should be preserved");
+        let fetched = db
+            .get_file_by_path(&source_id, "/data/test.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fetched.tag,
+            Some("original_tag".to_string()),
+            "Tag should be preserved"
+        );
     }
 
     /// Test glob_to_like_pattern conversion
@@ -3377,38 +3382,81 @@ mod tests {
         // /data/logs/2024/feb.log
         let files = vec![
             ScannedFile::new(source_id.clone(), "/data/root.txt", "root.txt", 100, 1000),
-            ScannedFile::new(source_id.clone(), "/data/docs/readme.md", "docs/readme.md", 200, 2000),
-            ScannedFile::new(source_id.clone(), "/data/docs/api/spec.json", "docs/api/spec.json", 300, 3000),
-            ScannedFile::new(source_id.clone(), "/data/logs/2024/jan.log", "logs/2024/jan.log", 400, 4000),
-            ScannedFile::new(source_id.clone(), "/data/logs/2024/feb.log", "logs/2024/feb.log", 500, 5000),
+            ScannedFile::new(
+                source_id.clone(),
+                "/data/docs/readme.md",
+                "docs/readme.md",
+                200,
+                2000,
+            ),
+            ScannedFile::new(
+                source_id.clone(),
+                "/data/docs/api/spec.json",
+                "docs/api/spec.json",
+                300,
+                3000,
+            ),
+            ScannedFile::new(
+                source_id.clone(),
+                "/data/logs/2024/jan.log",
+                "logs/2024/jan.log",
+                400,
+                4000,
+            ),
+            ScannedFile::new(
+                source_id.clone(),
+                "/data/logs/2024/feb.log",
+                "logs/2024/feb.log",
+                500,
+                5000,
+            ),
         ];
 
         db.batch_upsert_files(&files, None).unwrap();
 
         // Verify parent_path and name are set correctly
-        let root_file = db.get_file_by_path(&source_id, "/data/root.txt").unwrap().unwrap();
+        let root_file = db
+            .get_file_by_path(&source_id, "/data/root.txt")
+            .unwrap()
+            .unwrap();
         assert_eq!(root_file.parent_path, "");
         assert_eq!(root_file.name, "root.txt");
 
-        let readme = db.get_file_by_path(&source_id, "/data/docs/readme.md").unwrap().unwrap();
+        let readme = db
+            .get_file_by_path(&source_id, "/data/docs/readme.md")
+            .unwrap()
+            .unwrap();
         assert_eq!(readme.parent_path, "docs");
         assert_eq!(readme.name, "readme.md");
 
-        let spec = db.get_file_by_path(&source_id, "/data/docs/api/spec.json").unwrap().unwrap();
+        let spec = db
+            .get_file_by_path(&source_id, "/data/docs/api/spec.json")
+            .unwrap()
+            .unwrap();
         assert_eq!(spec.parent_path, "docs/api");
         assert_eq!(spec.name, "spec.json");
 
         // Test O(1) folder listing at root
         let root_contents = db.get_folder_counts(&source_id, "", None).unwrap();
         // Should have: docs folder, logs folder, root.txt file
-        assert!(root_contents.iter().any(|(name, _, is_file)| name == "docs" && !is_file));
-        assert!(root_contents.iter().any(|(name, _, is_file)| name == "logs" && !is_file));
-        assert!(root_contents.iter().any(|(name, _, is_file)| name == "root.txt" && *is_file));
+        assert!(root_contents
+            .iter()
+            .any(|(name, _, is_file)| name == "docs" && !is_file));
+        assert!(root_contents
+            .iter()
+            .any(|(name, _, is_file)| name == "logs" && !is_file));
+        assert!(root_contents
+            .iter()
+            .any(|(name, _, is_file)| name == "root.txt" && *is_file));
 
         // Test folder listing at docs/
         let docs_contents = db.get_folder_counts(&source_id, "docs", None).unwrap();
-        assert!(docs_contents.iter().any(|(name, _, is_file)| name == "api" && !is_file));
-        assert!(docs_contents.iter().any(|(name, _, is_file)| name == "readme.md" && *is_file));
+        assert!(docs_contents
+            .iter()
+            .any(|(name, _, is_file)| name == "api" && !is_file));
+        assert!(docs_contents
+            .iter()
+            .any(|(name, _, is_file)| name == "readme.md" && *is_file));
 
         // Test count files in folder
         let count = db.count_files_in_folder(&source_id, "logs/2024").unwrap();
@@ -3428,7 +3476,10 @@ mod tests {
 
         // No existing sources - should allow any path
         let result = db.check_source_overlap(temp_dir.path());
-        assert!(result.is_ok(), "Should allow source when no existing sources");
+        assert!(
+            result.is_ok(),
+            "Should allow source when no existing sources"
+        );
     }
 
     #[test]
@@ -3450,7 +3501,10 @@ mod tests {
         // Same path is NOT overlap (it's a rescan of existing source)
         // The overlap check should pass because paths are equal, not nested
         let result = db.check_source_overlap(temp_dir.path());
-        assert!(result.is_ok(), "Same path should be allowed (rescan scenario)");
+        assert!(
+            result.is_ok(),
+            "Same path should be allowed (rescan scenario)"
+        );
     }
 
     #[test]
@@ -3475,7 +3529,10 @@ mod tests {
 
         // Try to add child - should fail
         let result = db.check_source_overlap(&child_dir);
-        assert!(result.is_err(), "Child of existing source should be rejected");
+        assert!(
+            result.is_err(),
+            "Child of existing source should be rejected"
+        );
 
         match result.unwrap_err() {
             ScoutError::SourceIsChildOfExisting {
@@ -3511,7 +3568,10 @@ mod tests {
 
         // Try to add parent - should fail
         let result = db.check_source_overlap(temp_dir.path());
-        assert!(result.is_err(), "Parent of existing source should be rejected");
+        assert!(
+            result.is_err(),
+            "Parent of existing source should be rejected"
+        );
 
         match result.unwrap_err() {
             ScoutError::SourceIsParentOfExisting {
@@ -3572,7 +3632,10 @@ mod tests {
         // New source should be allowed even though stale source exists
         // (stale source can't be canonicalized, so it's skipped)
         let result = db.check_source_overlap(temp_dir.path());
-        assert!(result.is_ok(), "Should skip stale sources during overlap check");
+        assert!(
+            result.is_ok(),
+            "Should skip stale sources during overlap check"
+        );
     }
 
     #[test]
@@ -3589,10 +3652,7 @@ mod tests {
         std::fs::create_dir_all(&dir_c).unwrap();
 
         // Create sources for a and b
-        for (name, path) in [
-            ("Source A", &dir_a),
-            ("Source B", &dir_b),
-        ] {
+        for (name, path) in [("Source A", &dir_a), ("Source B", &dir_b)] {
             let source = Source {
                 id: SourceId::new(),
                 name: name.to_string(),
@@ -3610,6 +3670,9 @@ mod tests {
 
         // Parent of all - should fail
         let result = db.check_source_overlap(temp_dir.path());
-        assert!(result.is_err(), "Parent of any existing source should be rejected");
+        assert!(
+            result.is_err(),
+            "Parent of any existing source should be rejected"
+        );
     }
 }

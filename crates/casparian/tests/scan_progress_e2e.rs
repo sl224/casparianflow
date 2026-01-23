@@ -16,12 +16,12 @@
 #![cfg(feature = "full")]
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::io::{Read, Write};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
-use std::thread;
-use std::path::PathBuf;
 use regex::Regex;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Helper struct for managing PTY reads via channel
 struct PtyReader {
@@ -49,7 +49,10 @@ impl PtyReader {
             }
         });
 
-        Self { rx, accumulated: String::new() }
+        Self {
+            rx,
+            accumulated: String::new(),
+        }
     }
 
     fn wait_for(&mut self, pattern: &str, timeout: Duration) -> Result<Duration, String> {
@@ -104,7 +107,10 @@ fn extract_progress(output: &str) -> Option<(usize, usize, Option<u64>)> {
     if let Some(caps) = re.captures(output) {
         let files: usize = caps.get(1)?.as_str().parse().ok()?;
         let dirs: usize = caps.get(2)?.as_str().parse().ok()?;
-        let mins: u64 = caps.get(3).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
+        let mins: u64 = caps
+            .get(3)
+            .map(|m| m.as_str().parse().unwrap_or(0))
+            .unwrap_or(0);
         let secs: u64 = caps.get(4)?.as_str().parse().ok()?;
         Some((files, dirs, Some(mins * 60 + secs)))
     } else {
@@ -158,7 +164,10 @@ fn create_test_dir(file_count: usize) -> std::io::Result<PathBuf> {
         let level3 = format!("level3_{}", i % 50);
         let subdir = temp.join(&level1).join(&level2).join(&level3);
         std::fs::create_dir_all(&subdir)?;
-        std::fs::write(subdir.join(format!("file_{}.txt", i)), format!("content {}", i))?;
+        std::fs::write(
+            subdir.join(format!("file_{}.txt", i)),
+            format!("content {}", i),
+        )?;
     }
 
     Ok(temp)
@@ -235,7 +244,9 @@ fn test_scan_completes_via_tui() {
 
     // Debug: show what we captured
     println!("    Captured so far ({} chars):", pty.accumulated.len());
-    let preview: String = pty.accumulated.chars()
+    let preview: String = pty
+        .accumulated
+        .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == ' ')
         .take(200)
         .collect();
@@ -245,7 +256,7 @@ fn test_scan_completes_via_tui() {
     println!("\n    Pressing '1' to enter Discover mode...");
     let _ = writer.write_all(b"1");
     let _ = writer.flush();
-    thread::sleep(Duration::from_millis(1000));  // Longer wait
+    thread::sleep(Duration::from_millis(1000)); // Longer wait
 
     // Wait for Discover mode to load
     match pty.wait_for("Sources", Duration::from_secs(10)) {
@@ -265,9 +276,16 @@ fn test_scan_completes_via_tui() {
         Err(e) => {
             println!("    Warning: Scan dialog path prompt not found: {}", e);
             // Debug current state
-            let preview: String = pty.accumulated.chars()
+            let preview: String = pty
+                .accumulated
+                .chars()
                 .filter(|c| !c.is_control() || *c == '\n' || *c == ' ')
-                .rev().take(300).collect::<String>().chars().rev().collect();
+                .rev()
+                .take(300)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
             println!("    Current output (last 300): {}", preview);
         }
     }
@@ -277,7 +295,7 @@ fn test_scan_completes_via_tui() {
     for ch in test_dir.display().to_string().chars() {
         let _ = writer.write_all(ch.to_string().as_bytes());
         let _ = writer.flush();
-        thread::sleep(Duration::from_millis(10));  // Slightly longer delay
+        thread::sleep(Duration::from_millis(10)); // Slightly longer delay
     }
     thread::sleep(Duration::from_millis(500));
 
@@ -298,10 +316,21 @@ fn test_scan_completes_via_tui() {
     }
 
     // Debug: print accumulated content
-    let state_preview: String = pty.accumulated.chars()
+    let state_preview: String = pty
+        .accumulated
+        .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == ' ')
-        .rev().take(500).collect::<String>().chars().rev().collect();
-    println!("    After Enter ({} chars): {}", pty.accumulated.len(), state_preview);
+        .rev()
+        .take(500)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    println!(
+        "    After Enter ({} chars): {}",
+        pty.accumulated.len(),
+        state_preview
+    );
 
     // Check for errors
     if pty.accumulated.contains("not found") || pty.accumulated.contains("Cannot read") {
@@ -310,9 +339,9 @@ fn test_scan_completes_via_tui() {
 
     // Check results - for small directories, scan completes instantly
     let mut scan_started = pty.accumulated.contains("Scanning");
-    let scan_completed = pty.accumulated.contains("scan_test") ||
-                         pty.accumulated.contains("Sources") ||
-                         pty.accumulated.contains("Added");
+    let scan_completed = pty.accumulated.contains("scan_test")
+        || pty.accumulated.contains("Sources")
+        || pty.accumulated.contains("Added");
 
     println!("[2] Verification:");
 
@@ -324,7 +353,7 @@ fn test_scan_completes_via_tui() {
     } else if scan_completed {
         println!("  [OK] Scan completed (too fast to capture Scanning state)");
         // This is acceptable for small test directories
-        scan_started = true;  // Count as success
+        scan_started = true; // Count as success
     } else {
         println!("  [FAIL] Neither Scanning dialog nor completion detected");
         passed = false;
@@ -359,12 +388,20 @@ fn test_scan_completes_via_tui() {
     let _ = child.kill();
     let _ = std::fs::remove_dir_all(&test_dir);
 
-    println!("=== TEST {} ===\n", if passed { "PASSED" } else { "FAILED" });
+    println!(
+        "=== TEST {} ===\n",
+        if passed { "PASSED" } else { "FAILED" }
+    );
 
     if !passed {
         println!("Debug info:");
-        println!("  Full accumulated output ({} chars):", pty.accumulated.len());
-        let clean: String = pty.accumulated.chars()
+        println!(
+            "  Full accumulated output ({} chars):",
+            pty.accumulated.len()
+        );
+        let clean: String = pty
+            .accumulated
+            .chars()
             .filter(|c| !c.is_control() || *c == '\n')
             .rev()
             .take(1000)
@@ -384,7 +421,10 @@ fn test_progress_extraction() {
     // Test various formats
     let cases = vec![
         ("  123 files | 45 dirs | 6s", Some((123, 45, Some(6)))),
-        ("  1000 files | 200 dirs | 1m 23s", Some((1000, 200, Some(83)))),
+        (
+            "  1000 files | 200 dirs | 1m 23s",
+            Some((1000, 200, Some(83))),
+        ),
         ("  0 files | 0 dirs | 0s", Some((0, 0, Some(0)))),
         ("no match here", None),
     ];

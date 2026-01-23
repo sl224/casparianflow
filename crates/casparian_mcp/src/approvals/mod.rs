@@ -10,27 +10,22 @@
 //! via CLI commands:
 //!
 //! ```bash
-//! casparian approvals list
-//! casparian approvals approve <id>
-//! casparian approvals reject <id> --reason "..."
+//! casparian mcp list
+//! casparian mcp approve <id>
+//! casparian mcp approve <id> --reject
 //! ```
 //!
 //! # Storage
 //!
-//! Approvals are stored as JSON files in `~/.casparian_flow/approvals/`:
-//!
-//! ```text
-//! approvals/
-//! ├── {approval_id_1}.json
-//! ├── {approval_id_2}.json
-//! └── ...
-//! ```
+//! Approvals are stored in DuckDB via `ApiStorage` (table: `cf_api_approvals`).
+//! The DB path is configured by the MCP server (default:
+//! `~/.casparian_flow/casparian_flow.duckdb`).
 
 mod manager;
+#[cfg(test)]
 mod store;
 
 pub use manager::ApprovalManager;
-pub use store::ApprovalStore;
 
 use crate::types::{ApprovalSummary, PluginRef};
 use chrono::{DateTime, Utc};
@@ -147,7 +142,7 @@ impl ApprovalRequest {
 
     /// Get the CLI command to approve this request
     pub fn approve_command(&self) -> String {
-        format!("casparian approvals approve {}", self.approval_id)
+        format!("casparian mcp approve {}", self.approval_id)
     }
 }
 
@@ -177,7 +172,11 @@ impl ApprovalOperation {
     /// Get a short description of the operation
     pub fn description(&self) -> String {
         match self {
-            Self::Run { plugin_ref, input_dir, output } => {
+            Self::Run {
+                plugin_ref,
+                input_dir,
+                output,
+            } => {
                 format!(
                     "Run {} on {} -> {}",
                     plugin_ref.display_name(),
@@ -185,7 +184,10 @@ impl ApprovalOperation {
                     output
                 )
             }
-            Self::SchemaPromote { ephemeral_id, output_path } => {
+            Self::SchemaPromote {
+                ephemeral_id,
+                output_path,
+            } => {
                 format!(
                     "Promote schema {} to {}",
                     ephemeral_id,
@@ -203,9 +205,7 @@ pub enum ApprovalStatus {
     /// Awaiting human approval
     Pending,
     /// Approved by human
-    Approved {
-        approved_at: DateTime<Utc>,
-    },
+    Approved { approved_at: DateTime<Utc> },
     /// Rejected by human
     Rejected {
         rejected_at: DateTime<Utc>,

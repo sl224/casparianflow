@@ -46,13 +46,7 @@ pub fn output_target_key(
 ) -> String {
     let table = table_name.unwrap_or("");
     let schema = schema_hash.unwrap_or("");
-    hash_parts(&[
-        output_name,
-        sink_uri,
-        sink_mode.as_str(),
-        table,
-        schema,
-    ])
+    hash_parts(&[output_name, sink_uri, sink_mode.as_str(), table, schema])
 }
 
 /// Stable key for a file/output materialization.

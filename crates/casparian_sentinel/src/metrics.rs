@@ -125,14 +125,16 @@ impl Metrics {
     #[inline]
     pub fn record_dispatch_time(&self, start: Instant) {
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.dispatch_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.dispatch_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
     }
 
     /// Record conclude timing in microseconds
     #[inline]
     pub fn record_conclude_time(&self, start: Instant) {
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.conclude_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.conclude_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
     }
 
     /// Get a snapshot of all metrics

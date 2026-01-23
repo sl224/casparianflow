@@ -84,7 +84,8 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["pandas>=2.0"]
 "#;
-    fs::write(dir.path().join("pyproject.toml"), pyproject).expect("Failed to write pyproject.toml");
+    fs::write(dir.path().join("pyproject.toml"), pyproject)
+        .expect("Failed to write pyproject.toml");
 }
 
 /// Helper to create a casparian.toml manifest for publish
@@ -100,8 +101,7 @@ entrypoint = "{name}.py:Handler"
         name = name,
         version = version
     );
-    fs::write(dir.path().join("casparian.toml"), manifest)
-        .expect("Failed to write casparian.toml");
+    fs::write(dir.path().join("casparian.toml"), manifest).expect("Failed to write casparian.toml");
 }
 
 // ===========================================================================
@@ -124,8 +124,14 @@ fn test_analyze_valid_plugin_reads_real_file() {
         analysis.validation_errors.is_empty(),
         "Valid plugin should have no errors"
     );
-    assert!(!analysis.source_code.is_empty(), "Should contain source code");
-    assert!(!analysis.source_hash.is_empty(), "Should have a source hash");
+    assert!(
+        !analysis.source_code.is_empty(),
+        "Should contain source code"
+    );
+    assert!(
+        !analysis.source_hash.is_empty(),
+        "Should have a source hash"
+    );
 }
 
 #[test]
@@ -155,7 +161,9 @@ fn test_analyze_detects_topic_registrations() {
 
     // Should detect registered topics
     assert!(
-        analysis.detected_topics.contains(&"processed_data".to_string()),
+        analysis
+            .detected_topics
+            .contains(&"processed_data".to_string()),
         "Should detect processed_data topic"
     );
     assert!(
@@ -206,7 +214,10 @@ fn test_analyze_checks_for_lockfile() {
     // Without lockfile
     let analysis = analyze_plugin(&plugin_path).unwrap();
     assert!(!analysis.has_lockfile, "Should not have lockfile initially");
-    assert!(analysis.env_hash.is_none(), "Should have no env_hash without lockfile");
+    assert!(
+        analysis.env_hash.is_none(),
+        "Should have no env_hash without lockfile"
+    );
 
     // Create a lockfile
     fs::write(temp_dir.path().join("uv.lock"), "# fake lockfile content")
@@ -215,7 +226,10 @@ fn test_analyze_checks_for_lockfile() {
     // With lockfile
     let analysis = analyze_plugin(&plugin_path).unwrap();
     assert!(analysis.has_lockfile, "Should detect lockfile");
-    assert!(analysis.env_hash.is_some(), "Should have env_hash with lockfile");
+    assert!(
+        analysis.env_hash.is_some(),
+        "Should have env_hash with lockfile"
+    );
 }
 
 #[test]
@@ -289,8 +303,7 @@ fn test_prepare_publish_uses_existing_lockfile() {
 
     // Create existing lockfile
     let lockfile_content = "# existing uv.lock\nversion = 1";
-    fs::write(temp_dir.path().join("uv.lock"), lockfile_content)
-        .expect("Failed to write lockfile");
+    fs::write(temp_dir.path().join("uv.lock"), lockfile_content).expect("Failed to write lockfile");
 
     let artifact = prepare_publish(&plugin_path).unwrap();
 
@@ -299,7 +312,10 @@ fn test_prepare_publish_uses_existing_lockfile() {
         artifact.lockfile_content.contains("existing uv.lock"),
         "Should use existing lockfile content"
     );
-    assert!(!artifact.env_hash.is_empty(), "Should compute env_hash from lockfile");
+    assert!(
+        !artifact.env_hash.is_empty(),
+        "Should compute env_hash from lockfile"
+    );
 }
 
 #[test]
@@ -316,7 +332,10 @@ fn test_prepare_publish_computes_artifact_hash() {
     // Should have all hashes computed
     assert!(!artifact.source_hash.is_empty(), "Should have source_hash");
     assert!(!artifact.env_hash.is_empty(), "Should have env_hash");
-    assert!(!artifact.artifact_hash.is_empty(), "Should have artifact_hash");
+    assert!(
+        !artifact.artifact_hash.is_empty(),
+        "Should have artifact_hash"
+    );
 
     // Artifact hash should be different from source hash (includes lockfile)
     assert_ne!(
@@ -337,7 +356,9 @@ fn test_prepare_publish_preserves_detected_topics() {
 
     // Detected topics should be preserved
     assert!(
-        artifact.detected_topics.contains(&"processed_data".to_string()),
+        artifact
+            .detected_topics
+            .contains(&"processed_data".to_string()),
         "Should preserve detected topics"
     );
 }

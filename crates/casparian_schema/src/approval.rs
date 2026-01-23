@@ -14,9 +14,9 @@
 //!
 //! After approval, any deviation from the contract is a FAILURE.
 
-use crate::{DataType, LockedColumn, LockedSchema, SchemaContract};
 use crate::ids::{DiscoveryId, SchemaTimestamp, SchemaVariantId};
 use crate::storage::{SchemaStorage, StorageError};
+use crate::{DataType, LockedColumn, LockedSchema, SchemaContract};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -369,7 +369,10 @@ pub enum AmbiguityResolution {
     MakeNullable { column: String },
 
     /// Use a default value for missing/invalid values
-    UseDefault { column: String, default_value: String },
+    UseDefault {
+        column: String,
+        default_value: String,
+    },
 
     /// Exclude files that don't match the majority pattern
     ExcludeNonConforming { file_pattern: String },
@@ -461,7 +464,9 @@ pub fn approve_schema(
         return Err(ApprovalError::Validation("parser_id is required".into()));
     }
     if request.parser_version.trim().is_empty() {
-        return Err(ApprovalError::Validation("parser_version is required".into()));
+        return Err(ApprovalError::Validation(
+            "parser_version is required".into(),
+        ));
     }
 
     // Validate each schema variant
@@ -470,7 +475,11 @@ pub fn approve_schema(
     }
 
     let output_table_name = request.approved_schemas[0].output_table_name.as_str();
-    if request.approved_schemas.iter().any(|schema| schema.output_table_name != output_table_name) {
+    if request
+        .approved_schemas
+        .iter()
+        .any(|schema| schema.output_table_name != output_table_name)
+    {
         // v1 scope_id derivation assumes a single output table name.
         // If multiple outputs are present, reject rather than guess identity.
         return Err(ApprovalError::MultipleOutputsNotSupported);
@@ -487,12 +496,13 @@ pub fn approve_schema(
     let warnings = generate_approval_warnings(&request);
 
     // Create the contract
-    let scope_id = derive_scope_id(&request.parser_id, &request.parser_version, output_table_name);
-    let mut contract = SchemaContract::with_schemas(
-        &scope_id,
-        locked_schemas,
-        &request.approved_by,
+    let scope_id = derive_scope_id(
+        &request.parser_id,
+        &request.parser_version,
+        output_table_name,
     );
+    let mut contract =
+        SchemaContract::with_schemas(&scope_id, locked_schemas, &request.approved_by);
     contract.logic_hash = request.logic_hash.clone();
 
     // Save to storage
@@ -512,37 +522,49 @@ fn validate_approved_schema(
     allow_nested_types: bool,
 ) -> Result<(), ApprovalError> {
     if schema.name.is_empty() {
-        return Err(ApprovalError::InvalidColumn("Schema name cannot be empty".into()));
+        return Err(ApprovalError::InvalidColumn(
+            "Schema name cannot be empty".into(),
+        ));
     }
 
     if schema.output_table_name.is_empty() {
-        return Err(ApprovalError::InvalidColumn("Output table name cannot be empty".into()));
+        return Err(ApprovalError::InvalidColumn(
+            "Output table name cannot be empty".into(),
+        ));
     }
 
     if schema.columns.is_empty() {
-        return Err(ApprovalError::InvalidColumn(
-            format!("Schema '{}' must have at least one column", schema.name)
-        ));
+        return Err(ApprovalError::InvalidColumn(format!(
+            "Schema '{}' must have at least one column",
+            schema.name
+        )));
     }
 
     // Validate each column
     for col in &schema.columns {
         if col.name.is_empty() {
-            return Err(ApprovalError::InvalidColumn("Column name cannot be empty".into()));
+            return Err(ApprovalError::InvalidColumn(
+                "Column name cannot be empty".into(),
+            ));
         }
 
-        if !allow_nested_types {
-            if matches!(col.data_type, DataType::List { .. } | DataType::Struct { .. }) {
-                return Err(ApprovalError::Validation(format!(
-                    "Nested List/Struct types require allow_nested_types: column '{}'",
-                    col.name
-                )));
-            }
+        if !allow_nested_types
+            && matches!(
+                col.data_type,
+                DataType::List { .. } | DataType::Struct { .. }
+            )
+        {
+            return Err(ApprovalError::Validation(format!(
+                "Nested List/Struct types require allow_nested_types: column '{}'",
+                col.name
+            )));
         }
 
         // Check for duplicate column names (including renames)
         let output_name = col.rename_to.as_ref().unwrap_or(&col.name);
-        let duplicates: Vec<_> = schema.columns.iter()
+        let duplicates: Vec<_> = schema
+            .columns
+            .iter()
             .filter(|c| {
                 let name = c.rename_to.as_ref().unwrap_or(&c.name);
                 name == output_name && !std::ptr::eq(*c, col)
@@ -550,9 +572,10 @@ fn validate_approved_schema(
             .collect();
 
         if !duplicates.is_empty() {
-            return Err(ApprovalError::InvalidColumn(
-                format!("Duplicate output column name: '{}'", output_name)
-            ));
+            return Err(ApprovalError::InvalidColumn(format!(
+                "Duplicate output column name: '{}'",
+                output_name
+            )));
         }
     }
 
@@ -567,7 +590,10 @@ fn generate_approval_warnings(request: &SchemaApprovalRequest) -> Vec<ApprovalWa
     if !request.excluded_files.is_empty() {
         warnings.push(ApprovalWarning {
             warning_type: WarningType::FilesExcluded,
-            message: format!("{} files excluded from processing", request.excluded_files.len()),
+            message: format!(
+                "{} files excluded from processing",
+                request.excluded_files.len()
+            ),
             column: None,
         });
     }
@@ -621,11 +647,10 @@ mod tests {
     fn test_create_approval_request() {
         let request = new_request("user123")
             .with_schema(
-                ApprovedSchemaVariant::new("transactions", "transactions")
-                    .with_columns(vec![
-                        ApprovedColumn::required("id", DataType::Int64),
-                        ApprovedColumn::required("amount", DataType::Float64),
-                    ])
+                ApprovedSchemaVariant::new("transactions", "transactions").with_columns(vec![
+                    ApprovedColumn::required("id", DataType::Int64),
+                    ApprovedColumn::required("amount", DataType::Float64),
+                ]),
             )
             .with_notes("Approved after review");
 
@@ -633,7 +658,10 @@ mod tests {
         assert_eq!(request.parser_id, "parser-123");
         assert_eq!(request.parser_version, "1.0.0");
         assert_eq!(request.approved_schemas.len(), 1);
-        assert_eq!(request.approval_notes, Some("Approved after review".to_string()));
+        assert_eq!(
+            request.approval_notes,
+            Some("Approved after review".to_string())
+        );
     }
 
     #[test]
@@ -655,14 +683,12 @@ mod tests {
     fn test_approve_schema_success() {
         let storage = create_test_storage();
 
-        let request = new_request("approver")
-            .with_schema(
-                ApprovedSchemaVariant::new("test_schema", "test_output")
-                    .with_columns(vec![
-                        ApprovedColumn::required("id", DataType::Int64),
-                        ApprovedColumn::optional("name", DataType::String),
-                    ])
-            );
+        let request = new_request("approver").with_schema(
+            ApprovedSchemaVariant::new("test_schema", "test_output").with_columns(vec![
+                ApprovedColumn::required("id", DataType::Int64),
+                ApprovedColumn::optional("name", DataType::String),
+            ]),
+        );
 
         let result = approve_schema(&storage, request).unwrap();
         assert_eq!(result.contract.approved_by, "approver");
@@ -680,17 +706,13 @@ mod tests {
         let output_table_name = "events";
         let logic_hash = "deadbeef";
 
-        let request = SchemaApprovalRequest::new(
-            DiscoveryId::new(),
-            parser_id,
-            parser_version,
-            "approver",
-        )
-        .with_logic_hash(logic_hash)
-        .with_schema(
-            ApprovedSchemaVariant::new("events", output_table_name)
-                .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)]),
-        );
+        let request =
+            SchemaApprovalRequest::new(DiscoveryId::new(), parser_id, parser_version, "approver")
+                .with_logic_hash(logic_hash)
+                .with_schema(
+                    ApprovedSchemaVariant::new("events", output_table_name)
+                        .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)]),
+                );
 
         let result = approve_schema(&storage, request).unwrap();
         let expected_scope_id = derive_scope_id(parser_id, parser_version, output_table_name);
@@ -712,11 +734,10 @@ mod tests {
     fn test_approve_schema_empty_name() {
         let storage = create_test_storage();
 
-        let request = new_request("user")
-            .with_schema(
-                ApprovedSchemaVariant::new("", "output")
-                    .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
-            );
+        let request = new_request("user").with_schema(
+            ApprovedSchemaVariant::new("", "output")
+                .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)]),
+        );
 
         let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
@@ -726,8 +747,8 @@ mod tests {
     fn test_approve_schema_no_columns() {
         let storage = create_test_storage();
 
-        let request = new_request("user")
-            .with_schema(ApprovedSchemaVariant::new("test", "test_output"));
+        let request =
+            new_request("user").with_schema(ApprovedSchemaVariant::new("test", "test_output"));
 
         let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));
@@ -738,13 +759,14 @@ mod tests {
         let storage = create_test_storage();
 
         let request = new_request("user").with_schema(
-            ApprovedSchemaVariant::new("nested", "nested_output")
-                .with_columns(vec![ApprovedColumn::required(
+            ApprovedSchemaVariant::new("nested", "nested_output").with_columns(vec![
+                ApprovedColumn::required(
                     "items",
                     DataType::List {
                         item: Box::new(DataType::String),
                     },
-                )]),
+                ),
+            ]),
         );
 
         let err = approve_schema(&storage, request).unwrap_err();
@@ -758,13 +780,14 @@ mod tests {
         let request = new_request("user")
             .with_allow_nested_types(true)
             .with_schema(
-                ApprovedSchemaVariant::new("nested", "nested_output")
-                    .with_columns(vec![ApprovedColumn::required(
+                ApprovedSchemaVariant::new("nested", "nested_output").with_columns(vec![
+                    ApprovedColumn::required(
                         "items",
                         DataType::List {
                             item: Box::new(DataType::String),
                         },
-                    )]),
+                    ),
+                ]),
             );
 
         let result = approve_schema(&storage, request).unwrap();
@@ -778,28 +801,32 @@ mod tests {
         let request = new_request("user")
             .with_schema(
                 ApprovedSchemaVariant::new("test", "test_output")
-                    .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
+                    .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)]),
             )
             .exclude_files(vec!["bad1.csv".into(), "bad2.csv".into()]);
 
         let result = approve_schema(&storage, request).unwrap();
-        assert!(result.warnings.iter().any(|w| w.warning_type == WarningType::FilesExcluded));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.warning_type == WarningType::FilesExcluded));
     }
 
     #[test]
     fn test_approval_warnings_for_rename() {
         let storage = create_test_storage();
 
-        let request = new_request("user")
-            .with_schema(
-                ApprovedSchemaVariant::new("test", "test_output")
-                    .with_columns(vec![
-                        ApprovedColumn::required("old", DataType::Int64).rename_to("new")
-                    ])
-            );
+        let request = new_request("user").with_schema(
+            ApprovedSchemaVariant::new("test", "test_output").with_columns(vec![
+                ApprovedColumn::required("old", DataType::Int64).rename_to("new"),
+            ]),
+        );
 
         let result = approve_schema(&storage, request).unwrap();
-        assert!(result.warnings.iter().any(|w| w.warning_type == WarningType::ColumnRenamed));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.warning_type == WarningType::ColumnRenamed));
     }
 
     #[test]
@@ -821,18 +848,17 @@ mod tests {
     fn test_multiple_output_tables_rejected() {
         let storage = create_test_storage();
 
-        let request = new_request("user")
-            .with_schemas(vec![
-                ApprovedSchemaVariant::new("schema_a", "output_a")
-                    .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
-                    .with_source_pattern("*_a.csv"),
-                ApprovedSchemaVariant::new("schema_b", "output_b")
-                    .with_columns(vec![
-                        ApprovedColumn::required("id", DataType::Int64),
-                        ApprovedColumn::optional("extra", DataType::String),
-                    ])
-                    .with_source_pattern("*_b.csv"),
-            ]);
+        let request = new_request("user").with_schemas(vec![
+            ApprovedSchemaVariant::new("schema_a", "output_a")
+                .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)])
+                .with_source_pattern("*_a.csv"),
+            ApprovedSchemaVariant::new("schema_b", "output_b")
+                .with_columns(vec![
+                    ApprovedColumn::required("id", DataType::Int64),
+                    ApprovedColumn::optional("extra", DataType::String),
+                ])
+                .with_source_pattern("*_b.csv"),
+        ]);
 
         let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::MultipleOutputsNotSupported));
@@ -842,14 +868,12 @@ mod tests {
     fn test_duplicate_column_name_rejected() {
         let storage = create_test_storage();
 
-        let request = new_request("user")
-            .with_schema(
-                ApprovedSchemaVariant::new("test", "test_output")
-                    .with_columns(vec![
-                        ApprovedColumn::required("id", DataType::Int64),
-                        ApprovedColumn::required("other", DataType::String).rename_to("id"),
-                    ])
-            );
+        let request = new_request("user").with_schema(
+            ApprovedSchemaVariant::new("test", "test_output").with_columns(vec![
+                ApprovedColumn::required("id", DataType::Int64),
+                ApprovedColumn::required("other", DataType::String).rename_to("id"),
+            ]),
+        );
 
         let err = approve_schema(&storage, request).unwrap_err();
         assert!(matches!(err, ApprovalError::InvalidColumn(_)));

@@ -14,10 +14,7 @@ pub enum Constraint {
         reason: EliminationReason,
     },
     /// This type is definitely required (rare - usually from schema hints)
-    MustBe {
-        data_type: DataType,
-        reason: String,
-    },
+    MustBe { data_type: DataType, reason: String },
     /// A specific date format is eliminated
     DateFormatEliminated {
         format: String,
@@ -227,7 +224,9 @@ impl TypeInferenceResult {
     pub fn data_type(&self) -> Option<DataType> {
         match self {
             TypeInferenceResult::Resolved { data_type, .. } => Some(*data_type),
-            TypeInferenceResult::Ambiguous { possible_types, .. } => possible_types.first().copied(),
+            TypeInferenceResult::Ambiguous { possible_types, .. } => {
+                possible_types.first().copied()
+            }
             TypeInferenceResult::NoValidType { fallback, .. } => Some(*fallback),
             TypeInferenceResult::Contradiction(_) => None,
         }

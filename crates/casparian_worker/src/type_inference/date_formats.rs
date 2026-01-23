@@ -408,10 +408,7 @@ fn check_format_elimination(value: &str, format: &DateFormatSpec) -> Option<&'st
     }
 
     // Parse each component
-    let components: Vec<i32> = parts
-        .iter()
-        .filter_map(|p| p.trim().parse().ok())
-        .collect();
+    let components: Vec<i32> = parts.iter().filter_map(|p| p.trim().parse().ok()).collect();
 
     if components.len() != 3 {
         return Some("non-numeric components");
@@ -552,18 +549,14 @@ mod tests {
         let eliminated = eliminate_formats_for_value("31/05/24", &formats);
 
         // Should eliminate MM/DD/YY format
-        let mm_dd_yy_eliminated = eliminated
-            .iter()
-            .any(|(f, _)| f.pattern == "%m/%d/%y");
+        let mm_dd_yy_eliminated = eliminated.iter().any(|(f, _)| f.pattern == "%m/%d/%y");
         assert!(
             mm_dd_yy_eliminated,
             "Should eliminate MM/DD/YY when first component is 31"
         );
 
         // Should NOT eliminate DD/MM/YY format
-        let dd_mm_yy_eliminated = eliminated
-            .iter()
-            .any(|(f, _)| f.pattern == "%d/%m/%y");
+        let dd_mm_yy_eliminated = eliminated.iter().any(|(f, _)| f.pattern == "%d/%m/%y");
         assert!(
             !dd_mm_yy_eliminated,
             "Should NOT eliminate DD/MM/YY when first component is 31"
@@ -577,12 +570,8 @@ mod tests {
         let eliminated = eliminate_formats_for_value("05/06/24", &formats);
 
         // Neither DD/MM/YY nor MM/DD/YY should be eliminated
-        let dd_mm_yy_eliminated = eliminated
-            .iter()
-            .any(|(f, _)| f.pattern == "%d/%m/%y");
-        let mm_dd_yy_eliminated = eliminated
-            .iter()
-            .any(|(f, _)| f.pattern == "%m/%d/%y");
+        let dd_mm_yy_eliminated = eliminated.iter().any(|(f, _)| f.pattern == "%d/%m/%y");
+        let mm_dd_yy_eliminated = eliminated.iter().any(|(f, _)| f.pattern == "%m/%d/%y");
 
         assert!(
             !dd_mm_yy_eliminated && !mm_dd_yy_eliminated,

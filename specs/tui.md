@@ -1,9 +1,9 @@
 # TUI Master Specification
 
 **Status:** READY FOR IMPLEMENTATION
-**Version:** 1.2
+**Version:** 1.3
 **Parent:** spec.md
-**Last Updated:** 2026-01-18
+**Last Updated:** 2026-01-21
 
 ---
 
@@ -23,23 +23,23 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 ### 1.2 View Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         HOME HUB                                │
-│                                                                 │
-│   [1] Discover    [2] Parser Bench    [3] Jobs    [4] Sources   │
-└─────────────────────────────────────────────────────────────────┘
-         │                  │               │            │
-         ▼                  ▼               ▼            ▼
-    ┌─────────┐      ┌───────────┐    ┌─────────┐  ┌──────────┐
-    │Discover │      │Parser     │    │ Jobs    │  │ Sources  │
-    │         │      │Bench      │    │         │  │          │
-    └─────────┘      └───────────┘    └─────────┘  └──────────┘
-         │                │
-         ▼                ▼
-    ┌─────────┐      ┌───────────┐
-    │Extraction│     │Test       │
-    │Rules    │      │Results    │
-    └─────────┘      └───────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                    HOME HUB                                      │
+│                                                                                  │
+│   [1] Discover  [2] Parser Bench  [3] Jobs  [4] Sources  [5] Approvals  [6] Query  [7] Sessions │
+└─────────────────────────────────────────────────────────────────────────────────┘
+         │              │              │           │            │           │           │
+         ▼              ▼              ▼           ▼            ▼           ▼           ▼
+    ┌─────────┐   ┌───────────┐  ┌─────────┐ ┌──────────┐ ┌───────────┐ ┌───────┐ ┌──────────┐
+    │Discover │   │Parser     │  │ Jobs    │ │ Sources  │ │ Approvals │ │ Query │ │ Sessions │
+    │         │   │Bench      │  │         │ │          │ │           │ │       │ │          │
+    └─────────┘   └───────────┘  └─────────┘ └──────────┘ └───────────┘ └───────┘ └──────────┘
+         │              │
+         ▼              ▼
+    ┌─────────┐   ┌───────────┐
+    │Extraction│  │Test       │
+    │Rules    │   │Results    │
+    └─────────┘   └───────────┘
 ```
 
 ### 1.3 View Specs
@@ -50,6 +50,10 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 | Discover | `views/discover.md` | File scanning, tagging |
 | Parser Bench | `views/parser_bench.md` | Parser development, testing |
 | Jobs | `views/jobs.md` | Job monitoring, logs |
+| Sources | `views/sources.md` | Source management |
+| Approvals | `views/approvals.md` | MCP approval management |
+| Query | `views/query.md` | SQL query console |
+| Sessions | `views/sessions.md` | Intent pipeline workflows |
 | Settings | `views/settings.md` | Configuration |
 | Extraction Rules | `views/extraction_rules.md` | Rule creation, testing (Draft) |
 
@@ -65,14 +69,24 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 | `2` | Go to Parser Bench | From any view |
 | `3` | Go to Jobs | From any view |
 | `4` | Go to Sources | From any view |
+| `5` | Go to Approvals | From any view |
+| `6` | Go to Query | From any view |
+| `7` | Go to Sessions | From any view |
 | `0` or `H` | Go to Home | From any view |
+| `:` or `/` | Open command palette | Natural language input |
 | `Esc` | Back / Close dialog | Context-dependent |
 | `q` | Quit (with confirmation if unsaved) | From any view |
 
 **View-level overrides:**
 - **Discover:** `1`, `2`, `3` control panel focus (Sources/Tags/Files) instead of view navigation.
   Use `0`/`H` or `4` to navigate away. See `views/discover.md` Section 6.1.
+- **Query:** `/` opens search in results mode, use `:` for command palette.
 - Views may override keys when contextually appropriate; overrides are documented in view specs.
+
+**Command Palette:**
+The command palette (`:` or `/`) provides natural language input for AI-assisted operations.
+Users can type intents like "parse orders.csv files" or "create schema for trades" which
+initiate intent pipeline sessions. See `views/sessions.md` for workflow details.
 
 ### 2.4 Jobs View Signals
 Jobs view emphasizes batch throughput over topology:
@@ -701,13 +715,13 @@ pub enum ViewAction {
 
 | Key | Action |
 |-----|--------|
-| `1-4` | Jump to view |
+| `1-7` | Jump to view (1=Discover, 2=Parser, 3=Jobs, 4=Sources, 5=Approvals, 6=Query, 7=Sessions) |
 | `0` / `H` | Home |
+| `:` / `/` | Command palette (natural language input) |
 | `?` | Help |
 | `q` | Quit |
 | `Esc` | Back |
 | `Tab` | Next focus |
-| `/` | Search |
 
 ### Lists
 
@@ -775,3 +789,4 @@ Each view spec in `specs/views/` should follow this structure:
 |------|---------|---------|
 | 2026-01-12 | 1.0 | Initial master TUI spec. Extracted common patterns from discover.md and parser_bench.md. |
 | 2026-01-13 | 1.1 | **Discoverability Rule (Section 6)**: Added mandatory requirement that all keybindings must be discoverable via footer, help overlay, or dialog footer. Added spec author checklist and footer design rules. Added Design Principle #6. |
+| 2026-01-21 | 1.2 | **MCP Integration Views**: Added Approvals (5), Query (6), Sessions (7) views. Added command palette (`:` / `/`) for natural language input. Updated view architecture diagram and navigation keys. |

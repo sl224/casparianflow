@@ -115,9 +115,7 @@ pub enum TerminationReason {
     MaxIterations,
 
     /// No improvement for N iterations
-    Plateau {
-        no_improvement_for: usize,
-    },
+    Plateau { no_improvement_for: usize },
 
     /// Total duration exceeded
     Timeout,
@@ -126,9 +124,7 @@ pub enum TerminationReason {
     UserStopped,
 
     /// Error occurred
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 impl std::fmt::Display for TerminationReason {
@@ -247,7 +243,7 @@ pub fn run_backtest_loop<P: MutableParser>(
         // F-009: Pass files by reference instead of cloning
         let result = backtest_with_failfast(
             parser,
-            &files,
+            files,
             high_failure_table,
             scope_id,
             parser_version,
@@ -288,7 +284,7 @@ pub fn run_backtest_loop<P: MutableParser>(
             }
         };
 
-        iterations.push(iteration.clone());
+        iterations.push(iteration);
 
         // Check termination conditions
         if let Some(reason) = should_terminate(&iterations, config, start_time) {
@@ -331,7 +327,15 @@ pub fn run_single_backtest<P: ParserRunner>(
     parser_version: usize,
     config: &FailFastConfig,
 ) -> Result<BacktestResult, HighFailureError> {
-    backtest_with_failfast(parser, files, high_failure_table, scope_id, parser_version, 1, config)
+    backtest_with_failfast(
+        parser,
+        files,
+        high_failure_table,
+        scope_id,
+        parser_version,
+        1,
+        config,
+    )
 }
 
 #[cfg(test)]
@@ -484,10 +488,14 @@ mod tests {
             FileInfo::new("/path/c.csv", 100),
         ];
 
-        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).expect("run backtest loop");
+        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config)
+            .expect("run backtest loop");
 
         // Should complete in 3 iterations (start with 2 failing, fix one each time)
-        assert_eq!(result.termination_reason, TerminationReason::PassRateAchieved);
+        assert_eq!(
+            result.termination_reason,
+            TerminationReason::PassRateAchieved
+        );
         assert_eq!(result.iterations.len(), 3);
         assert!((result.final_pass_rate - 1.0).abs() < 0.001);
     }
@@ -515,7 +523,8 @@ mod tests {
             FileInfo::new("/path/b.csv", 100),
         ];
 
-        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).expect("run backtest loop");
+        let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config)
+            .expect("run backtest loop");
 
         // Should stop after 1 iteration (no fixes possible)
         assert!(matches!(
@@ -549,7 +558,6 @@ mod tests {
             1,
             &FailFastConfig::no_early_stop(),
         )
-        
         .expect("run single backtest");
 
         assert!(result.is_complete());

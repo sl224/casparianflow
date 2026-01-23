@@ -68,7 +68,6 @@ where
     F: FnOnce(DbConnection) -> T,
 {
     let url = format!("duckdb:{}", db_path.display());
-    let conn = DbConnection::open_from_url(&url)
-        .expect("open duckdb connection");
+    let conn = DbConnection::open_from_url(&url).expect("open duckdb connection");
     f(conn)
 }

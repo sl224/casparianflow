@@ -3,7 +3,7 @@
 //! Generates Python parser code from sample analysis.
 //! Produces polars-based code conforming to the Bridge Protocol.
 
-use super::sample_reader::{SampleAnalysis, FileFormat, ColumnInfo};
+use super::sample_reader::{ColumnInfo, FileFormat, SampleAnalysis};
 use super::ParserLabError;
 
 /// Options for parser generation
@@ -65,7 +65,7 @@ impl ParserGenerator {
     ) -> super::Result<(String, String, Vec<String>, Vec<String>)> {
         if analysis.columns.is_empty() && analysis.format != FileFormat::Parquet {
             return Err(ParserLabError::SchemaInferenceFailed(
-                "No columns detected in sample".to_string()
+                "No columns detected in sample".to_string(),
             ));
         }
 
@@ -84,17 +84,29 @@ impl ParserGenerator {
         code.push_str(&format!("TOPIC = \"{}\"\n", topic_name));
         // Parser class
         code.push_str(&format!("class {}:\n", self.to_class_name(&parser_name)));
-        code.push_str(&format!("{}\"\"\"Parser for {} files.\"\"\"\n\n", self.indent, analysis.format));
+        code.push_str(&format!(
+            "{}\"\"\"Parser for {} files.\"\"\"\n\n",
+            self.indent, analysis.format
+        ));
 
         // Class attributes
         code.push_str(&format!("{}name = \"{}\"\n", self.indent, parser_name));
-        code.push_str(&format!("{}version = \"{}\"\n", self.indent, options.version));
+        code.push_str(&format!(
+            "{}version = \"{}\"\n",
+            self.indent, options.version
+        ));
         code.push_str(&format!("{}topics = [\"{}\"]\n\n", self.indent, topic_name));
 
         // Parse method
         code.push_str(&format!("{}def parse(self, ctx):\n", self.indent));
-        code.push_str(&format!("{}{}\"\"\"Parse a file and yield data.\"\"\"\n", self.indent, self.indent));
-        code.push_str(&format!("{}{}file_path = ctx.input_path\n\n", self.indent, self.indent));
+        code.push_str(&format!(
+            "{}{}\"\"\"Parse a file and yield data.\"\"\"\n",
+            self.indent, self.indent
+        ));
+        code.push_str(&format!(
+            "{}{}file_path = ctx.input_path\n\n",
+            self.indent, self.indent
+        ));
 
         // File reading
         let read_code = self.generate_read_code(analysis, &options);
@@ -106,7 +118,10 @@ impl ParserGenerator {
         // Type conversions
         let (conversion_code, converted_cols) = self.generate_type_conversions(analysis);
         if !conversion_code.is_empty() {
-            code.push_str(&format!("{}{}# Type conversions\n", self.indent, self.indent));
+            code.push_str(&format!(
+                "{}{}# Type conversions\n",
+                self.indent, self.indent
+            ));
             for line in conversion_code.lines() {
                 code.push_str(&format!("{}{}{}\n", self.indent, self.indent, line));
             }
@@ -127,7 +142,10 @@ impl ParserGenerator {
         }
 
         // Yield result
-        code.push_str(&format!("{}{}yield (TOPIC, df)\n", self.indent, self.indent));
+        code.push_str(&format!(
+            "{}{}yield (TOPIC, df)\n",
+            self.indent, self.indent
+        ));
         code.push('\n');
 
         // Standalone test block
@@ -135,14 +153,33 @@ impl ParserGenerator {
         code.push_str("if __name__ == \"__main__\":\n");
         code.push_str(&format!("{}import sys\n", self.indent));
         code.push_str(&format!("{}if len(sys.argv) < 2:\n", self.indent));
-        code.push_str(&format!("{}{}print(\"Usage: python parser.py <file>\")\n", self.indent, self.indent));
+        code.push_str(&format!(
+            "{}{}print(\"Usage: python parser.py <file>\")\n",
+            self.indent, self.indent
+        ));
         code.push_str(&format!("{}{}sys.exit(1)\n", self.indent, self.indent));
         code.push_str(&format!("{}class MockCtx:\n", self.indent));
-        code.push_str(&format!("{}{}def __init__(self, path):\n", self.indent, self.indent));
-        code.push_str(&format!("{}{}{}self.input_path = path\n", self.indent, self.indent, self.indent));
-        code.push_str(&format!("{}parser = {}()\n", self.indent, self.to_class_name(&parser_name)));
-        code.push_str(&format!("{}for topic, df in parser.parse(MockCtx(sys.argv[1])):\n", self.indent));
-        code.push_str(&format!("{}{}print(f\"Topic: {{topic}}\")\n", self.indent, self.indent));
+        code.push_str(&format!(
+            "{}{}def __init__(self, path):\n",
+            self.indent, self.indent
+        ));
+        code.push_str(&format!(
+            "{}{}{}self.input_path = path\n",
+            self.indent, self.indent, self.indent
+        ));
+        code.push_str(&format!(
+            "{}parser = {}()\n",
+            self.indent,
+            self.to_class_name(&parser_name)
+        ));
+        code.push_str(&format!(
+            "{}for topic, df in parser.parse(MockCtx(sys.argv[1])):\n",
+            self.indent
+        ));
+        code.push_str(&format!(
+            "{}{}print(f\"Topic: {{topic}}\")\n",
+            self.indent, self.indent
+        ));
         code.push_str(&format!("{}{}print(df)\n", self.indent, self.indent));
 
         // Warnings
@@ -155,23 +192,22 @@ impl ParserGenerator {
 
     /// Generate parser name from hints or default
     fn generate_parser_name(&self, hints: Option<&str>) -> String {
-        hints.map(|h| {
-            h.to_lowercase()
-                .replace(' ', "_")
-                .replace('-', "_")
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_')
-                .collect::<String>()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "data_parser".to_string())
+        hints
+            .map(|h| {
+                h.to_lowercase()
+                    .replace(' ', "_")
+                    .replace('-', "_")
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "data_parser".to_string())
     }
 
     /// Sanitize topic name
     fn sanitize_topic(&self, name: &str) -> String {
-        name.to_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_")
+        name.to_lowercase().replace(' ', "_").replace('-', "_")
     }
 
     /// Convert to PascalCase class name
@@ -199,14 +235,20 @@ impl ParserGenerator {
                     if delimiter == ',' {
                         code.push_str("    df = pl.read_csv(file_path)\n");
                     } else {
-                        code.push_str(&format!("    df = pl.read_csv(file_path, separator=\"{}\")\n", delimiter));
+                        code.push_str(&format!(
+                            "    df = pl.read_csv(file_path, separator=\"{}\")\n",
+                            delimiter
+                        ));
                     }
                     code.push_str("except Exception as e:\n");
                     code.push_str("    raise ValueError(f\"Failed to read CSV: {e}\")\n");
                 } else if delimiter == ',' {
                     code.push_str("df = pl.read_csv(file_path)\n");
                 } else {
-                    code.push_str(&format!("df = pl.read_csv(file_path, separator=\"{}\")\n", delimiter));
+                    code.push_str(&format!(
+                        "df = pl.read_csv(file_path, separator=\"{}\")\n",
+                        delimiter
+                    ));
                 }
             }
             FileFormat::Tsv => {
@@ -329,9 +371,8 @@ impl ParserGenerator {
     fn generate_validation(&self, analysis: &SampleAnalysis) -> String {
         let mut code = String::new();
 
-        let non_nullable: Vec<&ColumnInfo> = analysis.columns.iter()
-            .filter(|c| !c.nullable)
-            .collect();
+        let non_nullable: Vec<&ColumnInfo> =
+            analysis.columns.iter().filter(|c| !c.nullable).collect();
 
         if !non_nullable.is_empty() {
             code.push_str("# Check for nulls in required columns\n");
@@ -386,10 +427,14 @@ mod tests {
         std::fs::write(&path, "name,age\nAlice,30\nBob,25").unwrap();
 
         let reader = SampleReader::new();
-        let analysis = reader.analyze(&[path.to_string_lossy().to_string()]).unwrap();
+        let analysis = reader
+            .analyze(&[path.to_string_lossy().to_string()])
+            .unwrap();
 
         let gen = ParserGenerator::new();
-        let (code, name, _, _) = gen.generate(&analysis, ParserOptions::default(), Some("test parser")).unwrap();
+        let (code, name, _, _) = gen
+            .generate(&analysis, ParserOptions::default(), Some("test parser"))
+            .unwrap();
 
         assert!(code.contains("TOPIC = \"test_parser\""));
         assert!(code.contains("class TestParser:"));

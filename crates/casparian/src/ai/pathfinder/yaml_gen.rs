@@ -172,19 +172,19 @@ impl YamlRuleGenerator {
                         pattern_type,
                         examples: _,
                     } => match pattern_type {
-                        VariablePattern::Date { format } => {
-                            (Some(format.regex().to_string()), Some(self.date_transform(format)))
-                        }
+                        VariablePattern::Date { format } => (
+                            Some(format.regex().to_string()),
+                            Some(self.date_transform(format)),
+                        ),
                         VariablePattern::Year => (Some(r"\d{4}".to_string()), None),
                         VariablePattern::Month => (Some(r"\d{2}".to_string()), None),
                         VariablePattern::NumericId => (Some(r"\d+".to_string()), None),
-                        VariablePattern::AlphanumericId => (Some(r"[a-zA-Z0-9]+".to_string()), None),
+                        VariablePattern::AlphanumericId => {
+                            (Some(r"[a-zA-Z0-9]+".to_string()), None)
+                        }
                         VariablePattern::EntityPrefix { prefix, separator } => {
                             let sep_escaped = if *separator == '-' { "-" } else { "_" };
-                            (
-                                Some(format!("{}{}(.+)", prefix, sep_escaped)),
-                                None,
-                            )
+                            (Some(format!("{}{}(.+)", prefix, sep_escaped)), None)
                         }
                         VariablePattern::FreeText => (None, None),
                     },

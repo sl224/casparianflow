@@ -30,29 +30,40 @@ fn test_date_format_constraint_via_solver() {
     solver.add_value("05/06/24");
 
     // Date should still be possible
-    assert!(solver.possible_types().contains(&DataType::Date),
-            "Date should be possible for ambiguous 05/06/24");
+    assert!(
+        solver.possible_types().contains(&DataType::Date),
+        "Date should be possible for ambiguous 05/06/24"
+    );
 
     // Add constraining value - 31 cannot be a month
     solver.add_value("31/05/24");
 
     // Date should still be possible but with narrowed formats
-    assert!(solver.possible_types().contains(&DataType::Date),
-            "Date should remain possible after constraint");
+    assert!(
+        solver.possible_types().contains(&DataType::Date),
+        "Date should remain possible after constraint"
+    );
 
     let result = solver.get_result();
     match result {
-        TypeInferenceResult::Resolved { data_type, format, .. } => {
+        TypeInferenceResult::Resolved {
+            data_type, format, ..
+        } => {
             assert_eq!(data_type, DataType::Date);
             // Format should be DD/MM variant (if specified)
             if let Some(fmt) = format {
-                assert!(fmt.contains("d") || fmt.contains("D"),
-                        "Format should be DD/MM variant, got: {}", fmt);
+                assert!(
+                    fmt.contains("d") || fmt.contains("D"),
+                    "Format should be DD/MM variant, got: {}",
+                    fmt
+                );
             }
         }
         TypeInferenceResult::Ambiguous { possible_types, .. } => {
-            assert!(possible_types.contains(&DataType::Date),
-                    "Date should be in possible types");
+            assert!(
+                possible_types.contains(&DataType::Date),
+                "Date should be in possible types"
+            );
         }
         _ => {}
     }
@@ -74,8 +85,10 @@ fn test_invalid_day_eliminates_date() {
     match result {
         TypeInferenceResult::Resolved { data_type, .. } => {
             // If resolved, should be String (invalid date)
-            assert!(data_type == DataType::String || data_type == DataType::Date,
-                    "Should resolve to String or Date with format constraints");
+            assert!(
+                data_type == DataType::String || data_type == DataType::Date,
+                "Should resolve to String or Date with format constraints"
+            );
         }
         _ => {}
     }
@@ -93,12 +106,17 @@ fn test_iso_date_format_detection() {
     let result = solver.get_result();
 
     match result {
-        TypeInferenceResult::Resolved { data_type, format, .. } => {
+        TypeInferenceResult::Resolved {
+            data_type, format, ..
+        } => {
             assert_eq!(data_type, DataType::Date);
             // Should recognize ISO format
             if let Some(fmt) = format {
-                assert!(fmt.contains("Y") || fmt.contains("%Y") || fmt.contains("y"),
-                        "Should detect YYYY-MM-DD format, got: {}", fmt);
+                assert!(
+                    fmt.contains("Y") || fmt.contains("%Y") || fmt.contains("y"),
+                    "Should detect YYYY-MM-DD format, got: {}",
+                    fmt
+                );
             }
         }
         TypeInferenceResult::Ambiguous { possible_types, .. } => {
@@ -125,10 +143,14 @@ fn test_decimal_eliminates_integer() {
 
     // Add decimal - eliminates Integer
     solver.add_value("150.50");
-    assert!(!solver.possible_types().contains(&DataType::Integer),
-            "Integer should be eliminated after seeing decimal");
-    assert!(solver.possible_types().contains(&DataType::Float),
-            "Float should remain");
+    assert!(
+        !solver.possible_types().contains(&DataType::Integer),
+        "Integer should be eliminated after seeing decimal"
+    );
+    assert!(
+        solver.possible_types().contains(&DataType::Float),
+        "Float should remain"
+    );
 
     // Verify result
     let result = solver.get_result();
@@ -230,8 +252,10 @@ fn test_invalid_time_eliminates() {
     // Hour > 23 should eliminate Time type
     solver.add_value("25:30");
 
-    assert!(!solver.possible_types().contains(&DataType::Time),
-            "Time should be eliminated for hour > 23");
+    assert!(
+        !solver.possible_types().contains(&DataType::Time),
+        "Time should be eliminated for hour > 23"
+    );
 }
 
 /// Test datetime detection
@@ -262,18 +286,20 @@ fn test_streaming_early_termination() {
         min_rows_before_termination: 10,
     };
 
-    let result = infer_types_streaming(
-        &["count"],
-        rows.iter().map(|r| r.as_slice()),
-        config,
-    );
+    let result = infer_types_streaming(&["count"], rows.iter().map(|r| r.as_slice()), config);
 
     // Should terminate early once Integer is confirmed
-    assert!(result.rows_processed <= 100,
-            "Should terminate early, processed {} rows", result.rows_processed);
+    assert!(
+        result.rows_processed <= 100,
+        "Should terminate early, processed {} rows",
+        result.rows_processed
+    );
 
     // Should be Integer
-    let col_result = result.columns.get("count").expect("count column should exist");
+    let col_result = result
+        .columns
+        .get("count")
+        .expect("count column should exist");
     match col_result {
         TypeInferenceResult::Resolved { data_type, .. } => {
             assert_eq!(*data_type, DataType::Integer);
@@ -294,11 +320,7 @@ fn test_multi_column_inference() {
     let columns = ["id", "name", "date", "amount", "active"];
 
     let config = StreamingConfig::default();
-    let result = infer_types_streaming(
-        &columns,
-        rows.iter().map(|r| r.as_slice()),
-        config,
-    );
+    let result = infer_types_streaming(&columns, rows.iter().map(|r| r.as_slice()), config);
 
     assert_eq!(result.columns.len(), 5);
 
@@ -312,18 +334,35 @@ fn test_multi_column_inference() {
     ];
 
     for (col_name, expected) in expected_types.iter() {
-        let col_result = result.columns.get(*col_name).expect(&format!("{} column should exist", col_name));
+        let col_result = result
+            .columns
+            .get(*col_name)
+            .expect(&format!("{} column should exist", col_name));
         match col_result {
             TypeInferenceResult::Resolved { data_type, .. } => {
-                assert_eq!(data_type, expected, "Column {} should be {:?}", col_name, expected);
+                assert_eq!(
+                    data_type, expected,
+                    "Column {} should be {:?}",
+                    col_name, expected
+                );
             }
             TypeInferenceResult::Ambiguous { possible_types, .. } => {
-                assert!(possible_types.contains(expected),
-                        "Column {} should contain {:?} in {:?}", col_name, expected, possible_types);
+                assert!(
+                    possible_types.contains(expected),
+                    "Column {} should contain {:?} in {:?}",
+                    col_name,
+                    expected,
+                    possible_types
+                );
             }
             TypeInferenceResult::NoValidType { fallback, .. } if col_name == &"name" => {
                 // name column with non-numeric data might fall back to String
-                assert_eq!(*fallback, DataType::String, "Column {} fallback should be String", col_name);
+                assert_eq!(
+                    *fallback,
+                    DataType::String,
+                    "Column {} fallback should be String",
+                    col_name
+                );
             }
             other => panic!("Unexpected result for column {}: {:?}", col_name, other),
         }
@@ -362,11 +401,7 @@ fn test_inference_from_real_csv_file() {
         .collect();
 
     let config = StreamingConfig::default();
-    let result = infer_types_streaming(
-        &headers,
-        rows.iter().map(|r| r.as_slice()),
-        config,
-    );
+    let result = infer_types_streaming(&headers, rows.iter().map(|r| r.as_slice()), config);
 
     // Verify types
     assert_eq!(result.columns.len(), 5);
@@ -380,7 +415,11 @@ fn test_inference_from_real_csv_file() {
     }
 
     // amount should be Float
-    match result.columns.get("amount").expect("amount column should exist") {
+    match result
+        .columns
+        .get("amount")
+        .expect("amount column should exist")
+    {
         TypeInferenceResult::Resolved { data_type, .. } => {
             assert_eq!(*data_type, DataType::Float, "amount should be Float");
         }
@@ -388,7 +427,11 @@ fn test_inference_from_real_csv_file() {
     }
 
     // active should be Boolean
-    match result.columns.get("active").expect("active column should exist") {
+    match result
+        .columns
+        .get("active")
+        .expect("active column should exist")
+    {
         TypeInferenceResult::Resolved { data_type, .. } => {
             assert_eq!(*data_type, DataType::Boolean, "active should be Boolean");
         }
@@ -424,24 +467,31 @@ fn test_ambiguous_date_resolution_across_rows() {
         .collect();
 
     let config = StreamingConfig::default();
-    let result = infer_types_streaming(
-        &headers,
-        rows.iter().map(|r| r.as_slice()),
-        config,
-    );
+    let result = infer_types_streaming(&headers, rows.iter().map(|r| r.as_slice()), config);
 
     // Should resolve to Date with DD/MM/YY format
-    match result.columns.get("order_date").expect("order_date column should exist") {
-        TypeInferenceResult::Resolved { data_type, format, .. } => {
+    match result
+        .columns
+        .get("order_date")
+        .expect("order_date column should exist")
+    {
+        TypeInferenceResult::Resolved {
+            data_type, format, ..
+        } => {
             assert_eq!(*data_type, DataType::Date, "Should resolve to Date");
             if let Some(fmt) = format {
-                assert!(fmt.contains("d") || fmt.contains("%d"),
-                        "Format should be DD/MM/YY variant, got: {}", fmt);
+                assert!(
+                    fmt.contains("d") || fmt.contains("%d"),
+                    "Format should be DD/MM/YY variant, got: {}",
+                    fmt
+                );
             }
         }
         TypeInferenceResult::Ambiguous { possible_types, .. } => {
-            assert!(possible_types.contains(&DataType::Date),
-                    "Date should be in possible types");
+            assert!(
+                possible_types.contains(&DataType::Date),
+                "Date should be in possible types"
+            );
         }
         _ => panic!("Should resolve to Date type"),
     }
@@ -458,8 +508,15 @@ fn test_large_file_inference_performance() {
     writeln!(file, "id,value,timestamp").unwrap();
 
     for i in 0..10_000 {
-        writeln!(file, "{},{}.{},2024-01-{:02}T12:00:00",
-                 i, i * 100, i % 100, (i % 28) + 1).unwrap();
+        writeln!(
+            file,
+            "{},{}.{},2024-01-{:02}T12:00:00",
+            i,
+            i * 100,
+            i % 100,
+            (i % 28) + 1
+        )
+        .unwrap();
     }
     drop(file);
 
@@ -481,17 +538,16 @@ fn test_large_file_inference_performance() {
         min_rows_before_termination: 50,
     };
 
-    let result = infer_types_streaming(
-        &headers,
-        rows.iter().map(|r| r.as_slice()),
-        config,
-    );
+    let result = infer_types_streaming(&headers, rows.iter().map(|r| r.as_slice()), config);
 
     let duration = start.elapsed();
 
     // Should complete in reasonable time
-    assert!(duration.as_millis() < 5000,
-            "Inference took too long: {:?}", duration);
+    assert!(
+        duration.as_millis() < 5000,
+        "Inference took too long: {:?}",
+        duration
+    );
 
     // Should correctly identify types
     assert_eq!(result.columns.len(), 3);
@@ -514,17 +570,28 @@ fn test_elimination_evidence_tracking() {
 
     // Should have elimination evidence
     match result {
-        TypeInferenceResult::Resolved { evidence, .. } |
-        TypeInferenceResult::NoValidType { eliminations: evidence, .. } => {
+        TypeInferenceResult::Resolved { evidence, .. }
+        | TypeInferenceResult::NoValidType {
+            eliminations: evidence,
+            ..
+        } => {
             assert!(!evidence.is_empty(), "Should have elimination evidence");
 
             // Check that we have evidence for numeric type elimination
             let has_numeric_elimination = evidence.iter().any(|e| {
-                matches!(e.eliminated,
-                    casparian_worker::type_inference::constraints::EliminatedItem::Type(DataType::Integer) |
-                    casparian_worker::type_inference::constraints::EliminatedItem::Type(DataType::Float))
+                matches!(
+                    e.eliminated,
+                    casparian_worker::type_inference::constraints::EliminatedItem::Type(
+                        DataType::Integer
+                    ) | casparian_worker::type_inference::constraints::EliminatedItem::Type(
+                        DataType::Float
+                    )
+                )
             });
-            assert!(has_numeric_elimination, "Should have evidence for numeric elimination");
+            assert!(
+                has_numeric_elimination,
+                "Should have evidence for numeric elimination"
+            );
         }
         _ => {}
     }
@@ -565,9 +632,11 @@ fn test_scientific_notation() {
     solver.add_value("2.3e-5");
 
     // Should recognize as Float (scientific notation is numeric)
-    assert!(solver.possible_types().contains(&DataType::Float) ||
-            solver.possible_types().contains(&DataType::String),
-            "Scientific notation should be Float or String");
+    assert!(
+        solver.possible_types().contains(&DataType::Float)
+            || solver.possible_types().contains(&DataType::String),
+        "Scientific notation should be Float or String"
+    );
 }
 
 /// Test negative numbers
@@ -583,7 +652,11 @@ fn test_negative_numbers() {
     let result = solver.get_result();
     match result {
         TypeInferenceResult::Resolved { data_type, .. } => {
-            assert_eq!(data_type, DataType::Float, "Mixed negatives with decimal should be Float");
+            assert_eq!(
+                data_type,
+                DataType::Float,
+                "Mixed negatives with decimal should be Float"
+            );
         }
         _ => panic!("Expected Float for negative numbers with decimal"),
     }
@@ -629,8 +702,11 @@ fn test_leading_zeros() {
     match result {
         TypeInferenceResult::Resolved { data_type, .. } => {
             // Either Integer (current) or String (ideal) is documented behavior
-            assert!(data_type == DataType::Integer || data_type == DataType::String,
-                    "Leading zeros should be Integer or String, got {:?}", data_type);
+            assert!(
+                data_type == DataType::Integer || data_type == DataType::String,
+                "Leading zeros should be Integer or String, got {:?}",
+                data_type
+            );
         }
         _ => {}
     }
@@ -647,9 +723,11 @@ fn test_boolean_variations() {
     solver.add_value("NO");
 
     // Should handle case-insensitive boolean values
-    assert!(solver.possible_types().contains(&DataType::Boolean) ||
-            solver.possible_types().contains(&DataType::String),
-            "Mixed case booleans should be Boolean or String");
+    assert!(
+        solver.possible_types().contains(&DataType::Boolean)
+            || solver.possible_types().contains(&DataType::String),
+        "Mixed case booleans should be Boolean or String"
+    );
 }
 
 // =============================================================================
@@ -669,8 +747,11 @@ fn test_pure_integers_resolve_to_integer() {
     let result = solver.get_result();
     match result {
         TypeInferenceResult::Resolved { data_type, .. } => {
-            assert_eq!(data_type, DataType::Integer,
-                       "Pure integers should resolve to Integer, not Float");
+            assert_eq!(
+                data_type,
+                DataType::Integer,
+                "Pure integers should resolve to Integer, not Float"
+            );
         }
         _ => panic!("Expected resolved Integer type"),
     }
@@ -688,8 +769,11 @@ fn test_single_decimal_makes_float() {
     let result = solver.get_result();
     match result {
         TypeInferenceResult::Resolved { data_type, .. } => {
-            assert_eq!(data_type, DataType::Float,
-                       "Single decimal should make entire column Float");
+            assert_eq!(
+                data_type,
+                DataType::Float,
+                "Single decimal should make entire column Float"
+            );
         }
         _ => panic!("Expected resolved Float type"),
     }

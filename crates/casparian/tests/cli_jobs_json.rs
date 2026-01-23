@@ -1,9 +1,9 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
-use casparian_db::{DbConnection, DbValue};
 use casparian::scout::FileStatus;
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::ProcessingStatus;
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -72,10 +72,7 @@ fn test_jobs_json_filters() {
     let (home_dir, db_path) = setup_jobs_db();
     assert!(db_path.exists());
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let jobs_args = vec!["jobs".to_string(), "--json".to_string()];
     let jobs_output: JobsOutput = run_cli_json(&jobs_args, &envs);
@@ -118,7 +115,10 @@ fn test_jobs_json_filters() {
         .iter()
         .find(|job| job.id == 2)
         .expect("job 2 present");
-    assert_eq!(completed_job.end_time.as_deref(), Some("2024-12-16T10:30:05Z"));
+    assert_eq!(
+        completed_job.end_time.as_deref(),
+        Some("2024-12-16T10:30:05Z")
+    );
     assert_eq!(
         completed_job.result_summary.as_deref(),
         Some("Processed 100 rows")
@@ -161,7 +161,10 @@ fn test_jobs_json_filters() {
         "invoice".to_string(),
     ];
     let topic_output: JobsOutput = run_cli_json(&topic_args, &envs);
-    assert!(topic_output.jobs.iter().all(|job| job.plugin_name == "invoice"));
+    assert!(topic_output
+        .jobs
+        .iter()
+        .all(|job| job.plugin_name == "invoice"));
 
     let limit_args = vec![
         "jobs".to_string(),
@@ -178,10 +181,7 @@ fn test_jobs_json_filters() {
 fn test_job_actions_update_db() {
     let (home_dir, db_path) = setup_jobs_db();
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let show_args = vec![
         "job".to_string(),
@@ -204,7 +204,10 @@ fn test_job_actions_update_db() {
     let cancel_args = vec!["job".to_string(), "cancel".to_string(), "1".to_string()];
     assert_cli_success(&run_cli(&cancel_args, &envs), &cancel_args);
     assert_eq!(job_status(&db_path, 1), ProcessingStatus::Failed.as_str());
-    assert_eq!(job_error(&db_path, 1), Some("Cancelled by user".to_string()));
+    assert_eq!(
+        job_error(&db_path, 1),
+        Some("Cancelled by user".to_string())
+    );
 
     cli_support::with_duckdb(&db_path, |conn| {
         conn.execute(
@@ -405,10 +408,7 @@ fn insert_file(
 
 fn split_rel_path(rel_path: &str) -> (String, String) {
     match rel_path.rfind('/') {
-        Some(idx) => (
-            rel_path[..idx].to_string(),
-            rel_path[idx + 1..].to_string(),
-        ),
+        Some(idx) => (rel_path[..idx].to_string(), rel_path[idx + 1..].to_string()),
         None => ("".to_string(), rel_path.to_string()),
     }
 }
@@ -440,6 +440,9 @@ fn job_error(db_path: &Path, job_id: i64) -> Option<String> {
             &[DbValue::from(job_id)],
         )
         .ok()
-        .and_then(|row| row.and_then(|r| r.get_by_name::<Option<String>>("error_message").ok()).flatten())
+        .and_then(|row| {
+            row.and_then(|r| r.get_by_name::<Option<String>>("error_message").ok())
+                .flatten()
+        })
     })
 }

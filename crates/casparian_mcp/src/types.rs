@@ -24,7 +24,10 @@ use std::path::PathBuf;
 /// { "plugin": "fix_parser" }
 /// { "path": "./parsers/my_parser.py" }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Note: Also accepts string-encoded JSON for compatibility with some MCP clients
+/// that double-encode structured arguments.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum PluginRef {
     /// Reference to a registered plugin
@@ -40,6 +43,65 @@ pub enum PluginRef {
         /// Local file path
         path: PathBuf,
     },
+}
+
+// Custom deserializer to handle string-encoded JSON from MCP clients
+impl<'de> serde::Deserialize<'de> for PluginRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        // First try to deserialize as a structured value
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // If it's a string, try to parse it as JSON
+        if let serde_json::Value::String(s) = &value {
+            // Try to parse the string as JSON
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                return parse_plugin_ref_value(&parsed)
+                    .map_err(|e| D::Error::custom(format!("Invalid PluginRef in string: {}", e)));
+            }
+            // If it doesn't parse as JSON, treat bare strings as registered plugin names
+            // (NOT as paths - that's a footgun where "evtx_native" becomes a file path)
+            return Ok(PluginRef::Registered {
+                plugin: s.clone(),
+                version: None,
+            });
+        }
+
+        // Otherwise parse the structured value directly
+        parse_plugin_ref_value(&value)
+            .map_err(|e| D::Error::custom(format!("Invalid PluginRef: {}", e)))
+    }
+}
+
+fn parse_plugin_ref_value(value: &serde_json::Value) -> Result<PluginRef, String> {
+    if let Some(obj) = value.as_object() {
+        // Check for Path variant
+        if let Some(path) = obj.get("path") {
+            if let Some(path_str) = path.as_str() {
+                return Ok(PluginRef::Path {
+                    path: PathBuf::from(path_str),
+                });
+            }
+        }
+        // Check for Registered variant
+        if let Some(plugin) = obj.get("plugin") {
+            if let Some(plugin_str) = plugin.as_str() {
+                let version = obj
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                return Ok(PluginRef::Registered {
+                    plugin: plugin_str.to_string(),
+                    version,
+                });
+            }
+        }
+    }
+    Err("data did not match any variant: expected {path: string} or {plugin: string, version?: string}".to_string())
 }
 
 impl PluginRef {
@@ -109,10 +171,7 @@ pub enum SimpleDataType {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ComplexDataType {
     /// Fixed-point decimal with precision and scale
-    Decimal {
-        precision: u8,
-        scale: u8,
-    },
+    Decimal { precision: u8, scale: u8 },
     /// Timestamp with timezone
     TimestampTz {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,7 +309,7 @@ impl RedactionPolicy {
                 }
             }
             RedactionMode::Hash => {
-                use sha2::{Sha256, Digest};
+                use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(value.as_bytes());
                 let hash = hasher.finalize();
@@ -330,16 +389,11 @@ pub enum ViolationType {
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum SuggestedFix {
     /// Change column type
-    ChangeType {
-        from: DataType,
-        to: DataType,
-    },
+    ChangeType { from: DataType, to: DataType },
     /// Make column nullable
     MakeNullable,
     /// Change format string
-    ChangeFormat {
-        suggested: String,
-    },
+    ChangeFormat { suggested: String },
     /// Add missing column
     AddColumn {
         name: String,
@@ -347,9 +401,7 @@ pub enum SuggestedFix {
         data_type: DataType,
     },
     /// Remove extra column
-    RemoveColumn {
-        name: String,
-    },
+    RemoveColumn { name: String },
 }
 
 // ============================================================================
@@ -375,6 +427,92 @@ pub struct ApprovalSummary {
     pub target_path: String,
 }
 
+// ============================================================================
+// Strongly-Typed Enums for Tool Inputs (anti-stringly-typed)
+// ============================================================================
+
+/// Decision for approval requests - replaces stringly-typed "approve"/"reject"
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalDecision {
+    /// Approve the request
+    Approve,
+    /// Reject the request
+    Reject,
+}
+
+impl std::fmt::Display for ApprovalDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Approve => write!(f, "approve"),
+            Self::Reject => write!(f, "reject"),
+        }
+    }
+}
+
+/// Status filter for job listings - replaces stringly-typed status strings
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum JobStatusFilter {
+    /// All jobs (no filter)
+    #[default]
+    All,
+    /// Running jobs only
+    Running,
+    /// Completed jobs only
+    Completed,
+    /// Failed jobs only
+    Failed,
+    /// Queued jobs only
+    Queued,
+    /// Cancelled jobs only
+    Cancelled,
+}
+
+impl JobStatusFilter {
+    /// Convert to Option<&str> for filtering (None = all)
+    pub fn as_filter_str(&self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Running => Some("running"),
+            Self::Completed => Some("completed"),
+            Self::Failed => Some("failed"),
+            Self::Queued => Some("queued"),
+            Self::Cancelled => Some("cancelled"),
+        }
+    }
+}
+
+/// Status filter for approval listings - replaces stringly-typed status strings
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalStatusFilter {
+    /// Pending approvals only (default)
+    #[default]
+    Pending,
+    /// All approvals
+    All,
+    /// Approved only
+    Approved,
+    /// Rejected only
+    Rejected,
+    /// Expired only
+    Expired,
+}
+
+impl ApprovalStatusFilter {
+    /// Convert to Option<&str> for filtering (None = all)
+    pub fn as_filter_str(&self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Pending => Some("pending"),
+            Self::Approved => Some("approved"),
+            Self::Rejected => Some("rejected"),
+            Self::Expired => Some("expired"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,11 +532,50 @@ mod tests {
     }
 
     #[test]
+    fn test_plugin_ref_path_deserialize() {
+        let json = r#"{"path": "parsers/fix/fix_parser.py"}"#;
+        let pr: PluginRef = serde_json::from_str(json).unwrap();
+        match pr {
+            PluginRef::Path { path } => {
+                assert_eq!(path.to_str().unwrap(), "parsers/fix/fix_parser.py");
+            }
+            _ => panic!("Expected Path variant"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_ref_registered_deserialize() {
+        let json = r#"{"plugin": "evtx_native", "version": "0.1.0"}"#;
+        let pr: PluginRef = serde_json::from_str(json).unwrap();
+        match pr {
+            PluginRef::Registered { plugin, version } => {
+                assert_eq!(plugin, "evtx_native");
+                assert_eq!(version, Some("0.1.0".to_string()));
+            }
+            _ => panic!("Expected Registered variant"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_ref_registered_no_version_deserialize() {
+        let json = r#"{"plugin": "evtx_native"}"#;
+        let pr: PluginRef = serde_json::from_str(json).unwrap();
+        match pr {
+            PluginRef::Registered { plugin, version } => {
+                assert_eq!(plugin, "evtx_native");
+                assert_eq!(version, None);
+            }
+            _ => panic!("Expected Registered variant"),
+        }
+    }
+
+    #[test]
     fn test_redaction_hash() {
         let policy = RedactionPolicy::default();
         let redacted = policy.redact("sensitive-data-12345");
         assert!(redacted.starts_with("[hash:"));
-        assert_eq!(redacted.len(), 8 + 8); // "[hash:" + 8 chars + "]"
+        // Format: "[hash:" (6) + 8 hash chars + "]" (1) = 15
+        assert_eq!(redacted.len(), 6 + 8 + 1);
     }
 
     #[test]
@@ -438,5 +615,46 @@ mod tests {
         let json = serde_json::to_string_pretty(&schema).unwrap();
         assert!(json.contains("events"));
         assert!(json.contains("int64"));
+    }
+
+    #[test]
+    fn test_plugin_ref_path_deserialize_via_value() {
+        // Test the exact path used in MCP tool execution
+        let json =
+            r#"{"plugin_ref": {"path": "parsers/fix/fix_parser.py"}, "files": ["test.fix"]}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+
+        // Extract plugin_ref like the tool would
+        let plugin_ref_value = value.get("plugin_ref").unwrap().clone();
+        let pr: PluginRef = serde_json::from_value(plugin_ref_value).unwrap();
+
+        match pr {
+            PluginRef::Path { path } => {
+                assert_eq!(path.to_str().unwrap(), "parsers/fix/fix_parser.py");
+            }
+            _ => panic!("Expected Path variant"),
+        }
+    }
+
+    #[test]
+    fn test_plugin_ref_nested_struct_deserialize() {
+        // Test deserializing a struct containing PluginRef
+        #[derive(Debug, serde::Deserialize)]
+        struct TestArgs {
+            plugin_ref: PluginRef,
+            files: Vec<String>,
+        }
+
+        let json =
+            r#"{"plugin_ref": {"path": "parsers/fix/fix_parser.py"}, "files": ["test.fix"]}"#;
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let args: TestArgs = serde_json::from_value(value).unwrap();
+
+        match args.plugin_ref {
+            PluginRef::Path { path } => {
+                assert_eq!(path.to_str().unwrap(), "parsers/fix/fix_parser.py");
+            }
+            _ => panic!("Expected Path variant"),
+        }
     }
 }

@@ -22,17 +22,17 @@
 //! ```
 
 pub mod analyzer;
-pub mod yaml_gen;
 pub mod python_gen;
 pub mod validator;
+pub mod yaml_gen;
 
 pub use analyzer::{PathAnalyzer, PathPattern, PatternSegment, SegmentType};
-pub use yaml_gen::{YamlRuleGenerator, GeneratedRule};
-pub use validator::{PythonValidator, ValidationResult};
 pub use python_gen::PythonGenerator;
+pub use validator::{PythonValidator, ValidationResult};
+pub use yaml_gen::{GeneratedRule, YamlRuleGenerator};
 
-use crate::ai::types::{Draft, DraftContext, DraftType};
 use crate::ai::draft::DraftManager;
+use crate::ai::types::{Draft, DraftContext, DraftType};
 
 /// Result of Pathfinder analysis
 #[derive(Debug, Clone)]
@@ -147,7 +147,11 @@ impl Pathfinder {
         // Step 3: Generate appropriate output
         let (yaml_rule, python_code, decision_reason) = if complexity.is_yaml_expressible() {
             let rule = self.yaml_gen.generate(&pattern, hints)?;
-            (Some(rule), None, "Pattern can be expressed in YAML".to_string())
+            (
+                Some(rule),
+                None,
+                "Pattern can be expressed in YAML".to_string(),
+            )
         } else {
             if let Some(ref gen) = self.python_gen {
                 let code = gen.generate(paths, &pattern, hints)?;
@@ -155,13 +159,17 @@ impl Pathfinder {
                 let validation = self.validator.validate(&code)?;
                 if !validation.is_valid {
                     return Err(PathfinderError::ValidationFailed(
-                        validation.errors.join("; ")
+                        validation.errors.join("; "),
                     ));
                 }
-                (None, Some(code), "Complex pattern requires Python".to_string())
+                (
+                    None,
+                    Some(code),
+                    "Complex pattern requires Python".to_string(),
+                )
             } else {
                 return Err(PathfinderError::LlmError(
-                    "LLM not configured for Python generation".to_string()
+                    "LLM not configured for Python generation".to_string(),
                 ));
             }
         };
@@ -209,15 +217,17 @@ impl Pathfinder {
 
     /// Generate extraction preview for sample paths
     fn generate_preview(&self, paths: &[String], pattern: &PathPattern) -> Vec<ExtractionPreview> {
-        paths.iter().take(5).map(|path| {
-            let fields = pattern.extract(path)
-                .into_iter()
-                .collect();
-            ExtractionPreview {
-                path: path.clone(),
-                fields,
-            }
-        }).collect()
+        paths
+            .iter()
+            .take(5)
+            .map(|path| {
+                let fields = pattern.extract(path).into_iter().collect();
+                ExtractionPreview {
+                    path: path.clone(),
+                    fields,
+                }
+            })
+            .collect()
     }
 
     /// Create a draft from the result
@@ -233,13 +243,16 @@ impl Pathfinder {
             (DraftType::Extractor, code.clone())
         } else {
             return Err(PathfinderError::GenerationFailed(
-                "No output generated".to_string()
+                "No output generated".to_string(),
             ));
         };
 
-        let draft = draft_manager
-            .create_draft(draft_type, &content, context, Some("qwen2.5-coder-1.5b"))
-            ?;
+        let draft = draft_manager.create_draft(
+            draft_type,
+            &content,
+            context,
+            Some("qwen2.5-coder-1.5b"),
+        )?;
 
         Ok(draft)
     }

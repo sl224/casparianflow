@@ -62,7 +62,9 @@ fn get_topic_stats(db: &Database) -> HashMap<String, TopicStats> {
     let sources = db.list_sources().unwrap_or_default();
 
     for source in sources {
-        let files = db.list_files_by_source(&source.id, 100000).unwrap_or_default();
+        let files = db
+            .list_files_by_source(&source.id, 100000)
+            .unwrap_or_default();
         for file in files {
             let topic = file.tag.clone().unwrap_or_else(|| "(untagged)".to_string());
             let entry = stats.entry(topic).or_default();
@@ -71,9 +73,10 @@ fn get_topic_stats(db: &Database) -> HashMap<String, TopicStats> {
 
             match file.status {
                 FileStatus::Processed => entry.processed += 1,
-                FileStatus::Pending | FileStatus::Tagged | FileStatus::Queued | FileStatus::Processing => {
-                    entry.pending += 1
-                }
+                FileStatus::Pending
+                | FileStatus::Tagged
+                | FileStatus::Queued
+                | FileStatus::Processing => entry.pending += 1,
                 FileStatus::Failed => entry.failed += 1,
                 FileStatus::Skipped | FileStatus::Deleted => {}
             }
@@ -98,7 +101,10 @@ fn run_with_action(action: TopicAction) -> anyhow::Result<()> {
 
     match action {
         TopicAction::List { json } => list_topics(&db, json),
-        TopicAction::Create { name, description: _ } => create_topic(&db, &name),
+        TopicAction::Create {
+            name,
+            description: _,
+        } => create_topic(&db, &name),
         TopicAction::Show { name, json } => show_topic(&db, &name, json),
         TopicAction::Delete { name, force } => delete_topic(&db, &name, force),
         TopicAction::Files { name, limit } => list_topic_files(&db, &name, limit),
@@ -167,7 +173,10 @@ fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
     let stats = get_topic_stats(db);
     if stats.contains_key(name) {
         return Err(HelpfulError::new(format!("Topic already exists: {}", name))
-            .with_context(format!("{} files tagged with this topic", stats[name].total))
+            .with_context(format!(
+                "{} files tagged with this topic",
+                stats[name].total
+            ))
             .with_suggestion("TRY: Use 'casparian topic show' to see topic details")
             .into());
     }
@@ -184,8 +193,14 @@ fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
         println!();
         println!("This is an empty topic (no files tagged yet).");
         println!("Add files by:");
-        println!("  1. Creating a rule: casparian rule add '*.csv' --topic {}", name);
-        println!("  2. Manual tagging: casparian tag /path/to/file.csv --topic {}", name);
+        println!(
+            "  1. Creating a rule: casparian rule add '*.csv' --topic {}",
+            name
+        );
+        println!(
+            "  2. Manual tagging: casparian tag /path/to/file.csv --topic {}",
+            name
+        );
     }
 
     Ok(())
@@ -263,7 +278,7 @@ fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
             // Count matches for this rule
             let matched = files
                 .iter()
-            .filter(|f| f.rule_id.as_ref() == Some(&rule.id))
+                .filter(|f| f.rule_id.as_ref() == Some(&rule.id))
                 .count();
             println!("  {}     {} files matched", rule.pattern, matched);
         }
@@ -312,11 +327,20 @@ fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
         if output_dir.exists() {
             // Count parquet files
             let parquet_count = std::fs::read_dir(&output_dir)
-                .map(|entries| entries.filter(|e| {
-                    e.as_ref()
-                        .map(|e| e.path().extension().map(|ext| ext == "parquet").unwrap_or(false))
-                        .unwrap_or(false)
-                }).count())
+                .map(|entries| {
+                    entries
+                        .filter(|e| {
+                            e.as_ref()
+                                .map(|e| {
+                                    e.path()
+                                        .extension()
+                                        .map(|ext| ext == "parquet")
+                                        .unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        })
+                        .count()
+                })
                 .unwrap_or(0);
             let total_size: u64 = std::fs::read_dir(&output_dir)
                 .map(|entries| {
@@ -327,16 +351,26 @@ fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
                         .sum()
                 })
                 .unwrap_or(0);
-            println!("  {} parquet files ({})", parquet_count, format_size(total_size));
+            println!(
+                "  {} parquet files ({})",
+                parquet_count,
+                format_size(total_size)
+            );
         }
         println!();
     }
 
     // Commands section
     println!("COMMANDS");
-    println!("  casparian files --topic {}          # List all files", name);
+    println!(
+        "  casparian files --topic {}          # List all files",
+        name
+    );
     if stats.failed > 0 {
-        println!("  casparian files --topic {} --failed # List failures", name);
+        println!(
+            "  casparian files --topic {} --failed # List failures",
+            name
+        );
     }
     Ok(())
 }
@@ -367,10 +401,12 @@ fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
     let stats = topic_stats.unwrap();
 
     if stats.total > 0 && !force {
-        return Err(HelpfulError::new(format!("Topic '{}' has {} files", name, stats.total))
-            .with_context("Deleting this topic will untag all files")
-            .with_suggestion("TRY: Use --force to remove anyway")
-            .into());
+        return Err(
+            HelpfulError::new(format!("Topic '{}' has {} files", name, stats.total))
+                .with_context("Deleting this topic will untag all files")
+                .with_suggestion("TRY: Use --force to remove anyway")
+                .into(),
+        );
     }
 
     // Delete rules for this topic
@@ -394,9 +430,9 @@ fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
 }
 
 fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Result<()> {
-    let files = db.list_files_by_tag(name, limit).map_err(|e| {
-        HelpfulError::new(format!("Failed to list files: {}", e))
-    })?;
+    let files = db
+        .list_files_by_tag(name, limit)
+        .map_err(|e| HelpfulError::new(format!("Failed to list files: {}", e)))?;
 
     if files.is_empty() {
         println!("No files tagged with '{}'", name);

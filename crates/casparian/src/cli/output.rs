@@ -264,7 +264,10 @@ mod tests {
     fn test_format_duration_ago() {
         assert_eq!(format_duration_ago(Duration::from_secs(5)), "5 seconds ago");
         assert_eq!(format_duration_ago(Duration::from_secs(1)), "1 second ago");
-        assert_eq!(format_duration_ago(Duration::from_secs(120)), "2 minutes ago");
+        assert_eq!(
+            format_duration_ago(Duration::from_secs(120)),
+            "2 minutes ago"
+        );
         assert_eq!(format_duration_ago(Duration::from_secs(3600)), "1 hour ago");
         assert_eq!(format_duration_ago(Duration::from_secs(86400)), "1 day ago");
     }
@@ -316,6 +319,9 @@ mod tests {
     fn test_format_number_signed_edge_cases() {
         assert_eq!(format_number_signed(-1), "-1");
         assert_eq!(format_number_signed(1), "1");
-        assert_eq!(format_number_signed(i64::MIN + 1), "-9,223,372,036,854,775,807");
+        assert_eq!(
+            format_number_signed(i64::MIN + 1),
+            "-9,223,372,036,854,775,807"
+        );
     }
 }

@@ -161,10 +161,19 @@ impl PathAnalyzer {
     pub fn new() -> Self {
         Self {
             date_patterns: vec![
-                (Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap(), DateFormat::IsoDate),
-                (Regex::new(r"^\d{4}/\d{2}/\d{2}$").unwrap(), DateFormat::SlashDate),
+                (
+                    Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap(),
+                    DateFormat::IsoDate,
+                ),
+                (
+                    Regex::new(r"^\d{4}/\d{2}/\d{2}$").unwrap(),
+                    DateFormat::SlashDate,
+                ),
                 (Regex::new(r"^\d{8}$").unwrap(), DateFormat::CompactDate),
-                (Regex::new(r"^\d{2}-\d{2}-\d{4}$").unwrap(), DateFormat::EuropeanDate),
+                (
+                    Regex::new(r"^\d{2}-\d{2}-\d{4}$").unwrap(),
+                    DateFormat::EuropeanDate,
+                ),
                 (Regex::new(r"^\d{4}-\d{2}$").unwrap(), DateFormat::YearMonth),
                 // Note: YearOnly is NOT included here - we use VariablePattern::Year instead
                 // for standalone 4-digit years to avoid confusion with date formats
@@ -216,11 +225,10 @@ impl PathAnalyzer {
                 SegmentType::Fixed(s) => s.clone(),
                 SegmentType::Variable { .. } => "*".to_string(),
                 SegmentType::Regex(_) => "*".to_string(),
-                SegmentType::Filename { extension } => {
-                    extension.as_ref()
-                        .map(|e| format!("*.{}", e))
-                        .unwrap_or_else(|| "*".to_string())
-                }
+                SegmentType::Filename { extension } => extension
+                    .as_ref()
+                    .map(|e| format!("*.{}", e))
+                    .unwrap_or_else(|| "*".to_string()),
             };
             glob_parts.push(glob_part);
             segments.push(segment);
@@ -240,14 +248,20 @@ impl PathAnalyzer {
     /// Analyze a single position across all paths
     fn analyze_position(&self, pos: usize, values: &[&str], is_filename: bool) -> PatternSegment {
         let unique_values: HashSet<&str> = values.iter().copied().collect();
-        let seen_values: Vec<String> = unique_values.iter().take(10).map(|s| s.to_string()).collect();
+        let seen_values: Vec<String> = unique_values
+            .iter()
+            .take(10)
+            .map(|s| s.to_string())
+            .collect();
 
         // If all values are the same, it's fixed
         if unique_values.len() == 1 {
             let value = unique_values.into_iter().next().unwrap();
 
             if is_filename {
-                let extension = value.rsplit('.').next()
+                let extension = value
+                    .rsplit('.')
+                    .next()
                     .filter(|e| e.len() <= 10 && !e.contains('/'))
                     .map(String::from);
                 return PatternSegment {
@@ -267,13 +281,17 @@ impl PathAnalyzer {
         }
 
         // Check for date patterns
-        if let Some((_, date_format)) = self.date_patterns.iter()
+        if let Some((_, date_format)) = self
+            .date_patterns
+            .iter()
             .find(|(regex, _)| values.iter().all(|v| regex.is_match(v)))
         {
             let field_name = self.suggest_field_name_for_date(date_format);
             return PatternSegment {
                 segment_type: SegmentType::Variable {
-                    pattern_type: VariablePattern::Date { format: date_format.clone() },
+                    pattern_type: VariablePattern::Date {
+                        format: date_format.clone(),
+                    },
                     examples: seen_values.clone(),
                 },
                 position: pos,
@@ -283,20 +301,28 @@ impl PathAnalyzer {
         }
 
         // Check for entity prefix pattern
-        if let Some(caps) = values.iter()
+        if let Some(caps) = values
+            .iter()
             .filter_map(|v| self.entity_prefix_pattern.captures(v))
             .next()
         {
             if let (Some(prefix), Some(_)) = (caps.get(1), caps.get(2)) {
                 let prefix_str = prefix.as_str().to_string();
                 // Verify most values match this pattern
-                let matching = values.iter()
-                    .filter(|v| v.starts_with(&format!("{}-", prefix_str)) ||
-                               v.starts_with(&format!("{}_", prefix_str)))
+                let matching = values
+                    .iter()
+                    .filter(|v| {
+                        v.starts_with(&format!("{}-", prefix_str))
+                            || v.starts_with(&format!("{}_", prefix_str))
+                    })
                     .count();
 
                 if matching as f64 / values.len() as f64 > 0.8 {
-                    let separator = if values.iter().any(|v| v.contains('-')) { '-' } else { '_' };
+                    let separator = if values.iter().any(|v| v.contains('-')) {
+                        '-'
+                    } else {
+                        '_'
+                    };
                     return PatternSegment {
                         segment_type: SegmentType::Variable {
                             pattern_type: VariablePattern::EntityPrefix {
@@ -315,7 +341,10 @@ impl PathAnalyzer {
 
         // Check for year-only (BEFORE numeric IDs to avoid false positives)
         if values.iter().all(|v| {
-            v.len() == 4 && v.parse::<u32>().map(|y| y >= 1900 && y <= 2100).unwrap_or(false)
+            v.len() == 4
+                && v.parse::<u32>()
+                    .map(|y| y >= 1900 && y <= 2100)
+                    .unwrap_or(false)
         }) {
             return PatternSegment {
                 segment_type: SegmentType::Variable {
@@ -344,9 +373,8 @@ impl PathAnalyzer {
         // Filename handling
         if is_filename {
             // Check for consistent extension
-            let extensions: HashSet<&str> = values.iter()
-                .filter_map(|v| v.rsplit('.').next())
-                .collect();
+            let extensions: HashSet<&str> =
+                values.iter().filter_map(|v| v.rsplit('.').next()).collect();
 
             let extension = if extensions.len() == 1 {
                 extensions.into_iter().next().map(String::from)
@@ -395,20 +423,22 @@ impl PathAnalyzer {
         for segment in segments {
             let segment_score = match &segment.segment_type {
                 SegmentType::Fixed(_) => 1.0,
-                SegmentType::Variable { pattern_type, .. } => {
-                    match pattern_type {
-                        VariablePattern::Date { .. } => 0.95,
-                        VariablePattern::Year => 0.95,
-                        VariablePattern::Month => 0.9,
-                        VariablePattern::EntityPrefix { .. } => 0.9,
-                        VariablePattern::NumericId => 0.85,
-                        VariablePattern::AlphanumericId => 0.8,
-                        VariablePattern::FreeText => 0.6,
-                    }
-                }
+                SegmentType::Variable { pattern_type, .. } => match pattern_type {
+                    VariablePattern::Date { .. } => 0.95,
+                    VariablePattern::Year => 0.95,
+                    VariablePattern::Month => 0.9,
+                    VariablePattern::EntityPrefix { .. } => 0.9,
+                    VariablePattern::NumericId => 0.85,
+                    VariablePattern::AlphanumericId => 0.8,
+                    VariablePattern::FreeText => 0.6,
+                },
                 SegmentType::Regex(_) => 0.7,
                 SegmentType::Filename { extension } => {
-                    if extension.is_some() { 0.9 } else { 0.7 }
+                    if extension.is_some() {
+                        0.9
+                    } else {
+                        0.7
+                    }
                 }
             };
             score += segment_score;
@@ -444,8 +474,12 @@ mod tests {
         let pattern = analyzer.analyze(&paths).unwrap();
 
         // "data" and "reports" should be fixed
-        assert!(matches!(pattern.segments[0].segment_type, SegmentType::Fixed(ref s) if s == "data"));
-        assert!(matches!(pattern.segments[1].segment_type, SegmentType::Fixed(ref s) if s == "reports"));
+        assert!(
+            matches!(pattern.segments[0].segment_type, SegmentType::Fixed(ref s) if s == "data")
+        );
+        assert!(
+            matches!(pattern.segments[1].segment_type, SegmentType::Fixed(ref s) if s == "reports")
+        );
     }
 
     #[test]
@@ -462,7 +496,12 @@ mod tests {
         // Second segment should be a date
         assert!(matches!(
             &pattern.segments[1].segment_type,
-            SegmentType::Variable { pattern_type: VariablePattern::Date { format: DateFormat::IsoDate }, .. }
+            SegmentType::Variable {
+                pattern_type: VariablePattern::Date {
+                    format: DateFormat::IsoDate
+                },
+                ..
+            }
         ));
         assert_eq!(pattern.segments[1].field_name, Some("date".to_string()));
     }
@@ -480,7 +519,10 @@ mod tests {
 
         assert!(matches!(
             &pattern.segments[1].segment_type,
-            SegmentType::Variable { pattern_type: VariablePattern::Year, .. }
+            SegmentType::Variable {
+                pattern_type: VariablePattern::Year,
+                ..
+            }
         ));
         assert_eq!(pattern.segments[1].field_name, Some("year".to_string()));
     }
@@ -518,7 +560,10 @@ mod tests {
 
         assert!(matches!(
             &pattern.segments[1].segment_type,
-            SegmentType::Variable { pattern_type: VariablePattern::NumericId, .. }
+            SegmentType::Variable {
+                pattern_type: VariablePattern::NumericId,
+                ..
+            }
         ));
     }
 
@@ -549,7 +594,9 @@ mod tests {
         let extracted = pattern.extract("/data/2024/report.csv");
 
         // Should extract the year
-        assert!(extracted.iter().any(|(name, val)| name == "year" && val == "2024"));
+        assert!(extracted
+            .iter()
+            .any(|(name, val)| name == "year" && val == "2024"));
     }
 
     #[test]

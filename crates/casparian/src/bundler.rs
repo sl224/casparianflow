@@ -17,9 +17,9 @@
 //! println!("Source hash: {}", bundle.source_hash);
 //! ```
 
+use crate::parser_metadata::extract_metadata_batch;
 use anyhow::{bail, Context, Result};
 use blake3::Hasher;
-use crate::parser_metadata::extract_metadata_batch;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -76,8 +76,7 @@ pub fn bundle_parser(dir: &Path) -> Result<ParserBundle> {
         );
     }
 
-    let lockfile_content =
-        fs::read_to_string(&lockfile_path).context("Failed to read uv.lock")?;
+    let lockfile_content = fs::read_to_string(&lockfile_path).context("Failed to read uv.lock")?;
 
     // 2. Find and parse the main parser file to extract name/version
     let (name, version) = extract_parser_metadata(dir)?;
@@ -124,8 +123,7 @@ pub fn bundle_parser(dir: &Path) -> Result<ParserBundle> {
         let mut zip = ZipWriter::new(std::io::Cursor::new(&mut archive));
         let options = SimpleFileOptions::default()
             .last_modified_time(
-                zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
-                    .expect("Valid date"),
+                zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).expect("Valid date"),
             )
             .compression_method(zip::CompressionMethod::Deflated);
 
@@ -166,7 +164,15 @@ fn is_excluded(path: &Path) -> bool {
     // Note: walkdir calls this on directories before descending
     let is_excluded_dir_name = matches!(
         name,
-        ".venv" | "__pycache__" | ".git" | "node_modules" | ".mypy_cache" | ".pytest_cache" | ".tox" | "dist" | "build"
+        ".venv"
+            | "__pycache__"
+            | ".git"
+            | "node_modules"
+            | ".mypy_cache"
+            | ".pytest_cache"
+            | ".tox"
+            | "dist"
+            | "build"
     ) || name.ends_with(".egg-info");
 
     if is_excluded_dir_name {
@@ -244,7 +250,11 @@ mod tests {
         let result = bundle_parser(temp.path());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("uv.lock"), "Error should mention uv.lock: {}", err);
+        assert!(
+            err.contains("uv.lock"),
+            "Error should mention uv.lock: {}",
+            err
+        );
     }
 
     #[test]
@@ -287,7 +297,10 @@ class Parser:
         let bundle1 = bundle_parser(temp.path()).unwrap();
         let bundle2 = bundle_parser(temp.path()).unwrap();
 
-        assert_eq!(bundle1.archive, bundle2.archive, "Archives should be identical");
+        assert_eq!(
+            bundle1.archive, bundle2.archive,
+            "Archives should be identical"
+        );
         assert_eq!(
             bundle1.source_hash, bundle2.source_hash,
             "Source hashes should be identical"
@@ -399,8 +412,14 @@ version = "1.0.0""#,
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
 
-        assert!(names.contains(&"parser.py".to_string()), "Should contain parser.py");
-        assert!(names.contains(&"utils.py".to_string()), "Should contain utils.py");
+        assert!(
+            names.contains(&"parser.py".to_string()),
+            "Should contain parser.py"
+        );
+        assert!(
+            names.contains(&"utils.py".to_string()),
+            "Should contain utils.py"
+        );
         assert!(
             names.contains(&"config.json".to_string()),
             "Should contain config.json"

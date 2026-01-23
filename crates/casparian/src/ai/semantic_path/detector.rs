@@ -3,7 +3,10 @@
 //! Analyzes a set of paths to detect common semantic structure.
 
 use super::{
-    primitives::{check_consistency, extraction_pattern_for_primitive, glob_pattern_for_primitive, match_segment},
+    primitives::{
+        check_consistency, extraction_pattern_for_primitive, glob_pattern_for_primitive,
+        match_segment,
+    },
     DetectedSegment, ExtractableField, SemanticPathResult, SemanticPrimitive,
 };
 use std::path::Path;
@@ -21,10 +24,12 @@ pub fn detect_semantic_structure(paths: &[&Path]) -> Option<SemanticPathResult> 
     let all_segments: Vec<Vec<&str>> = paths
         .iter()
         .filter_map(|p| {
-            let components: Vec<&str> = p.iter()
-                .filter_map(|c| c.to_str())
-                .collect();
-            if components.is_empty() { None } else { Some(components) }
+            let components: Vec<&str> = p.iter().filter_map(|c| c.to_str()).collect();
+            if components.is_empty() {
+                None
+            } else {
+                Some(components)
+            }
         })
         .collect();
 
@@ -72,7 +77,11 @@ pub fn detect_semantic_structure(paths: &[&Path]) -> Option<SemanticPathResult> 
             confidence: combined_conf,
             parameter: parameter.clone(),
             date_format,
-            examples: values_at_position.iter().take(5).map(|s| s.to_string()).collect(),
+            examples: values_at_position
+                .iter()
+                .take(5)
+                .map(|s| s.to_string())
+                .collect(),
             pattern: extraction_pattern_for_primitive(primitive, parameter.as_deref()),
         };
 
@@ -147,7 +156,9 @@ fn generate_extractable_fields(segments: &[DetectedSegment]) -> Vec<ExtractableF
     for segment in segments {
         match segment.primitive {
             SemanticPrimitive::EntityFolder => {
-                let field_name = segment.parameter.clone()
+                let field_name = segment
+                    .parameter
+                    .clone()
                     .map(|p| format!("{}_id", p))
                     .unwrap_or_else(|| "entity_id".to_string());
 
@@ -163,7 +174,13 @@ fn generate_extractable_fields(segments: &[DetectedSegment]) -> Vec<ExtractableF
                     name: "date".to_string(),
                     from_segment: segment.position,
                     pattern: None,
-                    data_type: Some(segment.date_format.map(|f| f.as_str()).unwrap_or("date").to_string()),
+                    data_type: Some(
+                        segment
+                            .date_format
+                            .map(|f| f.as_str())
+                            .unwrap_or("date")
+                            .to_string(),
+                    ),
                 });
             }
             SemanticPrimitive::YearFolder => {
@@ -245,7 +262,10 @@ mod tests {
         assert!(result.confidence > 0.7);
 
         // Should extract mission_id and date
-        assert!(result.extractable_fields.iter().any(|f| f.name == "mission_id"));
+        assert!(result
+            .extractable_fields
+            .iter()
+            .any(|f| f.name == "mission_id"));
         assert!(result.extractable_fields.iter().any(|f| f.name == "date"));
     }
 

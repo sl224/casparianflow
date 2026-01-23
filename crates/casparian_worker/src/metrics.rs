@@ -119,7 +119,8 @@ impl Metrics {
     #[inline]
     pub fn record_job_time(&self, start: Instant) {
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.job_execution_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.job_execution_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
     }
 
     #[inline]
@@ -131,7 +132,8 @@ impl Metrics {
     #[inline]
     pub fn record_parquet_time(&self, start: Instant) {
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.parquet_write_time_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.parquet_write_time_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
     }
 
     /// Get a snapshot of all metrics

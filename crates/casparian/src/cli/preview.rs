@@ -12,9 +12,9 @@ use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table};
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
+use arrow::error::ArrowError;
 use csv::ReaderBuilder;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use arrow::error::ArrowError;
 use parquet::errors::ParquetError;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -115,13 +115,15 @@ fn validate_output_flags(args: &PreviewArgs) -> anyhow::Result<()> {
     }
 
     if args.json && (args.raw || args.head.is_some()) {
-        return Err(HelpfulError::new("JSON output is not supported with --raw or --head")
-            .with_context("Raw/head modes emit plain text")
-            .with_suggestions([
-                "TRY: Remove --raw or --head to use --json".to_string(),
-                "TRY: Remove --json for text output".to_string(),
-            ])
-            .into());
+        return Err(
+            HelpfulError::new("JSON output is not supported with --raw or --head")
+                .with_context("Raw/head modes emit plain text")
+                .with_suggestions([
+                    "TRY: Remove --raw or --head to use --json".to_string(),
+                    "TRY: Remove --json for text output".to_string(),
+                ])
+                .into(),
+        );
     }
 
     Ok(())
@@ -138,13 +140,15 @@ pub fn run(args: PreviewArgs) -> anyhow::Result<()> {
 
     // Validate it's a file, not a directory
     if args.file.is_dir() {
-        return Err(HelpfulError::new(format!("Not a file: {}", args.file.display()))
-            .with_context("The preview command expects a file, not a directory")
-            .with_suggestion(format!(
-                "TRY: Use 'scan' to list files: casparian scan {}",
-                args.file.display()
-            ))
-            .into());
+        return Err(
+            HelpfulError::new(format!("Not a file: {}", args.file.display()))
+                .with_context("The preview command expects a file, not a directory")
+                .with_suggestion(format!(
+                    "TRY: Use 'scan' to list files: casparian scan {}",
+                    args.file.display()
+                ))
+                .into(),
+        );
     }
 
     // Get file size
@@ -258,8 +262,8 @@ fn detect_file_type(path: &Path) -> FileType {
 
 /// Preview CSV file
 fn preview_csv(path: &Path, rows: usize, delimiter: char) -> anyhow::Result<PreviewResult> {
-    let file = File::open(path)
-        .map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
+    let file =
+        File::open(path).map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
 
     let mut reader = ReaderBuilder::new()
         .delimiter(delimiter as u8)
@@ -279,7 +283,9 @@ fn preview_csv(path: &Path, rows: usize, delimiter: char) -> anyhow::Result<Prev
     let mut type_trackers: Vec<TypeTracker> = vec![TypeTracker::new(); headers.len()];
 
     for (idx, result) in reader.records().take(rows).enumerate() {
-        let record = result.map_err(|e: csv::Error| HelpfulError::csv_parse_error(path, idx + 2, &e.to_string()))?;
+        let record = result.map_err(|e: csv::Error| {
+            HelpfulError::csv_parse_error(path, idx + 2, &e.to_string())
+        })?;
 
         let row: Vec<String> = record.iter().map(|s: &str| s.to_string()).collect();
 
@@ -330,16 +336,18 @@ fn preview_json(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
     match value {
         JsonValue::Array(arr) => preview_json_array(path, &arr, rows),
         JsonValue::Object(obj) => preview_json_object(path, &JsonValue::Object(obj)),
-        _ => Err(HelpfulError::json_parse_error(
-            path,
-            "Expected JSON object or array at root",
-        )
-        .into()),
+        _ => Err(
+            HelpfulError::json_parse_error(path, "Expected JSON object or array at root").into(),
+        ),
     }
 }
 
 /// Preview JSON array
-fn preview_json_array(path: &Path, arr: &[JsonValue], rows: usize) -> anyhow::Result<PreviewResult> {
+fn preview_json_array(
+    path: &Path,
+    arr: &[JsonValue],
+    rows: usize,
+) -> anyhow::Result<PreviewResult> {
     if arr.is_empty() {
         return Ok(PreviewResult {
             file_path: path.to_path_buf(),
@@ -446,8 +454,8 @@ fn preview_json_object(path: &Path, obj: &JsonValue) -> anyhow::Result<PreviewRe
 
 /// Preview NDJSON/JSONL file
 fn preview_ndjson(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
-    let file = File::open(path)
-        .map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
+    let file =
+        File::open(path).map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
     let reader = BufReader::new(file);
 
     let mut objects: Vec<JsonValue> = Vec::new();
@@ -459,8 +467,9 @@ fn preview_ndjson(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
             continue;
         }
 
-        let value: JsonValue = serde_json::from_str(&line)
-            .map_err(|e| HelpfulError::json_parse_error(path, &format!("Line {}: {}", line_num + 1, e)))?;
+        let value: JsonValue = serde_json::from_str(&line).map_err(|e| {
+            HelpfulError::json_parse_error(path, &format!("Line {}: {}", line_num + 1, e))
+        })?;
 
         objects.push(value);
     }
@@ -470,8 +479,8 @@ fn preview_ndjson(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
 
 /// Preview Parquet file
 fn preview_parquet(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
-    let file = File::open(path)
-        .map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
+    let file =
+        File::open(path).map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
 
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e: ParquetError| HelpfulError::parquet_error(path, &e.to_string()))?;
@@ -493,12 +502,14 @@ fn preview_parquet(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
     let schema: Vec<ColumnSchema> = arrow_schema
         .fields()
         .iter()
-        .map(|field: &std::sync::Arc<arrow::datatypes::Field>| ColumnSchema {
-            name: field.name().clone(),
-            inferred_type: arrow_type_to_string(field.data_type()),
-            nullable: field.is_nullable(),
-            sample_values: vec![],
-        })
+        .map(
+            |field: &std::sync::Arc<arrow::datatypes::Field>| ColumnSchema {
+                name: field.name().clone(),
+                inferred_type: arrow_type_to_string(field.data_type()),
+                nullable: field.is_nullable(),
+                sample_values: vec![],
+            },
+        )
         .collect();
 
     // Read rows
@@ -506,7 +517,8 @@ fn preview_parquet(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
     let mut total_rows = 0;
 
     while let Some(batch_result) = reader.next() {
-        let batch = batch_result.map_err(|e: ArrowError| HelpfulError::parquet_error(path, &e.to_string()))?;
+        let batch = batch_result
+            .map_err(|e: ArrowError| HelpfulError::parquet_error(path, &e.to_string()))?;
 
         for row_idx in 0..batch.num_rows() {
             if total_rows >= rows {
@@ -541,8 +553,8 @@ fn preview_parquet(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
 
 /// Preview text file
 fn preview_text(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
-    let file = File::open(path)
-        .map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
+    let file =
+        File::open(path).map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
     let reader = BufReader::new(file);
 
     let lines: Vec<Vec<String>> = reader
@@ -565,8 +577,8 @@ fn preview_text(path: &Path, rows: usize) -> anyhow::Result<PreviewResult> {
 
 /// Preview raw bytes as hex dump
 fn preview_raw(path: &Path, bytes: usize) -> anyhow::Result<()> {
-    let mut file = File::open(path)
-        .map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
+    let mut file =
+        File::open(path).map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
 
     let mut buffer = vec![0u8; bytes];
     let bytes_read = file.read(&mut buffer)?;
@@ -613,8 +625,8 @@ fn preview_raw(path: &Path, bytes: usize) -> anyhow::Result<()> {
 
 /// Preview file head (first N lines)
 fn preview_head(path: &Path, lines: usize) -> anyhow::Result<()> {
-    let file = File::open(path)
-        .map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
+    let file =
+        File::open(path).map_err(|e| HelpfulError::cannot_read_file(path, &e.to_string()))?;
     let reader = BufReader::new(file);
 
     println!("First {} lines of {}:", lines, path.display());
@@ -661,8 +673,12 @@ fn json_type_to_string(value: &JsonValue) -> String {
 fn arrow_type_to_string(dt: &DataType) -> String {
     match dt {
         DataType::Boolean => "boolean".to_string(),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "integer".to_string(),
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "unsigned".to_string(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            "integer".to_string()
+        }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            "unsigned".to_string()
+        }
         DataType::Float16 | DataType::Float32 | DataType::Float64 => "float".to_string(),
         DataType::Utf8 | DataType::LargeUtf8 => "string".to_string(),
         DataType::Binary | DataType::LargeBinary => "binary".to_string(),
@@ -899,7 +915,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let json_path = temp_dir.path().join("test.json");
         let mut file = File::create(&json_path).unwrap();
-        writeln!(file, r#"[{{"id": 1, "name": "foo"}}, {{"id": 2, "name": "bar"}}]"#).unwrap();
+        writeln!(
+            file,
+            r#"[{{"id": 1, "name": "foo"}}, {{"id": 2, "name": "bar"}}]"#
+        )
+        .unwrap();
 
         let result = preview_json(&json_path, 10).unwrap();
 

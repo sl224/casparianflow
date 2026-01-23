@@ -4,8 +4,9 @@
 //! Human must approve via CLI before the job runs.
 
 use super::McpTool;
-use crate::approvals::{ApprovalManager, ApprovalOperation};
-use crate::jobs::JobManager;
+use crate::approvals::ApprovalOperation;
+use crate::core::CoreHandle;
+use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
 use crate::types::{ApprovalSummary, PluginRef, SchemasMap};
@@ -13,8 +14,6 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use walkdir::WalkDir;
 
 pub struct RunRequestTool;
@@ -46,7 +45,6 @@ struct RunRequestResult {
     approve_command: String,
 }
 
-#[async_trait::async_trait]
 impl McpTool for RunRequestTool {
     fn name(&self) -> &'static str {
         "casparian_run_request"
@@ -96,13 +94,13 @@ impl McpTool for RunRequestTool {
         })
     }
 
-    async fn execute(
+    fn execute(
         &self,
         args: Value,
         security: &SecurityConfig,
-        _jobs: &Arc<Mutex<JobManager>>,
-        approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         _config: &McpServerConfig,
+        _executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: RunRequestArgs = serde_json::from_value(args)?;
 
@@ -117,7 +115,9 @@ impl McpTool for RunRequestTool {
             .count();
 
         // Default output path
-        let output = args.output.unwrap_or_else(|| "parquet://./output/".to_string());
+        let output = args
+            .output
+            .unwrap_or_else(|| "parquet://./output/".to_string());
 
         // Build summary
         let summary = ApprovalSummary {
@@ -139,9 +139,8 @@ impl McpTool for RunRequestTool {
             output: output.clone(),
         };
 
-        // Create approval request
-        let mut approval_manager = approvals.lock().await;
-        let approval = approval_manager.create_approval(operation, summary.clone())?;
+        // Create approval request via Core
+        let approval = core.create_approval(operation, summary.clone())?;
 
         let result = RunRequestResult {
             approval_id: approval.approval_id.to_string(),

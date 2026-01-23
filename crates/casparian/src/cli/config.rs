@@ -123,16 +123,33 @@ pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
         println!();
         println!("Database Backend: {}", backend.as_str());
         println!("  Active:  {}", active_db.display());
-        println!("  DuckDB:  {} ({})", duckdb_db.display(), if duckdb_db.exists() { "exists" } else { "not found" });
+        println!(
+            "  DuckDB:  {} ({})",
+            duckdb_db.display(),
+            if duckdb_db.exists() {
+                "exists"
+            } else {
+                "not found"
+            }
+        );
         println!();
         println!("Output:   {}", output.display());
-        println!("          exists: {}", if output.exists() { "yes" } else { "no" });
+        println!(
+            "          exists: {}",
+            if output.exists() { "yes" } else { "no" }
+        );
         println!();
         println!("Venvs:    {}", venvs.display());
-        println!("          exists: {}", if venvs.exists() { "yes" } else { "no" });
+        println!(
+            "          exists: {}",
+            if venvs.exists() { "yes" } else { "no" }
+        );
         println!();
         println!("Parsers:  {}", parsers.display());
-        println!("          exists: {}", if parsers.exists() { "yes" } else { "no" });
+        println!(
+            "          exists: {}",
+            if parsers.exists() { "yes" } else { "no" }
+        );
     }
 
     Ok(())

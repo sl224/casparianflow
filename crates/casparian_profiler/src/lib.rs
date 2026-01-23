@@ -110,11 +110,7 @@ impl Drop for ZoneGuard<'_> {
     fn drop(&mut self) {
         let elapsed = self.start.elapsed().as_nanos() as u64;
         let mut inner = self.profiler.inner.borrow_mut();
-        inner
-            .zone_times
-            .entry(self.zone)
-            .or_default()
-            .add(elapsed);
+        inner.zone_times.entry(self.zone).or_default().add(elapsed);
     }
 }
 
@@ -277,8 +273,8 @@ impl Profiler {
     ///
     /// Example output:
     /// ```text
-    /// 0	205.3	82.1	scanner.walk:120.1,tui.draw:45.2
-    /// 1	198.7	79.5	scanner.walk:115.0,tui.draw:42.0
+    /// 0    205.3    82.1    scanner.walk:120.1,tui.draw:45.2
+    /// 1    198.7    79.5    scanner.walk:115.0,tui.draw:42.0
     /// ```
     ///
     /// Suitable for shell script parsing with `cut` and `grep`.
@@ -328,10 +324,7 @@ impl Profiler {
         let avg = times.iter().sum::<f64>() / times.len() as f64;
         let max = times.iter().cloned().fold(f64::MIN, f64::max);
         let min = times.iter().cloned().fold(f64::MAX, f64::min);
-        let over_budget = times
-            .iter()
-            .filter(|t| **t > self.budget_ms as f64)
-            .count();
+        let over_budget = times.iter().filter(|t| **t > self.budget_ms as f64).count();
 
         format!(
             "frame_count={}\navg_ms={:.1}\nmax_ms={:.1}\nmin_ms={:.1}\nover_budget_count={}\nbudget_ms={}\n",

@@ -109,9 +109,7 @@ impl TopicConfig {
         }
         if let Some(value) = max_quarantine_count {
             let count = u64::try_from(value).map_err(|_| {
-                BackendError::TypeConversion(
-                    "quarantine_max_count out of range".to_string(),
-                )
+                BackendError::TypeConversion("quarantine_max_count out of range".to_string())
             })?;
             quarantine_config.max_quarantine_count = Some(count);
             has_quarantine_config = true;
@@ -174,7 +172,10 @@ impl ProcessingJob {
     pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
         let status_str: String = row.get_by_name("status")?;
         let status = status_str.parse::<ProcessingStatus>().map_err(|e| {
-            BackendError::TypeConversion(format!("Invalid processing status '{}': {}", status_str, e))
+            BackendError::TypeConversion(format!(
+                "Invalid processing status '{}': {}",
+                status_str, e
+            ))
         })?;
 
         // Parse completion_status if present - this is optional, but if present should be valid
@@ -337,7 +338,9 @@ impl WorkerNode {
 
         Ok(Self {
             id: row.get_by_name("id")?,
-            host: row.get_by_name("host").or_else(|_| row.get_by_name("hostname"))?,
+            host: row
+                .get_by_name("host")
+                .or_else(|_| row.get_by_name("hostname"))?,
             pid: row.get_by_name("pid")?,
             status,
             current_job_id: row.get_by_name("current_job_id")?,

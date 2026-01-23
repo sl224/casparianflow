@@ -224,17 +224,18 @@ impl DbRow {
     pub fn get<T: FromDbValue>(&self, index: usize) -> Result<T, BackendError> {
         self.values
             .get(index)
-            .ok_or_else(|| BackendError::TypeConversion(format!("Column index {} out of bounds", index)))
+            .ok_or_else(|| {
+                BackendError::TypeConversion(format!("Column index {} out of bounds", index))
+            })
             .and_then(|v| T::from_db_value(v))
     }
 
     /// Get a value by column name.
     pub fn get_by_name<T: FromDbValue>(&self, name: &str) -> Result<T, BackendError> {
-        let index = self
-            .columns
-            .iter()
-            .position(|c| c == name)
-            .ok_or_else(|| BackendError::TypeConversion(format!("Column '{}' not found", name)))?;
+        let index =
+            self.columns.iter().position(|c| c == name).ok_or_else(|| {
+                BackendError::TypeConversion(format!("Column '{}' not found", name))
+            })?;
         self.get(index)
     }
 
@@ -247,6 +248,16 @@ impl DbRow {
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
+
+    /// Get the column names.
+    pub fn column_names(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// Get the raw DbValue at an index.
+    pub fn get_raw(&self, index: usize) -> Option<&DbValue> {
+        self.values.get(index)
+    }
 }
 
 /// Trait for converting from DbValue.
@@ -258,7 +269,9 @@ impl FromDbValue for i64 {
     fn from_db_value(value: &DbValue) -> Result<Self, BackendError> {
         match value {
             DbValue::Integer(v) => Ok(*v),
-            DbValue::Null => Ok(0),
+            DbValue::Null => Err(BackendError::TypeConversion(
+                "i64 field is NULL - use Option<i64> for nullable columns".to_string(),
+            )),
             _ => Err(BackendError::TypeConversion("Expected integer".to_string())),
         }
     }
@@ -269,7 +282,9 @@ impl FromDbValue for i32 {
         match value {
             DbValue::Integer(v) => i32::try_from(*v)
                 .map_err(|_| BackendError::TypeConversion("Expected i32".to_string())),
-            DbValue::Null => Ok(0),
+            DbValue::Null => Err(BackendError::TypeConversion(
+                "i32 field is NULL - use Option<i32> for nullable columns".to_string(),
+            )),
             _ => Err(BackendError::TypeConversion("Expected integer".to_string())),
         }
     }
@@ -280,7 +295,9 @@ impl FromDbValue for f64 {
         match value {
             DbValue::Real(v) => Ok(*v),
             DbValue::Integer(v) => Ok(*v as f64),
-            DbValue::Null => Ok(0.0),
+            DbValue::Null => Err(BackendError::TypeConversion(
+                "f64 field is NULL - use Option<f64> for nullable columns".to_string(),
+            )),
             _ => Err(BackendError::TypeConversion("Expected real".to_string())),
         }
     }
@@ -292,7 +309,13 @@ impl FromDbValue for DbTimestamp {
             DbValue::Timestamp(v) => Ok(v.clone()),
             DbValue::Text(v) => DbTimestamp::from_rfc3339(v)
                 .map_err(|e| BackendError::TypeConversion(e.to_string())),
-            _ => Err(BackendError::TypeConversion("Expected timestamp".to_string())),
+            DbValue::Null => Err(BackendError::TypeConversion(
+                "DbTimestamp field is NULL - use Option<DbTimestamp> for nullable columns"
+                    .to_string(),
+            )),
+            _ => Err(BackendError::TypeConversion(
+                "Expected timestamp".to_string(),
+            )),
         }
     }
 }
@@ -301,7 +324,9 @@ impl FromDbValue for String {
     fn from_db_value(value: &DbValue) -> Result<Self, BackendError> {
         match value {
             DbValue::Text(v) => Ok(v.clone()),
-            DbValue::Null => Ok(String::new()),
+            DbValue::Null => Err(BackendError::TypeConversion(
+                "String field is NULL - use Option<String> for nullable columns".to_string(),
+            )),
             _ => Err(BackendError::TypeConversion("Expected text".to_string())),
         }
     }
@@ -312,7 +337,9 @@ impl FromDbValue for bool {
         match value {
             DbValue::Boolean(v) => Ok(*v),
             DbValue::Integer(v) => Ok(*v != 0),
-            DbValue::Null => Ok(false),
+            DbValue::Null => Err(BackendError::TypeConversion(
+                "bool field is NULL - use Option<bool> for nullable columns".to_string(),
+            )),
             _ => Err(BackendError::TypeConversion("Expected boolean".to_string())),
         }
     }
@@ -331,7 +358,9 @@ impl FromDbValue for Vec<u8> {
     fn from_db_value(value: &DbValue) -> Result<Self, BackendError> {
         match value {
             DbValue::Blob(v) => Ok(v.clone()),
-            DbValue::Null => Ok(Vec::new()),
+            DbValue::Null => Err(BackendError::TypeConversion(
+                "Vec<u8> field is NULL - use Option<Vec<u8>> for nullable columns".to_string(),
+            )),
             _ => Err(BackendError::TypeConversion("Expected blob".to_string())),
         }
     }
@@ -342,6 +371,8 @@ impl FromDbValue for Vec<u8> {
 pub struct DbConnection {
     conn: Rc<duckdb::Connection>,
     access_mode: AccessMode,
+    /// Holds the exclusive file lock via RAII - not read, but dropping it releases the lock.
+    #[allow(dead_code)]
     lock_guard: Option<Rc<crate::lock::DbLockGuard>>,
 }
 
@@ -378,12 +409,19 @@ impl DbConnection {
 
         let lock_guard = try_lock_exclusive(path).map_err(|e| match e {
             LockError::Locked(p) => BackendError::Locked(p.display().to_string()),
-            LockError::CreateFailed(io) => BackendError::Database(format!("Lock file error: {}", io)),
-            LockError::AcquireFailed(io) => BackendError::Database(format!("Lock acquire error: {}", io)),
+            LockError::CreateFailed(io) => {
+                BackendError::Database(format!("Lock file error: {}", io))
+            }
+            LockError::AcquireFailed(io) => {
+                BackendError::Database(format!("Lock acquire error: {}", io))
+            }
         })?;
 
         let conn = Rc::new(duckdb::Connection::open(path)?);
-        info!("Opened DuckDB database with exclusive lock: {}", path.display());
+        info!(
+            "Opened DuckDB database with exclusive lock: {}",
+            path.display()
+        );
 
         Ok(Self {
             conn,
@@ -460,7 +498,11 @@ impl DbConnection {
     }
 
     /// Query and return the first row, if any.
-    pub fn query_optional(&self, sql: &str, params: &[DbValue]) -> Result<Option<DbRow>, BackendError> {
+    pub fn query_optional(
+        &self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, BackendError> {
         let rows = self.query_all(sql, params)?;
         Ok(rows.into_iter().next())
     }
@@ -472,7 +514,11 @@ impl DbConnection {
     }
 
     /// Query and return a single scalar value.
-    pub fn query_scalar<T: FromDbValue>(&self, sql: &str, params: &[DbValue]) -> Result<T, BackendError> {
+    pub fn query_scalar<T: FromDbValue>(
+        &self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<T, BackendError> {
         let row = self.query_one(sql, params)?;
         row.get(0)
     }
@@ -499,15 +545,13 @@ impl DbConnection {
                 self.conn.execute_batch("COMMIT")?;
                 Ok(value)
             }
-            Err(err) => {
-                match self.conn.execute_batch("ROLLBACK") {
-                    Ok(()) => Err(err),
-                    Err(rollback_err) => Err(BackendError::Transaction(format!(
-                        "Transaction failed: {}; rollback failed: {}",
-                        err, rollback_err
-                    ))),
-                }
-            }
+            Err(err) => match self.conn.execute_batch("ROLLBACK") {
+                Ok(()) => Err(err),
+                Err(rollback_err) => Err(BackendError::Transaction(format!(
+                    "Transaction failed: {}; rollback failed: {}",
+                    err, rollback_err
+                ))),
+            },
         }
     }
 
@@ -568,7 +612,7 @@ impl DbConnection {
         while let Some(row) = rows_iter.next()? {
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
-                let value = Self::duckdb_value_to_db_value(&row, i)?;
+                let value = Self::duckdb_value_to_db_value(row, i)?;
                 values.push(value);
             }
             result.push(DbRow::new(columns.clone(), values));
@@ -645,21 +689,21 @@ impl DbConnection {
                 };
                 let secs = (micros / 1_000_000) as u32;
                 let nanos = ((micros % 1_000_000) * 1_000) as u32;
-                if let Some(time) = chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos) {
+                if let Some(time) =
+                    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, nanos)
+                {
                     Ok(DbValue::Text(time.format("%H:%M:%S%.6f").to_string()))
                 } else {
                     Ok(DbValue::Integer(micros))
                 }
             }
-            ValueRef::Interval { months, days, nanos } => {
-                Ok(DbValue::Text(format!("P{}M{}DT{}N", months, days, nanos)))
-            }
-            ValueRef::Enum(_, _) => {
-                Ok(DbValue::Text(format!("{:?}", row.get_ref(index)?)))
-            }
-            ValueRef::List(_, _) => {
-                Ok(DbValue::Text(format!("{:?}", row.get_ref(index)?)))
-            }
+            ValueRef::Interval {
+                months,
+                days,
+                nanos,
+            } => Ok(DbValue::Text(format!("P{}M{}DT{}N", months, days, nanos))),
+            ValueRef::Enum(_, _) => Ok(DbValue::Text(format!("{:?}", row.get_ref(index)?))),
+            ValueRef::List(_, _) => Ok(DbValue::Text(format!("{:?}", row.get_ref(index)?))),
             other => {
                 tracing::warn!(
                     "DuckDB type {:?} at column {} mapped to debug string",
@@ -694,7 +738,11 @@ impl<'a> DbTransaction<'a> {
         DbConnection::query_duckdb_on_conn(self.conn, sql, params)
     }
 
-    pub fn query_optional(&mut self, sql: &str, params: &[DbValue]) -> Result<Option<DbRow>, BackendError> {
+    pub fn query_optional(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, BackendError> {
         let rows = self.query_all(sql, params)?;
         Ok(rows.into_iter().next())
     }
@@ -704,7 +752,11 @@ impl<'a> DbTransaction<'a> {
             .ok_or_else(|| BackendError::Query("Expected one row, got none".to_string()))
     }
 
-    pub fn query_scalar<T: FromDbValue>(&mut self, sql: &str, params: &[DbValue]) -> Result<T, BackendError> {
+    pub fn query_scalar<T: FromDbValue>(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<T, BackendError> {
         let row = self.query_one(sql, params)?;
         row.get(0)
     }

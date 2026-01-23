@@ -32,7 +32,8 @@ struct PrimitivePatterns {
     file_ext: Regex,
 }
 
-static PATTERNS: LazyLock<PrimitivePatterns> = LazyLock::new(|| PrimitivePatterns {
+static PATTERNS: LazyLock<PrimitivePatterns> = LazyLock::new(|| {
+    PrimitivePatterns {
     iso_date: Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap(),
     us_date: Regex::new(r"^\d{2}-\d{2}-\d{4}$").unwrap(),
     eu_date: Regex::new(r"^\d{2}-\d{2}-\d{4}$").unwrap(),
@@ -44,19 +45,41 @@ static PATTERNS: LazyLock<PrimitivePatterns> = LazyLock::new(|| PrimitivePattern
     version: Regex::new(r"^v?\d+(?:\.\d+)*$|^release-\d+(?:\.\d+)*$").unwrap(),
     entity: Regex::new(r"^[a-zA-Z]+[_-]\w+$").unwrap(),
     file_ext: Regex::new(r"\.\w+$").unwrap(),
+}
 });
 
 /// Common category folder names
 const CATEGORY_FOLDERS: &[&str] = &[
-    "reports", "logs", "data", "output", "input", "raw", "processed",
-    "archive", "backup", "temp", "cache", "config", "docs", "src",
-    "bin", "lib", "test", "tests", "spec", "specs", "export", "import",
+    "reports",
+    "logs",
+    "data",
+    "output",
+    "input",
+    "raw",
+    "processed",
+    "archive",
+    "backup",
+    "temp",
+    "cache",
+    "config",
+    "docs",
+    "src",
+    "bin",
+    "lib",
+    "test",
+    "tests",
+    "spec",
+    "specs",
+    "export",
+    "import",
 ];
 
 /// Match a segment against known primitives
 ///
 /// Returns (primitive, confidence, optional parameter, optional date format)
-pub fn match_segment(segment: &str) -> (SemanticPrimitive, f32, Option<String>, Option<DateFormat>) {
+pub fn match_segment(
+    segment: &str,
+) -> (SemanticPrimitive, f32, Option<String>, Option<DateFormat>) {
     // Check for file (has extension)
     if PATTERNS.file_ext.is_match(segment) {
         return (SemanticPrimitive::Files, 1.0, None, None);
@@ -64,15 +87,30 @@ pub fn match_segment(segment: &str) -> (SemanticPrimitive, f32, Option<String>, 
 
     // Check dated hierarchy patterns
     if PATTERNS.iso_date.is_match(segment) {
-        return (SemanticPrimitive::DatedHierarchy, 0.95, None, Some(DateFormat::Iso));
+        return (
+            SemanticPrimitive::DatedHierarchy,
+            0.95,
+            None,
+            Some(DateFormat::Iso),
+        );
     }
 
     if PATTERNS.compact_date.is_match(segment) {
-        return (SemanticPrimitive::DatedHierarchy, 0.85, None, Some(DateFormat::Compact));
+        return (
+            SemanticPrimitive::DatedHierarchy,
+            0.85,
+            None,
+            Some(DateFormat::Compact),
+        );
     }
 
     if PATTERNS.year_month.is_match(segment) {
-        return (SemanticPrimitive::DatedHierarchy, 0.90, None, Some(DateFormat::YearMonth));
+        return (
+            SemanticPrimitive::DatedHierarchy,
+            0.90,
+            None,
+            Some(DateFormat::YearMonth),
+        );
     }
 
     // US vs European date: need context to distinguish
@@ -81,11 +119,21 @@ pub fn match_segment(segment: &str) -> (SemanticPrimitive, f32, Option<String>, 
         // Parse first two digits - if > 12, it's definitely day-first (European)
         if let Ok(first) = segment[..2].parse::<u32>() {
             if first > 12 {
-                return (SemanticPrimitive::DatedHierarchy, 0.85, None, Some(DateFormat::European));
+                return (
+                    SemanticPrimitive::DatedHierarchy,
+                    0.85,
+                    None,
+                    Some(DateFormat::European),
+                );
             }
         }
         // Ambiguous - assume US but lower confidence
-        return (SemanticPrimitive::DatedHierarchy, 0.70, None, Some(DateFormat::Us));
+        return (
+            SemanticPrimitive::DatedHierarchy,
+            0.70,
+            None,
+            Some(DateFormat::Us),
+        );
     }
 
     // Year folder
@@ -145,7 +193,8 @@ pub fn check_consistency(segments: &[&str]) -> f32 {
     }
 
     // Average confidence of all matches
-    let avg_confidence: f32 = matches.iter().map(|(_, c, _, _)| c).sum::<f32>() / matches.len() as f32;
+    let avg_confidence: f32 =
+        matches.iter().map(|(_, c, _, _)| c).sum::<f32>() / matches.len() as f32;
 
     // Boost if we have many consistent examples
     let count_bonus = (segments.len() as f32 / 10.0).min(0.1);
@@ -154,17 +203,18 @@ pub fn check_consistency(segments: &[&str]) -> f32 {
 }
 
 /// Generate a glob pattern for a segment based on its primitive
-pub fn glob_pattern_for_primitive(primitive: SemanticPrimitive, date_format: Option<DateFormat>) -> &'static str {
+pub fn glob_pattern_for_primitive(
+    primitive: SemanticPrimitive,
+    date_format: Option<DateFormat>,
+) -> &'static str {
     match primitive {
-        SemanticPrimitive::DatedHierarchy => {
-            match date_format {
-                Some(DateFormat::Iso) => "????-??-??",
-                Some(DateFormat::Compact) => "????????",
-                Some(DateFormat::YearMonth) => "????-??",
-                Some(DateFormat::Us) | Some(DateFormat::European) => "??-??-????",
-                None => "*",
-            }
-        }
+        SemanticPrimitive::DatedHierarchy => match date_format {
+            Some(DateFormat::Iso) => "????-??-??",
+            Some(DateFormat::Compact) => "????????",
+            Some(DateFormat::YearMonth) => "????-??",
+            Some(DateFormat::Us) | Some(DateFormat::European) => "??-??-????",
+            None => "*",
+        },
         SemanticPrimitive::YearFolder => "????",
         SemanticPrimitive::MonthFolder => "*",
         SemanticPrimitive::DayFolder => "*",
@@ -177,7 +227,10 @@ pub fn glob_pattern_for_primitive(primitive: SemanticPrimitive, date_format: Opt
 }
 
 /// Generate extraction regex for a segment
-pub fn extraction_pattern_for_primitive(primitive: SemanticPrimitive, parameter: Option<&str>) -> Option<String> {
+pub fn extraction_pattern_for_primitive(
+    primitive: SemanticPrimitive,
+    parameter: Option<&str>,
+) -> Option<String> {
     match primitive {
         SemanticPrimitive::EntityFolder => {
             // Extract the ID part after the prefix

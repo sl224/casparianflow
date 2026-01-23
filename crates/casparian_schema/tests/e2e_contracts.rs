@@ -4,17 +4,15 @@
 //! Uses REAL SQLite databases - no mocks.
 
 use casparian_schema::{
-    approval::{
-        approve_schema, ApprovedColumn, ApprovedSchemaVariant,
-        SchemaApprovalRequest,
-    },
     amendment::{
-        approve_amendment, AmendmentAction,
-        AmendmentReason, SchemaAmendmentProposal,
-        propose_type_mismatch_amendment, propose_nullability_amendment,
-        propose_new_columns_amendment, SchemaChange,
+        approve_amendment, propose_new_columns_amendment, propose_nullability_amendment,
+        propose_type_mismatch_amendment, AmendmentAction, AmendmentReason, SchemaAmendmentProposal,
+        SchemaChange,
     },
-    contract::{DataType, LockedColumn, LockedSchema, SchemaContract, SchemaViolation, ViolationType},
+    approval::{approve_schema, ApprovedColumn, ApprovedSchemaVariant, SchemaApprovalRequest},
+    contract::{
+        DataType, LockedColumn, LockedSchema, SchemaContract, SchemaViolation, ViolationType,
+    },
     storage::SchemaStorage,
 };
 use casparian_schema::{ContractId, DiscoveryId};
@@ -60,9 +58,7 @@ fn test_create_basic_contract() {
 fn test_contract_content_hash() {
     let schema = LockedSchema::new(
         "test",
-        vec![
-            LockedColumn::optional("col1", DataType::String),
-        ],
+        vec![LockedColumn::optional("col1", DataType::String)],
     );
 
     let hash = &schema.content_hash;
@@ -71,9 +67,7 @@ fn test_contract_content_hash() {
     // Same schema should produce same hash
     let schema2 = LockedSchema::new(
         "test",
-        vec![
-            LockedColumn::optional("col1", DataType::String),
-        ],
+        vec![LockedColumn::optional("col1", DataType::String)],
     );
 
     let hash2 = &schema2.content_hash;
@@ -122,12 +116,7 @@ fn test_validate_columns_missing() {
 /// Test column validation failure - extra column
 #[test]
 fn test_validate_columns_extra() {
-    let schema = LockedSchema::new(
-        "test",
-        vec![
-            LockedColumn::required("id", DataType::Int64),
-        ],
-    );
+    let schema = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
 
     // Extra column should fail
     let result = schema.validate_columns(&["id", "extra"]);
@@ -179,12 +168,7 @@ fn test_data_type_validation() {
 fn test_storage_save_and_get() {
     let storage = SchemaStorage::in_memory().unwrap();
 
-    let schema = LockedSchema::new(
-        "users",
-        vec![
-            LockedColumn::required("id", DataType::Int64),
-        ],
-    );
+    let schema = LockedSchema::new("users", vec![LockedColumn::required("id", DataType::Int64)]);
 
     let contract = SchemaContract::new("test-scope", schema, "test_user");
 
@@ -240,9 +224,7 @@ fn test_storage_versioning() {
     // V2 - same scope, new contract
     let schema_v2 = LockedSchema::new(
         "data_v2",
-        vec![
-            LockedColumn::optional("new_col", DataType::String),
-        ],
+        vec![LockedColumn::optional("new_col", DataType::String)],
     );
     let mut v2 = SchemaContract::new(scope_id, schema_v2, "test_user");
     v2.version = 2;
@@ -288,13 +270,19 @@ fn test_storage_delete_contract() {
     storage.save_contract(&contract).unwrap();
 
     // Verify exists
-    assert!(storage.get_contract(&contract.contract_id).unwrap().is_some());
+    assert!(storage
+        .get_contract(&contract.contract_id)
+        .unwrap()
+        .is_some());
 
     // Delete
     storage.delete_contract(&contract.contract_id).unwrap();
 
     // Verify gone
-    assert!(storage.get_contract(&contract.contract_id).unwrap().is_none());
+    assert!(storage
+        .get_contract(&contract.contract_id)
+        .unwrap()
+        .is_none());
 }
 
 // =============================================================================
@@ -306,15 +294,13 @@ fn test_storage_delete_contract() {
 fn test_approval_basic() {
     let storage = SchemaStorage::in_memory().unwrap();
 
-    let request = new_approval_request("approver")
-        .with_schema(
-            ApprovedSchemaVariant::new("sales", "sales_fact")
-                .with_columns(vec![
-                    ApprovedColumn::required("product_id", DataType::Int64),
-                    ApprovedColumn::required("quantity", DataType::Int64),
-                    ApprovedColumn::required("price", DataType::Float64),
-                ])
-        );
+    let request = new_approval_request("approver").with_schema(
+        ApprovedSchemaVariant::new("sales", "sales_fact").with_columns(vec![
+            ApprovedColumn::required("product_id", DataType::Int64),
+            ApprovedColumn::required("quantity", DataType::Int64),
+            ApprovedColumn::required("price", DataType::Float64),
+        ]),
+    );
 
     let result = approve_schema(&storage, request).unwrap();
 
@@ -333,14 +319,11 @@ fn test_approval_basic() {
 fn test_approval_with_rename() {
     let storage = SchemaStorage::in_memory().unwrap();
 
-    let request = new_approval_request("approver")
-        .with_schema(
-            ApprovedSchemaVariant::new("customers", "customers")
-                .with_columns(vec![
-                    ApprovedColumn::required("cust_id", DataType::Int64)
-                        .rename_to("customer_id"),
-                ])
-        );
+    let request = new_approval_request("approver").with_schema(
+        ApprovedSchemaVariant::new("customers", "customers").with_columns(vec![
+            ApprovedColumn::required("cust_id", DataType::Int64).rename_to("customer_id"),
+        ]),
+    );
 
     let result = approve_schema(&storage, request).unwrap();
 
@@ -348,8 +331,13 @@ fn test_approval_with_rename() {
     assert_eq!(result.contract.schemas[0].columns[0].name, "customer_id");
 
     // Check warnings about rename
-    assert!(result.warnings.iter().any(|w| w.message.contains("renamed")),
-            "Should warn about rename");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("renamed")),
+        "Should warn about rename"
+    );
 }
 
 /// Test approval with excluded files
@@ -360,9 +348,7 @@ fn test_approval_with_exclusions() {
     let request = new_approval_request("approver")
         .with_schema(
             ApprovedSchemaVariant::new("logs", "logs")
-                .with_columns(vec![
-                    ApprovedColumn::required("id", DataType::Int64),
-                ])
+                .with_columns(vec![ApprovedColumn::required("id", DataType::Int64)]),
         )
         .exclude_files(vec![
             "/path/to/bad_file1.csv".to_string(),
@@ -372,8 +358,13 @@ fn test_approval_with_exclusions() {
     let result = approve_schema(&storage, request).unwrap();
 
     // Should have warnings about excluded files
-    assert!(result.warnings.iter().any(|w| w.message.contains("excluded")),
-            "Should warn about excluded files");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("excluded")),
+        "Should warn about excluded files"
+    );
 }
 
 /// Test approval failure - no schemas
@@ -416,7 +407,8 @@ fn test_amendment_type_mismatch() {
         DataType::Int64,
         vec!["EVT001".to_string(), "EVT002".to_string()],
         DataType::String,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(proposal.contract_id, contract.contract_id);
     assert!(!proposal.changes.is_empty(), "Should have proposed changes");
@@ -426,7 +418,10 @@ fn test_amendment_type_mismatch() {
         matches!(c, SchemaChange::ChangeType { column_name, from, to }
             if column_name == "event_id" && *from == DataType::Int64 && *to == DataType::String)
     });
-    assert!(has_type_change, "Should propose changing event_id to String");
+    assert!(
+        has_type_change,
+        "Should propose changing event_id to String"
+    );
 }
 
 /// Test proposing nullability amendment
@@ -436,18 +431,15 @@ fn test_amendment_nullability() {
 
     let schema = LockedSchema::new(
         "products",
-        vec![
-            LockedColumn::required("sku", DataType::String),
-        ],
+        vec![LockedColumn::required("sku", DataType::String)],
     );
     let contract = SchemaContract::new("null-scope", schema, "test_user");
     storage.save_contract(&contract).unwrap();
 
     let proposal = propose_nullability_amendment(
-        &contract,
-        "sku",
-        15.5, // 15.5% nulls found
-    ).unwrap();
+        &contract, "sku", 15.5, // 15.5% nulls found
+    )
+    .unwrap();
 
     // Should propose making it nullable
     let has_null_change = proposal.changes.iter().any(|c| {
@@ -464,9 +456,7 @@ fn test_amendment_new_columns() {
 
     let schema = LockedSchema::new(
         "orders",
-        vec![
-            LockedColumn::required("order_id", DataType::Int64),
-        ],
+        vec![LockedColumn::required("order_id", DataType::Int64)],
     );
     let contract = SchemaContract::new("newcol-scope", schema, "test_user");
     storage.save_contract(&contract).unwrap();
@@ -479,9 +469,11 @@ fn test_amendment_new_columns() {
     let proposal = propose_new_columns_amendment(&contract, new_columns, 10).unwrap();
 
     // Should propose adding both columns
-    let add_count = proposal.changes.iter().filter(|c| {
-        matches!(c, SchemaChange::AddColumn { .. })
-    }).count();
+    let add_count = proposal
+        .changes
+        .iter()
+        .filter(|c| matches!(c, SchemaChange::AddColumn { .. }))
+        .count();
     assert_eq!(add_count, 2, "Should propose adding 2 columns");
 }
 
@@ -492,9 +484,7 @@ fn test_amendment_approve_as_proposed() {
 
     let schema = LockedSchema::new(
         "metrics",
-        vec![
-            LockedColumn::required("value", DataType::Int64),
-        ],
+        vec![LockedColumn::required("value", DataType::Int64)],
     );
     let contract = SchemaContract::new("approve-amend-scope", schema, "test_user");
     storage.save_contract(&contract).unwrap();
@@ -506,10 +496,17 @@ fn test_amendment_approve_as_proposed() {
         DataType::Int64,
         vec!["12.5".to_string()],
         DataType::Float64,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Approve as proposed
-    let result = approve_amendment(&storage, &proposal, AmendmentAction::ApproveAsProposed, "reviewer").unwrap();
+    let result = approve_amendment(
+        &storage,
+        &proposal,
+        AmendmentAction::ApproveAsProposed,
+        "reviewer",
+    )
+    .unwrap();
 
     // Should create new contract version
     assert!(result.contract.is_some());
@@ -556,7 +553,8 @@ fn test_amendment_reject() {
             reason: "We don't support this format".to_string(),
         },
         "reviewer",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Should not create new contract
     assert!(result.new_contract.is_none());
@@ -570,9 +568,7 @@ fn test_amendment_create_separate_schema() {
 
     let schema = LockedSchema::new(
         "original",
-        vec![
-            LockedColumn::required("id", DataType::Int64),
-        ],
+        vec![LockedColumn::required("id", DataType::Int64)],
     );
     let contract = SchemaContract::new("separate-scope", schema, "test_user");
     storage.save_contract(&contract).unwrap();
@@ -605,7 +601,8 @@ fn test_amendment_create_separate_schema() {
             description: Some("Alternate format files".to_string()),
         },
         "reviewer",
-    ).unwrap();
+    )
+    .unwrap();
 
     // Should have new contract
     assert!(result.new_contract.is_some());
@@ -625,15 +622,13 @@ fn test_full_schema_lifecycle() {
     let storage = SchemaStorage::in_memory().unwrap();
 
     // Step 1: Initial approval (simulating discovery result)
-    let initial_request = new_approval_request("approver")
-        .with_schema(
-            ApprovedSchemaVariant::new("transactions", "tx_fact")
-                .with_columns(vec![
-                    ApprovedColumn::required("tx_id", DataType::Int64),
-                    ApprovedColumn::required("amount", DataType::Int64), // Initially thought to be Int
-                    ApprovedColumn::required("status", DataType::String),
-                ])
-        );
+    let initial_request = new_approval_request("approver").with_schema(
+        ApprovedSchemaVariant::new("transactions", "tx_fact").with_columns(vec![
+            ApprovedColumn::required("tx_id", DataType::Int64),
+            ApprovedColumn::required("amount", DataType::Int64), // Initially thought to be Int
+            ApprovedColumn::required("status", DataType::String),
+        ]),
+    );
 
     let result = approve_schema(&storage, initial_request).unwrap();
     let v1_contract = result.contract;
@@ -653,15 +648,23 @@ fn test_full_schema_lifecycle() {
         &v1_contract,
         "amount",
         DataType::Int64,
-        vec!["125.50".to_string(), "99.99".to_string(), "0.01".to_string()],
+        vec![
+            "125.50".to_string(),
+            "99.99".to_string(),
+            "0.01".to_string(),
+        ],
         DataType::Float64,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify proposal suggests Float64
-    assert!(proposal.changes.iter().any(|c| {
-        matches!(c, SchemaChange::ChangeType { column_name, to, .. }
+    assert!(
+        proposal.changes.iter().any(|c| {
+            matches!(c, SchemaChange::ChangeType { column_name, to, .. }
             if column_name == "amount" && *to == DataType::Float64)
-    }), "Should propose changing amount to Float64");
+        }),
+        "Should propose changing amount to Float64"
+    );
 
     // Step 4: Approve amendment
     let amend_result = approve_amendment(
@@ -669,19 +672,29 @@ fn test_full_schema_lifecycle() {
         &proposal,
         AmendmentAction::ApproveAsProposed,
         "reviewer",
-    ).unwrap();
+    )
+    .unwrap();
 
     let v2_contract = amend_result.contract.unwrap();
     assert_eq!(v2_contract.version, 2);
 
     // Step 5: Verify new contract has correct type
-    let amount_col = v2_contract.schemas[0].columns.iter()
+    let amount_col = v2_contract.schemas[0]
+        .columns
+        .iter()
         .find(|c| c.name == "amount")
         .expect("Should have amount column");
-    assert_eq!(amount_col.data_type, DataType::Float64, "amount should now be Float64");
+    assert_eq!(
+        amount_col.data_type,
+        DataType::Float64,
+        "amount should now be Float64"
+    );
 
     // Step 6: Verify we can retrieve latest contract
-    let latest = storage.get_contract_for_scope(&v1_contract.scope_id).unwrap().unwrap();
+    let latest = storage
+        .get_contract_for_scope(&v1_contract.scope_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(latest.version, 2);
     assert_eq!(latest.contract_id, v2_contract.contract_id);
 }
@@ -698,8 +711,10 @@ fn test_violation_display() {
         .with_row(42);
 
     let display = format!("{}", violation);
-    assert!(display.contains("TypeMismatch") || display.contains("type"),
-            "Display should mention type mismatch");
+    assert!(
+        display.contains("TypeMismatch") || display.contains("type"),
+        "Display should mention type mismatch"
+    );
 }
 
 /// Test violation types
@@ -740,20 +755,28 @@ fn test_sql_injection_in_scope_id() {
     ];
 
     for payload in injection_payloads {
-        let schema = LockedSchema::new(
-            "test",
-            vec![LockedColumn::required("id", DataType::Int64)],
-        );
+        let schema = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
         let contract = SchemaContract::new(payload, schema, "attacker");
 
         // Should store safely (parameterized query)
         let result = storage.save_contract(&contract);
-        assert!(result.is_ok(), "Should handle SQL injection attempt safely: {}", payload);
+        assert!(
+            result.is_ok(),
+            "Should handle SQL injection attempt safely: {}",
+            payload
+        );
 
         // Verify the payload is stored as literal text, not executed
         let retrieved = storage.get_contract_for_scope(payload).unwrap();
-        assert!(retrieved.is_some(), "Should find contract with literal scope_id");
-        assert_eq!(retrieved.unwrap().scope_id, payload, "Scope ID should be stored literally");
+        assert!(
+            retrieved.is_some(),
+            "Should find contract with literal scope_id"
+        );
+        assert_eq!(
+            retrieved.unwrap().scope_id,
+            payload,
+            "Scope ID should be stored literally"
+        );
     }
 }
 
@@ -785,16 +808,16 @@ fn test_sql_injection_in_user_name() {
     let storage = SchemaStorage::in_memory().unwrap();
 
     let malicious_user = "admin'; UPDATE schema_contracts SET approved_by='hacked' WHERE '1'='1";
-    let schema = LockedSchema::new(
-        "test",
-        vec![LockedColumn::required("id", DataType::Int64)],
-    );
+    let schema = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
     let contract = SchemaContract::new("scope-sql", schema, malicious_user);
 
     storage.save_contract(&contract).unwrap();
 
     // Verify stored literally
-    let retrieved = storage.get_contract_for_scope("scope-sql").unwrap().unwrap();
+    let retrieved = storage
+        .get_contract_for_scope("scope-sql")
+        .unwrap()
+        .unwrap();
     assert_eq!(retrieved.approved_by, malicious_user);
 }
 
@@ -811,14 +834,14 @@ fn test_path_traversal_in_scope_id() {
     ];
 
     for payload in path_traversal_payloads {
-        let schema = LockedSchema::new(
-            "test",
-            vec![LockedColumn::required("id", DataType::Int64)],
-        );
+        let schema = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
         let contract = SchemaContract::new(payload, schema, "user");
 
         // Scope ID is just a string identifier - no file operations
-        assert_eq!(contract.scope_id, payload, "Scope ID should be stored as-is");
+        assert_eq!(
+            contract.scope_id, payload,
+            "Scope ID should be stored as-is"
+        );
     }
 }
 
@@ -829,10 +852,7 @@ fn test_extremely_long_strings() {
 
     // Very long scope_id
     let long_scope_id = "x".repeat(10_000);
-    let schema = LockedSchema::new(
-        "test",
-        vec![LockedColumn::required("id", DataType::Int64)],
-    );
+    let schema = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
     let contract = SchemaContract::new(&long_scope_id, schema, "user");
 
     // Should handle without crashing
@@ -857,20 +877,14 @@ fn test_empty_string_inputs() {
     let storage = SchemaStorage::in_memory().unwrap();
 
     // Empty scope_id
-    let schema = LockedSchema::new(
-        "test",
-        vec![LockedColumn::required("id", DataType::Int64)],
-    );
+    let schema = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
     let contract = SchemaContract::new("", schema, "user");
 
     let result = storage.save_contract(&contract);
     assert!(result.is_ok(), "Should handle empty scope_id");
 
     // Empty column name
-    let schema2 = LockedSchema::new(
-        "test",
-        vec![LockedColumn::required("", DataType::String)],
-    );
+    let schema2 = LockedSchema::new("test", vec![LockedColumn::required("", DataType::String)]);
     let contract2 = SchemaContract::new("empty-col", schema2, "user");
 
     let result2 = storage.save_contract(&contract2);
@@ -883,17 +897,14 @@ fn test_null_bytes_and_special_chars() {
     let storage = SchemaStorage::in_memory().unwrap();
 
     let special_strings = [
-        "scope\twith\ttabs",       // Tabs
-        "scope\nwith\nnewlines",   // Newlines
-        "scope\rwith\rreturns",    // Carriage returns
+        "scope\twith\ttabs",     // Tabs
+        "scope\nwith\nnewlines", // Newlines
+        "scope\rwith\rreturns",  // Carriage returns
         "scope with unicode 你好 🎉 émojis",
     ];
 
     for (i, payload) in special_strings.iter().enumerate() {
-        let schema = LockedSchema::new(
-            "test",
-            vec![LockedColumn::required("id", DataType::Int64)],
-        );
+        let schema = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
         let contract = SchemaContract::new(*payload, schema, "user");
 
         let result = storage.save_contract(&contract);
@@ -913,21 +924,22 @@ fn test_delete_sql_injection_safety() {
     let storage = SchemaStorage::in_memory().unwrap();
 
     // Create legitimate contract
-    let legit_schema = LockedSchema::new(
-        "legit",
-        vec![LockedColumn::required("id", DataType::Int64)],
-    );
+    let legit_schema =
+        LockedSchema::new("legit", vec![LockedColumn::required("id", DataType::Int64)]);
     let legit_contract = SchemaContract::new("legitimate-scope", legit_schema, "real_user");
     storage.save_contract(&legit_contract).unwrap();
 
     // Try to delete with injection
-    let malicious_id = ContractId::new();  // Random ID - won't match legitimate
+    let malicious_id = ContractId::new(); // Random ID - won't match legitimate
     let result = storage.delete_contract(&malicious_id);
     assert!(result.is_ok());
 
     // Legitimate contract should still exist
     let still_exists = storage.get_contract_for_scope("legitimate-scope").unwrap();
-    assert!(still_exists.is_some(), "Legitimate contract should not be affected");
+    assert!(
+        still_exists.is_some(),
+        "Legitimate contract should not be affected"
+    );
 }
 
 /// Test content hash doesn't reveal sensitive data
@@ -947,8 +959,14 @@ fn test_content_hash_is_opaque() {
     assert!(!hash.is_empty(), "Hash should not be empty");
 
     // Hash should not contain any original content (column names or table name)
-    assert!(!hash.contains("credit_card"), "Hash should not reveal column names");
-    assert!(!hash.contains("sensitive"), "Hash should not reveal table name");
+    assert!(
+        !hash.contains("credit_card"),
+        "Hash should not reveal column names"
+    );
+    assert!(
+        !hash.contains("sensitive"),
+        "Hash should not reveal table name"
+    );
     assert!(!hash.contains("ssn"), "Hash should not reveal column names");
 }
 
@@ -958,10 +976,7 @@ fn test_concurrent_scope_updates() {
     let storage = SchemaStorage::in_memory().unwrap();
 
     // Create initial contract
-    let schema1 = LockedSchema::new(
-        "test",
-        vec![LockedColumn::required("id", DataType::Int64)],
-    );
+    let schema1 = LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
     let contract1 = SchemaContract::new("concurrent-scope", schema1, "user1");
     storage.save_contract(&contract1).unwrap();
 
@@ -1001,11 +1016,11 @@ fn test_data_type_validation_security() {
 
     // These should NOT be valid integers
     let invalid_integers = [
-        "12.5",            // Float
-        "1e10",            // Scientific notation
-        "12,345",          // Comma-formatted
-        "0x1A",            // Hex
-        "12abc",           // Trailing garbage
+        "12.5",                   // Float
+        "1e10",                   // Scientific notation
+        "12,345",                 // Comma-formatted
+        "0x1A",                   // Hex
+        "12abc",                  // Trailing garbage
         "9999999999999999999999", // Overflow
     ];
 
@@ -1041,7 +1056,10 @@ fn test_malicious_schema_names() {
     assert!(result.is_ok(), "Should handle malicious schema name");
 
     // Verify stored literally
-    let retrieved = storage.get_contract_for_scope("scope-malicious").unwrap().unwrap();
+    let retrieved = storage
+        .get_contract_for_scope("scope-malicious")
+        .unwrap()
+        .unwrap();
     assert_eq!(retrieved.schemas[0].name, malicious_name);
 }
 
@@ -1050,15 +1068,19 @@ fn test_malicious_schema_names() {
 fn test_format_string_injection() {
     // Format strings should be stored literally, not interpreted
     let malicious_formats = [
-        "%n%n%n%n%n",              // printf format string attack
-        "${7*7}",                   // Template injection
-        "{{7*7}}",                  // Jinja/Twig injection
-        "$(whoami)",               // Command substitution
-        "`whoami`",                // Backtick command substitution
+        "%n%n%n%n%n", // printf format string attack
+        "${7*7}",     // Template injection
+        "{{7*7}}",    // Jinja/Twig injection
+        "$(whoami)",  // Command substitution
+        "`whoami`",   // Backtick command substitution
     ];
 
     for format in malicious_formats {
         let column = LockedColumn::required("date", DataType::Date).with_format(format);
-        assert_eq!(column.format, Some(format.to_string()), "Format should be stored literally");
+        assert_eq!(
+            column.format,
+            Some(format.to_string()),
+            "Format should be stored literally"
+        );
     }
 }

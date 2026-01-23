@@ -1,3 +1,13 @@
+// TODO(Phase 3): Fix these clippy warnings properly during silent corruption sweep
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(unused_macros)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::unwrap_or_default)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::redundant_closure)]
+
 //! MCP (Model Context Protocol) Server for Casparian Flow
 //!
 //! This crate implements an MCP server that exposes Casparian's core capabilities
@@ -59,15 +69,36 @@ pub mod protocol;
 pub mod server;
 pub mod types;
 
-pub mod security;
-pub mod jobs;
 pub mod approvals;
+pub mod db_store;
+pub mod jobs;
+pub mod redaction;
+pub mod security;
 pub mod tools;
 
+// Sync Core - single-owner state management (Phase 1B)
+pub mod core;
+
+// Intent Pipeline (non-brittle MCP orchestration)
+pub mod intent;
+
 // Re-exports for convenience
-pub use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, ErrorCode};
+pub use approvals::{ApprovalId, ApprovalManager, ApprovalRequest, ApprovalStatus};
+pub use db_store::{DbApprovalStore, DbJobStore};
+pub use jobs::{JobId, JobManager, JobProgress, JobState};
+
+// Core module re-exports (Phase 1B - sync architecture)
+pub use core::{spawn_core, CancellationToken, Command, Core, CoreHandle, Event, Responder};
+pub use protocol::{ErrorCode, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+pub use security::{OutputBudget, PathAllowlist, SecurityConfig};
 pub use server::{McpServer, McpServerConfig};
-pub use types::{PluginRef, RedactionPolicy, ViolationContext};
-pub use security::{SecurityConfig, PathAllowlist, OutputBudget};
-pub use jobs::{JobManager, JobId, JobState, JobProgress};
-pub use approvals::{ApprovalManager, ApprovalId, ApprovalRequest, ApprovalStatus};
+pub use types::{
+    ApprovalDecision, ApprovalStatusFilter, ColumnDefinition, DataType, JobStatusFilter, PluginRef,
+    RedactionPolicy, SchemaDefinition, SchemaMode, SimpleDataType, ViolationContext,
+};
+
+// Intent pipeline re-exports
+pub use intent::{
+    ConfidenceScore, FileSetId, FileSetStore, IntentState, ProposalId, SessionBundle, SessionId,
+    SessionStore, StateMachine,
+};

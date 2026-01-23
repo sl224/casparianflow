@@ -12,16 +12,16 @@
 //!
 //! ```ignore
 //! let config = McpServerConfig::default();
-//! let server = McpServer::new(config)?;
-//! server.run().await?;
+//! let mut server = McpServer::new(config)?;
+//! server.run()?; // Blocking, no async runtime required
 //! ```
 
-use crate::approvals::ApprovalManager;
-use crate::jobs::JobManager;
+use crate::core::{spawn_core, CoreHandle, Event};
+use crate::jobs::{JobExecutor, JobExecutorHandle};
 use crate::protocol::{
     methods, ContentBlock, InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest,
-    JsonRpcResponse, RequestId, ServerCapabilities, ServerInfo, ToolCallParams, ToolCallResult,
-    ToolDefinition, ToolsCapability, ToolsListResult, MCP_PROTOCOL_VERSION, JSONRPC_VERSION,
+    JsonRpcResponse, ServerCapabilities, ServerInfo, ToolCallParams, ToolCallResult,
+    ToolsCapability, ToolsListResult, JSONRPC_VERSION, MCP_PROTOCOL_VERSION,
 };
 use crate::security::{AuditLog, OutputBudget, PathAllowlist, SecurityConfig};
 use crate::tools::ToolRegistry;
@@ -29,8 +29,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::mpsc::Receiver;
+use std::thread::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 /// MCP Server configuration
@@ -56,12 +56,6 @@ pub struct McpServerConfig {
 
     /// Database path
     pub db_path: PathBuf,
-
-    /// Directory for approval files
-    pub approvals_dir: PathBuf,
-
-    /// Directory for job state
-    pub jobs_dir: PathBuf,
 }
 
 impl Default for McpServerConfig {
@@ -75,21 +69,35 @@ impl Default for McpServerConfig {
             allowed_paths: vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))],
             max_response_bytes: 1024 * 1024, // 1MB
             max_rows: 10_000,
-            audit_log_path: Some(casparian_dir.join("mcp_audit.log")),
+            audit_log_path: Some(casparian_dir.join("mcp_audit.ndjson")),
             db_path: casparian_dir.join("casparian_flow.duckdb"),
-            approvals_dir: casparian_dir.join("approvals"),
-            jobs_dir: casparian_dir.join("mcp_jobs"),
         }
     }
 }
 
 /// MCP Server
+///
+/// # Lock-Free Architecture (Phase 4)
+///
+/// The server no longer holds any `Arc<Mutex<>>` for job/approval management.
+/// All state is owned by the Core thread and accessed via message passing (CoreHandle).
+/// The executor uses CoreHandle for all job state operations.
 pub struct McpServer {
     config: McpServerConfig,
     security: SecurityConfig,
-    jobs: Arc<Mutex<JobManager>>,
-    approvals: Arc<Mutex<ApprovalManager>>,
+    /// Handle to the Core thread for all state operations
+    core: CoreHandle,
+    /// Event receiver for state change notifications (not used yet, for future TUI)
+    #[allow(dead_code)]
+    events: Receiver<Event>,
+    /// Core thread handle (joined on drop)
+    #[allow(dead_code)]
+    core_thread: JoinHandle<()>,
     tools: ToolRegistry,
+    executor_handle: JobExecutorHandle,
+    /// Executor thread handle (joined on drop)
+    #[allow(dead_code)]
+    executor_thread: JoinHandle<()>,
     initialized: bool,
 }
 
@@ -111,11 +119,15 @@ impl McpServer {
             audit_log,
         };
 
-        // Initialize job manager
-        let jobs = JobManager::new(config.jobs_dir.clone())?;
+        // Spawn the Core thread (owns JobManager, ApprovalManager - single owner, no locks)
+        let (core, events, core_thread) = spawn_core(config.db_path.clone())?;
 
-        // Initialize approval manager
-        let approvals = ApprovalManager::new(config.approvals_dir.clone())?;
+        // Initialize job executor (sync, runs in dedicated thread)
+        // Uses CoreHandle for all job state operations via message passing (no locks)
+        let (executor, executor_handle) = JobExecutor::new(core.clone());
+
+        // Spawn executor loop in dedicated thread (no tokio)
+        let executor_thread = executor.spawn();
 
         // Initialize tool registry
         let tools = ToolRegistry::new();
@@ -123,15 +135,20 @@ impl McpServer {
         Ok(Self {
             config,
             security,
-            jobs: Arc::new(Mutex::new(jobs)),
-            approvals: Arc::new(Mutex::new(approvals)),
+            core,
+            events,
+            core_thread,
             tools,
+            executor_handle,
+            executor_thread,
             initialized: false,
         })
     }
 
     /// Run the server (blocking, reads from stdin, writes to stdout)
-    pub async fn run(&mut self) -> Result<()> {
+    ///
+    /// This is a synchronous blocking loop - no async runtime required.
+    pub fn run(&mut self) -> Result<()> {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
@@ -168,8 +185,13 @@ impl McpServer {
                 audit.log_request(&request)?;
             }
 
-            // Handle request
-            let response = self.handle_request(request).await;
+            // Handle request (synchronous)
+            let response = self.handle_request(request);
+
+            // Skip response for notifications (no id, no result, no error)
+            if response.id.is_none() && response.result.is_none() && response.error.is_none() {
+                continue;
+            }
 
             // Log response to audit
             if let Some(ref mut audit) = self.security.audit_log {
@@ -184,8 +206,8 @@ impl McpServer {
         Ok(())
     }
 
-    /// Handle a single JSON-RPC request
-    async fn handle_request(&mut self, request: JsonRpcRequest) -> JsonRpcResponse {
+    /// Handle a single JSON-RPC request (synchronous)
+    fn handle_request(&mut self, request: JsonRpcRequest) -> JsonRpcResponse {
         // Validate JSON-RPC version
         if request.jsonrpc != JSONRPC_VERSION {
             return JsonRpcResponse::error(
@@ -198,14 +220,28 @@ impl McpServer {
         }
 
         match request.method.as_str() {
-            methods::INITIALIZE => self.handle_initialize(request).await,
+            methods::INITIALIZE => self.handle_initialize(request),
             methods::INITIALIZED => {
-                // Notification, no response needed but we return empty for consistency
+                // JSON-RPC notifications (no id) should not receive a response
+                // If this is a notification (id is None), we skip writing a response
+                // by returning early from the handler
+                if request.id.is_none() {
+                    // Return a dummy response that will be skipped in write path
+                    return JsonRpcResponse {
+                        jsonrpc: JSONRPC_VERSION.to_string(),
+                        id: None,
+                        result: None,
+                        error: None,
+                    };
+                }
+                // If it has an id (unusual but valid), respond with empty object
                 JsonRpcResponse::success(request.id, Value::Null)
             }
-            methods::TOOLS_LIST => self.handle_tools_list(request).await,
-            methods::TOOLS_CALL => self.handle_tools_call(request).await,
-            methods::PING => JsonRpcResponse::success(request.id, Value::Object(Default::default())),
+            methods::TOOLS_LIST => self.handle_tools_list(request),
+            methods::TOOLS_CALL => self.handle_tools_call(request),
+            methods::PING => {
+                JsonRpcResponse::success(request.id, Value::Object(Default::default()))
+            }
             _ => JsonRpcResponse::error(
                 request.id,
                 JsonRpcError::new(
@@ -217,7 +253,7 @@ impl McpServer {
     }
 
     /// Handle initialize request
-    async fn handle_initialize(&mut self, request: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_initialize(&mut self, request: JsonRpcRequest) -> JsonRpcResponse {
         let params: InitializeParams = match request.params {
             Some(p) => match serde_json::from_value(p) {
                 Ok(params) => params,
@@ -252,7 +288,9 @@ impl McpServer {
         let result = InitializeResult {
             protocol_version: MCP_PROTOCOL_VERSION.to_string(),
             capabilities: ServerCapabilities {
-                tools: Some(ToolsCapability { list_changed: false }),
+                tools: Some(ToolsCapability {
+                    list_changed: false,
+                }),
                 resources: None,
                 prompts: None,
                 logging: None,
@@ -267,7 +305,7 @@ impl McpServer {
     }
 
     /// Handle tools/list request
-    async fn handle_tools_list(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_tools_list(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let tools = self.tools.list_tools();
 
         let result = ToolsListResult { tools };
@@ -276,7 +314,7 @@ impl McpServer {
     }
 
     /// Handle tools/call request
-    async fn handle_tools_call(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_tools_call(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         if !self.initialized {
             return JsonRpcResponse::error(
                 request.id,
@@ -313,46 +351,89 @@ impl McpServer {
 
         info!("Tool call: {}", params.name);
 
-        // Execute the tool
-        let result = self
-            .tools
-            .call_tool(
-                &params.name,
-                params.arguments,
-                &self.security,
-                &self.jobs,
-                &self.approvals,
-                &self.config,
-            )
-            .await;
+        // Execute the tool (synchronous)
+        let result = self.tools.call_tool(
+            &params.name,
+            params.arguments,
+            &self.security,
+            &self.core,
+            &self.config,
+            &self.executor_handle,
+        );
 
         match result {
             Ok(value) => {
-                // Check output budget
-                let json = serde_json::to_string(&value).unwrap_or_default();
-                let (truncated_value, was_truncated) =
-                    self.security.output_budget.enforce_size(&json);
+                // Check output budget - return structured JSON with truncation flag
+                let json = match serde_json::to_string(&value) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        error!("Failed to serialize tool result: {}", e);
+                        let tool_result = ToolCallResult {
+                            content: vec![ContentBlock::text(format!(
+                                "{{\"error\": \"Serialization failed: {}\"}}",
+                                e
+                            ))],
+                            is_error: true,
+                        };
+                        let tool_value = match serde_json::to_value(tool_result) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                error!("Failed to serialize tool error response: {}", e);
+                                return JsonRpcResponse::error(
+                                    request.id,
+                                    JsonRpcError::new(
+                                        crate::protocol::ErrorCode::InternalError,
+                                        "Failed to serialize tool error response",
+                                    ),
+                                );
+                            }
+                        };
+                        return JsonRpcResponse::success(request.id, tool_value);
+                    }
+                };
 
-                let content = if was_truncated {
+                let (content, was_truncated) = if json.len() > self.config.max_response_bytes {
                     warn!(
                         "Response truncated from {} to {} bytes",
                         json.len(),
-                        truncated_value.len()
+                        self.config.max_response_bytes
                     );
-                    format!(
-                        "{}... [TRUNCATED: response exceeded {} byte limit]",
-                        truncated_value, self.config.max_response_bytes
-                    )
+                    // Create a valid JSON response that indicates truncation
+                    // instead of breaking the JSON by cutting mid-string
+                    let truncated_response = serde_json::json!({
+                        "truncated": true,
+                        "max_bytes": self.config.max_response_bytes,
+                        "original_bytes": json.len(),
+                        "message": "Response exceeded size limit. Use pagination or filters to reduce output.",
+                        "partial_data": null
+                    });
+                    (serde_json::to_string(&truncated_response).unwrap_or_else(|_|
+                        r#"{"truncated":true,"error":"Failed to create truncation response"}"#.to_string()
+                    ), true)
                 } else {
-                    json
+                    (json, false)
                 };
 
                 let tool_result = ToolCallResult {
                     content: vec![ContentBlock::text(content)],
-                    is_error: false,
+                    is_error: was_truncated, // Mark truncated responses as errors so agent knows to paginate
                 };
 
-                JsonRpcResponse::success(request.id, serde_json::to_value(tool_result).unwrap())
+                let tool_value = match serde_json::to_value(tool_result) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        error!("Failed to serialize tool response: {}", e);
+                        return JsonRpcResponse::error(
+                            request.id,
+                            JsonRpcError::new(
+                                crate::protocol::ErrorCode::InternalError,
+                                "Failed to serialize tool response",
+                            ),
+                        );
+                    }
+                };
+
+                JsonRpcResponse::success(request.id, tool_value)
             }
             Err(e) => {
                 error!("Tool error: {}", e);
@@ -360,8 +441,21 @@ impl McpServer {
                     content: vec![ContentBlock::text(format!("Error: {}", e))],
                     is_error: true,
                 };
+                let tool_value = match serde_json::to_value(tool_result) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        error!("Failed to serialize tool error response: {}", e);
+                        return JsonRpcResponse::error(
+                            request.id,
+                            JsonRpcError::new(
+                                crate::protocol::ErrorCode::InternalError,
+                                "Failed to serialize tool error response",
+                            ),
+                        );
+                    }
+                };
 
-                JsonRpcResponse::success(request.id, serde_json::to_value(tool_result).unwrap())
+                JsonRpcResponse::success(request.id, tool_value)
             }
         }
     }

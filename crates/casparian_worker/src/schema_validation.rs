@@ -2,11 +2,11 @@ use anyhow::anyhow;
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::record_batch::RecordBatch;
-use casparian_protocol::DataType as SchemaDataType;
 use casparian_protocol::types::{
     ColumnOrderMismatch, ObservedColumn, ObservedDataType, SchemaColumnSpec, SchemaDefinition,
     SchemaMismatch, TypeMismatch,
 };
+use casparian_protocol::DataType as SchemaDataType;
 use thiserror::Error;
 
 type SchemaResult<T> = std::result::Result<T, SchemaValidationError>;
@@ -17,7 +17,10 @@ pub enum SchemaValidationError {
     #[error("{message}")]
     InvalidSchemaDef { message: String },
     #[error("schema mismatch for '{output_name}'")]
-    SchemaMismatch { output_name: String, mismatch: SchemaMismatch },
+    SchemaMismatch {
+        output_name: String,
+        mismatch: SchemaMismatch,
+    },
 }
 
 pub fn summarize_schema_mismatch(mismatch: &SchemaMismatch) -> String {
@@ -32,16 +35,10 @@ pub fn summarize_schema_mismatch(mismatch: &SchemaMismatch) -> String {
         ));
     }
     if !mismatch.missing_columns.is_empty() {
-        parts.push(format!(
-            "missing: {}",
-            mismatch.missing_columns.join(", ")
-        ));
+        parts.push(format!("missing: {}", mismatch.missing_columns.join(", ")));
     }
     if !mismatch.extra_columns.is_empty() {
-        parts.push(format!(
-            "extra: {}",
-            mismatch.extra_columns.join(", ")
-        ));
+        parts.push(format!("extra: {}", mismatch.extra_columns.join(", ")));
     }
     if !mismatch.order_mismatches.is_empty() {
         let details = mismatch
@@ -74,7 +71,11 @@ pub fn summarize_schema_mismatch(mismatch: &SchemaMismatch) -> String {
     if parts.is_empty() {
         format!("schema mismatch for '{}'", mismatch.output_name)
     } else {
-        format!("schema mismatch for '{}': {}", mismatch.output_name, parts.join("; "))
+        format!(
+            "schema mismatch for '{}': {}",
+            mismatch.output_name,
+            parts.join("; ")
+        )
     }
 }
 
@@ -158,8 +159,7 @@ fn validate_record_batch(
     }
 
     let schema = batch.schema();
-    for (expected, idx) in schema_def.columns.iter().zip(data_field_indices.iter())
-    {
+    for (expected, idx) in schema_def.columns.iter().zip(data_field_indices.iter()) {
         let actual_name = schema.field(*idx).name();
         if expected.name != *actual_name {
             return Err(build_schema_mismatch(
@@ -231,7 +231,11 @@ enum TypeCheck {
     Mismatch,
 }
 
-fn type_check_mode(expected: &SchemaDataType, actual: &ArrowDataType, column: &ColumnDef) -> TypeCheck {
+fn type_check_mode(
+    expected: &SchemaDataType,
+    actual: &ArrowDataType,
+    column: &ColumnDef,
+) -> TypeCheck {
     use ArrowDataType as A;
     use SchemaDataType as S;
 
@@ -306,7 +310,10 @@ fn build_schema_mismatch(
         })
         .collect();
 
-    let expected_names: Vec<String> = expected_columns.iter().map(|col| col.name.clone()).collect();
+    let expected_names: Vec<String> = expected_columns
+        .iter()
+        .map(|col| col.name.clone())
+        .collect();
     let actual_names: Vec<String> = actual_columns.iter().map(|col| col.name.clone()).collect();
 
     let expected_set: std::collections::HashSet<&str> =
@@ -372,7 +379,11 @@ fn build_schema_mismatch(
     }
 }
 
-fn is_type_compatible(expected: &SchemaDataType, actual: &ArrowDataType, column: &ColumnDef) -> bool {
+fn is_type_compatible(
+    expected: &SchemaDataType,
+    actual: &ArrowDataType,
+    column: &ColumnDef,
+) -> bool {
     use ArrowDataType as A;
     use SchemaDataType as S;
 
@@ -691,7 +702,11 @@ mod tests {
         }]);
         let ids = StringArray::from(vec![Some("1"), Some("bad")]);
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Utf8, true)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "id",
+                ArrowDataType::Utf8,
+                true,
+            )])),
             vec![Arc::new(ids) as ArrayRef],
         )
         .unwrap();
@@ -710,7 +725,11 @@ mod tests {
         }]);
         let ids = Int64Array::from(vec![Some(1), None]);
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Int64, true)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "id",
+                ArrowDataType::Int64,
+                true,
+            )])),
             vec![Arc::new(ids) as ArrayRef],
         )
         .unwrap();
@@ -736,7 +755,11 @@ mod tests {
         }]);
         let ids = arrow::array::BooleanArray::from(vec![Some(true), Some(false)]);
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Boolean, true)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "id",
+                ArrowDataType::Boolean,
+                true,
+            )])),
             vec![Arc::new(ids) as ArrayRef],
         )
         .unwrap();
@@ -755,7 +778,11 @@ mod tests {
         }]);
         let dates = StringArray::from(vec![Some("2024-01-15"), Some("01/15/2024")]);
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("date", ArrowDataType::Utf8, true)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "date",
+                ArrowDataType::Utf8,
+                true,
+            )])),
             vec![Arc::new(dates) as ArrayRef],
         )
         .unwrap();
@@ -779,8 +806,10 @@ mod tests {
             nullable: true,
             format: Some("%Y-%m-%d %H:%M:%S".to_string()),
         }]);
-        let values =
-            StringArray::from(vec![Some("2024-01-15 10:30:00"), Some("2024-01-16 09:00:00")]);
+        let values = StringArray::from(vec![
+            Some("2024-01-15 10:30:00"),
+            Some("2024-01-16 09:00:00"),
+        ]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "created_at",
@@ -819,7 +848,8 @@ mod tests {
         ));
 
         // Timestamp without TZ should fail
-        let ts_no_tz = arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000), Some(2000000)]);
+        let ts_no_tz =
+            arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000), Some(2000000)]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "ts",
@@ -845,12 +875,16 @@ mod tests {
         }]);
 
         // Timestamp WITH matching TZ should pass
-        let ts_with_tz = arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000), Some(2000000)])
-            .with_timezone("UTC");
+        let ts_with_tz =
+            arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000), Some(2000000)])
+                .with_timezone("UTC");
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "ts",
-                ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                ArrowDataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
                 true,
             )])),
             vec![Arc::new(ts_with_tz) as ArrayRef],
@@ -872,12 +906,15 @@ mod tests {
         }]);
 
         // Timestamp with different TZ should fail
-        let ts_utc = arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000)])
-            .with_timezone("UTC");
+        let ts_utc =
+            arrow::array::TimestampMicrosecondArray::from(vec![Some(1000000)]).with_timezone("UTC");
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "ts",
-                ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                ArrowDataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
                 true,
             )])),
             vec![Arc::new(ts_utc) as ArrayRef],
@@ -960,10 +997,14 @@ mod tests {
         // Valid RFC3339 format should pass
         let ts_strings = StringArray::from(vec![
             Some("2024-01-15T10:30:00+00:00"),
-            Some("2024-01-16T09:00:00+00:00")
+            Some("2024-01-16T09:00:00+00:00"),
         ]);
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("ts", ArrowDataType::Utf8, true)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                ArrowDataType::Utf8,
+                true,
+            )])),
             vec![Arc::new(ts_strings) as ArrayRef],
         )
         .unwrap();
@@ -985,11 +1026,15 @@ mod tests {
 
         // Invalid format should quarantine
         let ts_strings = StringArray::from(vec![
-            Some("2024-01-15 10:30:00"),  // Missing timezone offset
-            Some("2024-01-16T09:00:00+00:00")  // Valid
+            Some("2024-01-15 10:30:00"),       // Missing timezone offset
+            Some("2024-01-16T09:00:00+00:00"), // Valid
         ]);
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("ts", ArrowDataType::Utf8, true)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                ArrowDataType::Utf8,
+                true,
+            )])),
             vec![Arc::new(ts_strings) as ArrayRef],
         )
         .unwrap();

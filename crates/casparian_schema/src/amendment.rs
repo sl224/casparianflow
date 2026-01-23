@@ -19,9 +19,9 @@
 //! 4. User chooses an action (approve, modify, reject, etc.)
 //! 5. Contract is updated (if approved) with new version
 
-use crate::{DataType, LockedColumn, LockedSchema, SchemaContract};
 use crate::ids::{AmendmentId, ContractId, SchemaTimestamp};
 use crate::storage::{SchemaStorage, StorageError};
+use crate::{DataType, LockedColumn, LockedSchema, SchemaContract};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -217,14 +217,37 @@ pub enum AmendmentReason {
 impl std::fmt::Display for AmendmentReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AmendmentReason::NewSchemaVariant { variant_description, file_count, .. } => {
-                write!(f, "New schema variant detected: {} ({} files)", variant_description, file_count)
+            AmendmentReason::NewSchemaVariant {
+                variant_description,
+                file_count,
+                ..
+            } => {
+                write!(
+                    f,
+                    "New schema variant detected: {} ({} files)",
+                    variant_description, file_count
+                )
             }
-            AmendmentReason::TypeMismatch { column, expected_type, .. } => {
-                write!(f, "Type mismatch in column '{}' (expected {})", column, expected_type)
+            AmendmentReason::TypeMismatch {
+                column,
+                expected_type,
+                ..
+            } => {
+                write!(
+                    f,
+                    "Type mismatch in column '{}' (expected {})",
+                    column, expected_type
+                )
             }
-            AmendmentReason::NullabilityChange { column, null_percentage } => {
-                write!(f, "Column '{}' has {:.1}% null values", column, null_percentage)
+            AmendmentReason::NullabilityChange {
+                column,
+                null_percentage,
+            } => {
+                write!(
+                    f,
+                    "Column '{}' has {:.1}% null values",
+                    column, null_percentage
+                )
             }
             AmendmentReason::NewColumns { column_names, .. } => {
                 write!(f, "New columns detected: {}", column_names.join(", "))
@@ -235,10 +258,21 @@ impl std::fmt::Display for AmendmentReason {
             AmendmentReason::ColumnOrderChanged { .. } => {
                 write!(f, "Column order changed")
             }
-            AmendmentReason::FormatMismatch { column, expected_format, .. } => {
-                write!(f, "Format mismatch in column '{}' (expected '{}')", column, expected_format)
+            AmendmentReason::FormatMismatch {
+                column,
+                expected_format,
+                ..
+            } => {
+                write!(
+                    f,
+                    "Format mismatch in column '{}' (expected '{}')",
+                    column, expected_format
+                )
             }
-            AmendmentReason::UserRequested { requested_by, reason } => {
+            AmendmentReason::UserRequested {
+                requested_by,
+                reason,
+            } => {
                 write!(f, "User '{}' requested: {}", requested_by, reason)
             }
         }
@@ -257,9 +291,7 @@ pub enum SchemaChange {
     },
 
     /// Remove an existing column
-    RemoveColumn {
-        column_name: String,
-    },
+    RemoveColumn { column_name: String },
 
     /// Change a column's data type
     ChangeType {
@@ -269,10 +301,7 @@ pub enum SchemaChange {
     },
 
     /// Change a column's nullability
-    ChangeNullability {
-        column_name: String,
-        nullable: bool,
-    },
+    ChangeNullability { column_name: String, nullable: bool },
 
     /// Add or change a default value
     AddDefaultValue {
@@ -281,9 +310,7 @@ pub enum SchemaChange {
     },
 
     /// Remove a default value
-    RemoveDefaultValue {
-        column_name: String,
-    },
+    RemoveDefaultValue { column_name: String },
 
     /// Change a column's format string
     ChangeFormat {
@@ -293,15 +320,10 @@ pub enum SchemaChange {
     },
 
     /// Rename a column
-    RenameColumn {
-        from: String,
-        to: String,
-    },
+    RenameColumn { from: String, to: String },
 
     /// Reorder columns
-    ReorderColumns {
-        new_order: Vec<String>,
-    },
+    ReorderColumns { new_order: Vec<String> },
 }
 
 impl std::fmt::Display for SchemaChange {
@@ -313,19 +335,38 @@ impl std::fmt::Display for SchemaChange {
             SchemaChange::RemoveColumn { column_name } => {
                 write!(f, "Remove column '{}'", column_name)
             }
-            SchemaChange::ChangeType { column_name, from, to } => {
+            SchemaChange::ChangeType {
+                column_name,
+                from,
+                to,
+            } => {
                 write!(f, "Change '{}' type: {} -> {}", column_name, from, to)
             }
-            SchemaChange::ChangeNullability { column_name, nullable } => {
-                write!(f, "Change '{}' nullability: {}", column_name, if *nullable { "nullable" } else { "required" })
+            SchemaChange::ChangeNullability {
+                column_name,
+                nullable,
+            } => {
+                write!(
+                    f,
+                    "Change '{}' nullability: {}",
+                    column_name,
+                    if *nullable { "nullable" } else { "required" }
+                )
             }
-            SchemaChange::AddDefaultValue { column_name, default } => {
+            SchemaChange::AddDefaultValue {
+                column_name,
+                default,
+            } => {
                 write!(f, "Add default '{}' to '{}'", default, column_name)
             }
             SchemaChange::RemoveDefaultValue { column_name } => {
                 write!(f, "Remove default from '{}'", column_name)
             }
-            SchemaChange::ChangeFormat { column_name, from, to } => {
+            SchemaChange::ChangeFormat {
+                column_name,
+                from,
+                to,
+            } => {
                 write!(f, "Change '{}' format: {:?} -> {:?}", column_name, from, to)
             }
             SchemaChange::RenameColumn { from, to } => {
@@ -473,7 +514,9 @@ pub fn propose_amendment(
     proposed_schema: LockedSchema,
 ) -> Result<SchemaAmendmentProposal, AmendmentError> {
     // Get the current schema from the contract
-    let current_schema = contract.schemas.first()
+    let current_schema = contract
+        .schemas
+        .first()
         .ok_or_else(|| AmendmentError::Validation("Contract has no schemas".into()))?
         .clone();
 
@@ -496,7 +539,9 @@ pub fn propose_type_mismatch_amendment(
     actual_values: Vec<String>,
     proposed_type: DataType,
 ) -> Result<SchemaAmendmentProposal, AmendmentError> {
-    let current_schema = contract.schemas.first()
+    let current_schema = contract
+        .schemas
+        .first()
         .ok_or_else(|| AmendmentError::Validation("Contract has no schemas".into()))?;
 
     // Create proposed schema with the type change
@@ -525,7 +570,9 @@ pub fn propose_nullability_amendment(
     column: &str,
     null_percentage: f32,
 ) -> Result<SchemaAmendmentProposal, AmendmentError> {
-    let current_schema = contract.schemas.first()
+    let current_schema = contract
+        .schemas
+        .first()
         .ok_or_else(|| AmendmentError::Validation("Contract has no schemas".into()))?;
 
     // Create proposed schema with nullable column
@@ -553,7 +600,9 @@ pub fn propose_new_columns_amendment(
     new_columns: Vec<LockedColumn>,
     file_count: usize,
 ) -> Result<SchemaAmendmentProposal, AmendmentError> {
-    let current_schema = contract.schemas.first()
+    let current_schema = contract
+        .schemas
+        .first()
         .ok_or_else(|| AmendmentError::Validation("Contract has no schemas".into()))?;
 
     // Create proposed schema with new columns appended
@@ -594,7 +643,9 @@ pub fn approve_amendment(
     processed_by: impl Into<String>,
 ) -> Result<AmendmentResult, AmendmentError> {
     if !proposal.is_pending() {
-        return Err(AmendmentError::AlreadyProcessed(proposal.amendment_id.clone()));
+        return Err(AmendmentError::AlreadyProcessed(
+            proposal.amendment_id.clone(),
+        ));
     }
 
     let processed_by = processed_by.into();
@@ -603,8 +654,12 @@ pub fn approve_amendment(
     match action {
         AmendmentAction::ApproveAsProposed => {
             // Get current contract
-            let current_contract = storage.get_contract(&proposal.contract_id)?
-                .ok_or_else(|| AmendmentError::ContractNotFound(proposal.contract_id.to_string()))?;
+            let current_contract =
+                storage
+                    .get_contract(&proposal.contract_id)?
+                    .ok_or_else(|| {
+                        AmendmentError::ContractNotFound(proposal.contract_id.to_string())
+                    })?;
 
             // Create new version with proposed schema
             let mut new_schemas = current_contract.schemas.clone();
@@ -634,10 +689,16 @@ pub fn approve_amendment(
 
         AmendmentAction::ApproveWithModifications { changes } => {
             // Apply custom changes
-            let current_contract = storage.get_contract(&proposal.contract_id)?
-                .ok_or_else(|| AmendmentError::ContractNotFound(proposal.contract_id.to_string()))?;
+            let current_contract =
+                storage
+                    .get_contract(&proposal.contract_id)?
+                    .ok_or_else(|| {
+                        AmendmentError::ContractNotFound(proposal.contract_id.to_string())
+                    })?;
 
-            let current_schema = current_contract.schemas.first()
+            let current_schema = current_contract
+                .schemas
+                .first()
                 .ok_or_else(|| AmendmentError::Validation("Contract has no schemas".into()))?;
 
             let modified_schema = apply_schema_changes(current_schema, &changes)?;
@@ -667,16 +728,14 @@ pub fn approve_amendment(
             })
         }
 
-        AmendmentAction::Reject { reason: _ } => {
-            Ok(AmendmentResult {
-                contract: None,
-                new_contract: None,
-                excluded_files: Vec::new(),
-                status: AmendmentStatus::Rejected,
-                processed_at,
-                processed_by,
-            })
-        }
+        AmendmentAction::Reject { reason: _ } => Ok(AmendmentResult {
+            contract: None,
+            new_contract: None,
+            excluded_files: Vec::new(),
+            status: AmendmentStatus::Rejected,
+            processed_at,
+            processed_by,
+        }),
 
         AmendmentAction::CreateSeparateSchema { name, description } => {
             // Create a new contract for the new schema variant
@@ -707,7 +766,9 @@ pub fn approve_amendment(
 
         AmendmentAction::ExcludeAffectedFiles => {
             // In a real implementation, this would record the excluded files
-            let excluded = proposal.sample_values.iter()
+            let excluded = proposal
+                .sample_values
+                .iter()
                 .map(|s| s.file_path.clone())
                 .collect::<Vec<_>>();
 
@@ -803,22 +864,22 @@ fn apply_schema_changes(
 
     for change in changes {
         match change {
-            SchemaChange::AddColumn { column, position } => {
-                match position {
-                    Some(pos) if *pos <= columns.len() => {
-                        columns.insert(*pos, column.clone());
-                    }
-                    _ => {
-                        columns.push(column.clone());
-                    }
+            SchemaChange::AddColumn { column, position } => match position {
+                Some(pos) if *pos <= columns.len() => {
+                    columns.insert(*pos, column.clone());
                 }
-            }
+                _ => {
+                    columns.push(column.clone());
+                }
+            },
 
             SchemaChange::RemoveColumn { column_name } => {
                 columns.retain(|c| c.name != *column_name);
             }
 
-            SchemaChange::ChangeType { column_name, to, .. } => {
+            SchemaChange::ChangeType {
+                column_name, to, ..
+            } => {
                 for col in &mut columns {
                     if col.name == *column_name {
                         col.data_type = to.clone();
@@ -827,7 +888,10 @@ fn apply_schema_changes(
                 }
             }
 
-            SchemaChange::ChangeNullability { column_name, nullable } => {
+            SchemaChange::ChangeNullability {
+                column_name,
+                nullable,
+            } => {
                 for col in &mut columns {
                     if col.name == *column_name {
                         col.nullable = *nullable;
@@ -845,7 +909,9 @@ fn apply_schema_changes(
                 // Same as above - no-op for schema structure
             }
 
-            SchemaChange::ChangeFormat { column_name, to, .. } => {
+            SchemaChange::ChangeFormat {
+                column_name, to, ..
+            } => {
                 for col in &mut columns {
                     if col.name == *column_name {
                         col.format = to.clone();
@@ -869,9 +935,10 @@ fn apply_schema_changes(
                     if let Some(col) = columns.iter().find(|c| c.name == *name) {
                         reordered.push(col.clone());
                     } else {
-                        return Err(AmendmentError::CannotApply(
-                            format!("Column '{}' not found for reordering", name)
-                        ));
+                        return Err(AmendmentError::CannotApply(format!(
+                            "Column '{}' not found for reordering",
+                            name
+                        )));
                     }
                 }
                 columns = reordered;
@@ -908,10 +975,8 @@ mod tests {
 
     #[test]
     fn test_create_amendment_proposal() {
-        let current = LockedSchema::new(
-            "test",
-            vec![LockedColumn::required("id", DataType::Int64)],
-        );
+        let current =
+            LockedSchema::new("test", vec![LockedColumn::required("id", DataType::Int64)]);
 
         let proposed = LockedSchema::new(
             "test",
@@ -951,8 +1016,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(proposal.reason, AmendmentReason::TypeMismatch { .. }));
-        assert!(proposal.changes.iter().any(|c| matches!(c, SchemaChange::ChangeType { .. })));
+        assert!(matches!(
+            proposal.reason,
+            AmendmentReason::TypeMismatch { .. }
+        ));
+        assert!(proposal
+            .changes
+            .iter()
+            .any(|c| matches!(c, SchemaChange::ChangeType { .. })));
     }
 
     #[test]
@@ -962,8 +1033,14 @@ mod tests {
 
         let proposal = propose_nullability_amendment(&contract, "name", 15.5).unwrap();
 
-        assert!(matches!(proposal.reason, AmendmentReason::NullabilityChange { .. }));
-        assert!(proposal.changes.iter().any(|c| matches!(c, SchemaChange::ChangeNullability { .. })));
+        assert!(matches!(
+            proposal.reason,
+            AmendmentReason::NullabilityChange { .. }
+        ));
+        assert!(proposal
+            .changes
+            .iter()
+            .any(|c| matches!(c, SchemaChange::ChangeNullability { .. })));
     }
 
     #[test]
@@ -978,8 +1055,13 @@ mod tests {
 
         let proposal = propose_new_columns_amendment(&contract, new_cols, 10).unwrap();
 
-        assert!(matches!(proposal.reason, AmendmentReason::NewColumns { .. }));
-        let add_count = proposal.changes.iter()
+        assert!(matches!(
+            proposal.reason,
+            AmendmentReason::NewColumns { .. }
+        ));
+        let add_count = proposal
+            .changes
+            .iter()
             .filter(|c| matches!(c, SchemaChange::AddColumn { .. }))
             .count();
         assert_eq!(add_count, 2);
@@ -1015,7 +1097,6 @@ mod tests {
             AmendmentAction::ApproveAsProposed,
             "reviewer",
         )
-        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Approved);
@@ -1045,16 +1126,13 @@ mod tests {
             &storage,
             &proposal,
             AmendmentAction::ApproveWithModifications {
-                changes: vec![
-                    SchemaChange::AddColumn {
-                        column: LockedColumn::optional("new_col", DataType::String),
-                        position: None,
-                    },
-                ],
+                changes: vec![SchemaChange::AddColumn {
+                    column: LockedColumn::optional("new_col", DataType::String),
+                    position: None,
+                }],
             },
             "reviewer",
         )
-        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Approved);
@@ -1087,7 +1165,6 @@ mod tests {
             },
             "reviewer",
         )
-        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Rejected);
@@ -1127,7 +1204,6 @@ mod tests {
             },
             "reviewer",
         )
-        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::SeparatedSchema);
@@ -1165,7 +1241,6 @@ mod tests {
             AmendmentAction::ExcludeAffectedFiles,
             "reviewer",
         )
-        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::FilesExcluded);
@@ -1196,7 +1271,6 @@ mod tests {
             },
             "reviewer",
         )
-        
         .unwrap();
 
         assert_eq!(result.status, AmendmentStatus::Pending);
@@ -1222,8 +1296,12 @@ mod tests {
 
         let changes = compute_schema_changes(&from, &to);
 
-        assert!(changes.iter().any(|c| matches!(c, SchemaChange::RemoveColumn { column_name } if column_name == "b")));
-        assert!(changes.iter().any(|c| matches!(c, SchemaChange::AddColumn { column, .. } if column.name == "c")));
+        assert!(changes.iter().any(
+            |c| matches!(c, SchemaChange::RemoveColumn { column_name } if column_name == "b")
+        ));
+        assert!(changes
+            .iter()
+            .any(|c| matches!(c, SchemaChange::AddColumn { column, .. } if column.name == "c")));
         assert!(changes.iter().any(|c| matches!(c, SchemaChange::ChangeType { column_name, from: DataType::Int64, to: DataType::Float64 } if column_name == "a")));
         assert!(changes.iter().any(|c| matches!(c, SchemaChange::ChangeNullability { column_name, nullable: true } if column_name == "a")));
     }
@@ -1292,8 +1370,7 @@ mod tests {
 
     #[test]
     fn test_sample_value() {
-        let sample = SampleValue::new("data.csv", "amount", "N/A", "Expected numeric")
-            .with_row(42);
+        let sample = SampleValue::new("data.csv", "amount", "N/A", "Expected numeric").with_row(42);
 
         assert_eq!(sample.file_path, "data.csv");
         assert_eq!(sample.row, Some(42));

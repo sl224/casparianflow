@@ -1,7 +1,7 @@
 mod cli_support;
 
-use casparian_db::{DbConnection, DbValue};
 use casparian::scout::FileStatus;
+use casparian_db::{DbConnection, DbValue};
 use cli_support::with_duckdb;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -79,9 +79,7 @@ fn test_tag_and_untag_update_sqlite_db() {
     let home_dir = TempDir::new().expect("create temp home");
     let db_path = home_dir.path().join("casparian_flow.duckdb");
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str())];
 
     {
         with_duckdb(&db_path, |conn| {
@@ -155,10 +153,7 @@ fn test_tag_and_untag_update_sqlite_db() {
                 )
                 .unwrap();
             let untagged_count = conn
-                .query_scalar::<i64>(
-                    "SELECT COUNT(*) FROM scout_files WHERE tag IS NULL",
-                    &[],
-                )
+                .query_scalar::<i64>("SELECT COUNT(*) FROM scout_files WHERE tag IS NULL", &[])
                 .unwrap();
             (csv_count, json_count, untagged_count)
         });
@@ -221,9 +216,7 @@ fn test_pipeline_run_enqueues_jobs() {
     let home_dir = TempDir::new().expect("create temp home");
     let db_path = home_dir.path().join("casparian_flow.duckdb");
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str())];
 
     {
         with_duckdb(&db_path, |conn| {

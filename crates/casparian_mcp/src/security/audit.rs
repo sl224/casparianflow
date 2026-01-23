@@ -33,10 +33,7 @@ impl AuditLog {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                SecurityError::AuditError(format!(
-                    "Failed to create audit log directory: {}",
-                    e
-                ))
+                SecurityError::AuditError(format!("Failed to create audit log directory: {}", e))
             })?;
         }
 
@@ -45,9 +42,7 @@ impl AuditLog {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|e| {
-                SecurityError::AuditError(format!("Failed to open audit log: {}", e))
-            })?;
+            .map_err(|e| SecurityError::AuditError(format!("Failed to open audit log: {}", e)))?;
 
         let writer = Mutex::new(BufWriter::new(file));
 
@@ -68,11 +63,34 @@ impl AuditLog {
 
     /// Log a response
     pub fn log_response(&mut self, response: &JsonRpcResponse) -> Result<(), SecurityError> {
+        // Check if this is a tool response with is_error field
+        let tool_is_error = response
+            .result
+            .as_ref()
+            .and_then(|r| r.get("is_error").and_then(|v| v.as_bool()));
+        let tool_content_preview = response.result.as_ref().and_then(|r| {
+            r.get("content").and_then(|c| {
+                c.as_array().and_then(|arr| {
+                    arr.first().and_then(|item| {
+                        item.get("text").and_then(|t| t.as_str()).map(|s| {
+                            if s.len() > 200 {
+                                format!("{}...", &s[..200])
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                    })
+                })
+            })
+        });
+
         let entry = AuditEntry::Response {
             ts: Utc::now(),
             id: response.id.as_ref().map(|id| format!("{:?}", id)),
             success: response.error.is_none(),
             error_code: response.error.as_ref().map(|e| e.code),
+            tool_is_error,
+            tool_content_preview,
         };
 
         self.write_entry(&entry)
@@ -101,17 +119,18 @@ impl AuditLog {
             SecurityError::AuditError(format!("Failed to serialize audit entry: {}", e))
         })?;
 
-        let mut writer = self.writer.lock().map_err(|e| {
-            SecurityError::AuditError(format!("Failed to lock audit log: {}", e))
-        })?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|e| SecurityError::AuditError(format!("Failed to lock audit log: {}", e)))?;
 
         writeln!(writer, "{}", json).map_err(|e| {
             SecurityError::AuditError(format!("Failed to write audit entry: {}", e))
         })?;
 
-        writer.flush().map_err(|e| {
-            SecurityError::AuditError(format!("Failed to flush audit log: {}", e))
-        })?;
+        writer
+            .flush()
+            .map_err(|e| SecurityError::AuditError(format!("Failed to flush audit log: {}", e)))?;
 
         Ok(())
     }
@@ -141,6 +160,10 @@ enum AuditEntry {
         success: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error_code: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_content_preview: Option<String>,
     },
     ToolCall {
         ts: DateTime<Utc>,
@@ -150,15 +173,14 @@ enum AuditEntry {
     },
 }
 
-/// Summarize params for logging (avoid logging sensitive data)
+/// Summarize params for logging (show full structure for debugging)
 fn summarize_params(params: &serde_json::Value) -> String {
-    match params {
-        serde_json::Value::Object(map) => {
-            let keys: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
-            format!("{{keys: [{}]}}", keys.join(", "))
-        }
-        serde_json::Value::Array(arr) => format!("[{} items]", arr.len()),
-        _ => "[value]".to_string(),
+    // For tools/call, show the full arguments to help debug serialization issues
+    let json = serde_json::to_string(params).unwrap_or_else(|_| "[serialize error]".to_string());
+    if json.len() > 500 {
+        format!("{}...", &json[..500])
+    } else {
+        json
     }
 }
 
@@ -205,8 +227,9 @@ mod tests {
         assert!(summary.contains("path"));
         assert!(summary.contains("limit"));
 
+        // summarize_params now shows full JSON for debugging
         let arr = serde_json::json!([1, 2, 3]);
         let summary = summarize_params(&arr);
-        assert!(summary.contains("3 items"));
+        assert!(summary.contains("[1,2,3]"));
     }
 }

@@ -47,7 +47,7 @@ const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HEADER_SIZE: usize = 4;
 const END_OF_STREAM: u32 = 0;
 const ERROR_SIGNAL: u32 = 0xFFFF_FFFF;
-const LOG_SIGNAL: u32 = 0xFFFF_FFFE;  // Sideband logging signal
+const LOG_SIGNAL: u32 = 0xFFFF_FFFE; // Sideband logging signal
 const OUTPUT_START_SIGNAL: u32 = 0xFFFF_FFFD;
 const OUTPUT_END_SIGNAL: u32 = 0xFFFF_FFFC;
 const METRICS_SIGNAL: u32 = 0xFFFF_FFFB;
@@ -172,9 +172,14 @@ impl JobLogWriter {
 
     /// Flush and close the log file, returning the path.
     fn finish(mut self) -> Result<PathBuf> {
-        self.writer.flush()
+        self.writer
+            .flush()
             .with_context(|| format!("Failed to flush log file: {}", self.path.display()))?;
-        debug!("Log file closed: {} ({} bytes)", self.path.display(), self.bytes_written);
+        debug!(
+            "Log file closed: {} ({} bytes)",
+            self.path.display(),
+            self.bytes_written
+        );
         Ok(self.path)
     }
 
@@ -248,11 +253,15 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .with_context(|| "[Job {}] Failed to bind TCP listener on 127.0.0.1:0")?;
 
-    let port = listener.local_addr()
+    let port = listener
+        .local_addr()
         .with_context(|| format!("[Job {}] Failed to get local address", job_id))?
         .port();
 
-    debug!("[Job {}] Bridge TCP listener bound to 127.0.0.1:{}", job_id, port);
+    debug!(
+        "[Job {}] Bridge TCP listener bound to 127.0.0.1:{}",
+        job_id, port
+    );
 
     let mut process = spawn_guest(&config, port)?;
     let process_pid = process.id();
@@ -266,7 +275,10 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
             cleanup_process(&mut process);
 
             if !stderr_output.is_empty() {
-                error!("[Job {}] Guest stderr before connection failure:\n{}", job_id, stderr_output);
+                error!(
+                    "[Job {}] Guest stderr before connection failure:\n{}",
+                    job_id, stderr_output
+                );
                 log_writer.write_log(log_level::STDERR, &stderr_output);
             }
             // Still return the logs even on failure
@@ -275,13 +287,19 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
         }
     };
 
-    debug!("[Job {}] Guest process (pid={}) connected", job_id, process_pid);
+    debug!(
+        "[Job {}] Guest process (pid={}) connected",
+        job_id, process_pid
+    );
 
     // Set read timeout on the stream (may already be set in accept_with_timeout)
     // On macOS, this can fail with EINVAL if the peer has already closed
     // We try it anyway but don't fail if it doesn't work - the read will still work
     if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
-        warn!("[Job {}] Could not set read timeout (may already be set or peer closed): {}", job_id, e);
+        warn!(
+            "[Job {}] Could not set read timeout (may already be set or peer closed): {}",
+            job_id, e
+        );
     }
 
     // Read all batches (log_writer receives sideband log messages)
@@ -292,7 +310,10 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
             cleanup_process(&mut process);
 
             if !stderr_output.is_empty() {
-                error!("[Job {}] Guest stderr during read failure:\n{}", job_id, stderr_output);
+                error!(
+                    "[Job {}] Guest stderr during read failure:\n{}",
+                    job_id, stderr_output
+                );
                 log_writer.write_log(log_level::STDERR, &stderr_output);
             }
             let logs = log_writer.read_and_cleanup().unwrap_or_default();
@@ -301,7 +322,8 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     };
 
     // Wait for process to exit
-    let status = process.wait()
+    let status = process
+        .wait()
         .with_context(|| format!("[Job {}] Failed to wait for guest process", job_id))?;
 
     // Always collect stderr for logging (even on success)
@@ -320,14 +342,21 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
             job_id,
             process_pid,
             status,
-            if stderr_output.is_empty() { "(no stderr output)" } else { &stderr_output },
+            if stderr_output.is_empty() {
+                "(no stderr output)"
+            } else {
+                &stderr_output
+            },
             logs
         );
     }
 
     // Log warnings from stderr even on success (append to sideband logs)
     if !stderr_output.is_empty() {
-        warn!("[Job {}] Guest stderr (process succeeded but had output):\n{}", job_id, stderr_output);
+        warn!(
+            "[Job {}] Guest stderr (process succeeded but had output):\n{}",
+            job_id, stderr_output
+        );
         log_writer.write_log(log_level::STDERR, &stderr_output);
     }
 
@@ -342,7 +371,8 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     // TCP socket cleanup is automatic when listener goes out of scope
 
     // Read and cleanup log file
-    let logs = log_writer.read_and_cleanup()
+    let logs = log_writer
+        .read_and_cleanup()
         .with_context(|| format!("[Job {}] Failed to read logs", job_id))?;
 
     if !output_info.is_empty() && output_info.len() != output_batches.len() {
@@ -389,8 +419,12 @@ fn accept_with_timeout(
     job_id: JobId,
 ) -> Result<TcpStream> {
     // Use non-blocking mode with polling
-    listener.set_nonblocking(true)
-        .with_context(|| format!("[Job {}] Failed to set TCP listener to non-blocking", job_id))?;
+    listener.set_nonblocking(true).with_context(|| {
+        format!(
+            "[Job {}] Failed to set TCP listener to non-blocking",
+            job_id
+        )
+    })?;
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
@@ -415,13 +449,17 @@ fn accept_with_timeout(
                 // Set read timeout first (while still non-blocking) - this helps on macOS
                 // where the order of socket option calls matters
                 if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
-                    debug!("[Job {}] Could not set read timeout in accept: {}", job_id, e);
+                    debug!(
+                        "[Job {}] Could not set read timeout in accept: {}",
+                        job_id, e
+                    );
                     // Continue anyway - we'll set it later if needed
                 }
 
                 // Switch back to blocking mode for the stream
-                stream.set_nonblocking(false)
-                    .with_context(|| format!("[Job {}] Failed to set TCP stream to blocking mode", job_id))?;
+                stream.set_nonblocking(false).with_context(|| {
+                    format!("[Job {}] Failed to set TCP stream to blocking mode", job_id)
+                })?;
 
                 debug!(
                     "[Job {}] Guest connected after {:.2}s",
@@ -434,11 +472,7 @@ fn accept_with_timeout(
                 // No connection yet, check if process is still alive
             }
             Err(e) => {
-                anyhow::bail!(
-                    "[Job {}] Failed to accept TCP connection: {}",
-                    job_id,
-                    e
-                );
+                anyhow::bail!("[Job {}] Failed to accept TCP connection: {}", job_id, e);
             }
         }
 
@@ -450,8 +484,9 @@ fn accept_with_timeout(
                     Ok((stream, _)) => {
                         // Try to set timeout, ignore if it fails on dead connection
                         let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-                        stream.set_nonblocking(false)
-                            .with_context(|| format!("[Job {}] Failed to set TCP stream to blocking mode", job_id))?;
+                        stream.set_nonblocking(false).with_context(|| {
+                            format!("[Job {}] Failed to set TCP stream to blocking mode", job_id)
+                        })?;
                         debug!(
                             "[Job {}] Guest connected after {:.2}s (process already exited)",
                             job_id,
@@ -507,16 +542,17 @@ fn parse_output_info(job_id: JobId, source: &str, json_text: &str) -> Vec<Output
                     .filter_map(|v| serde_json::from_value::<OutputInfo>(v.clone()).ok())
                     .collect()
             } else {
-                debug!("[Job {}] No output_info in metrics JSON ({})", job_id, source);
+                debug!(
+                    "[Job {}] No output_info in metrics JSON ({})",
+                    job_id, source
+                );
                 vec![]
             }
         }
         Err(e) => {
             warn!(
                 "[Job {}] Failed to parse metrics JSON ({}): {}",
-                job_id,
-                source,
-                e
+                job_id, source, e
             );
             vec![]
         }
@@ -537,7 +573,7 @@ fn cleanup_process(process: &mut Child) {
 ///
 /// The guest connects to localhost TCP port specified by BRIDGE_PORT env var.
 fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
-    use base64::{Engine as _, engine::general_purpose};
+    use base64::{engine::general_purpose, Engine as _};
     let source_b64 = general_purpose::STANDARD.encode(&config.source_code);
 
     // Use uv to spawn Python - it knows how to set up the environment correctly
@@ -562,7 +598,11 @@ fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
         .env("BRIDGE_FILE_ID", config.file_id.to_string())
         .env(
             "BRIDGE_STDIO_MODE",
-            if config.inherit_stdio { "inherit" } else { "piped" },
+            if config.inherit_stdio {
+                "inherit"
+            } else {
+                "piped"
+            },
         );
 
     if config.inherit_stdio {
@@ -573,14 +613,15 @@ fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
 
     // NOTE: uv sets VIRTUAL_ENV automatically, no need to do it ourselves
 
-    let child = cmd.spawn()
-        .with_context(|| format!(
+    let child = cmd.spawn().with_context(|| {
+        format!(
             "[Job {}] Failed to spawn guest process via 'uv run'. \
             Is uv installed? Interpreter: {}, Shim: {}",
             config.job_id,
             config.interpreter_path.display(),
             config.shim_path.display()
-        ))?;
+        )
+    })?;
 
     info!(
         "[Job {}] Spawned guest via uv (pid={}) using interpreter {}, port {}",
@@ -617,8 +658,10 @@ fn read_arrow_batches(
                 debug!("[Job {}] Socket closed by guest (EOF)", job_id);
                 break;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                   || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 anyhow::bail!(
                     "[Job {}] TIMEOUT: No data received from guest within {:.0}s. \
                     The Python plugin may be hanging or performing very slow I/O. \
@@ -662,7 +705,7 @@ fn read_arrow_batches(
         if length == LOG_SIGNAL {
             read_and_write_log(stream, job_id, log_writer)?;
             log_count += 1;
-            continue;  // Don't treat as data batch
+            continue; // Don't treat as data batch
         }
 
         if length == METRICS_SIGNAL {
@@ -676,7 +719,8 @@ fn read_arrow_batches(
 
         if length == OUTPUT_START_SIGNAL {
             let mut index_buf = [0u8; HEADER_SIZE];
-            stream.read_exact(&mut index_buf)
+            stream
+                .read_exact(&mut index_buf)
                 .with_context(|| format!("[Job {}] Failed to read output start index", job_id))?;
             let output_index = u32::from_be_bytes(index_buf);
             if current_output.is_some() {
@@ -696,7 +740,8 @@ fn read_arrow_batches(
 
         if length == OUTPUT_END_SIGNAL {
             let mut index_buf = [0u8; HEADER_SIZE];
-            stream.read_exact(&mut index_buf)
+            stream
+                .read_exact(&mut index_buf)
                 .with_context(|| format!("[Job {}] Failed to read output end index", job_id))?;
             let end_index = u32::from_be_bytes(index_buf);
 
@@ -741,21 +786,26 @@ fn read_arrow_batches(
 
         // Read Arrow IPC payload
         let mut ipc_buf = vec![0u8; length as usize];
-        stream.read_exact(&mut ipc_buf)
-            .with_context(|| format!(
+        stream.read_exact(&mut ipc_buf).with_context(|| {
+            format!(
                 "[Job {}] Failed to read Arrow IPC payload ({} bytes) after {} batches",
                 job_id, length, batch_count
-            ))?;
+            )
+        })?;
 
-        debug!("[Job {}] Received {} bytes of Arrow IPC data", job_id, length);
+        debug!(
+            "[Job {}] Received {} bytes of Arrow IPC data",
+            job_id, length
+        );
 
         // Parse Arrow IPC stream
         let cursor = std::io::Cursor::new(ipc_buf);
-        let reader = StreamReader::try_new(cursor, None)
-            .with_context(|| format!(
+        let reader = StreamReader::try_new(cursor, None).with_context(|| {
+            format!(
                 "[Job {}] Failed to parse Arrow IPC stream (output {})",
                 job_id, batch_count
-            ))?;
+            )
+        })?;
 
         if current_output.is_some() {
             let schema = reader.schema();
@@ -776,11 +826,12 @@ fn read_arrow_batches(
 
         let mut ipc_batches: Vec<RecordBatch> = Vec::new();
         for batch_result in reader {
-            let batch = batch_result
-                .with_context(|| format!(
+            let batch = batch_result.with_context(|| {
+                format!(
                     "[Job {}] Failed to read Arrow batch from IPC stream",
                     job_id
-                ))?;
+                )
+            })?;
             ipc_batches.push(batch);
         }
 
@@ -797,8 +848,7 @@ fn read_arrow_batches(
     if let Some(output_batches) = current_output.take() {
         warn!(
             "[Job {}] Output stream ended without OUTPUT_END (index {:?}); closing open output",
-            job_id,
-            current_output_index
+            job_id, current_output_index
         );
         outputs.push(output_batches);
     }
@@ -818,13 +868,15 @@ fn read_and_write_log(
 ) -> Result<()> {
     // Read 1-byte log level
     let mut level_buf = [0u8; 1];
-    stream.read_exact(&mut level_buf)
+    stream
+        .read_exact(&mut level_buf)
         .with_context(|| format!("[Job {}] Failed to read log level", job_id))?;
     let level = level_buf[0];
 
     // Read 4-byte message length
     let mut len_buf = [0u8; HEADER_SIZE];
-    stream.read_exact(&mut len_buf)
+    stream
+        .read_exact(&mut len_buf)
         .with_context(|| format!("[Job {}] Failed to read log message length", job_id))?;
     let msg_len = u32::from_be_bytes(len_buf);
 
@@ -833,13 +885,16 @@ fn read_and_write_log(
     if msg_len > MAX_LOG_MESSAGE {
         anyhow::bail!(
             "[Job {}] Log message size {} bytes exceeds maximum {} bytes",
-            job_id, msg_len, MAX_LOG_MESSAGE
+            job_id,
+            msg_len,
+            MAX_LOG_MESSAGE
         );
     }
 
     // Read message bytes
     let mut msg_buf = vec![0u8; msg_len as usize];
-    stream.read_exact(&mut msg_buf)
+    stream
+        .read_exact(&mut msg_buf)
         .with_context(|| format!("[Job {}] Failed to read log message body", job_id))?;
 
     // Convert to string (lossy for invalid UTF-8)
@@ -852,12 +907,10 @@ fn read_and_write_log(
 }
 
 /// Read error message after ERROR_SIGNAL with size limit
-fn read_error_message(
-    stream: &mut TcpStream,
-    job_id: JobId,
-) -> Result<String> {
+fn read_error_message(stream: &mut TcpStream, job_id: JobId) -> Result<String> {
     let mut len_buf = [0u8; HEADER_SIZE];
-    stream.read_exact(&mut len_buf)
+    stream
+        .read_exact(&mut len_buf)
         .with_context(|| format!("[Job {}] Failed to read error message length", job_id))?;
 
     let error_len = u32::from_be_bytes(len_buf);
@@ -874,11 +927,12 @@ fn read_error_message(
     }
 
     let mut error_buf = vec![0u8; error_len as usize];
-    stream.read_exact(&mut error_buf)
-        .with_context(|| format!(
+    stream.read_exact(&mut error_buf).with_context(|| {
+        format!(
             "[Job {}] Failed to read error message body ({} bytes)",
             job_id, error_len
-        ))?;
+        )
+    })?;
 
     Ok(String::from_utf8_lossy(&error_buf).to_string())
 }
@@ -886,7 +940,8 @@ fn read_error_message(
 /// Read metrics JSON after METRICS_SIGNAL with size limit
 fn read_metrics_payload(stream: &mut TcpStream, job_id: JobId) -> Result<String> {
     let mut len_buf = [0u8; HEADER_SIZE];
-    stream.read_exact(&mut len_buf)
+    stream
+        .read_exact(&mut len_buf)
         .with_context(|| format!("[Job {}] Failed to read metrics length", job_id))?;
 
     let msg_len = u32::from_be_bytes(len_buf);
@@ -900,12 +955,12 @@ fn read_metrics_payload(stream: &mut TcpStream, job_id: JobId) -> Result<String>
     }
 
     let mut msg_buf = vec![0u8; msg_len as usize];
-    stream.read_exact(&mut msg_buf)
-        .with_context(|| format!(
+    stream.read_exact(&mut msg_buf).with_context(|| {
+        format!(
             "[Job {}] Failed to read metrics payload ({} bytes)",
-            job_id,
-            msg_len
-        ))?;
+            job_id, msg_len
+        )
+    })?;
 
     String::from_utf8(msg_buf)
         .with_context(|| format!("[Job {}] Metrics payload is not valid UTF-8", job_id))
@@ -941,14 +996,16 @@ fn materialize_bridge_shim_inner() -> Result<PathBuf> {
     let types_path = shim_dir.join("casparian_types.py");
 
     // Check if both files exist and content matches (fast path)
-    let shim_ok = shim_path.exists() && matches!(
-        std::fs::read_to_string(&shim_path),
-        Ok(existing) if existing == BRIDGE_SHIM_SOURCE
-    );
-    let types_ok = types_path.exists() && matches!(
-        std::fs::read_to_string(&types_path),
-        Ok(existing) if existing == CASPARIAN_TYPES_SOURCE
-    );
+    let shim_ok = shim_path.exists()
+        && matches!(
+            std::fs::read_to_string(&shim_path),
+            Ok(existing) if existing == BRIDGE_SHIM_SOURCE
+        );
+    let types_ok = types_path.exists()
+        && matches!(
+            std::fs::read_to_string(&types_path),
+            Ok(existing) if existing == CASPARIAN_TYPES_SOURCE
+        );
 
     if shim_ok && types_ok {
         debug!("Using cached bridge shim: {}", shim_path.display());
@@ -988,14 +1045,20 @@ fn materialize_bridge_shim_inner() -> Result<PathBuf> {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o644);
-            std::fs::set_permissions(&temp_path, perms)
-                .with_context(|| format!("Failed to set permissions on: {}", temp_path.display()))?;
+            std::fs::set_permissions(&temp_path, perms).with_context(|| {
+                format!("Failed to set permissions on: {}", temp_path.display())
+            })?;
         }
 
         // Atomic rename
         match std::fs::rename(&temp_path, target) {
             Ok(()) => {
-                info!("Materialized {} v{}: {}", name, CRATE_VERSION, target.display());
+                info!(
+                    "Materialized {} v{}: {}",
+                    name,
+                    CRATE_VERSION,
+                    target.display()
+                );
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&temp_path);
@@ -1049,13 +1112,22 @@ mod tests {
 
         // Verify bridge_shim.py content matches
         let content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(content, BRIDGE_SHIM_SOURCE, "Content should match embedded source");
+        assert_eq!(
+            content, BRIDGE_SHIM_SOURCE,
+            "Content should match embedded source"
+        );
 
         // Verify casparian_types.py also exists alongside
         let types_path = path.parent().unwrap().join("casparian_types.py");
-        assert!(types_path.exists(), "casparian_types.py should exist alongside bridge_shim.py");
+        assert!(
+            types_path.exists(),
+            "casparian_types.py should exist alongside bridge_shim.py"
+        );
         let types_content = std::fs::read_to_string(&types_path).unwrap();
-        assert_eq!(types_content, CASPARIAN_TYPES_SOURCE, "casparian_types content should match");
+        assert_eq!(
+            types_content, CASPARIAN_TYPES_SOURCE,
+            "casparian_types content should match"
+        );
     }
 
     #[test]
@@ -1136,7 +1208,9 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(addr).unwrap();
 
-            stream.write_all(&OUTPUT_START_SIGNAL.to_be_bytes()).unwrap();
+            stream
+                .write_all(&OUTPUT_START_SIGNAL.to_be_bytes())
+                .unwrap();
             stream.write_all(&1u32.to_be_bytes()).unwrap();
 
             let batch1 = make_int_batch();
@@ -1150,7 +1224,9 @@ mod tests {
         });
 
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
 
         let mut log_writer = JobLogWriter::new(JobId::new(1)).unwrap();
         let result = read_arrow_batches(&mut stream, JobId::new(1), &mut log_writer);
@@ -1172,7 +1248,9 @@ mod tests {
         writer.write(batch).unwrap();
         writer.finish().unwrap();
 
-        stream.write_all(&(sink.len() as u32).to_be_bytes()).unwrap();
+        stream
+            .write_all(&(sink.len() as u32).to_be_bytes())
+            .unwrap();
         stream.write_all(&sink).unwrap();
     }
 

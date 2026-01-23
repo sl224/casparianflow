@@ -17,7 +17,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{prelude::*, backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, prelude::*, Terminal};
 use std::io::stdout;
 use std::path::PathBuf;
 
@@ -52,10 +52,7 @@ pub fn run(args: TuiArgs) -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -109,9 +106,7 @@ mod tests {
 
     #[test]
     fn test_app_starts_in_home_mode() {
-        let args = TuiArgs {
-            database: None,
-        };
+        let args = TuiArgs { database: None };
         let app = App::new(args);
         assert!(matches!(app.mode, app::TuiMode::Home));
         assert!(app.running);
@@ -122,9 +117,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let args = TuiArgs {
-            database: None,
-        };
+        let args = TuiArgs { database: None };
         let app = App::new(args);
 
         terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
@@ -134,5 +127,4 @@ mod tests {
         assert!(buffer.area.width == 80);
         assert!(buffer.area.height == 24);
     }
-
 }

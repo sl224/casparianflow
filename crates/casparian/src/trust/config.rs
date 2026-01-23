@@ -260,10 +260,7 @@ mod tests {
         let config = load_trust_config(&config_path).unwrap();
         assert_eq!(config.mode, TrustMode::VaultSignedOnly);
         assert_eq!(config.allowed_signers.len(), 1);
-        assert_eq!(
-            config.allowed_signers[0].as_str(),
-            "casparian_root_2026"
-        );
+        assert_eq!(config.allowed_signers[0].as_str(), "casparian_root_2026");
         assert_eq!(config.keys.len(), 1);
         assert_eq!(
             config

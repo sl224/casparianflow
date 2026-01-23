@@ -138,9 +138,7 @@ where
         // Track resolution order
         for solver in &solvers {
             let name = solver.column_name().to_string();
-            if solver.is_resolved()
-                && !resolution_order.iter().any(|(n, _)| n == &name)
-            {
+            if solver.is_resolved() && !resolution_order.iter().any(|(n, _)| n == &name) {
                 resolution_order.push((name, rows_processed));
             }
         }
@@ -263,11 +261,7 @@ mod tests {
             min_rows_before_termination: 100,
         };
 
-        let result = infer_types_streaming(
-            &columns,
-            rows.iter().map(|r| r.as_slice()),
-            config,
-        );
+        let result = infer_types_streaming(&columns, rows.iter().map(|r| r.as_slice()), config);
 
         // Should terminate early since Integer is resolved quickly
         assert!(result.early_termination || result.rows_processed < 1000);
@@ -286,11 +280,7 @@ mod tests {
             min_rows_before_termination: 100,
         };
 
-        let result = infer_types_streaming(
-            &columns,
-            rows.iter().map(|r| r.as_slice()),
-            config,
-        );
+        let result = infer_types_streaming(&columns, rows.iter().map(|r| r.as_slice()), config);
 
         assert_eq!(result.rows_processed, 50);
     }
@@ -332,13 +322,7 @@ mod tests {
     #[test]
     fn test_mixed_nulls() {
         let columns = vec!["nullable"];
-        let rows = vec![
-            vec![""],
-            vec!["42"],
-            vec!["null"],
-            vec!["100"],
-            vec!["NA"],
-        ];
+        let rows = vec![vec![""], vec!["42"], vec!["null"], vec!["100"], vec!["NA"]];
 
         let result = infer_types_from_rows(&columns, &rows);
 

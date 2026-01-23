@@ -56,7 +56,12 @@ pub struct AuditEntry {
 
 impl AuditEntry {
     /// Create a new audit entry for a starting call
-    pub fn new(wizard_type: WizardType, model_name: &str, input_type: &str, input_hash: &str) -> Self {
+    pub fn new(
+        wizard_type: WizardType,
+        model_name: &str,
+        input_type: &str,
+        input_hash: &str,
+    ) -> Self {
         Self {
             id: uuid::Uuid::new_v4().simple().to_string()[..16].to_string(),
             wizard_type,
@@ -142,9 +147,8 @@ impl AuditLogger {
     pub fn log(&self, entry: &AuditEntry) -> Result<()> {
         let redactions_json = serde_json::to_string(&entry.redactions)?;
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO cf_ai_audit_log (
                     id, wizard_type, model_name, input_type, input_hash,
                     input_preview, redactions_json, output_type, output_hash,
@@ -153,35 +157,32 @@ impl AuditLogger {
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
-                &[
-                    DbValue::from(entry.id.as_str()),
-                    DbValue::from(entry.wizard_type.as_str()),
-                    DbValue::from(entry.model_name.as_str()),
-                    DbValue::from(entry.input_type.as_str()),
-                    DbValue::from(entry.input_hash.as_str()),
-                    DbValue::from(entry.input_preview.clone()),
-                    DbValue::from(redactions_json),
-                    DbValue::from(entry.output_type.clone()),
-                    DbValue::from(entry.output_hash.clone()),
-                    DbValue::from(entry.output_file.clone()),
-                    DbValue::from(entry.duration_ms),
-                    DbValue::from(entry.status.as_str()),
-                    DbValue::from(entry.error_message.clone()),
-                    DbValue::from(entry.attempt_number as i64),
-                    DbValue::from(entry.created_at.timestamp_millis()),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(entry.id.as_str()),
+                DbValue::from(entry.wizard_type.as_str()),
+                DbValue::from(entry.model_name.as_str()),
+                DbValue::from(entry.input_type.as_str()),
+                DbValue::from(entry.input_hash.as_str()),
+                DbValue::from(entry.input_preview.clone()),
+                DbValue::from(redactions_json),
+                DbValue::from(entry.output_type.clone()),
+                DbValue::from(entry.output_hash.clone()),
+                DbValue::from(entry.output_file.clone()),
+                DbValue::from(entry.duration_ms),
+                DbValue::from(entry.status.as_str()),
+                DbValue::from(entry.error_message.clone()),
+                DbValue::from(entry.attempt_number as i64),
+                DbValue::from(entry.created_at.timestamp_millis()),
+            ],
+        )?;
 
         Ok(())
     }
 
     /// Query recent audit entries
     pub fn query_recent(&self, limit: usize) -> Result<Vec<AuditEntry>> {
-        let rows = self
-            .conn
-            .query_all(
-                r#"
+        let rows = self.conn.query_all(
+            r#"
                 SELECT id, wizard_type, model_name, input_type, input_hash,
                        input_preview, redactions_json, output_type, output_hash,
                        output_file, duration_ms, status, error_message,
@@ -190,9 +191,8 @@ impl AuditLogger {
                 ORDER BY created_at DESC
                 LIMIT ?
                 "#,
-                &[DbValue::from(limit as i64)],
-            )
-            ?;
+            &[DbValue::from(limit as i64)],
+        )?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -202,11 +202,13 @@ impl AuditLogger {
     }
 
     /// Query entries by wizard type
-    pub fn query_by_wizard(&self, wizard_type: WizardType, limit: usize) -> Result<Vec<AuditEntry>> {
-        let rows = self
-            .conn
-            .query_all(
-                r#"
+    pub fn query_by_wizard(
+        &self,
+        wizard_type: WizardType,
+        limit: usize,
+    ) -> Result<Vec<AuditEntry>> {
+        let rows = self.conn.query_all(
+            r#"
                 SELECT id, wizard_type, model_name, input_type, input_hash,
                        input_preview, redactions_json, output_type, output_hash,
                        output_file, duration_ms, status, error_message,
@@ -216,12 +218,11 @@ impl AuditLogger {
                 ORDER BY created_at DESC
                 LIMIT ?
                 "#,
-                &[
-                    DbValue::from(wizard_type.as_str()),
-                    DbValue::from(limit as i64),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(wizard_type.as_str()),
+                DbValue::from(limit as i64),
+            ],
+        )?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -232,10 +233,8 @@ impl AuditLogger {
 
     /// Query entries by status
     pub fn query_by_status(&self, status: AuditStatus, limit: usize) -> Result<Vec<AuditEntry>> {
-        let rows = self
-            .conn
-            .query_all(
-                r#"
+        let rows = self.conn.query_all(
+            r#"
                 SELECT id, wizard_type, model_name, input_type, input_hash,
                        input_preview, redactions_json, output_type, output_hash,
                        output_file, duration_ms, status, error_message,
@@ -245,9 +244,8 @@ impl AuditLogger {
                 ORDER BY created_at DESC
                 LIMIT ?
                 "#,
-                &[DbValue::from(status.as_str()), DbValue::from(limit as i64)],
-            )
-            ?;
+            &[DbValue::from(status.as_str()), DbValue::from(limit as i64)],
+        )?;
 
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
@@ -258,17 +256,14 @@ impl AuditLogger {
 
     /// Count entries by status
     pub fn count_by_status(&self) -> Result<Vec<(AuditStatus, i64)>> {
-        let rows = self
-            .conn
-            .query_all(
-                r#"
+        let rows = self.conn.query_all(
+            r#"
                 SELECT status, COUNT(*) as count
                 FROM cf_ai_audit_log
                 GROUP BY status
                 "#,
-                &[],
-            )
-            ?;
+            &[],
+        )?;
 
         let mut counts = Vec::new();
         for row in rows {
@@ -287,39 +282,35 @@ impl AuditLogger {
     /// and longer for errors (2x retention for errors, 3x for critical).
     pub fn cleanup_old(&self, retention_days: u32) -> Result<usize> {
         let now = Utc::now();
-        let success_cutoff = (now - chrono::Duration::days(retention_days as i64)).timestamp_millis();
-        let error_cutoff = (now - chrono::Duration::days(retention_days as i64 * 2)).timestamp_millis();
+        let success_cutoff =
+            (now - chrono::Duration::days(retention_days as i64)).timestamp_millis();
+        let error_cutoff =
+            (now - chrono::Duration::days(retention_days as i64 * 2)).timestamp_millis();
 
         // Delete old success entries
-        let result1 = self
-            .conn
-            .execute(
-                r#"
+        let result1 = self.conn.execute(
+            r#"
                 DELETE FROM cf_ai_audit_log
                 WHERE status = ? AND created_at < ?
                 "#,
-                &[
-                    DbValue::from(AuditStatus::Success.as_str()),
-                    DbValue::from(success_cutoff),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(AuditStatus::Success.as_str()),
+                DbValue::from(success_cutoff),
+            ],
+        )?;
 
         // Delete old error entries (longer retention)
-        let result2 = self
-            .conn
-            .execute(
-                r#"
+        let result2 = self.conn.execute(
+            r#"
                 DELETE FROM cf_ai_audit_log
                 WHERE status IN (?, ?) AND created_at < ?
                 "#,
-                &[
-                    DbValue::from(AuditStatus::Error.as_str()),
-                    DbValue::from(AuditStatus::Timeout.as_str()),
-                    DbValue::from(error_cutoff),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(AuditStatus::Error.as_str()),
+                DbValue::from(AuditStatus::Timeout.as_str()),
+                DbValue::from(error_cutoff),
+            ],
+        )?;
 
         Ok((result1 + result2) as usize)
     }
@@ -342,19 +333,17 @@ impl AuditLogger {
         let attempt_number: i64 = row.get_by_name("attempt_number")?;
         let created_at_millis: i64 = row.get_by_name("created_at")?;
 
-        let wizard_type = WizardType::from_str(&wizard_type_str)
-            .unwrap_or(WizardType::Pathfinder); // Fallback
+        let wizard_type = WizardType::from_str(&wizard_type_str).unwrap_or(WizardType::Pathfinder); // Fallback
 
         let redactions: Vec<String> = redactions_json
             .map(|json| serde_json::from_str(&json))
             .transpose()?
             .unwrap_or_default();
 
-        let status = AuditStatus::from_str(&status_str)
-            .unwrap_or(AuditStatus::Success); // Fallback
+        let status = AuditStatus::from_str(&status_str).unwrap_or(AuditStatus::Success); // Fallback
 
-        let created_at = chrono::DateTime::from_timestamp_millis(created_at_millis)
-            .unwrap_or_else(Utc::now);
+        let created_at =
+            chrono::DateTime::from_timestamp_millis(created_at_millis).unwrap_or_else(Utc::now);
 
         Ok(AuditEntry {
             id,
@@ -409,7 +398,6 @@ mod tests {
             )
             "#,
         )
-        
         .unwrap();
 
         (AuditLogger::new(conn), temp_dir)
@@ -443,21 +431,19 @@ mod tests {
         let (logger, _temp) = setup();
 
         // Log entries for different wizards
-        for wt in [WizardType::Pathfinder, WizardType::ParserLab, WizardType::Pathfinder] {
+        for wt in [
+            WizardType::Pathfinder,
+            WizardType::ParserLab,
+            WizardType::Pathfinder,
+        ] {
             let entry = AuditEntry::new(wt, "model", "input", "hash");
             logger.log(&entry).unwrap();
         }
 
-        let pathfinder_entries = logger
-            .query_by_wizard(WizardType::Pathfinder, 10)
-            
-            .unwrap();
+        let pathfinder_entries = logger.query_by_wizard(WizardType::Pathfinder, 10).unwrap();
         assert_eq!(pathfinder_entries.len(), 2);
 
-        let parser_entries = logger
-            .query_by_wizard(WizardType::ParserLab, 10)
-            
-            .unwrap();
+        let parser_entries = logger.query_by_wizard(WizardType::ParserLab, 10).unwrap();
         assert_eq!(parser_entries.len(), 1);
     }
 
@@ -466,14 +452,22 @@ mod tests {
         let (logger, _temp) = setup();
 
         // Log entries with different statuses
-        for status in [AuditStatus::Success, AuditStatus::Success, AuditStatus::Error] {
+        for status in [
+            AuditStatus::Success,
+            AuditStatus::Success,
+            AuditStatus::Error,
+        ] {
             let entry = AuditEntry::new(WizardType::Pathfinder, "model", "input", "hash")
                 .with_status(status);
             logger.log(&entry).unwrap();
         }
 
         let counts = logger.count_by_status().unwrap();
-        assert!(counts.iter().any(|(s, c)| *s == AuditStatus::Success && *c == 2));
-        assert!(counts.iter().any(|(s, c)| *s == AuditStatus::Error && *c == 1));
+        assert!(counts
+            .iter()
+            .any(|(s, c)| *s == AuditStatus::Success && *c == 2));
+        assert!(counts
+            .iter()
+            .any(|(s, c)| *s == AuditStatus::Error && *c == 1));
     }
 }

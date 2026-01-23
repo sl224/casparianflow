@@ -4,42 +4,73 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use casparian::tui_extraction::{
-    extract_path_archetypes, group_variant_archetypes, VariantGroup,
-};
+use casparian::tui_extraction::{extract_path_archetypes, group_variant_archetypes, VariantGroup};
 
 fn assert_group_contains(templates: &[String], expected: &[&str]) {
     for &needle in expected {
-        assert!(templates.iter().any(|t| t.contains(needle)), "missing variant: {needle}");
+        assert!(
+            templates.iter().any(|t| t.contains(needle)),
+            "missing variant: {needle}"
+        );
     }
 }
 
 fn has_group_with(expected: &[&str], groups: &[VariantGroup]) -> bool {
     groups.iter().any(|group| {
         let templates: Vec<String> = group.variants.iter().map(|v| v.template.clone()).collect();
-        expected.iter().all(|needle| templates.iter().any(|t| t.contains(needle)))
+        expected
+            .iter()
+            .all(|needle| templates.iter().any(|t| t.contains(needle)))
     })
 }
 
 fn hl7_paths() -> Vec<String> {
     let mut paths = Vec::new();
     for i in 0..24 {
-        paths.push(format!("/health/hl7/admission_in/ADT_202401{:02}_{}.hl7", (i % 28) + 1, i));
+        paths.push(format!(
+            "/health/hl7/admission_in/ADT_202401{:02}_{}.hl7",
+            (i % 28) + 1,
+            i
+        ));
     }
     for i in 0..22 {
-        paths.push(format!("/health/hl7/adm_in/ADT_202401{:02}_{}.hl7", (i % 28) + 1, i));
+        paths.push(format!(
+            "/health/hl7/adm_in/ADT_202401{:02}_{}.hl7",
+            (i % 28) + 1,
+            i
+        ));
     }
     for i in 0..20 {
-        paths.push(format!("/health/hl7/lab_in/ORU_202401{:02}_{}.hl7", (i % 28) + 1, i));
+        paths.push(format!(
+            "/health/hl7/lab_in/ORU_202401{:02}_{}.hl7",
+            (i % 28) + 1,
+            i
+        ));
     }
     for i in 0..18 {
-        paths.push(format!("/health/hl7/lab_out/ORU_2024-01-{:02}_{}.hl7", (i % 28) + 1, i));
+        paths.push(format!(
+            "/health/hl7/lab_out/ORU_2024-01-{:02}_{}.hl7",
+            (i % 28) + 1,
+            i
+        ));
     }
     for i in 0..16 {
-        paths.push(format!("/health/hl7/facility_a/inbound/ADT_{:04}{:02}{:02}_{}.hl7", 2024, 1, (i % 28) + 1, i));
+        paths.push(format!(
+            "/health/hl7/facility_a/inbound/ADT_{:04}{:02}{:02}_{}.hl7",
+            2024,
+            1,
+            (i % 28) + 1,
+            i
+        ));
     }
     for i in 0..14 {
-        paths.push(format!("/health/hl7/facility_a/in/ADT_{:04}{:02}{:02}_{}.hl7", 2024, 1, (i % 28) + 1, i));
+        paths.push(format!(
+            "/health/hl7/facility_a/in/ADT_{:04}{:02}{:02}_{}.hl7",
+            2024,
+            1,
+            (i % 28) + 1,
+            i
+        ));
     }
     paths
 }
@@ -47,22 +78,40 @@ fn hl7_paths() -> Vec<String> {
 fn defense_paths() -> Vec<String> {
     let mut paths = Vec::new();
     for i in 0..28 {
-        paths.push(format!("/defense/mission_{:03}/satA/2024/01/15/telemetry_{:04}.csv", i, i));
+        paths.push(format!(
+            "/defense/mission_{:03}/satA/2024/01/15/telemetry_{:04}.csv",
+            i, i
+        ));
     }
     for i in 0..26 {
-        paths.push(format!("/defense/msn_{:03}/satA/2024/01/15/telemetry_{:04}.csv", i, i));
+        paths.push(format!(
+            "/defense/msn_{:03}/satA/2024/01/15/telemetry_{:04}.csv",
+            i, i
+        ));
     }
     for i in 0..18 {
-        paths.push(format!("/defense/mission_{:03}/satA/2024/01/15/telemetry_{:04}.json", i, i));
+        paths.push(format!(
+            "/defense/mission_{:03}/satA/2024/01/15/telemetry_{:04}.json",
+            i, i
+        ));
     }
     for i in 0..16 {
-        paths.push(format!("/defense/patrol_{:03}/uav_01/2024/01/15/telemetry_{:04}.csv", i, i));
+        paths.push(format!(
+            "/defense/patrol_{:03}/uav_01/2024/01/15/telemetry_{:04}.csv",
+            i, i
+        ));
     }
     for i in 0..16 {
-        paths.push(format!("/defense/ptl_{:03}/uav_01/2024/01/15/telemetry_{:04}.csv", i, i));
+        paths.push(format!(
+            "/defense/ptl_{:03}/uav_01/2024/01/15/telemetry_{:04}.csv",
+            i, i
+        ));
     }
     for i in 0..12 {
-        paths.push(format!("/defense/mission_{:03}/satA/2024/01/15/imagery_{:04}.tif", i, i));
+        paths.push(format!(
+            "/defense/mission_{:03}/satA/2024/01/15/imagery_{:04}.tif",
+            i, i
+        ));
     }
     paths
 }
@@ -70,22 +119,40 @@ fn defense_paths() -> Vec<String> {
 fn finance_paths() -> Vec<String> {
     let mut paths = Vec::new();
     for i in 1..=20 {
-        paths.push(format!("/finance/netsuite/exports/2024/01/fin_export_202401{:02}.csv", i));
+        paths.push(format!(
+            "/finance/netsuite/exports/2024/01/fin_export_202401{:02}.csv",
+            i
+        ));
     }
     for i in 1..=18 {
-        paths.push(format!("/finance/ns/exports/2024/01/fin_export_202401{:02}.xlsx", i));
+        paths.push(format!(
+            "/finance/ns/exports/2024/01/fin_export_202401{:02}.xlsx",
+            i
+        ));
     }
     for i in 1..=16 {
-        paths.push(format!("/finance/saved_search/ap_aging/2024/01/transactions_202401{:02}.csv", i));
+        paths.push(format!(
+            "/finance/saved_search/ap_aging/2024/01/transactions_202401{:02}.csv",
+            i
+        ));
     }
     for i in 1..=16 {
-        paths.push(format!("/finance/saved_search/ap_age/2024/01/transactions_202401{:02}.xlsx", i));
+        paths.push(format!(
+            "/finance/saved_search/ap_age/2024/01/transactions_202401{:02}.xlsx",
+            i
+        ));
     }
     for i in 1..=12 {
-        paths.push(format!("/finance/payroll/exports/2024/01/payroll_202401{:02}.csv", i));
+        paths.push(format!(
+            "/finance/payroll/exports/2024/01/payroll_202401{:02}.csv",
+            i
+        ));
     }
     for i in 1..=10 {
-        paths.push(format!("/finance/gl/exports/2024/01/general_ledger_202401{:02}.csv", i));
+        paths.push(format!(
+            "/finance/gl/exports/2024/01/general_ledger_202401{:02}.csv",
+            i
+        ));
     }
     paths
 }
@@ -106,7 +173,11 @@ fn write_tree_dump(label: &str, paths: &[String]) {
     let _ = fs::write(&file_path, output);
 }
 
-fn write_debug_dump(label: &str, archetypes: &[casparian::tui_extraction::PathArchetype], groups: &[VariantGroup]) {
+fn write_debug_dump(
+    label: &str,
+    archetypes: &[casparian::tui_extraction::PathArchetype],
+    groups: &[VariantGroup],
+) {
     let dump_dir = PathBuf::from("output/variant_grouping_fixtures");
     let _ = fs::create_dir_all(&dump_dir);
     let file_path = dump_dir.join(format!("{label}.debug.txt"));
@@ -162,7 +233,11 @@ impl TreeNode {
             output.push_str(branch);
             output.push_str(name);
             output.push('\n');
-            let next_prefix = if is_last { format!("{prefix}    ") } else { format!("{prefix}│   ") };
+            let next_prefix = if is_last {
+                format!("{prefix}    ")
+            } else {
+                format!("{prefix}│   ")
+            };
             child.render(output, &next_prefix);
         }
     }
@@ -182,7 +257,10 @@ fn variant_grouping_healthcare_hl7() {
     }
     let elapsed = start.elapsed();
 
-    assert!(elapsed < Duration::from_millis(300), "hl7 grouping too slow: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "hl7 grouping too slow: {elapsed:?}"
+    );
     assert!(has_group_with(&["admission_in", "adm_in"], &groups));
     assert!(has_group_with(&["inbound", "in"], &groups));
     assert!(!has_group_with(&["admission_in", "lab_in"], &groups));
@@ -202,7 +280,10 @@ fn variant_grouping_defense_telemetry() {
     }
     let elapsed = start.elapsed();
 
-    assert!(elapsed < Duration::from_millis(300), "defense grouping too slow: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "defense grouping too slow: {elapsed:?}"
+    );
     assert!(has_group_with(&["mission_<n>", "msn_<n>"], &groups));
     assert!(has_group_with(&["patrol_<n>", "ptl_<n>"], &groups));
 }
@@ -221,7 +302,10 @@ fn variant_grouping_finance_exports() {
     }
     let elapsed = start.elapsed();
 
-    assert!(elapsed < Duration::from_millis(300), "finance grouping too slow: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "finance grouping too slow: {elapsed:?}"
+    );
     assert!(has_group_with(&["netsuite", "ns"], &groups));
     assert!(has_group_with(&["ap_aging", "ap_age"], &groups));
 }
@@ -244,7 +328,25 @@ fn variant_grouping_real_world_summary() {
     }
     let elapsed = start.elapsed();
 
-    assert!(elapsed < Duration::from_millis(400), "combined grouping too slow: {elapsed:?}");
-    let templates: Vec<String> = groups.iter().flat_map(|g| g.variants.iter().map(|v| v.template.clone())).collect();
-    assert_group_contains(&templates, &["admission_in", "adm_in", "mission_<n>", "msn_<n>", "netsuite", "ns", "ap_aging", "ap_age"]);
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "combined grouping too slow: {elapsed:?}"
+    );
+    let templates: Vec<String> = groups
+        .iter()
+        .flat_map(|g| g.variants.iter().map(|v| v.template.clone()))
+        .collect();
+    assert_group_contains(
+        &templates,
+        &[
+            "admission_in",
+            "adm_in",
+            "mission_<n>",
+            "msn_<n>",
+            "netsuite",
+            "ns",
+            "ap_aging",
+            "ap_age",
+        ],
+    );
 }

@@ -2,9 +2,9 @@
 //!
 //! Tests the complete control plane: worker registration, job dispatch, and ZMQ communication.
 
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::types::{IdentifyPayload, JobReceipt, JobStatus};
 use casparian_protocol::{JobId, Message, OpCode, PipelineRunStatus, ProcessingStatus};
-use casparian_db::{DbConnection, DbValue};
 use std::time::Duration;
 use zmq::Context;
 
@@ -30,7 +30,6 @@ fn setup_queue_db() -> DbConnection {
         "#,
         &[],
     )
-    
     .unwrap();
     conn.execute(
         r#"
@@ -41,7 +40,6 @@ fn setup_queue_db() -> DbConnection {
         "#,
         &[],
     )
-    
     .unwrap();
     conn
 }
@@ -131,11 +129,20 @@ fn test_worker_sentinel_exchange() {
 
     println!("Received {} parts", parts.len());
     for (i, part) in parts.iter().enumerate() {
-        println!("  Part {}: {} bytes, first byte: {:02x}", i, part.len(), part.get(0).unwrap_or(&0));
+        println!(
+            "  Part {}: {} bytes, first byte: {:02x}",
+            i,
+            part.len(),
+            part.get(0).unwrap_or(&0)
+        );
     }
 
     // ROUTER format: [identity, header, payload]
-    assert!(parts.len() >= 3, "Expected at least 3 parts, got {}", parts.len());
+    assert!(
+        parts.len() >= 3,
+        "Expected at least 3 parts, got {}",
+        parts.len()
+    );
 
     let _identity = &parts[0];
     let mut cursor = 1;
@@ -172,7 +179,6 @@ fn test_job_queue_operations() {
         "#,
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    
     .unwrap();
 
     // Pop job
@@ -185,7 +191,9 @@ fn test_job_queue_operations() {
 
     // Complete job with SUCCESS completion_status using enum helper
     use casparian_protocol::types::JobStatus as ProtocolJobStatus;
-    queue.complete_job(job.id, ProtocolJobStatus::Success.as_str(), "Success", None).unwrap();
+    queue
+        .complete_job(job.id, ProtocolJobStatus::Success.as_str(), "Success", None)
+        .unwrap();
 
     // Verify completed with completion_status
     let row = conn
@@ -193,14 +201,16 @@ fn test_job_queue_operations() {
             "SELECT status, completion_status FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job.id)],
         )
-        
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
     let completion_status: Option<String> = row.get_by_name("completion_status").unwrap();
 
     assert_eq!(status, ProcessingStatus::Completed.as_str());
-    assert_eq!(completion_status, Some(ProtocolJobStatus::Success.as_str().to_string()));
+    assert_eq!(
+        completion_status,
+        Some(ProtocolJobStatus::Success.as_str().to_string())
+    );
 }
 
 /// Test job details lookup via scout_files
@@ -215,14 +225,13 @@ fn test_job_details_uses_scout_files() {
         "INSERT INTO scout_files (id, path) VALUES (1, '/data/demo/sample.csv')",
         &[],
     )
-    
     .unwrap();
 
     conn.execute(
         "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'demo', ?)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    
+
     .unwrap();
 
     let details = queue.get_job_details(1).unwrap().unwrap();
@@ -242,14 +251,13 @@ fn test_pipeline_run_status_updates() {
         "INSERT INTO cf_pipeline_runs (id, pipeline_id, selection_spec_id, selection_snapshot_hash, logical_date, status) VALUES ('run-1', 'pipe-1', 'spec-1', 'hash-1', '2025-01-01', ?)",
         &[DbValue::from(PipelineRunStatus::Queued.as_str())],
     )
-    
+
     .unwrap();
 
     conn.execute(
         "INSERT INTO scout_files (id, path) VALUES (1, '/data/demo/a.csv')",
         &[],
     )
-    
     .unwrap();
 
     conn.execute(
@@ -259,7 +267,7 @@ fn test_pipeline_run_status_updates() {
         "#,
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    
+
     .unwrap();
 
     let job = queue.pop_job().unwrap().unwrap();
@@ -269,11 +277,12 @@ fn test_pipeline_run_status_updates() {
         "UPDATE cf_pipeline_runs SET status = ?, started_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
         &[DbValue::from(PipelineRunStatus::Running.as_str())],
     )
-    
     .unwrap();
 
     use casparian_protocol::types::JobStatus as ProtocolJobStatus;
-    queue.complete_job(job.id, ProtocolJobStatus::Success.as_str(), "Success", None).unwrap();
+    queue
+        .complete_job(job.id, ProtocolJobStatus::Success.as_str(), "Success", None)
+        .unwrap();
 
     let row = conn
         .query_one(
@@ -286,7 +295,7 @@ fn test_pipeline_run_status_updates() {
                 DbValue::from("run-1"),
             ],
         )
-        
+
         .unwrap();
     let active: i64 = row.get_by_name("active").unwrap_or(0);
     let failed: i64 = row.get_by_name("failed").unwrap_or(0);
@@ -297,27 +306,28 @@ fn test_pipeline_run_status_updates() {
             "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
             &[DbValue::from(PipelineRunStatus::Failed.as_str())],
         )
-        
+
         .unwrap();
     } else if active > 0 {
         conn.execute(
             "UPDATE cf_pipeline_runs SET status = ? WHERE id = 'run-1'",
             &[DbValue::from(PipelineRunStatus::Running.as_str())],
         )
-        
         .unwrap();
     } else if completed > 0 {
         conn.execute(
             "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
             &[DbValue::from(PipelineRunStatus::Completed.as_str())],
         )
-        
+
         .unwrap();
     }
 
     let status_row = conn
-        .query_one("SELECT status FROM cf_pipeline_runs WHERE id = 'run-1'", &[])
-        
+        .query_one(
+            "SELECT status FROM cf_pipeline_runs WHERE id = 'run-1'",
+            &[],
+        )
         .unwrap();
     let status: String = status_row.get_by_name("status").unwrap();
     assert_eq!(status, PipelineRunStatus::Completed.as_str());
@@ -344,7 +354,6 @@ fn test_job_priority_ordering() {
         ),
         &[],
     )
-    
     .unwrap();
 
     let queue = JobQueue::new(conn);
@@ -382,7 +391,7 @@ fn test_job_failure_marks_status_and_error() {
         "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'test', ?)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    
+
     .unwrap();
 
     let queue = JobQueue::new(conn.clone());
@@ -390,7 +399,13 @@ fn test_job_failure_marks_status_and_error() {
 
     // Fail the job with an error message using enum helper
     use casparian_protocol::types::JobStatus as ProtocolJobStatus;
-    queue.fail_job(job.id, ProtocolJobStatus::Failed.as_str(), "Parser crashed: division by zero").unwrap();
+    queue
+        .fail_job(
+            job.id,
+            ProtocolJobStatus::Failed.as_str(),
+            "Parser crashed: division by zero",
+        )
+        .unwrap();
 
     // Verify status, completion_status, and error message
     let row = conn
@@ -398,7 +413,6 @@ fn test_job_failure_marks_status_and_error() {
             "SELECT status, completion_status, error_message FROM cf_processing_queue WHERE id = ?",
             &[DbValue::from(job.id)],
         )
-        
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
@@ -406,7 +420,10 @@ fn test_job_failure_marks_status_and_error() {
     let error: Option<String> = row.get_by_name("error_message").ok();
 
     assert_eq!(status, ProcessingStatus::Failed.as_str());
-    assert_eq!(completion_status, Some(ProtocolJobStatus::Failed.as_str().to_string()));
+    assert_eq!(
+        completion_status,
+        Some(ProtocolJobStatus::Failed.as_str().to_string())
+    );
     assert_eq!(error, Some("Parser crashed: division by zero".to_string()));
 }
 
@@ -420,7 +437,7 @@ fn test_job_requeue_increments_retry_count() {
         "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', ?, 0)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    
+
     .unwrap();
 
     let queue = JobQueue::new(conn.clone());
@@ -435,12 +452,15 @@ fn test_job_requeue_increments_retry_count() {
                 "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
                 &[DbValue::from(job.id)],
             )
-            
             .unwrap()
             .unwrap();
         let retry_count: i32 = row.get_by_name("retry_count").unwrap();
 
-        assert_eq!(retry_count, expected_retry, "Retry count should be {}", expected_retry);
+        assert_eq!(
+            retry_count, expected_retry,
+            "Retry count should be {}",
+            expected_retry
+        );
     }
 }
 
@@ -455,7 +475,7 @@ fn test_job_exceeds_max_retries_marked_failed() {
         "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', ?, 3)",
         &[DbValue::from(ProcessingStatus::Running.as_str())],
     )
-    
+
     .unwrap();
 
     let queue = JobQueue::new(conn.clone());
@@ -465,11 +485,7 @@ fn test_job_exceeds_max_retries_marked_failed() {
 
     // Check that job is now FAILED, not QUEUED
     let row = conn
-        .query_optional(
-            "SELECT status FROM cf_processing_queue WHERE id = 1",
-            &[],
-        )
-        
+        .query_optional("SELECT status FROM cf_processing_queue WHERE id = 1", &[])
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
@@ -499,7 +515,7 @@ fn test_concurrent_job_claim_only_one_wins() {
         "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'contested_job', ?)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
-    
+
     .unwrap();
 
     let queue = JobQueue::new(conn);
@@ -534,7 +550,7 @@ fn test_multiple_jobs_claimed_sequentially() {
                 DbValue::from(ProcessingStatus::Queued.as_str()),
             ],
         )
-        
+
         .unwrap();
     }
 
@@ -542,7 +558,8 @@ fn test_multiple_jobs_claimed_sequentially() {
 
     // Claim all 10 jobs sequentially
     let mut claimed_ids: Vec<i64> = vec![];
-    for _ in 0..15 {  // Try more times than jobs exist
+    for _ in 0..15 {
+        // Try more times than jobs exist
         if let Some(job) = queue.pop_job().unwrap() {
             claimed_ids.push(job.id);
         }
@@ -557,7 +574,10 @@ fn test_multiple_jobs_claimed_sequentially() {
 
     // Another pop should get nothing
     let extra = queue.pop_job().unwrap();
-    assert!(extra.is_none(), "Queue should be empty after claiming all jobs");
+    assert!(
+        extra.is_none(),
+        "Queue should be empty after claiming all jobs"
+    );
 }
 
 // ============================================================================
@@ -579,7 +599,7 @@ fn test_stale_running_jobs_can_be_recovered() {
             DbValue::from(stale_time.to_rfc3339()),
         ],
     )
-    
+
     .unwrap();
 
     // Query for stale jobs (running for more than 10 minutes with no heartbeat)
@@ -592,7 +612,6 @@ fn test_stale_running_jobs_can_be_recovered() {
                 DbValue::from(stale_threshold.to_rfc3339()),
             ],
         )
-        
         .unwrap();
     let mut stale_jobs = Vec::new();
     for row in stale_rows {
@@ -612,16 +631,12 @@ fn test_stale_running_jobs_can_be_recovered() {
             DbValue::from(stale_jobs[0].0),
         ],
     )
-    
+
     .unwrap();
 
     // Verify it's now available
     let row = conn
-        .query_optional(
-            "SELECT status FROM cf_processing_queue WHERE id = 1",
-            &[],
-        )
-        
+        .query_optional("SELECT status FROM cf_processing_queue WHERE id = 1", &[])
         .unwrap()
         .unwrap();
     let status: String = row.get_by_name("status").unwrap();
@@ -684,7 +699,6 @@ fn test_only_queued_jobs_are_dispatched() {
         ),
         &[],
     )
-    
     .unwrap();
 
     let queue = JobQueue::new(conn);
@@ -837,7 +851,9 @@ fn test_error_message_carries_full_info() {
 
     let error = ErrorPayload {
         message: "Parser failed: invalid CSV format".to_string(),
-        traceback: Some("File parser.py, line 42\n  raise ValueError\nValueError: bad row".to_string()),
+        traceback: Some(
+            "File parser.py, line 42\n  raise ValueError\nValueError: bad row".to_string(),
+        ),
     };
 
     let payload = serde_json::to_vec(&error).unwrap();

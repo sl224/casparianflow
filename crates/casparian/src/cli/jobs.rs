@@ -125,9 +125,15 @@ fn run_with_db(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
 
     if args.json {
         let (jobs, dead_letter) = if args.dead_letter {
-            (Vec::new(), get_dead_letter_jobs(&conn, &args.topic, args.limit)?)
+            (
+                Vec::new(),
+                get_dead_letter_jobs(&conn, &args.topic, args.limit)?,
+            )
         } else {
-            (get_jobs(&conn, &args.topic, &status_filter, args.limit)?, Vec::new())
+            (
+                get_jobs(&conn, &args.topic, &status_filter, args.limit)?,
+                Vec::new(),
+            )
         };
 
         let output = JobsOutput {
@@ -210,12 +216,10 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
 /// Get queue statistics
 
 pub(crate) fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
-    let row = conn
-        .query_optional(
-            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
-            &[DbValue::from(table)],
-        )
-        ?;
+    let row = conn.query_optional(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+        &[DbValue::from(table)],
+    )?;
     Ok(row.is_some())
 }
 
@@ -238,10 +242,9 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
         return Ok(QueueStats::default());
     }
 
-    let row = conn
-        .query_one(
-            &format!(
-                r#"
+    let row = conn.query_one(
+        &format!(
+            r#"
         SELECT
             COUNT(*) as total,
             COALESCE(SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END), 0) as queued,
@@ -250,14 +253,13 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
             COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed
         FROM cf_processing_queue
         "#,
-                queued = ProcessingStatus::Queued.as_str(),
-                running = ProcessingStatus::Running.as_str(),
-                completed = ProcessingStatus::Completed.as_str(),
-                failed = ProcessingStatus::Failed.as_str(),
-            ),
-            &[],
-        )
-        ?;
+            queued = ProcessingStatus::Queued.as_str(),
+            running = ProcessingStatus::Running.as_str(),
+            completed = ProcessingStatus::Completed.as_str(),
+            failed = ProcessingStatus::Failed.as_str(),
+        ),
+        &[],
+    )?;
 
     let total: i64 = row.get(0)?;
     let queued: i64 = row.get(1)?;
@@ -267,7 +269,6 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
 
     let dead_letter_count = if table_exists(conn, "cf_dead_letter")? {
         conn.query_scalar::<i64>("SELECT COUNT(*) FROM cf_dead_letter", &[])
-            
             .unwrap_or(0)
     } else {
         0
@@ -320,8 +321,9 @@ fn get_dead_letter_jobs(
         .map(|row| -> anyhow::Result<DeadLetterJobDisplay> {
             let id = row.get(0)?;
             let raw_job_id: i64 = row.get(1)?;
-            let original_job_id = JobId::try_from(raw_job_id)
-                .map_err(|err| anyhow::anyhow!("Invalid job id {} in dead letter: {}", raw_job_id, err))?;
+            let original_job_id = JobId::try_from(raw_job_id).map_err(|err| {
+                anyhow::anyhow!("Invalid job id {} in dead letter: {}", raw_job_id, err)
+            })?;
             Ok(DeadLetterJobDisplay {
                 id,
                 original_job_id,
@@ -348,8 +350,7 @@ fn get_jobs(
         return Ok(Vec::new());
     }
 
-    let has_quarantine_column =
-        column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
+    let has_quarantine_column = column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
     let has_quarantine_table = table_exists(conn, "cf_quarantine")?;
     let quarantine_select = if has_quarantine_column {
         ", COALESCE(q.quarantine_rows, 0) as quarantine_rows"
@@ -447,8 +448,9 @@ fn get_jobs(
             let id = JobId::try_from(raw_id)
                 .map_err(|err| anyhow::anyhow!("Invalid job id {} in queue: {}", raw_id, err))?;
             let status_str: String = row.get(3)?;
-            let status = status_str.parse::<ProcessingStatus>()
-                .map_err(|e| anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e))?;
+            let status = status_str.parse::<ProcessingStatus>().map_err(|e| {
+                anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e)
+            })?;
             Ok(Job {
                 id,
                 file_path: row.get(1)?,
@@ -460,11 +462,13 @@ fn get_jobs(
                 error_message: row.get::<Option<String>>(7).ok().flatten(),
                 result_summary: row.get::<Option<String>>(8).ok().flatten(),
                 retry_count: row.get(9)?,
-                quarantine_rows: row
-                    .get::<Option<i64>>(10)
-                    .ok()
-                    .flatten()
-                    .and_then(|value| if value > 0 { Some(value) } else { None }),
+                quarantine_rows: row.get::<Option<i64>>(10).ok().flatten().and_then(|value| {
+                    if value > 0 {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                }),
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -475,13 +479,22 @@ fn get_jobs(
 /// Print queue status summary
 fn print_queue_status(stats: &QueueStats) {
     println!("QUEUE STATUS");
-    println!("  Total:       {:>6} jobs", format_number_signed(stats.total));
+    println!(
+        "  Total:       {:>6} jobs",
+        format_number_signed(stats.total)
+    );
     println!("  Pending:     {:>6}", format_number_signed(stats.queued));
     println!("  Running:     {:>6}", format_number_signed(stats.running));
-    println!("  Done:        {:>6}", format_number_signed(stats.completed));
+    println!(
+        "  Done:        {:>6}",
+        format_number_signed(stats.completed)
+    );
     println!("  Failed:      {:>6}", format_number_signed(stats.failed));
     if stats.dead_letter > 0 {
-        println!("  Dead Letter: {:>6}", format_number_signed(stats.dead_letter));
+        println!(
+            "  Dead Letter: {:>6}",
+            format_number_signed(stats.dead_letter)
+        );
     }
 }
 
@@ -494,7 +507,9 @@ fn print_jobs_table(jobs: &[Job], limit: usize) {
 
     println!("JOBS (last {})", limit.min(jobs.len()));
 
-    let headers = &["ID", "FILE", "TOPIC", "STATUS", "QUAR", "STARTED", "DURATION"];
+    let headers = &[
+        "ID", "FILE", "TOPIC", "STATUS", "QUAR", "STARTED", "DURATION",
+    ];
 
     let rows: Vec<Vec<(String, Option<Color>)>> = jobs
         .iter()
@@ -506,7 +521,9 @@ fn print_jobs_table(jobs: &[Job], limit: usize) {
             let duration = calculate_duration(&job.claim_time, &job.end_time);
 
             // Format start time
-            let started = job.claim_time.as_ref()
+            let started = job
+                .claim_time
+                .as_ref()
                 .map(|t| format_datetime(t))
                 .unwrap_or_else(|| "-".to_string());
             let quarantine_display = job
@@ -522,7 +539,10 @@ fn print_jobs_table(jobs: &[Job], limit: usize) {
                 (job.id.to_string(), None),
                 (file_display, None),
                 (job.plugin_name.clone(), None),
-                (job.status.as_str().to_string(), Some(status_color(job.status))),
+                (
+                    job.status.as_str().to_string(),
+                    Some(status_color(job.status)),
+                ),
                 (quarantine_display, quarantine_color),
                 (started, None),
                 (duration, None),
@@ -554,7 +574,9 @@ fn print_dead_letter_table(jobs: &[DeadLetterJobDisplay], limit: usize) {
             let moved_at = format_datetime(&job.moved_at);
 
             // Truncate reason for display
-            let reason = job.reason.as_ref()
+            let reason = job
+                .reason
+                .as_ref()
                 .map(|r| truncate_string(r, 30))
                 .unwrap_or_else(|| "-".to_string());
 
@@ -598,7 +620,10 @@ fn truncate_path(path: &str, max_len: usize) -> String {
 
         if filename.len() >= max_len - 4 {
             // Filename itself is too long
-            return format!("...{}", &filename[filename.len().saturating_sub(max_len - 3)..]);
+            return format!(
+                "...{}",
+                &filename[filename.len().saturating_sub(max_len - 3)..]
+            );
         }
 
         let available = max_len - filename.len() - 4; // 4 for ".../""
@@ -716,7 +741,11 @@ mod tests {
         assert_eq!(truncate_path("short.txt", 40), "short.txt");
         // Path is 35 chars, with max 25: keeps filename (8) + ".../X/" prefix
         let truncated = truncate_path("/a/very/long/path/to/some/file.csv", 25);
-        assert!(truncated.len() <= 25, "Truncated path too long: {}", truncated);
+        assert!(
+            truncated.len() <= 25,
+            "Truncated path too long: {}",
+            truncated
+        );
         assert!(truncated.ends_with("file.csv"), "Should preserve filename");
         assert!(truncated.starts_with("..."), "Should start with ellipsis");
     }

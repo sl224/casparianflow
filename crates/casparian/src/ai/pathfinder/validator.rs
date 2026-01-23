@@ -63,7 +63,7 @@ impl PythonValidator {
                 "eval(",
                 "exec(",
                 "compile(",
-                "open(",      // Allow only with context manager
+                "open(", // Allow only with context manager
                 "__import__(",
                 "globals(",
                 "locals(",
@@ -164,9 +164,9 @@ except SyntaxError as e:
             if code.contains(forbidden) {
                 // Special case: allow open() with 'with' statement
                 if *forbidden == "open(" {
-                    let has_safe_open = code.lines().any(|line| {
-                        line.trim().starts_with("with") && line.contains("open(")
-                    });
+                    let has_safe_open = code
+                        .lines()
+                        .any(|line| line.trim().starts_with("with") && line.contains("open("));
                     if !has_safe_open {
                         warnings.push(format!(
                             "Potentially unsafe call: {} - use 'with' statement for file operations",
@@ -257,7 +257,10 @@ except SyntaxError as e:
     ) {
         // Check for expected imports
         let has_re = structure.imports.iter().any(|i| i.contains("re"));
-        let has_pathlib = structure.imports.iter().any(|i| i.contains("pathlib") || i.contains("Path"));
+        let has_pathlib = structure
+            .imports
+            .iter()
+            .any(|i| i.contains("pathlib") || i.contains("Path"));
 
         if !has_re && !has_pathlib {
             warnings.push("Consider importing 're' or 'pathlib' for path extraction".to_string());

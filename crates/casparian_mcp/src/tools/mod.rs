@@ -20,29 +20,39 @@
 mod registry;
 
 // Tool implementations
+mod approval;
+mod backtest;
+mod job;
 mod plugins;
-mod scan;
 mod preview;
 mod query;
-mod backtest;
 mod run;
-mod job;
-mod approval;
+mod scan;
+
+// Intent pipeline tools (§7.1-7.9)
+mod intent_backtest;
+mod intent_fileset;
+mod intent_path_fields;
+mod intent_publish;
+mod intent_schema;
+mod intent_select;
+mod intent_session;
+mod intent_tags;
 
 pub use registry::ToolRegistry;
 
-use crate::approvals::ApprovalManager;
-use crate::jobs::JobManager;
+use crate::core::CoreHandle;
+use crate::jobs::JobExecutorHandle;
 use crate::protocol::ToolDefinition;
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
 use anyhow::Result;
 use serde_json::Value;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// Trait for MCP tools
-#[async_trait::async_trait]
+///
+/// All tool execution is synchronous. Tools receive a `CoreHandle` for
+/// state operations via message passing to the Core thread.
 pub trait McpTool: Send + Sync {
     /// Tool name (e.g., "casparian_scan")
     fn name(&self) -> &'static str;
@@ -53,14 +63,17 @@ pub trait McpTool: Send + Sync {
     /// JSON Schema for input parameters
     fn input_schema(&self) -> Value;
 
-    /// Execute the tool
-    async fn execute(
+    /// Execute the tool (synchronous)
+    ///
+    /// Tools receive a `CoreHandle` for all state operations (jobs, approvals).
+    /// State changes flow through the Core via message passing.
+    fn execute(
         &self,
         args: Value,
         security: &SecurityConfig,
-        jobs: &Arc<Mutex<JobManager>>,
-        approvals: &Arc<Mutex<ApprovalManager>>,
+        core: &CoreHandle,
         config: &McpServerConfig,
+        executor: &JobExecutorHandle,
     ) -> Result<Value>;
 
     /// Get the tool definition for tools/list

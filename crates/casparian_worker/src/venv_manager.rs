@@ -260,7 +260,9 @@ impl VenvManager {
         }
 
         // Remove from metadata
-        metadata.entries.retain(|e| !to_remove.contains(&e.env_hash));
+        metadata
+            .entries
+            .retain(|e| !to_remove.contains(&e.env_hash));
 
         // Release lock before I/O operations
         drop(metadata);

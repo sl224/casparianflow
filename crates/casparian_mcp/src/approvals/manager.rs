@@ -1,222 +1,277 @@
 //! Approval Manager - Approval Lifecycle Management
 //!
-//! Manages approval request creation, status tracking, and cleanup.
+//! DB-backed approval manager using casparian_sentinel::ApiStorage.
 
-use super::{
-    ApprovalId, ApprovalOperation, ApprovalRequest, ApprovalStatus, ApprovalStore,
-    APPROVAL_TTL_DAYS,
-};
+use super::{ApprovalId, ApprovalOperation, ApprovalRequest, ApprovalStatus, APPROVAL_TTL_DAYS};
 use crate::types::ApprovalSummary;
 use anyhow::{Context, Result};
+use casparian_db::DbConnection;
+use casparian_protocol::{
+    Approval as ProtocolApproval, ApprovalOperation as ProtocolApprovalOperation,
+    ApprovalStatus as ProtocolApprovalStatus, JobId as ProtocolJobId,
+};
+use casparian_sentinel::ApiStorage;
 use chrono::Utc;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
 
-/// Approval manager for tracking approval requests
+/// Approval manager for tracking approval requests (DB-backed, no cache)
 pub struct ApprovalManager {
-    /// Approval store for persistence
-    store: ApprovalStore,
-
-    /// In-memory approval cache
-    approvals: HashMap<ApprovalId, ApprovalRequest>,
+    db_path: PathBuf,
 }
 
 impl ApprovalManager {
-    /// Create a new approval manager
-    pub fn new(approvals_dir: PathBuf) -> Result<Self> {
-        let store = ApprovalStore::new(approvals_dir)?;
-
-        // Load existing approvals from store
-        let approvals = store.load_all()?;
-        let mut approvals_map: HashMap<ApprovalId, ApprovalRequest> =
-            approvals.into_iter().map(|a| (a.approval_id.clone(), a)).collect();
-
-        // Auto-expire any pending approvals that have passed their expiry time
-        let now = Utc::now();
-        for approval in approvals_map.values_mut() {
-            if matches!(approval.status, ApprovalStatus::Pending) && approval.expires_at < now {
-                approval.mark_expired();
-            }
-        }
-
-        Ok(Self {
-            store,
-            approvals: approvals_map,
-        })
+    /// Create a new approval manager backed by DuckDB at the given path.
+    pub fn new(db_path: PathBuf) -> Result<Self> {
+        let conn = DbConnection::open_duckdb(&db_path)
+            .with_context(|| format!("Failed to open DB at {}", db_path.display()))?;
+        let storage = ApiStorage::new(conn);
+        storage.init_schema().context("Failed to init schema")?;
+        Ok(Self { db_path })
     }
 
-    /// Create a new approval request
+    fn storage(&self) -> Result<ApiStorage> {
+        let conn = DbConnection::open_duckdb(&self.db_path)
+            .with_context(|| format!("Failed to open DB at {}", self.db_path.display()))?;
+        let storage = ApiStorage::new(conn);
+        storage.init_schema().context("Failed to init schema")?;
+        Ok(storage)
+    }
+
+    /// Create a new approval request.
     pub fn create_approval(
-        &mut self,
+        &self,
         operation: ApprovalOperation,
         summary: ApprovalSummary,
     ) -> Result<ApprovalRequest> {
         let approval = ApprovalRequest::new(operation, summary);
-        self.store.save(&approval)?;
-        self.approvals.insert(approval.approval_id.clone(), approval.clone());
+        let protocol_op = to_protocol_operation(&approval.operation);
+        let expires_in = approval.expires_at.signed_duration_since(Utc::now());
 
-        info!(
-            "Created approval request: {} ({})",
-            approval.approval_id,
-            approval.operation.description()
-        );
+        let storage = self.storage()?;
+        storage.create_approval(
+            approval.approval_id.as_ref(),
+            &protocol_op,
+            &approval.summary.description,
+            expires_in,
+        )?;
 
         Ok(approval)
     }
 
-    /// Get an approval by ID
-    pub fn get_approval(&self, id: &ApprovalId) -> Option<&ApprovalRequest> {
-        self.approvals.get(id)
+    /// Get an approval by ID.
+    pub fn get_approval(&self, id: &ApprovalId) -> Result<Option<ApprovalRequest>> {
+        let storage = self.storage()?;
+        let approval = storage.get_approval(id.as_ref())?;
+        approval.map(from_protocol_approval).transpose()
     }
 
-    /// Get a mutable reference to an approval
-    pub fn get_approval_mut(&mut self, id: &ApprovalId) -> Option<&mut ApprovalRequest> {
-        self.approvals.get_mut(id)
+    /// Approve an approval request.
+    pub fn approve(&self, id: &ApprovalId) -> Result<bool> {
+        let storage = self.storage()?;
+        storage.approve(id.as_ref(), None)
     }
 
-    /// Approve an approval request
-    pub fn approve(&mut self, id: &ApprovalId) -> Result<bool> {
-        let approval = match self.approvals.get_mut(id) {
-            Some(a) => a,
-            None => return Ok(false),
+    /// Reject an approval request.
+    pub fn reject(&self, id: &ApprovalId, reason: Option<String>) -> Result<bool> {
+        let storage = self.storage()?;
+        storage.reject(id.as_ref(), None, reason.as_deref())
+    }
+
+    /// Set the job ID after approval is processed.
+    pub fn set_job_id(&self, approval_id: &ApprovalId, job_id: String) -> Result<()> {
+        let parsed: ProtocolJobId = job_id
+            .parse()
+            .with_context(|| format!("Invalid job_id: {}", job_id))?;
+        let storage = self.storage()?;
+        storage.link_approval_to_job(approval_id.as_ref(), parsed)
+    }
+
+    /// List approvals with optional status filter.
+    pub fn list_approvals(&self, status_filter: Option<&str>) -> Result<Vec<ApprovalRequest>> {
+        let status = match status_filter {
+            None => None,
+            Some("pending") => Some(ProtocolApprovalStatus::Pending),
+            Some("approved") => Some(ProtocolApprovalStatus::Approved),
+            Some("rejected") => Some(ProtocolApprovalStatus::Rejected),
+            Some("expired") => Some(ProtocolApprovalStatus::Expired),
+            Some(other) => anyhow::bail!("Unknown approval status filter: {}", other),
         };
 
-        // Check if already expired
-        if approval.is_expired() {
-            approval.mark_expired();
-            self.store.save(approval)?;
-            return Ok(false);
-        }
-
-        if !matches!(approval.status, ApprovalStatus::Pending) {
-            return Ok(false);
-        }
-
-        approval.approve();
-        self.store.save(approval)?;
-
-        info!("Approved request: {}", id);
-        Ok(true)
+        let storage = self.storage()?;
+        let approvals = storage.list_approvals(status)?;
+        approvals.into_iter().map(from_protocol_approval).collect()
     }
 
-    /// Reject an approval request
-    pub fn reject(&mut self, id: &ApprovalId, reason: Option<String>) -> Result<bool> {
-        let approval = match self.approvals.get_mut(id) {
-            Some(a) => a,
-            None => return Ok(false),
-        };
-
-        if !matches!(approval.status, ApprovalStatus::Pending) {
-            return Ok(false);
-        }
-
-        approval.reject(reason.clone());
-        self.store.save(approval)?;
-
-        info!(
-            "Rejected request: {} (reason: {:?})",
-            id,
-            reason.as_deref().unwrap_or("none")
-        );
-        Ok(true)
-    }
-
-    /// Set the job ID after approval is processed
-    pub fn set_job_id(&mut self, approval_id: &ApprovalId, job_id: String) -> Result<()> {
-        let approval = self
-            .approvals
-            .get_mut(approval_id)
-            .context("Approval not found")?;
-
-        approval.job_id = Some(job_id);
-        self.store.save(approval)?;
-
-        Ok(())
-    }
-
-    /// List approvals with optional status filter
-    pub fn list_approvals(&self, status_filter: Option<&str>) -> Vec<&ApprovalRequest> {
-        let mut approvals: Vec<&ApprovalRequest> = self
-            .approvals
-            .values()
-            .filter(|a| {
-                status_filter
-                    .map(|s| a.status.status_str() == s)
-                    .unwrap_or(true)
-            })
-            .collect();
-
-        // Sort by created_at descending (newest first)
-        approvals.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-        approvals
-    }
-
-    /// List pending approvals
-    pub fn list_pending(&self) -> Vec<&ApprovalRequest> {
+    /// List pending approvals.
+    pub fn list_pending(&self) -> Result<Vec<ApprovalRequest>> {
         self.list_approvals(Some("pending"))
     }
 
-    /// Check and expire any pending approvals past their expiry time
-    pub fn check_expired(&mut self) -> Result<Vec<ApprovalId>> {
-        let now = Utc::now();
-        let mut expired = Vec::new();
+    /// Check and expire any pending approvals past their expiry time.
+    pub fn check_expired(&self) -> Result<Vec<ApprovalId>> {
+        let pending = self.list_approvals(Some("pending"))?;
+        let expired: Vec<ApprovalId> = pending
+            .iter()
+            .filter(|a| a.is_expired())
+            .map(|a| a.approval_id.clone())
+            .collect();
 
-        for (id, approval) in &mut self.approvals {
-            if matches!(approval.status, ApprovalStatus::Pending) && approval.expires_at < now {
-                approval.mark_expired();
-                expired.push(id.clone());
-                warn!("Approval {} expired", id);
-            }
-        }
-
-        // Persist changes
-        for id in &expired {
-            if let Some(approval) = self.approvals.get(id) {
-                self.store.save(approval)?;
-            }
+        if !expired.is_empty() {
+            let storage = self.storage()?;
+            storage.expire_approvals()?;
         }
 
         Ok(expired)
     }
 
-    /// Clean up old terminal approvals
-    pub fn cleanup_old_approvals(&mut self) -> Result<usize> {
-        let now = Utc::now();
-        let cutoff = now - chrono::Duration::days(APPROVAL_TTL_DAYS);
-
-        let to_remove: Vec<ApprovalId> = self
-            .approvals
-            .iter()
-            .filter(|(_, a)| a.status.is_terminal() && a.created_at < cutoff)
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        let count = to_remove.len();
-
-        for id in to_remove {
-            self.approvals.remove(&id);
-            self.store.delete(&id)?;
-        }
-
-        if count > 0 {
-            info!("Cleaned up {} old approvals", count);
-        }
-
-        Ok(count)
+    /// Clean up old terminal approvals (not supported in DB; retained for audit).
+    pub fn cleanup_old_approvals(&self) -> Result<usize> {
+        let _ = APPROVAL_TTL_DAYS; // retained for compatibility
+        Ok(0)
     }
+}
+
+// ============================================================================
+// Conversion Helpers
+// ============================================================================
+
+fn to_protocol_operation(op: &ApprovalOperation) -> ProtocolApprovalOperation {
+    match op {
+        ApprovalOperation::Run {
+            plugin_ref,
+            input_dir,
+            output,
+        } => {
+            let (plugin_name, plugin_version) = match plugin_ref {
+                crate::types::PluginRef::Registered { plugin, version } => {
+                    (plugin.clone(), version.clone())
+                }
+                crate::types::PluginRef::Path { path } => {
+                    (path.to_string_lossy().to_string(), None)
+                }
+            };
+            ProtocolApprovalOperation::Run {
+                plugin_name,
+                plugin_version,
+                input_dir: input_dir.to_string_lossy().to_string(),
+                file_count: 0,
+                output: Some(output.clone()),
+            }
+        }
+        ApprovalOperation::SchemaPromote {
+            ephemeral_id,
+            output_path,
+        } => ProtocolApprovalOperation::SchemaPromote {
+            plugin_name: ephemeral_id.clone(),
+            output_name: output_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "default".to_string()),
+            schema: casparian_protocol::SchemaSpec {
+                columns: vec![],
+                mode: casparian_protocol::SchemaMode::Strict,
+            },
+        },
+    }
+}
+
+fn from_protocol_operation(op: &ProtocolApprovalOperation) -> Result<ApprovalOperation> {
+    match op {
+        ProtocolApprovalOperation::Run {
+            plugin_name,
+            plugin_version,
+            input_dir,
+            output,
+            ..
+        } => {
+            let output = output
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Run approval missing output"))?;
+            Ok(ApprovalOperation::Run {
+                plugin_ref: crate::types::PluginRef::Registered {
+                    plugin: plugin_name.clone(),
+                    version: plugin_version.clone(),
+                },
+                input_dir: PathBuf::from(input_dir),
+                output,
+            })
+        }
+        ProtocolApprovalOperation::SchemaPromote {
+            plugin_name,
+            output_name,
+            ..
+        } => Ok(ApprovalOperation::SchemaPromote {
+            ephemeral_id: plugin_name.clone(),
+            output_path: PathBuf::from(output_name),
+        }),
+    }
+}
+
+fn from_protocol_approval(pa: ProtocolApproval) -> Result<ApprovalRequest> {
+    let created_at = pa
+        .created_at
+        .parse()
+        .context("Invalid created_at timestamp")?;
+    let expires_at = pa
+        .expires_at
+        .parse()
+        .context("Invalid expires_at timestamp")?;
+
+    let status = match pa.status {
+        ProtocolApprovalStatus::Pending => ApprovalStatus::Pending,
+        ProtocolApprovalStatus::Approved => {
+            let approved_at = pa
+                .decided_at
+                .as_ref()
+                .context("Missing decided_at for approved request")?
+                .parse()
+                .context("Invalid decided_at timestamp")?;
+            ApprovalStatus::Approved { approved_at }
+        }
+        ProtocolApprovalStatus::Rejected => {
+            let rejected_at = pa
+                .decided_at
+                .as_ref()
+                .context("Missing decided_at for rejected request")?
+                .parse()
+                .context("Invalid decided_at timestamp")?;
+            ApprovalStatus::Rejected {
+                rejected_at,
+                reason: pa.rejection_reason.clone(),
+            }
+        }
+        ProtocolApprovalStatus::Expired => ApprovalStatus::Expired,
+    };
+
+    let operation = from_protocol_operation(&pa.operation)?;
+
+    Ok(ApprovalRequest {
+        approval_id: ApprovalId::from_string(pa.approval_id),
+        operation,
+        summary: ApprovalSummary {
+            description: pa.summary.clone(),
+            file_count: 0,
+            estimated_rows: None,
+            target_path: String::new(),
+        },
+        created_at,
+        expires_at,
+        status,
+        job_id: pa.job_id.map(|id| id.as_u64().to_string()),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::PluginRef;
+
     use tempfile::TempDir;
 
     fn create_test_manager() -> (ApprovalManager, TempDir) {
         let temp = TempDir::new().unwrap();
-        let manager = ApprovalManager::new(temp.path().to_path_buf()).unwrap();
+        let db_path = temp.path().join("test.duckdb");
+        let manager = ApprovalManager::new(db_path).unwrap();
         (manager, temp)
     }
 
@@ -239,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_create_approval() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
         let approval = manager
             .create_approval(test_operation(), test_summary())
@@ -251,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_approve() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
         let approval = manager
             .create_approval(test_operation(), test_summary())
@@ -261,13 +316,13 @@ mod tests {
         let approved = manager.approve(&id).unwrap();
         assert!(approved);
 
-        let approval = manager.get_approval(&id).unwrap();
+        let approval = manager.get_approval(&id).unwrap().unwrap();
         assert!(matches!(approval.status, ApprovalStatus::Approved { .. }));
     }
 
     #[test]
     fn test_reject() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
         let approval = manager
             .create_approval(test_operation(), test_summary())
@@ -279,13 +334,13 @@ mod tests {
             .unwrap();
         assert!(rejected);
 
-        let approval = manager.get_approval(&id).unwrap();
+        let approval = manager.get_approval(&id).unwrap().unwrap();
         assert!(matches!(approval.status, ApprovalStatus::Rejected { .. }));
     }
 
     #[test]
     fn test_list_pending() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
         manager
             .create_approval(test_operation(), test_summary())
@@ -294,20 +349,20 @@ mod tests {
             .create_approval(test_operation(), test_summary())
             .unwrap();
 
-        let pending = manager.list_pending();
+        let pending = manager.list_pending().unwrap();
         assert_eq!(pending.len(), 2);
     }
 
     #[test]
     fn test_approve_command() {
-        let (mut manager, _temp) = create_test_manager();
+        let (manager, _temp) = create_test_manager();
 
         let approval = manager
             .create_approval(test_operation(), test_summary())
             .unwrap();
 
         let cmd = approval.approve_command();
-        assert!(cmd.contains("casparian approvals approve"));
+        assert!(cmd.contains("casparian mcp approve"));
         assert!(cmd.contains(&approval.approval_id.0));
     }
 }

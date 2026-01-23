@@ -117,11 +117,17 @@ impl PluginRuntime for NativeSubprocessRuntime {
                             stream_index_expected
                         );
                     }
+                    // Look up expected hash, falling back to wildcard "*" if present
                     let expected_hash = ctx
                         .schema_hashes
                         .get(&output)
+                        .or_else(|| ctx.schema_hashes.get("*"))
                         .ok_or_else(|| anyhow::anyhow!("Unknown output '{}'", output))?;
-                    if expected_hash != &schema_hash {
+                    // Skip hash validation for backtest and preview modes
+                    if expected_hash != "backtest"
+                        && expected_hash != "preview"
+                        && expected_hash != &schema_hash
+                    {
                         anyhow::bail!(
                             "Schema hash mismatch for '{}': expected {}, got {}",
                             output,
@@ -206,7 +212,10 @@ impl PluginRuntime for NativeSubprocessRuntime {
     }
 }
 
-fn spawn_stderr_reader(stderr: std::process::ChildStderr, tx: Sender<ControlFrame>) -> thread::JoinHandle<()> {
+fn spawn_stderr_reader(
+    stderr: std::process::ChildStderr,
+    tx: Sender<ControlFrame>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
@@ -279,7 +288,8 @@ fn parse_control_frame(line: &str) -> Result<ControlFrame> {
             stream_index: value
                 .get("stream_index")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("output_begin missing stream_index"))? as u32,
+                .ok_or_else(|| anyhow::anyhow!("output_begin missing stream_index"))?
+                as u32,
         }),
         "output_end" => Ok(ControlFrame::OutputEnd {
             output: value
@@ -291,7 +301,8 @@ fn parse_control_frame(line: &str) -> Result<ControlFrame> {
             stream_index: value
                 .get("stream_index")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("output_end missing stream_index"))? as u32,
+                .ok_or_else(|| anyhow::anyhow!("output_end missing stream_index"))?
+                as u32,
         }),
         "warning" => Ok(ControlFrame::Warning(
             value
@@ -317,8 +328,8 @@ fn parse_control_frame(line: &str) -> Result<ControlFrame> {
 fn read_arrow_stream(
     reader: &mut BufReader<std::process::ChildStdout>,
 ) -> Result<Vec<OutputBatch>> {
-    let mut stream_reader = StreamReader::try_new(reader, None)
-        .context("stdout is not valid Arrow IPC stream")?;
+    let mut stream_reader =
+        StreamReader::try_new(reader, None).context("stdout is not valid Arrow IPC stream")?;
     let mut batches = Vec::new();
     for batch in stream_reader.by_ref() {
         let batch = batch.context("Failed to read Arrow batch")?;

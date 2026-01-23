@@ -41,10 +41,7 @@ fn test_source_json_and_sync() {
     fs::write(data_dir.path().join("sample.json"), "{\"ok\":true}\n").unwrap();
 
     let home_str = home_dir.path().to_string_lossy().to_string();
-    let envs = [
-        ("CASPARIAN_HOME", home_str.as_str()),
-        ("RUST_LOG", "error"),
-    ];
+    let envs = [("CASPARIAN_HOME", home_str.as_str()), ("RUST_LOG", "error")];
 
     let add_args = vec![
         "source".to_string(),
@@ -65,10 +62,7 @@ fn test_source_json_and_sync() {
         .iter()
         .find(|s| s.name == "test_source")
         .expect("source present");
-    let canonical = data_dir
-        .path()
-        .canonicalize()
-        .expect("canonicalize");
+    let canonical = data_dir.path().canonicalize().expect("canonicalize");
     assert_eq!(Path::new(&source.path), canonical);
     assert!(source.enabled);
     assert_eq!(source.files, 0);

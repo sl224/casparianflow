@@ -1,5 +1,5 @@
 use casparian::scout::{Database, ScanConfig, ScannedFile, Scanner, Source, SourceId, SourceType};
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use ignore::WalkBuilder;
 use std::fs::File;
 use std::io::Write;
@@ -146,7 +146,10 @@ fn walk_count_bytes(root: &Path, config: &ScanConfig) -> (usize, u64) {
         })
     });
 
-    (total_files.load(Ordering::Relaxed), total_bytes.load(Ordering::Relaxed))
+    (
+        total_files.load(Ordering::Relaxed),
+        total_bytes.load(Ordering::Relaxed),
+    )
 }
 
 fn build_scanned_files(source_id: &SourceId, count: usize) -> Vec<ScannedFile> {
@@ -172,22 +175,29 @@ fn bench_scanner_full_scan(c: &mut Criterion) {
     group.throughput(Throughput::Elements(fixture.file_count as u64));
 
     for &batch_size in BATCH_SIZES {
-        group.bench_with_input(BenchmarkId::new("batch_size", batch_size), &batch_size, |b, &batch| {
-            b.iter_batched(
-                || {
-                    let db = Database::open_in_memory().expect("open db");
-                    let source = create_source(fixture.temp_dir.path());
-                    db.upsert_source(&source).expect("insert source");
-                    (db, source)
-                },
-                |(db, source)| {
-                    let config = ScanConfig { batch_size: batch, ..Default::default() };
-                    let scanner = Scanner::with_config(db, config);
-                    scanner.scan_source(&source).expect("scan");
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("batch_size", batch_size),
+            &batch_size,
+            |b, &batch| {
+                b.iter_batched(
+                    || {
+                        let db = Database::open_in_memory().expect("open db");
+                        let source = create_source(fixture.temp_dir.path());
+                        db.upsert_source(&source).expect("insert source");
+                        (db, source)
+                    },
+                    |(db, source)| {
+                        let config = ScanConfig {
+                            batch_size: batch,
+                            ..Default::default()
+                        };
+                        let scanner = Scanner::with_config(db, config);
+                        scanner.scan_source(&source).expect("scan");
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();
@@ -200,25 +210,35 @@ fn bench_scanner_rescan(c: &mut Criterion) {
     group.throughput(Throughput::Elements(fixture.file_count as u64));
 
     for &batch_size in BATCH_SIZES {
-        group.bench_with_input(BenchmarkId::new("batch_size", batch_size), &batch_size, |b, &batch| {
-            b.iter_batched(
-                || {
-                    let db = Database::open_in_memory().expect("open db");
-                    let source = create_source(fixture.temp_dir.path());
-                    db.upsert_source(&source).expect("insert source");
-                    let config = ScanConfig { batch_size: batch, ..Default::default() };
-                    let scanner = Scanner::with_config(db.clone(), config);
-                    scanner.scan_source(&source).expect("warm scan");
-                    (db, source)
-                },
-                |(db, source)| {
-                    let config = ScanConfig { batch_size: batch, ..Default::default() };
-                    let scanner = Scanner::with_config(db, config);
-                    scanner.scan_source(&source).expect("rescan");
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("batch_size", batch_size),
+            &batch_size,
+            |b, &batch| {
+                b.iter_batched(
+                    || {
+                        let db = Database::open_in_memory().expect("open db");
+                        let source = create_source(fixture.temp_dir.path());
+                        db.upsert_source(&source).expect("insert source");
+                        let config = ScanConfig {
+                            batch_size: batch,
+                            ..Default::default()
+                        };
+                        let scanner = Scanner::with_config(db.clone(), config);
+                        scanner.scan_source(&source).expect("warm scan");
+                        (db, source)
+                    },
+                    |(db, source)| {
+                        let config = ScanConfig {
+                            batch_size: batch,
+                            ..Default::default()
+                        };
+                        let scanner = Scanner::with_config(db, config);
+                        scanner.scan_source(&source).expect("rescan");
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();
@@ -251,33 +271,37 @@ fn bench_scanner_db_write(c: &mut Criterion) {
 
     for &batch_size in WRITE_BATCH_SIZES {
         let source_id = source_id.clone();
-        group.bench_with_input(BenchmarkId::new("batch_size", batch_size), &batch_size, |b, &batch| {
-            b.iter_batched(
-                || {
-                    let db = Database::open_in_memory().expect("open db");
-                    let source = Source {
-                        id: source_id.clone(),
-                        name: "Bench Source".to_string(),
-                        source_type: SourceType::Local,
-                        path: "/bench".to_string(),
-                        poll_interval_secs: 0,
-                        enabled: true,
-                    };
-                    db.upsert_source(&source).expect("insert source");
-                    db
-                },
-                |db| {
-                    let mut offset = 0;
-                    while offset < files.len() {
-                        let end = (offset + batch).min(files.len());
-                        db.batch_upsert_files(&files[offset..end], None)
-                            .expect("batch upsert");
-                        offset = end;
-                    }
-                },
-                BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("batch_size", batch_size),
+            &batch_size,
+            |b, &batch| {
+                b.iter_batched(
+                    || {
+                        let db = Database::open_in_memory().expect("open db");
+                        let source = Source {
+                            id: source_id.clone(),
+                            name: "Bench Source".to_string(),
+                            source_type: SourceType::Local,
+                            path: "/bench".to_string(),
+                            poll_interval_secs: 0,
+                            enabled: true,
+                        };
+                        db.upsert_source(&source).expect("insert source");
+                        db
+                    },
+                    |db| {
+                        let mut offset = 0;
+                        while offset < files.len() {
+                            let end = (offset + batch).min(files.len());
+                            db.batch_upsert_files(&files[offset..end], None)
+                                .expect("batch upsert");
+                            offset = end;
+                        }
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
     }
 
     group.finish();

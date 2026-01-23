@@ -27,13 +27,11 @@ impl PathAllowlist {
         // Canonicalize all roots at construction time
         let roots = roots
             .into_iter()
-            .filter_map(|p| {
-                match p.canonicalize() {
-                    Ok(canonical) => Some(canonical),
-                    Err(e) => {
-                        warn!("Failed to canonicalize allowed path {:?}: {}", p, e);
-                        None
-                    }
+            .filter_map(|p| match p.canonicalize() {
+                Ok(canonical) => Some(canonical),
+                Err(e) => {
+                    warn!("Failed to canonicalize allowed path {:?}: {}", p, e);
+                    None
                 }
             })
             .collect();
@@ -49,16 +47,19 @@ impl PathAllowlist {
 
     /// Add a root to the allowlist
     pub fn add_root(&mut self, root: PathBuf) -> Result<(), SecurityError> {
-        let canonical = root.canonicalize().map_err(|e| SecurityError::PathNotAllowed {
-            path: format!("{}: {}", root.display(), e),
-        })?;
+        let canonical = root
+            .canonicalize()
+            .map_err(|e| SecurityError::PathNotAllowed {
+                path: format!("{}: {}", root.display(), e),
+            })?;
         self.roots.push(canonical);
         Ok(())
     }
 
     /// Check if a path contains traversal attempts
     fn contains_traversal(path: &Path) -> bool {
-        path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        path.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
     }
 
     /// Validate a path is within allowed roots
@@ -73,9 +74,11 @@ impl PathAllowlist {
         }
 
         // Canonicalize to resolve symlinks and get absolute path
-        let canonical = path.canonicalize().map_err(|_| SecurityError::PathNotAllowed {
-            path: path.display().to_string(),
-        })?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| SecurityError::PathNotAllowed {
+                path: path.display().to_string(),
+            })?;
 
         // Check against all allowed roots
         for root in &self.roots {
@@ -90,9 +93,10 @@ impl PathAllowlist {
         })
     }
 
-    /// Check if a path would be valid without canonicalizing
+    /// Check if a path would be valid without requiring the path to exist.
     ///
     /// Useful for checking paths that may not exist yet.
+    /// Note: On macOS, symlinks like /var -> /private/var are resolved via parent canonicalization.
     pub fn would_be_allowed(&self, path: &Path) -> bool {
         // Check for traversal
         if Self::contains_traversal(path) {
@@ -109,9 +113,25 @@ impl PathAllowlist {
             }
         };
 
+        // Try to canonicalize parent directory (which should exist) to resolve symlinks
+        // This handles macOS /var -> /private/var symlink
+        let check_path = if let Some(parent) = absolute.parent() {
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                if let Some(filename) = absolute.file_name() {
+                    canonical_parent.join(filename)
+                } else {
+                    absolute.clone()
+                }
+            } else {
+                absolute.clone()
+            }
+        } else {
+            absolute.clone()
+        };
+
         // Check if it would be under an allowed root
         for root in &self.roots {
-            if absolute.starts_with(root) {
+            if check_path.starts_with(root) {
                 return true;
             }
         }
@@ -162,7 +182,13 @@ mod tests {
         let allowlist = PathAllowlist::new(vec![temp.path().to_path_buf()]);
 
         // Try to escape with ..
-        let malicious = temp.path().join("subdir").join("..").join("..").join("etc").join("passwd");
+        let malicious = temp
+            .path()
+            .join("subdir")
+            .join("..")
+            .join("..")
+            .join("etc")
+            .join("passwd");
         let result = allowlist.validate(&malicious);
 
         assert!(matches!(result, Err(SecurityError::PathTraversal { .. })));
@@ -204,10 +230,8 @@ mod tests {
         std::fs::write(&file1, "test1").unwrap();
         std::fs::write(&file2, "test2").unwrap();
 
-        let allowlist = PathAllowlist::new(vec![
-            temp1.path().to_path_buf(),
-            temp2.path().to_path_buf(),
-        ]);
+        let allowlist =
+            PathAllowlist::new(vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()]);
 
         assert!(allowlist.validate(&file1).is_ok());
         assert!(allowlist.validate(&file2).is_ok());

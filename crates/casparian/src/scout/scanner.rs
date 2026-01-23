@@ -18,8 +18,8 @@ use chrono::Utc;
 use ignore::WalkBuilder;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
 
@@ -63,10 +63,10 @@ pub struct ScanConfig {
 /// 2. Are typically not useful for data processing (.Trash, Caches)
 /// 3. Can cause infinite loops or excessive I/O (node_modules, .git)
 pub const DEFAULT_EXCLUDE_DIR_NAMES: &[&str] = &[
-    "node_modules",  // Often huge and not useful for data processing
-    ".git",          // Git internals
-    "__pycache__",   // Python cache
-    ".cache",        // Various caches
+    "node_modules", // Often huge and not useful for data processing
+    ".git",         // Git internals
+    "__pycache__",  // Python cache
+    ".cache",       // Various caches
 ];
 
 /// Default path patterns to exclude
@@ -78,7 +78,7 @@ pub const DEFAULT_EXCLUDE_DIR_NAMES: &[&str] = &[
 /// indefinitely (the root cause of scan hangs).
 pub const DEFAULT_EXCLUDE_PATH_PATTERNS: &[&str] = &[
     // macOS cloud storage - uses File Provider framework (virtual FS)
-    "Library/CloudStorage",    // Google Drive, OneDrive, Dropbox via macOS
+    "Library/CloudStorage",     // Google Drive, OneDrive, Dropbox via macOS
     "Library/Mobile Documents", // iCloud Drive
     // Legacy iCloud location
     "iCloud Drive",
@@ -88,7 +88,7 @@ pub const DEFAULT_EXCLUDE_PATH_PATTERNS: &[&str] = &[
     "Dropbox",
     // macOS system directories that are slow or problematic
     ".Trash",
-    "Library/Caches",  // Can be huge and changes frequently
+    "Library/Caches", // Can be huge and changes frequently
 ];
 
 impl Default for ScanConfig {
@@ -99,8 +99,14 @@ impl Default for ScanConfig {
             progress_interval: 100, // Progress update every 100 files for responsive TUI
             follow_symlinks: false,
             include_hidden: true,
-            exclude_dir_names: DEFAULT_EXCLUDE_DIR_NAMES.iter().map(|s| s.to_string()).collect(),
-            exclude_path_patterns: DEFAULT_EXCLUDE_PATH_PATTERNS.iter().map(|s| s.to_string()).collect(),
+            exclude_dir_names: DEFAULT_EXCLUDE_DIR_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            exclude_path_patterns: DEFAULT_EXCLUDE_PATH_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 }
@@ -312,7 +318,10 @@ impl Scanner {
 
         // Update denormalized file_count on source for fast TUI queries
         // GAP-SCAN-005: Use files_persisted (actual count in DB) not files_discovered
-        if let Err(e) = self.db.update_source_file_count(&source.id, final_stats.files_persisted as usize) {
+        if let Err(e) = self
+            .db
+            .update_source_file_count(&source.id, final_stats.files_persisted as usize)
+        {
             tracing::warn!(source_id = %source.id, error = %e, "Failed to update source file_count");
         }
 
@@ -335,7 +344,10 @@ impl Scanner {
             "Streaming scan complete"
         );
 
-        Ok(ScanResult { stats: final_stats, errors: walk_errors })
+        Ok(ScanResult {
+            stats: final_stats,
+            errors: walk_errors,
+        })
     }
 
     /// Streaming parallel walk - sends batches to channel instead of collecting
@@ -463,7 +475,8 @@ impl Scanner {
                     // Always flush byte count (GAP-SCAN-006)
                     // Note: dir_count is now updated immediately when dirs are encountered
                     if self.byte_count > 0 {
-                        self.total_bytes.fetch_add(self.byte_count, Ordering::Relaxed);
+                        self.total_bytes
+                            .fetch_add(self.byte_count, Ordering::Relaxed);
                     }
                 }
             }
@@ -558,12 +571,10 @@ impl Scanner {
                 let current_total = total_files.load(Ordering::Relaxed) + guard.batch.len();
                 let last = last_progress_at.load(Ordering::Relaxed);
                 if current_total.saturating_sub(last) >= progress_interval {
-                    if last_progress_at.compare_exchange(
-                        last,
-                        current_total,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed
-                    ).is_ok() {
+                    if last_progress_at
+                        .compare_exchange(last, current_total, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
                         if let Some(tx) = &progress_tx {
                             let dir_hint = current_dir_hint.clone();
                             let _ = tx.send(ScanProgress {
@@ -578,10 +589,8 @@ impl Scanner {
 
                 // Send batch to channel when full
                 if guard.batch.len() >= guard.batch_size {
-                    let batch = std::mem::replace(
-                        &mut guard.batch,
-                        Vec::with_capacity(guard.batch_size)
-                    );
+                    let batch =
+                        std::mem::replace(&mut guard.batch, Vec::with_capacity(guard.batch_size));
                     let batch_len = batch.len();
 
                     // send provides backpressure with sync_channel (waits if channel full)
@@ -598,19 +607,17 @@ impl Scanner {
                     // Send progress update
                     let last = last_progress_at.load(Ordering::Relaxed);
                     if new_total.saturating_sub(last) >= progress_interval {
-                    if last_progress_at.compare_exchange(
-                        last,
-                        new_total,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed
-                    ).is_ok() {
-                        if let Some(tx) = &progress_tx {
-                            let dir_hint = current_dir_hint.clone();
-                            let _ = tx.send(ScanProgress {
-                                dirs_scanned: total_dirs.load(Ordering::Relaxed),
-                                files_found: new_total,
-                                files_persisted: files_persisted.load(Ordering::Relaxed),
-                                current_dir: dir_hint,
+                        if last_progress_at
+                            .compare_exchange(last, new_total, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            if let Some(tx) = &progress_tx {
+                                let dir_hint = current_dir_hint.clone();
+                                let _ = tx.send(ScanProgress {
+                                    dirs_scanned: total_dirs.load(Ordering::Relaxed),
+                                    files_found: new_total,
+                                    files_persisted: files_persisted.load(Ordering::Relaxed),
+                                    current_dir: dir_hint,
                                 });
                             }
                         }
@@ -672,10 +679,10 @@ impl Scanner {
 mod tests {
     use super::*;
     use crate::scout::types::{FileStatus, SourceId, SourceType};
-    use tempfile::TempDir;
+    use filetime::{set_file_mtime, FileTime};
     use std::fs::File;
     use std::io::Write;
-    use filetime::{FileTime, set_file_mtime};
+    use tempfile::TempDir;
 
     fn create_test_env() -> (TempDir, Database, Source) {
         let temp_dir = TempDir::new().unwrap();

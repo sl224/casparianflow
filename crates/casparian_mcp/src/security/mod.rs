@@ -34,7 +34,10 @@ pub struct SecurityConfig {
 
 impl SecurityConfig {
     /// Validate a path is within allowed roots
-    pub fn validate_path(&self, path: &std::path::Path) -> Result<std::path::PathBuf, SecurityError> {
+    pub fn validate_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<std::path::PathBuf, SecurityError> {
         self.path_allowlist.validate(path)
     }
 }

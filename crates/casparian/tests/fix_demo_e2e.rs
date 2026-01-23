@@ -22,8 +22,16 @@ fn test_fix_demo_lifecycle_query_by_cl_ord_id() {
 
     let fixture_path = workspace_root.join("docs/demo/fix/fix_demo.fix");
     let parser_path = workspace_root.join("parsers/fix/fix_parser.py");
-    assert!(fixture_path.exists(), "Missing fixture: {}", fixture_path.display());
-    assert!(parser_path.exists(), "Missing parser: {}", parser_path.display());
+    assert!(
+        fixture_path.exists(),
+        "Missing fixture: {}",
+        fixture_path.display()
+    );
+    assert!(
+        parser_path.exists(),
+        "Missing parser: {}",
+        parser_path.display()
+    );
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let db_path = temp_dir.path().join("fix_demo.duckdb");
@@ -54,7 +62,9 @@ fn test_fix_demo_lifecycle_query_by_cl_ord_id() {
 
     let conn = duckdb::Connection::open(&db_path).expect("open duckdb output");
     let total_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fix_order_lifecycle", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM fix_order_lifecycle", [], |row| {
+            row.get(0)
+        })
         .expect("query fix_order_lifecycle");
     assert!(total_rows > 0, "expected rows in fix_order_lifecycle");
 
@@ -91,8 +101,16 @@ fn test_first_class_fix_parser_multi_output() {
 
     let fixture_path = workspace_root.join("tests/fixtures/fix/mixed_messages.fix");
     let parser_path = workspace_root.join("parsers/fix/fix_parser.py");
-    assert!(fixture_path.exists(), "Missing fixture: {}", fixture_path.display());
-    assert!(parser_path.exists(), "Missing parser: {}", parser_path.display());
+    assert!(
+        fixture_path.exists(),
+        "Missing fixture: {}",
+        fixture_path.display()
+    );
+    assert!(
+        parser_path.exists(),
+        "Missing parser: {}",
+        parser_path.display()
+    );
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let db_path = temp_dir.path().join("fix_multi.duckdb");
@@ -126,15 +144,27 @@ fn test_first_class_fix_parser_multi_output() {
 
     // Verify fix_order_lifecycle table exists and has rows
     let order_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fix_order_lifecycle", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM fix_order_lifecycle", [], |row| {
+            row.get(0)
+        })
         .expect("query fix_order_lifecycle");
-    assert!(order_rows > 0, "expected rows in fix_order_lifecycle, got {}", order_rows);
+    assert!(
+        order_rows > 0,
+        "expected rows in fix_order_lifecycle, got {}",
+        order_rows
+    );
 
     // Verify fix_session_events table exists and has rows
     let session_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fix_session_events", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM fix_session_events", [], |row| {
+            row.get(0)
+        })
         .expect("query fix_session_events");
-    assert!(session_rows > 0, "expected rows in fix_session_events, got {}", session_rows);
+    assert!(
+        session_rows > 0,
+        "expected rows in fix_session_events, got {}",
+        session_rows
+    );
 
     // Verify context columns exist
     let has_source_path: bool = conn
@@ -178,8 +208,16 @@ fn test_fix_parser_requires_fix_tz() {
 
     let fixture_path = workspace_root.join("tests/fixtures/fix/order_lifecycle.fix");
     let parser_path = workspace_root.join("parsers/fix/fix_parser.py");
-    assert!(fixture_path.exists(), "Missing fixture: {}", fixture_path.display());
-    assert!(parser_path.exists(), "Missing parser: {}", parser_path.display());
+    assert!(
+        fixture_path.exists(),
+        "Missing fixture: {}",
+        fixture_path.display()
+    );
+    assert!(
+        parser_path.exists(),
+        "Missing parser: {}",
+        parser_path.display()
+    );
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let output_path = temp_dir.path().join("output");
@@ -223,8 +261,16 @@ fn test_fix_tags_allowlist() {
 
     let fixture_path = workspace_root.join("tests/fixtures/fix/order_lifecycle.fix");
     let parser_path = workspace_root.join("parsers/fix/fix_parser.py");
-    assert!(fixture_path.exists(), "Missing fixture: {}", fixture_path.display());
-    assert!(parser_path.exists(), "Missing parser: {}", parser_path.display());
+    assert!(
+        fixture_path.exists(),
+        "Missing fixture: {}",
+        fixture_path.display()
+    );
+    assert!(
+        parser_path.exists(),
+        "Missing parser: {}",
+        parser_path.display()
+    );
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let db_path = temp_dir.path().join("fix_tags.duckdb");
@@ -241,7 +287,7 @@ fn test_fix_tags_allowlist() {
     let output = Command::new(casparian_bin())
         .args(&args)
         .env("FIX_TZ", "UTC")
-        .env("FIX_TAGS_ALLOWLIST", "55,54,38,44")  // symbol, side, qty, price
+        .env("FIX_TAGS_ALLOWLIST", "55,54,38,44") // symbol, side, qty, price
         .output()
         .expect("run casparian");
 
@@ -285,8 +331,16 @@ fn test_fix_parser_prefixed_logs() {
 
     let fixture_path = workspace_root.join("tests/fixtures/fix/prefixed_logs.fix");
     let parser_path = workspace_root.join("parsers/fix/fix_parser.py");
-    assert!(fixture_path.exists(), "Missing fixture: {}", fixture_path.display());
-    assert!(parser_path.exists(), "Missing parser: {}", parser_path.display());
+    assert!(
+        fixture_path.exists(),
+        "Missing fixture: {}",
+        fixture_path.display()
+    );
+    assert!(
+        parser_path.exists(),
+        "Missing parser: {}",
+        parser_path.display()
+    );
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let db_path = temp_dir.path().join("fix_prefixed.duckdb");
@@ -319,15 +373,27 @@ fn test_fix_parser_prefixed_logs() {
 
     // Verify fix_order_lifecycle captured messages despite prefixes
     let order_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fix_order_lifecycle", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM fix_order_lifecycle", [], |row| {
+            row.get(0)
+        })
         .expect("query fix_order_lifecycle");
-    assert!(order_rows > 0, "expected prefixed order messages, got {}", order_rows);
+    assert!(
+        order_rows > 0,
+        "expected prefixed order messages, got {}",
+        order_rows
+    );
 
     // Verify session events captured
     let session_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fix_session_events", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM fix_session_events", [], |row| {
+            row.get(0)
+        })
         .expect("query fix_session_events");
-    assert!(session_rows > 0, "expected prefixed session messages, got {}", session_rows);
+    assert!(
+        session_rows > 0,
+        "expected prefixed session messages, got {}",
+        session_rows
+    );
 
     // Verify message_index disambiguates multi-message lines
     let multi_message_lines: i64 = conn
@@ -357,10 +423,15 @@ fn test_fix_parser_prefixed_logs() {
 
     // Verify fix_parse_errors table exists (may be empty or have errors from malformed line)
     let errors_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fix_parse_errors", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM fix_parse_errors", [], |row| {
+            row.get(0)
+        })
         .expect("fix_parse_errors should exist");
     // Table exists if we can query it (count may be 0)
-    assert!(errors_count >= 0, "fix_parse_errors table should be queryable");
+    assert!(
+        errors_count >= 0,
+        "fix_parse_errors table should be queryable"
+    );
 
     // Check for the specific prefixed order - PREFIXED001
     let prefixed_order_count: i64 = conn
@@ -370,7 +441,10 @@ fn test_fix_parser_prefixed_logs() {
             |row| row.get(0),
         )
         .expect("query prefixed order");
-    assert!(prefixed_order_count > 0, "expected to find PREFIXED001 order from prefixed logs");
+    assert!(
+        prefixed_order_count > 0,
+        "expected to find PREFIXED001 order from prefixed logs"
+    );
 }
 
 /// Test source_fingerprint, message_index, and DECIMAL types in v1.2 schema
@@ -384,8 +458,16 @@ fn test_fix_parser_v1_2_schema_features() {
 
     let fixture_path = workspace_root.join("tests/fixtures/fix/mixed_messages.fix");
     let parser_path = workspace_root.join("parsers/fix/fix_parser.py");
-    assert!(fixture_path.exists(), "Missing fixture: {}", fixture_path.display());
-    assert!(parser_path.exists(), "Missing parser: {}", parser_path.display());
+    assert!(
+        fixture_path.exists(),
+        "Missing fixture: {}",
+        fixture_path.display()
+    );
+    assert!(
+        parser_path.exists(),
+        "Missing parser: {}",
+        parser_path.display()
+    );
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let db_path = temp_dir.path().join("fix_v11.duckdb");
@@ -424,7 +506,10 @@ fn test_fix_parser_v1_2_schema_features() {
             |row| row.get(0),
         )
         .expect("check order source_fingerprint");
-    assert!(order_fp > 0, "fix_order_lifecycle should have source_fingerprint");
+    assert!(
+        order_fp > 0,
+        "fix_order_lifecycle should have source_fingerprint"
+    );
 
     let session_fp: i64 = conn
         .query_row(
@@ -433,7 +518,10 @@ fn test_fix_parser_v1_2_schema_features() {
             |row| row.get(0),
         )
         .expect("check session source_fingerprint");
-    assert!(session_fp > 0, "fix_session_events should have source_fingerprint");
+    assert!(
+        session_fp > 0,
+        "fix_session_events should have source_fingerprint"
+    );
 
     // Verify message_index is populated
     let has_message_index: bool = conn
@@ -458,9 +546,14 @@ fn test_fix_parser_v1_2_schema_features() {
 
     // Verify fix_parse_errors table exists (may be empty)
     let errors_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM fix_parse_errors", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM fix_parse_errors", [], |row| {
+            row.get(0)
+        })
         .expect("fix_parse_errors should exist");
-    assert!(errors_count >= 0, "fix_parse_errors table should be queryable");
+    assert!(
+        errors_count >= 0,
+        "fix_parse_errors table should be queryable"
+    );
 }
 
 /// Test decimal rounding emits parse error warnings
@@ -474,8 +567,16 @@ fn test_fix_decimal_rounding_records_error() {
 
     let fixture_path = workspace_root.join("tests/fixtures/fix/decimal_rounding.fix");
     let parser_path = workspace_root.join("parsers/fix/fix_parser.py");
-    assert!(fixture_path.exists(), "Missing fixture: {}", fixture_path.display());
-    assert!(parser_path.exists(), "Missing parser: {}", parser_path.display());
+    assert!(
+        fixture_path.exists(),
+        "Missing fixture: {}",
+        fixture_path.display()
+    );
+    assert!(
+        parser_path.exists(),
+        "Missing parser: {}",
+        parser_path.display()
+    );
 
     let temp_dir = TempDir::new().expect("create temp dir");
     let db_path = temp_dir.path().join("fix_rounding.duckdb");

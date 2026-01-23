@@ -3,20 +3,21 @@
 //! Tests use REAL SQLite databases, REAL file I/O, and REAL parser execution.
 //! No mocks - actual backtest behavior is verified.
 
+use casparian_backtest::ScopeId;
 use casparian_backtest::{
-    failfast::{backtest_with_failfast, BacktestResult, FailFastConfig, FileTestResult, ParserRunner},
-    high_failure::{FailureHistoryEntry, HighFailureTable, FileInfo},
-    iteration::{
-        run_backtest_loop, BacktestIteration, IterationConfig,
-        MutableParser, TerminationReason,
+    failfast::{
+        backtest_with_failfast, BacktestResult, FailFastConfig, FileTestResult, ParserRunner,
     },
-    metrics::{BacktestMetrics, FailureSummary, IterationMetrics, FailureCategory},
+    high_failure::{FailureHistoryEntry, FileInfo, HighFailureTable},
+    iteration::{
+        run_backtest_loop, BacktestIteration, IterationConfig, MutableParser, TerminationReason,
+    },
+    metrics::{BacktestMetrics, FailureCategory, FailureSummary, IterationMetrics},
 };
 use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
-use casparian_backtest::ScopeId;
 
 // =============================================================================
 // REAL PARSER RUNNER - Actually reads and validates files
@@ -54,16 +55,16 @@ impl RealCsvParser {
 
     fn validate_value(&self, value: &str, expected_type: &ExpectedType) -> Result<(), String> {
         match expected_type {
-            ExpectedType::Integer => {
-                value.trim().parse::<i64>()
-                    .map(|_| ())
-                    .map_err(|_| format!("Expected integer, got: {}", value))
-            }
-            ExpectedType::Float => {
-                value.trim().parse::<f64>()
-                    .map(|_| ())
-                    .map_err(|_| format!("Expected float, got: {}", value))
-            }
+            ExpectedType::Integer => value
+                .trim()
+                .parse::<i64>()
+                .map(|_| ())
+                .map_err(|_| format!("Expected integer, got: {}", value)),
+            ExpectedType::Float => value
+                .trim()
+                .parse::<f64>()
+                .map(|_| ())
+                .map_err(|_| format!("Expected float, got: {}", value)),
             ExpectedType::Boolean => {
                 let lower = value.trim().to_lowercase();
                 if ["true", "false", "1", "0", "yes", "no"].contains(&lower.as_str()) {
@@ -74,7 +75,10 @@ impl RealCsvParser {
             }
             ExpectedType::Date => {
                 // Simple date validation - YYYY-MM-DD
-                if value.len() == 10 && value.chars().nth(4) == Some('-') && value.chars().nth(7) == Some('-') {
+                if value.len() == 10
+                    && value.chars().nth(4) == Some('-')
+                    && value.chars().nth(7) == Some('-')
+                {
                     Ok(())
                 } else {
                     Err(format!("Expected date (YYYY-MM-DD), got: {}", value))
@@ -126,8 +130,11 @@ impl ParserRunner for RealCsvParser {
             return FileTestResult {
                 file_path: file_path.to_string(),
                 passed: false,
-                error: Some(format!("Column count mismatch: expected {}, got {}",
-                    self.expected_columns.len(), headers.len())),
+                error: Some(format!(
+                    "Column count mismatch: expected {}, got {}",
+                    self.expected_columns.len(),
+                    headers.len()
+                )),
                 category: Some(FailureCategory::SchemaViolation),
             };
         }
@@ -145,7 +152,9 @@ impl ParserRunner for RealCsvParser {
                 };
             }
 
-            for (col_idx, (value, expected_type)) in values.iter().zip(&self.expected_types).enumerate() {
+            for (col_idx, (value, expected_type)) in
+                values.iter().zip(&self.expected_types).enumerate()
+            {
                 if let Err(e) = self.validate_value(value, expected_type) {
                     return FileTestResult {
                         file_path: file_path.to_string(),
@@ -210,7 +219,9 @@ fn test_high_failure_table_real_sqlite() {
         "Expected int, got string",
     );
 
-    table.record_failure("/data/bad_file.csv", &scope_id, entry).unwrap();
+    table
+        .record_failure("/data/bad_file.csv", &scope_id, entry)
+        .unwrap();
 
     // Verify recorded
     let active = table.get_active(&scope_id).unwrap();
@@ -229,18 +240,17 @@ fn test_consecutive_failures_increment() {
 
     // Record multiple failures
     for i in 1..=5 {
-        let entry = FailureHistoryEntry::new(
-            i,
-            1,
-            FailureCategory::ParseError,
-            format!("Failure #{}", i),
-        );
+        let entry =
+            FailureHistoryEntry::new(i, 1, FailureCategory::ParseError, format!("Failure #{}", i));
         table.record_failure(file_path, &scope_id, entry).unwrap();
     }
 
     let active = table.get_active(&scope_id).unwrap();
     assert_eq!(active.len(), 1);
-    assert_eq!(active[0].consecutive_failures, 5, "Should have 5 consecutive failures");
+    assert_eq!(
+        active[0].consecutive_failures, 5,
+        "Should have 5 consecutive failures"
+    );
     assert_eq!(active[0].failure_count, 5, "Total failures should be 5");
 }
 
@@ -254,12 +264,7 @@ fn test_success_resets_consecutive() {
 
     // Record failures
     for _ in 0..3 {
-        let entry = FailureHistoryEntry::new(
-            1,
-            1,
-            FailureCategory::TypeMismatch,
-            "Error",
-        );
+        let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
         table.record_failure(file_path, &scope_id, entry).unwrap();
     }
 
@@ -272,7 +277,10 @@ fn test_success_resets_consecutive() {
 
     // Consecutive should be 0, but total failures preserved
     let after = table.get_active(&scope_id).unwrap();
-    assert!(after.is_empty(), "Should not be in active failures after success");
+    assert!(
+        after.is_empty(),
+        "Should not be in active failures after success"
+    );
 
     // Check get_all list (resolved files have consecutive=0 but are still in get_all)
     let all = table.get_all(&scope_id).unwrap();
@@ -294,12 +302,7 @@ fn test_backtest_order_prioritizes_high_failure() {
         ("/data/meh.csv", 2),
     ] {
         for _ in 0..failures {
-            let entry = FailureHistoryEntry::new(
-                1,
-                1,
-                FailureCategory::TypeMismatch,
-                "Error",
-            );
+            let entry = FailureHistoryEntry::new(1, 1, FailureCategory::TypeMismatch, "Error");
             table.record_failure(path, &scope_id, entry).unwrap();
         }
     }
@@ -340,22 +343,35 @@ fn test_backtest_all_pass() {
 
     // Create valid CSV files
     let csv_content = "id,name,amount\n1,Alice,100\n2,Bob,200\n3,Charlie,300\n";
-    create_test_files(&temp_dir, &[
-        ("file1.csv", csv_content),
-        ("file2.csv", csv_content),
-        ("file3.csv", csv_content),
-    ]);
+    create_test_files(
+        &temp_dir,
+        &[
+            ("file1.csv", csv_content),
+            ("file2.csv", csv_content),
+            ("file3.csv", csv_content),
+        ],
+    );
 
     let parser = RealCsvParser::new(
         vec!["id", "name", "amount"],
-        vec![ExpectedType::Integer, ExpectedType::String, ExpectedType::Integer],
+        vec![
+            ExpectedType::Integer,
+            ExpectedType::String,
+            ExpectedType::Integer,
+        ],
     );
 
     let files: Vec<FileInfo> = (1..=3)
-        .map(|i| FileInfo::new(
-            temp_dir.path().join(format!("file{}.csv", i)).to_string_lossy().to_string(),
-            100,
-        ))
+        .map(|i| {
+            FileInfo::new(
+                temp_dir
+                    .path()
+                    .join(format!("file{}.csv", i))
+                    .to_string_lossy()
+                    .to_string(),
+                100,
+            )
+        })
         .collect();
 
     let table = HighFailureTable::in_memory().unwrap();
@@ -364,20 +380,20 @@ fn test_backtest_all_pass() {
     let config = FailFastConfig::default();
 
     let result = backtest_with_failfast(
-        &parser,
-        &files,
-        &table,
-        &scope_id,
-        1, // parser_version
+        &parser, &files, &table, &scope_id, 1, // parser_version
         1, // iteration
         &config,
-    ).unwrap();
+    )
+    .unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
             assert_eq!(metrics.files_passed, 3);
             assert_eq!(metrics.files_failed, 0);
-            assert!((metrics.pass_rate - 1.0).abs() < 0.001, "Pass rate should be 100%");
+            assert!(
+                (metrics.pass_rate - 1.0).abs() < 0.001,
+                "Pass rate should be 100%"
+            );
         }
         other => panic!("Expected Complete, got {:?}", other),
     }
@@ -392,23 +408,32 @@ fn test_backtest_some_fail() {
     let valid = "id,name,amount\n1,Alice,100\n2,Bob,200\n";
     let invalid = "id,name,amount\n1,Alice,not_a_number\n"; // Invalid amount
 
-    create_test_files(&temp_dir, &[
-        ("good1.csv", valid),
-        ("good2.csv", valid),
-        ("bad.csv", invalid),
-    ]);
+    create_test_files(
+        &temp_dir,
+        &[
+            ("good1.csv", valid),
+            ("good2.csv", valid),
+            ("bad.csv", invalid),
+        ],
+    );
 
     let parser = RealCsvParser::new(
         vec!["id", "name", "amount"],
-        vec![ExpectedType::Integer, ExpectedType::String, ExpectedType::Integer],
+        vec![
+            ExpectedType::Integer,
+            ExpectedType::String,
+            ExpectedType::Integer,
+        ],
     );
 
     let files: Vec<FileInfo> = ["good1.csv", "good2.csv", "bad.csv"]
         .iter()
-        .map(|name| FileInfo::new(
-            temp_dir.path().join(name).to_string_lossy().to_string(),
-            100,
-        ))
+        .map(|name| {
+            FileInfo::new(
+                temp_dir.path().join(name).to_string_lossy().to_string(),
+                100,
+            )
+        })
         .collect();
 
     let table = HighFailureTable::in_memory().unwrap();
@@ -440,16 +465,19 @@ fn test_early_stop_on_high_failure() {
     let valid = "id,value\n1,100\n";
     let invalid = "id,value\n1,not_valid\n";
 
-    create_test_files(&temp_dir, &[
-        ("bad1.csv", invalid),
-        ("bad2.csv", invalid),
-        ("bad3.csv", invalid),
-        ("good1.csv", valid),
-        ("good2.csv", valid),
-        ("good3.csv", valid),
-        ("good4.csv", valid),
-        ("good5.csv", valid),
-    ]);
+    create_test_files(
+        &temp_dir,
+        &[
+            ("bad1.csv", invalid),
+            ("bad2.csv", invalid),
+            ("bad3.csv", invalid),
+            ("good1.csv", valid),
+            ("good2.csv", valid),
+            ("good3.csv", valid),
+            ("good4.csv", valid),
+            ("good5.csv", valid),
+        ],
+    );
 
     let parser = RealCsvParser::new(
         vec!["id", "value"],
@@ -461,27 +489,36 @@ fn test_early_stop_on_high_failure() {
 
     // Pre-populate high-failure table with bad files
     for name in &["bad1.csv", "bad2.csv", "bad3.csv"] {
-        let entry = FailureHistoryEntry::new(
-            0,
-            0,
-            FailureCategory::TypeMismatch,
-            "Previous failure",
-        );
-        table.record_failure(
-            &temp_dir.path().join(name).to_string_lossy(),
-            &scope_id,
-            entry,
-        ).unwrap();
+        let entry =
+            FailureHistoryEntry::new(0, 0, FailureCategory::TypeMismatch, "Previous failure");
+        table
+            .record_failure(
+                &temp_dir.path().join(name).to_string_lossy(),
+                &scope_id,
+                entry,
+            )
+            .unwrap();
     }
 
     // Get files in backtest order (high-failure first)
-    let all_files: Vec<FileInfo> = ["bad1.csv", "bad2.csv", "bad3.csv", "good1.csv", "good2.csv", "good3.csv", "good4.csv", "good5.csv"]
-        .iter()
-        .map(|name| FileInfo::new(
+    let all_files: Vec<FileInfo> = [
+        "bad1.csv",
+        "bad2.csv",
+        "bad3.csv",
+        "good1.csv",
+        "good2.csv",
+        "good3.csv",
+        "good4.csv",
+        "good5.csv",
+    ]
+    .iter()
+    .map(|name| {
+        FileInfo::new(
             temp_dir.path().join(name).to_string_lossy().to_string(),
             100,
-        ))
-        .collect();
+        )
+    })
+    .collect();
 
     let ordered = table.get_backtest_order(&all_files, &scope_id).unwrap();
 
@@ -494,26 +531,37 @@ fn test_early_stop_on_high_failure() {
 
     let tracking_parser = TrackingParser::new(parser);
 
-    let result = backtest_with_failfast(
-        &tracking_parser,
-        &ordered,
-        &table,
-        &scope_id,
-        1,
-        1,
-        &config,
-    ).unwrap();
+    let result =
+        backtest_with_failfast(&tracking_parser, &ordered, &table, &scope_id, 1, 1, &config)
+            .unwrap();
 
     match result {
-        BacktestResult::EarlyStopped { reason, high_failure_pass_rate, files_tested, .. } => {
-            assert!(high_failure_pass_rate < 0.5, "Pass rate should be below threshold");
-            assert!(files_tested <= 5, "Should stop early, not process all files");
-            assert!(reason.contains("High-failure") || reason.contains("high-failure"),
-                    "Reason should mention high-failure: {}", reason);
+        BacktestResult::EarlyStopped {
+            reason,
+            high_failure_pass_rate,
+            files_tested,
+            ..
+        } => {
+            assert!(
+                high_failure_pass_rate < 0.5,
+                "Pass rate should be below threshold"
+            );
+            assert!(
+                files_tested <= 5,
+                "Should stop early, not process all files"
+            );
+            assert!(
+                reason.contains("High-failure") || reason.contains("high-failure"),
+                "Reason should mention high-failure: {}",
+                reason
+            );
         }
         BacktestResult::Complete { metrics, .. } => {
             // If it completed, high-failure files must have passed somehow
-            println!("Completed with passed={}, failed={}", metrics.files_passed, metrics.files_failed);
+            println!(
+                "Completed with passed={}, failed={}",
+                metrics.files_passed, metrics.files_failed
+            );
         }
         BacktestResult::Error { error, .. } => panic!("Unexpected error: {}", error),
     }
@@ -598,10 +646,16 @@ fn test_loop_achieves_pass_rate() {
     }
 
     let files: Vec<FileInfo> = (1..=5)
-        .map(|i| FileInfo::new(
-            temp_dir.path().join(format!("file{}.csv", i)).to_string_lossy().to_string(),
-            100,
-        ))
+        .map(|i| {
+            FileInfo::new(
+                temp_dir
+                    .path()
+                    .join(format!("file{}.csv", i))
+                    .to_string_lossy()
+                    .to_string(),
+                100,
+            )
+        })
         .collect();
 
     // Parser that fails on file1 and file2 initially, then improves
@@ -619,22 +673,22 @@ fn test_loop_achieves_pass_rate() {
         failfast_config: FailFastConfig::default(),
     };
 
-    let result = run_backtest_loop(
-        &mut parser,
-        &files,
-        &table,
-        &scope_id,
-        &config,
-    ).unwrap();
+    let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).unwrap();
 
     match result.termination_reason {
         TerminationReason::PassRateAchieved => {
-            assert!(result.final_pass_rate >= 1.0, "Should achieve 100% pass rate");
+            assert!(
+                result.final_pass_rate >= 1.0,
+                "Should achieve 100% pass rate"
+            );
         }
         other => {
             // May terminate for other reasons depending on timing
             println!("Terminated due to: {:?}", other);
-            assert!(!result.iterations.is_empty(), "Should have at least 1 iteration");
+            assert!(
+                !result.iterations.is_empty(),
+                "Should have at least 1 iteration"
+            );
         }
     }
 }
@@ -649,7 +703,11 @@ fn test_loop_max_iterations() {
     fs::write(temp_dir.path().join("always_fails.csv"), invalid).unwrap();
 
     let files = vec![FileInfo::new(
-        temp_dir.path().join("always_fails.csv").to_string_lossy().to_string(),
+        temp_dir
+            .path()
+            .join("always_fails.csv")
+            .to_string_lossy()
+            .to_string(),
         100,
     )];
 
@@ -666,8 +724,12 @@ fn test_loop_max_iterations() {
         }
     }
     impl MutableParser for NeverImprovesParser {
-        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
-        fn version(&self) -> usize { 0 }
+        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool {
+            true
+        }
+        fn version(&self) -> usize {
+            0
+        }
     }
 
     let mut parser = NeverImprovesParser;
@@ -686,9 +748,15 @@ fn test_loop_max_iterations() {
 
     let result = run_backtest_loop(&mut parser, &files, &table, &scope_id, &config).unwrap();
 
-    assert!(matches!(result.termination_reason, TerminationReason::MaxIterations),
-            "Should terminate due to max iterations");
-    assert_eq!(result.iterations.len(), 3, "Should have exactly 3 iterations");
+    assert!(
+        matches!(result.termination_reason, TerminationReason::MaxIterations),
+        "Should terminate due to max iterations"
+    );
+    assert_eq!(
+        result.iterations.len(),
+        3,
+        "Should have exactly 3 iterations"
+    );
 }
 
 /// Test plateau detection
@@ -708,14 +776,26 @@ fn test_loop_plateau_detection() {
     }
 
     let files: Vec<FileInfo> = (1..=3)
-        .map(|i| FileInfo::new(
-            temp_dir.path().join(format!("good{}.csv", i)).to_string_lossy().to_string(),
-            100,
-        ))
-        .chain((1..=2).map(|i| FileInfo::new(
-            temp_dir.path().join(format!("bad{}.csv", i)).to_string_lossy().to_string(),
-            100,
-        )))
+        .map(|i| {
+            FileInfo::new(
+                temp_dir
+                    .path()
+                    .join(format!("good{}.csv", i))
+                    .to_string_lossy()
+                    .to_string(),
+                100,
+            )
+        })
+        .chain((1..=2).map(|i| {
+            FileInfo::new(
+                temp_dir
+                    .path()
+                    .join(format!("bad{}.csv", i))
+                    .to_string_lossy()
+                    .to_string(),
+                100,
+            )
+        }))
         .collect();
 
     // Parser that never fixes the bad files
@@ -740,8 +820,12 @@ fn test_loop_plateau_detection() {
         }
     }
     impl MutableParser for PlateauParser {
-        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
-        fn version(&self) -> usize { 0 }
+        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool {
+            true
+        }
+        fn version(&self) -> usize {
+            0
+        }
     }
 
     let mut parser = PlateauParser;
@@ -762,7 +846,11 @@ fn test_loop_plateau_detection() {
 
     match result.termination_reason {
         TerminationReason::Plateau { no_improvement_for } => {
-            assert!(no_improvement_for >= 3, "Should detect plateau after {} iterations", no_improvement_for);
+            assert!(
+                no_improvement_for >= 3,
+                "Should detect plateau after {} iterations",
+                no_improvement_for
+            );
         }
         TerminationReason::MaxIterations => {
             // Also acceptable if plateau detection is conservative
@@ -831,9 +919,16 @@ fn test_iteration_metrics() {
     assert_eq!(metrics.iterations, 3);
     assert!((metrics.final_pass_rate - 0.9).abs() < 0.001);
     // Check improvement from first to last
-    let improvement = metrics.pass_rate_history.last().unwrap() - metrics.pass_rate_history.first().unwrap();
-    assert!((improvement - 0.4).abs() < 0.001, "Should improve 0.5 -> 0.9 = 0.4");
-    assert!(!metrics.has_plateau(3), "Should not be plateau with 0.4 improvement");
+    let improvement =
+        metrics.pass_rate_history.last().unwrap() - metrics.pass_rate_history.first().unwrap();
+    assert!(
+        (improvement - 0.4).abs() < 0.001,
+        "Should improve 0.5 -> 0.9 = 0.4"
+    );
+    assert!(
+        !metrics.has_plateau(3),
+        "Should not be plateau with 0.4 improvement"
+    );
 }
 
 /// Test plateau detection in metrics
@@ -865,7 +960,10 @@ fn test_metrics_plateau_detection() {
     metrics.record_iteration(&iter2);
     metrics.record_iteration(&iter3);
 
-    assert!(metrics.has_plateau(3), "Should detect plateau with <1% improvement within window");
+    assert!(
+        metrics.has_plateau(3),
+        "Should detect plateau with <1% improvement within window"
+    );
 }
 
 // =============================================================================
@@ -894,9 +992,14 @@ fn test_complete_backtest_workflow() {
         fs::write(
             temp_dir.path().join(format!("transactions_{}.csv", i)),
             valid_content,
-        ).unwrap();
+        )
+        .unwrap();
     }
-    fs::write(temp_dir.path().join("transactions_bad.csv"), invalid_content).unwrap();
+    fs::write(
+        temp_dir.path().join("transactions_bad.csv"),
+        invalid_content,
+    )
+    .unwrap();
 
     // Create parser
     let parser = RealCsvParser::new(
@@ -913,10 +1016,12 @@ fn test_complete_backtest_workflow() {
     let files: Vec<FileInfo> = (1..=5)
         .map(|i| format!("transactions_{}.csv", i))
         .chain(std::iter::once("transactions_bad.csv".to_string()))
-        .map(|name| FileInfo::new(
-            temp_dir.path().join(&name).to_string_lossy().to_string(),
-            100,
-        ))
+        .map(|name| {
+            FileInfo::new(
+                temp_dir.path().join(&name).to_string_lossy().to_string(),
+                100,
+            )
+        })
         .collect();
 
     let table = HighFailureTable::in_memory().unwrap();
@@ -932,8 +1037,10 @@ fn test_complete_backtest_workflow() {
             assert_eq!(metrics.files_failed, 1, "Should have 1 failing file");
 
             // Verify the bad file is in failure summary
-            assert!(metrics.failure_summary.total_failures >= 1,
-                    "Should have at least 1 failure");
+            assert!(
+                metrics.failure_summary.total_failures >= 1,
+                "Should have at least 1 failure"
+            );
         }
         other => panic!("Expected Complete, got {:?}", other),
     }
@@ -941,13 +1048,17 @@ fn test_complete_backtest_workflow() {
     // Verify high-failure table was updated
     let active = table.get_active(&scope_id).unwrap();
     assert_eq!(active.len(), 1, "Should have 1 file in high-failure table");
-    assert!(active[0].file_path.contains("transactions_bad"),
-            "Bad file should be tracked");
+    assert!(
+        active[0].file_path.contains("transactions_bad"),
+        "Bad file should be tracked"
+    );
 
     // Second backtest - high-failure file should be tested first
     let ordered = table.get_backtest_order(&files, &scope_id).unwrap();
-    assert!(ordered[0].path.contains("transactions_bad"),
-            "Bad file should be first in backtest order");
+    assert!(
+        ordered[0].path.contains("transactions_bad"),
+        "Bad file should be first in backtest order"
+    );
 
     // Run again with fail-fast
     let strict_config = FailFastConfig {
@@ -957,12 +1068,16 @@ fn test_complete_backtest_workflow() {
         min_high_failure_files: 1,
     };
 
-    let result2 = backtest_with_failfast(&parser, &ordered, &table, &scope_id, 1, 2, &strict_config).unwrap();
+    let result2 =
+        backtest_with_failfast(&parser, &ordered, &table, &scope_id, 1, 2, &strict_config).unwrap();
 
     // Should stop early because high-failure file still fails
     match result2 {
         BacktestResult::EarlyStopped { files_tested, .. } => {
-            assert!(files_tested <= 2, "Should stop early after testing high-failure file");
+            assert!(
+                files_tested <= 2,
+                "Should stop early after testing high-failure file"
+            );
         }
         BacktestResult::Complete { .. } => {
             // May complete if failfast doesn't trigger
@@ -998,7 +1113,10 @@ fn test_handles_missing_files_gracefully() {
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
-            assert_eq!(metrics.files_failed, 2, "Both files should fail (not found)");
+            assert_eq!(
+                metrics.files_failed, 2,
+                "Both files should fail (not found)"
+            );
             assert_eq!(metrics.files_passed, 0);
         }
         other => panic!("Expected Complete with failures, got {:?}", other),
@@ -1025,8 +1143,10 @@ fn test_handles_empty_file_list() {
     match result {
         BacktestResult::Complete { metrics, .. } => {
             assert_eq!(metrics.files_tested, 0);
-            assert!((metrics.pass_rate - 0.0).abs() < 0.001 || metrics.pass_rate.is_nan(),
-                    "Empty test should have 0 or NaN pass rate");
+            assert!(
+                (metrics.pass_rate - 0.0).abs() < 0.001 || metrics.pass_rate.is_nan(),
+                "Empty test should have 0 or NaN pass rate"
+            );
         }
         other => panic!("Expected Complete, got {:?}", other),
     }
@@ -1047,14 +1167,27 @@ fn test_handles_unreadable_files() {
     );
 
     let files = vec![FileInfo::new(
-        temp_dir.path().join("empty.csv").to_string_lossy().to_string(),
+        temp_dir
+            .path()
+            .join("empty.csv")
+            .to_string_lossy()
+            .to_string(),
         0,
     )];
 
     let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
+    let result = backtest_with_failfast(
+        &parser,
+        &files,
+        &table,
+        &scope_id,
+        1,
+        1,
+        &FailFastConfig::default(),
+    )
+    .unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1071,29 +1204,47 @@ fn test_handles_malformed_csv() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create files with various malformed content
-    create_test_files(&temp_dir, &[
-        ("wrong_columns.csv", "a,b,c\n1,2,3\n"),           // Wrong column names
-        ("missing_values.csv", "id,value\n1\n2,3\n"),       // Inconsistent column counts
-        ("extra_columns.csv", "id,value\n1,2,3,4,5\n"),    // Extra columns in data
-    ]);
+    create_test_files(
+        &temp_dir,
+        &[
+            ("wrong_columns.csv", "a,b,c\n1,2,3\n"), // Wrong column names
+            ("missing_values.csv", "id,value\n1\n2,3\n"), // Inconsistent column counts
+            ("extra_columns.csv", "id,value\n1,2,3,4,5\n"), // Extra columns in data
+        ],
+    );
 
     let parser = RealCsvParser::new(
         vec!["id", "value"],
         vec![ExpectedType::Integer, ExpectedType::Integer],
     );
 
-    let files: Vec<FileInfo> = ["wrong_columns.csv", "missing_values.csv", "extra_columns.csv"]
-        .iter()
-        .map(|name| FileInfo::new(
+    let files: Vec<FileInfo> = [
+        "wrong_columns.csv",
+        "missing_values.csv",
+        "extra_columns.csv",
+    ]
+    .iter()
+    .map(|name| {
+        FileInfo::new(
             temp_dir.path().join(name).to_string_lossy().to_string(),
             100,
-        ))
-        .collect();
+        )
+    })
+    .collect();
 
     let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
+    let result = backtest_with_failfast(
+        &parser,
+        &files,
+        &table,
+        &scope_id,
+        1,
+        1,
+        &FailFastConfig::default(),
+    )
+    .unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1109,10 +1260,13 @@ fn test_failure_categories_recorded_correctly() {
     let temp_dir = TempDir::new().unwrap();
 
     // Create files that will fail for different reasons
-    create_test_files(&temp_dir, &[
-        ("type_error.csv", "id,value\n1,not_int\n"),        // Type mismatch
-        ("column_error.csv", "wrong_header\n1\n"),          // Schema violation
-    ]);
+    create_test_files(
+        &temp_dir,
+        &[
+            ("type_error.csv", "id,value\n1,not_int\n"), // Type mismatch
+            ("column_error.csv", "wrong_header\n1\n"),   // Schema violation
+        ],
+    );
 
     let parser = RealCsvParser::new(
         vec!["id", "value"],
@@ -1121,20 +1275,35 @@ fn test_failure_categories_recorded_correctly() {
 
     let files: Vec<FileInfo> = ["type_error.csv", "column_error.csv"]
         .iter()
-        .map(|name| FileInfo::new(
-            temp_dir.path().join(name).to_string_lossy().to_string(),
-            100,
-        ))
+        .map(|name| {
+            FileInfo::new(
+                temp_dir.path().join(name).to_string_lossy().to_string(),
+                100,
+            )
+        })
         .collect();
 
     let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let _ = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
+    let _ = backtest_with_failfast(
+        &parser,
+        &files,
+        &table,
+        &scope_id,
+        1,
+        1,
+        &FailFastConfig::default(),
+    )
+    .unwrap();
 
     // Check that failures were recorded with correct categories
     let all_failures = table.get_all(&scope_id).unwrap();
-    assert_eq!(all_failures.len(), 2, "Should have 2 files in failure table");
+    assert_eq!(
+        all_failures.len(),
+        2,
+        "Should have 2 files in failure table"
+    );
 
     // Verify categories are recorded
     for failure in &all_failures {
@@ -1159,16 +1328,31 @@ fn test_handles_large_file_count() {
     );
 
     let files: Vec<FileInfo> = (0..100)
-        .map(|i| FileInfo::new(
-            temp_dir.path().join(format!("file_{}.csv", i)).to_string_lossy().to_string(),
-            content.len() as u64,
-        ))
+        .map(|i| {
+            FileInfo::new(
+                temp_dir
+                    .path()
+                    .join(format!("file_{}.csv", i))
+                    .to_string_lossy()
+                    .to_string(),
+                content.len() as u64,
+            )
+        })
         .collect();
 
     let table = HighFailureTable::in_memory().unwrap();
     let scope_id = ScopeId::new();
 
-    let result = backtest_with_failfast(&parser, &files, &table, &scope_id, 1, 1, &FailFastConfig::default()).unwrap();
+    let result = backtest_with_failfast(
+        &parser,
+        &files,
+        &table,
+        &scope_id,
+        1,
+        1,
+        &FailFastConfig::default(),
+    )
+    .unwrap();
 
     match result {
         BacktestResult::Complete { metrics, .. } => {
@@ -1193,7 +1377,9 @@ fn test_no_duplicate_failure_records() {
             FailureCategory::TypeMismatch,
             format!("Failure at iteration {}", i),
         );
-        table.record_failure("/data/repeated.csv", &scope_id, entry).unwrap();
+        table
+            .record_failure("/data/repeated.csv", &scope_id, entry)
+            .unwrap();
     }
 
     // Should be only 1 file, not 5
@@ -1223,14 +1409,22 @@ fn test_loop_handles_parser_errors() {
         }
     }
     impl MutableParser for ErrorParser {
-        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool { true }
-        fn version(&self) -> usize { 0 }
+        fn apply_fixes(&mut self, _: &BacktestIteration) -> bool {
+            true
+        }
+        fn version(&self) -> usize {
+            0
+        }
     }
 
     let mut parser = ErrorParser;
 
     let files = vec![FileInfo::new(
-        temp_dir.path().join("test.csv").to_string_lossy().to_string(),
+        temp_dir
+            .path()
+            .join("test.csv")
+            .to_string_lossy()
+            .to_string(),
         100,
     )];
 
