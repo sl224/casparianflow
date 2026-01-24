@@ -46,6 +46,7 @@ fn main() -> anyhow::Result<()> {
     let config = SentinelConfig {
         bind_addr: args.bind,
         database_url: database,
+        control_addr: None,
         max_workers: args.max_workers,
     };
 

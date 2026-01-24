@@ -6,7 +6,7 @@
 //! - **Graceful Shutdown**: SIGINT/SIGTERM handling with timeout
 //! - **CLI Commands**: Standalone utilities for file discovery and preview
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use casparian_sentinel::{Sentinel, SentinelArgs, SentinelConfig};
 use casparian_worker::{bridge, Worker, WorkerArgs, WorkerConfig};
 use clap::{Parser, Subcommand};
@@ -789,8 +789,13 @@ fn run_unified(
     std::fs::create_dir_all(&output)?;
 
     let addr = addr.unwrap_or_else(get_default_ipc_addr);
+    let control_addr = Some("tcp://127.0.0.1:5556".to_string());
     info!("Starting Unified Casparian Stack (Split-Runtime Architecture)");
     info!("Transport: {}", addr);
+    info!(
+        "Control API: {}",
+        control_addr.as_deref().unwrap_or("disabled")
+    );
     info!("Database: {}", db_path.display());
     info!("Output: {}", output.display());
 
@@ -837,6 +842,7 @@ fn run_unified(
         let config = SentinelConfig {
             bind_addr: sentinel_addr,
             database_url: sentinel_db,
+            control_addr,
             max_workers: 1,
         };
 
@@ -962,6 +968,7 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
     let config = SentinelConfig {
         bind_addr: args.bind,
         database_url,
+        control_addr: None,
         max_workers: args.max_workers,
     };
     let mut sentinel = Sentinel::bind(config)?;

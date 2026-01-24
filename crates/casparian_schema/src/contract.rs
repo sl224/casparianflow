@@ -5,6 +5,7 @@
 
 use crate::ids::{ContractId, SchemaId, SchemaTimestamp};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// A schema contract - the binding agreement between user intent and parser output.
 ///
@@ -137,18 +138,34 @@ impl LockedSchema {
 
     /// Compute a content hash for the schema
     fn compute_hash(name: &str, columns: &[LockedColumn]) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        name.hash(&mut hasher);
-        for col in columns {
-            col.name.hash(&mut hasher);
-            format!("{:?}", col.data_type).hash(&mut hasher);
-            col.nullable.hash(&mut hasher);
-            col.format.hash(&mut hasher);
+        #[derive(Serialize)]
+        struct HashColumn<'a> {
+            name: &'a str,
+            data_type: &'a DataType,
+            nullable: bool,
+            format: Option<&'a str>,
         }
-        format!("{:016x}", hasher.finish())
+
+        #[derive(Serialize)]
+        struct HashSchema<'a> {
+            name: &'a str,
+            columns: Vec<HashColumn<'a>>,
+        }
+
+        let columns = columns
+            .iter()
+            .map(|col| HashColumn {
+                name: col.name.as_str(),
+                data_type: &col.data_type,
+                nullable: col.nullable,
+                format: col.format.as_deref(),
+            })
+            .collect();
+
+        let payload = HashSchema { name, columns };
+        let json = serde_json::to_vec(&payload)
+            .expect("LockedSchema hash serialization should never fail");
+        format!("{:x}", Sha256::digest(&json))
     }
 
     /// Check if data columns match this schema
@@ -439,6 +456,81 @@ mod tests {
     }
 
     #[test]
+    fn test_content_hash_stable() {
+        let schema_a = LockedSchema::new(
+            "events",
+            vec![
+                LockedColumn::required("id", DataType::Int64),
+                LockedColumn::optional("name", DataType::String),
+            ],
+        );
+        let schema_b = LockedSchema::new(
+            "events",
+            vec![
+                LockedColumn::required("id", DataType::Int64),
+                LockedColumn::optional("name", DataType::String),
+            ],
+        );
+        assert_eq!(schema_a.content_hash, schema_b.content_hash);
+        assert_eq!(schema_a.content_hash.len(), 64);
+    }
+
+    #[test]
+    fn test_content_hash_column_order_matters() {
+        let schema_a = LockedSchema::new(
+            "events",
+            vec![
+                LockedColumn::required("id", DataType::Int64),
+                LockedColumn::required("name", DataType::String),
+            ],
+        );
+        let schema_b = LockedSchema::new(
+            "events",
+            vec![
+                LockedColumn::required("name", DataType::String),
+                LockedColumn::required("id", DataType::Int64),
+            ],
+        );
+        assert_ne!(schema_a.content_hash, schema_b.content_hash);
+    }
+
+    #[test]
+    fn test_content_hash_nullable_and_format_change() {
+        let schema_nullable = LockedSchema::new(
+            "events",
+            vec![LockedColumn::optional("ts", DataType::Timestamp)],
+        );
+        let schema_required = LockedSchema::new(
+            "events",
+            vec![LockedColumn::required("ts", DataType::Timestamp)],
+        );
+        assert_ne!(schema_nullable.content_hash, schema_required.content_hash);
+
+        let schema_format_a = LockedSchema::new(
+            "events",
+            vec![LockedColumn::required("ts", DataType::Timestamp).with_format("%Y-%m-%d")],
+        );
+        let schema_format_b = LockedSchema::new(
+            "events",
+            vec![LockedColumn::required("ts", DataType::Timestamp).with_format("%Y-%m-%d %H:%M:%S")],
+        );
+        assert_ne!(schema_format_a.content_hash, schema_format_b.content_hash);
+    }
+
+    #[test]
+    fn test_content_hash_ignores_description() {
+        let mut with_desc = LockedColumn::required("id", DataType::Int64);
+        with_desc = with_desc.with_description("primary id");
+        let schema_with_desc = LockedSchema::new("events", vec![with_desc]);
+
+        let schema_without_desc = LockedSchema::new(
+            "events",
+            vec![LockedColumn::required("id", DataType::Int64)],
+        );
+        assert_eq!(schema_with_desc.content_hash, schema_without_desc.content_hash);
+    }
+
+    #[test]
     fn test_data_type_validation() {
         assert!(DataType::Int64.validate_string("123"));
         assert!(DataType::Int64.validate_string("-456"));
@@ -455,7 +547,7 @@ mod tests {
         assert!(!DataType::Boolean.validate_string("maybe"));
 
         assert!(DataType::Date.validate_string("2024-01-15"));
-        assert!(DataType::Date.validate_string("01/15/2024"));
+        assert!(!DataType::Date.validate_string("01/15/2024"));
         assert!(!DataType::Date.validate_string("not a date"));
     }
 

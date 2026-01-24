@@ -212,7 +212,10 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     } else if args.all {
         // --all flag: query all sources
         (sources.iter().map(|s| s.id.clone()).collect(), None, None)
-    } else if let Some(default_source) = context::get_default_source() {
+    } else if let Some(default_source) = context::get_default_source().map_err(|e| {
+        HelpfulError::new(format!("Failed to load context: {}", e))
+            .with_suggestion("TRY: Delete ~/.casparian_flow/context.toml to reset".to_string())
+    })? {
         // Use default context
         let source = find_source(&sources, &default_source);
         match source {
@@ -223,7 +226,10 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
             ),
             None => {
                 // Default source no longer exists - clear it and show all
-                let _ = context::clear_default_source();
+                context::clear_default_source().map_err(|e| {
+                    HelpfulError::new(format!("Failed to clear context: {}", e))
+                        .with_suggestion("TRY: Delete ~/.casparian_flow/context.toml to reset".to_string())
+                })?;
                 (sources.iter().map(|s| s.id.clone()).collect(), None, None)
             }
         }

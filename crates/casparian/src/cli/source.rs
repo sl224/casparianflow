@@ -458,14 +458,19 @@ fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
     // If no name provided, show current context
     if name.is_none() {
         match context::get_default_source() {
-            Some(source_name) => {
+            Ok(Some(source_name)) => {
                 println!("Current source: {}", source_name);
             }
-            None => {
+            Ok(None) => {
                 println!("No default source set.");
                 println!();
                 println!("Set a default with:");
                 println!("  casparian source use <name>");
+            }
+            Err(err) => {
+                return Err(HelpfulError::new(format!("Failed to load context: {}", err))
+                    .with_suggestion("TRY: Delete ~/.casparian_flow/context.toml to reset".to_string())
+                    .into());
             }
         }
         return Ok(());

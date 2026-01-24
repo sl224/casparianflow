@@ -6,7 +6,7 @@
 //! They are scaffolding for active development. See specs/views/*.md.
 #![allow(dead_code)]
 
-use casparian_db::{DbConnection, DbValue};
+use casparian_db::{BackendError, DbConnection, DbValue};
 use casparian_protocol::{JobStatus as ProtocolJobStatus, ProcessingStatus};
 use chrono::{DateTime, Local};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -16,8 +16,15 @@ use std::sync::mpsc;
 use super::TuiArgs;
 use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
 use casparian::scout::{
-    scan_path, Database as ScoutDatabase,
-    ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source, SourceId, SourceType,
+    error::ScoutError,
+    patterns,
+    scan_path,
+    Database as ScoutDatabase,
+    ScanProgress as ScoutProgress,
+    Scanner as ScoutScanner,
+    Source,
+    SourceId,
+    SourceType,
     TaggingRuleId,
 };
 
@@ -1587,11 +1594,11 @@ pub struct App {
     /// Pending folder query (on-demand database query for navigation)
     pending_folder_query: Option<mpsc::Receiver<FolderQueryMessage>>,
     /// Pending sources load (non-blocking DB query)
-    pending_sources_load: Option<mpsc::Receiver<Vec<SourceInfo>>>,
+    pending_sources_load: Option<mpsc::Receiver<SourcesLoadMessage>>,
     /// Pending jobs load (non-blocking DB query)
-    pending_jobs_load: Option<mpsc::Receiver<Vec<JobInfo>>>,
+    pending_jobs_load: Option<mpsc::Receiver<JobsLoadMessage>>,
     /// Pending home stats load (non-blocking DB query)
-    pending_stats_load: Option<mpsc::Receiver<HomeStats>>,
+    pending_stats_load: Option<mpsc::Receiver<StatsLoadMessage>>,
     /// Last time jobs were polled (for incremental updates)
     last_jobs_poll: Option<std::time::Instant>,
     /// Profiler for frame timing and zone breakdown (F12 toggle)
@@ -1627,6 +1634,24 @@ enum FolderQueryMessage {
         total_count: usize,
     },
     /// Error during query
+    Error(String),
+}
+
+/// Message for sources load
+enum SourcesLoadMessage {
+    Complete(Vec<SourceInfo>),
+    Error(String),
+}
+
+/// Message for jobs load
+enum JobsLoadMessage {
+    Complete(Vec<JobInfo>),
+    Error(String),
+}
+
+/// Message for stats load
+enum StatsLoadMessage {
+    Complete(HomeStats),
     Error(String),
 }
 
@@ -1674,6 +1699,7 @@ struct GlobSearchResult {
     folders: Vec<FsEntry>,
     total_count: usize,
     pattern: String,
+    error: Option<String>,
 }
 
 /// Result of background Rule Builder pattern search
@@ -1681,6 +1707,7 @@ struct RuleBuilderSearchResult {
     folder_matches: Vec<super::extraction::FolderMatch>,
     total_count: usize,
     pattern: String,
+    error: Option<String>,
 }
 
 impl App {
@@ -1701,8 +1728,12 @@ impl App {
         }
 
         let conn = match App::open_db_readonly_with(backend, &path) {
-            Some(conn) => conn,
-            None => return,
+            Ok(Some(conn)) => conn,
+            Ok(None) => return,
+            Err(err) => {
+                self.report_db_error("Failed to open database", err);
+                return;
+            }
         };
 
         let required_tables = [
@@ -1714,13 +1745,17 @@ impl App {
             "schema_migrations",
         ];
 
-        let existing_tables = conn
-            .query_all(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
-                &[],
-            )
-            
-            .unwrap_or_default()
+        let rows = match conn.query_all(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
+            &[],
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                self.report_db_error("Failed to read database tables", err);
+                return;
+            }
+        };
+        let existing_tables = rows
             .into_iter()
             .filter_map(|row| row.get::<String>(0).ok())
             .map(|t| t.to_lowercase())
@@ -1886,83 +1921,89 @@ impl App {
         }
     }
 
-    fn open_db_readonly(&self) -> Option<DbConnection> {
+    fn open_db_readonly(&self) -> Result<Option<DbConnection>, BackendError> {
         let (backend, path) = self.resolve_db_target();
         Self::open_db_readonly_with(backend, &path)
     }
 
-    fn open_db_write(&self) -> Option<DbConnection> {
+    fn open_db_write(&self) -> Result<Option<DbConnection>, BackendError> {
         if self.db_read_only {
-            return None;
+            return Ok(None);
         }
         let (backend, path) = self.resolve_db_target();
         Self::open_db_write_with(backend, &path)
     }
 
-    fn open_scout_db_for_writes(&self) -> Option<ScoutDatabase> {
+    fn open_scout_db_for_writes(&self) -> Result<Option<ScoutDatabase>, ScoutError> {
         if self.db_read_only {
-            return None;
+            return Ok(None);
         }
         let (_backend, path) = self.resolve_db_target();
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        ScoutDatabase::open(&path).ok()
+        Ok(Some(ScoutDatabase::open(&path)?))
     }
 
-    fn open_db_readonly_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
+    fn open_db_readonly_with(
+        backend: DbBackend,
+        path: &std::path::Path,
+    ) -> Result<Option<DbConnection>, BackendError> {
         if !path.exists() {
-            return None;
+            return Ok(None);
         }
 
         let _ = backend;
         #[cfg(feature = "duckdb")]
         {
-            DbConnection::open_duckdb_readonly(path).ok()
+            DbConnection::open_duckdb_readonly(path).map(Some)
         }
         #[cfg(not(feature = "duckdb"))]
         {
-            None
+            Ok(None)
         }
     }
 
-    fn open_db_write_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
+    fn open_db_write_with(
+        backend: DbBackend,
+        path: &std::path::Path,
+    ) -> Result<Option<DbConnection>, BackendError> {
         if !path.exists() {
-            return None;
+            return Ok(None);
         }
 
         let _ = backend;
         #[cfg(feature = "duckdb")]
         {
-            DbConnection::open_duckdb(path).ok()
+            DbConnection::open_duckdb(path).map(Some)
         }
         #[cfg(not(feature = "duckdb"))]
         {
-            None
+            Ok(None)
         }
     }
 
-    fn table_exists(conn: &DbConnection, table: &str) -> bool {
+    fn table_exists(conn: &DbConnection, table: &str) -> Result<bool, BackendError> {
         let query =
             "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?"
                 .to_string();
         let params = vec![DbValue::from(table)];
 
-        conn.query_optional(&query, &params)
-            
-            .map(|row| row.is_some())
-            .unwrap_or(false)
+        conn.query_optional(&query, &params).map(|row| row.is_some())
     }
 
-    fn column_exists(conn: &DbConnection, table: &str, column: &str) -> bool {
+    fn report_db_error(&mut self, context: &str, err: impl std::fmt::Display) {
+        self.discover
+            .status_message
+            .replace((format!("{}: {}", context, err), true));
+    }
+
+    fn column_exists(conn: &DbConnection, table: &str, column: &str) -> Result<bool, BackendError> {
         let query = "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?"
             .to_string();
         let params = vec![DbValue::from(table), DbValue::from(column)];
 
-        conn.query_optional(&query, &params)
-            
-            .map(|row| row.is_some())
-            .unwrap_or(false)
+        conn.query_optional(&query, &params).map(|row| row.is_some())
     }
 
     /// Handle key event
@@ -5044,12 +5085,25 @@ impl App {
 
             std::thread::spawn(move || {
                 let conn = match App::open_db_readonly_with(backend, &db_path) {
-                    Some(conn) => conn,
-                    None => {
+                    Ok(Some(conn)) => conn,
+                    Ok(None) => {
                         let _ = tx.send(RuleBuilderSearchResult {
                             folder_matches: vec![],
                             total_count: 0,
                             pattern: pattern_for_msg,
+                            error: Some(format!(
+                                "Database not found at {}",
+                                db_path.display()
+                            )),
+                        });
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = tx.send(RuleBuilderSearchResult {
+                            folder_matches: vec![],
+                            total_count: 0,
+                            pattern: pattern_for_msg,
+                            error: Some(format!("Failed to open database: {}", err)),
                         });
                         return;
                     }
@@ -5063,9 +5117,31 @@ impl App {
                     })
                     .collect();
 
-                let total_count = query.count_files(&conn, source_id) as usize;
+                let total_count = match query.count_files(&conn, source_id) {
+                    Ok(count) => count as usize,
+                    Err(err) => {
+                        let _ = tx.send(RuleBuilderSearchResult {
+                            folder_matches: vec![],
+                            total_count: 0,
+                            pattern: pattern_for_msg,
+                            error: Some(format!("Failed to count files: {}", err)),
+                        });
+                        return;
+                    }
+                };
 
-                let results = query.search_files(&conn, source_id, 1000, 0);
+                let results = match query.search_files(&conn, source_id, 1000, 0) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        let _ = tx.send(RuleBuilderSearchResult {
+                            folder_matches: vec![],
+                            total_count: 0,
+                            pattern: pattern_for_msg,
+                            error: Some(format!("Failed to search files: {}", err)),
+                        });
+                        return;
+                    }
+                };
 
                 // Group by parent folder
                 let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
@@ -5103,6 +5179,7 @@ impl App {
                     folder_matches,
                     total_count,
                     pattern: pattern_for_msg,
+                    error: None,
                 });
             });
 
@@ -5652,19 +5729,8 @@ impl App {
                 || self.discover.filter.contains('?');
 
             if has_wildcards {
-                use globset::GlobBuilder;
-
-                let pattern = if self.discover.filter.contains('/') {
-                    self.discover.filter.clone()
-                } else {
-                    format!("**/{}", self.discover.filter)
-                };
-
-                match GlobBuilder::new(&pattern)
-                    .case_insensitive(true)
-                    .build()
-                    .map(|g| g.compile_matcher())
-                {
+                let pattern = patterns::normalize_glob_pattern(&self.discover.filter);
+                match patterns::build_matcher(&pattern) {
                     Ok(matcher) => {
                         tag_filtered
                             .into_iter()
@@ -5873,9 +5939,19 @@ impl App {
 
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Some(conn) => conn,
-                None => {
-                    let _ = tx.send(SampleEvalResult::Error("Database error: failed to open".to_string()));
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    let _ = tx.send(SampleEvalResult::Error(format!(
+                        "Database not found at {}",
+                        db_path.display()
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(SampleEvalResult::Error(format!(
+                        "Failed to open database: {}",
+                        err
+                    )));
                     return;
                 }
             };
@@ -5895,12 +5971,21 @@ impl App {
                 }
             };
 
-            let paths = super::pattern_query::sample_paths_for_eval(
+            let paths = match super::pattern_query::sample_paths_for_eval(
                 &conn,
                 source_id,
                 &glob_pattern,
                 &matcher,
-            );
+            ) {
+                Ok(paths) => paths,
+                Err(err) => {
+                    let _ = tx.send(SampleEvalResult::Error(format!(
+                        "Failed to sample paths: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
             if paths.is_empty() {
                 let _ = tx.send(SampleEvalResult::Error("No files to analyze".to_string()));
                 return;
@@ -5969,9 +6054,19 @@ impl App {
             let _ = tx.send(SchemaEvalResult::Started { job_id });
 
             let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Some(conn) => conn,
-                None => {
-                    let _ = tx.send(SchemaEvalResult::Error("Database error: failed to open".to_string()));
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    let _ = tx.send(SchemaEvalResult::Error(format!(
+                        "Database not found at {}",
+                        db_path.display()
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(SchemaEvalResult::Error(format!(
+                        "Failed to open database: {}",
+                        err
+                    )));
                     return;
                 }
             };
@@ -5992,7 +6087,16 @@ impl App {
             };
 
             let query = super::pattern_query::PatternQuery::from_glob(&glob_pattern);
-            let total_candidates = query.count_files(&conn, source_id) as usize;
+            let total_candidates = match query.count_files(&conn, source_id) {
+                Ok(count) => count as usize,
+                Err(err) => {
+                    let _ = tx.send(SchemaEvalResult::Error(format!(
+                        "Failed to count files: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
 
             let _ = tx.send(SchemaEvalResult::Progress {
                 progress: 0,
@@ -6006,7 +6110,16 @@ impl App {
             let mut matched_paths: Vec<String> = Vec::new();
 
             loop {
-                let results = query.search_files(&conn, source_id, batch_size, offset);
+                let results = match query.search_files(&conn, source_id, batch_size, offset) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        let _ = tx.send(SchemaEvalResult::Error(format!(
+                            "Failed to search files: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
 
                 if results.is_empty() {
                     break;
@@ -6387,9 +6500,15 @@ impl App {
         };
 
         let conn = match self.open_db_readonly() {
-            Some(conn) => conn,
-            None => {
+            Ok(Some(conn)) => conn,
+            Ok(None) => {
                 self.discover.scan_error = Some("No Scout database found. Press 's' to scan a folder.".to_string());
+                self.discover.data_loaded = true;
+                return;
+            }
+            Err(err) => {
+                self.report_db_error("Failed to open database", err);
+                self.discover.scan_error = Some("Database error while loading files".to_string());
                 self.discover.data_loaded = true;
                 return;
             }
@@ -6548,11 +6667,19 @@ impl App {
         // Spawn background task for database queries (live folder derivation)
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Some(conn) => conn,
-                None => {
-                    let _ = tx.send(CacheLoadMessage::Error(
-                        "Database error: failed to open".to_string()
-                    ));
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    let _ = tx.send(CacheLoadMessage::Error(format!(
+                        "Database not found at {}",
+                        db_path.display()
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(CacheLoadMessage::Error(format!(
+                        "Failed to open database: {}",
+                        err
+                    )));
                     return;
                 }
             };
@@ -6575,20 +6702,47 @@ impl App {
             let mut cache: HashMap<String, Vec<FsEntry>> = HashMap::new();
             cache.insert(String::new(), folder_infos);
 
-            let total_files: usize = conn.query_scalar::<i64>(
+            let total_files: usize = match conn.query_scalar::<i64>(
                 "SELECT file_count FROM scout_sources WHERE id = ?",
                 &[DbValue::Integer(source_id.as_i64())],
-            ).unwrap_or(0) as usize;
+            ) {
+                Ok(count) => count as usize,
+                Err(err) => {
+                    let _ = tx.send(CacheLoadMessage::Error(format!(
+                        "Failed to read source stats: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
 
-            let tag_rows = conn.query_all(
+            let tag_rows = match conn.query_all(
                 "SELECT tag, COUNT(*) as count FROM scout_files WHERE source_id = ? AND tag IS NOT NULL GROUP BY tag ORDER BY count DESC, tag",
                 &[DbValue::Integer(source_id.as_i64())],
-            ).unwrap_or_default();
+            ) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    let _ = tx.send(CacheLoadMessage::Error(format!(
+                        "Failed to load tags: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
 
-            let untagged_count: i64 = conn.query_scalar::<i64>(
+            let untagged_count: i64 = match conn.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND tag IS NULL",
                 &[DbValue::Integer(source_id.as_i64())],
-            ).unwrap_or(0);
+            ) {
+                Ok(count) => count,
+                Err(err) => {
+                    let _ = tx.send(CacheLoadMessage::Error(format!(
+                        "Failed to read untagged count: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
 
             // Build tags list
             let mut tags: Vec<TagInfo> = Vec::new();
@@ -6600,11 +6754,23 @@ impl App {
             for row in tag_rows {
                 let tag_name: String = match row.get(0) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(err) => {
+                        let _ = tx.send(CacheLoadMessage::Error(format!(
+                            "Failed to read tag name: {}",
+                            err
+                        )));
+                        return;
+                    }
                 };
                 let count: i64 = match row.get(1) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(err) => {
+                        let _ = tx.send(CacheLoadMessage::Error(format!(
+                            "Failed to read tag count: {}",
+                            err
+                        )));
+                        return;
+                    }
                 };
                 tags.push(TagInfo {
                     name: tag_name,
@@ -6712,20 +6878,55 @@ impl App {
 
                 std::thread::spawn(move || {
                     let conn = match App::open_db_readonly_with(backend, &db_path) {
-                        Some(conn) => conn,
-                        None => {
+                        Ok(Some(conn)) => conn,
+                        Ok(None) => {
                             let _ = tx.send(GlobSearchResult {
                                 folders: vec![],
                                 total_count: 0,
                                 pattern: pattern_for_search,
+                                error: Some(format!(
+                                    "Database not found at {}",
+                                    db_path.display()
+                                )),
+                            });
+                            return;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(GlobSearchResult {
+                                folders: vec![],
+                                total_count: 0,
+                                pattern: pattern_for_search,
+                                error: Some(format!("Failed to open database: {}", err)),
                             });
                             return;
                         }
                     };
 
-                    let count = query.count_files(&conn, source_id);
+                    let count = match query.count_files(&conn, source_id) {
+                        Ok(count) => count,
+                        Err(err) => {
+                            let _ = tx.send(GlobSearchResult {
+                                folders: vec![],
+                                total_count: 0,
+                                pattern: pattern_for_search,
+                                error: Some(format!("Failed to count files: {}", err)),
+                            });
+                            return;
+                        }
+                    };
 
-                    let results = query.search_files(&conn, source_id, 100, 0);
+                    let results = match query.search_files(&conn, source_id, 100, 0) {
+                        Ok(results) => results,
+                        Err(err) => {
+                            let _ = tx.send(GlobSearchResult {
+                                folders: vec![],
+                                total_count: 0,
+                                pattern: pattern_for_search,
+                                error: Some(format!("Failed to search files: {}", err)),
+                            });
+                            return;
+                        }
+                    };
 
                     // Convert to FsEntry for display
                     let folders: Vec<FsEntry> = results.into_iter()
@@ -6738,6 +6939,7 @@ impl App {
                         folders,
                         total_count: count as usize,
                         pattern: pattern_for_search,
+                        error: None,
                     });
                 });
 
@@ -6810,9 +7012,19 @@ impl App {
 
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Some(conn) => conn,
-                None => {
-                    let _ = tx.send(FolderQueryMessage::Error("Database error: failed to open".to_string()));
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    let _ = tx.send(FolderQueryMessage::Error(format!(
+                        "Database not found at {}",
+                        db_path.display()
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(FolderQueryMessage::Error(format!(
+                        "Failed to open database: {}",
+                        err
+                    )));
                     return;
                 }
             };
@@ -7065,8 +7277,21 @@ impl App {
         // Spawn background task for DB query
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Some(conn) => conn,
-                None => return,
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    let _ = tx.send(SourcesLoadMessage::Error(format!(
+                        "Database not found at {}",
+                        db_path.display()
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(SourcesLoadMessage::Error(format!(
+                        "Failed to open database: {}",
+                        err
+                    )));
+                    return;
+                }
             };
 
             // Use denormalized file_count column (O(n) instead of O(n×m))
@@ -7077,40 +7302,73 @@ impl App {
                 ORDER BY updated_at DESC
             "#;
 
-            if let Ok(rows) = conn.query_all(query, &[]) {
-                let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let id_raw: String = match row.get(0) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let id = match SourceId::try_from(id_raw) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let name: String = match row.get(1) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let path: String = match row.get(2) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let file_count: i64 = match row.get(3) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-
-                    sources.push(SourceInfo {
-                        id,
-                        name,
-                        path: std::path::PathBuf::from(path),
-                        file_count: file_count as usize,
-                    });
+            let rows = match conn.query_all(query, &[]) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    let _ = tx.send(SourcesLoadMessage::Error(format!(
+                        "Failed to load sources: {}",
+                        err
+                    )));
+                    return;
                 }
+            };
 
-                let _ = tx.send(sources);
+            let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id_raw: String = match row.get(0) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(SourcesLoadMessage::Error(format!(
+                            "Failed to read source id: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let id = match SourceId::try_from(id_raw) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let name: String = match row.get(1) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(SourcesLoadMessage::Error(format!(
+                            "Failed to read source name: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let path: String = match row.get(2) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(SourcesLoadMessage::Error(format!(
+                            "Failed to read source path: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let file_count: i64 = match row.get(3) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(SourcesLoadMessage::Error(format!(
+                            "Failed to read source file count: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+
+                sources.push(SourceInfo {
+                    id,
+                    name,
+                    path: std::path::PathBuf::from(path),
+                    file_count: file_count as usize,
+                });
             }
+
+            let _ = tx.send(SourcesLoadMessage::Complete(sources));
         });
     }
 
@@ -7134,14 +7392,54 @@ impl App {
         // Spawn background task for DB query
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Some(conn) => conn,
-                None => return,
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    let _ = tx.send(JobsLoadMessage::Error(format!(
+                        "Database not found at {}",
+                        db_path.display()
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(JobsLoadMessage::Error(format!(
+                        "Failed to open database: {}",
+                        err
+                    )));
+                    return;
+                }
             };
 
-            let has_pipeline_runs = App::table_exists(&conn, "cf_pipeline_runs");
+            let has_pipeline_runs = match App::table_exists(&conn, "cf_pipeline_runs") {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = tx.send(JobsLoadMessage::Error(format!(
+                        "Failed to inspect pipeline runs table: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
             let has_quarantine_column =
-                App::column_exists(&conn, "cf_processing_queue", "quarantine_rows");
-            let has_quarantine_table = App::table_exists(&conn, "cf_quarantine");
+                match App::column_exists(&conn, "cf_processing_queue", "quarantine_rows") {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to inspect processing queue schema: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+            let has_quarantine_table = match App::table_exists(&conn, "cf_quarantine") {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = tx.send(JobsLoadMessage::Error(format!(
+                        "Failed to inspect quarantine table: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
 
             let (quarantine_select, quarantine_join) = if has_quarantine_column {
                 ("q.quarantine_rows", "")
@@ -7246,56 +7544,109 @@ impl App {
 
             let rows = match conn.query_all(&query, &[]) {
                 Ok(rows) => rows,
-                Err(_) => return,
+                Err(err) => {
+                    let _ = tx.send(JobsLoadMessage::Error(format!(
+                        "Failed to load jobs: {}",
+                        err
+                    )));
+                    return;
+                }
             };
 
-            if !rows.is_empty() {
-                let mut jobs: Vec<JobInfo> = Vec::with_capacity(rows.len());
-                for row in rows {
-                    let id: i64 = match row.get(0) {
-                        Ok(v) => v,
-                        Err(_) => return,
+            let mut jobs: Vec<JobInfo> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = match row.get(0) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job id: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let file_id: Option<i64> = match row.get(1) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job file id: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let plugin_name: String = match row.get(2) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job plugin name: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let status_str: String = match row.get(3) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job status: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let claim_time: Option<String> = match row.get(4) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job claim time: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let end_time: Option<String> = match row.get(5) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job end time: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let result_summary: Option<String> = match row.get(6) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job summary: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let error_message: Option<String> = match row.get(7) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(JobsLoadMessage::Error(format!(
+                            "Failed to read job error: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let completion_status: Option<String> = row.get(8).ok().flatten();
+                let (pipeline_run_id, logical_date, selection_snapshot_hash, quarantine_rows) =
+                    if has_pipeline_runs {
+                        (
+                            row.get(9).ok(),
+                            row.get(10).ok(),
+                            row.get(11).ok(),
+                            row.get(12).ok(),
+                        )
+                    } else {
+                        (None, None, None, row.get(9).ok())
                     };
-                    let file_id: Option<i64> = match row.get(1) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let plugin_name: String = match row.get(2) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let status_str: String = match row.get(3) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let claim_time: Option<String> = match row.get(4) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let end_time: Option<String> = match row.get(5) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let result_summary: Option<String> = match row.get(6) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let error_message: Option<String> = match row.get(7) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let completion_status: Option<String> = row.get(8).ok().flatten();
-                    let (pipeline_run_id, logical_date, selection_snapshot_hash, quarantine_rows) =
-                        if has_pipeline_runs {
-                            (
-                                row.get(9).ok(),
-                                row.get(10).ok(),
-                                row.get(11).ok(),
-                                row.get(12).ok(),
-                            )
-                        } else {
-                            (None, None, None, row.get(9).ok())
-                        };
 
                     // Map queue status + completion_status to UI status
                     let status = JobStatus::from_db_status(&status_str, completion_status.as_deref());
@@ -7319,31 +7670,30 @@ impl App {
                         vec![]
                     };
 
-                    jobs.push(JobInfo {
-                        id,
-                        file_id,
-                        job_type: JobType::Parse,
-                        name: plugin_name,
-                        version: None,
-                        status,
-                        started_at,
-                        completed_at,
-                        pipeline_run_id,
-                        logical_date,
-                        selection_snapshot_hash,
-                        quarantine_rows,
-                        items_total: 0,
-                        items_processed: if result_summary.is_some() { 1 } else { 0 },
-                        items_failed: if error_message.is_some() { 1 } else { 0 },
-                        output_path: None,
-                        output_size_bytes: None,
-                        backtest: None,
-                        failures,
-                    });
-                }
-
-                let _ = tx.send(jobs);
+                jobs.push(JobInfo {
+                    id,
+                    file_id,
+                    job_type: JobType::Parse,
+                    name: plugin_name,
+                    version: None,
+                    status,
+                    started_at,
+                    completed_at,
+                    pipeline_run_id,
+                    logical_date,
+                    selection_snapshot_hash,
+                    quarantine_rows,
+                    items_total: 0,
+                    items_processed: if result_summary.is_some() { 1 } else { 0 },
+                    items_failed: if error_message.is_some() { 1 } else { 0 },
+                    output_path: None,
+                    output_size_bytes: None,
+                    backtest: None,
+                    failures,
+                });
             }
+
+            let _ = tx.send(JobsLoadMessage::Complete(jobs));
         });
     }
 
@@ -7393,55 +7743,112 @@ impl App {
         // Spawn background task for DB query
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Some(conn) => conn,
-                None => return,
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    let _ = tx.send(StatsLoadMessage::Error(format!(
+                        "Database not found at {}",
+                        db_path.display()
+                    )));
+                    return;
+                }
+                Err(err) => {
+                    let _ = tx.send(StatsLoadMessage::Error(format!(
+                        "Failed to open database: {}",
+                        err
+                    )));
+                    return;
+                }
             };
 
             let mut stats = HomeStats::default();
 
-            if let Ok(count) = conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_files", &[]) {
-                stats.file_count = count as usize;
-            }
+            let file_count = match conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_files", &[]) {
+                Ok(count) => count,
+                Err(err) => {
+                    let _ = tx.send(StatsLoadMessage::Error(format!(
+                        "Failed to read file stats: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+            stats.file_count = file_count as usize;
 
-            if let Ok(count) = conn.query_scalar::<i64>(
+            let source_count = match conn.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM scout_sources WHERE enabled = 1",
                 &[],
             ) {
-                stats.source_count = count as usize;
-            }
+                Ok(count) => count,
+                Err(err) => {
+                    let _ = tx.send(StatsLoadMessage::Error(format!(
+                        "Failed to read source stats: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+            stats.source_count = source_count as usize;
 
-            if let Ok(rows) = conn.query_all(
+            let rows = match conn.query_all(
                 "SELECT status, COUNT(*) as cnt FROM cf_processing_queue GROUP BY status",
                 &[],
             ) {
-                for row in rows {
-                    let status: String = match row.get(0) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    let count: i64 = match row.get(1) {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    if let Ok(queue_status) = status.parse::<ProcessingStatus>() {
-                        match queue_status {
-                            ProcessingStatus::Running => stats.running_jobs = count as usize,
-                            ProcessingStatus::Queued => stats.pending_jobs = count as usize,
-                            ProcessingStatus::Failed => stats.failed_jobs = count as usize,
-                            _ => {}
-                        }
+                Ok(rows) => rows,
+                Err(err) => {
+                    let _ = tx.send(StatsLoadMessage::Error(format!(
+                        "Failed to read job stats: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+            for row in rows {
+                let status: String = match row.get(0) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(StatsLoadMessage::Error(format!(
+                            "Failed to read job status: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                let count: i64 = match row.get(1) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.send(StatsLoadMessage::Error(format!(
+                            "Failed to read job counts: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+                if let Ok(queue_status) = status.parse::<ProcessingStatus>() {
+                    match queue_status {
+                        ProcessingStatus::Running => stats.running_jobs = count as usize,
+                        ProcessingStatus::Queued => stats.pending_jobs = count as usize,
+                        ProcessingStatus::Failed => stats.failed_jobs = count as usize,
+                        _ => {}
                     }
                 }
             }
 
-            if let Ok(count) = conn.query_scalar::<i64>(
+            let parser_count = match conn.query_scalar::<i64>(
                 "SELECT COUNT(*) FROM cf_plugin_manifest",
                 &[],
             ) {
-                stats.parser_count = count as usize;
-            }
+                Ok(count) => count,
+                Err(err) => {
+                    let _ = tx.send(StatsLoadMessage::Error(format!(
+                        "Failed to read parser stats: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+            stats.parser_count = parser_count as usize;
 
-            let _ = tx.send(stats);
+            let _ = tx.send(StatsLoadMessage::Complete(stats));
         });
     }
 
@@ -7463,31 +7870,59 @@ impl App {
         }
 
         let db = match self.open_scout_db_for_writes() {
-            Some(db) => db,
-            None => return,
+            Ok(Some(db)) => db,
+            Ok(None) => return,
+            Err(err) => {
+                self.report_db_error("Failed to open database for writes", err);
+                return;
+            }
         };
         let conn = db.conn();
 
         // Persist tag updates to scout_files
         let tag_writes = std::mem::take(&mut self.discover.pending_tag_writes);
+        let mut failed_tag_writes = Vec::new();
         for write in tag_writes {
-            let _ = conn.execute(
+            let result = conn.execute(
                 "UPDATE scout_files SET tag = ? WHERE path = ?",
                 &[
-                    DbValue::Text(write.tag),
-                    DbValue::Text(write.file_path),
+                    DbValue::Text(write.tag.clone()),
+                    DbValue::Text(write.file_path.clone()),
                 ],
             );
+            match result {
+                Ok(0) => {
+                    self.discover.status_message = Some((
+                        format!("No file updated for tag write: {}", &write.file_path),
+                        true,
+                    ));
+                    failed_tag_writes.push(write);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.discover.status_message = Some((
+                        format!("Failed to tag file {}: {}", &write.file_path, err),
+                        true,
+                    ));
+                    failed_tag_writes.push(write);
+                }
+            }
         }
+        self.discover
+            .pending_tag_writes
+            .extend(failed_tag_writes);
 
         // Persist rules to scout_tagging_rules
         let rule_writes = std::mem::take(&mut self.discover.pending_rule_writes);
+        let mut failed_rule_writes = Vec::new();
         for write in rule_writes {
             let rule_id = TaggingRuleId::new();
-            let rule_name = format!("{} → {}", write.pattern, write.tag);
+            let pattern = write.pattern.clone();
+            let tag = write.tag.clone();
+            let rule_name = format!("{} → {}", &pattern, &tag);
             let now = chrono::Utc::now().timestamp();
 
-            let _ = conn.execute(
+            let result = conn.execute(
                 r#"INSERT OR IGNORE INTO scout_tagging_rules
                    (id, name, source_id, pattern, tag, priority, enabled, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, 100, 1, ?, ?)"#
@@ -7496,68 +7931,178 @@ impl App {
                     DbValue::Integer(rule_id.as_i64()),
                     DbValue::Text(rule_name),
                     DbValue::Integer(write.source_id.as_i64()),
-                    DbValue::Text(write.pattern),
-                    DbValue::Text(write.tag),
+                    DbValue::Text(pattern.clone()),
+                    DbValue::Text(tag.clone()),
                     DbValue::Integer(now),
                     DbValue::Integer(now),
                 ],
             );
+            if let Err(err) = result {
+                self.discover.status_message = Some((
+                    format!("Failed to save rule '{}': {}", pattern, err),
+                    true,
+                ));
+                failed_rule_writes.push(write);
+            }
         }
+        self.discover
+            .pending_rule_writes
+            .extend(failed_rule_writes);
 
         // Persist rule enabled toggles
         let rule_updates = std::mem::take(&mut self.discover.pending_rule_updates);
+        let mut failed_rule_updates = Vec::new();
         for update in rule_updates {
-            let _ = conn.execute(
+            let result = conn.execute(
                 "UPDATE scout_tagging_rules SET enabled = ? WHERE id = ?",
                 &[
                     DbValue::Integer(if update.enabled { 1 } else { 0 }),
                     DbValue::Integer(update.id.as_i64()),
                 ],
             );
+            match result {
+                Ok(0) => {
+                    self.discover.status_message = Some((
+                        format!("Rule not found for update: {}", update.id.as_i64()),
+                        true,
+                    ));
+                    failed_rule_updates.push(update);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.discover.status_message = Some((
+                        format!("Failed to update rule {}: {}", update.id.as_i64(), err),
+                        true,
+                    ));
+                    failed_rule_updates.push(update);
+                }
+            }
         }
+        self.discover
+            .pending_rule_updates
+            .extend(failed_rule_updates);
 
         // Persist rule deletes
         let rule_deletes = std::mem::take(&mut self.discover.pending_rule_deletes);
+        let mut failed_rule_deletes = Vec::new();
         for delete in rule_deletes {
-            let _ = conn.execute(
+            let result = conn.execute(
                 "DELETE FROM scout_tagging_rules WHERE id = ?",
                 &[DbValue::Integer(delete.id.as_i64())],
             );
+            match result {
+                Ok(0) => {
+                    self.discover.status_message = Some((
+                        format!("Rule not found for delete: {}", delete.id.as_i64()),
+                        true,
+                    ));
+                    failed_rule_deletes.push(delete);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    self.discover.status_message = Some((
+                        format!("Failed to delete rule {}: {}", delete.id.as_i64(), err),
+                        true,
+                    ));
+                    failed_rule_deletes.push(delete);
+                }
+            }
         }
+        self.discover
+            .pending_rule_deletes
+            .extend(failed_rule_deletes);
 
         let mut sources_changed = false;
 
         // Persist source creates
         let source_creates = std::mem::take(&mut self.discover.pending_source_creates);
+        let mut failed_source_creates = Vec::new();
         for source in source_creates {
-            if db.upsert_source(&source).is_ok() {
-                sources_changed = true;
+            match db.upsert_source(&source) {
+                Ok(_) => {
+                    sources_changed = true;
+                }
+                Err(err) => {
+                    self.discover.status_message = Some((
+                        format!("Failed to create source '{}': {}", source.name.as_str(), err),
+                        true,
+                    ));
+                    failed_source_creates.push(source);
+                }
             }
         }
+        self.discover
+            .pending_source_creates
+            .extend(failed_source_creates);
 
         // Persist source updates
         let source_updates = std::mem::take(&mut self.discover.pending_source_updates);
+        let mut failed_source_updates = Vec::new();
         for update in source_updates {
-            if let Ok(Some(mut source)) = db.get_source(&update.id) {
-                if let Some(name) = update.name {
-                    source.name = name;
+            match db.get_source(&update.id) {
+                Ok(Some(mut source)) => {
+                    if let Some(name) = update.name.clone() {
+                        source.name = name;
+                    }
+                    if let Some(path) = update.path.clone() {
+                        source.path = path;
+                    }
+                    match db.upsert_source(&source) {
+                        Ok(_) => sources_changed = true,
+                        Err(err) => {
+                            self.discover.status_message = Some((
+                                format!("Failed to update source {}: {}", update.id.as_i64(), err),
+                                true,
+                            ));
+                            failed_source_updates.push(update);
+                        }
+                    }
                 }
-                if let Some(path) = update.path {
-                    source.path = path;
+                Ok(None) => {
+                    self.discover.status_message = Some((
+                        format!("Source not found for update: {}", update.id.as_i64()),
+                        true,
+                    ));
+                    failed_source_updates.push(update);
                 }
-                if db.upsert_source(&source).is_ok() {
-                    sources_changed = true;
+                Err(err) => {
+                    self.discover.status_message = Some((
+                        format!("Failed to load source {}: {}", update.id.as_i64(), err),
+                        true,
+                    ));
+                    failed_source_updates.push(update);
                 }
             }
         }
+        self.discover
+            .pending_source_updates
+            .extend(failed_source_updates);
 
         // Persist source deletes
         let source_deletes = std::mem::take(&mut self.discover.pending_source_deletes);
+        let mut failed_source_deletes = Vec::new();
         for delete in source_deletes {
-            if db.delete_source(&delete.id).unwrap_or(false) {
-                sources_changed = true;
+            match db.delete_source(&delete.id) {
+                Ok(true) => sources_changed = true,
+                Ok(false) => {
+                    self.discover.status_message = Some((
+                        format!("Source not found for delete: {}", delete.id.as_i64()),
+                        true,
+                    ));
+                    failed_source_deletes.push(delete);
+                }
+                Err(err) => {
+                    self.discover.status_message = Some((
+                        format!("Failed to delete source {}: {}", delete.id.as_i64(), err),
+                        true,
+                    ));
+                    failed_source_deletes.push(delete);
+                }
             }
         }
+        self.discover
+            .pending_source_deletes
+            .extend(failed_source_deletes);
 
         // Touch source for MRU ordering (updates updated_at timestamp)
         if let Some(source_id) = std::mem::take(&mut self.discover.pending_source_touch) {
@@ -7569,9 +8114,25 @@ impl App {
                     DbValue::Integer(source_id.as_i64()),
                 ],
             );
-            // Trigger sources reload to reflect new MRU ordering
-            if result.is_ok() {
-                self.discover.sources_loaded = false;
+            match result {
+                Ok(0) => {
+                    self.discover.status_message = Some((
+                        format!("Source not found for touch: {}", source_id.as_i64()),
+                        true,
+                    ));
+                    self.discover.pending_source_touch = Some(source_id);
+                }
+                Ok(_) => {
+                    // Trigger sources reload to reflect new MRU ordering
+                    self.discover.sources_loaded = false;
+                }
+                Err(err) => {
+                    self.discover.status_message = Some((
+                        format!("Failed to touch source {}: {}", source_id.as_i64(), err),
+                        true,
+                    ));
+                    self.discover.pending_source_touch = Some(source_id);
+                }
             }
         }
 
@@ -7595,8 +8156,18 @@ impl App {
         };
 
         let conn = match self.open_db_readonly() {
-            Some(conn) => conn,
-            None => return,
+            Ok(Some(conn)) => conn,
+            Ok(None) => {
+                self.discover.status_message = Some((
+                    "No Scout database found. Press 's' to scan a folder.".to_string(),
+                    true,
+                ));
+                return;
+            }
+            Err(err) => {
+                self.report_db_error("Failed to open database", err);
+                return;
+            }
         };
 
         let query = r#"
@@ -7608,14 +8179,20 @@ impl App {
 
         let rows = match conn.query_all(query, &[DbValue::Integer(source_id.as_i64())]) {
             Ok(rows) => rows,
-            Err(_) => return,
+            Err(err) => {
+                self.discover.status_message = Some((format!("Failed to load rules: {}", err), true));
+                return;
+            }
         };
 
         let mut rules: Vec<RuleInfo> = Vec::with_capacity(rows.len());
         for row in rows {
             let id_raw: i64 = match row.get(0) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(err) => {
+                    self.discover.status_message = Some((format!("Failed to read rule id: {}", err), true));
+                    return;
+                }
             };
             let id = match TaggingRuleId::try_from(id_raw) {
                 Ok(v) => v,
@@ -7623,19 +8200,31 @@ impl App {
             };
             let pattern: String = match row.get(1) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(err) => {
+                    self.discover.status_message = Some((format!("Failed to read rule pattern: {}", err), true));
+                    return;
+                }
             };
             let tag: String = match row.get(2) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(err) => {
+                    self.discover.status_message = Some((format!("Failed to read rule tag: {}", err), true));
+                    return;
+                }
             };
             let priority: i32 = match row.get(3) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(err) => {
+                    self.discover.status_message = Some((format!("Failed to read rule priority: {}", err), true));
+                    return;
+                }
             };
             let enabled: bool = match row.get(4) {
                 Ok(v) => v,
-                Err(_) => return,
+                Err(err) => {
+                    self.discover.status_message = Some((format!("Failed to read rule enabled: {}", err), true));
+                    return;
+                }
             };
 
             rules.push(RuleInfo {
@@ -8273,8 +8862,13 @@ impl App {
         // Poll for pending stats load results (non-blocking)
         if let Some(ref mut rx) = self.pending_stats_load {
             match rx.try_recv() {
-                Ok(stats) => {
+                Ok(StatsLoadMessage::Complete(stats)) => {
                     self.home.stats = stats;
+                    self.home.stats_loaded = true;
+                    self.pending_stats_load = None;
+                }
+                Ok(StatsLoadMessage::Error(error)) => {
+                    self.discover.status_message = Some((error, true));
                     self.home.stats_loaded = true;
                     self.pending_stats_load = None;
                 }
@@ -8298,7 +8892,7 @@ impl App {
             };
 
             match recv_result {
-                Ok(sources) => {
+                Ok(SourcesLoadMessage::Complete(sources)) => {
                     self.discover.sources = sources;
                     self.discover.sources_loaded = true;
                     self.discover.validate_source_selection();
@@ -8328,6 +8922,11 @@ impl App {
                         self.discover.sources_filtering = false;
                         self.discover.preview_source = Some(self.discover.selected_source_index());
                     }
+                    self.pending_sources_load = None;
+                }
+                Ok(SourcesLoadMessage::Error(error)) => {
+                    self.discover.status_message = Some((error, true));
+                    self.discover.sources_loaded = true;
                     self.pending_sources_load = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -8371,11 +8970,16 @@ impl App {
             };
 
             match recv_result {
-                Ok(jobs) => {
+                Ok(JobsLoadMessage::Complete(jobs)) => {
                     self.jobs_state.jobs = jobs;
                     self.jobs_state.jobs_loaded = true;
                     self.last_jobs_poll = Some(std::time::Instant::now());
                     self.update_home_recent_jobs();
+                    self.pending_jobs_load = None;
+                }
+                Ok(JobsLoadMessage::Error(error)) => {
+                    self.discover.status_message = Some((error, true));
+                    self.jobs_state.jobs_loaded = true;
                     self.pending_jobs_load = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
@@ -8434,6 +9038,16 @@ impl App {
                         .unwrap_or_default();
 
                     if result.pattern == current_pattern {
+                        if let Some(error) = result.error {
+                            self.discover.status_message = Some((error, true));
+                            if let Some(ref mut explorer) = self.discover.glob_explorer {
+                                explorer.folders = Vec::new();
+                                explorer.total_count = GlobFileCount::Exact(0);
+                                explorer.selected_folder = 0;
+                            }
+                            self.pending_glob_search = None;
+                            return;
+                        }
                         // Search complete! Update explorer with results
                         if let Some(ref mut explorer) = self.discover.glob_explorer {
                             explorer.folders = result.folders;
@@ -8474,6 +9088,14 @@ impl App {
                         .unwrap_or_default();
 
                     if result.pattern == current_pattern || result.pattern == format!("**/{}", current_pattern) {
+                        if let Some(error) = result.error {
+                            self.discover.status_message = Some((error, true));
+                            if let Some(ref mut builder) = self.discover.rule_builder {
+                                builder.is_streaming = false;
+                            }
+                            self.pending_rule_builder_search = None;
+                            return;
+                        }
                         // Search complete! Update Rule Builder with results
                         let has_matches = result.total_count > 0;
                         if let Some(ref mut builder) = self.discover.rule_builder {
@@ -8869,12 +9491,22 @@ impl App {
                                 let final_file_count = files_persisted;
 
                                 let source_id = match self.open_scout_db_for_writes() {
-                                    Some(db) => match db.get_source_by_path(&source_path) {
+                                    Ok(Some(db)) => match db.get_source_by_path(&source_path) {
                                         Ok(Some(source)) => Some(source.id),
                                         Ok(None) => None,
-                                        Err(_) => None,
+                                        Err(err) => {
+                                            self.discover.status_message = Some((
+                                                format!("Failed to load source after scan: {}", err),
+                                                true,
+                                            ));
+                                            None
+                                        }
                                     },
-                                    None => None,
+                                    Ok(None) => None,
+                                    Err(err) => {
+                                        self.report_db_error("Failed to open database", err);
+                                        None
+                                    }
                                 };
 
                                 // Trigger sources reload (non-blocking, handled by tick())

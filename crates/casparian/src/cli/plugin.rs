@@ -14,8 +14,10 @@ use base64::{engine::general_purpose, Engine as _};
 use casparian_db::{DbConnection, DbTimestamp, DbValue};
 use casparian_protocol::{PluginStatus, RuntimeKind, SchemaDefinition};
 use casparian_schema::approval::derive_scope_id;
-use casparian_schema::{LockedColumn, LockedSchema, SchemaContract, SchemaStorage};
-use casparian_security::signing::sha256;
+use casparian_schema::{
+    build_outputs_json, locked_schema_from_definition, SchemaContract, SchemaStorage,
+};
+use casparian_security::signing::{compute_artifact_hash, sha256};
 use clap::Subcommand;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -130,6 +132,8 @@ fn cmd_import(bundle_root: PathBuf) -> Result<()> {
     let schema_defs = load_schema_definitions(&bundle_root)?;
     let schema_artifacts_json =
         serde_json::to_string(&schema_defs).context("Failed to serialize schema artifacts")?;
+    let outputs_json =
+        build_outputs_json(&schema_defs).context("Failed to build outputs_json")?;
 
     let binary_bytes = fs::read(&entrypoint_path)
         .with_context(|| format!("Failed to read binary: {}", entrypoint_path.display()))?;
@@ -169,6 +173,7 @@ fn cmd_import(bundle_root: PathBuf) -> Result<()> {
         &artifact_hash,
         &manifest_json,
         &schema_artifacts_json,
+        &outputs_json,
         signature_verified,
         signer_id.as_ref(),
     )?;
@@ -693,6 +698,7 @@ fn insert_manifest(
     artifact_hash: &str,
     manifest_json: &str,
     schema_artifacts_json: &str,
+    outputs_json: &str,
     signature_verified: bool,
     signer_id: Option<&SignerId>,
 ) -> Result<()> {
@@ -734,7 +740,7 @@ fn insert_manifest(
             DbValue::from(manifest_json),
             DbValue::from(manifest.protocol_version.as_str()),
             DbValue::from(schema_artifacts_json),
-            DbValue::from(schema_artifacts_json),
+            DbValue::from(outputs_json),
             DbValue::from(signature_verified),
             signer_value,
             DbValue::from(now.clone()),
@@ -796,80 +802,6 @@ fn register_schema_contracts(
             .map_err(|e| anyhow::anyhow!("Failed to save schema contract: {}", e))?;
     }
     Ok(())
-}
-
-fn locked_schema_from_definition(
-    output_name: &str,
-    schema_def: &SchemaDefinition,
-) -> Result<LockedSchema> {
-    if output_name.trim().is_empty() {
-        anyhow::bail!("Output name cannot be empty");
-    }
-    let mut chars = output_name.chars();
-    let first = chars
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Output name cannot be empty"))?;
-    if !first.is_ascii_alphabetic() {
-        anyhow::bail!("Output name must start with a letter: '{}'", output_name);
-    }
-    if !output_name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    {
-        anyhow::bail!(
-            "Output name must be lowercase alphanumeric + underscore: '{}'",
-            output_name
-        );
-    }
-    if schema_def.columns.is_empty() {
-        anyhow::bail!("Schema for '{}' must include at least one column", output_name);
-    }
-
-    let mut seen = HashSet::new();
-    let mut columns = Vec::with_capacity(schema_def.columns.len());
-    for col in &schema_def.columns {
-        if col.name.trim().is_empty() {
-            anyhow::bail!("Schema for '{}' has a column with empty name", output_name);
-        }
-        if !seen.insert(col.name.clone()) {
-            anyhow::bail!(
-                "Schema for '{}' has duplicate column '{}'",
-                output_name,
-                col.name
-            );
-        }
-        let mut locked = if col.nullable {
-            LockedColumn::optional(&col.name, col.data_type.clone())
-        } else {
-            LockedColumn::required(&col.name, col.data_type.clone())
-        };
-        if let Some(format) = &col.format {
-            locked = locked.with_format(format);
-        }
-        columns.push(locked);
-    }
-
-    Ok(LockedSchema::new(output_name, columns))
-}
-
-fn compute_artifact_hash(
-    source_code: &str,
-    lockfile_content: &str,
-    manifest_json: &str,
-    schema_artifacts_json: &str,
-) -> String {
-    const SEP: u8 = 0x1f;
-    let mut hasher = Sha256::new();
-    for part in [
-        source_code,
-        lockfile_content,
-        manifest_json,
-        schema_artifacts_json,
-    ] {
-        hasher.update(part.as_bytes());
-        hasher.update(&[SEP]);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 fn parse_target(target: &str) -> Result<(String, String)> {

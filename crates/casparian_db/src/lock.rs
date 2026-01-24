@@ -7,9 +7,13 @@
 //! Note: std::fs::File::lock() requires Rust 1.89+, so we use fs2 instead.
 
 #[cfg(feature = "duckdb")]
+use chrono::Utc;
+#[cfg(feature = "duckdb")]
 use fs2::FileExt;
 #[cfg(feature = "duckdb")]
-use std::fs::{File, OpenOptions};
+use serde::Serialize;
+#[cfg(feature = "duckdb")]
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -36,12 +40,14 @@ pub enum LockError {
 pub struct DbLockGuard {
     _file: File,
     lock_path: PathBuf,
+    sidecar_path: Option<PathBuf>,
 }
 
 /// Stub guard for when duckdb feature is disabled.
 #[cfg(not(feature = "duckdb"))]
 pub struct DbLockGuard {
     lock_path: PathBuf,
+    sidecar_path: Option<PathBuf>,
 }
 
 impl DbLockGuard {
@@ -52,9 +58,57 @@ impl DbLockGuard {
 }
 
 #[cfg(feature = "duckdb")]
+#[derive(Serialize)]
+struct LockSidecar {
+    pid: u32,
+    exe: Option<String>,
+    timestamp: String,
+    mode: &'static str,
+}
+
+#[cfg(feature = "duckdb")]
+fn sidecar_path_for(lock_path: &Path) -> PathBuf {
+    let ext = lock_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("lock");
+    lock_path.with_extension(format!("{ext}.json"))
+}
+
+#[cfg(feature = "duckdb")]
+fn write_lock_sidecar(lock_path: &Path, mode: &'static str) -> Option<PathBuf> {
+    let sidecar = LockSidecar {
+        pid: std::process::id(),
+        exe: std::env::current_exe().ok().map(|p| p.display().to_string()),
+        timestamp: Utc::now().to_rfc3339(),
+        mode,
+    };
+    let sidecar_path = sidecar_path_for(lock_path);
+    match serde_json::to_vec_pretty(&sidecar)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .and_then(|payload| fs::write(&sidecar_path, payload))
+    {
+        Ok(()) => Some(sidecar_path),
+        Err(e) => {
+            warn!(
+                "Failed to write lock sidecar {}: {}",
+                sidecar_path.display(),
+                e
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "duckdb")]
 impl Drop for DbLockGuard {
     fn drop(&mut self) {
         debug!("Releasing database lock: {}", self.lock_path.display());
+        if let Some(path) = &self.sidecar_path {
+            if let Err(e) = fs::remove_file(path) {
+                debug!("Failed to remove lock sidecar {}: {}", path.display(), e);
+            }
+        }
         // File is automatically unlocked when closed (fs2 uses flock/LockFileEx)
     }
 }
@@ -121,9 +175,11 @@ pub fn try_lock_exclusive(db_path: &Path) -> Result<DbLockGuard, LockError> {
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {
             info!("Acquired exclusive database lock: {}", lock_path.display());
+            let sidecar_path = write_lock_sidecar(&lock_path, "exclusive");
             Ok(DbLockGuard {
                 _file: file,
                 lock_path,
+                sidecar_path,
             })
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -166,9 +222,11 @@ pub fn lock_exclusive(db_path: &Path) -> Result<DbLockGuard, LockError> {
     file.lock_exclusive().map_err(LockError::AcquireFailed)?;
 
     info!("Acquired exclusive database lock: {}", lock_path.display());
+    let sidecar_path = write_lock_sidecar(&lock_path, "exclusive");
     Ok(DbLockGuard {
         _file: file,
         lock_path,
+        sidecar_path,
     })
 }
 
@@ -208,6 +266,7 @@ pub fn try_lock_shared(db_path: &Path) -> Result<DbLockGuard, LockError> {
             Ok(DbLockGuard {
                 _file: file,
                 lock_path,
+                sidecar_path: None,
             })
         }
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

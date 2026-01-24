@@ -29,6 +29,7 @@ pub mod amendment;
 pub mod approval;
 pub mod contract;
 pub mod ids;
+pub mod output_specs;
 pub mod storage;
 
 pub use contract::*;
@@ -36,6 +37,7 @@ pub use ids::{
     AmendmentId, ContractId, DiscoveryId, IdParseError, SchemaId, SchemaTimestamp,
     SchemaTimestampError, SchemaVariantId,
 };
+pub use output_specs::{build_outputs_json, locked_schema_from_definition, SchemaSpecError};
 pub use storage::SchemaStorage;
 
 // Re-export key types from approval module

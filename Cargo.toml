@@ -43,8 +43,8 @@ zmq = "0.10"
 
 # Arrow & Parquet (for future use in data plane)
 # Upgraded to 54.x to fix chrono 0.4.43 incompatibility in arrow-arith 53.x
-arrow = "54"
-parquet = "54"
+arrow = "56"
+parquet = "56"
 
 # Note: We need chrono with serde for time handling
 chrono = { version = "0.4", features = ["serde"] }

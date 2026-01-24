@@ -166,7 +166,7 @@ fn test_data_type_validation() {
 
     // Date validation (ISO format)
     assert!(DataType::Date.validate_string("2024-01-15"));
-    assert!(DataType::Date.validate_string("01/15/2024")); // US format supported
+    assert!(!DataType::Date.validate_string("01/15/2024"));
     assert!(!DataType::Date.validate_string("not a date"));
 }
 

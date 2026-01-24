@@ -5,12 +5,16 @@
 
 use std::path::PathBuf;
 
-/// Get the path to the context file
-fn context_file_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".casparian_flow")
-        .join("context.toml")
+fn context_file_path() -> anyhow::Result<PathBuf> {
+    if let Ok(home) = std::env::var("CASPARIAN_HOME") {
+        return Ok(PathBuf::from(home).join("context.toml"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        return Ok(home.join(".casparian_flow").join("context.toml"));
+    }
+    Err(anyhow::anyhow!(
+        "Could not determine home directory for context file. Set CASPARIAN_HOME to continue."
+    ))
 }
 
 /// Context configuration
@@ -27,20 +31,27 @@ pub struct SourceContext {
 }
 
 /// Get the default source from context file
-pub fn get_default_source() -> Option<String> {
-    let path = context_file_path();
+pub fn get_default_source() -> anyhow::Result<Option<String>> {
+    let path = context_file_path()?;
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
 
-    let content = std::fs::read_to_string(&path).ok()?;
-    let context: Context = toml::from_str(&content).ok()?;
-    context.source.map(|s| s.name)
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+    let context: Context = toml::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse context file {}: {}. Delete this file to reset.",
+            path.display(),
+            e
+        )
+    })?;
+    Ok(context.source.map(|s| s.name))
 }
 
 /// Set the default source in context file
 pub fn set_default_source(name: &str) -> anyhow::Result<()> {
-    let path = context_file_path();
+    let path = context_file_path()?;
 
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
@@ -49,8 +60,15 @@ pub fn set_default_source(name: &str) -> anyhow::Result<()> {
 
     // Load existing context or create new
     let mut context = if path.exists() {
-        let content = std::fs::read_to_string(&path)?;
-        toml::from_str(&content).unwrap_or_default()
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+        toml::from_str(&content).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse context file {}: {}. Delete this file to reset.",
+                path.display(),
+                e
+            )
+        })?
     } else {
         Context::default()
     };
@@ -69,15 +87,22 @@ pub fn set_default_source(name: &str) -> anyhow::Result<()> {
 
 /// Clear the default source from context file
 pub fn clear_default_source() -> anyhow::Result<()> {
-    let path = context_file_path();
+    let path = context_file_path()?;
 
     if !path.exists() {
         return Ok(());
     }
 
     // Load existing context
-    let content = std::fs::read_to_string(&path)?;
-    let mut context: Context = toml::from_str(&content).unwrap_or_default();
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+    let mut context: Context = toml::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse context file {}: {}. Delete this file to reset.",
+            path.display(),
+            e
+        )
+    })?;
 
     // Clear source context
     context.source = None;

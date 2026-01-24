@@ -278,8 +278,9 @@ pub(crate) fn ensure_dev_venv(source: &str) -> Result<Option<PathBuf>> {
 
         if !output.status.success() {
             anyhow::bail!(
-                "uv venv failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "uv venv failed: {}\nTRY: Install uv and ensure it is on PATH\nTRY: Run `uv venv --clear {}` manually to inspect errors",
+                String::from_utf8_lossy(&output.stderr).trim(),
+                venv_path.display()
             );
         }
 
@@ -294,8 +295,9 @@ pub(crate) fn ensure_dev_venv(source: &str) -> Result<Option<PathBuf>> {
             let output = cmd.output().context("Failed to install dependencies")?;
             if !output.status.success() {
                 anyhow::bail!(
-                    "uv pip install failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    "uv pip install failed: {}\nTRY: Check network access and pip indexes\nTRY: Run `uv pip install ...` manually inside {}",
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                    venv_path.display()
                 );
             }
         }

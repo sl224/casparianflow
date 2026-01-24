@@ -358,7 +358,10 @@ fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
 
         // Delete rules
         for rule in topic_rules {
-            db.delete_tagging_rule(&rule.id).ok();
+            db.delete_tagging_rule(&rule.id).map_err(|e| {
+                HelpfulError::new(format!("Failed to delete tagging rule: {}", e))
+                    .with_context(format!("Rule ID: {}", rule.id))
+            })?;
         }
         println!("Removed rules for topic '{}'", name);
         return Ok(());
@@ -376,14 +379,23 @@ fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
     // Delete rules for this topic
     let rules = db.list_tagging_rules()?;
     for rule in rules.iter().filter(|r| r.tag == name) {
-        db.delete_tagging_rule(&rule.id).ok();
+        db.delete_tagging_rule(&rule.id).map_err(|e| {
+            HelpfulError::new(format!("Failed to delete tagging rule: {}", e))
+                .with_context(format!("Rule ID: {}", rule.id))
+        })?;
     }
 
     // Untag files (set tag to NULL, status to pending)
-    let files = db.list_files_by_tag(name, 100000).unwrap_or_default();
+    let files = db.list_files_by_tag(name, 100000).map_err(|e| {
+        HelpfulError::new(format!("Failed to list files for topic: {}", e))
+            .with_context(format!("Topic: {}", name))
+    })?;
     for file in files {
         if let Some(id) = file.id {
-            db.untag_file(id).ok();
+            db.untag_file(id).map_err(|e| {
+                HelpfulError::new(format!("Failed to untag file: {}", e))
+                    .with_context(format!("File ID: {}", id))
+            })?;
         }
     }
 

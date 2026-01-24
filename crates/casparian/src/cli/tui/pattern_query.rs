@@ -1,5 +1,5 @@
-use casparian::scout::SourceId;
-use casparian_db::{DbConnection, DbValue};
+use casparian::scout::{patterns, SourceId};
+use casparian_db::{BackendError, DbConnection, DbValue};
 use globset::GlobMatcher;
 
 #[derive(Debug, Clone, Default)]
@@ -60,7 +60,7 @@ impl PatternQuery {
         }
     }
 
-    pub fn count_files(&self, conn: &DbConnection, source_id: SourceId) -> i64 {
+    pub fn count_files(&self, conn: &DbConnection, source_id: SourceId) -> Result<i64, BackendError> {
         let (sql, params) = match (self.extension.as_deref(), self.path_pattern.as_deref()) {
             (Some(ext), Some(path_pat)) => (
                 "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND extension = ? AND rel_path LIKE ?",
@@ -90,7 +90,7 @@ impl PatternQuery {
             ),
         };
 
-        conn.query_scalar::<i64>(sql, &params).unwrap_or(0)
+        conn.query_scalar::<i64>(sql, &params)
     }
 
     pub fn search_files(
@@ -99,7 +99,7 @@ impl PatternQuery {
         source_id: SourceId,
         limit: usize,
         offset: usize,
-    ) -> Vec<(String, i64, i64)> {
+    ) -> Result<Vec<(String, i64, i64)>, BackendError> {
         let (sql, params) = match (self.extension.as_deref(), self.path_pattern.as_deref()) {
             (Some(ext), Some(path_pat)) => (
                 r#"SELECT rel_path, size, mtime FROM scout_files
@@ -147,34 +147,21 @@ impl PatternQuery {
             ),
         };
 
-        let rows = match conn.query_all(sql, &params) {
-            Ok(rows) => rows,
-            Err(_) => return Vec::new(),
-        };
-
+        let rows = conn.query_all(sql, &params)?;
         let mut results = Vec::with_capacity(rows.len());
         for row in rows {
-            let rel_path: String = match row.get(0) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let size: i64 = match row.get(1) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let mtime: i64 = match row.get(2) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let rel_path: String = row.get(0)?;
+            let size: i64 = row.get(1)?;
+            let mtime: i64 = row.get(2)?;
             results.push((rel_path, size, mtime));
         }
 
-        results
+        Ok(results)
     }
 }
 
 pub fn eval_glob_pattern(pattern: &str) -> Result<String, String> {
-    let mut glob_pattern = if pattern.is_empty() {
+    let glob_pattern = if pattern.is_empty() {
         "**/*".to_string()
     } else if pattern.contains('<') && pattern.contains('>') {
         super::extraction::parse_custom_glob(pattern)
@@ -184,23 +171,11 @@ pub fn eval_glob_pattern(pattern: &str) -> Result<String, String> {
         pattern.to_string()
     };
 
-    if glob_pattern == "*" {
-        glob_pattern = "**/*".to_string();
-    }
-
-    if !glob_pattern.contains('/') && !glob_pattern.starts_with("**/") && glob_pattern != "**/*" {
-        glob_pattern = format!("**/{}", glob_pattern);
-    }
-
-    Ok(glob_pattern)
+    Ok(patterns::normalize_glob_pattern(&glob_pattern))
 }
 
 pub fn build_eval_matcher(glob_pattern: &str) -> Result<GlobMatcher, String> {
-    globset::GlobBuilder::new(glob_pattern)
-        .case_insensitive(true)
-        .build()
-        .map(|g| g.compile_matcher())
-        .map_err(|_| "Invalid pattern".to_string())
+    patterns::build_matcher(glob_pattern)
 }
 
 pub fn sample_paths_for_eval(
@@ -208,7 +183,7 @@ pub fn sample_paths_for_eval(
     source_id: SourceId,
     glob_pattern: &str,
     matcher: &GlobMatcher,
-) -> Vec<String> {
+) -> Result<Vec<String>, BackendError> {
     let query = PatternQuery::from_glob(glob_pattern);
 
     let mut where_sql = String::from("source_id = ?");
@@ -229,19 +204,13 @@ pub fn sample_paths_for_eval(
         where_sql
     );
 
-    let prefix_rows = match conn.query_all(&prefix_query, &base_params) {
-        Ok(rows) => rows,
-        Err(_) => return Vec::new(),
-    };
+    let prefix_rows = conn.query_all(&prefix_query, &base_params)?;
 
     let mut samples: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for row in prefix_rows {
-        let prefix: String = match row.get(0) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let prefix: String = row.get(0)?;
         if prefix.is_empty() {
             continue;
         }
@@ -256,27 +225,21 @@ pub fn sample_paths_for_eval(
             where_sql
         );
 
-        let rows = match conn.query_all(&paths_query, &params) {
-            Ok(rows) => rows,
-            Err(_) => continue,
-        };
+        let rows = conn.query_all(&paths_query, &params)?;
 
         for row in rows {
-            let rel_path: String = match row.get(0) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let rel_path: String = row.get(0)?;
             if !matcher.is_match(&rel_path) {
                 continue;
             }
             if seen.insert(rel_path.clone()) {
                 samples.push(rel_path);
                 if samples.len() >= 200 {
-                    return samples;
+                    return Ok(samples);
                 }
             }
         }
     }
 
-    samples
+    Ok(samples)
 }

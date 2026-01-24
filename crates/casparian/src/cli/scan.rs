@@ -700,9 +700,21 @@ fn run_interactive(result: ScanResult, _tag: Option<String>) -> anyhow::Result<(
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-                            let _ = std::process::Command::new("casparian")
+                            match std::process::Command::new("casparian")
                                 .args(["preview", &file.path.display().to_string()])
-                                .status();
+                                .status()
+                            {
+                                Ok(status) if status.success() => {}
+                                Ok(status) => {
+                                    eprintln!(
+                                        "Preview failed (exit code {:?}). Check that casparian is on PATH.",
+                                        status.code()
+                                    );
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to run preview: {}", err);
+                                }
+                            }
 
                             println!("\nPress Enter to continue...");
                             let _ = std::io::stdin().read_line(&mut String::new());
@@ -717,9 +729,21 @@ fn run_interactive(result: ScanResult, _tag: Option<String>) -> anyhow::Result<(
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-                            let _ = std::process::Command::new("casparian")
+                            match std::process::Command::new("casparian")
                                 .args(["preview", &file.path.display().to_string(), "--schema"])
-                                .status();
+                                .status()
+                            {
+                                Ok(status) if status.success() => {}
+                                Ok(status) => {
+                                    eprintln!(
+                                        "Preview --schema failed (exit code {:?}). Check that casparian is on PATH.",
+                                        status.code()
+                                    );
+                                }
+                                Err(err) => {
+                                    eprintln!("Failed to run preview --schema: {}", err);
+                                }
+                            }
 
                             println!("\nPress Enter to continue...");
                             let _ = std::io::stdin().read_line(&mut String::new());

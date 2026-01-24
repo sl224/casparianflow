@@ -7,8 +7,8 @@
 use crate::cli::error::HelpfulError;
 use crate::cli::output::format_size;
 use casparian::scout::{FileStatus, SourceId, TaggingRuleId};
+use casparian::scout::patterns;
 use casparian_db::{DbConnection, DbValue};
-use glob::Pattern;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -102,10 +102,7 @@ fn open_db() -> Result<DbConnection, HelpfulError> {
 
 /// Check if a glob pattern matches a path
 fn pattern_matches(pattern: &str, path: &str) -> bool {
-    // Try both the full pattern and with a leading slash stripped
-    Pattern::new(pattern)
-        .map(|p| p.matches(path) || p.matches(&path.trim_start_matches('/')))
-        .unwrap_or(false)
+    patterns::matches(pattern, path).unwrap_or(false)
 }
 
 /// Load all enabled tagging rules from the database
@@ -275,7 +272,7 @@ fn apply_tag(
         Some(id) => DbValue::from(id.as_i64()),
         None => DbValue::Null,
     };
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE scout_files \
          SET tag = ?, tag_source = ?, rule_id = ?, status = ? \
          WHERE id = ?",
@@ -293,12 +290,18 @@ fn apply_tag(
             .with_context(format!("File ID: {}", file_id))
     })?;
 
+    if updated == 0 {
+        return Err(HelpfulError::new("No file updated")
+            .with_context(format!("File ID: {}", file_id))
+            .with_suggestion("TRY: Re-scan the source to refresh file IDs".to_string()));
+    }
+
     Ok(())
 }
 
 /// Remove tag from a file in the database
 fn remove_tag(conn: &DbConnection, file_id: i64) -> Result<(), HelpfulError> {
-    conn.execute(
+    let updated = conn.execute(
         "UPDATE scout_files \
          SET tag = NULL, tag_source = NULL, rule_id = NULL, status = ?, sentinel_job_id = NULL \
          WHERE id = ?",
@@ -312,6 +315,12 @@ fn remove_tag(conn: &DbConnection, file_id: i64) -> Result<(), HelpfulError> {
         HelpfulError::new(format!("Failed to remove file tag: {}", e))
             .with_context(format!("File ID: {}", file_id))
     })?;
+
+    if updated == 0 {
+        return Err(HelpfulError::new("No file updated")
+            .with_context(format!("File ID: {}", file_id))
+            .with_suggestion("TRY: Re-scan the source to refresh file IDs".to_string()));
+    }
 
     Ok(())
 }

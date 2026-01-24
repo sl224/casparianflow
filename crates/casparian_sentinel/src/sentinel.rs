@@ -13,7 +13,8 @@ use casparian_protocol::{
     JobId, Message, OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
 };
 use casparian_schema::approval::derive_scope_id;
-use casparian_schema::{LockedColumn, LockedSchema, SchemaContract, SchemaStorage};
+use casparian_schema::{build_outputs_json, locked_schema_from_definition, SchemaContract, SchemaStorage};
+use casparian_security::signing::compute_artifact_hash;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
@@ -145,6 +146,7 @@ impl ConnectedWorker {
 pub struct SentinelConfig {
     pub bind_addr: String,
     pub database_url: String,
+    pub control_addr: Option<String>,
     pub max_workers: usize,
 }
 
@@ -1453,6 +1455,8 @@ impl Sentinel {
         if schema_defs.is_empty() {
             anyhow::bail!("schema_artifacts_json must include at least one output");
         }
+        let outputs_json =
+            build_outputs_json(&schema_defs).context("Failed to build outputs_json")?;
 
         let mut contracts = Vec::new();
         for (output_name, schema_def) in &schema_defs {
@@ -1564,7 +1568,7 @@ impl Sentinel {
                     DbValue::from(cmd.manifest_json.as_str()),
                     DbValue::from(cmd.protocol_version.as_str()),
                     DbValue::from(cmd.schema_artifacts_json.as_str()),
-                    DbValue::from(cmd.schema_artifacts_json.as_str()),
+                    DbValue::from(outputs_json.as_str()),
                     DbValue::from(false),
                     DbValue::Null,
                     DbValue::from(now.clone()),
@@ -1928,82 +1932,6 @@ fn compute_sha256(content: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-fn locked_schema_from_definition(
-    output_name: &str,
-    schema_def: &SchemaDefinition,
-) -> Result<LockedSchema> {
-    if output_name.trim().is_empty() {
-        anyhow::bail!("Output name cannot be empty");
-    }
-    let mut chars = output_name.chars();
-    let first = chars
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Output name cannot be empty"))?;
-    if !first.is_ascii_alphabetic() {
-        anyhow::bail!("Output name must start with a letter: '{}'", output_name);
-    }
-    if !output_name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    {
-        anyhow::bail!(
-            "Output name must be lowercase alphanumeric + underscore: '{}'",
-            output_name
-        );
-    }
-    if schema_def.columns.is_empty() {
-        anyhow::bail!("Schema for '{}' must include at least one column", output_name);
-    }
-
-    let mut seen = HashSet::new();
-    let mut columns = Vec::with_capacity(schema_def.columns.len());
-    for col in &schema_def.columns {
-        if col.name.trim().is_empty() {
-            anyhow::bail!("Schema for '{}' has a column with empty name", output_name);
-        }
-        if !seen.insert(col.name.clone()) {
-            anyhow::bail!(
-                "Schema for '{}' has duplicate column '{}'",
-                output_name,
-                col.name
-            );
-        }
-        let mut locked = if col.nullable {
-            LockedColumn::optional(&col.name, col.data_type.clone())
-        } else {
-            LockedColumn::required(&col.name, col.data_type.clone())
-        };
-        if let Some(format) = &col.format {
-            locked = locked.with_format(format);
-        }
-        columns.push(locked);
-    }
-
-    Ok(LockedSchema::new(output_name, columns))
-}
-
-/// Compute artifact hash from source code, lockfile, manifest, and schemas
-fn compute_artifact_hash(
-    source_code: &str,
-    lockfile_content: &str,
-    manifest_json: &str,
-    schema_artifacts_json: &str,
-) -> String {
-    use sha2::{Digest, Sha256};
-    const SEP: u8 = 0x1f;
-    let mut hasher = Sha256::new();
-    for part in [
-        source_code,
-        lockfile_content,
-        manifest_json,
-        schema_artifacts_json,
-    ] {
-        hasher.update(part.as_bytes());
-        hasher.update(&[SEP]);
-    }
     format!("{:x}", hasher.finalize())
 }
 

@@ -5,10 +5,9 @@
 
 use anyhow::{Context, Result};
 use casparian_protocol::{DataType, SchemaColumnSpec, SchemaDefinition};
-use casparian_security::signing::sha256;
+use casparian_security::signing::{compute_artifact_hash, sha256};
 use casparian_security::Gatekeeper;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::process::Command;
@@ -146,7 +145,12 @@ pub fn analyze_plugin(path: &Path) -> Result<PluginAnalysis> {
     let plugin_name = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("Invalid plugin filename"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid plugin filename: {} (expected <name>.py)",
+                path.display()
+            )
+        })?
         .to_string();
 
     // 3. Compute source hash
@@ -174,9 +178,10 @@ pub fn analyze_plugin(path: &Path) -> Result<PluginAnalysis> {
     let (has_lockfile, env_hash) = if let Some(dir) = plugin_dir {
         let lockfile_path = dir.join("uv.lock");
         if lockfile_path.exists() {
-            let content = std::fs::read_to_string(&lockfile_path).ok();
-            let hash = content.map(|c| sha256(c.as_bytes()));
-            (true, hash)
+            let content = std::fs::read_to_string(&lockfile_path)
+                .with_context(|| format!("Failed to read uv.lock: {}", lockfile_path.display()))?;
+            let hash = sha256(content.as_bytes());
+            (true, Some(hash))
         } else {
             (false, None)
         }
@@ -438,26 +443,6 @@ fn extract_outputs_manifest(path: &Path) -> Result<BTreeMap<String, SchemaDefini
     }
 
     Ok(schemas)
-}
-
-fn compute_artifact_hash(
-    source_code: &str,
-    lockfile_content: &str,
-    manifest_json: &str,
-    schema_artifacts_json: &str,
-) -> String {
-    const SEP: u8 = 0x1f;
-    let mut hasher = Sha256::new();
-    for part in [
-        source_code,
-        lockfile_content,
-        manifest_json,
-        schema_artifacts_json,
-    ] {
-        hasher.update(part.as_bytes());
-        hasher.update(&[SEP]);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 /// Options for publishing a plugin

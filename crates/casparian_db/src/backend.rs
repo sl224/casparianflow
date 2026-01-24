@@ -369,6 +369,20 @@ impl DbConnection {
         )))
     }
 
+    /// Open a database from a URL in read-only mode.
+    ///
+    /// Supported scheme: duckdb:
+    pub fn open_from_url_readonly(url: &str) -> Result<Self, BackendError> {
+        if let Some(path) = strip_url_prefix(url, "duckdb:") {
+            return Self::open_duckdb_readonly(Path::new(&path));
+        }
+
+        Err(BackendError::NotAvailable(format!(
+            "Unsupported database URL: {}",
+            url
+        )))
+    }
+
     /// Open a DuckDB database with exclusive write lock.
     ///
     /// DuckDB only allows one writer process at a time. This function acquires

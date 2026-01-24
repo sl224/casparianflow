@@ -4,6 +4,9 @@
 //! All paths are under ~/.casparian_flow/
 
 use std::path::PathBuf;
+use std::sync::Once;
+
+static CREATE_DIR_WARNED: Once = Once::new();
 
 /// Database backend type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +29,7 @@ pub fn casparian_home() -> PathBuf {
         return PathBuf::from(override_path);
     }
     dirs::home_dir()
-        .expect("Could not determine home directory")
+        .expect("Could not determine home directory. Set CASPARIAN_HOME or pass --db-path.")
         .join(".casparian_flow")
 }
 
@@ -40,7 +43,15 @@ pub fn ensure_casparian_home() -> std::io::Result<PathBuf> {
 /// Get the DuckDB database path: ~/.casparian_flow/casparian_flow.duckdb
 pub fn default_duckdb_path() -> PathBuf {
     let home = casparian_home();
-    let _ = std::fs::create_dir_all(&home);
+    if let Err(err) = std::fs::create_dir_all(&home) {
+        CREATE_DIR_WARNED.call_once(|| {
+            eprintln!(
+                "Warning: failed to create Casparian home directory {}: {}. Set CASPARIAN_HOME or use --db-path.",
+                home.display(),
+                err
+            );
+        });
+    }
     home.join("casparian_flow.duckdb")
 }
 

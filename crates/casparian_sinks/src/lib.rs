@@ -10,8 +10,9 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use casparian_db::{try_lock_exclusive, DbLockGuard, LockError};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -490,14 +491,34 @@ pub struct DuckDbSink {
     conn: duckdb::Connection,
     rows_written: u64,
     schema: Option<Schema>,
+    _lock_guard: DbLockGuard,
 }
 
 impl DuckDbSink {
     pub fn new(db_path: PathBuf, table_name: &str) -> Result<Self> {
+        if is_control_plane_db_path(&db_path) {
+            bail!(
+                "Refusing to write sink output into control-plane database: {}",
+                db_path.display()
+            );
+        }
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create database directory: {}", parent.display()))?;
         }
+
+        let lock_guard = try_lock_exclusive(&db_path).map_err(|err| match err {
+            LockError::Locked(path) => anyhow::anyhow!(
+                "DuckDB sink is locked by another writer: {}",
+                path.display()
+            ),
+            LockError::CreateFailed(io) => {
+                anyhow::anyhow!("Failed to create DuckDB lock file: {}", io)
+            }
+            LockError::AcquireFailed(io) => {
+                anyhow::anyhow!("Failed to acquire DuckDB lock: {}", io)
+            }
+        })?;
 
         let conn = duckdb::Connection::open(&db_path)
             .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
@@ -508,6 +529,7 @@ impl DuckDbSink {
             conn,
             rows_written: 0,
             schema: None,
+            _lock_guard: lock_guard,
         })
     }
 
@@ -584,44 +606,14 @@ impl DuckDbSink {
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let schema = self.schema.as_ref().unwrap();
-        let num_cols = batch.num_columns();
         let num_rows = batch.num_rows();
-
-        let placeholders: Vec<&str> = (0..num_cols).map(|_| "?").collect();
-        let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-
-        let insert_sql = format!(
-            "INSERT INTO \"{}\" ({}) VALUES ({})",
-            self.table_name.replace('"', "\"\""),
-            columns
-                .iter()
-                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(", "),
-            placeholders.join(", ")
-        );
-
-        self.with_conn_mut(|conn| {
-            let tx = conn.transaction().context("Failed to begin DuckDB transaction")?;
-            {
-                let mut stmt = tx.prepare(&insert_sql).context("Failed to prepare DuckDB INSERT")?;
-                for row_idx in 0..num_rows {
-                    let params: Vec<duckdb::types::Value> = (0..num_cols)
-                        .map(|col_idx| {
-                            let array = batch.column(col_idx);
-                            arrow_value_to_duckdb(array, row_idx)
-                        })
-                        .collect();
-                    let param_refs: Vec<&dyn duckdb::ToSql> =
-                        params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
-                    stmt.execute(param_refs.as_slice())
-                        .context("Failed to execute DuckDB INSERT")?;
-                }
-            }
-            tx.commit().context("Failed to commit DuckDB transaction")?;
-            Ok(())
-        })?;
+        let mut appender = self
+            .conn
+            .appender(&self.table_name)
+            .context("Failed to create DuckDB appender")?;
+        appender
+            .append_record_batch(batch.clone())
+            .context("Failed to append DuckDB record batch")?;
 
         self.rows_written += num_rows as u64;
         debug!("Wrote {} rows to DuckDB (total: {})", num_rows, self.rows_written);
@@ -673,145 +665,33 @@ impl Sink {
     }
 }
 
-fn arrow_value_to_duckdb(array: &ArrayRef, row: usize) -> duckdb::types::Value {
-    use arrow::array::*;
-    use duckdb::types::Value;
-    use rust_decimal::Decimal;
-
-    if array.is_null(row) {
-        return Value::Null;
+fn is_control_plane_db_path(db_path: &Path) -> bool {
+    if db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "casparian_flow.duckdb")
+    {
+        return true;
     }
 
-    match array.data_type() {
-        DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            Value::Boolean(arr.value(row))
+    if let Ok(home) = std::env::var("CASPARIAN_HOME") {
+        let candidate = PathBuf::from(home).join("casparian_flow.duckdb");
+        if candidate == db_path {
+            return true;
         }
-        DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
-            Value::TinyInt(arr.value(row))
-        }
-        DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
-            Value::SmallInt(arr.value(row))
-        }
-        DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            Value::Int(arr.value(row))
-        }
-        DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            Value::BigInt(arr.value(row))
-        }
-        DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
-            Value::UTinyInt(arr.value(row))
-        }
-        DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-            Value::USmallInt(arr.value(row))
-        }
-        DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-            Value::UInt(arr.value(row))
-        }
-        DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            Value::UBigInt(arr.value(row))
-        }
-        DataType::Float16 => {
-            let arr = array.as_any().downcast_ref::<Float16Array>().unwrap();
-            Value::Float(f32::from(arr.value(row)))
-        }
-        DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            Value::Float(arr.value(row))
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            Value::Double(arr.value(row))
-        }
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            Value::Text(arr.value(row).to_string())
-        }
-        DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            Value::Text(arr.value(row).to_string())
-        }
-        DataType::Binary => {
-            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
-            Value::Blob(arr.value(row).to_vec())
-        }
-        DataType::LargeBinary => {
-            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-            Value::Blob(arr.value(row).to_vec())
-        }
-        DataType::Date32 => {
-            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
-            Value::Date32(arr.value(row))
-        }
-        DataType::Date64 => {
-            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
-            Value::BigInt(arr.value(row))
-        }
-        DataType::Time32(unit) => match unit {
-            arrow::datatypes::TimeUnit::Second => {
-                let arr = array.as_any().downcast_ref::<Time32SecondArray>().unwrap();
-                Value::BigInt(arr.value(row) as i64)
-            }
-            arrow::datatypes::TimeUnit::Millisecond => {
-                let arr = array.as_any().downcast_ref::<Time32MillisecondArray>().unwrap();
-                Value::BigInt(arr.value(row) as i64)
-            }
-            _ => Value::Text(format!("{:?}", array.slice(row, 1))),
-        },
-        DataType::Time64(unit) => match unit {
-            arrow::datatypes::TimeUnit::Microsecond => {
-                let arr = array.as_any().downcast_ref::<Time64MicrosecondArray>().unwrap();
-                Value::BigInt(arr.value(row))
-            }
-            arrow::datatypes::TimeUnit::Nanosecond => {
-                let arr = array.as_any().downcast_ref::<Time64NanosecondArray>().unwrap();
-                Value::BigInt(arr.value(row))
-            }
-            _ => Value::Text(format!("{:?}", array.slice(row, 1))),
-        },
-        DataType::Timestamp(unit, _) => {
-            let (duck_unit, value) = match unit {
-                arrow::datatypes::TimeUnit::Second => {
-                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-                    (duckdb::types::TimeUnit::Second, arr.value(row))
-                }
-                arrow::datatypes::TimeUnit::Millisecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
-                    (duckdb::types::TimeUnit::Millisecond, arr.value(row))
-                }
-                arrow::datatypes::TimeUnit::Microsecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
-                    (duckdb::types::TimeUnit::Microsecond, arr.value(row))
-                }
-                arrow::datatypes::TimeUnit::Nanosecond => {
-                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
-                    (duckdb::types::TimeUnit::Nanosecond, arr.value(row))
-                }
-            };
-            Value::Timestamp(duck_unit, value)
-        }
-        DataType::Decimal128(_, scale) => {
-            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let value = arr.value(row);
-            if *scale < 0 {
-                Value::Text(format!("{:?}", array.slice(row, 1)))
-            } else {
-                // DuckDB rust bindings don't support Decimal bindings yet, so pass as text for casting.
-                let decimal = Decimal::from_i128_with_scale(value, *scale as u32);
-                Value::Text(decimal.to_string())
-            }
-        }
-        DataType::Decimal256(_, _) => Value::Text(format!("{:?}", array.slice(row, 1))),
-        _ => Value::Text(format!("{:?}", array.slice(row, 1))),
     }
+
+    let home_env = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+    if let Ok(home) = home_env {
+        let candidate = PathBuf::from(home)
+            .join(".casparian_flow")
+            .join("casparian_flow.duckdb");
+        if candidate == db_path {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Sink registry - manages multiple sinks for a run

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 casparian_protocol = { path = "../casparian_protocol" }
+casparian_db = { path = "../casparian_db" }
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -16,7 +17,7 @@ tracing.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 csv = "1"
-duckdb = "1.4"
+duckdb = { version = "1.4", features = ["appender-arrow"] }
 chrono.workspace = true
 rust_decimal = "1.40"
 

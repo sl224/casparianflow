@@ -25,6 +25,7 @@ serde_json.workspace = true
 # Database
 casparian_db = { path = "../casparian_db" }
 casparian_schema = { path = "../casparian_schema" }
+casparian_security = { path = "../casparian_security" }
 
 # Error handling
 anyhow.workspace = true

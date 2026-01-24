@@ -5,6 +5,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Parser metadata extracted without executing plugin code.
 #[derive(Debug, Clone, Default)]
@@ -97,10 +99,19 @@ pub fn extract_metadata_batch(paths: &[PathBuf]) -> HashMap<String, ParserMetada
     }
 
     let json_input = serde_json::to_string(&path_strings).ok();
-    let parsed = json_input
+    let python_output = json_input.as_deref().and_then(run_python_extractor);
+    let parsed = python_output
         .as_deref()
-        .and_then(run_python_extractor)
-        .and_then(|output| serde_json::from_str::<Value>(&output).ok());
+        .and_then(|output| match serde_json::from_str::<Value>(output) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                record_python_extractor_error(format!(
+                    "Python metadata extractor returned invalid JSON: {}",
+                    err
+                ));
+                None
+            }
+        });
 
     for path_str in &path_strings {
         let path = PathBuf::from(path_str);
@@ -117,36 +128,83 @@ pub fn extract_metadata_batch(paths: &[PathBuf]) -> HashMap<String, ParserMetada
 }
 
 fn run_python_extractor(input: &str) -> Option<String> {
+    let mut last_error: Option<String> = None;
     for candidate in ["python3", "python"] {
         let mut child = match Command::new(candidate)
             .arg("-c")
             .arg(METADATA_EXTRACTOR_SCRIPT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
         {
             Ok(child) => child,
-            Err(_) => continue,
+            Err(err) => {
+                last_error = Some(format!("Failed to spawn {}: {}", candidate, err));
+                continue;
+            }
         };
 
         if let Some(mut stdin) = child.stdin.take() {
             if stdin.write_all(input.as_bytes()).is_err() {
+                last_error = Some(format!("Failed to write input to {}", candidate));
                 continue;
             }
         }
 
         let output = match child.wait_with_output() {
             Ok(output) => output,
-            Err(_) => continue,
+            Err(err) => {
+                last_error = Some(format!("Failed to read output from {}: {}", candidate, err));
+                continue;
+            }
         };
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                last_error = Some(format!(
+                    "{} exited with status {}",
+                    candidate, output.status
+                ));
+            } else {
+                last_error = Some(format!(
+                    "{} exited with status {}: {}",
+                    candidate, output.status, stderr
+                ));
+            }
             continue;
         }
 
-        return String::from_utf8(output.stdout).ok();
+        match String::from_utf8(output.stdout) {
+            Ok(stdout) => return Some(stdout),
+            Err(err) => {
+                last_error = Some(format!("{} returned non-UTF8 output: {}", candidate, err));
+                continue;
+            }
+        }
+    }
+    if let Some(err) = last_error {
+        record_python_extractor_error(err);
     }
     None
+}
+
+fn record_python_extractor_error(message: String) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+    let store = LAST_ERROR.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = store.lock() {
+        *guard = Some(message.clone());
+    }
+
+    if !WARNED.swap(true, Ordering::SeqCst) {
+        eprintln!(
+            "Warning: Python metadata extraction failed: {}. Falling back to regex parsing.",
+            message
+        );
+    }
 }
 
 fn merge_metadata(value: &Value, path: &Path, fallback: &ParserMetadata) -> ParserMetadata {
