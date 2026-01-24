@@ -220,8 +220,12 @@ impl SupportBundle {
 
     /// Create the support bundle
     pub fn create(&self) -> Result<BundleResult> {
-        let file = File::create(&self.output_path)
-            .with_context(|| format!("Failed to create bundle file: {}", self.output_path.display()))?;
+        let file = File::create(&self.output_path).with_context(|| {
+            format!(
+                "Failed to create bundle file: {}",
+                self.output_path.display()
+            )
+        })?;
         let mut zip = ZipWriter::new(file);
         let options = SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated)
@@ -363,11 +367,7 @@ impl SupportBundle {
     }
 
     /// Add redacted configuration to the zip
-    fn add_config(
-        &self,
-        zip: &mut ZipWriter<File>,
-        options: SimpleFileOptions,
-    ) -> Result<()> {
+    fn add_config(&self, zip: &mut ZipWriter<File>, options: SimpleFileOptions) -> Result<()> {
         let home = casparian_home();
         let config = RedactedConfig {
             database_backend: super::config::default_db_backend().as_str().to_string(),
@@ -424,7 +424,10 @@ pub fn run(args: SupportBundleArgs) -> Result<()> {
         println!("Contents:");
         println!("  Tape files: {}", result.tape_count);
         println!("  Log files: {}", result.log_count);
-        println!("  Config included: {}", if result.config_included { "yes" } else { "no" });
+        println!(
+            "  Config included: {}",
+            if result.config_included { "yes" } else { "no" }
+        );
         println!();
         println!("Bundle size: {} bytes", result.size_bytes);
     }
@@ -560,7 +563,7 @@ mod tests {
         assert!(manifest["created_at"].is_string());
         assert!(manifest["casparian_version"].is_string());
         assert!(manifest["contents"]["tapes"].as_array().unwrap().len() == 1);
-        assert!(manifest["contents"]["logs"].as_array().unwrap().len() == 0);
+        assert!(manifest["contents"]["logs"].as_array().unwrap().is_empty());
         assert_eq!(manifest["contents"]["config"], true);
     }
 

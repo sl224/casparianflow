@@ -46,11 +46,10 @@ pub fn resolve_active_workspace_id(db: &Database) -> Result<WorkspaceId, Helpful
                 })?;
             }
             Err(err) => {
-                return Err(HelpfulError::new(format!(
-                    "Failed to load active workspace: {}",
-                    err
-                ))
-                .with_context("Active workspace is required for this command"));
+                return Err(
+                    HelpfulError::new(format!("Failed to load active workspace: {}", err))
+                        .with_context("Active workspace is required for this command"),
+                );
             }
         }
     }
@@ -67,11 +66,10 @@ pub fn resolve_active_workspace_id(db: &Database) -> Result<WorkspaceId, Helpful
 fn list_workspaces() -> anyhow::Result<()> {
     let db = open_db()?;
     let workspaces = db.list_workspaces()?;
-    let active_id = context::get_active_workspace_id()
-        .map_err(|err| {
-            HelpfulError::new(format!("Workspace context error: {}", err))
-                .with_context("Delete the context file to reset")
-        })?;
+    let active_id = context::get_active_workspace_id().map_err(|err| {
+        HelpfulError::new(format!("Workspace context error: {}", err))
+            .with_context("Delete the context file to reset")
+    })?;
 
     if workspaces.is_empty() {
         println!("No workspaces found.");
@@ -107,15 +105,17 @@ fn set_workspace(workspace_ref: Option<&str>) -> anyhow::Result<()> {
     if let Some(workspace_ref) = workspace_ref {
         let workspace = resolve_workspace_ref(&db, workspace_ref)?;
         context::set_active_workspace(&workspace.id)?;
-        println!("Active workspace set to '{}' ({})", workspace.name, workspace.id);
+        println!(
+            "Active workspace set to '{}' ({})",
+            workspace.name, workspace.id
+        );
         return Ok(());
     }
 
-    let active_id = context::get_active_workspace_id()
-        .map_err(|err| {
-            HelpfulError::new(format!("Workspace context error: {}", err))
-                .with_context("Delete the context file to reset")
-        })?;
+    let active_id = context::get_active_workspace_id().map_err(|err| {
+        HelpfulError::new(format!("Workspace context error: {}", err))
+            .with_context("Delete the context file to reset")
+    })?;
     if let Some(active_id) = active_id {
         if let Some(workspace) = db.get_workspace(&active_id)? {
             println!("Active workspace: '{}' ({})", workspace.name, workspace.id);
@@ -142,10 +142,6 @@ fn resolve_workspace_ref(db: &Database, raw: &str) -> anyhow::Result<Workspace> 
 
 fn open_db() -> anyhow::Result<Database> {
     let db_path = config::active_db_path();
-    Database::open(&db_path).with_context(|| {
-        format!(
-            "Failed to open database at {}",
-            db_path.to_string_lossy()
-        )
-    })
+    Database::open(&db_path)
+        .with_context(|| format!("Failed to open database at {}", db_path.to_string_lossy()))
 }

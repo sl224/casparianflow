@@ -5,8 +5,8 @@
 use crate::cli::config::active_db_path;
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
-use crate::cli::workspace;
 use crate::cli::output::{format_size, print_table};
+use crate::cli::workspace;
 use casparian::scout::{Database, Scanner, Source, SourceId, SourceType, WorkspaceId};
 use casparian_db::DbValue;
 use clap::Subcommand;
@@ -79,9 +79,8 @@ struct SourceFileRow {
 }
 
 fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
-    workspace::resolve_active_workspace_id(db).map_err(|e| {
-        e.with_context("The workspace registry is required for sources")
-    })
+    workspace::resolve_active_workspace_id(db)
+        .map_err(|e| e.with_context("The workspace registry is required for sources"))
 }
 
 fn find_source<'a>(sources: &'a [Source], input: &str) -> Option<&'a Source> {
@@ -241,7 +240,9 @@ fn run_with_action(action: SourceAction) -> anyhow::Result<()> {
             limit,
             json,
         } => show_source(conn, &workspace_id, &db, &name, files, limit, json),
-        SourceAction::Remove { name, force } => remove_source(conn, &workspace_id, &db, &name, force),
+        SourceAction::Remove { name, force } => {
+            remove_source(conn, &workspace_id, &db, &name, force)
+        }
         SourceAction::Sync { name, all } => sync_sources(&db, &workspace_id, name, all),
         SourceAction::Use { .. } => unreachable!(), // Handled above
     }
@@ -436,10 +437,9 @@ fn show_source(
             let files_json: Vec<serde_json::Value> = files
                 .iter()
                 .map(|f| {
-                    let tags = f
-                        .id
-                        .and_then(|id| tags_by_file.get(&id).cloned())
-                        .unwrap_or_default();
+                    let tags =
+                        f.id.and_then(|id| tags_by_file.get(&id).cloned())
+                            .unwrap_or_default();
                     serde_json::json!({
                         "path": f.rel_path,
                         "size": f.size,
@@ -494,12 +494,11 @@ fn show_source(
             let rows: Vec<Vec<String>> = files
                 .iter()
                 .map(|f| {
-                    let tags = f
-                        .id
-                        .and_then(|id| tags_by_file.get(&id))
-                        .map(|tags| tags.join(", "))
-                        .filter(|t| !t.is_empty())
-                        .unwrap_or_else(|| "-".to_string());
+                    let tags =
+                        f.id.and_then(|id| tags_by_file.get(&id))
+                            .map(|tags| tags.join(", "))
+                            .filter(|t| !t.is_empty())
+                            .unwrap_or_else(|| "-".to_string());
                     vec![
                         if f.rel_path.len() > 50 {
                             format!("...{}", &f.rel_path[f.rel_path.len().saturating_sub(47)..])
@@ -658,9 +657,13 @@ fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
                 println!("  casparian source use <name>");
             }
             Err(err) => {
-                return Err(HelpfulError::new(format!("Failed to load context: {}", err))
-                    .with_suggestion("TRY: Delete ~/.casparian_flow/context.toml to reset".to_string())
-                    .into());
+                return Err(
+                    HelpfulError::new(format!("Failed to load context: {}", err))
+                        .with_suggestion(
+                            "TRY: Delete ~/.casparian_flow/context.toml to reset".to_string(),
+                        )
+                        .into(),
+                );
             }
         }
         return Ok(());

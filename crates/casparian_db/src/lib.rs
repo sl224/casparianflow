@@ -20,6 +20,7 @@
 pub mod backend;
 mod license;
 pub mod lock;
+pub mod sql_guard;
 
 pub use backend::{
     AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbTimestamp, DbTimestampError,
@@ -29,6 +30,7 @@ pub use license::{License, LicenseError, LicenseTier};
 #[cfg(feature = "duckdb")]
 pub use lock::{is_locked, lock_exclusive, try_lock_exclusive, try_lock_shared};
 pub use lock::{lock_path_for, DbLockGuard, LockError};
+pub use sql_guard::{apply_row_limit, validate_read_only, SqlGuardError};
 /// Database backend type.
 ///
 /// DuckDB is the only supported backend in v1.

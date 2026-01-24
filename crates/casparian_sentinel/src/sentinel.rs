@@ -4,17 +4,22 @@
 //! Ported from Python sentinel.py with data-oriented design principles.
 
 use anyhow::{Context, Result};
-use casparian_protocol::http_types::{ApprovalOperation, ApprovalStatus};
+use casparian_protocol::http_types::{
+    ApprovalOperation, ApprovalStatus, JobProgress as ApiJobProgress, JobResult as ApiJobResult,
+};
 use casparian_protocol::types::{
     self, ArtifactV1, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, RuntimeKind,
     SchemaColumnSpec, SchemaDefinition, SinkConfig, SinkMode,
 };
 use casparian_protocol::{
-    materialization_key, metrics, output_target_key, schema_hash, table_name_with_schema, JobId,
-    Message, OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
+    defaults, materialization_key, metrics, output_target_key, schema_hash, table_name_with_schema,
+    ApiJobId, JobId, Message, OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
+    WorkerStatus,
 };
 use casparian_schema::approval::derive_scope_id;
-use casparian_schema::{build_outputs_json, locked_schema_from_definition, SchemaContract, SchemaStorage};
+use casparian_schema::{
+    build_outputs_json, locked_schema_from_definition, SchemaContract, SchemaStorage,
+};
 use casparian_security::signing::compute_artifact_hash;
 use chrono::Duration as ChronoDuration;
 use serde::Deserialize;
@@ -27,8 +32,8 @@ use zmq::{Context as ZmqContext, Socket};
 use crate::control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo};
 use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
 use crate::db::{
-    ensure_schema_version, models::*, ApiStorage, IntentState, JobQueue, SessionId,
-    SessionStorage, SCHEMA_VERSION,
+    ensure_schema_version, models::*, ApiStorage, IntentState, JobQueue, SessionId, SessionStorage,
+    SCHEMA_VERSION,
 };
 use crate::metrics::METRICS;
 use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
@@ -128,12 +133,6 @@ pub struct ConnectedWorker {
     pub capabilities: Vec<String>,
     pub current_job_id: Option<JobId>,
     pub worker_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkerStatus {
-    Idle,
-    Busy,
 }
 
 impl ConnectedWorker {
@@ -253,7 +252,10 @@ impl Sentinel {
                 if path.exists() {
                     info!("Removing stale control IPC socket: {}", socket_path);
                     if let Err(e) = std::fs::remove_file(path) {
-                        warn!("Failed to remove stale control socket {}: {}", socket_path, e);
+                        warn!(
+                            "Failed to remove stale control socket {}: {}",
+                            socket_path, e
+                        );
                     }
                 }
             }
@@ -296,7 +298,13 @@ impl Sentinel {
 
     /// Load topic configurations from database into memory (non-blocking cache)
     fn load_topic_configs(conn: &DbConnection) -> Result<HashMap<String, Vec<SinkConfig>>> {
-        let rows = conn.query_all("SELECT * FROM cf_topic_config ORDER BY id ASC", &[])?;
+        let rows = conn.query_all(
+            &format!(
+                "SELECT {} FROM cf_topic_config ORDER BY id ASC",
+                TOPIC_CONFIG_COLUMNS.join(", ")
+            ),
+            &[],
+        )?;
         let mut configs = Vec::with_capacity(rows.len());
         for row in rows {
             configs.push(TopicConfig::from_row(&row)?);
@@ -335,8 +343,8 @@ impl Sentinel {
         let mut sinks = topic_map.get(plugin_name).cloned().unwrap_or_default();
         if sinks.is_empty() {
             sinks.push(SinkConfig {
-                topic: "output".to_string(),
-                uri: "parquet://./output".to_string(),
+                topic: defaults::DEFAULT_SINK_TOPIC.to_string(),
+                uri: defaults::DEFAULT_SINK_URI.to_string(),
                 mode: SinkMode::Append,
                 quarantine_config: None,
                 schema: None,
@@ -426,7 +434,7 @@ impl Sentinel {
     }
 
     fn is_default_sink(topic: &str) -> bool {
-        topic == "*" || topic == "output"
+        topic == "*" || topic == defaults::DEFAULT_SINK_TOPIC
     }
 
     fn select_sink_for_output<'a>(
@@ -878,20 +886,17 @@ impl Sentinel {
                 operation,
                 summary,
                 expires_in_seconds,
-            } => self.handle_create_approval(
-                &approval_id,
-                operation,
-                &summary,
-                expires_in_seconds,
-            ),
+            } => self.handle_create_approval(&approval_id, operation, &summary, expires_in_seconds),
             ControlRequest::GetApproval { approval_id } => self.handle_get_approval(&approval_id),
             ControlRequest::Approve { approval_id } => self.handle_approve(&approval_id),
-            ControlRequest::Reject { approval_id, reason } => {
-                self.handle_reject(&approval_id, &reason)
-            }
-            ControlRequest::SetApprovalJobId { approval_id, job_id } => {
-                self.handle_set_approval_job_id(&approval_id, job_id)
-            }
+            ControlRequest::Reject {
+                approval_id,
+                reason,
+            } => self.handle_reject(&approval_id, &reason),
+            ControlRequest::SetApprovalJobId {
+                approval_id,
+                job_id,
+            } => self.handle_set_approval_job_id(&approval_id, job_id),
             ControlRequest::ExpireApprovals => self.handle_expire_approvals(),
             ControlRequest::CreateSession {
                 intent_text,
@@ -1030,15 +1035,14 @@ impl Sentinel {
             spec_json,
         ) {
             Ok(job_id) => ControlResponse::ApiJobCreated { job_id },
-            Err(e) => ControlResponse::error(
-                "DB_ERROR",
-                format!("Failed to create API job: {}", e),
-            ),
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to create API job: {}", e))
+            }
         }
     }
 
     /// Handle GetApiJob request
-    fn handle_get_api_job(&self, job_id: JobId) -> ControlResponse {
+    fn handle_get_api_job(&self, job_id: ApiJobId) -> ControlResponse {
         match self.api_storage.get_job(job_id) {
             Ok(job) => ControlResponse::ApiJob(job),
             Err(e) => ControlResponse::error(
@@ -1057,7 +1061,10 @@ impl Sentinel {
     ) -> ControlResponse {
         let limit = limit.unwrap_or(100).max(0) as usize;
         let offset = offset.unwrap_or(0).max(0) as usize;
-        match self.api_storage.list_jobs(status, limit.saturating_add(offset)) {
+        match self
+            .api_storage
+            .list_jobs(status, limit.saturating_add(offset))
+        {
             Ok(jobs) => {
                 let jobs = jobs
                     .into_iter()
@@ -1066,17 +1073,14 @@ impl Sentinel {
                     .collect::<Vec<_>>();
                 ControlResponse::ApiJobs(jobs)
             }
-            Err(e) => ControlResponse::error(
-                "DB_ERROR",
-                format!("Failed to list API jobs: {}", e),
-            ),
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list API jobs: {}", e)),
         }
     }
 
     /// Handle UpdateApiJobStatus request
     fn handle_update_api_job_status(
         &self,
-        job_id: JobId,
+        job_id: ApiJobId,
         status: casparian_protocol::HttpJobStatus,
     ) -> ControlResponse {
         match self.api_storage.update_job_status(job_id, status) {
@@ -1094,8 +1098,8 @@ impl Sentinel {
     /// Handle UpdateApiJobProgress request
     fn handle_update_api_job_progress(
         &self,
-        job_id: JobId,
-        progress: casparian_protocol::http_types::JobProgress,
+        job_id: ApiJobId,
+        progress: ApiJobProgress,
     ) -> ControlResponse {
         match self.api_storage.update_job_progress(
             job_id,
@@ -1118,8 +1122,8 @@ impl Sentinel {
     /// Handle UpdateApiJobResult request
     fn handle_update_api_job_result(
         &self,
-        job_id: JobId,
-        result: casparian_protocol::http_types::JobResult,
+        job_id: ApiJobId,
+        result: ApiJobResult,
     ) -> ControlResponse {
         match self.api_storage.update_job_result(job_id, &result) {
             Ok(()) => ControlResponse::ApiJobResult {
@@ -1134,7 +1138,7 @@ impl Sentinel {
     }
 
     /// Handle UpdateApiJobError request
-    fn handle_update_api_job_error(&self, job_id: JobId, error: &str) -> ControlResponse {
+    fn handle_update_api_job_error(&self, job_id: ApiJobId, error: &str) -> ControlResponse {
         match self.api_storage.update_job_error(job_id, error) {
             Ok(()) => ControlResponse::ApiJobResult {
                 success: true,
@@ -1148,7 +1152,7 @@ impl Sentinel {
     }
 
     /// Handle CancelApiJob request
-    fn handle_cancel_api_job(&self, job_id: JobId) -> ControlResponse {
+    fn handle_cancel_api_job(&self, job_id: ApiJobId) -> ControlResponse {
         match self.api_storage.cancel_job(job_id) {
             Ok(success) => ControlResponse::ApiJobResult {
                 success,
@@ -1183,10 +1187,9 @@ impl Sentinel {
                     .collect::<Vec<_>>();
                 ControlResponse::Approvals(approvals)
             }
-            Err(e) => ControlResponse::error(
-                "DB_ERROR",
-                format!("Failed to list approvals: {}", e),
-            ),
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to list approvals: {}", e))
+            }
         }
     }
 
@@ -1245,10 +1248,7 @@ impl Sentinel {
 
     /// Handle Reject request
     fn handle_reject(&self, approval_id: &str, reason: &str) -> ControlResponse {
-        match self
-            .api_storage
-            .reject(approval_id, None, Some(reason))
-        {
+        match self.api_storage.reject(approval_id, None, Some(reason)) {
             Ok(true) => ControlResponse::ApprovalResult {
                 success: true,
                 message: "Approval rejected".to_string(),
@@ -1265,7 +1265,7 @@ impl Sentinel {
     }
 
     /// Handle SetApprovalJobId request
-    fn handle_set_approval_job_id(&self, approval_id: &str, job_id: JobId) -> ControlResponse {
+    fn handle_set_approval_job_id(&self, approval_id: &str, job_id: ApiJobId) -> ControlResponse {
         match self.api_storage.link_approval_to_job(approval_id, job_id) {
             Ok(()) => ControlResponse::ApprovalResult {
                 success: true,
@@ -1273,7 +1273,10 @@ impl Sentinel {
             },
             Err(e) => ControlResponse::error(
                 "DB_ERROR",
-                format!("Failed to link approval {} to job {}: {}", approval_id, job_id, e),
+                format!(
+                    "Failed to link approval {} to job {}: {}",
+                    approval_id, job_id, e
+                ),
             ),
         }
     }
@@ -1285,24 +1288,19 @@ impl Sentinel {
                 success: true,
                 message: format!("Expired {} approvals", count),
             },
-            Err(e) => ControlResponse::error(
-                "DB_ERROR",
-                format!("Failed to expire approvals: {}", e),
-            ),
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to expire approvals: {}", e))
+            }
         }
     }
 
     /// Handle CreateSession request
     fn handle_create_session(&self, intent_text: &str, input_dir: Option<&str>) -> ControlResponse {
-        match self
-            .session_storage
-            .create_session(intent_text, input_dir)
-        {
+        match self.session_storage.create_session(intent_text, input_dir) {
             Ok(session_id) => ControlResponse::SessionCreated { session_id },
-            Err(e) => ControlResponse::error(
-                "DB_ERROR",
-                format!("Failed to create session: {}", e),
-            ),
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to create session: {}", e))
+            }
         }
     }
 
@@ -1326,10 +1324,7 @@ impl Sentinel {
         let limit = limit.unwrap_or(100).max(0) as usize;
         match self.session_storage.list_sessions(state, limit) {
             Ok(sessions) => ControlResponse::Sessions(sessions),
-            Err(e) => ControlResponse::error(
-                "DB_ERROR",
-                format!("Failed to list sessions: {}", e),
-            ),
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list sessions: {}", e)),
         }
     }
 
@@ -1659,7 +1654,8 @@ impl Sentinel {
                 METRICS.inc_jobs_rejected();
                 // Use defer_job (not requeue_job) to avoid incrementing retry_count
                 let scheduled_at = DbTimestamp::now();
-                self.queue.defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
+                self.queue
+                    .defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
             }
             JobStatus::Aborted => {
                 let error = receipt
@@ -2491,14 +2487,17 @@ Delete the database to republish.",
         } else {
             // Move to dead letter queue
             let reason = if is_transient {
-                "max_retries_exceeded"
+                DeadLetterReason::MaxRetriesExceeded
             } else {
-                "permanent_error"
+                DeadLetterReason::PermanentError
             };
 
             warn!(
                 "Job {} moving to dead letter queue: {} (retries: {}/{})",
-                job_id, reason, retry_count, MAX_RETRY_COUNT
+                job_id,
+                reason.as_str(),
+                retry_count,
+                MAX_RETRY_COUNT
             );
 
             self.queue.move_to_dead_letter(job_id, error, reason)?;
@@ -2513,7 +2512,10 @@ Delete the database to republish.",
     /// Returns true if parser can accept jobs, false if paused.
     pub fn check_circuit_breaker(&self, parser_name: &str) -> Result<bool> {
         let health = self.conn.query_optional(
-            "SELECT * FROM cf_parser_health WHERE parser_name = ?",
+            &format!(
+                "SELECT {} FROM cf_parser_health WHERE parser_name = ?",
+                PARSER_HEALTH_COLUMNS.join(", ")
+            ),
             &[DbValue::from(parser_name)],
         )?;
         let health = health.map(|row| ParserHealth::from_row(&row)).transpose()?;
@@ -2685,8 +2687,8 @@ mod tests {
         let topic_map: HashMap<String, Vec<SinkConfig>> = HashMap::new();
         let sinks = Sentinel::resolve_sinks_for_plugin(&topic_map, "missing_plugin");
         assert_eq!(sinks.len(), 1);
-        assert_eq!(sinks[0].topic, "output");
-        assert_eq!(sinks[0].uri, "parquet://./output");
+        assert_eq!(sinks[0].topic, defaults::DEFAULT_SINK_TOPIC);
+        assert_eq!(sinks[0].uri, defaults::DEFAULT_SINK_URI);
     }
 
     #[test]

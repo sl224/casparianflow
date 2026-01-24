@@ -3,7 +3,7 @@
 //! Commands are sent from tool handlers to the Core thread.
 //! Each command includes a Responder channel for returning results.
 
-use crate::approvals::{ApprovalId, ApprovalOperation, ApprovalRequest, ApprovalStatus};
+use crate::approvals::{ApprovalId, ApprovalOperation, ApprovalRequest};
 use crate::jobs::{Job, JobId, JobProgress, JobSpec};
 use crate::types::ApprovalSummary;
 use anyhow::Result;

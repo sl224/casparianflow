@@ -9,14 +9,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 use crate::core::CoreHandle;
-use crate::intent::fileset::FileSetStore;
 use crate::intent::session::SessionStore;
 use crate::intent::state::IntentState;
 use crate::intent::types::{
-    Confidence, ConfidenceLabel, FileSetId, HumanQuestion, MagicBytesCondition, ProposalId,
-    QuestionId, QuestionKind, QuestionOption, RuleConflict, RuleEvaluation, RuleEvaluationExamples,
-    RuleEvaluationSampling, SamplingMethod, SessionId, TagRule, TagRuleCandidate, TagRuleProposal,
-    TagRuleWhen,
+    Confidence, ConfidenceLabel, FileSetId, HumanQuestion, ProposalId, QuestionId, QuestionKind,
+    QuestionOption, RuleEvaluation, RuleEvaluationExamples, RuleEvaluationSampling, SessionId,
+    TagRule, TagRuleCandidate, TagRuleProposal, TagRuleWhen,
 };
 use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;
@@ -264,7 +262,7 @@ impl McpTool for TagsApplyRulesTool {
         }
 
         // Find the selected rule
-        let selected_candidate = proposal
+        let _selected_candidate = proposal
             .candidates
             .iter()
             .find(|c| c.rule.rule_id == args.selected_rule_id)
@@ -309,7 +307,7 @@ fn analyze_for_rules(
     entries: &[crate::intent::session::FileSetEntry],
     suggested_tags: &[String],
     route_to_topic: Option<&str>,
-    bundle: &crate::intent::session::SessionBundle,
+    _bundle: &crate::intent::session::SessionBundle,
 ) -> anyhow::Result<(Vec<TagRuleCandidate>, Vec<HumanQuestion>)> {
     // Analyze path patterns
     let mut dir_patterns: HashMap<String, u64> = HashMap::new();

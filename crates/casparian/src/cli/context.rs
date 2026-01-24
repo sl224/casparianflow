@@ -92,8 +92,9 @@ pub fn set_active_workspace(id: &WorkspaceId) -> anyhow::Result<()> {
     }
 
     let mut context = if path.exists() {
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e)
+        })?;
         toml::from_str(&content).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse context file {}: {}. Delete this file to reset.",
@@ -105,9 +106,7 @@ pub fn set_active_workspace(id: &WorkspaceId) -> anyhow::Result<()> {
         Context::default()
     };
 
-    context.workspace = Some(WorkspaceContext {
-        id: id.to_string(),
-    });
+    context.workspace = Some(WorkspaceContext { id: id.to_string() });
 
     let content = toml::to_string_pretty(&context)?;
     std::fs::write(&path, content)?;
@@ -151,8 +150,9 @@ pub fn set_default_source(name: &str) -> anyhow::Result<()> {
 
     // Load existing context or create new
     let mut context = if path.exists() {
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e)
+        })?;
         toml::from_str(&content).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse context file {}: {}. Delete this file to reset.",

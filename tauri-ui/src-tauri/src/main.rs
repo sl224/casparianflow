@@ -21,8 +21,8 @@ mod tape;
 mod tests;
 
 use state::AppState;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_subscriber::Layer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() {
     // Initialize tracing (console + rolling file)

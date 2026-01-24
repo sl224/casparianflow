@@ -374,10 +374,18 @@ mod tests {
 
         for (event_name, expected_json) in cases {
             let json = serde_json::to_string(&event_name).unwrap();
-            assert_eq!(json, expected_json, "Serialization mismatch for {:?}", event_name);
+            assert_eq!(
+                json, expected_json,
+                "Serialization mismatch for {:?}",
+                event_name
+            );
 
             let deserialized: EventName = serde_json::from_str(&json).unwrap();
-            assert_eq!(event_name, deserialized, "Roundtrip mismatch for {:?}", event_name);
+            assert_eq!(
+                event_name, deserialized,
+                "Roundtrip mismatch for {:?}",
+                event_name
+            );
         }
     }
 
@@ -433,7 +441,10 @@ mod tests {
 
         // Different values should produce different hashes
         let hash2 = writer.redact_string(value2);
-        assert_ne!(hash1a, hash2, "Different values should produce different hashes");
+        assert_ne!(
+            hash1a, hash2,
+            "Different values should produce different hashes"
+        );
 
         // Hash should be 16 chars (8 bytes hex)
         assert_eq!(hash1a.len(), 16, "Hash should be 16 hex characters");
@@ -531,8 +542,7 @@ mod tests {
 
         // Each line should be valid JSON
         for line in contents.lines() {
-            let _: EnvelopeV1 = serde_json::from_str(line)
-                .expect("Each line should be valid JSON");
+            let _: EnvelopeV1 = serde_json::from_str(line).expect("Each line should be valid JSON");
         }
 
         // File should end with newline

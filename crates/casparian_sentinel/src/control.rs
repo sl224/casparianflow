@@ -22,16 +22,16 @@
 //! - `AdvanceSession` / `CancelSession`
 
 use casparian_protocol::http_types::{
-    Approval, ApprovalOperation, ApprovalStatus, Job as ApiJob, JobProgress as ApiJobProgress,
-    JobResult as ApiJobResult, HttpJobStatus, HttpJobType,
+    Approval, ApprovalOperation, ApprovalStatus, HttpJobStatus, HttpJobType, Job as ApiJob,
+    JobProgress as ApiJobProgress, JobResult as ApiJobResult,
 };
-use casparian_protocol::{JobId, ProcessingStatus};
+use casparian_protocol::{ApiJobId, JobId, ProcessingStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{IntentState, Session, SessionId};
 
 /// Default Control API address (TCP loopback).
-pub const DEFAULT_CONTROL_ADDR: &str = "tcp://127.0.0.1:5556";
+pub const DEFAULT_CONTROL_ADDR: &str = casparian_protocol::defaults::DEFAULT_CONTROL_ADDR;
 
 /// Control API request envelope
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ pub enum ControlRequest {
         spec_json: Option<String>,
     },
     /// Get a single API job by ID
-    GetApiJob { job_id: JobId },
+    GetApiJob { job_id: ApiJobId },
     /// List API jobs with optional status filter
     ListApiJobs {
         status: Option<HttpJobStatus>,
@@ -69,23 +69,23 @@ pub enum ControlRequest {
     },
     /// Update API job status
     UpdateApiJobStatus {
-        job_id: JobId,
+        job_id: ApiJobId,
         status: HttpJobStatus,
     },
     /// Update API job progress
     UpdateApiJobProgress {
-        job_id: JobId,
+        job_id: ApiJobId,
         progress: ApiJobProgress,
     },
     /// Update API job result
     UpdateApiJobResult {
-        job_id: JobId,
+        job_id: ApiJobId,
         result: ApiJobResult,
     },
     /// Update API job error
-    UpdateApiJobError { job_id: JobId, error: String },
+    UpdateApiJobError { job_id: ApiJobId, error: String },
     /// Cancel an API job
-    CancelApiJob { job_id: JobId },
+    CancelApiJob { job_id: ApiJobId },
     /// List approvals with optional status filter
     ListApprovals {
         status: Option<ApprovalStatus>,
@@ -106,7 +106,10 @@ pub enum ControlRequest {
     /// Reject an approval request with reason
     Reject { approval_id: String, reason: String },
     /// Link a job ID to an approval
-    SetApprovalJobId { approval_id: String, job_id: JobId },
+    SetApprovalJobId {
+        approval_id: String,
+        job_id: ApiJobId,
+    },
     /// Expire pending approvals that are past their expiry
     ExpireApprovals,
     /// Create a new session
@@ -151,7 +154,7 @@ pub enum ControlResponse {
     /// List of API jobs
     ApiJobs(Vec<ApiJob>),
     /// API job creation result
-    ApiJobCreated { job_id: JobId },
+    ApiJobCreated { job_id: ApiJobId },
     /// API job mutation result
     ApiJobResult { success: bool, message: String },
     /// List of approvals

@@ -7,8 +7,8 @@ use crate::db::{IntentState, Session, SessionId};
 use anyhow::{Context, Result};
 use casparian_protocol::http_types::{Approval, ApprovalStatus};
 use casparian_protocol::http_types::{
-    Job as ApiJob, JobProgress as ApiJobProgress, JobResult as ApiJobResult, HttpJobStatus,
-    HttpJobType,
+    HttpJobStatus, HttpJobType, Job as ApiJob, JobProgress as ApiJobProgress,
+    JobResult as ApiJobResult,
 };
 use std::time::Duration;
 use zmq::{Context as ZmqContext, Socket};
@@ -37,9 +37,7 @@ impl ControlClient {
         socket
             .set_sndtimeo(DEFAULT_TIMEOUT_MS)
             .context("Failed to set send timeout")?;
-        socket
-            .set_linger(0)
-            .context("Failed to set linger")?;
+        socket.set_linger(0).context("Failed to set linger")?;
 
         socket
             .connect(addr)
@@ -62,9 +60,7 @@ impl ControlClient {
         socket
             .set_sndtimeo(timeout_ms)
             .context("Failed to set send timeout")?;
-        socket
-            .set_linger(0)
-            .context("Failed to set linger")?;
+        socket.set_linger(0).context("Failed to set linger")?;
 
         socket
             .connect(addr)
@@ -173,7 +169,7 @@ impl ControlClient {
         output: Option<&str>,
         approval_id: Option<&str>,
         spec_json: Option<&str>,
-    ) -> Result<casparian_protocol::JobId> {
+    ) -> Result<casparian_protocol::ApiJobId> {
         match self.request(ControlRequest::CreateApiJob {
             job_type,
             plugin_name: plugin_name.to_string(),
@@ -192,7 +188,7 @@ impl ControlClient {
     }
 
     /// Get an API job by ID
-    pub fn get_api_job(&self, job_id: casparian_protocol::JobId) -> Result<Option<ApiJob>> {
+    pub fn get_api_job(&self, job_id: casparian_protocol::ApiJobId) -> Result<Option<ApiJob>> {
         match self.request(ControlRequest::GetApiJob { job_id })? {
             ControlResponse::ApiJob(job) => Ok(job),
             ControlResponse::Error { code, message } => {
@@ -225,7 +221,7 @@ impl ControlClient {
     /// Update API job status
     pub fn update_api_job_status(
         &self,
-        job_id: casparian_protocol::JobId,
+        job_id: casparian_protocol::ApiJobId,
         status: HttpJobStatus,
     ) -> Result<()> {
         match self.request(ControlRequest::UpdateApiJobStatus { job_id, status })? {
@@ -246,7 +242,7 @@ impl ControlClient {
     /// Update API job progress
     pub fn update_api_job_progress(
         &self,
-        job_id: casparian_protocol::JobId,
+        job_id: casparian_protocol::ApiJobId,
         progress: ApiJobProgress,
     ) -> Result<()> {
         match self.request(ControlRequest::UpdateApiJobProgress { job_id, progress })? {
@@ -267,7 +263,7 @@ impl ControlClient {
     /// Update API job result
     pub fn update_api_job_result(
         &self,
-        job_id: casparian_protocol::JobId,
+        job_id: casparian_protocol::ApiJobId,
         result: ApiJobResult,
     ) -> Result<()> {
         match self.request(ControlRequest::UpdateApiJobResult { job_id, result })? {
@@ -288,7 +284,7 @@ impl ControlClient {
     /// Update API job error
     pub fn update_api_job_error(
         &self,
-        job_id: casparian_protocol::JobId,
+        job_id: casparian_protocol::ApiJobId,
         error: &str,
     ) -> Result<()> {
         match self.request(ControlRequest::UpdateApiJobError {
@@ -310,7 +306,7 @@ impl ControlClient {
     }
 
     /// Cancel an API job
-    pub fn cancel_api_job(&self, job_id: casparian_protocol::JobId) -> Result<bool> {
+    pub fn cancel_api_job(&self, job_id: casparian_protocol::ApiJobId) -> Result<bool> {
         match self.request(ControlRequest::CancelApiJob { job_id })? {
             ControlResponse::ApiJobResult { success, .. } => Ok(success),
             ControlResponse::Error { code, message } => {
@@ -412,7 +408,7 @@ impl ControlClient {
     pub fn set_approval_job_id(
         &self,
         approval_id: &str,
-        job_id: casparian_protocol::JobId,
+        job_id: casparian_protocol::ApiJobId,
     ) -> Result<()> {
         match self.request(ControlRequest::SetApprovalJobId {
             approval_id: approval_id.to_string(),

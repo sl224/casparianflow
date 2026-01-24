@@ -80,9 +80,7 @@ impl JobExecutorHandle {
     /// The job must already exist in JobManager with a valid JobSpec.
     /// The executor will start it when capacity is available.
     pub fn enqueue(&self, job_id: JobId) -> Result<()> {
-        self.tx
-            .send(job_id.clone())
-            .context("Executor channel closed")?;
+        self.tx.send(job_id).context("Executor channel closed")?;
         debug!("Enqueued job for execution: {}", job_id);
         Ok(())
     }
@@ -275,7 +273,7 @@ impl JobExecutor {
         job_id: &JobId,
         spec: JobSpec,
         cancel_token: CancellationToken,
-        timeout: Duration,
+        _timeout: Duration,
     ) -> Result<serde_json::Value> {
         // For now, execute synchronously with periodic cancellation checks
         // A more sophisticated approach would use a worker thread with timeout
@@ -683,7 +681,7 @@ mod tests {
 
         // Enqueue should work
         let job_id = JobId::new(1);
-        handle.enqueue(job_id.clone()).unwrap();
+        handle.enqueue(job_id).unwrap();
 
         // Drop executor to close channel
         drop(executor);

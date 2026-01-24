@@ -100,6 +100,7 @@ impl McpTool for SchemaPromoteTool {
         _executor: &JobExecutorHandle,
     ) -> anyhow::Result<Value> {
         let args: SchemaPromoteArgs = serde_json::from_value(args)?;
+        let _ = &args.schema_proposal_id;
 
         let session_store = SessionStore::new();
         let bundle = session_store.get_session(args.session_id)?;
@@ -198,6 +199,7 @@ impl McpTool for PublishPlanTool {
         _executor: &JobExecutorHandle,
     ) -> anyhow::Result<Value> {
         let args: PublishPlanArgs = serde_json::from_value(args)?;
+        let _ = &args.draft_id;
 
         let session_store = SessionStore::new();
         let bundle = session_store.get_session(args.session_id)?;

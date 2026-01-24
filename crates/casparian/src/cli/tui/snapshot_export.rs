@@ -39,10 +39,7 @@ pub fn run(args: TuiSnapshotArgs) -> Result<()> {
     fs::create_dir_all(&args.out)
         .with_context(|| format!("create snapshot output dir {}", args.out.display()))?;
 
-    let size_labels: Vec<String> = sizes
-        .iter()
-        .map(|(w, h)| format!("{}x{}", w, h))
-        .collect();
+    let size_labels: Vec<String> = sizes.iter().map(|(w, h)| format!("{}x{}", w, h)).collect();
 
     let mut bundle = String::new();
     bundle.push_str("# TUI Snapshot Bundle\n\n");
@@ -82,9 +79,8 @@ pub fn run(args: TuiSnapshotArgs) -> Result<()> {
 
         for (width, height) in &sizes {
             let app = (case.build)();
-            let buffer = render_app_to_buffer(&app, *width, *height).with_context(|| {
-                format!("render {} at {}x{}", case.name, width, height)
-            })?;
+            let buffer = render_app_to_buffer(&app, *width, *height)
+                .with_context(|| format!("render {} at {}x{}", case.name, width, height))?;
 
             let plain = normalize_for_snapshot(&buffer_to_plain_text(&buffer));
             let mask = normalize_for_snapshot(&buffer_to_bg_mask(&buffer));
@@ -112,8 +108,7 @@ pub fn run(args: TuiSnapshotArgs) -> Result<()> {
     }
 
     let bundle_path = args.out.join("tui_snapshots.md");
-    fs::write(&bundle_path, bundle)
-        .with_context(|| format!("write {}", bundle_path.display()))?;
+    fs::write(&bundle_path, bundle).with_context(|| format!("write {}", bundle_path.display()))?;
 
     Ok(())
 }
@@ -129,7 +124,9 @@ fn parse_sizes(input: &str) -> Result<Vec<(u16, u16)>> {
         let (w, h) = trimmed
             .split_once('x')
             .with_context(|| format!("invalid size '{}', expected WxH", trimmed))?;
-        let width: u16 = w.parse().with_context(|| format!("invalid width '{}', expected u16", w))?;
+        let width: u16 = w
+            .parse()
+            .with_context(|| format!("invalid width '{}', expected u16", w))?;
         let height: u16 = h
             .parse()
             .with_context(|| format!("invalid height '{}', expected u16", h))?;

@@ -3,7 +3,6 @@
 //! Events are broadcast to interested subscribers when state changes occur.
 //! This enables reactive patterns without polling.
 
-use crate::approvals::ApprovalId;
 use crate::jobs::{JobId, JobProgress};
 
 /// Events emitted by the Core thread

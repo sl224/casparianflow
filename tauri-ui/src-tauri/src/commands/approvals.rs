@@ -161,9 +161,22 @@ pub async fn approval_decide(
         })
     };
 
-    let storage = state
-        .open_api_storage()
-        .map_err(|e| {
+    let storage = state.open_api_storage().map_err(|e| {
+        if let Some((event_id, correlation_id)) = &tape_ids {
+            if let Ok(tape) = state.tape().read() {
+                tape.emit_error(
+                    correlation_id,
+                    event_id,
+                    &e.to_string(),
+                    serde_json::json!({"status": "failed"}),
+                );
+            }
+        }
+        CommandError::Database(e.to_string())
+    })?;
+
+    let success = match decision.decision.as_str() {
+        "approve" => storage.approve(&decision.approval_id, None).map_err(|e| {
             if let Some((event_id, correlation_id)) = &tape_ids {
                 if let Ok(tape) = state.tape().read() {
                     tape.emit_error(
@@ -175,24 +188,7 @@ pub async fn approval_decide(
                 }
             }
             CommandError::Database(e.to_string())
-        })?;
-
-    let success = match decision.decision.as_str() {
-        "approve" => storage
-            .approve(&decision.approval_id, None)
-            .map_err(|e| {
-                if let Some((event_id, correlation_id)) = &tape_ids {
-                    if let Ok(tape) = state.tape().read() {
-                        tape.emit_error(
-                            correlation_id,
-                            event_id,
-                            &e.to_string(),
-                            serde_json::json!({"status": "failed"}),
-                        );
-                    }
-                }
-                CommandError::Database(e.to_string())
-            })?,
+        })?,
         "reject" => storage
             .reject(&decision.approval_id, None, decision.reason.as_deref())
             .map_err(|e| {
@@ -221,7 +217,7 @@ pub async fn approval_decide(
             }
             return Err(CommandError::InvalidArgument(
                 "Decision must be 'approve' or 'reject'".to_string(),
-            ))
+            ));
         }
     };
 

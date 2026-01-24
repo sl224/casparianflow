@@ -4,8 +4,8 @@
 
 use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
-use crate::cli::workspace;
 use crate::cli::output::print_table;
+use crate::cli::workspace;
 use casparian::scout::{Database, TaggingRule, TaggingRuleId, WorkspaceId};
 use casparian_db::DbValue;
 use clap::Subcommand;
@@ -130,9 +130,8 @@ fn run_with_action(action: RuleAction) -> anyhow::Result<()> {
 }
 
 fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
-    workspace::resolve_active_workspace_id(db).map_err(|e| {
-        e.with_context("The workspace registry is required for tagging rules")
-    })
+    workspace::resolve_active_workspace_id(db)
+        .map_err(|e| e.with_context("The workspace registry is required for tagging rules"))
 }
 
 fn list_rules(db: &Database, workspace_id: &WorkspaceId, json: bool) -> anyhow::Result<()> {

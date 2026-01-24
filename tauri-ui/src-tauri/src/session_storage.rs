@@ -32,8 +32,12 @@ impl SessionStorage {
     /// Creates the cf_sessions table with proper CHECK constraints
     /// that match the IntentState enum values.
     pub fn init_schema(&self) -> Result<()> {
-        // All valid state strings - matches IntentState::as_str() exactly
-        let state_values = r#"'S0_INTERPRET_INTENT','S1_SCAN_CORPUS','S2_PROPOSE_SELECTION','G1_AWAITING_SELECTION_APPROVAL','S3_PROPOSE_TAG_RULES','G2_AWAITING_TAG_RULES_APPROVAL','S4_PROPOSE_PATH_FIELDS','G3_AWAITING_PATH_FIELDS_APPROVAL','S5_INFER_SCHEMA_INTENT','G4_AWAITING_SCHEMA_APPROVAL','S6_GENERATE_PARSER_DRAFT','S7_BACKTEST_FAIL_FAST','S8_PROMOTE_SCHEMA','S9_PUBLISH_PLAN','G5_AWAITING_PUBLISH_APPROVAL','S10_PUBLISH_EXECUTE','S11_RUN_PLAN','G6_AWAITING_RUN_APPROVAL','S12_RUN_EXECUTE','COMPLETED','FAILED','CANCELLED'"#;
+        let state_values = IntentState::ALL
+            .iter()
+            .map(|state| format!("'{}'", state.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let default_state = IntentState::InterpretIntent.as_str();
 
         let create_sql = format!(
             r#"
@@ -41,7 +45,7 @@ impl SessionStorage {
             CREATE TABLE IF NOT EXISTS cf_sessions (
                 session_id TEXT PRIMARY KEY,
                 intent_text TEXT NOT NULL,
-                state TEXT NOT NULL DEFAULT 'S0_INTERPRET_INTENT' CHECK (state IN ({state_values})),
+                state TEXT NOT NULL DEFAULT '{default_state}' CHECK (state IN ({state_values})),
                 files_selected BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -142,24 +146,24 @@ impl SessionStorage {
 
     /// List sessions that need human input (at gates).
     pub fn list_sessions_needing_input(&self, limit: usize) -> Result<Vec<Session>> {
-        // Gates are G1-G6
-        let sql = r#"
+        let gate_values = IntentState::GATES
+            .iter()
+            .map(|state| format!("'{}'", state.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            r#"
             SELECT session_id, intent_text, state, files_selected, created_at, updated_at,
                    input_dir, error_message, pending_question_id
             FROM cf_sessions
-            WHERE state IN (
-                'G1_AWAITING_SELECTION_APPROVAL',
-                'G2_AWAITING_TAG_RULES_APPROVAL',
-                'G3_AWAITING_PATH_FIELDS_APPROVAL',
-                'G4_AWAITING_SCHEMA_APPROVAL',
-                'G5_AWAITING_PUBLISH_APPROVAL',
-                'G6_AWAITING_RUN_APPROVAL'
-            )
+            WHERE state IN ({gate_values})
             ORDER BY created_at DESC
             LIMIT ?
-        "#;
+        "#,
+            gate_values = gate_values
+        );
 
-        let rows = self.conn.query_all(sql, &[DbValue::from(limit as i64)])?;
+        let rows = self.conn.query_all(&sql, &[DbValue::from(limit as i64)])?;
         rows.iter().map(|r| self.row_to_session(r)).collect()
     }
 
@@ -486,7 +490,7 @@ mod tests {
 
         // Create sessions at different states
         let s1 = storage.create_session("Session 1", None).unwrap();
-        let s2 = storage.create_session("Session 2", None).unwrap();
+        let _s2 = storage.create_session("Session 2", None).unwrap();
 
         // Move s1 to a gate
         storage

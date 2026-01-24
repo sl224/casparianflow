@@ -184,10 +184,8 @@ pub async fn casp_select_propose(
                     *ext_counts.entry(ext).or_default() += 1;
                 }
             }
-        } else if ext_match || token_match {
-            if near_miss_paths.len() < 1000 {
-                near_miss_paths.push(path_str);
-            }
+        } else if (ext_match || token_match) && near_miss_paths.len() < 1000 {
+            near_miss_paths.push(path_str);
         }
     }
 

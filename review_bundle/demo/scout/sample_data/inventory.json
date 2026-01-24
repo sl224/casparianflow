@@ -1,6 +1,0 @@
-[
-  {"sku": "WA001", "name": "Widget A", "quantity_on_hand": 150, "reorder_point": 50},
-  {"sku": "WB001", "name": "Widget B", "quantity_on_hand": 75, "reorder_point": 25},
-  {"sku": "WC001", "name": "Widget C", "quantity_on_hand": 30, "reorder_point": 10},
-  {"sku": "WD001", "name": "Widget D", "quantity_on_hand": 20, "reorder_point": 5}
-]

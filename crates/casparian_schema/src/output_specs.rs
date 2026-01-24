@@ -35,9 +35,7 @@ pub fn locked_schema_from_definition(
         return Err(SchemaSpecError::EmptyOutputName);
     }
     let mut chars = output_name.chars();
-    let first = chars
-        .next()
-        .ok_or(SchemaSpecError::EmptyOutputName)?;
+    let first = chars.next().ok_or(SchemaSpecError::EmptyOutputName)?;
     if !first.is_ascii_alphabetic() {
         return Err(SchemaSpecError::OutputNameMustStartWithLetter(
             output_name.to_string(),

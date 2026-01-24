@@ -63,8 +63,9 @@ impl McpTool for PluginsTool {
         _config: &McpServerConfig,
         _executor: &JobExecutorHandle,
     ) -> Result<Value> {
-        let _args: PluginsArgs =
+        let args: PluginsArgs =
             serde_json::from_value(args).unwrap_or(PluginsArgs { include_dev: false });
+        let _include_dev = args.include_dev;
 
         // TODO: Query actual plugin registry from casparian storage
         // For now, return a placeholder with the native EVTX parser

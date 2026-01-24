@@ -727,9 +727,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let source_type_json = serde_json::to_string(&source.source_type)?;
         let now = now_millis();
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO scout_sources (
                     id,
                     workspace_id,
@@ -751,19 +750,18 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     enabled = excluded.enabled,
                     updated_at = excluded.updated_at
                 "#,
-                &[
-                    source.id.as_i64().into(),
-                    DbValue::from(source.workspace_id.to_string()),
-                    source.name.as_str().into(),
-                    source_type_json.into(),
-                    source.path.as_str().into(),
-                    (source.poll_interval_secs as i64).into(),
-                    source.enabled.into(),
-                    now.into(),
-                    now.into(),
-                ],
-            )
-            ?;
+            &[
+                source.id.as_i64().into(),
+                DbValue::from(source.workspace_id.to_string()),
+                source.name.as_str().into(),
+                source_type_json.into(),
+                source.path.as_str().into(),
+                (source.poll_interval_secs as i64).into(),
+                source.enabled.into(),
+                now.into(),
+                now.into(),
+            ],
+        )?;
 
         Ok(())
     }
@@ -843,28 +841,32 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         }
 
         let now = now_millis();
-
-        // GAP-SCAN-013: Use batch INSERT instead of serial inserts for folders
-        // This reduces ~500+ individual INSERTs to a single batch operation
         let source_id_i64 = source_id.as_i64();
         let workspace_id_str = workspace_id.to_string();
-        let root_folder_rows_clone = root_folder_rows.clone();
-        self.conn.execute_duckdb_op(move |conn| {
-            let mut appender = conn.appender("scout_folders")?;
-            for (name, count) in &root_folder_rows_clone {
-                appender.append_row(duckdb::params![
-                    workspace_id_str.as_str(), // workspace_id
-                    source_id_i64,             // source_id
-                    "",              // prefix
-                    name.as_str(),   // name
-                    *count,          // file_count
-                    true,            // is_folder
-                    now              // updated_at
-                ])?;
-            }
-            appender.flush()?;
-            Ok(())
-        })?;
+        const FOLDER_COLUMNS: [&str; 7] = [
+            "workspace_id",
+            "source_id",
+            "prefix",
+            "name",
+            "file_count",
+            "is_folder",
+            "updated_at",
+        ];
+
+        let mut folder_rows = Vec::with_capacity(root_folder_rows.len());
+        for (name, count) in &root_folder_rows {
+            folder_rows.push(vec![
+                DbValue::from(workspace_id_str.as_str()),
+                DbValue::from(source_id_i64),
+                DbValue::from(""),
+                DbValue::from(name.as_str()),
+                DbValue::from(*count),
+                DbValue::from(1_i64),
+                DbValue::from(now),
+            ]);
+        }
+        self.conn
+            .bulk_insert_rows("scout_folders", &FOLDER_COLUMNS, &folder_rows)?;
 
         // Also add root-level files (files with empty parent_path)
         let root_files = self
@@ -884,25 +886,20 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             root_file_names.push(name);
         }
 
-        // GAP-SCAN-013: Batch insert root files too
-        let root_file_names_clone = root_file_names.clone();
-        let workspace_id_str = workspace_id.to_string();
-        self.conn.execute_duckdb_op(move |conn| {
-            let mut appender = conn.appender("scout_folders")?;
-            for name in &root_file_names_clone {
-                appender.append_row(duckdb::params![
-                    workspace_id_str.as_str(), // workspace_id
-                    source_id_i64,             // source_id
-                    "",              // prefix
-                    name.as_str(),   // name
-                    1_i64,           // file_count
-                    false,           // is_folder
-                    now              // updated_at
-                ])?;
-            }
-            appender.flush()?;
-            Ok(())
-        })?;
+        let mut file_rows = Vec::with_capacity(root_file_names.len());
+        for name in &root_file_names {
+            file_rows.push(vec![
+                DbValue::from(workspace_id_str.as_str()),
+                DbValue::from(source_id_i64),
+                DbValue::from(""),
+                DbValue::from(name.as_str()),
+                DbValue::from(1_i64),
+                DbValue::from(0_i64),
+                DbValue::from(now),
+            ]);
+        }
+        self.conn
+            .bulk_insert_rows("scout_folders", &FOLDER_COLUMNS, &file_rows)?;
 
         tracing::info!(
             source_id = %source_id,
@@ -958,33 +955,41 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let root_folders_len = folder_rows.len();
         let root_files_len = root_files.len();
 
-        self.conn.execute_duckdb_op(move |conn| {
-            let mut appender = conn.appender("scout_folders")?;
-            for (name, count) in &folder_rows {
-                appender.append_row(duckdb::params![
-                    workspace_id_str.as_str(), // workspace_id
-                    source_id_i64,             // source_id
-                    "",                        // prefix
-                    name.as_str(),             // name
-                    *count,                    // file_count
-                    true,                      // is_folder
-                    now                         // updated_at
-                ])?;
-            }
-            for name in &root_files {
-                appender.append_row(duckdb::params![
-                    workspace_id_str.as_str(), // workspace_id
-                    source_id_i64,             // source_id
-                    "",                        // prefix
-                    name.as_str(),             // name
-                    1_i64,                     // file_count
-                    false,                     // is_folder
-                    now                         // updated_at
-                ])?;
-            }
-            appender.flush()?;
-            Ok(())
-        })?;
+        const FOLDER_COLUMNS: [&str; 7] = [
+            "workspace_id",
+            "source_id",
+            "prefix",
+            "name",
+            "file_count",
+            "is_folder",
+            "updated_at",
+        ];
+
+        let mut rows = Vec::with_capacity(folder_rows.len() + root_files.len());
+        for (name, count) in &folder_rows {
+            rows.push(vec![
+                DbValue::from(workspace_id_str.as_str()),
+                DbValue::from(source_id_i64),
+                DbValue::from(""),
+                DbValue::from(name.as_str()),
+                DbValue::from(*count),
+                DbValue::from(1_i64),
+                DbValue::from(now),
+            ]);
+        }
+        for name in &root_files {
+            rows.push(vec![
+                DbValue::from(workspace_id_str.as_str()),
+                DbValue::from(source_id_i64),
+                DbValue::from(""),
+                DbValue::from(name.as_str()),
+                DbValue::from(1_i64),
+                DbValue::from(0_i64),
+                DbValue::from(now),
+            ]);
+        }
+        self.conn
+            .bulk_insert_rows("scout_folders", &FOLDER_COLUMNS, &rows)?;
 
         tracing::info!(
             source_id = %source_id,
@@ -1182,11 +1187,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// - Conflicting tags (different rules per source)
     /// - Double processing (parsers run twice)
     /// - Inflated file counts
-    pub fn check_source_overlap(
-        &self,
-        workspace_id: &WorkspaceId,
-        new_path: &Path,
-    ) -> Result<()> {
+    pub fn check_source_overlap(&self, workspace_id: &WorkspaceId, new_path: &Path) -> Result<()> {
         use super::error::ScoutError;
 
         // Canonicalize the new path to resolve symlinks, `.`, `..`, etc.
@@ -1269,9 +1270,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     pub fn upsert_tagging_rule(&self, rule: &TaggingRule) -> Result<()> {
         let now = now_millis();
 
-        self.conn
-            .execute(
-                r#"
+        self.conn.execute(
+            r#"
                 INSERT INTO scout_rules (
                     id,
                     workspace_id,
@@ -1295,19 +1295,18 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     enabled = excluded.enabled,
                     updated_at = excluded.updated_at
                 "#,
-                &[
-                    DbValue::from(rule.id.to_string()),
-                    DbValue::from(rule.workspace_id.to_string()),
-                    rule.name.as_str().into(),
-                    rule.pattern.as_str().into(),
-                    rule.tag.as_str().into(),
-                    (rule.priority as i64).into(),
-                    rule.enabled.into(),
-                    now.into(),
-                    now.into(),
-                ],
-            )
-            ?;
+            &[
+                DbValue::from(rule.id.to_string()),
+                DbValue::from(rule.workspace_id.to_string()),
+                rule.name.as_str().into(),
+                rule.pattern.as_str().into(),
+                rule.tag.as_str().into(),
+                (rule.priority as i64).into(),
+                rule.enabled.into(),
+                now.into(),
+                now.into(),
+            ],
+        )?;
 
         Ok(())
     }
@@ -1402,8 +1401,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         match existing {
             None => {
                 // New file
-                self.conn
-                    .execute(
+                self.conn.execute(
                     r#"
                     INSERT INTO scout_files (
                         workspace_id,
@@ -1423,24 +1421,23 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#,
-                &[
-                    DbValue::from(file.workspace_id.to_string()),
-                    file.source_id.as_i64().into(),
-                    file.path.as_str().into(),
-                    file.rel_path.as_str().into(),
-                    file.parent_path.as_str().into(),
-                    file.name.as_str().into(),
-                    file.extension.as_deref().into(),
-                    (file.is_dir as i64).into(),
-                    (file.size as i64).into(),
-                    file.mtime.into(),
-                    file.content_hash.as_deref().into(),
-                    FileStatus::Pending.as_str().into(),
-                    now.into(),
-                    now.into(),
-                ],
-                )
-                ?;
+                    &[
+                        DbValue::from(file.workspace_id.to_string()),
+                        file.source_id.as_i64().into(),
+                        file.path.as_str().into(),
+                        file.rel_path.as_str().into(),
+                        file.parent_path.as_str().into(),
+                        file.name.as_str().into(),
+                        file.extension.as_deref().into(),
+                        (file.is_dir as i64).into(),
+                        (file.size as i64).into(),
+                        file.mtime.into(),
+                        file.content_hash.as_deref().into(),
+                        FileStatus::Pending.as_str().into(),
+                        now.into(),
+                        now.into(),
+                    ],
+                )?;
 
                 let id: i64 = self.conn.query_scalar(
                     "SELECT id FROM scout_files WHERE source_id = ? AND path = ?",
@@ -1625,8 +1622,6 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         #[cfg(feature = "duckdb")]
         {
             let now = now_millis();
-            let mut stats = BatchUpsertResult::default();
-
             let pending_status = FileStatus::Pending.as_str();
             let workspace_id = files[0].workspace_id;
             let source_id = files[0].source_id;
@@ -1636,10 +1631,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 Vec::new()
             };
 
-            self.conn.execute_duckdb_op(|conn| {
-                conn.execute_batch("BEGIN")?;
-                let op_result: std::result::Result<(), BackendError> = (|| {
-                    conn.execute_batch(&format!(
+            let stats = self
+                .conn
+                .transaction(|tx| {
+                    let mut stats = BatchUpsertResult::default();
+                    tx.execute_batch(&format!(
                         "CREATE TEMP TABLE IF NOT EXISTS staging_scout_files (
                             workspace_id TEXT NOT NULL,
                             source_id BIGINT NOT NULL,
@@ -1659,32 +1655,49 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         DELETE FROM staging_scout_files;",
                         pending_status = pending_status
                     ))?;
+
+                    const STAGING_COLUMNS: [&str; 14] = [
+                        "workspace_id",
+                        "source_id",
+                        "path",
+                        "rel_path",
+                        "parent_path",
+                        "name",
+                        "extension",
+                        "is_dir",
+                        "size",
+                        "mtime",
+                        "content_hash",
+                        "status",
+                        "first_seen_at",
+                        "last_seen_at",
+                    ];
+
                     let workspace_id_str = workspace_id.to_string();
-                    {
-                        let mut appender = conn.appender("staging_scout_files")?;
-                        for file in files {
-                            appender.append_row(duckdb::params![
-                                workspace_id_str.as_str(),
-                                file.source_id.as_i64(),
-                                &file.path,
-                                &file.rel_path,
-                                &file.parent_path,
-                                &file.name,
-                                file.extension.as_deref(),
-                                file.is_dir as i64,
-                                file.size as i64,
-                                file.mtime,
-                                file.content_hash.as_deref(),
-                                pending_status,
-                                now,
-                                now
-                            ])?;
-                        }
-                        appender.flush()?;
+                    let mut rows = Vec::with_capacity(files.len());
+                    for file in files {
+                        rows.push(vec![
+                            DbValue::from(workspace_id_str.as_str()),
+                            DbValue::from(file.source_id.as_i64()),
+                            DbValue::from(file.path.as_str()),
+                            DbValue::from(file.rel_path.as_str()),
+                            DbValue::from(file.parent_path.as_str()),
+                            DbValue::from(file.name.as_str()),
+                            DbValue::from(file.extension.as_deref()),
+                            DbValue::from(file.is_dir as i64),
+                            DbValue::from(file.size as i64),
+                            DbValue::from(file.mtime),
+                            DbValue::from(file.content_hash.as_deref()),
+                            DbValue::from(pending_status),
+                            DbValue::from(now),
+                            DbValue::from(now),
+                        ]);
                     }
 
+                    tx.bulk_insert_rows("staging_scout_files", &STAGING_COLUMNS, &rows)?;
+
                     if compute_stats {
-                        let (new_count, changed_count, unchanged_count) = conn.query_row(
+                        let row = tx.query_one(
                             r#"
                             SELECT
                                 COALESCE(SUM(CASE WHEN target.path IS NULL THEN 1 ELSE 0 END), 0) AS new_count,
@@ -1700,9 +1713,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                             LEFT JOIN scout_files AS target
                               ON target.source_id = source.source_id AND target.path = source.path
                             "#,
-                            [],
-                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+                            &[],
                         )?;
+
+                        let new_count: i64 = row.get(0)?;
+                        let changed_count: i64 = row.get(1)?;
+                        let unchanged_count: i64 = row.get(2)?;
 
                         stats.new = u64::try_from(new_count).map_err(|_| {
                             BackendError::TypeConversion("new_count out of range".to_string())
@@ -1746,22 +1762,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         pending_status = pending_status
                     );
 
-                    conn.execute_batch(&merge_sql)?;
-                    conn.execute_batch("DELETE FROM staging_scout_files;")?;
-                    Ok(())
-                })();
-
-                match op_result {
-                    Ok(()) => {
-                        conn.execute_batch("COMMIT")?;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        Err(err)
-                    }
-                }
-            })?;
+                    tx.execute_batch(&merge_sql)?;
+                    tx.execute_batch("DELETE FROM staging_scout_files;")?;
+                    Ok(stats)
+                })
+                .map_err(ScoutError::from)?;
 
             if let Some(tag_value) = tag {
                 self.tag_paths_for_source(
@@ -1902,9 +1907,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         for file in files {
             let classification = existing.map(|existing| {
                 let is_new = !existing.contains_key(&file.path);
-                let is_changed = existing.get(&file.path).is_some_and(|(size, mtime)| {
-                    *size != file.size as i64 || *mtime != file.mtime
-                });
+                let is_changed = existing
+                    .get(&file.path)
+                    .is_some_and(|(size, mtime)| *size != file.size as i64 || *mtime != file.mtime);
                 (is_new, is_changed)
             });
 
@@ -1969,14 +1974,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     /// Get a file by ID
     pub fn get_file(&self, id: i64) -> Result<Option<ScannedFile>> {
-        let row = self
-            .conn
-            .query_optional(
-                &format!(
-                    "SELECT {FILE_SELECT_COLUMNS} FROM scout_files WHERE id = ?"
-                ),
-                &[id.into()],
-            )?;
+        let row = self.conn.query_optional(
+            &format!("SELECT {FILE_SELECT_COLUMNS} FROM scout_files WHERE id = ?"),
+            &[id.into()],
+        )?;
 
         match row {
             Some(row) => Ok(Some(Self::row_to_file(&row)?)),
@@ -1990,14 +1991,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         source_id: &SourceId,
         path: &str,
     ) -> Result<Option<ScannedFile>> {
-        let row = self
-            .conn
-            .query_optional(
-                &format!(
-                    "SELECT {FILE_SELECT_COLUMNS} FROM scout_files WHERE source_id = ? AND path = ?"
-                ),
-                &[source_id.as_i64().into(), path.into()],
-            )?;
+        let row = self.conn.query_optional(
+            &format!(
+                "SELECT {FILE_SELECT_COLUMNS} FROM scout_files WHERE source_id = ? AND path = ?"
+            ),
+            &[source_id.as_i64().into(), path.into()],
+        )?;
 
         match row {
             Some(row) => Ok(Some(Self::row_to_file(&row)?)),
@@ -3583,9 +3582,7 @@ mod tests {
         assert_eq!(fetched.status, FileStatus::Tagged);
 
         // List by tag
-        let tagged = db
-            .list_files_by_tag(&workspace_id, "csv_data", 10)
-            .unwrap();
+        let tagged = db.list_files_by_tag(&workspace_id, "csv_data", 10).unwrap();
         assert_eq!(tagged.len(), 1);
     }
 
@@ -3838,7 +3835,9 @@ mod tests {
 
         // Batch upsert with no tag - should preserve existing tag
         // GAP-SCAN-012: Stats are now approximate for performance
-        let result = db.batch_upsert_files(&[file.clone()], None, true).unwrap();
+        let result = db
+            .batch_upsert_files(std::slice::from_ref(&file), None, true)
+            .unwrap();
         assert_eq!(result.errors, 0);
 
         let fetched = db

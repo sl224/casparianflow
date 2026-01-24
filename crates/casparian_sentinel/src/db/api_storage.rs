@@ -3,16 +3,16 @@
 //! Manages jobs, events, and approvals in DuckDB tables.
 //! Used directly by casparian_mcp to drive job execution.
 
+use super::schema_version::{ensure_schema_version, SCHEMA_VERSION};
 use anyhow::{Context, Result};
 use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
 use casparian_protocol::{
-    Approval, ApprovalOperation, ApprovalStatus, Event, EventId, EventType, HttpJobStatus,
-    HttpJobType, Job, JobId, JobProgress, JobResult, OutputInfo,
+    ApiJobId, Approval, ApprovalOperation, ApprovalStatus, Event, EventId, EventType,
+    HttpJobStatus, HttpJobType, Job, JobProgress, JobResult, OutputInfo,
 };
 use chrono::Duration;
 use std::collections::HashMap;
 use uuid::Uuid;
-use super::schema_version::{ensure_schema_version, SCHEMA_VERSION};
 
 /// Storage for Control Plane API data.
 ///
@@ -134,7 +134,7 @@ impl ApiStorage {
         output_sink: Option<&str>,
         approval_id: Option<&str>,
         job_spec_json: Option<&str>,
-    ) -> Result<JobId> {
+    ) -> Result<ApiJobId> {
         let job_type_str = match job_type {
             HttpJobType::Run => "run",
             HttpJobType::Backtest => "backtest",
@@ -159,13 +159,13 @@ impl ApiStorage {
                 DbValue::from(job_spec_json),
             ],
         )?;
-        let job_id = JobId::try_from(job_id_raw).context("job_id must be non-negative")?;
+        let job_id = ApiJobId::try_from(job_id_raw).context("job_id must be non-negative")?;
 
         Ok(job_id)
     }
 
     /// Get a job by ID.
-    pub fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
+    pub fn get_job(&self, job_id: ApiJobId) -> Result<Option<Job>> {
         let sql = r#"
             SELECT job_id, job_type, status, plugin_name, plugin_version, input_dir, output_sink,
                    approval_id, job_spec_json, created_at, started_at, finished_at, error_message,
@@ -226,7 +226,7 @@ impl ApiStorage {
     }
 
     /// Update job status.
-    pub fn update_job_status(&self, job_id: JobId, status: HttpJobStatus) -> Result<()> {
+    pub fn update_job_status(&self, job_id: ApiJobId, status: HttpJobStatus) -> Result<()> {
         let status_str = job_status_to_str(status);
         let now = DbTimestamp::now();
         let job_id_i64 = job_id.to_i64().context("job_id exceeds i64::MAX")?;
@@ -262,7 +262,7 @@ impl ApiStorage {
     /// Update job progress.
     pub fn update_job_progress(
         &self,
-        job_id: JobId,
+        job_id: ApiJobId,
         phase: &str,
         items_done: u64,
         items_total: Option<u64>,
@@ -295,7 +295,7 @@ impl ApiStorage {
     }
 
     /// Update job result.
-    pub fn update_job_result(&self, job_id: JobId, result: &JobResult) -> Result<()> {
+    pub fn update_job_result(&self, job_id: ApiJobId, result: &JobResult) -> Result<()> {
         let outputs_json = serde_json::to_string(&result.outputs)?;
         let metrics_json = serde_json::to_string(&result.metrics)?;
 
@@ -328,7 +328,7 @@ impl ApiStorage {
     }
 
     /// Update job error message.
-    pub fn update_job_error(&self, job_id: JobId, error_message: &str) -> Result<()> {
+    pub fn update_job_error(&self, job_id: ApiJobId, error_message: &str) -> Result<()> {
         let sql = r#"UPDATE cf_api_jobs SET error_message = ? WHERE job_id = ?"#;
         self.conn.execute(
             sql,
@@ -341,7 +341,7 @@ impl ApiStorage {
     }
 
     /// Cancel a job (if not in terminal state).
-    pub fn cancel_job(&self, job_id: JobId) -> Result<bool> {
+    pub fn cancel_job(&self, job_id: ApiJobId) -> Result<bool> {
         let job = self.get_job(job_id)?;
         match job {
             Some(j) if !is_terminal_status(j.status) => {
@@ -350,7 +350,9 @@ impl ApiStorage {
                     job_id,
                     &EventType::JobFinished {
                         status: HttpJobStatus::Cancelled,
-                        error_message: Some("Cancelled by user".to_string()),
+                        error_message: Some(
+                            casparian_protocol::defaults::CANCELLED_BY_USER_MESSAGE.to_string(),
+                        ),
                     },
                 )?;
                 Ok(true)
@@ -440,7 +442,7 @@ impl ApiStorage {
             None => None,
         };
 
-        let job_id = JobId::try_from(job_id_raw).context("job_id must be non-negative")?;
+        let job_id = ApiJobId::try_from(job_id_raw).context("job_id must be non-negative")?;
 
         Ok(Job {
             job_id,
@@ -466,7 +468,7 @@ impl ApiStorage {
     // ========================================================================
 
     /// Insert an event.
-    pub fn insert_event(&self, job_id: JobId, event_type: &EventType) -> Result<EventId> {
+    pub fn insert_event(&self, job_id: ApiJobId, event_type: &EventType) -> Result<EventId> {
         let event_type_str = event_type_to_str(event_type);
         let payload_json = serde_json::to_string(event_type)?;
 
@@ -494,7 +496,7 @@ impl ApiStorage {
     /// List events for a job, optionally after a given event ID (for polling).
     pub fn list_events(
         &self,
-        job_id: JobId,
+        job_id: ApiJobId,
         after_event_id: Option<EventId>,
     ) -> Result<Vec<Event>> {
         let job_id_i64 = job_id.to_i64().context("job_id exceeds i64::MAX")?;
@@ -541,7 +543,7 @@ impl ApiStorage {
         let event_id: EventId = event_id_raw
             .try_into()
             .context("event_id must be non-negative")?;
-        let job_id = JobId::try_from(job_id_raw).context("job_id must be non-negative")?;
+        let job_id = ApiJobId::try_from(job_id_raw).context("job_id must be non-negative")?;
 
         Ok(Event {
             event_id,
@@ -709,7 +711,7 @@ impl ApiStorage {
     }
 
     /// Link a job to an approval.
-    pub fn link_approval_to_job(&self, approval_id: &str, job_id: JobId) -> Result<()> {
+    pub fn link_approval_to_job(&self, approval_id: &str, job_id: ApiJobId) -> Result<()> {
         let sql = r#"UPDATE cf_api_approvals SET job_id = ? WHERE approval_id = ?"#;
         self.conn.execute(
             sql,
@@ -749,7 +751,7 @@ impl ApiStorage {
             rejection_reason,
             job_id: match job_id_raw {
                 Some(id) => {
-                    Some(JobId::try_from(id).context("approval job_id must be non-negative")?)
+                    Some(ApiJobId::try_from(id).context("approval job_id must be non-negative")?)
                 }
                 None => None,
             },

@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 # Protocol
 casparian_protocol = { path = "../casparian_protocol" }
+casparian_intent = { path = "../casparian_intent" }
 
 # ZeroMQ
 zmq.workspace = true

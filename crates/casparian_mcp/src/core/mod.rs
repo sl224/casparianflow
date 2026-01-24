@@ -14,9 +14,9 @@
 mod command;
 mod event;
 
+pub use casparian_worker::cancel::CancellationToken;
 pub use command::{Command, Responder};
 pub use event::Event;
-pub use casparian_worker::cancel::CancellationToken;
 
 use crate::approvals::ApprovalManager;
 use crate::jobs::{Job, JobId, JobManager, JobProgress, JobSpec};
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use tracing::{debug, error, info, warn};
+use tracing::info;
 
 /// Configuration for Core backend selection.
 #[derive(Debug, Clone)]

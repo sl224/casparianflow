@@ -5,11 +5,14 @@
 use anyhow::{Context, Result};
 use casparian_db::{BackendError, DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
 use casparian_protocol::types::{ObservedDataType, SchemaMismatch};
-use casparian_protocol::{JobId, JobStatus, PluginStatus, ProcessingStatus};
+use casparian_protocol::{JobId, JobStatus, PluginStatus, ProcessingStatus, RuntimeKind, SinkMode};
 use serde::Serialize;
 use std::collections::HashMap;
 
-use super::models::{DeadLetterJob, ParserHealth, ProcessingJob, QuarantinedRow};
+use super::models::{
+    DeadLetterJob, DeadLetterReason, ParserHealth, ProcessingJob, QuarantinedRow,
+    DEAD_LETTER_COLUMNS, PARSER_HEALTH_COLUMNS, PROCESSING_JOB_COLUMNS, QUARANTINE_COLUMNS,
+};
 use super::schema_version::{ensure_schema_version, SCHEMA_VERSION};
 
 /// Maximum number of retries before a job is marked as permanently failed
@@ -69,6 +72,18 @@ fn now_ts() -> DbTimestamp {
     DbTimestamp::now()
 }
 
+fn column_list(columns: &[&str]) -> String {
+    columns.join(", ")
+}
+
+fn prefixed_columns(prefix: &str, columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|col| format!("{}.{}", prefix, col))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn observed_type_label(observed: &ObservedDataType) -> String {
     match observed {
         ObservedDataType::Canonical { data_type } => data_type.to_string(),
@@ -100,6 +115,11 @@ impl JobQueue {
         let completion_values = JobStatus::ALL
             .iter()
             .map(|status| format!("'{}'", status.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sink_mode_values = [SinkMode::Append, SinkMode::Replace, SinkMode::Error]
+            .iter()
+            .map(|mode| format!("'{}'", mode.as_str()))
             .collect::<Vec<_>>()
             .join(",");
         let create_sql = format!(
@@ -143,7 +163,8 @@ impl JobQueue {
                 parser_fingerprint TEXT,
                 output_name TEXT NOT NULL,
                 sink_uri TEXT NOT NULL,
-                sink_mode TEXT NOT NULL,
+                sink_mode TEXT NOT NULL
+                    CHECK (sink_mode IN ({sink_mode_values})),
                 table_name TEXT,
                 schema_hash TEXT,
                 status TEXT NOT NULL
@@ -158,7 +179,8 @@ impl JobQueue {
         "#,
             default_status = ProcessingStatus::Queued.as_str(),
             status_values = status_values,
-            completion_values = completion_values
+            completion_values = completion_values,
+            sink_mode_values = sink_mode_values
         );
 
         self.conn
@@ -184,6 +206,16 @@ impl JobQueue {
             .map(|status| format!("'{}'", status.as_str()))
             .collect::<Vec<_>>()
             .join(",");
+        let runtime_kind_values = [RuntimeKind::PythonShim, RuntimeKind::NativeExec]
+            .iter()
+            .map(|kind| format!("'{}'", kind.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sink_mode_values = [SinkMode::Append, SinkMode::Replace, SinkMode::Error]
+            .iter()
+            .map(|mode| format!("'{}'", mode.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
         let create_sql = format!(
             r#"
             CREATE SEQUENCE IF NOT EXISTS seq_cf_plugin_manifest;
@@ -191,7 +223,7 @@ impl JobQueue {
                 id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_plugin_manifest'),
                 plugin_name TEXT NOT NULL,
                 version TEXT NOT NULL,
-                runtime_kind TEXT NOT NULL,
+                runtime_kind TEXT NOT NULL CHECK (runtime_kind IN ({runtime_kind_values})),
                 entrypoint TEXT NOT NULL,
                 platform_os TEXT,
                 platform_arch TEXT,
@@ -232,7 +264,7 @@ impl JobQueue {
                 plugin_name TEXT NOT NULL,
                 topic_name TEXT NOT NULL,
                 uri TEXT NOT NULL,
-                mode TEXT DEFAULT 'append',
+                mode TEXT NOT NULL DEFAULT 'append' CHECK (mode IN ({sink_mode_values})),
                 quarantine_allow BOOLEAN,
                 quarantine_max_pct DOUBLE,
                 quarantine_max_count BIGINT,
@@ -242,7 +274,9 @@ impl JobQueue {
             CREATE UNIQUE INDEX IF NOT EXISTS ux_topic_unique ON cf_topic_config(plugin_name, topic_name);
         "#,
             default_status = PluginStatus::Pending.as_str(),
-            plugin_status_values = plugin_status_values
+            plugin_status_values = plugin_status_values,
+            runtime_kind_values = runtime_kind_values,
+            sink_mode_values = sink_mode_values
         );
 
         self.conn
@@ -388,8 +422,9 @@ impl JobQueue {
         let now = now_ts();
         let (query, params) = if has_health {
             (
-                r#"
-                SELECT q.*
+                format!(
+                    r#"
+                SELECT {columns}
                 FROM cf_processing_queue q
                 LEFT JOIN cf_parser_health ph ON ph.parser_name = q.plugin_name
                 WHERE q.status = ?
@@ -398,6 +433,8 @@ impl JobQueue {
                 ORDER BY q.priority DESC, q.id ASC
                 LIMIT 1
                 "#,
+                    columns = prefixed_columns("q", PROCESSING_JOB_COLUMNS)
+                ),
                 vec![
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                     DbValue::from(now),
@@ -405,14 +442,17 @@ impl JobQueue {
             )
         } else {
             (
-                r#"
-                SELECT *
+                format!(
+                    r#"
+                SELECT {columns}
                 FROM cf_processing_queue
                 WHERE status = ?
                   AND (scheduled_at IS NULL OR scheduled_at <= ?)
                 ORDER BY priority DESC, id ASC
                 LIMIT 1
                 "#,
+                    columns = column_list(PROCESSING_JOB_COLUMNS)
+                ),
                 vec![
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                     DbValue::from(now),
@@ -420,7 +460,7 @@ impl JobQueue {
             )
         };
 
-        let row = self.conn.query_optional(query, &params)?;
+        let row = self.conn.query_optional(&query, &params)?;
         Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
 
@@ -430,7 +470,8 @@ impl JobQueue {
         let now = now_ts();
         let (query, params) = if has_health {
             (
-                r#"
+                format!(
+                    r#"
                 UPDATE cf_processing_queue
                 SET status = ?, claim_time = ?
                 WHERE id = (
@@ -443,8 +484,10 @@ impl JobQueue {
                     ORDER BY q.priority DESC, q.id ASC
                     LIMIT 1
                 )
-                RETURNING *
+                RETURNING {columns}
                 "#,
+                    columns = column_list(PROCESSING_JOB_COLUMNS)
+                ),
                 vec![
                     DbValue::from(ProcessingStatus::Running.as_str()),
                     DbValue::from(now.clone()),
@@ -454,7 +497,8 @@ impl JobQueue {
             )
         } else {
             (
-                r#"
+                format!(
+                    r#"
                 UPDATE cf_processing_queue
                 SET status = ?, claim_time = ?
                 WHERE id = (
@@ -465,8 +509,10 @@ impl JobQueue {
                     ORDER BY priority DESC, id ASC
                     LIMIT 1
                 )
-                RETURNING *
+                RETURNING {columns}
                 "#,
+                    columns = column_list(PROCESSING_JOB_COLUMNS)
+                ),
                 vec![
                     DbValue::from(ProcessingStatus::Running.as_str()),
                     DbValue::from(now.clone()),
@@ -476,7 +522,7 @@ impl JobQueue {
             )
         };
 
-        let row = self.conn.query_optional(query, &params)?;
+        let row = self.conn.query_optional(&query, &params)?;
 
         Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
@@ -767,7 +813,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         if let Some(row) = row {
             let retry_count: i32 = row.get_by_name("retry_count")?;
             if retry_count >= MAX_RETRY_COUNT {
-                self.move_to_dead_letter(job_id, "max_retries_exceeded", "max_retries_exceeded")?;
+                self.move_to_dead_letter(
+                    job_id,
+                    DeadLetterReason::MaxRetriesExceeded.as_str(),
+                    DeadLetterReason::MaxRetriesExceeded,
+                )?;
                 return Ok(());
             }
         }
@@ -1116,7 +1166,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     /// Move a job to dead letter.
-    pub fn move_to_dead_letter(&self, job_id: i64, error: &str, reason: &str) -> Result<()> {
+    pub fn move_to_dead_letter(
+        &self,
+        job_id: i64,
+        error: &str,
+        reason: DeadLetterReason,
+    ) -> Result<()> {
         let row = self.conn.query_optional(
             r#"
                 SELECT file_id, plugin_name, retry_count
@@ -1135,7 +1190,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let retry_count: i32 = row.get_by_name("retry_count")?;
 
         let now = now_ts();
-        let full_error = format!("{}: {}", reason, error);
+        let full_error = format!("{}: {}", reason.as_str(), error);
         self.conn
             .execute(
                 r#"
@@ -1149,7 +1204,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     DbValue::from(full_error.as_str()),
                     DbValue::from(retry_count),
                     DbValue::from(now.clone()),
-                    DbValue::from(reason),
+                    DbValue::from(reason.as_str()),
                 ],
             )
             ?;
@@ -1178,7 +1233,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     pub fn get_dead_letter_jobs(&self, limit: i64) -> Result<Vec<DeadLetterJob>> {
         let rows = self.conn.query_all(
-            "SELECT * FROM cf_dead_letter ORDER BY moved_at DESC LIMIT ?",
+            &format!(
+                "SELECT {} FROM cf_dead_letter ORDER BY moved_at DESC LIMIT ?",
+                column_list(DEAD_LETTER_COLUMNS)
+            ),
             &[DbValue::from(limit)],
         )?;
         rows.iter()
@@ -1193,7 +1251,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         limit: i64,
     ) -> Result<Vec<DeadLetterJob>> {
         let rows = self.conn.query_all(
-            "SELECT * FROM cf_dead_letter WHERE plugin_name = ? ORDER BY moved_at DESC LIMIT ?",
+            &format!(
+                "SELECT {} FROM cf_dead_letter WHERE plugin_name = ? ORDER BY moved_at DESC LIMIT ?",
+                column_list(DEAD_LETTER_COLUMNS)
+            ),
             &[DbValue::from(plugin), DbValue::from(limit)],
         )?;
         rows.iter()
@@ -1332,14 +1393,23 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     pub fn get_parser_health(&self, parser_name: &str) -> Result<Option<ParserHealth>> {
         let row = self.conn.query_optional(
-            "SELECT * FROM cf_parser_health WHERE parser_name = ?",
+            &format!(
+                "SELECT {} FROM cf_parser_health WHERE parser_name = ?",
+                column_list(PARSER_HEALTH_COLUMNS)
+            ),
             &[DbValue::from(parser_name)],
         )?;
         Ok(row.map(|row| ParserHealth::from_row(&row)).transpose()?)
     }
 
     pub fn get_all_parser_health(&self) -> Result<Vec<ParserHealth>> {
-        let rows = self.conn.query_all("SELECT * FROM cf_parser_health", &[])?;
+        let rows = self.conn.query_all(
+            &format!(
+                "SELECT {} FROM cf_parser_health",
+                column_list(PARSER_HEALTH_COLUMNS)
+            ),
+            &[],
+        )?;
         rows.iter()
             .map(ParserHealth::from_row)
             .collect::<Result<_, _>>()
@@ -1349,7 +1419,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     pub fn quarantine_row(
         &self,
         job_id: i64,
-        row_index: i32,
+        row_index: i64,
         error: &str,
         raw: Option<&[u8]>,
     ) -> Result<()> {
@@ -1372,7 +1442,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     pub fn get_quarantined_rows(&self, job_id: i64) -> Result<Vec<QuarantinedRow>> {
         let rows = self.conn.query_all(
-            "SELECT * FROM cf_quarantine WHERE job_id = ? ORDER BY row_index",
+            &format!(
+                "SELECT {} FROM cf_quarantine WHERE job_id = ? ORDER BY row_index",
+                column_list(QUARANTINE_COLUMNS)
+            ),
             &[DbValue::from(job_id)],
         )?;
         rows.iter()
@@ -1410,10 +1483,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Job>> {
-        let limit_i64 =
-            i64::try_from(limit).context("list_jobs limit exceeds i64::MAX")?;
-        let offset_i64 =
-            i64::try_from(offset).context("list_jobs offset exceeds i64::MAX")?;
+        let limit_i64 = i64::try_from(limit).context("list_jobs limit exceeds i64::MAX")?;
+        let offset_i64 = i64::try_from(offset).context("list_jobs offset exceeds i64::MAX")?;
 
         let (sql, params): (&str, Vec<DbValue>) = match status {
             Some(s) => (
@@ -1497,13 +1568,14 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             SET status = ?,
                 completion_status = ?,
                 end_time = ?,
-                error_message = 'Cancelled by user'
+                error_message = ?
             WHERE id = ? AND status IN (?, ?)
             "#,
             &[
                 DbValue::from(ProcessingStatus::Aborted.as_str()),
                 DbValue::from(JobStatus::Aborted.as_str()),
                 DbValue::from(now),
+                DbValue::from(casparian_protocol::defaults::CANCELLED_BY_USER_MESSAGE),
                 DbValue::from(job_id_i64),
                 DbValue::from(ProcessingStatus::Queued.as_str()),
                 DbValue::from(ProcessingStatus::Pending.as_str()),
@@ -1772,9 +1844,7 @@ mod tests {
         let queue = setup_queue();
         let job_id = enqueue_test_job(&queue, "test_parser", 1);
 
-        let cancelled = queue
-            .cancel_job(JobId::try_from(job_id).unwrap())
-            .unwrap();
+        let cancelled = queue.cancel_job(JobId::try_from(job_id).unwrap()).unwrap();
         assert!(cancelled);
 
         // Verify job is now ABORTED with ABORTED completion_status
@@ -1784,7 +1854,10 @@ mod tests {
             .unwrap();
         assert_eq!(job.status, ProcessingStatus::Aborted);
         assert_eq!(job.completion_status, Some(JobStatus::Aborted));
-        assert_eq!(job.error_message, Some("Cancelled by user".to_string()));
+        assert_eq!(
+            job.error_message,
+            Some(casparian_protocol::defaults::CANCELLED_BY_USER_MESSAGE.to_string())
+        );
     }
 
     #[test]
@@ -1798,9 +1871,7 @@ mod tests {
             .unwrap();
 
         // Try to cancel - should return false
-        let cancelled = queue
-            .cancel_job(JobId::try_from(job_id).unwrap())
-            .unwrap();
+        let cancelled = queue.cancel_job(JobId::try_from(job_id).unwrap()).unwrap();
         assert!(!cancelled);
 
         // Verify job is still COMPLETED
@@ -1843,7 +1914,7 @@ mod tests {
         assert_eq!(counts.get(&ProcessingStatus::Completed), Some(&1));
         assert_eq!(counts.get(&ProcessingStatus::Failed), Some(&1));
         // RUNNING should not exist (no jobs in that state)
-        assert!(counts.get(&ProcessingStatus::Running).is_none());
+        assert!(!counts.contains_key(&ProcessingStatus::Running));
     }
 
     #[test]

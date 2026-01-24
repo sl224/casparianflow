@@ -54,6 +54,7 @@ casparian_db = { path = "../../crates/casparian_db" }
 casparian_protocol = { path = "../../crates/casparian_protocol" }
 casparian_mcp = { path = "../../crates/casparian_mcp" }
 casparian_tape = { path = "../../crates/casparian_tape" }
+casparian_intent = { path = "../../crates/casparian_intent" }
 
 [dev-dependencies]
 tempfile = "3"

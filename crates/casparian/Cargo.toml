@@ -15,6 +15,7 @@ casparian_sinks = { path = "../casparian_sinks" }
 casparian_security = { path = "../casparian_security" }
 casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
 casparian_schema = { path = "../casparian_schema" }
+casparian_ids = { path = "../casparian_ids" }
 casparian_mcp = { path = "../casparian_mcp" }
 casparian_tape = { path = "../casparian_tape" }
 

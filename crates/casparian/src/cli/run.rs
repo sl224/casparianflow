@@ -19,6 +19,7 @@
 
 use anyhow::{Context, Result};
 use casparian::telemetry::TelemetryRecorder;
+use casparian_protocol::defaults;
 use casparian_protocol::telemetry as protocol_telemetry;
 use clap::Args;
 use serde::Serialize;
@@ -44,7 +45,7 @@ pub struct RunArgs {
     pub input: PathBuf,
 
     /// Output sink (default: parquet://./output/)
-    #[arg(long, short, default_value = "parquet://./output/")]
+    #[arg(long, short, default_value_t = defaults::DEFAULT_SINK_URI.to_string())]
     pub sink: String,
 
     /// Force re-processing even if already processed

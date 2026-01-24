@@ -125,6 +125,7 @@ impl ApprovalStore {
     }
 
     /// Get the storage directory
+    #[allow(dead_code)]
     pub fn dir(&self) -> &PathBuf {
         &self.dir
     }

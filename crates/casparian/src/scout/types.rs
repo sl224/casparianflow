@@ -4,6 +4,7 @@
 //! It watches folders, discovers files, and assigns tags.
 //! Actual processing happens in Sentinel (Tag → Plugin → Sink).
 
+pub use casparian_ids::IdParseError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -13,28 +14,6 @@ use uuid::Uuid;
 // ============================================================================
 // Identifier Types
 // ============================================================================
-
-/// Error returned when parsing a UUID-backed identifier fails.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdParseError {
-    message: String,
-}
-
-impl IdParseError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for IdParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for IdParseError {}
 
 fn parse_i64_id(label: &str, value: &str) -> Result<i64, IdParseError> {
     let id = value

@@ -85,18 +85,3 @@ pub trait McpTool: Send + Sync {
         }
     }
 }
-
-// Macro to reduce boilerplate for tool error handling
-macro_rules! require_param {
-    ($args:expr, $name:literal, $ty:ty) => {
-        serde_json::from_value::<$ty>($args.get($name).cloned().unwrap_or(Value::Null))
-            .map_err(|e| anyhow::anyhow!("Invalid parameter '{}': {}", $name, e))?
-    };
-    ($args:expr, $name:literal) => {
-        $args
-            .get($name)
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: {}", $name))?
-    };
-}
-
-pub(crate) use require_param;

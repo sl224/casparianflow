@@ -2,7 +2,7 @@
 //!
 //! Scans a directory and returns file metadata. Path must be within allowed roots.
 
-use super::{require_param, McpTool};
+use super::McpTool;
 use crate::core::CoreHandle;
 use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;

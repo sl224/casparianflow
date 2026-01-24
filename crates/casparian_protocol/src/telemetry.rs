@@ -160,9 +160,7 @@ impl TelemetryHasher {
 
     /// Hash a path (canonicalized when possible).
     pub fn hash_path(&self, path: &Path) -> String {
-        let canonical = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         self.hash_str(&canonical.to_string_lossy())
     }
 
@@ -211,8 +209,8 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);
-    let mut iter = s.as_bytes().chunks(2);
-    while let Some(pair) = iter.next() {
+    let iter = s.as_bytes().chunks(2);
+    for pair in iter {
         let hex = std::str::from_utf8(pair).ok()?;
         let value = u8::from_str_radix(hex, 16).ok()?;
         bytes.push(value);

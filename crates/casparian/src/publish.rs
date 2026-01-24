@@ -4,7 +4,7 @@
 //! Used by both CLI (`casparian publish`) and Tauri UI.
 
 use anyhow::{Context, Result};
-use casparian_protocol::{DataType, SchemaColumnSpec, SchemaDefinition};
+use casparian_protocol::{DataType, RuntimeKind, SchemaColumnSpec, SchemaDefinition};
 use casparian_security::signing::{compute_artifact_hash, sha256};
 use casparian_security::Gatekeeper;
 use serde::{Deserialize, Serialize};
@@ -82,22 +82,6 @@ if __name__ == "__main__":
         sys.exit(0)
     print(json.dumps(extract_outputs(sys.argv[1])))
 "#;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeKind {
-    PythonShim,
-    NativeExec,
-}
-
-impl RuntimeKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            RuntimeKind::PythonShim => "python_shim",
-            RuntimeKind::NativeExec => "native_exec",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {

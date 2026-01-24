@@ -7,8 +7,8 @@
 
 use casparian_sentinel::{Sentinel, SentinelConfig};
 use clap::Parser;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tracing_subscriber::Layer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -17,7 +17,10 @@ use tracing_subscriber::Layer;
 )]
 struct Args {
     /// ZMQ bind address for workers
-    #[arg(long, default_value = "tcp://127.0.0.1:5555")]
+    #[arg(
+        long,
+        default_value_t = casparian_protocol::defaults::DEFAULT_SENTINEL_BIND_ADDR.to_string()
+    )]
     bind: String,
 
     /// Database connection string

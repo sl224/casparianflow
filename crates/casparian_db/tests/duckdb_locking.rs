@@ -37,7 +37,8 @@ fn maybe_run_child() {
             if let Ok(ready_path) = env::var(READY_ENV) {
                 fs::write(ready_path, "ready").expect("child failed to write ready file");
             }
-            let release_path = PathBuf::from(env::var(RELEASE_ENV).expect("child missing release path"));
+            let release_path =
+                PathBuf::from(env::var(RELEASE_ENV).expect("child missing release path"));
             let start = Instant::now();
             while !release_path.exists() {
                 if start.elapsed() > Duration::from_secs(20) {

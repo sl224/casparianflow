@@ -50,9 +50,8 @@ pub fn quarantine_rows_by_output_key(output: &str) -> String {
 
 /// Build a per-output lineage-unavailable rows key.
 pub fn lineage_unavailable_rows_by_output_key(output: &str) -> String {
-    let mut key = String::with_capacity(
-        LINEAGE_UNAVAILABLE_ROWS_BY_OUTPUT_PREFIX.len() + output.len(),
-    );
+    let mut key =
+        String::with_capacity(LINEAGE_UNAVAILABLE_ROWS_BY_OUTPUT_PREFIX.len() + output.len());
     key.push_str(LINEAGE_UNAVAILABLE_ROWS_BY_OUTPUT_PREFIX);
     key.push_str(output);
     key

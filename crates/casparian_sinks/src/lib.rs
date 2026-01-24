@@ -10,14 +10,16 @@
 use anyhow::{bail, Context, Result};
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use casparian_db::{try_lock_exclusive, DbLockGuard, LockError};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use casparian_protocol::SinkMode;
+mod relational;
+pub use relational::duckdb::DuckDbSink;
+use relational::{RelationalBackend, RelationalSink};
 
 fn job_prefix(job_id: &str) -> String {
     // Use a stable 16-hex blake3 digest prefix to avoid collisions
@@ -571,10 +573,7 @@ impl CsvSink {
             if let Some(final_path) = &self.final_path {
                 if final_path.exists() {
                     let _ = std::fs::remove_file(final_path);
-                    warn!(
-                        "Rolled back CSV committed file: {}",
-                        final_path.display()
-                    );
+                    warn!("Rolled back CSV committed file: {}", final_path.display());
                 }
             }
         }
@@ -603,265 +602,10 @@ impl Drop for CsvSink {
     }
 }
 
-fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn stage_table_name(job_id: &str, output_name: &str) -> String {
-    let seed = format!("{}:{}", job_id, output_name);
-    format!(
-        "__cf_stage_{}",
-        blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
-    )
-}
-
-/// DuckDB sink writer
-pub struct DuckDbSink {
-    db_path: PathBuf,
-    table_name: String,
-    stage_table: String,
-    sink_mode: SinkMode,
-    conn: duckdb::Connection,
-    rows_written: u64,
-    schema: Option<Schema>,
-    _lock_guard: DbLockGuard,
-}
-
-impl DuckDbSink {
-    pub fn new(
-        db_path: PathBuf,
-        table_name: &str,
-        sink_mode: SinkMode,
-        job_id: &str,
-        output_name: &str,
-    ) -> Result<Self> {
-        if is_control_plane_db_path(&db_path) {
-            bail!(
-                "Refusing to write sink output into control-plane database: {}",
-                db_path.display()
-            );
-        }
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create database directory: {}", parent.display())
-            })?;
-        }
-
-        let lock_guard = try_lock_exclusive(&db_path).map_err(|err| match err {
-            LockError::Locked(path) => anyhow::anyhow!(
-                "DuckDB sink is locked by another writer: {}",
-                path.display()
-            ),
-            LockError::CreateFailed(io) => {
-                anyhow::anyhow!("Failed to create DuckDB lock file: {}", io)
-            }
-            LockError::AcquireFailed(io) => {
-                anyhow::anyhow!("Failed to acquire DuckDB lock: {}", io)
-            }
-        })?;
-
-        let conn = duckdb::Connection::open(&db_path)
-            .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
-
-        let stage_table = stage_table_name(job_id, output_name);
-
-        Ok(Self {
-            db_path,
-            table_name: table_name.to_string(),
-            stage_table,
-            sink_mode,
-            conn,
-            rows_written: 0,
-            schema: None,
-            _lock_guard: lock_guard,
-        })
-    }
-
-    fn with_conn_mut<F, T>(&mut self, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut duckdb::Connection) -> Result<T>,
-    {
-        f(&mut self.conn)
-    }
-
-    fn arrow_to_duckdb_type(dt: &DataType) -> String {
-        match dt {
-            DataType::Boolean => "BOOLEAN".to_string(),
-            DataType::Int8 => "TINYINT".to_string(),
-            DataType::Int16 => "SMALLINT".to_string(),
-            DataType::Int32 => "INTEGER".to_string(),
-            DataType::Int64 => "BIGINT".to_string(),
-            DataType::UInt8 => "UTINYINT".to_string(),
-            DataType::UInt16 => "USMALLINT".to_string(),
-            DataType::UInt32 => "UINTEGER".to_string(),
-            DataType::UInt64 => "UBIGINT".to_string(),
-            DataType::Float16 | DataType::Float32 => "FLOAT".to_string(),
-            DataType::Float64 => "DOUBLE".to_string(),
-            DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR".to_string(),
-            DataType::Binary | DataType::LargeBinary => "BLOB".to_string(),
-            DataType::Date32 => "DATE".to_string(),
-            DataType::Date64 => "BIGINT".to_string(),
-            DataType::Timestamp(_, tz) => {
-                if tz.is_some() {
-                    "TIMESTAMPTZ".to_string()
-                } else {
-                    "TIMESTAMP".to_string()
-                }
-            }
-            DataType::Time32(_) | DataType::Time64(_) => "BIGINT".to_string(),
-            DataType::Decimal128(precision, scale) => {
-                format!("DECIMAL({}, {})", precision, scale)
-            }
-            DataType::Decimal256(_, _) => "VARCHAR".to_string(),
-            _ => "VARCHAR".to_string(),
-        }
-    }
-}
-
-impl DuckDbSink {
-    fn init(&mut self, schema: &Schema) -> Result<()> {
-        info!(
-            "Initializing DuckDB sink: {} (table: {}, stage: {})",
-            self.db_path.display(),
-            self.table_name,
-            self.stage_table
-        );
-
-        let columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| {
-                let sql_type = Self::arrow_to_duckdb_type(f.data_type());
-                let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
-                format!(
-                    "\"{}\" {}{}",
-                    f.name().replace('"', "\"\""),
-                    sql_type,
-                    nullable
-                )
-            })
-            .collect();
-
-        let stage_ident = quote_ident(&self.stage_table);
-        let drop_sql = format!("DROP TABLE IF EXISTS {}", stage_ident);
-        let create_sql = format!("CREATE TABLE {} ({})", stage_ident, columns.join(", "));
-
-        debug!("DROP TABLE: {}", drop_sql);
-        debug!("CREATE TABLE: {}", create_sql);
-        self.with_conn_mut(|conn| {
-            conn.execute(&drop_sql, [])
-                .context("Failed to drop DuckDB stage table")?;
-            conn.execute(&create_sql, [])
-                .context("Failed to create DuckDB stage table")?;
-            Ok(())
-        })?;
-
-        self.schema = Some(schema.clone());
-        Ok(())
-    }
-
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let num_rows = batch.num_rows();
-        let mut appender = self
-            .conn
-            .appender(&self.stage_table)
-            .context("Failed to create DuckDB appender")?;
-        appender
-            .append_record_batch(batch.clone())
-            .context("Failed to append DuckDB record batch")?;
-
-        self.rows_written += num_rows as u64;
-        debug!(
-            "Wrote {} rows to DuckDB (total: {})",
-            num_rows, self.rows_written
-        );
-
-        Ok(num_rows as u64)
-    }
-
-    fn prepare(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn commit(&mut self) -> Result<()> {
-        if self.schema.is_none() {
-            return Ok(());
-        }
-
-        let target = quote_ident(&self.table_name);
-        let stage = quote_ident(&self.stage_table);
-        let sink_mode = self.sink_mode;
-        let table_name = self.table_name.clone();
-
-        self.with_conn_mut(|conn| {
-            let tx = conn
-                .transaction()
-                .context("Failed to begin DuckDB transaction")?;
-            match sink_mode {
-                SinkMode::Append => {
-                    let create_dest = format!(
-                        "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM {} WHERE 1=0",
-                        target, stage
-                    );
-                    tx.execute(&create_dest, [])
-                        .context("Failed to ensure DuckDB destination table")?;
-                    let insert_sql =
-                        format!("INSERT INTO {} SELECT * FROM {}", target, stage);
-                    tx.execute(&insert_sql, [])
-                        .context("Failed to append DuckDB stage data")?;
-                    let drop_stage = format!("DROP TABLE {}", stage);
-                    tx.execute(&drop_stage, [])
-                        .context("Failed to drop DuckDB stage table")?;
-                }
-                SinkMode::Replace => {
-                    let drop_target = format!("DROP TABLE IF EXISTS {}", target);
-                    tx.execute(&drop_target, [])
-                        .context("Failed to drop DuckDB target table")?;
-                    let rename_sql =
-                        format!("ALTER TABLE {} RENAME TO {}", stage, target);
-                    tx.execute(&rename_sql, [])
-                        .context("Failed to rename DuckDB stage table")?;
-                }
-                SinkMode::Error => {
-                    let rename_sql =
-                        format!("ALTER TABLE {} RENAME TO {}", stage, target);
-                    tx.execute(&rename_sql, [])
-                        .with_context(|| {
-                            format!(
-                                "DuckDB sink in Error mode: destination table '{}' already exists",
-                                table_name
-                            )
-                        })?;
-                }
-            }
-            tx.commit().context("Failed to commit DuckDB transaction")?;
-            Ok(())
-        })?;
-
-        self.with_conn_mut(|conn| {
-            conn.execute_batch("CHECKPOINT")
-                .context("Failed to checkpoint DuckDB database")?;
-            Ok(())
-        })?;
-        info!("Committed DuckDB sink: {} total rows", self.rows_written);
-        Ok(())
-    }
-
-    fn rollback(&mut self) -> Result<()> {
-        let stage = quote_ident(&self.stage_table);
-        self.with_conn_mut(|conn| {
-            conn.execute(&format!("DROP TABLE IF EXISTS {}", stage), [])
-                .context("Failed to drop DuckDB stage table")?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-}
-
 enum Sink {
     Parquet(ParquetSink),
     Csv(Box<CsvSink>),
-    DuckDb(DuckDbSink),
+    Relational(RelationalSink),
 }
 
 impl Sink {
@@ -869,7 +613,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.init(schema),
             Sink::Csv(sink) => sink.init(schema),
-            Sink::DuckDb(sink) => sink.init(schema),
+            Sink::Relational(sink) => sink.init(schema),
         }
     }
 
@@ -877,7 +621,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.write_batch(batch),
             Sink::Csv(sink) => sink.write_batch(batch),
-            Sink::DuckDb(sink) => sink.write_batch(batch),
+            Sink::Relational(sink) => sink.write_batch(batch),
         }
     }
 
@@ -885,7 +629,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.prepare(),
             Sink::Csv(sink) => sink.prepare(),
-            Sink::DuckDb(sink) => sink.prepare(),
+            Sink::Relational(sink) => sink.prepare(),
         }
     }
 
@@ -893,7 +637,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.commit(),
             Sink::Csv(sink) => sink.commit(),
-            Sink::DuckDb(sink) => sink.commit(),
+            Sink::Relational(sink) => sink.commit(),
         }
     }
 
@@ -901,38 +645,9 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.rollback(),
             Sink::Csv(sink) => sink.rollback(),
-            Sink::DuckDb(sink) => sink.rollback(),
+            Sink::Relational(sink) => sink.rollback(),
         }
     }
-}
-
-fn is_control_plane_db_path(db_path: &Path) -> bool {
-    if db_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "casparian_flow.duckdb")
-    {
-        return true;
-    }
-
-    if let Ok(home) = std::env::var("CASPARIAN_HOME") {
-        let candidate = PathBuf::from(home).join("casparian_flow.duckdb");
-        if candidate == db_path {
-            return true;
-        }
-    }
-
-    let home_env = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
-    if let Ok(home) = home_env {
-        let candidate = PathBuf::from(home)
-            .join(".casparian_flow")
-            .join("casparian_flow.duckdb");
-        if candidate == db_path {
-            return true;
-        }
-    }
-
-    false
 }
 
 /// Sink registry - manages multiple sinks for a run
@@ -985,10 +700,7 @@ impl SinkRegistry {
     /// Finish all sinks with an optional commit guard.
     ///
     /// If the guard returns false, all sinks are rolled back.
-    pub fn finish_with_guard(
-        mut self,
-        should_commit: Option<&dyn Fn() -> bool>,
-    ) -> Result<()> {
+    pub fn finish_with_guard(mut self, should_commit: Option<&dyn Fn() -> bool>) -> Result<()> {
         let mut names: Vec<String> = self.sinks.keys().cloned().collect();
         names.sort();
 
@@ -1223,13 +935,15 @@ pub(crate) fn create_sink_from_uri(
                 job_id,
             )?)))
         }
-        casparian_protocol::types::SinkScheme::Duckdb => Ok(Sink::DuckDb(DuckDbSink::new(
-            parsed.path,
-            table_name,
-            sink_mode,
-            job_id,
-            output_name,
-        )?)),
+        casparian_protocol::types::SinkScheme::Duckdb => Ok(Sink::Relational(RelationalSink::new(
+            RelationalBackend::DuckDb(DuckDbSink::new(
+                parsed.path,
+                table_name,
+                sink_mode,
+                job_id,
+                output_name,
+            )?),
+        ))),
         casparian_protocol::types::SinkScheme::File => {
             // File sink: infer by extension
             let ext = parsed
@@ -1272,13 +986,15 @@ pub(crate) fn create_sink_from_uri(
                         job_id,
                     )?)))
                 }
-                "duckdb" | "db" => Ok(Sink::DuckDb(DuckDbSink::new(
-                    parsed.path,
-                    table_name,
-                    sink_mode,
-                    job_id,
-                    output_name,
-                )?)),
+                "duckdb" | "db" => Ok(Sink::Relational(RelationalSink::new(
+                    RelationalBackend::DuckDb(DuckDbSink::new(
+                        parsed.path,
+                        table_name,
+                        sink_mode,
+                        job_id,
+                        output_name,
+                    )?),
+                ))),
                 _ => bail!("Unsupported file sink extension: '{}'", ext),
             }
         }
@@ -1328,15 +1044,14 @@ mod tests {
         sink.commit().unwrap();
 
         // Verify partitioned file exists
-        let output_path = dir
-            .path()
-            .join(output_filename("test", job_id, "parquet"));
+        let output_path = dir.path().join(output_filename("test", job_id, "parquet"));
         assert!(output_path.exists());
 
         // Verify temp file was cleaned up
-        let temp_path = dir
-            .path()
-            .join(format!(".{}.tmp", output_filename("test", job_id, "parquet")));
+        let temp_path = dir.path().join(format!(
+            ".{}.tmp",
+            output_filename("test", job_id, "parquet")
+        ));
         assert!(!temp_path.exists());
     }
 
@@ -1439,9 +1154,7 @@ mod tests {
         sink.commit().unwrap();
 
         // Verify partitioned file exists and has content
-        let output_path = dir
-            .path()
-            .join(output_filename("test", job_id, "csv"));
+        let output_path = dir.path().join(output_filename("test", job_id, "csv"));
         assert!(output_path.exists());
 
         let content = std::fs::read_to_string(&output_path).unwrap();
@@ -1459,9 +1172,14 @@ mod tests {
     fn test_duckdb_sink() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.duckdb");
-        let mut sink =
-            DuckDbSink::new(db_path.clone(), "records", SinkMode::Append, "job-1", "records")
-                .unwrap();
+        let mut sink = DuckDbSink::new(
+            db_path.clone(),
+            "records",
+            SinkMode::Append,
+            "job-1",
+            "records",
+        )
+        .unwrap();
 
         let batch = create_test_batch();
         sink.init(batch.schema().as_ref()).unwrap();
@@ -1483,17 +1201,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("locked.duckdb");
 
-        let _sink1 =
-            DuckDbSink::new(db_path.clone(), "records", SinkMode::Append, "job-1", "records")
-                .unwrap();
-
-        let err = match DuckDbSink::new(
-            db_path,
+        let _sink1 = DuckDbSink::new(
+            db_path.clone(),
             "records",
             SinkMode::Append,
-            "job-2",
+            "job-1",
             "records",
-        ) {
+        )
+        .unwrap();
+
+        let err = match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-2", "records") {
             Ok(_) => panic!("expected lock error, got Ok"),
             Err(err) => err,
         };
@@ -1509,20 +1226,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("casparian_flow.duckdb");
 
-        let err = match DuckDbSink::new(
-            db_path,
-            "records",
-            SinkMode::Append,
-            "job-1",
-            "records",
-        ) {
+        let err = match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-1", "records") {
             Ok(_) => panic!("expected control-plane rejection, got Ok"),
             Err(err) => err,
         };
         assert!(
-            err.to_string()
-                .to_lowercase()
-                .contains("control-plane"),
+            err.to_string().to_lowercase().contains("control-plane"),
             "expected control-plane rejection, got: {}",
             err
         );
@@ -1532,9 +1241,14 @@ mod tests {
     fn test_duckdb_sink_decimal_timestamp_tz() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_decimal_tz.duckdb");
-        let mut sink =
-            DuckDbSink::new(db_path.clone(), "records", SinkMode::Append, "job-1", "records")
-                .unwrap();
+        let mut sink = DuckDbSink::new(
+            db_path.clone(),
+            "records",
+            SinkMode::Append,
+            "job-1",
+            "records",
+        )
+        .unwrap();
 
         let mut dec_builder =
             Decimal128Builder::with_capacity(3).with_data_type(DataType::Decimal128(10, 2));

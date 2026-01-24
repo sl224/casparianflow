@@ -28,10 +28,11 @@ pub fn casparian_home() -> PathBuf {
     if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
         return PathBuf::from(override_path);
     }
-    dirs::home_dir().expect(
-        "Could not determine home directory (HOME not set). \
+    dirs::home_dir()
+        .expect(
+            "Could not determine home directory (HOME not set). \
 Set CASPARIAN_HOME or pass --db-path, or export HOME.",
-    )
+        )
         .join(".casparian_flow")
 }
 

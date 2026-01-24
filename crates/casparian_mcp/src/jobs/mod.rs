@@ -27,7 +27,6 @@ pub use manager::JobManager;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::str::FromStr;
 
 // ============================================================================
 // JobSpec - Persisted job execution details
@@ -71,38 +70,8 @@ pub enum JobSpec {
 // JobId - Unique job identifier
 // ============================================================================
 
-/// Unique job identifier (numeric, DB-backed)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct JobId(pub u64);
-
-impl JobId {
-    /// Create from an existing numeric ID
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Parse from string (MCP inputs)
-    pub fn parse(s: &str) -> Result<Self, std::num::ParseIntError> {
-        Ok(Self(u64::from_str(s)?))
-    }
-
-    /// Convert to protocol JobId
-    pub const fn to_proto(self) -> casparian_protocol::JobId {
-        casparian_protocol::JobId::new(self.0)
-    }
-
-    /// Convert from protocol JobId
-    pub const fn from_proto(id: casparian_protocol::JobId) -> Self {
-        Self(id.as_u64())
-    }
-}
-
-impl fmt::Display for JobId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+/// Unique API job identifier (cf_api_jobs).
+pub type JobId = casparian_protocol::ApiJobId;
 
 /// Job state
 #[derive(Debug, Clone, Serialize, Deserialize)]

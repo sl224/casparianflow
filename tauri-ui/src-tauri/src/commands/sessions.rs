@@ -165,21 +165,19 @@ pub async fn session_create(
         })
     };
 
-    let storage = state
-        .open_session_storage()
-        .map_err(|e| {
-            if let Some((event_id, correlation_id)) = &tape_ids {
-                if let Ok(tape) = state.tape().read() {
-                    tape.emit_error(
-                        correlation_id,
-                        event_id,
-                        &e.to_string(),
-                        serde_json::json!({"status": "failed"}),
-                    );
-                }
+    let storage = state.open_session_storage().map_err(|e| {
+        if let Some((event_id, correlation_id)) = &tape_ids {
+            if let Ok(tape) = state.tape().read() {
+                tape.emit_error(
+                    correlation_id,
+                    event_id,
+                    &e.to_string(),
+                    serde_json::json!({"status": "failed"}),
+                );
             }
-            CommandError::Database(e.to_string())
-        })?;
+        }
+        CommandError::Database(e.to_string())
+    })?;
 
     let session_id = storage
         .create_session(&request.intent, request.input_dir.as_deref())

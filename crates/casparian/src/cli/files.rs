@@ -89,9 +89,8 @@ struct FileRow {
 }
 
 fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
-    workspace::resolve_active_workspace_id(db).map_err(|e| {
-        e.with_context("The workspace registry is required for files")
-    })
+    workspace::resolve_active_workspace_id(db)
+        .map_err(|e| e.with_context("The workspace registry is required for files"))
 }
 
 fn now_millis() -> i64 {
@@ -112,7 +111,9 @@ fn load_files(
          FROM scout_files f ",
     );
     if topic.is_some() {
-        sql.push_str("JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id ");
+        sql.push_str(
+            "JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id ",
+        );
     } else if untagged {
         sql.push_str(
             "LEFT JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id ",
@@ -264,7 +265,10 @@ fn apply_manual_tag(
         let updated = conn
             .execute(
                 "UPDATE scout_files SET status = ? WHERE id = ?",
-                &[DbValue::from(FileStatus::Tagged.as_str()), DbValue::from(*file_id)],
+                &[
+                    DbValue::from(FileStatus::Tagged.as_str()),
+                    DbValue::from(*file_id),
+                ],
             )
             .map_err(|e| HelpfulError::new(format!("Failed to update file status: {}", e)))?;
         if updated == 0 {
@@ -458,8 +462,9 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
             None => {
                 // Default source no longer exists - clear it and show all
                 context::clear_default_source().map_err(|e| {
-                    HelpfulError::new(format!("Failed to clear context: {}", e))
-                        .with_suggestion("TRY: Delete ~/.casparian_flow/context.toml to reset".to_string())
+                    HelpfulError::new(format!("Failed to clear context: {}", e)).with_suggestion(
+                        "TRY: Delete ~/.casparian_flow/context.toml to reset".to_string(),
+                    )
                 })?;
                 (sources.iter().map(|s| s.id.clone()).collect(), None, None)
             }

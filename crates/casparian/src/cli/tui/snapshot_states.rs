@@ -16,7 +16,7 @@ use super::app::{
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
-    MatchedFile, NamingScheme, PatternSeed, PathArchetype, ResultFilter, RuleBuilderField,
+    MatchedFile, NamingScheme, PathArchetype, PatternSeed, ResultFilter, RuleBuilderField,
     RuleBuilderFocus, RuleBuilderState, SuggestionSection, SynonymConfidence, SynonymSuggestion,
 };
 use super::TuiArgs;
@@ -242,7 +242,9 @@ fn case_query_results_table() -> App {
     app.mode = TuiMode::Query;
     app.query_state = QueryState {
         view_state: QueryViewState::ViewingResults,
-        sql_input: "SELECT id, name, status, created_at FROM scout_jobs ORDER BY created_at DESC LIMIT 20".to_string(),
+        sql_input:
+            "SELECT id, name, status, created_at FROM scout_jobs ORDER BY created_at DESC LIMIT 20"
+                .to_string(),
         cursor_position: 0,
         history: vec![
             "SELECT * FROM scout_jobs WHERE status = 'FAILED'".to_string(),
@@ -379,7 +381,12 @@ fn sample_sources() -> Vec<SourceInfo> {
     vec![
         source_info(1, "alpha-lake", "/data/alpha", 1280),
         source_info(2, "bravo-share", "/mnt/bravo/share", 342),
-        source_info(3, "charlie-archive-long-name", "/Volumes/archive/2024/charlie", 9050),
+        source_info(
+            3,
+            "charlie-archive-long-name",
+            "/Volumes/archive/2024/charlie",
+            9050,
+        ),
     ]
 }
 
@@ -588,8 +595,7 @@ fn sample_rules() -> Vec<RuleInfo> {
     vec![
         RuleInfo {
             id: RuleId::new(
-                TaggingRuleId::parse("22222222-2222-2222-2222-222222222222")
-                    .expect("rule id"),
+                TaggingRuleId::parse("22222222-2222-2222-2222-222222222222").expect("rule id"),
             ),
             pattern: "reports/**/*.csv".to_string(),
             tag: "report".to_string(),
@@ -598,8 +604,7 @@ fn sample_rules() -> Vec<RuleInfo> {
         },
         RuleInfo {
             id: RuleId::new(
-                TaggingRuleId::parse("33333333-3333-3333-3333-333333333333")
-                    .expect("rule id"),
+                TaggingRuleId::parse("33333333-3333-3333-3333-333333333333").expect("rule id"),
             ),
             pattern: "trades/**/*.parquet".to_string(),
             tag: "trade".to_string(),
@@ -608,8 +613,7 @@ fn sample_rules() -> Vec<RuleInfo> {
         },
         RuleInfo {
             id: RuleId::new(
-                TaggingRuleId::parse("44444444-4444-4444-4444-444444444444")
-                    .expect("rule id"),
+                TaggingRuleId::parse("44444444-4444-4444-4444-444444444444").expect("rule id"),
             ),
             pattern: "archive/**/*.zip".to_string(),
             tag: "archive".to_string(),
@@ -821,11 +825,36 @@ fn sample_query_results() -> QueryResults {
         "created_at".to_string(),
     ];
     let rows = vec![
-        vec!["9105".to_string(), "schema_seeds".to_string(), "Completed".to_string(), "2024-10-01 09:42".to_string()],
-        vec!["9104".to_string(), "broken_parser".to_string(), "Failed".to_string(), "2024-10-01 09:30".to_string()],
-        vec!["9103".to_string(), "report_rules".to_string(), "PartialSuccess".to_string(), "2024-10-01 09:20".to_string()],
-        vec!["9102".to_string(), "trades_parser".to_string(), "Pending".to_string(), "2024-10-01 09:10".to_string()],
-        vec!["9101".to_string(), "alpha-lake".to_string(), "Running".to_string(), "2024-10-01 09:05".to_string()],
+        vec![
+            "9105".to_string(),
+            "schema_seeds".to_string(),
+            "Completed".to_string(),
+            "2024-10-01 09:42".to_string(),
+        ],
+        vec![
+            "9104".to_string(),
+            "broken_parser".to_string(),
+            "Failed".to_string(),
+            "2024-10-01 09:30".to_string(),
+        ],
+        vec![
+            "9103".to_string(),
+            "report_rules".to_string(),
+            "PartialSuccess".to_string(),
+            "2024-10-01 09:20".to_string(),
+        ],
+        vec![
+            "9102".to_string(),
+            "trades_parser".to_string(),
+            "Pending".to_string(),
+            "2024-10-01 09:10".to_string(),
+        ],
+        vec![
+            "9101".to_string(),
+            "alpha-lake".to_string(),
+            "Running".to_string(),
+            "2024-10-01 09:05".to_string(),
+        ],
     ];
 
     QueryResults {

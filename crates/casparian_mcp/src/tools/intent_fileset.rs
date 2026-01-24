@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::core::CoreHandle;
-use crate::intent::fileset::{FileSetPage, FileSetSample, FileSetStore};
+use crate::intent::fileset::FileSetStore;
 use crate::intent::session::{FileSetEntry, SessionStore};
-use crate::intent::types::{FileSetId, FileSetMeta, SessionId};
+use crate::intent::types::{FileSetId, SessionId};
 use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;

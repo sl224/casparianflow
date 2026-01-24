@@ -156,7 +156,16 @@ impl DuckDbPipelineStore {
             .conn
             .query_optional(
                 r#"
-                SELECT pr.*
+                SELECT
+                    pr.id,
+                    pr.pipeline_id,
+                    pr.selection_spec_id,
+                    pr.selection_snapshot_hash,
+                    pr.context_snapshot_hash,
+                    pr.logical_date,
+                    pr.status,
+                    pr.started_at,
+                    pr.completed_at
                 FROM cf_processing_queue q
                 JOIN cf_pipeline_runs pr ON pr.id = q.pipeline_run_id
                 WHERE q.id = ?
@@ -475,7 +484,9 @@ impl DuckDbPipelineStore {
         }
         let mut sql = String::from("SELECT f.id, f.mtime FROM scout_files f");
         if filters.tag.is_some() {
-            sql.push_str(" JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id");
+            sql.push_str(
+                " JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id",
+            );
         }
         sql.push_str(" WHERE f.status != ?");
         let mut params: Vec<DbValue> = vec![DbValue::from(FileStatus::Deleted.as_str())];

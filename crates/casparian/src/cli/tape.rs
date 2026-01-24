@@ -69,12 +69,8 @@ impl TapeSummary {
 
 pub fn run_tape_command(cmd: TapeCommands) -> Result<()> {
     match cmd {
-        TapeCommands::Explain { tape_file, format } => {
-            explain_tape(&tape_file, &format)
-        }
-        TapeCommands::Validate { tape_file } => {
-            validate_tape(&tape_file)
-        }
+        TapeCommands::Explain { tape_file, format } => explain_tape(&tape_file, &format),
+        TapeCommands::Validate { tape_file } => validate_tape(&tape_file),
     }
 }
 
@@ -131,14 +127,23 @@ fn process_event(envelope: &EnvelopeV1, summary: &mut TapeSummary) {
                     .payload
                     .get("message")
                     .and_then(|v: &Value| v.as_str())
-                    .or_else(|| envelope.payload.get("error").and_then(|v: &Value| v.as_str()));
+                    .or_else(|| {
+                        envelope
+                            .payload
+                            .get("error")
+                            .and_then(|v: &Value| v.as_str())
+                    });
                 if let Some(msg) = msg {
                     summary.errors.push(format!("{}: {}", name, msg));
                 }
             }
         }
         EventName::ErrorEvent(name) => {
-            if let Some(msg) = envelope.payload.get("message").and_then(|v: &Value| v.as_str()) {
+            if let Some(msg) = envelope
+                .payload
+                .get("message")
+                .and_then(|v: &Value| v.as_str())
+            {
                 summary.errors.push(format!("{}: {}", name, msg));
             } else {
                 summary.errors.push(name.clone());
@@ -151,17 +156,22 @@ fn process_domain_event(name: &str, payload: &Value, summary: &mut TapeSummary) 
     match name {
         "JobDispatched" => {
             if let Some(job_id_str) = extract_job_id(payload) {
-                let plugin_name =
-                    payload.get("plugin_name").and_then(|v| v.as_str()).map(String::from);
+                let plugin_name = payload
+                    .get("plugin_name")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
 
-                summary.jobs.entry(job_id_str.clone()).or_insert(JobSummary {
-                    job_id: job_id_str,
-                    plugin_name,
-                    status: "dispatched".to_string(),
-                    rows: None,
-                    outputs: Vec::new(),
-                    error: None,
-                });
+                summary
+                    .jobs
+                    .entry(job_id_str.clone())
+                    .or_insert(JobSummary {
+                        job_id: job_id_str,
+                        plugin_name,
+                        status: "dispatched".to_string(),
+                        rows: None,
+                        outputs: Vec::new(),
+                        error: None,
+                    });
             }
         }
         "JobCompleted" => {
@@ -178,7 +188,10 @@ fn process_domain_event(name: &str, payload: &Value, summary: &mut TapeSummary) 
             if let Some(job_id_str) = extract_job_id(payload) {
                 if let Some(job) = summary.jobs.get_mut(&job_id_str) {
                     job.status = "failed".to_string();
-                    job.error = payload.get("error").and_then(|v| v.as_str()).map(String::from);
+                    job.error = payload
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                 }
             }
         }
@@ -202,15 +215,10 @@ fn process_domain_event(name: &str, payload: &Value, summary: &mut TapeSummary) 
 fn extract_job_id(payload: &Value) -> Option<String> {
     match payload.get("job_id") {
         Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Number(n)) => {
-            if let Some(v) = n.as_u64() {
-                Some(v.to_string())
-            } else if let Some(v) = n.as_i64() {
-                Some(v.to_string())
-            } else {
-                None
-            }
-        }
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .map(|v| v.to_string())
+            .or_else(|| n.as_i64().map(|v| v.to_string())),
         _ => None,
     }
 }
@@ -238,7 +246,10 @@ fn print_summary_text(summary: &TapeSummary) {
         for job in summary.jobs.values() {
             let plugin = job.plugin_name.as_deref().unwrap_or("unknown");
             let rows_str = job.rows.map(|r| format!("{} rows", r)).unwrap_or_default();
-            println!("  [{}] {} - {} {}", job.status, job.job_id, plugin, rows_str);
+            println!(
+                "  [{}] {} - {} {}",
+                job.status, job.job_id, plugin, rows_str
+            );
 
             if let Some(error) = &job.error {
                 println!("       Error: {}", error);
@@ -256,7 +267,10 @@ fn print_summary_text(summary: &TapeSummary) {
         }
 
         println!();
-        println!("  Summary: {} completed, {} failed, {} total rows", completed, failed, total_rows);
+        println!(
+            "  Summary: {} completed, {} failed, {} total rows",
+            completed, failed, total_rows
+        );
         println!();
     }
 
@@ -275,16 +289,20 @@ fn print_summary_text(summary: &TapeSummary) {
 }
 
 fn print_summary_json(summary: &TapeSummary) -> Result<()> {
-    let jobs_list: Vec<_> = summary.jobs.values().map(|j| {
-        serde_json::json!({
-            "job_id": j.job_id,
-            "plugin_name": j.plugin_name,
-            "status": j.status,
-            "rows": j.rows,
-            "outputs": j.outputs,
-            "error": j.error,
+    let jobs_list: Vec<_> = summary
+        .jobs
+        .values()
+        .map(|j| {
+            serde_json::json!({
+                "job_id": j.job_id,
+                "plugin_name": j.plugin_name,
+                "status": j.status,
+                "rows": j.rows,
+                "outputs": j.outputs,
+                "error": j.error,
+            })
         })
-    }).collect();
+        .collect();
 
     let output = serde_json::json!({
         "schema_version": summary.schema_version,
@@ -325,7 +343,9 @@ fn validate_tape(tape_file: &PathBuf) -> Result<()> {
                     if envelope.schema_version != seen {
                         errors.push(format!(
                             "Line {}: Schema version mismatch ({} vs {})",
-                            line_num + 1, envelope.schema_version, seen
+                            line_num + 1,
+                            envelope.schema_version,
+                            seen
                         ));
                     }
                 } else {
@@ -343,7 +363,9 @@ fn validate_tape(tape_file: &PathBuf) -> Result<()> {
                     if envelope.seq != last + 1 {
                         errors.push(format!(
                             "Line {}: Sequence gap ({} -> {})",
-                            line_num + 1, last, envelope.seq
+                            line_num + 1,
+                            last,
+                            envelope.seq
                         ));
                     }
                 }

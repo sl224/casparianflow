@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/casparian_protocol",
+    "crates/casparian_intent",
     "crates/casparian_worker",
     "crates/casparian_sentinel",
     "crates/casparian_sinks",

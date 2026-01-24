@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::approvals::{ApprovalId, ApprovalOperation, ApprovalRequest, ApprovalStatus};
-use crate::jobs::{Job, JobId, JobProgress, JobSpec, JobState, JobType};
+use crate::jobs::{Job, JobId, JobProgress, JobState, JobType};
 use crate::types::{ApprovalSummary, PluginRef};
 
 /// Database-backed job store using ApiStorage.
@@ -46,7 +46,7 @@ impl DbJobStore {
     /// Save a job to the database.
     pub fn save(&self, job: &Job) -> Result<()> {
         // Check if job exists
-        let existing = self.storage.get_job(to_protocol_job_id(&job.id))?;
+        let existing = self.storage.get_job(job.id)?;
 
         if existing.is_none() {
             // Create new job
@@ -79,17 +79,17 @@ impl DbJobStore {
                 job.approval_id.as_deref(),
                 Some(&spec_json),
             )?;
-            if new_id.as_u64() != job.id.0 {
+            if new_id.as_u64() != job.id.as_u64() {
                 anyhow::bail!(
                     "Job ID mismatch: DB generated {}, expected {}",
                     new_id.as_u64(),
-                    job.id.0
+                    job.id.as_u64()
                 );
             }
         }
 
         // Update status and progress based on current state
-        let protocol_job_id = to_protocol_job_id(&job.id);
+        let protocol_job_id = job.id;
 
         match &job.state {
             JobState::Queued { .. } => {
@@ -140,8 +140,7 @@ impl DbJobStore {
 
     /// Load a job by ID.
     pub fn load(&self, id: &JobId) -> Result<Option<Job>> {
-        let protocol_id = to_protocol_job_id(id);
-        let job_opt = self.storage.get_job(protocol_id)?;
+        let job_opt = self.storage.get_job(*id)?;
 
         match job_opt {
             Some(pj) => Ok(Some(from_protocol_job(pj)?)),
@@ -160,14 +159,12 @@ impl DbJobStore {
         // Note: ApiStorage doesn't have a direct delete method.
         // For cleanup, use cleanup_old_data instead.
         // For now, we just mark as cancelled if possible.
-        let protocol_id = to_protocol_job_id(id);
-        self.storage.cancel_job(protocol_id)
+        self.storage.cancel_job(*id)
     }
 
     /// Insert an event for a job.
     pub fn insert_event(&self, job_id: &JobId, event_type: &EventType) -> Result<u64> {
-        let protocol_id = to_protocol_job_id(job_id);
-        self.storage.insert_event(protocol_id, event_type)
+        self.storage.insert_event(*job_id, event_type)
     }
 
     /// List events for a job.
@@ -176,8 +173,7 @@ impl DbJobStore {
         job_id: &JobId,
         after_event_id: Option<u64>,
     ) -> Result<Vec<casparian_protocol::Event>> {
-        let protocol_id = to_protocol_job_id(job_id);
-        self.storage.list_events(protocol_id, after_event_id)
+        self.storage.list_events(*job_id, after_event_id)
     }
 }
 
@@ -234,7 +230,7 @@ impl DbApprovalStore {
                             .with_context(|| format!("Invalid job_id: {}", job_id))?;
                         self.storage.link_approval_to_job(
                             approval.approval_id.as_ref(),
-                            casparian_protocol::JobId::new(parsed),
+                            casparian_protocol::ApiJobId::new(parsed),
                         )?;
                     }
                 }
@@ -297,14 +293,6 @@ impl DbApprovalStore {
 // ============================================================================
 // Type Conversion Helpers
 // ============================================================================
-
-fn to_protocol_job_id(id: &JobId) -> casparian_protocol::JobId {
-    casparian_protocol::JobId::new(id.0)
-}
-
-fn from_protocol_job_id(id: casparian_protocol::JobId) -> JobId {
-    JobId::new(id.as_u64())
-}
 
 fn from_protocol_job(pj: casparian_protocol::Job) -> Result<Job> {
     let job_type = match pj.job_type {
@@ -407,7 +395,7 @@ fn from_protocol_job(pj: casparian_protocol::Job) -> Result<Job> {
     });
 
     Ok(Job {
-        id: from_protocol_job_id(pj.job_id),
+        id: pj.job_id,
         job_type,
         state,
         created_at,
@@ -573,6 +561,7 @@ impl From<JobResultWrapper> for JobResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobSpec;
     use casparian_db::DbConnection;
 
     #[test]

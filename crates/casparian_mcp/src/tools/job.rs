@@ -77,7 +77,9 @@ impl McpTool for JobStatusTool {
         _executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: JobStatusArgs = serde_json::from_value(args)?;
-        let job_id = JobId::parse(&args.job_id)
+        let job_id: JobId = args
+            .job_id
+            .parse()
             .map_err(|e| anyhow::anyhow!("Invalid job_id '{}': {}", args.job_id, e))?;
 
         let job = core
@@ -171,7 +173,9 @@ impl McpTool for JobCancelTool {
         executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: JobCancelArgs = serde_json::from_value(args)?;
-        let job_id = JobId::parse(&args.job_id)
+        let job_id: JobId = args
+            .job_id
+            .parse()
             .map_err(|e| anyhow::anyhow!("Invalid job_id '{}': {}", args.job_id, e))?;
 
         // Check if job exists and its state

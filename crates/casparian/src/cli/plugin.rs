@@ -133,8 +133,7 @@ fn cmd_import(bundle_root: PathBuf) -> Result<()> {
     let schema_defs = load_schema_definitions(&bundle_root)?;
     let schema_artifacts_json =
         serde_json::to_string(&schema_defs).context("Failed to serialize schema artifacts")?;
-    let outputs_json =
-        build_outputs_json(&schema_defs).context("Failed to build outputs_json")?;
+    let outputs_json = build_outputs_json(&schema_defs).context("Failed to build outputs_json")?;
 
     let binary_bytes = fs::read(&entrypoint_path)
         .with_context(|| format!("Failed to read binary: {}", entrypoint_path.display()))?;

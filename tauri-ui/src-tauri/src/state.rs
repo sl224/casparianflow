@@ -12,7 +12,7 @@ use crate::tape::{create_disabled_tape, SharedTapeState};
 use std::time::Duration;
 
 /// Default Control API address when sentinel is running.
-const DEFAULT_CONTROL_ADDR: &str = "tcp://127.0.0.1:5556";
+const DEFAULT_CONTROL_ADDR: &str = casparian_protocol::defaults::DEFAULT_CONTROL_ADDR;
 
 /// Application state shared across Tauri commands.
 ///

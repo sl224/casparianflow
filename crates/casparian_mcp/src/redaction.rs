@@ -10,9 +10,9 @@ use crate::types::{RedactionMode, RedactionPolicy};
 
 /// Apply redaction to a single JSON value based on the policy.
 pub fn redact_value(value: &Value, policy: &RedactionPolicy) -> Value {
-    match policy.mode {
+    match policy.base.mode {
         RedactionMode::None => value.clone(),
-        RedactionMode::Truncate => truncate_value(value, policy.max_value_length),
+        RedactionMode::Truncate => truncate_value(value, policy.base.max_value_length),
         RedactionMode::Hash => hash_value(value, policy.hash_prefix_length),
     }
 }
@@ -169,16 +169,21 @@ mod tests {
 
     fn truncate_policy(max_len: usize) -> RedactionPolicy {
         RedactionPolicy {
-            mode: RedactionMode::Truncate,
-            max_sample_count: 5,
-            max_value_length: max_len,
+            base: casparian_protocol::RedactionPolicy {
+                mode: RedactionMode::Truncate,
+                max_sample_count: 5,
+                max_value_length: max_len,
+            },
             hash_prefix_length: 8,
         }
     }
 
     fn no_redaction_policy() -> RedactionPolicy {
         RedactionPolicy {
-            mode: RedactionMode::None,
+            base: casparian_protocol::RedactionPolicy {
+                mode: RedactionMode::None,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

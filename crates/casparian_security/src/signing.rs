@@ -29,7 +29,7 @@ pub fn compute_artifact_hash(
         schema_artifacts_json,
     ] {
         hasher.update(part.as_bytes());
-        hasher.update(&[SEP]);
+        hasher.update([SEP]);
     }
     hex::encode(hasher.finalize())
 }

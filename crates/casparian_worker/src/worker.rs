@@ -763,10 +763,7 @@ fn validate_entrypoint(entrypoint: &Path, base_dir: &Path) -> WorkerResult<PathB
     for component in entrypoint.components() {
         if matches!(component, Component::ParentDir) {
             return Err(WorkerError::Permanent {
-                message: format!(
-                    "Entrypoint cannot contain '..': {:?}",
-                    entrypoint.display()
-                ),
+                message: format!("Entrypoint cannot contain '..': {:?}", entrypoint.display()),
             });
         }
     }
@@ -774,19 +771,17 @@ fn validate_entrypoint(entrypoint: &Path, base_dir: &Path) -> WorkerResult<PathB
     // Join and canonicalize
     let joined = base_dir.join(entrypoint);
     let canonical = joined.canonicalize().map_err(|e| WorkerError::Permanent {
-        message: format!(
-            "Failed to resolve entrypoint '{}': {}",
-            joined.display(),
-            e
-        ),
+        message: format!("Failed to resolve entrypoint '{}': {}", joined.display(), e),
     })?;
-    let base_canonical = base_dir.canonicalize().map_err(|e| WorkerError::Permanent {
-        message: format!(
-            "Failed to resolve base directory '{}': {}",
-            base_dir.display(),
-            e
-        ),
-    })?;
+    let base_canonical = base_dir
+        .canonicalize()
+        .map_err(|e| WorkerError::Permanent {
+            message: format!(
+                "Failed to resolve base directory '{}': {}",
+                base_dir.display(),
+                e
+            ),
+        })?;
 
     // Verify the resolved path stays within the base directory
     if !canonical.starts_with(&base_canonical) {
@@ -1050,9 +1045,7 @@ enum ExecutionOutcome {
         source_hash: String,
     },
     /// Job was cancelled during execution
-    Cancelled {
-        source_hash: Option<String>,
-    },
+    Cancelled { source_hash: Option<String> },
 }
 
 fn insert_execution_metrics(metrics: &mut HashMap<String, i64>, exec: &ExecutionMetrics) {
@@ -1069,7 +1062,10 @@ fn insert_execution_metrics(metrics: &mut HashMap<String, i64>, exec: &Execution
 
     // Per-output metrics including status
     for output in &exec.outputs {
-        metrics.insert(metrics::rows_by_output_key(&output.name), output.rows as i64);
+        metrics.insert(
+            metrics::rows_by_output_key(&output.name),
+            output.rows as i64,
+        );
         metrics.insert(
             metrics::quarantine_rows_by_output_key(&output.name),
             output.quarantine_rows as i64,
@@ -1558,14 +1554,13 @@ fn execute_job_inner(
         })?;
 
     let job_id_str = job_id.to_string();
-    let source_hash = compute_source_hash(&cmd.file_path).map_err(|err| {
-        WorkerError::Permanent {
+    let source_hash =
+        compute_source_hash(&cmd.file_path).map_err(|err| WorkerError::Permanent {
             message: format!(
                 "Failed to compute source hash for '{}': {}",
                 cmd.file_path, err
             ),
-        }
-    })?;
+        })?;
     let parser_version = cmd.parser_version.as_deref().unwrap_or("unknown");
 
     let mut total_rows = 0;
@@ -1581,7 +1576,9 @@ fn execute_job_inner(
         let output_name = output.name().to_string();
         let mut output_table = output.table().map(|table| table.to_string());
         let sink_config = select_sink_config(cmd, &output_name)?;
-        let sink_mode = sink_config.map(|sink| sink.mode).unwrap_or(SinkMode::Append);
+        let sink_mode = sink_config
+            .map(|sink| sink.mode)
+            .unwrap_or(SinkMode::Append);
         let schema_def = sink_config.and_then(|sink| sink.schema.as_ref());
         let schema_hash_value = schema_hash(schema_def);
         if schema_hash_value.is_some() {
@@ -1849,21 +1846,15 @@ fn write_outputs_grouped(
 
     let mut artifacts = Vec::new();
     for sink_uri in sink_uris {
-        let mut group = grouped
-            .remove(&sink_uri)
-            .unwrap_or_else(|| Vec::new());
+        let mut group = grouped.remove(&sink_uri).unwrap_or_default();
         group.sort_by(|a, b| a.name.cmp(&b.name));
         let plans = to_output_plans(&group);
         let should_commit = || !cancel_token.is_cancelled();
-        let written = casparian_sinks::write_output_plan(
-            &sink_uri,
-            &plans,
-            job_id,
-            Some(&should_commit),
-        )
-        .map_err(|e| WorkerError::Transient {
-            message: e.to_string(),
-        })?;
+        let written =
+            casparian_sinks::write_output_plan(&sink_uri, &plans, job_id, Some(&should_commit))
+                .map_err(|e| WorkerError::Transient {
+                    message: e.to_string(),
+                })?;
         artifacts.extend(written);
     }
 
@@ -2845,11 +2836,7 @@ mod tests {
 
         for attempt in traversal_attempts {
             let result = validate_entrypoint(Path::new(attempt), base);
-            assert!(
-                result.is_err(),
-                "Expected rejection for path: {}",
-                attempt
-            );
+            assert!(result.is_err(), "Expected rejection for path: {}", attempt);
             let err = result.unwrap_err();
             assert!(
                 err.to_string().contains("cannot contain '..'"),

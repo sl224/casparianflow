@@ -5,16 +5,16 @@ use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use anyhow::{Context, Result};
 use casparian::scout::{SourceId, WorkspaceId};
-use casparian::telemetry::TelemetryRecorder;
 use casparian::storage::{
     DuckDbPipelineStore, Pipeline, SelectionFilters, SelectionResolution, WatermarkField,
 };
+use casparian::telemetry::TelemetryRecorder;
 use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::telemetry as protocol_telemetry;
 use casparian_protocol::types::SchemaDefinition;
 use casparian_protocol::{
-    materialization_key, output_target_key, schema_hash, table_name_with_schema, PipelineRunStatus,
-    ProcessingStatus, SchemaColumnSpec, SinkConfig, SinkMode,
+    defaults, materialization_key, output_target_key, schema_hash, table_name_with_schema,
+    PipelineRunStatus, ProcessingStatus, SchemaColumnSpec, SinkConfig, SinkMode,
 };
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{SchemaContract, SchemaStorage};
@@ -551,7 +551,10 @@ fn resolve_workspace_id(conn: &DbConnection, selection: &SelectionConfig) -> Res
     }
 
     let active = context::get_active_workspace_id().map_err(|err| {
-        anyhow::anyhow!("Workspace context error: {}. Delete the context file to reset.", err)
+        anyhow::anyhow!(
+            "Workspace context error: {}. Delete the context file to reset.",
+            err
+        )
     })?;
 
     if let Some(active_id) = active {
@@ -696,7 +699,7 @@ fn snapshot_hash(spec_id: &str, logical_date: &str, file_ids: &[i64]) -> String 
 }
 
 fn is_default_sink(topic: &str) -> bool {
-    topic == "*" || topic == "output"
+    topic == "*" || topic == defaults::DEFAULT_SINK_TOPIC
 }
 
 fn table_exists(conn: &DbConnection, table: &str) -> Result<bool> {
@@ -877,8 +880,8 @@ fn load_sink_configs(
 
     if sinks.is_empty() {
         sinks.push(SinkConfig {
-            topic: "output".to_string(),
-            uri: "parquet://./output".to_string(),
+            topic: defaults::DEFAULT_SINK_TOPIC.to_string(),
+            uri: defaults::DEFAULT_SINK_URI.to_string(),
             mode: SinkMode::Append,
             quarantine_config: None,
             schema: None,

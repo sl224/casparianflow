@@ -19,6 +19,10 @@ notes:
   - "2026-01-24: Updated scan progress + telemetry + tracing/logging; refreshed TUI scanning progress snapshots."
   - "cargo test -p casparian now fails only in tests/fix_demo_e2e.rs (missing DuckDB tables fix_order_lifecycle/fix_parse_errors)."
   - "cargo bench -p casparian --bench scanner_perf timed out after ~120s; partial results: full_scan batch_size=512 time ~146.9-153.4ms (thrpt ~32.6-34.0 Kelem/s); batch_size=2048 time ~116.9-122.5ms (thrpt ~40.8-42.8 Kelem/s)."
+  - "2026-01-24: cargo test -p casparian passed; cargo bench -p casparian --bench scanner_perf timed out after 300s during build."
+  - "2026-01-24: cargo bench -p casparian --bench scanner_perf timed out after 600s; partial results: full_scan batch_size=512 time 207.11-215.47ms (thrpt 23.205-24.141 Kelem/s), batch_size=2048 time 157.36-161.95ms (thrpt 30.875-31.774 Kelem/s), batch_size=10000 time 157.82-163.76ms (thrpt 30.533-31.682 Kelem/s); rescan batch_size=512 time 301.58-317.20ms (thrpt 15.763-16.579 Kelem/s), batch_size=2048 time 244.56-255.77ms (thrpt 19.549-20.445 Kelem/s)."
+  - "2026-01-24: cargo check -p casparian-flow-ui failed: tauri distDir \"../dist\" missing (generate_context! panic)."
+  - "2026-01-24: cargo test -p casparian passed; cargo bench -p casparian --bench scanner_perf completed (see benchmark log)."
 ---
 
 # Goal
@@ -40,6 +44,9 @@ Get scanning + persistence as close to filesystem walk ("line rate") as possible
 # Benchmark log
 - 2026-01-24: Bench run (criterion): walk_parallel 10.480 ms; full_scan batch_size=10000 114.40 ms; rescan batch_size=10000 179.73 ms; db_write batch_size=10000 56.895 ms. Full scan ~10.9x walk_only.
 - 2026-01-23: M2–M3 applied (DuckDB upsert fast-path + streaming folder cache). Tests/bench still blocked by existing workspace-related compile errors in CLI/TUI.
+- 2026-01-24: cargo bench -p casparian --bench scanner_perf timed out after 300s during build; no criterion output.
+- 2026-01-24: cargo bench -p casparian --bench scanner_perf timed out after 600s; partial results for full_scan/rescan (see notes).
+- 2026-01-24: Bench run (criterion): walk_parallel 10.056-10.265 ms (thrpt 487.07-497.24 Kelem/s); full_scan batch_size=512 143.42-155.24 ms (32.208-34.862 Kelem/s), batch_size=2048 117.21-125.08 ms (39.973-42.659 Kelem/s), batch_size=10000 111.62-122.27 ms (40.895-44.796 Kelem/s); rescan batch_size=512 183.74-186.91 ms (26.751-27.212 Kelem/s), batch_size=2048 158.69-160.23 ms (31.204-31.508 Kelem/s), batch_size=10000 159.61-162.31 ms (30.806-31.326 Kelem/s); db_write batch_size=256 136.78-140.54 ms, batch_size=1024 73.888-75.702 ms, batch_size=4096 58.573-60.501 ms, batch_size=10000 52.683-54.360 ms.
 
 # Decisions / gotchas
 - (append as discovered)

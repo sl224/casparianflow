@@ -11,7 +11,7 @@ use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
 use crate::types::RedactionPolicy;
 use anyhow::{anyhow, Result};
-use casparian_db::DbConnection;
+use casparian_db::{apply_row_limit, validate_read_only, DbConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -24,18 +24,12 @@ struct QueryArgs {
     sql: String,
     #[serde(default = "default_limit")]
     limit: usize,
-    #[serde(default = "default_timeout")]
-    timeout_ms: u64,
     #[serde(default)]
     redaction: Option<RedactionPolicy>,
 }
 
 fn default_limit() -> usize {
     1000
-}
-
-fn default_timeout() -> u64 {
-    30_000
 }
 
 #[derive(Debug, Serialize)]
@@ -52,42 +46,6 @@ struct QueryResult {
     row_count: usize,
     truncated: bool,
     elapsed_ms: u64,
-}
-
-/// SQL commands that are allowed (read-only)
-const ALLOWED_PREFIXES: &[&str] = &["SELECT", "WITH", "EXPLAIN"];
-
-/// SQL commands that are forbidden (write operations)
-const FORBIDDEN_KEYWORDS: &[&str] = &[
-    "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "COPY", "INSTALL", "LOAD",
-    "ATTACH", "DETACH",
-];
-
-fn is_read_only_query(sql: &str) -> Result<()> {
-    let normalized = sql.trim().to_uppercase();
-
-    // Check if it starts with an allowed command
-    let starts_allowed = ALLOWED_PREFIXES
-        .iter()
-        .any(|prefix| normalized.starts_with(prefix));
-
-    if !starts_allowed {
-        return Err(anyhow!("Query must start with SELECT, WITH, or EXPLAIN"));
-    }
-
-    // Check for forbidden keywords (even in subqueries)
-    for keyword in FORBIDDEN_KEYWORDS {
-        // Look for keyword as a word boundary (not part of identifier)
-        let pattern = format!(r"\b{}\b", keyword);
-        if regex::Regex::new(&pattern)
-            .map(|re| re.is_match(&normalized))
-            .unwrap_or(false)
-        {
-            return Err(anyhow!("Query contains forbidden keyword: {}", keyword));
-        }
-    }
-
-    Ok(())
 }
 
 impl McpTool for QueryTool {
@@ -112,11 +70,6 @@ impl McpTool for QueryTool {
                     "default": 1000,
                     "maximum": 10000
                 },
-                "timeout_ms": {
-                    "type": "integer",
-                    "default": 30000,
-                    "maximum": 300000
-                },
                 "redaction": {
                     "type": "object",
                     "properties": {
@@ -139,7 +92,7 @@ impl McpTool for QueryTool {
         let args: QueryArgs = serde_json::from_value(args)?;
 
         // Validate SQL is read-only
-        is_read_only_query(&args.sql)?;
+        validate_read_only(&args.sql).map_err(|err| anyhow!(err))?;
 
         // Enforce row limit
         let limit = args.limit.min(security.output_budget.max_rows());
@@ -151,7 +104,7 @@ impl McpTool for QueryTool {
             .map_err(|e| anyhow!("Failed to open database: {}", e))?;
 
         // Add LIMIT to query if not present
-        let sql = add_limit_if_missing(&args.sql, limit);
+        let sql = apply_row_limit(&args.sql, limit);
 
         // Execute query
         let db_rows = conn
@@ -170,7 +123,7 @@ impl McpTool for QueryTool {
                     // Infer type from the first row's values
                     let data_type = first_row
                         .get_raw(i)
-                        .map(|v| db_value_to_type_name(v))
+                        .map(db_value_to_type_name)
                         .unwrap_or_else(|| "UNKNOWN".to_string());
                     ColumnInfo {
                         name: name.clone(),
@@ -203,16 +156,6 @@ impl McpTool for QueryTool {
         };
 
         Ok(serde_json::to_value(result)?)
-    }
-}
-
-/// Add LIMIT clause to query if not present.
-fn add_limit_if_missing(sql: &str, limit: usize) -> String {
-    let upper = sql.to_uppercase();
-    if upper.contains("LIMIT") {
-        sql.to_string()
-    } else {
-        format!("{} LIMIT {}", sql.trim_end_matches(';'), limit)
     }
 }
 
@@ -269,89 +212,83 @@ mod tests {
     #[test]
     fn test_read_only_validation() {
         // Allowed
-        assert!(is_read_only_query("SELECT * FROM events").is_ok());
-        assert!(is_read_only_query("WITH cte AS (SELECT 1) SELECT * FROM cte").is_ok());
-        assert!(is_read_only_query("EXPLAIN SELECT * FROM events").is_ok());
+        assert!(validate_read_only("SELECT * FROM events").is_ok());
+        assert!(validate_read_only("WITH cte AS (SELECT 1) SELECT * FROM cte").is_ok());
+        assert!(validate_read_only("EXPLAIN SELECT * FROM events").is_ok());
 
         // Forbidden
-        assert!(is_read_only_query("INSERT INTO events VALUES (1)").is_err());
-        assert!(is_read_only_query("DELETE FROM events").is_err());
-        assert!(is_read_only_query("DROP TABLE events").is_err());
-        assert!(is_read_only_query("CREATE TABLE foo (id INT)").is_err());
-        assert!(is_read_only_query("UPDATE events SET id = 1").is_err());
+        assert!(validate_read_only("INSERT INTO events VALUES (1)").is_err());
+        assert!(validate_read_only("DELETE FROM events").is_err());
+        assert!(validate_read_only("DROP TABLE events").is_err());
+        assert!(validate_read_only("CREATE TABLE foo (id INT)").is_err());
+        assert!(validate_read_only("UPDATE events SET id = 1").is_err());
 
         // Forbidden even in subqueries
-        assert!(is_read_only_query("SELECT * FROM (DELETE FROM events RETURNING *)").is_err());
+        assert!(validate_read_only("SELECT * FROM (DELETE FROM events RETURNING *)").is_err());
     }
 
     #[test]
     fn test_sql_injection_patterns() {
         // Semicolon chaining attacks
-        assert!(is_read_only_query("SELECT 1; DROP TABLE events").is_err());
-        assert!(is_read_only_query("SELECT 1; DELETE FROM events").is_err());
+        assert!(validate_read_only("SELECT 1; DROP TABLE events").is_err());
+        assert!(validate_read_only("SELECT 1; DELETE FROM events").is_err());
 
         // UNION-based attacks that include write operations
         // These are allowed if they're just SELECT statements
-        assert!(is_read_only_query("SELECT 1 UNION SELECT 2").is_ok());
+        assert!(validate_read_only("SELECT 1 UNION SELECT 2").is_ok());
 
-        // Comment-based attacks - we intentionally block these too for security
-        // Even if "INSERT" is in a comment, we block it to prevent evasion attempts
-        assert!(is_read_only_query("SELECT 1 -- INSERT INTO events").is_err());
-        assert!(is_read_only_query("SELECT 1 /* INSERT */ FROM events").is_err());
+        // Comment-based keywords are ignored
+        assert!(validate_read_only("SELECT 1 -- INSERT INTO events").is_ok());
+        assert!(validate_read_only("SELECT 1 /* INSERT */ FROM events").is_ok());
     }
 
     #[test]
     fn test_case_insensitivity() {
         // Should block regardless of case
-        assert!(is_read_only_query("insert into events values (1)").is_err());
-        assert!(is_read_only_query("INSERT INTO events VALUES (1)").is_err());
-        assert!(is_read_only_query("InSeRt InTo events VALUES (1)").is_err());
+        assert!(validate_read_only("insert into events values (1)").is_err());
+        assert!(validate_read_only("INSERT INTO events VALUES (1)").is_err());
+        assert!(validate_read_only("InSeRt InTo events VALUES (1)").is_err());
 
         // Should allow regardless of case
-        assert!(is_read_only_query("select * from events").is_ok());
-        assert!(is_read_only_query("SELECT * FROM events").is_ok());
-        assert!(is_read_only_query("SeLeCt * FrOm events").is_ok());
+        assert!(validate_read_only("select * from events").is_ok());
+        assert!(validate_read_only("SELECT * FROM events").is_ok());
+        assert!(validate_read_only("SeLeCt * FrOm events").is_ok());
     }
 
     #[test]
     fn test_duckdb_specific_forbidden_commands() {
         // DuckDB-specific commands that should be blocked
-        assert!(is_read_only_query("COPY events TO '/tmp/data.csv'").is_err());
-        assert!(is_read_only_query("INSTALL httpfs").is_err());
-        assert!(is_read_only_query("LOAD httpfs").is_err());
-        assert!(is_read_only_query("ATTACH '/tmp/other.db' AS other").is_err());
-        assert!(is_read_only_query("DETACH other").is_err());
+        assert!(validate_read_only("COPY events TO '/tmp/data.csv'").is_err());
+        assert!(validate_read_only("INSTALL httpfs").is_err());
+        assert!(validate_read_only("LOAD httpfs").is_err());
+        assert!(validate_read_only("ATTACH '/tmp/other.db' AS other").is_err());
+        assert!(validate_read_only("DETACH other").is_err());
     }
 
     #[test]
     fn test_add_limit_if_missing() {
-        // Add LIMIT when not present
         assert_eq!(
-            add_limit_if_missing("SELECT * FROM events", 100),
-            "SELECT * FROM events LIMIT 100"
+            apply_row_limit("SELECT * FROM events", 100),
+            "SELECT * FROM (SELECT * FROM events) AS _q LIMIT 100"
         );
-
-        // Don't add LIMIT when already present
         assert_eq!(
-            add_limit_if_missing("SELECT * FROM events LIMIT 50", 100),
-            "SELECT * FROM events LIMIT 50"
+            apply_row_limit("SELECT * FROM events LIMIT 50", 100),
+            "SELECT * FROM (SELECT * FROM events LIMIT 50) AS _q LIMIT 100"
         );
-
-        // Handle trailing semicolon
         assert_eq!(
-            add_limit_if_missing("SELECT * FROM events;", 100),
-            "SELECT * FROM events LIMIT 100"
+            apply_row_limit("SELECT * FROM events;", 100),
+            "SELECT * FROM (SELECT * FROM events) AS _q LIMIT 100"
         );
     }
 
     #[test]
     fn test_whitespace_handling() {
         // Leading/trailing whitespace should be handled
-        assert!(is_read_only_query("  SELECT * FROM events  ").is_ok());
-        assert!(is_read_only_query("\n\tSELECT * FROM events\n").is_ok());
+        assert!(validate_read_only("  SELECT * FROM events  ").is_ok());
+        assert!(validate_read_only("\n\tSELECT * FROM events\n").is_ok());
 
         // Newlines shouldn't break validation
-        assert!(is_read_only_query("SELECT *\nFROM events").is_ok());
-        assert!(is_read_only_query("SELECT 1;\nDROP TABLE events").is_err());
+        assert!(validate_read_only("SELECT *\nFROM events").is_ok());
+        assert!(validate_read_only("SELECT 1;\nDROP TABLE events").is_err());
     }
 }

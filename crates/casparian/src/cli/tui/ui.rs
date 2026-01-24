@@ -73,8 +73,7 @@ pub(super) fn help_overlay_area(area: Rect) -> Rect {
 pub(super) fn command_palette_area(palette: &CommandPaletteState, area: Rect) -> Rect {
     let dialog_width = 56.min(area.width.saturating_sub(4));
     let suggestion_count = palette.suggestions.len().min(6);
-    let dialog_height =
-        (4 + (suggestion_count as u16 * 2) + 3).min(area.height.saturating_sub(4));
+    let dialog_height = (4 + (suggestion_count as u16 * 2) + 3).min(area.height.saturating_sub(4));
 
     centered_dialog_area(area, dialog_width, dialog_height)
 }
@@ -2587,7 +2586,11 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     // Elapsed time from scan_start_time
     let elapsed_ms = progress
         .map(|p| p.elapsed_ms)
-        .or_else(|| app.discover.scan_start_time.map(|t| t.elapsed().as_millis() as u64))
+        .or_else(|| {
+            app.discover
+                .scan_start_time
+                .map(|t| t.elapsed().as_millis() as u64)
+        })
         .unwrap_or(0);
     let secs = elapsed_ms / 1_000;
     let time_str = if secs >= 60 {
@@ -6895,12 +6898,14 @@ mod tests {
         app.mode = TuiMode::Jobs;
 
         // Create a job with a UTF-8 name containing multi-byte characters
-        let mut jobs_state = JobsState::default();
-        jobs_state.jobs = vec![create_test_job(
-            1,
-            "文件夹_数据_测试解析器",
-            JobStatus::Running,
-        )];
+        let jobs_state = JobsState {
+            jobs: vec![create_test_job(
+                1,
+                "文件夹_数据_测试解析器",
+                JobStatus::Running,
+            )],
+            ..Default::default()
+        };
         app.jobs_state = jobs_state;
 
         // This should not panic - the bug was byte-based truncation on UTF-8
@@ -6918,12 +6923,14 @@ mod tests {
         app.mode = TuiMode::Jobs;
 
         // Emoji are 4-byte UTF-8 sequences
-        let mut jobs_state = JobsState::default();
-        jobs_state.jobs = vec![create_test_job(
-            1,
-            "📁_parser_📊_reports_📈",
-            JobStatus::Pending,
-        )];
+        let jobs_state = JobsState {
+            jobs: vec![create_test_job(
+                1,
+                "📁_parser_📊_reports_📈",
+                JobStatus::Pending,
+            )],
+            ..Default::default()
+        };
         app.jobs_state = jobs_state;
 
         let result = terminal.draw(|f| draw(f, &app));

@@ -7,8 +7,8 @@ use crate::types::ApprovalSummary;
 use anyhow::{Context, Result};
 use casparian_db::DbConnection;
 use casparian_protocol::{
-    Approval as ProtocolApproval, ApprovalOperation as ProtocolApprovalOperation,
-    ApprovalStatus as ProtocolApprovalStatus, JobId as ProtocolJobId,
+    ApiJobId as ProtocolJobId, Approval as ProtocolApproval,
+    ApprovalOperation as ProtocolApprovalOperation, ApprovalStatus as ProtocolApprovalStatus,
 };
 use casparian_sentinel::{ApiStorage, ControlClient, DEFAULT_CONTROL_ADDR};
 use chrono::Utc;

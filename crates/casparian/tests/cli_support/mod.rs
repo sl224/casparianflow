@@ -35,7 +35,7 @@ pub fn run_cli_json_value(args: &[String], envs: &[(&str, &str)]) -> serde_json:
     assert_cli_success(&output, args);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json_start = stdout.find(|c| c == '{' || c == '[').unwrap_or_else(|| {
+    let json_start = stdout.find(|c| ['{', '['].contains(&c)).unwrap_or_else(|| {
         panic!(
             "no JSON payload found in output\nstdout:\n{}\nstderr:\n{}",
             stdout,

@@ -225,11 +225,7 @@ impl ProgressCounters {
     }
 
     fn snapshot(&self) -> (usize, usize, usize, Option<String>) {
-        let current_dir = self
-            .current_dir
-            .lock()
-            .ok()
-            .and_then(|value| value.clone());
+        let current_dir = self.current_dir.lock().ok().and_then(|value| value.clone());
         (
             self.dirs_scanned.load(Ordering::Relaxed),
             self.files_found.load(Ordering::Relaxed),
@@ -438,9 +434,12 @@ impl Scanner {
             *dir = Some(source.path.clone());
         }
 
-        let progress_emitter = progress_tx
-            .as_ref()
-            .map(|_| Arc::new(std::sync::Mutex::new(ProgressEmitter::new(start, &self.config))));
+        let progress_emitter = progress_tx.as_ref().map(|_| {
+            Arc::new(std::sync::Mutex::new(ProgressEmitter::new(
+                start,
+                &self.config,
+            )))
+        });
 
         let progress_state = match (progress_tx.clone(), progress_emitter.clone()) {
             (Some(tx), Some(emitter)) => Some(ProgressState {
@@ -715,7 +714,10 @@ impl Scanner {
             } else {
                 let cache_duration_ms = cache_start.elapsed().as_millis() as u64;
                 cache_span.record("duration_ms", &cache_duration_ms);
-                info!(duration_ms = cache_duration_ms, "populate_folder_cache (streaming) complete");
+                info!(
+                    duration_ms = cache_duration_ms,
+                    "populate_folder_cache (streaming) complete"
+                );
             }
         } else if let Err(e) = self.db.populate_folder_cache(&source.id) {
             tracing::warn!(
@@ -726,7 +728,10 @@ impl Scanner {
         } else {
             let cache_duration_ms = cache_start.elapsed().as_millis() as u64;
             cache_span.record("duration_ms", &cache_duration_ms);
-            info!(duration_ms = cache_duration_ms, "populate_folder_cache complete");
+            info!(
+                duration_ms = cache_duration_ms,
+                "populate_folder_cache complete"
+            );
         }
 
         // GAP-SCAN-005: Log both discovered (walker found) and persisted (saved to DB)
@@ -843,7 +848,6 @@ impl Scanner {
             .build_parallel();
 
         let source_id_arc = source_id.clone();
-        let workspace_id = workspace_id;
         let source_path_owned = source_path.to_path_buf();
         let batch_tx = batch_tx.clone();
         let cancel_flag = cancel.clone();
@@ -851,7 +855,6 @@ impl Scanner {
         walker.run(|| {
             let source_path = source_path_owned.clone();
             let source_id = source_id_arc.clone();
-            let workspace_id = workspace_id;
             let error_tx = error_tx.clone();
             let total_files = total_files.clone();
             let total_dirs = total_dirs.clone();
@@ -1178,7 +1181,10 @@ mod tests {
         // Verify mtime was updated in database
         let files = db.list_pending_files(&source.id, 10).unwrap();
         assert_eq!(files.len(), 1);
-        assert_ne!(files[0].mtime, original_mtime, "mtime should be updated after file change");
+        assert_ne!(
+            files[0].mtime, original_mtime,
+            "mtime should be updated after file change"
+        );
     }
 
     #[test]

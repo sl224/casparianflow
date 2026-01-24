@@ -21,9 +21,8 @@ fn maybe_run_child() {
     let db_path = PathBuf::from(env::var(DB_ENV).expect("child missing DB path"));
     match role.as_str() {
         "hold" => {
-            let _sink =
-                DuckDbSink::new(db_path, "records", SinkMode::Append, "job-1", "records")
-                    .expect("child failed to open sink");
+            let _sink = DuckDbSink::new(db_path, "records", SinkMode::Append, "job-1", "records")
+                .expect("child failed to open sink");
             if let Ok(ready_path) = env::var(READY_ENV) {
                 fs::write(ready_path, "ready").expect("child failed to write ready file");
             }
@@ -37,19 +36,17 @@ fn maybe_run_child() {
             }
             std::process::exit(0);
         }
-        "try" => {
-            match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-2", "records") {
-                Ok(_) => std::process::exit(0),
-                Err(err) => {
-                    let msg = err.to_string().to_lowercase();
-                    if msg.contains("lock") || msg.contains("locked") || msg.contains("in use") {
-                        std::process::exit(2);
-                    }
-                    eprintln!("unexpected error: {}", err);
-                    std::process::exit(3);
+        "try" => match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-2", "records") {
+            Ok(_) => std::process::exit(0),
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                if msg.contains("lock") || msg.contains("locked") || msg.contains("in use") {
+                    std::process::exit(2);
                 }
+                eprintln!("unexpected error: {}", err);
+                std::process::exit(3);
             }
-        }
+        },
         other => {
             eprintln!("unknown role: {other}");
             std::process::exit(4);

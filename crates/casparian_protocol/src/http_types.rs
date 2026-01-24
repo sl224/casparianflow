@@ -5,8 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 
-use crate::types::{DataType, JobId, ProcessingStatus, SchemaColumnSpec};
+use thiserror::Error;
+
+use crate::types::{DataType, ProcessingStatus, SchemaColumnSpec};
 
 // ============================================================================
 // Event Types
@@ -15,6 +18,100 @@ use crate::types::{DataType, JobId, ProcessingStatus, SchemaColumnSpec};
 /// Unique identifier for an event within a job.
 /// Monotonically increasing per job to ensure ordering.
 pub type EventId = u64;
+
+/// Unique identifier for an API job (cf_api_jobs).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, Default,
+)]
+#[serde(transparent)]
+pub struct ApiJobId(u64);
+
+impl ApiJobId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    pub fn to_i64(self) -> Result<i64, ApiJobIdError> {
+        i64::try_from(self.0).map_err(|_| ApiJobIdError::Overflow(self.0 as u128))
+    }
+}
+
+impl fmt::Display for ApiJobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u64> for ApiJobId {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+impl From<ApiJobId> for u64 {
+    fn from(value: ApiJobId) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<i64> for ApiJobId {
+    type Error = ApiJobIdError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        if value < 0 {
+            return Err(ApiJobIdError::Negative(value as i128));
+        }
+        Ok(ApiJobId::new(value as u64))
+    }
+}
+
+impl TryFrom<i128> for ApiJobId {
+    type Error = ApiJobIdError;
+
+    fn try_from(value: i128) -> Result<Self, Self::Error> {
+        if value < 0 {
+            return Err(ApiJobIdError::Negative(value));
+        }
+        if value > u64::MAX as i128 {
+            return Err(ApiJobIdError::Overflow(value as u128));
+        }
+        Ok(ApiJobId::new(value as u64))
+    }
+}
+
+impl TryFrom<ApiJobId> for i64 {
+    type Error = ApiJobIdError;
+
+    fn try_from(value: ApiJobId) -> Result<Self, Self::Error> {
+        value.to_i64()
+    }
+}
+
+impl std::str::FromStr for ApiJobId {
+    type Err = ApiJobIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value = s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ApiJobIdError::Parse(s.to_string()))?;
+        Ok(ApiJobId::new(value))
+    }
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ApiJobIdError {
+    #[error("api job id cannot be negative: {0}")]
+    Negative(i128),
+    #[error("api job id does not fit in u64: {0}")]
+    Overflow(u128),
+    #[error("invalid api job id: {0}")]
+    Parse(String),
+}
 
 /// Event types emitted during job execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,7 +171,7 @@ pub enum ViolationType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub event_id: EventId,
-    pub job_id: JobId,
+    pub job_id: ApiJobId,
     pub timestamp: String, // RFC3339
     #[serde(flatten)]
     pub event_type: EventType,
@@ -165,7 +262,7 @@ pub enum SchemaMode {
 /// Full job record returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
-    pub job_id: JobId,
+    pub job_id: ApiJobId,
     pub job_type: HttpJobType,
     pub status: HttpJobStatus,
     pub plugin_name: String,
@@ -277,7 +374,7 @@ pub struct Approval {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejection_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<JobId>,
+    pub job_id: Option<ApiJobId>,
 }
 
 /// Decision for an approval request.
@@ -403,7 +500,7 @@ pub struct QueryResponse {
 /// Response for POST /jobs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateJobResponse {
-    pub job_id: JobId,
+    pub job_id: ApiJobId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
 }
@@ -437,7 +534,7 @@ pub struct ApprovalDecideResponse {
     pub approval_id: String,
     pub status: ApprovalStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<JobId>,
+    pub job_id: Option<ApiJobId>,
 }
 
 /// Response for GET /health
@@ -531,6 +628,15 @@ impl ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_api_job_id_json_roundtrip() {
+        let id = ApiJobId::new(42);
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "42");
+        let parsed: ApiJobId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, id);
+    }
 
     #[test]
     fn test_event_type_serialization() {

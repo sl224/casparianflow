@@ -19,7 +19,6 @@ const WRITE_BATCH_SIZES: &[usize] = &[256, 1_024, 4_096, 10_000];
 struct Fixture {
     temp_dir: TempDir,
     file_count: usize,
-    total_bytes: u64,
 }
 
 fn build_path(root: &Path, index: usize, depth: usize) -> PathBuf {
@@ -47,7 +46,6 @@ fn create_fixture(file_count: usize, depth: usize, file_size: usize) -> Fixture 
     Fixture {
         temp_dir,
         file_count,
-        total_bytes: (file_count * file_size) as u64,
     }
 }
 
@@ -80,7 +78,7 @@ fn walk_count_bytes(root: &Path, config: &ScanConfig) -> (usize, u64) {
         .git_global(false)
         .git_exclude(false)
         .filter_entry(move |entry| {
-            if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 return true;
             }
 
@@ -127,7 +125,7 @@ fn walk_count_bytes(root: &Path, config: &ScanConfig) -> (usize, u64) {
                 return ignore::WalkState::Continue;
             }
 
-            if entry.file_type().map_or(false, |ft| ft.is_symlink()) {
+            if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
                 return ignore::WalkState::Continue;
             }
 
@@ -166,7 +164,7 @@ fn build_scanned_files(
         let full_path = format!("/bench/{}", rel_path);
         files.push(ScannedFile::new(
             workspace_id,
-            source_id.clone(),
+            *source_id,
             &full_path,
             &rel_path,
             FILE_SIZE_BYTES as u64,
@@ -288,7 +286,7 @@ fn bench_scanner_db_write(c: &mut Criterion) {
                         let source_id = SourceId::new();
                         let source = Source {
                             workspace_id,
-                            id: source_id.clone(),
+                            id: source_id,
                             name: "Bench Source".to_string(),
                             source_type: SourceType::Local,
                             path: "/bench".to_string(),

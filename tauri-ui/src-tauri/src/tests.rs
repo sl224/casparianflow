@@ -4,7 +4,7 @@
 //! against a real DuckDB database.
 
 #[cfg(test)]
-mod tests {
+mod app_state_tests {
     use crate::state::AppState;
     use tempfile::tempdir;
 
@@ -13,9 +13,8 @@ mod tests {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let db_path = temp_dir.path().join("test.duckdb");
 
-        let state = AppState {
-            db_path: db_path.to_string_lossy().to_string(),
-        };
+        let mut state = AppState::new().expect("Failed to create AppState");
+        state.db_path = db_path.to_string_lossy().to_string();
 
         // Return both state and temp_dir to keep directory alive
         (state, temp_dir)

@@ -115,7 +115,7 @@ impl McpTool for BacktestStartTool {
         let job_id = job.id;
 
         // Enqueue for execution - executor will start when ready
-        executor.enqueue(job_id.clone())?;
+        executor.enqueue(job_id)?;
 
         let result = BacktestStartResult {
             job_id: job_id.to_string(),

@@ -77,7 +77,7 @@ impl McpTool for SessionCreateTool {
         args: Value,
         _security: &SecurityConfig,
         _core: &CoreHandle,
-        config: &McpServerConfig,
+        _config: &McpServerConfig,
         _executor: &JobExecutorHandle,
     ) -> anyhow::Result<Value> {
         let args: SessionCreateArgs = serde_json::from_value(args)?;

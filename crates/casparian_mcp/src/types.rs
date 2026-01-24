@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use casparian_protocol::RedactionPolicy as ProtocolRedactionPolicy;
+pub use casparian_protocol::{RedactionMode, SchemaMode};
+
 // ============================================================================
 // PluginRef - Parser/Plugin Identity
 // ============================================================================
@@ -197,19 +200,6 @@ pub struct SchemaDefinition {
     pub columns: Vec<ColumnDefinition>,
 }
 
-/// Schema validation mode
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SchemaMode {
-    /// All columns must match exactly
-    #[default]
-    Strict,
-    /// Extra columns in output are allowed
-    AllowExtra,
-    /// Optional columns can be missing
-    AllowMissingOptional,
-}
-
 /// Column definition within a schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnDefinition {
@@ -245,18 +235,8 @@ pub type SchemasMap = HashMap<String, SchemaDefinition>;
 /// DFIR data often contains sensitive content; redaction is enabled by default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedactionPolicy {
-    /// Redaction mode
-    #[serde(default)]
-    pub mode: RedactionMode,
-
-    /// Maximum number of sample values to include
-    #[serde(default = "default_max_sample_count")]
-    pub max_sample_count: usize,
-
-    /// Maximum length of sample values (characters)
-    #[serde(default = "default_max_value_length")]
-    pub max_value_length: usize,
-
+    #[serde(flatten)]
+    pub base: ProtocolRedactionPolicy,
     /// Length of hash prefix (for hash mode)
     #[serde(default = "default_hash_prefix_length")]
     pub hash_prefix_length: usize,
@@ -265,47 +245,26 @@ pub struct RedactionPolicy {
 impl Default for RedactionPolicy {
     fn default() -> Self {
         Self {
-            mode: RedactionMode::default(),
-            max_sample_count: default_max_sample_count(),
-            max_value_length: default_max_value_length(),
+            base: ProtocolRedactionPolicy::default(),
             hash_prefix_length: default_hash_prefix_length(),
         }
     }
 }
 
-fn default_max_sample_count() -> usize {
-    5
-}
-fn default_max_value_length() -> usize {
-    100
-}
 fn default_hash_prefix_length() -> usize {
     8
-}
-
-/// Redaction mode
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum RedactionMode {
-    /// No redaction - raw values (requires explicit opt-in)
-    None,
-    /// Truncate values to max_value_length
-    Truncate,
-    /// Hash values (SHA256 prefix) - default for security
-    #[default]
-    Hash,
 }
 
 impl RedactionPolicy {
     /// Apply redaction to a string value
     pub fn redact(&self, value: &str) -> String {
-        match self.mode {
+        match self.base.mode {
             RedactionMode::None => value.to_string(),
             RedactionMode::Truncate => {
-                if value.len() <= self.max_value_length {
+                if value.len() <= self.base.max_value_length {
                     value.to_string()
                 } else {
-                    format!("{}...", &value[..self.max_value_length])
+                    format!("{}...", &value[..self.base.max_value_length])
                 }
             }
             RedactionMode::Hash => {
@@ -323,7 +282,7 @@ impl RedactionPolicy {
     pub fn redact_samples(&self, samples: &[String]) -> Vec<String> {
         samples
             .iter()
-            .take(self.max_sample_count)
+            .take(self.base.max_sample_count)
             .map(|s| self.redact(s))
             .collect()
     }
@@ -581,8 +540,11 @@ mod tests {
     #[test]
     fn test_redaction_truncate() {
         let policy = RedactionPolicy {
-            mode: RedactionMode::Truncate,
-            max_value_length: 10,
+            base: ProtocolRedactionPolicy {
+                mode: RedactionMode::Truncate,
+                max_value_length: 10,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let redacted = policy.redact("this is a very long string");
@@ -592,7 +554,10 @@ mod tests {
     #[test]
     fn test_redaction_none() {
         let policy = RedactionPolicy {
-            mode: RedactionMode::None,
+            base: ProtocolRedactionPolicy {
+                mode: RedactionMode::None,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let redacted = policy.redact("sensitive");
@@ -649,6 +614,7 @@ mod tests {
             r#"{"plugin_ref": {"path": "parsers/fix/fix_parser.py"}, "files": ["test.fix"]}"#;
         let value: serde_json::Value = serde_json::from_str(json).unwrap();
         let args: TestArgs = serde_json::from_value(value).unwrap();
+        assert_eq!(args.files.len(), 1);
 
         match args.plugin_ref {
             PluginRef::Path { path } => {

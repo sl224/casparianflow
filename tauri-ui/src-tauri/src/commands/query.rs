@@ -7,7 +7,7 @@
 //! - Only row counts and execution times are recorded
 
 use crate::state::{AppState, CommandError, CommandResult};
-use casparian_db::DbValue;
+use casparian_db::{apply_row_limit, validate_read_only, DbValue};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -27,49 +27,6 @@ pub struct QueryResult {
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
     pub exec_time_ms: u64,
-}
-
-/// Allowed SQL prefixes (read-only operations).
-const ALLOWED_PREFIXES: &[&str] = &["SELECT", "WITH", "EXPLAIN"];
-
-/// Forbidden SQL keywords (write operations).
-const FORBIDDEN_KEYWORDS: &[&str] = &[
-    "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "COPY", "INSTALL", "LOAD",
-    "ATTACH", "DETACH",
-];
-
-/// Validate that the SQL query is read-only.
-fn validate_sql(sql: &str) -> Result<(), CommandError> {
-    let trimmed = sql.trim().to_uppercase();
-
-    // Check if starts with allowed prefix
-    let has_allowed_prefix = ALLOWED_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix));
-
-    if !has_allowed_prefix {
-        return Err(CommandError::InvalidArgument(format!(
-            "Query must start with one of: {}",
-            ALLOWED_PREFIXES.join(", ")
-        )));
-    }
-
-    // Check for forbidden keywords
-    for keyword in FORBIDDEN_KEYWORDS {
-        // Check for keyword at word boundary
-        if trimmed.contains(&format!(" {} ", keyword))
-            || trimmed.contains(&format!("({})", keyword))
-            || trimmed.contains(&format!("({} ", keyword))
-            || trimmed.ends_with(&format!(" {}", keyword))
-        {
-            return Err(CommandError::InvalidArgument(format!(
-                "Query contains forbidden keyword: {}",
-                keyword
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 /// Convert a database value to JSON.
@@ -112,7 +69,8 @@ pub async fn query_execute(
     };
 
     // Validate the SQL
-    validate_sql(&request.sql)?;
+    validate_read_only(&request.sql)
+        .map_err(|err| CommandError::InvalidArgument(err.to_string()))?;
 
     let start = std::time::Instant::now();
 
@@ -123,29 +81,23 @@ pub async fn query_execute(
 
     // Apply limit
     let limit = request.limit.unwrap_or(1000).min(10000);
-    let sql_with_limit = if request.sql.to_uppercase().contains(" LIMIT ") {
-        request.sql.clone()
-    } else {
-        format!("{} LIMIT {}", request.sql.trim_end_matches(';'), limit)
-    };
+    let sql_with_limit = apply_row_limit(&request.sql, limit);
 
     // Execute query
-    let rows = conn
-        .query_all(&sql_with_limit, &[])
-        .map_err(|e| {
-            // Record error in tape
-            if let Some((event_id, correlation_id)) = &tape_ids {
-                if let Ok(tape) = state.tape().read() {
-                    tape.emit_error(
-                        correlation_id,
-                        event_id,
-                        &e.to_string(),
-                        serde_json::json!({"status": "failed"}),
-                    );
-                }
+    let rows = conn.query_all(&sql_with_limit, &[]).map_err(|e| {
+        // Record error in tape
+        if let Some((event_id, correlation_id)) = &tape_ids {
+            if let Ok(tape) = state.tape().read() {
+                tape.emit_error(
+                    correlation_id,
+                    event_id,
+                    &e.to_string(),
+                    serde_json::json!({"status": "failed"}),
+                );
             }
-            CommandError::Database(e.to_string())
-        })?;
+        }
+        CommandError::Database(e.to_string())
+    })?;
 
     let exec_time_ms = start.elapsed().as_millis() as u64;
 

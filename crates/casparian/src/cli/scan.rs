@@ -191,7 +191,11 @@ pub fn run(args: ScanArgs, telemetry: Option<TelemetryRecorder>) -> anyhow::Resu
     let telemetry_context = telemetry.as_ref().map(|recorder| {
         let run_id = Uuid::new_v4().to_string();
         let source_id = source.id.to_string();
-        let root_hash = Some(recorder.hasher().hash_path(std::path::Path::new(&source.path)));
+        let root_hash = Some(
+            recorder
+                .hasher()
+                .hash_path(std::path::Path::new(&source.path)),
+        );
         let payload = protocol_telemetry::ScanStarted {
             run_id: run_id.clone(),
             source_id: source_id.clone(),
@@ -371,10 +375,7 @@ fn scanned_to_discovered(file: &ScannedFile) -> DiscoveredFile {
 fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Option<String>) {
     use casparian::scout::error::ScoutError;
     match err {
-        ScoutError::Io(io_err) => (
-            "io_error".to_string(),
-            Some(format!("{:?}", io_err.kind())),
-        ),
+        ScoutError::Io(io_err) => ("io_error".to_string(), Some(format!("{:?}", io_err.kind()))),
         ScoutError::Database(_) => ("db_error".to_string(), None),
         ScoutError::Walk(_) => ("walk_error".to_string(), None),
         ScoutError::Json(_) => ("json_error".to_string(), None),
@@ -522,9 +523,8 @@ fn tag_filtered_files(
 
 /// Get or create a source for the scan path
 fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
-    workspace::resolve_active_workspace_id(db).map_err(|e| {
-        e.with_context("The workspace registry is required for scanning")
-    })
+    workspace::resolve_active_workspace_id(db)
+        .map_err(|e| e.with_context("The workspace registry is required for scanning"))
 }
 
 fn get_or_create_source(

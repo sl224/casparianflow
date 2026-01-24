@@ -519,7 +519,10 @@ mod tests {
             "events",
             vec![LockedColumn::required("id", DataType::Int64)],
         );
-        assert_eq!(schema_with_desc.content_hash, schema_without_desc.content_hash);
+        assert_eq!(
+            schema_with_desc.content_hash,
+            schema_without_desc.content_hash
+        );
     }
 
     #[test]

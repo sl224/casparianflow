@@ -8,14 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::core::CoreHandle;
-use crate::intent::confidence::compute_schema_column_confidence;
 use crate::intent::session::SessionStore;
 use crate::intent::state::IntentState;
 use crate::intent::types::{
     CollisionResolution, ColumnCollision, ColumnConstraints, ColumnInference, ColumnSource,
-    Confidence, ConfidenceLabel, FileSetId, HumanQuestion, InferenceEvidence, InferenceMethod,
-    ProposalId, QuestionId, QuestionKind, QuestionOption, SchemaIntentColumn, SchemaIntentProposal,
-    SchemaIntentSources, SchemaSafeDefaults, SessionId,
+    Confidence, HumanQuestion, InferenceEvidence, InferenceMethod, ProposalId, QuestionId,
+    QuestionKind, QuestionOption, SchemaIntentColumn, SchemaIntentProposal, SchemaIntentSources,
+    SchemaSafeDefaults, SessionId,
 };
 use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;

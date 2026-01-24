@@ -32,11 +32,17 @@ pub use sentinel::{Sentinel, SentinelConfig};
 )]
 pub struct SentinelArgs {
     /// ZMQ bind address for workers
-    #[arg(long, default_value = "tcp://127.0.0.1:5555")]
+    #[arg(
+        long,
+        default_value_t = casparian_protocol::defaults::DEFAULT_SENTINEL_BIND_ADDR.to_string()
+    )]
     pub bind: String,
 
     /// Database connection string
-    #[arg(long, default_value = "duckdb:casparian_flow.duckdb")]
+    #[arg(
+        long,
+        default_value_t = casparian_protocol::defaults::DEFAULT_DB_URL.to_string()
+    )]
     pub database: String,
 
     /// Maximum number of workers (default 4, hard cap 8)

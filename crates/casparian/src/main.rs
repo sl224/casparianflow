@@ -54,11 +54,11 @@
 //! - **CLI Commands**: Standalone utilities for file discovery and preview
 
 use anyhow::Result;
+use casparian::telemetry::TelemetryRecorder;
 use casparian_sentinel::{Sentinel, SentinelArgs, SentinelConfig};
+use casparian_tape::{EventName, TapeWriter};
 use casparian_worker::{bridge, Worker, WorkerArgs, WorkerConfig};
 use clap::{Parser, Subcommand};
-use casparian::telemetry::TelemetryRecorder;
-use casparian_tape::{EventName, TapeWriter};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -862,19 +862,24 @@ fn main() -> ExitCode {
     registry.init();
 
     // Create tape writer if --tape specified
-    let tape_writer = cli.tape.as_ref().and_then(|path| match TapeWriter::new(path) {
-        Ok(w) => Some(Arc::new(w)),
-        Err(e) => {
-            eprintln!("Warning: Failed to create tape file: {}", e);
-            None
-        }
-    });
+    let tape_writer = cli
+        .tape
+        .as_ref()
+        .and_then(|path| match TapeWriter::new(path) {
+            Ok(w) => Some(Arc::new(w)),
+            Err(e) => {
+                eprintln!("Warning: Failed to create tape file: {}", e);
+                None
+            }
+        });
 
     let telemetry = tape_writer.as_ref().and_then(|writer| {
-        TelemetryRecorder::new(writer.clone()).map_err(|e| {
-            warn!("Failed to initialize telemetry hasher: {}", e);
-            e
-        }).ok()
+        TelemetryRecorder::new(writer.clone())
+            .map_err(|e| {
+                warn!("Failed to initialize telemetry hasher: {}", e);
+                e
+            })
+            .ok()
     });
 
     // Record UICommand before execution
@@ -1003,7 +1008,14 @@ fn build_command_payload(cmd: &Commands, writer: &TapeWriter) -> serde_json::Val
                 "topic": topic,
             })
         }
-        Commands::Jobs { topic, pending, running, failed, done, .. } => {
+        Commands::Jobs {
+            topic,
+            pending,
+            running,
+            failed,
+            done,
+            ..
+        } => {
             serde_json::json!({
                 "topic": topic,
                 "pending": pending,
@@ -1040,10 +1052,7 @@ fn run_unified(
     let control_addr = if no_control_api {
         None
     } else {
-        Some(
-            control_addr
-                .unwrap_or_else(|| casparian_sentinel::DEFAULT_CONTROL_ADDR.to_string()),
-        )
+        Some(control_addr.unwrap_or_else(|| casparian_sentinel::DEFAULT_CONTROL_ADDR.to_string()))
     };
     info!("Starting Unified Casparian Stack (Split-Runtime Architecture)");
     info!("Transport: {}", addr);
@@ -1213,7 +1222,7 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
     }
 
     // Resolve database URL: if it's the default, use config module resolution
-    let database_url = if args.database == "duckdb:casparian_flow.duckdb" {
+    let database_url = if args.database == casparian_protocol::defaults::DEFAULT_DB_URL {
         let db_path = cli::config::active_db_path();
         format!("duckdb:{}", db_path.display())
     } else {

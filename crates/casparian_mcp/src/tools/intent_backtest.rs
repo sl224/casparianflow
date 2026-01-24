@@ -109,6 +109,7 @@ impl McpTool for ParserGenerateDraftTool {
         _executor: &JobExecutorHandle,
     ) -> anyhow::Result<Value> {
         let args: ParserGenerateDraftArgs = serde_json::from_value(args)?;
+        let _ = &args.schema_proposal_id;
 
         let session_store = SessionStore::new();
         let bundle = session_store.get_session(args.session_id)?;
@@ -230,6 +231,7 @@ impl McpTool for IntentBacktestStartTool {
         _executor: &JobExecutorHandle,
     ) -> anyhow::Result<Value> {
         let args: IntentBacktestStartArgs = serde_json::from_value(args)?;
+        let _ = &args.draft_id;
 
         let session_store = SessionStore::new();
         let bundle = session_store.get_session(args.session_id)?;
@@ -303,6 +305,7 @@ impl McpTool for IntentBacktestStatusTool {
         _executor: &JobExecutorHandle,
     ) -> anyhow::Result<Value> {
         let args: IntentBacktestStatusArgs = serde_json::from_value(args)?;
+        let _ = &args.session_id;
 
         // In production, would query actual job status
         // For now, return mock progress

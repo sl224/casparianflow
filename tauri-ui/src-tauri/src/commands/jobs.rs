@@ -54,9 +54,7 @@ pub async fn job_list(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> CommandResult<Vec<JobItem>> {
-    let status_filter = status
-        .as_deref()
-        .and_then(|s| parse_processing_status(s));
+    let status_filter = status.as_deref().and_then(|s| parse_processing_status(s));
     let limit = limit.unwrap_or(100);
 
     let jobs = if let Some(client) = state.try_control_client() {
@@ -181,9 +179,8 @@ pub async fn job_cancel(
     // Record tape event
     let tape_ids = {
         let tape = state.tape().read().ok();
-        tape.as_ref().and_then(|t| {
-            t.emit_command("JobCancel", serde_json::json!({ "job_id": job_id }))
-        })
+        tape.as_ref()
+            .and_then(|t| t.emit_command("JobCancel", serde_json::json!({ "job_id": job_id })))
     };
 
     let id: u64 = job_id
@@ -211,7 +208,10 @@ pub async fn job_cancel(
             })?
     } else {
         // Fall back to direct DB (limited - can only update status, not stop worker)
-        tracing::debug!("Cancelling job {} via direct DB (sentinel not available)", job_id);
+        tracing::debug!(
+            "Cancelling job {} via direct DB (sentinel not available)",
+            job_id
+        );
         let conn = state
             .open_rw_connection()
             .map_err(|e| CommandError::Database(e.to_string()))?;

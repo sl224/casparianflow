@@ -35,7 +35,7 @@ impl JobStore {
 
     /// Get the file path for a job
     fn job_path(&self, id: &JobId) -> PathBuf {
-        self.dir.join(format!("{}.json", id.0))
+        self.dir.join(format!("{}.json", id.as_u64()))
     }
 
     /// Save a job to disk
@@ -110,6 +110,7 @@ impl JobStore {
     }
 
     /// Get the storage directory
+    #[allow(dead_code)]
     pub fn dir(&self) -> &PathBuf {
         &self.dir
     }
@@ -138,7 +139,7 @@ mod tests {
         let store = JobStore::new(temp.path().to_path_buf()).unwrap();
 
         let job = Job::new(JobId::new(1), JobType::Backtest);
-        let id = job.id.clone();
+        let id = job.id;
 
         store.save(&job).unwrap();
 
@@ -178,7 +179,7 @@ mod tests {
         let store = JobStore::new(temp.path().to_path_buf()).unwrap();
 
         let job = Job::new(JobId::new(1), JobType::Backtest);
-        let id = job.id.clone();
+        let id = job.id;
 
         store.save(&job).unwrap();
         assert!(store.load(&id).unwrap().is_some());

@@ -31,6 +31,9 @@ pub enum BackendError {
     #[error("Type conversion error: {0}")]
     TypeConversion(String),
 
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("Backend not available: {0}")]
     NotAvailable(String),
 
@@ -507,6 +510,29 @@ impl DbConnection {
         Self::execute_duckdb_batch_on_conn(self.conn.as_ref(), sql)
     }
 
+    /// Bulk insert rows into a table.
+    ///
+    /// Column order must match the row value order.
+    pub fn bulk_insert_rows(
+        &self,
+        table: &str,
+        columns: &[&str],
+        rows: &[Vec<DbValue>],
+    ) -> Result<u64, BackendError> {
+        if self.access_mode == AccessMode::ReadOnly {
+            return Err(BackendError::ReadOnly);
+        }
+
+        let conn = self.conn.as_ref();
+        bulk_insert_rows_internal(
+            conn,
+            |sql, params| Self::execute_duckdb_on_conn(conn, sql, params),
+            table,
+            columns,
+            rows,
+        )
+    }
+
     /// Query and return all rows.
     pub fn query_all(&self, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
         Self::query_duckdb_on_conn(self.conn.as_ref(), sql, params)
@@ -536,14 +562,6 @@ impl DbConnection {
     ) -> Result<T, BackendError> {
         let row = self.query_one(sql, params)?;
         row.get(0)
-    }
-
-    /// Execute a DuckDB-specific operation (advanced usage).
-    pub fn execute_duckdb_op<F>(&self, op: F) -> Result<(), BackendError>
-    where
-        F: FnOnce(&duckdb::Connection) -> Result<(), BackendError>,
-    {
-        op(self.conn.as_ref())
     }
 
     /// Execute a transaction using DuckDB.
@@ -594,7 +612,7 @@ impl DbConnection {
             .collect();
         let rows = stmt.execute(param_refs.as_slice())?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        span.record("duration_ms", &duration_ms);
+        span.record("duration_ms", duration_ms);
         Ok(rows as u64)
     }
 
@@ -613,7 +631,7 @@ impl DbConnection {
         let start = Instant::now();
         conn.execute_batch(sql)?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        span.record("duration_ms", &duration_ms);
+        span.record("duration_ms", duration_ms);
         Ok(())
     }
 
@@ -669,7 +687,7 @@ impl DbConnection {
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        span.record("duration_ms", &duration_ms);
+        span.record("duration_ms", duration_ms);
         Ok(result)
     }
 
@@ -812,6 +830,160 @@ impl<'a> DbTransaction<'a> {
         let row = self.query_one(sql, params)?;
         row.get(0)
     }
+
+    /// Bulk insert rows into a table within this transaction.
+    ///
+    /// Column order must match the row value order.
+    pub fn bulk_insert_rows(
+        &mut self,
+        table: &str,
+        columns: &[&str],
+        rows: &[Vec<DbValue>],
+    ) -> Result<u64, BackendError> {
+        let conn = self.conn;
+        bulk_insert_rows_internal(
+            conn,
+            |sql, params| DbConnection::execute_duckdb_on_conn(conn, sql, params),
+            table,
+            columns,
+            rows,
+        )
+    }
+}
+
+const DEFAULT_MAX_PARAMS: usize = 999;
+
+fn bulk_insert_rows_internal<F>(
+    conn: &duckdb::Connection,
+    mut execute: F,
+    table: &str,
+    columns: &[&str],
+    rows: &[Vec<DbValue>],
+) -> Result<u64, BackendError>
+where
+    F: FnMut(&str, &[DbValue]) -> Result<u64, BackendError>,
+{
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    if columns.is_empty() {
+        return Err(BackendError::InvalidInput(
+            "bulk_insert_rows requires at least one column".to_string(),
+        ));
+    }
+
+    for (index, row) in rows.iter().enumerate() {
+        if row.len() != columns.len() {
+            return Err(BackendError::InvalidInput(format!(
+                "Row {} has {} values, expected {}",
+                index,
+                row.len(),
+                columns.len()
+            )));
+        }
+    }
+
+    let total_params = rows.len().saturating_mul(columns.len());
+    if total_params <= DEFAULT_MAX_PARAMS {
+        return bulk_insert_rows_generic(&mut execute, table, columns, rows, DEFAULT_MAX_PARAMS);
+    }
+
+    bulk_insert_rows_duckdb(conn, table, rows)
+}
+
+fn bulk_insert_rows_duckdb(
+    conn: &duckdb::Connection,
+    table: &str,
+    rows: &[Vec<DbValue>],
+) -> Result<u64, BackendError> {
+    let mut appender = conn.appender(table)?;
+    for row in rows {
+        let duckdb_params = DbConnection::to_duckdb_params(row);
+        let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params
+            .iter()
+            .map(|v| v as &dyn duckdb::ToSql)
+            .collect();
+        appender.append_row(param_refs.as_slice())?;
+    }
+    appender.flush()?;
+    Ok(rows.len() as u64)
+}
+
+fn bulk_insert_rows_generic<F>(
+    execute: &mut F,
+    table: &str,
+    columns: &[&str],
+    rows: &[Vec<DbValue>],
+    max_params: usize,
+) -> Result<u64, BackendError>
+where
+    F: FnMut(&str, &[DbValue]) -> Result<u64, BackendError>,
+{
+    let cols_len = columns.len();
+    if cols_len > max_params {
+        return Err(BackendError::InvalidInput(format!(
+            "Too many columns ({}) for max params ({})",
+            cols_len, max_params
+        )));
+    }
+
+    let rows_per_chunk = max_params / cols_len;
+    if rows_per_chunk == 0 {
+        return Err(BackendError::InvalidInput(
+            "Unable to compute rows per chunk".to_string(),
+        ));
+    }
+
+    let quoted_table = quote_ident_path(table);
+    let quoted_cols = columns
+        .iter()
+        .map(|col| quote_ident(col))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let placeholders = vec!["?"; cols_len].join(", ");
+    let row_clause = format!("({})", placeholders);
+
+    let mut total = 0;
+    for chunk in rows.chunks(rows_per_chunk) {
+        let values_clause = std::iter::repeat(row_clause.as_str())
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({}) VALUES {}",
+            quoted_table, quoted_cols, values_clause
+        );
+        let mut params = Vec::with_capacity(chunk.len() * cols_len);
+        for row in chunk {
+            for value in row {
+                params.push(value.clone());
+            }
+        }
+        execute(&sql, &params)?;
+        total += chunk.len() as u64;
+    }
+
+    Ok(total)
+}
+
+fn quote_ident(name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len() + 2);
+    escaped.push('"');
+    for ch in name.chars() {
+        if ch == '"' {
+            escaped.push('"');
+        }
+        escaped.push(ch);
+    }
+    escaped.push('"');
+    escaped
+}
+
+fn quote_ident_path(path: &str) -> String {
+    path.split('.')
+        .map(quote_ident)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn strip_url_prefix(url: &str, prefix: &str) -> Option<String> {
@@ -830,4 +1002,51 @@ fn hash_sql(sql: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{:016x}", hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_insert_rows_inserts_expected_rows() {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+
+        let rows = vec![
+            vec![DbValue::from(1_i64), DbValue::from("alpha")],
+            vec![DbValue::from(2_i64), DbValue::from("beta")],
+        ];
+        let inserted = conn.bulk_insert_rows("t", &["id", "name"], &rows).unwrap();
+
+        assert_eq!(inserted, 2);
+        let count: i64 = conn.query_scalar("SELECT COUNT(*) FROM t", &[]).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn bulk_insert_rows_rejects_mismatched_row_len() {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+
+        let rows = vec![
+            vec![DbValue::from(1_i64)],
+            vec![DbValue::from(2_i64), DbValue::from("beta")],
+        ];
+        let err = conn
+            .bulk_insert_rows("t", &["id", "name"], &rows)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn bulk_insert_rows_empty_is_noop() {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id BIGINT)").unwrap();
+
+        let inserted = conn.bulk_insert_rows("t", &["id"], &[]).unwrap();
+        assert_eq!(inserted, 0);
+    }
 }

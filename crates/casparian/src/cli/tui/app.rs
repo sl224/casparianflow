@@ -22,10 +22,9 @@ use tracing::info_span;
 use super::TuiArgs;
 use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
 use casparian::scout::{
-    match_rules_to_files, patterns, scan_path, Database as ScoutDatabase,
-    RuleApplyFile, RuleApplyRule, ScanCancelToken, ScanProgress as ScoutProgress,
-    Scanner as ScoutScanner, Source, SourceId, SourceType, TagSource, TaggingRuleId, Workspace,
-    WorkspaceId,
+    match_rules_to_files, patterns, scan_path, Database as ScoutDatabase, RuleApplyFile,
+    RuleApplyRule, ScanCancelToken, ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source,
+    SourceId, SourceType, TagSource, TaggingRuleId, Workspace, WorkspaceId,
 };
 use casparian::telemetry::{scan_config_telemetry, TelemetryRecorder};
 use casparian_protocol::telemetry as protocol_telemetry;
@@ -2824,7 +2823,10 @@ impl App {
                 return;
             }
             self.db_read_only = true;
-            let warn = format!("Database missing tables: {}. Read-only mode.", missing.join(", "));
+            let warn = format!(
+                "Database missing tables: {}. Read-only mode.",
+                missing.join(", ")
+            );
             self.db_health_warning = Some(warn.clone());
             self.discover.status_message = Some((warn, true));
         }
@@ -2939,8 +2941,10 @@ impl App {
 
     /// Create new app with given args
     pub fn new(args: TuiArgs, telemetry: Option<TelemetryRecorder>) -> Self {
-        let mut discover = DiscoverState::default();
-        discover.page_size = DISCOVER_PAGE_SIZE;
+        let discover = DiscoverState {
+            page_size: DISCOVER_PAGE_SIZE,
+            ..Default::default()
+        };
         Self {
             running: true,
             mode: TuiMode::Home,
@@ -3083,10 +3087,8 @@ impl App {
                 }
             }
             Err(err) => {
-                self.discover.status_message = Some((
-                    format!("Database open failed: {}", err),
-                    true,
-                ));
+                self.discover.status_message =
+                    Some((format!("Database open failed: {}", err), true));
                 None
             }
         }
@@ -3143,10 +3145,7 @@ impl App {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let created_at_ms: i64 = match row.get(2) {
-                Ok(v) => v,
-                Err(_) => 0,
-            };
+            let created_at_ms: i64 = row.get(2).unwrap_or_default();
             let id = match WorkspaceId::parse(&id_raw) {
                 Ok(id) => id,
                 Err(_) => return,
@@ -3205,7 +3204,8 @@ impl App {
                 .to_string();
         let params = vec![DbValue::from(table)];
 
-        conn.query_optional(&query, &params).map(|row| row.is_some())
+        conn.query_optional(&query, &params)
+            .map(|row| row.is_some())
     }
 
     fn column_exists(conn: &DbConnection, table: &str, column: &str) -> Result<bool, BackendError> {
@@ -3213,7 +3213,8 @@ impl App {
             .to_string();
         let params = vec![DbValue::from(table), DbValue::from(column)];
 
-        conn.query_optional(&query, &params).map(|row| row.is_some())
+        conn.query_optional(&query, &params)
+            .map(|row| row.is_some())
     }
 
     fn report_db_error(&mut self, context: &str, err: impl std::fmt::Display) {
@@ -3523,9 +3524,7 @@ impl App {
             // r: Refresh current view (per spec Section 3.3)
             // Don't intercept when in text input mode
             // Exempt Sources view: 'r' there means Rescan, not global refresh
-            KeyCode::Char('r')
-                if !self.in_text_input_mode() && self.mode != TuiMode::Sources =>
-            {
+            KeyCode::Char('r') if !self.in_text_input_mode() && self.mode != TuiMode::Sources => {
                 self.refresh_current_view();
                 return;
             }
@@ -4118,11 +4117,8 @@ impl App {
                     TextInputResult::Committed => {
                         let tag = self.discover.bulk_tag_input.trim().to_string();
                         if !tag.is_empty() {
-                            let file_ids: Vec<i64> = self
-                                .filtered_files()
-                                .iter()
-                                .map(|f| f.file_id)
-                                .collect();
+                            let file_ids: Vec<i64> =
+                                self.filtered_files().iter().map(|f| f.file_id).collect();
                             let count = file_ids.len();
                             for file_id in file_ids {
                                 self.queue_tag_for_file(
@@ -4749,8 +4745,9 @@ impl App {
                         } else {
                             format!("{}{}", explorer.current_prefix, explorer.pattern)
                         };
-                        explorer.rule_draft =
-                            Some(super::extraction::RuleDraft::from_pattern(&pattern, source_id));
+                        explorer.rule_draft = Some(super::extraction::RuleDraft::from_pattern(
+                            &pattern, source_id,
+                        ));
                         explorer.phase = GlobExplorerPhase::EditRule {
                             focus: super::extraction::RuleEditorFocus::GlobPattern,
                             selected_index: 0,
@@ -6215,10 +6212,8 @@ impl App {
                         | RuleBuilderFocus::ExtractionEdit(_)
                 ) =>
             {
-                self.discover.status_message = Some((
-                    "Backtest is not available yet".to_string(),
-                    true,
-                ));
+                self.discover.status_message =
+                    Some(("Backtest is not available yet".to_string(), true));
             }
 
             // Space toggles selection in preview/results list
@@ -6461,8 +6456,10 @@ impl App {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
             None => {
-                self.discover.status_message =
-                    Some(("No workspace selected; cannot create source".to_string(), true));
+                self.discover.status_message = Some((
+                    "No workspace selected; cannot create source".to_string(),
+                    true,
+                ));
                 return;
             }
         };
@@ -6674,10 +6671,8 @@ impl App {
             }
         };
         if tag_source == TagSource::Rule && rule_id.is_none() {
-            self.discover.status_message = Some((
-                "Rule-based tag write missing rule ID".to_string(),
-                true,
-            ));
+            self.discover.status_message =
+                Some(("Rule-based tag write missing rule ID".to_string(), true));
             return false;
         }
 
@@ -6841,13 +6836,7 @@ impl App {
 
             match row.and_then(|row| row.get::<i64>(0).ok()) {
                 Some(file_id) => {
-                    if self.queue_tag_for_file(
-                        file_id,
-                        tag,
-                        TagSource::Manual,
-                        None,
-                        false,
-                    ) {
+                    if self.queue_tag_for_file(file_id, tag, TagSource::Manual, None, false) {
                         tagged += 1;
                     }
                 }
@@ -6856,7 +6845,12 @@ impl App {
         }
 
         if !missing.is_empty() {
-            let preview = missing.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            let preview = missing
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
             self.discover.status_message = Some((
                 format!(
                     "Some preview files are missing in the database ({} missing). Example: {}",
@@ -7213,10 +7207,9 @@ impl App {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
                     builder.match_count = 0;
                     builder.pattern_error = Some("No workspace selected".to_string());
-                    builder.file_results =
-                        super::extraction::FileResultsState::ExtractionPreview {
-                            preview_files: Vec::new(),
-                        };
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -7224,10 +7217,9 @@ impl App {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
                     builder.match_count = 0;
                     builder.pattern_error = Some("No source selected".to_string());
-                    builder.file_results =
-                        super::extraction::FileResultsState::ExtractionPreview {
-                            preview_files: Vec::new(),
-                        };
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -7255,10 +7247,9 @@ impl App {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
                     builder.match_count = 0;
                     builder.pattern_error = None;
-                    builder.file_results =
-                        super::extraction::FileResultsState::ExtractionPreview {
-                            preview_files: Vec::new(),
-                        };
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -7267,10 +7258,9 @@ impl App {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
                     builder.match_count = 0;
                     builder.pattern_error = None;
-                    builder.file_results =
-                        super::extraction::FileResultsState::ExtractionPreview {
-                            preview_files: Vec::new(),
-                        };
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -7284,10 +7274,9 @@ impl App {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
                     builder.match_count = 0;
                     builder.pattern_error = None;
-                    builder.file_results =
-                        super::extraction::FileResultsState::ExtractionPreview {
-                            preview_files: Vec::new(),
-                        };
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -7300,10 +7289,9 @@ impl App {
                 if let Some(builder) = self.discover.rule_builder.as_mut() {
                     builder.match_count = 0;
                     builder.pattern_error = None;
-                    builder.file_results =
-                        super::extraction::FileResultsState::ExtractionPreview {
-                            preview_files: Vec::new(),
-                        };
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
                 }
                 return;
             }
@@ -7403,8 +7391,10 @@ impl App {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
             None => {
-                self.discover.status_message =
-                    Some(("No workspace selected; cannot apply rules".to_string(), true));
+                self.discover.status_message = Some((
+                    "No workspace selected; cannot apply rules".to_string(),
+                    true,
+                ));
                 return 0;
             }
         };
@@ -7461,40 +7451,36 @@ impl App {
             let id: i64 = match row.get(0) {
                 Ok(v) => v,
                 Err(err) => {
-                    self.discover.status_message.replace((
-                        format!("Rule apply parse failed: {}", err),
-                        true,
-                    ));
+                    self.discover
+                        .status_message
+                        .replace((format!("Rule apply parse failed: {}", err), true));
                     return 0;
                 }
             };
             let path: String = match row.get(1) {
                 Ok(v) => v,
                 Err(err) => {
-                    self.discover.status_message.replace((
-                        format!("Rule apply parse failed: {}", err),
-                        true,
-                    ));
+                    self.discover
+                        .status_message
+                        .replace((format!("Rule apply parse failed: {}", err), true));
                     return 0;
                 }
             };
             let rel_path: String = match row.get(2) {
                 Ok(v) => v,
                 Err(err) => {
-                    self.discover.status_message.replace((
-                        format!("Rule apply parse failed: {}", err),
-                        true,
-                    ));
+                    self.discover
+                        .status_message
+                        .replace((format!("Rule apply parse failed: {}", err), true));
                     return 0;
                 }
             };
             let size: i64 = match row.get(3) {
                 Ok(v) => v,
                 Err(err) => {
-                    self.discover.status_message.replace((
-                        format!("Rule apply parse failed: {}", err),
-                        true,
-                    ));
+                    self.discover
+                        .status_message
+                        .replace((format!("Rule apply parse failed: {}", err), true));
                     return 0;
                 }
             };
@@ -7518,10 +7504,9 @@ impl App {
         let (matches, _summary) = match match_rules_to_files(&files, &rules) {
             Ok(result) => result,
             Err(err) => {
-                self.discover.status_message.replace((
-                    format!("Invalid rule pattern '{}': {}", pattern, err),
-                    true,
-                ));
+                self.discover
+                    .status_message
+                    .replace((format!("Invalid rule pattern '{}': {}", pattern, err), true));
                 return 0;
             }
         };
@@ -7535,10 +7520,9 @@ impl App {
         ) {
             Ok(rows) => rows,
             Err(err) => {
-                self.discover.status_message.replace((
-                    format!("Rule apply tag lookup failed: {}", err),
-                    true,
-                ));
+                self.discover
+                    .status_message
+                    .replace((format!("Rule apply tag lookup failed: {}", err), true));
                 return 0;
             }
         };
@@ -8219,8 +8203,7 @@ impl App {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
             None => {
-                self.discover.status_message =
-                    Some(("No workspace selected".to_string(), true));
+                self.discover.status_message = Some(("No workspace selected".to_string(), true));
                 return;
             }
         };
@@ -8326,8 +8309,7 @@ impl App {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
             None => {
-                self.discover.status_message =
-                    Some(("No workspace selected".to_string(), true));
+                self.discover.status_message = Some(("No workspace selected".to_string(), true));
                 return;
             }
         };
@@ -8600,8 +8582,7 @@ impl App {
                     .unwrap_or_else(|| source_path.clone());
 
                 // Check if a source with this name (but different path) already exists
-                if let Ok(Some(name_conflict)) =
-                    db.get_source_by_name(&workspace_id, &source_name)
+                if let Ok(Some(name_conflict)) = db.get_source_by_name(&workspace_id, &source_name)
                 {
                     let _ = tui_tx.send(TuiScanResult::Error(format!(
                         "A source named '{}' already exists at '{}'. Use Sources Manager (M) to rename or delete it first.",
@@ -8673,9 +8654,11 @@ impl App {
             let telemetry_context = telemetry.as_ref().map(|recorder| {
                 let run_id = Uuid::new_v4().to_string();
                 let source_id = source.id.to_string();
-                let root_hash = Some(recorder.hasher().hash_path(std::path::Path::new(
-                    &source.path,
-                )));
+                let root_hash = Some(
+                    recorder
+                        .hasher()
+                        .hash_path(std::path::Path::new(&source.path)),
+                );
                 let payload = protocol_telemetry::ScanStarted {
                     run_id: run_id.clone(),
                     source_id: source_id.clone(),
@@ -8712,9 +8695,10 @@ impl App {
                 while let Ok(progress) = progress_rx.recv() {
                     let _ = tui_tx_progress.try_send(TuiScanResult::Progress(progress.clone()));
 
-                    if let (Some(recorder), Some((run_id, source_id, parent_id))) =
-                        (telemetry_progress.as_ref(), telemetry_context_progress.as_ref())
-                    {
+                    if let (Some(recorder), Some((run_id, source_id, parent_id))) = (
+                        telemetry_progress.as_ref(),
+                        telemetry_context_progress.as_ref(),
+                    ) {
                         let now = std::time::Instant::now();
                         if now.duration_since(last_emit) >= std::time::Duration::from_secs(1) {
                             last_emit = now;
@@ -8795,8 +8779,7 @@ impl App {
                 }
                 Err(e) => {
                     if matches!(e, casparian::scout::error::ScoutError::Cancelled) {
-                        let _ =
-                            tui_tx.send(TuiScanResult::Error("Scan cancelled".to_string()));
+                        let _ = tui_tx.send(TuiScanResult::Error("Scan cancelled".to_string()));
                         return;
                     }
                     if let (Some(recorder), Some((run_id, source_id, _))) =
@@ -8984,8 +8967,7 @@ impl App {
                 return;
             }
             Err(err) => {
-                self.discover.scan_error =
-                    Some(format!("Database open failed: {}", err));
+                self.discover.scan_error = Some(format!("Database open failed: {}", err));
                 self.discover.page_offset = 0;
                 self.discover.total_files = 0;
                 self.discover.data_loaded = true;
@@ -9293,12 +9275,12 @@ impl App {
 
             let root_folders =
                 match App::query_folder_counts(&conn, workspace_id, source_id, "", None) {
-                Ok(folders) => folders,
-                Err(e) => {
-                    let _ = tx.send(CacheLoadMessage::Error(format!("Query error: {}", e)));
-                    return;
-                }
-            };
+                    Ok(folders) => folders,
+                    Err(e) => {
+                        let _ = tx.send(CacheLoadMessage::Error(format!("Query error: {}", e)));
+                        return;
+                    }
+                };
 
             let folder_infos: Vec<FsEntry> = root_folders
                 .into_iter()
@@ -9414,10 +9396,7 @@ impl App {
 fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Option<String>) {
     use casparian::scout::error::ScoutError;
     match err {
-        ScoutError::Io(io_err) => (
-            "io_error".to_string(),
-            Some(format!("{:?}", io_err.kind())),
-        ),
+        ScoutError::Io(io_err) => ("io_error".to_string(), Some(format!("{:?}", io_err.kind()))),
         ScoutError::Database(_) => ("db_error".to_string(), None),
         ScoutError::Walk(_) => ("walk_error".to_string(), None),
         ScoutError::Json(_) => ("json_error".to_string(), None),
@@ -9503,13 +9482,11 @@ impl App {
                 let pattern_for_search = pattern.clone();
 
                 // Get source ID for query
-                let (workspace_id, source_id) = match (
-                    explorer.cache_workspace_id,
-                    explorer.cache_source_id,
-                ) {
-                    (Some(workspace_id), Some(source_id)) => (workspace_id, source_id),
-                    _ => return,
-                };
+                let (workspace_id, source_id) =
+                    match (explorer.cache_workspace_id, explorer.cache_source_id) {
+                        (Some(workspace_id), Some(source_id)) => (workspace_id, source_id),
+                        _ => return,
+                    };
 
                 // Show loading indicator immediately
                 let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
@@ -9981,16 +9958,20 @@ impl App {
                 let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
                 for row in rows {
                     // id is BIGINT, read as i64 then convert to SourceId
-                    let id_i64: i64 =
-                        row.get(0).map_err(|e| format!("Sources parse failed: {}", e))?;
+                    let id_i64: i64 = row
+                        .get(0)
+                        .map_err(|e| format!("Sources parse failed: {}", e))?;
                     let id = SourceId::try_from(id_i64)
                         .map_err(|e| format!("Sources parse failed: {}", e))?;
-                    let name: String =
-                        row.get(1).map_err(|e| format!("Sources parse failed: {}", e))?;
-                    let path: String =
-                        row.get(2).map_err(|e| format!("Sources parse failed: {}", e))?;
-                    let file_count: i64 =
-                        row.get(3).map_err(|e| format!("Sources parse failed: {}", e))?;
+                    let name: String = row
+                        .get(1)
+                        .map_err(|e| format!("Sources parse failed: {}", e))?;
+                    let path: String = row
+                        .get(2)
+                        .map_err(|e| format!("Sources parse failed: {}", e))?;
+                    let file_count: i64 = row
+                        .get(3)
+                        .map_err(|e| format!("Sources parse failed: {}", e))?;
 
                     sources.push(SourceInfo {
                         id,
@@ -10035,35 +10016,32 @@ impl App {
 
                 let has_pipeline_runs = App::table_exists(&conn, "cf_pipeline_runs")
                     .map_err(|err| format!("Jobs schema check failed: {}", err))?;
-                let has_quarantine_column = App::column_exists(
-                    &conn,
-                    "cf_processing_queue",
-                    "quarantine_rows",
-                )
-                .map_err(|err| format!("Jobs schema check failed: {}", err))?;
+                let has_quarantine_column =
+                    App::column_exists(&conn, "cf_processing_queue", "quarantine_rows")
+                        .map_err(|err| format!("Jobs schema check failed: {}", err))?;
                 let has_quarantine_table = App::table_exists(&conn, "cf_quarantine")
                     .map_err(|err| format!("Jobs schema check failed: {}", err))?;
 
-            let (quarantine_select, quarantine_join) = if has_quarantine_column {
-                ("q.quarantine_rows", "")
-            } else if has_quarantine_table {
-                (
-                    "qc.quarantine_rows",
-                    r#"
+                let (quarantine_select, quarantine_join) = if has_quarantine_column {
+                    ("q.quarantine_rows", "")
+                } else if has_quarantine_table {
+                    (
+                        "qc.quarantine_rows",
+                        r#"
                 LEFT JOIN (
                     SELECT job_id, COUNT(*) AS quarantine_rows
                     FROM cf_quarantine
                     GROUP BY job_id
                 ) qc ON qc.job_id = q.id
                 "#,
-                )
-            } else {
-                ("NULL as quarantine_rows", "")
-            };
+                    )
+                } else {
+                    ("NULL as quarantine_rows", "")
+                };
 
-            let query = if has_pipeline_runs {
-                format!(
-                    r#"
+                let query = if has_pipeline_runs {
+                    format!(
+                        r#"
                 SELECT
                     q.id,
                     q.file_id,
@@ -10095,20 +10073,20 @@ impl App {
                     q.id DESC
                 LIMIT 100
                 "#,
-                    quarantine_select = quarantine_select,
-                    quarantine_join = quarantine_join,
-                    running = ProcessingStatus::Running.as_str(),
-                    staged = ProcessingStatus::Staged.as_str(),
-                    queued = ProcessingStatus::Queued.as_str(),
-                    pending = ProcessingStatus::Pending.as_str(),
-                    failed = ProcessingStatus::Failed.as_str(),
-                    aborted = ProcessingStatus::Aborted.as_str(),
-                    completed = ProcessingStatus::Completed.as_str(),
-                    skipped = ProcessingStatus::Skipped.as_str(),
-                )
-            } else {
-                format!(
-                    r#"
+                        quarantine_select = quarantine_select,
+                        quarantine_join = quarantine_join,
+                        running = ProcessingStatus::Running.as_str(),
+                        staged = ProcessingStatus::Staged.as_str(),
+                        queued = ProcessingStatus::Queued.as_str(),
+                        pending = ProcessingStatus::Pending.as_str(),
+                        failed = ProcessingStatus::Failed.as_str(),
+                        aborted = ProcessingStatus::Aborted.as_str(),
+                        completed = ProcessingStatus::Completed.as_str(),
+                        skipped = ProcessingStatus::Skipped.as_str(),
+                    )
+                } else {
+                    format!(
+                        r#"
                 SELECT
                     q.id,
                     q.file_id,
@@ -10136,18 +10114,18 @@ impl App {
                     q.id DESC
                 LIMIT 100
                 "#,
-                    quarantine_select = quarantine_select,
-                    quarantine_join = quarantine_join,
-                    running = ProcessingStatus::Running.as_str(),
-                    staged = ProcessingStatus::Staged.as_str(),
-                    queued = ProcessingStatus::Queued.as_str(),
-                    pending = ProcessingStatus::Pending.as_str(),
-                    failed = ProcessingStatus::Failed.as_str(),
-                    aborted = ProcessingStatus::Aborted.as_str(),
-                    completed = ProcessingStatus::Completed.as_str(),
-                    skipped = ProcessingStatus::Skipped.as_str(),
-                )
-            };
+                        quarantine_select = quarantine_select,
+                        quarantine_join = quarantine_join,
+                        running = ProcessingStatus::Running.as_str(),
+                        staged = ProcessingStatus::Staged.as_str(),
+                        queued = ProcessingStatus::Queued.as_str(),
+                        pending = ProcessingStatus::Pending.as_str(),
+                        failed = ProcessingStatus::Failed.as_str(),
+                        aborted = ProcessingStatus::Aborted.as_str(),
+                        completed = ProcessingStatus::Completed.as_str(),
+                        skipped = ProcessingStatus::Skipped.as_str(),
+                    )
+                };
 
                 let rows = conn
                     .query_all(&query, &[])
@@ -10155,22 +10133,30 @@ impl App {
 
                 let mut jobs: Vec<JobInfo> = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let id: i64 =
-                        row.get(0).map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let file_id: Option<i64> =
-                        row.get(1).map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let plugin_name: String =
-                        row.get(2).map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let status_str: String =
-                        row.get(3).map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let claim_time: Option<String> =
-                        row.get(4).map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let end_time: Option<String> =
-                        row.get(5).map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let result_summary: Option<String> =
-                        row.get(6).map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let error_message: Option<String> =
-                        row.get(7).map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let id: i64 = row
+                        .get(0)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let file_id: Option<i64> = row
+                        .get(1)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let plugin_name: String = row
+                        .get(2)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let status_str: String = row
+                        .get(3)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let claim_time: Option<String> = row
+                        .get(4)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let end_time: Option<String> = row
+                        .get(5)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let result_summary: Option<String> = row
+                        .get(6)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
+                    let error_message: Option<String> = row
+                        .get(7)
+                        .map_err(|e| format!("Jobs parse failed: {}", e))?;
                     let completion_status: Option<String> = row.get(8).ok().flatten();
                     let (pipeline_run_id, logical_date, selection_snapshot_hash, quarantine_rows) =
                         if has_pipeline_runs {
@@ -10323,10 +10309,12 @@ impl App {
                     )
                     .map_err(|err| format!("Stats query failed: {}", err))?;
                 for row in rows {
-                    let status: String =
-                        row.get(0).map_err(|e| format!("Stats parse failed: {}", e))?;
-                    let count: i64 =
-                        row.get(1).map_err(|e| format!("Stats parse failed: {}", e))?;
+                    let status: String = row
+                        .get(0)
+                        .map_err(|e| format!("Stats parse failed: {}", e))?;
+                    let count: i64 = row
+                        .get(1)
+                        .map_err(|e| format!("Stats parse failed: {}", e))?;
                     if let Ok(queue_status) = status.parse::<ProcessingStatus>() {
                         match queue_status {
                             ProcessingStatus::Running => stats.running_jobs = count as usize,
@@ -10405,23 +10393,30 @@ impl App {
                 let mut approvals: Vec<ApprovalInfo> = Vec::with_capacity(rows.len());
 
                 for row in rows {
-                    let id: String =
-                        row.get(0).map_err(|e| format!("Approvals parse failed: {}", e))?;
-                    let status_str: String =
-                        row.get(1).map_err(|e| format!("Approvals parse failed: {}", e))?;
-                    let operation_type_str: String =
-                        row.get(2).map_err(|e| format!("Approvals parse failed: {}", e))?;
+                    let id: String = row
+                        .get(0)
+                        .map_err(|e| format!("Approvals parse failed: {}", e))?;
+                    let status_str: String = row
+                        .get(1)
+                        .map_err(|e| format!("Approvals parse failed: {}", e))?;
+                    let operation_type_str: String = row
+                        .get(2)
+                        .map_err(|e| format!("Approvals parse failed: {}", e))?;
                     // Parse strings to enums at the DB boundary
                     let status = ApprovalDisplayStatus::from_db_str(&status_str);
                     let operation_type = ApprovalOperationType::from_db_str(&operation_type_str);
-                    let operation_json: String =
-                        row.get(3).map_err(|e| format!("Approvals parse failed: {}", e))?;
-                    let summary: String =
-                        row.get(4).map_err(|e| format!("Approvals parse failed: {}", e))?;
-                    let created_at_str: String =
-                        row.get(5).map_err(|e| format!("Approvals parse failed: {}", e))?;
-                    let expires_at_str: String =
-                        row.get(6).map_err(|e| format!("Approvals parse failed: {}", e))?;
+                    let operation_json: String = row
+                        .get(3)
+                        .map_err(|e| format!("Approvals parse failed: {}", e))?;
+                    let summary: String = row
+                        .get(4)
+                        .map_err(|e| format!("Approvals parse failed: {}", e))?;
+                    let created_at_str: String = row
+                        .get(5)
+                        .map_err(|e| format!("Approvals parse failed: {}", e))?;
+                    let expires_at_str: String = row
+                        .get(6)
+                        .map_err(|e| format!("Approvals parse failed: {}", e))?;
                     let job_id: Option<i64> = row.get(7).ok();
 
                     // Parse timestamps
@@ -12612,16 +12607,18 @@ impl App {
                                 let final_file_count = files_persisted;
 
                                 let workspace_id = self.active_workspace_id();
-                                let source_id = match (self.open_scout_db_for_writes(), workspace_id) {
-                                    (Some(db), Some(workspace_id)) => {
-                                        match db.get_source_by_path(&workspace_id, &source_path) {
-                                            Ok(Some(source)) => Some(source.id),
-                                            Ok(None) => None,
-                                            Err(_) => None,
+                                let source_id =
+                                    match (self.open_scout_db_for_writes(), workspace_id) {
+                                        (Some(db), Some(workspace_id)) => {
+                                            match db.get_source_by_path(&workspace_id, &source_path)
+                                            {
+                                                Ok(Some(source)) => Some(source.id),
+                                                Ok(None) => None,
+                                                Err(_) => None,
+                                            }
                                         }
-                                    }
-                                    _ => None,
-                                };
+                                        _ => None,
+                                    };
 
                                 // Trigger sources reload (non-blocking, handled by tick())
                                 self.discover.sources_loaded = false;
@@ -12763,8 +12760,7 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_query = None;
                     self.query_state.executing = false;
-                    self.query_state.error =
-                        Some("Query task ended unexpectedly".to_string());
+                    self.query_state.error = Some("Query task ended unexpectedly".to_string());
                     if self.query_state.view_state == QueryViewState::Executing {
                         self.query_state.view_state = QueryViewState::Editing;
                     }
@@ -13240,8 +13236,10 @@ mod tests {
 
     #[test]
     fn test_jobs_filtered_jobs() {
-        let mut state = JobsState::default();
-        state.jobs = create_test_jobs();
+        let mut state = JobsState {
+            jobs: create_test_jobs(),
+            ..Default::default()
+        };
 
         // No filter - all 4 jobs
         assert_eq!(state.filtered_jobs().len(), 4);
@@ -13259,9 +13257,11 @@ mod tests {
 
     #[test]
     fn test_jobs_filter_clamps_selection() {
-        let mut state = JobsState::default();
-        state.jobs = create_test_jobs();
-        state.selected_index = 3; // Last job (Completed)
+        let mut state = JobsState {
+            jobs: create_test_jobs(),
+            selected_index: 3, // Last job (Completed)
+            ..Default::default()
+        };
 
         // Filter to Pending - only 1 job exists, selection must clamp to 0
         state.set_filter(Some(JobStatus::Pending));
@@ -13563,9 +13563,11 @@ mod tests {
 
     #[test]
     fn test_filter_to_empty_result() {
-        let mut state = JobsState::default();
-        state.jobs = create_test_jobs(); // Has Pending, Running, Failed, Completed
-        state.selected_index = 2;
+        let mut state = JobsState {
+            jobs: create_test_jobs(), // Has Pending, Running, Failed, Completed
+            selected_index: 2,
+            ..Default::default()
+        };
 
         // Remove all jobs and filter - should handle gracefully
         state.jobs.clear();

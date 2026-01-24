@@ -89,7 +89,7 @@ impl McpTool for ApprovalStatusTool {
                 estimated_rows: approval.summary.estimated_rows,
                 target_path: approval.summary.target_path.clone(),
             },
-            job_id: approval.job_id.clone(),
+            job_id: approval.job_id,
             expires_at: approval.expires_at.to_rfc3339(),
         };
 
@@ -279,7 +279,7 @@ impl McpTool for ApprovalDecideTool {
                     approval_id: args.approval_id.clone(),
                     decision: args.decision.to_string(),
                     status: "already_approved".to_string(),
-                    job_id: approval.job_id.clone(),
+                    job_id: approval.job_id,
                     error: None,
                 })?);
             }

@@ -14,8 +14,8 @@
 #![allow(clippy::redundant_guards)]
 #![allow(clippy::needless_borrows_for_generic_args)]
 
-pub mod cancel;
 pub mod bridge;
+pub mod cancel;
 pub mod metrics;
 pub mod native_runtime;
 pub mod runtime;
@@ -31,7 +31,10 @@ pub use worker::{Worker, WorkerConfig, WorkerError, WorkerHandle};
 #[command(name = "casparian-worker", about = "Rust Worker for Casparian Flow")]
 pub struct WorkerArgs {
     /// Sentinel address
-    #[arg(long, default_value = "tcp://127.0.0.1:5555")]
+    #[arg(
+        long,
+        default_value_t = casparian_protocol::defaults::DEFAULT_SENTINEL_BIND_ADDR.to_string()
+    )]
     pub connect: String,
 
     /// Parquet output directory

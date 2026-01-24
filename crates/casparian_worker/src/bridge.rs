@@ -53,6 +53,12 @@ const OUTPUT_START_SIGNAL: u32 = 0xFFFF_FFFD;
 const OUTPUT_END_SIGNAL: u32 = 0xFFFF_FFFC;
 const METRICS_SIGNAL: u32 = 0xFFFF_FFFB;
 
+const _: () = {
+    assert!(LOG_SIGNAL > 100 * 1024 * 1024);
+    assert!(OUTPUT_START_SIGNAL > 100 * 1024 * 1024);
+    assert!(OUTPUT_END_SIGNAL > 100 * 1024 * 1024);
+};
+
 /// Log levels (must match Python bridge_shim.py)
 #[allow(dead_code)]
 mod log_level {
@@ -319,28 +325,26 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     // Read all batches (log_writer receives sideband log messages)
     let stream_result =
         match read_arrow_batches(&mut stream, job_id, &mut log_writer, &config.cancel_token) {
-        Ok(result) => result,
-        Err(e) => {
-            let stderr_output = collect_stderr(&mut process);
-            cleanup_process(&mut process);
+            Ok(result) => result,
+            Err(e) => {
+                let stderr_output = collect_stderr(&mut process);
+                cleanup_process(&mut process);
 
-            if !stderr_output.is_empty() {
-                error!(
-                    "[Job {}] Guest stderr during read failure:\n{}",
-                    job_id, stderr_output
-                );
-                log_writer.write_log(log_level::STDERR, &stderr_output);
+                if !stderr_output.is_empty() {
+                    error!(
+                        "[Job {}] Guest stderr during read failure:\n{}",
+                        job_id, stderr_output
+                    );
+                    log_writer.write_log(log_level::STDERR, &stderr_output);
+                }
+                let logs = log_writer.read_and_cleanup().unwrap_or_default();
+                return Err(e.context(format!("Logs:\n{}", logs)));
             }
-            let logs = log_writer.read_and_cleanup().unwrap_or_default();
-            return Err(e.context(format!("Logs:\n{}", logs)));
-        }
-    };
+        };
 
     // Wait for process to exit
-    let status =
-        wait_for_exit(&mut process, job_id, &config.cancel_token).with_context(|| {
-            format!("[Job {}] Failed to wait for guest process", job_id)
-        })?;
+    let status = wait_for_exit(&mut process, job_id, &config.cancel_token)
+        .with_context(|| format!("[Job {}] Failed to wait for guest process", job_id))?;
 
     // Always collect stderr for logging (even on success)
     let stderr_output = collect_stderr(&mut process);
@@ -1225,9 +1229,6 @@ mod tests {
         assert_eq!(END_OF_STREAM, 0);
         // LOG_SIGNAL must be distinct from ERROR_SIGNAL and valid data lengths
         assert_ne!(LOG_SIGNAL, ERROR_SIGNAL);
-        assert!(LOG_SIGNAL > 100 * 1024 * 1024); // Greater than max batch size
-        assert!(OUTPUT_START_SIGNAL > 100 * 1024 * 1024);
-        assert!(OUTPUT_END_SIGNAL > 100 * 1024 * 1024);
     }
 
     #[test]
@@ -1283,8 +1284,7 @@ mod tests {
 
         let mut log_writer = JobLogWriter::new(JobId::new(1)).unwrap();
         let cancel_token = CancellationToken::new();
-        let result =
-            read_arrow_batches(&mut stream, JobId::new(1), &mut log_writer, &cancel_token);
+        let result = read_arrow_batches(&mut stream, JobId::new(1), &mut log_writer, &cancel_token);
 
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();

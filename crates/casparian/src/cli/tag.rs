@@ -8,8 +8,8 @@ use crate::cli::error::HelpfulError;
 use crate::cli::output::format_size;
 use crate::cli::workspace;
 use casparian::scout::{
-    match_rules_to_files, patterns, Database, FileStatus, RuleApplyFile, RuleApplyRule,
-    TagSource, TaggingRuleId, TaggingSummary, WorkspaceId,
+    match_rules_to_files, patterns, Database, FileStatus, RuleApplyFile, RuleApplyRule, TagSource,
+    TaggingRuleId, TaggingSummary, WorkspaceId,
 };
 use casparian_db::{DbConnection, DbValue};
 use chrono::Utc;
@@ -66,9 +66,8 @@ fn open_db() -> Result<Database, HelpfulError> {
 }
 
 fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
-    workspace::resolve_active_workspace_id(db).map_err(|e| {
-        e.with_context("The workspace registry is required for tagging")
-    })
+    workspace::resolve_active_workspace_id(db)
+        .map_err(|e| e.with_context("The workspace registry is required for tagging"))
 }
 
 fn now_millis() -> i64 {
@@ -182,10 +181,7 @@ fn get_file_by_path(
             "SELECT id, path, rel_path, size \
              FROM scout_files \
              WHERE workspace_id = ? AND path = ?",
-            &[
-                DbValue::from(workspace_id.to_string()),
-                DbValue::from(path),
-            ],
+            &[DbValue::from(workspace_id.to_string()), DbValue::from(path)],
         )
         .map_err(|e| HelpfulError::new(format!("Failed to query file: {}", e)))?;
 
@@ -246,17 +242,18 @@ fn apply_tag(
             .with_context(format!("File ID: {}", file_id))
     })?;
 
-    let updated = conn.execute(
-        "UPDATE scout_files SET status = ? WHERE id = ?",
-        &[
-            DbValue::from(FileStatus::Tagged.as_str()),
-            DbValue::from(file_id),
-        ],
-    )
-    .map_err(|e| {
-        HelpfulError::new(format!("Failed to update file status: {}", e))
-            .with_context(format!("File ID: {}", file_id))
-    })?;
+    let updated = conn
+        .execute(
+            "UPDATE scout_files SET status = ? WHERE id = ?",
+            &[
+                DbValue::from(FileStatus::Tagged.as_str()),
+                DbValue::from(file_id),
+            ],
+        )
+        .map_err(|e| {
+            HelpfulError::new(format!("Failed to update file status: {}", e))
+                .with_context(format!("File ID: {}", file_id))
+        })?;
 
     if updated == 0 {
         return Err(HelpfulError::new("No file updated")
@@ -316,19 +313,20 @@ fn remove_all_tags(
 
 /// Reset file status after untagging
 fn reset_file_status(conn: &DbConnection, file_id: i64) -> Result<(), HelpfulError> {
-    let updated = conn.execute(
-        "UPDATE scout_files \
+    let updated = conn
+        .execute(
+            "UPDATE scout_files \
          SET status = ?, sentinel_job_id = NULL, manual_plugin = NULL \
          WHERE id = ?",
-        &[
-            DbValue::from(FileStatus::Pending.as_str()),
-            DbValue::from(file_id),
-        ],
-    )
-    .map_err(|e| {
-        HelpfulError::new(format!("Failed to remove file tag: {}", e))
-            .with_context(format!("File ID: {}", file_id))
-    })?;
+            &[
+                DbValue::from(FileStatus::Pending.as_str()),
+                DbValue::from(file_id),
+            ],
+        )
+        .map_err(|e| {
+            HelpfulError::new(format!("Failed to remove file tag: {}", e))
+                .with_context(format!("File ID: {}", file_id))
+        })?;
 
     if updated == 0 {
         return Err(HelpfulError::new("No file updated")
@@ -340,10 +338,7 @@ fn reset_file_status(conn: &DbConnection, file_id: i64) -> Result<(), HelpfulErr
 }
 
 /// Count total files
-fn count_all_files(
-    conn: &DbConnection,
-    workspace_id: &WorkspaceId,
-) -> Result<i64, HelpfulError> {
+fn count_all_files(conn: &DbConnection, workspace_id: &WorkspaceId) -> Result<i64, HelpfulError> {
     conn.query_scalar::<i64>(
         "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ?",
         &[DbValue::from(workspace_id.to_string())],
@@ -814,15 +809,7 @@ mod tests {
         .unwrap();
 
         // Apply tag
-        apply_tag(
-            &conn,
-            &workspace_id,
-            1,
-            "csv_data",
-            None,
-            TagSource::Manual,
-        )
-        .unwrap();
+        apply_tag(&conn, &workspace_id, 1, "csv_data", None, TagSource::Manual).unwrap();
 
         // Verify
         let file = get_file_by_path(&conn, &workspace_id, "/data/test.csv")

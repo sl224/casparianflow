@@ -4,9 +4,7 @@
 
 use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::types::{IdentifyPayload, JobReceipt, JobStatus};
-use casparian_protocol::{
-    metrics, JobId, Message, OpCode, PipelineRunStatus, ProcessingStatus,
-};
+use casparian_protocol::{metrics, JobId, Message, OpCode, PipelineRunStatus, ProcessingStatus};
 use casparian_sentinel::{ControlClient, Sentinel, SentinelConfig};
 use std::time::Duration;
 use std::{sync::mpsc, thread};
@@ -116,15 +114,9 @@ fn test_control_api_smoke() {
     let db_url = format!("duckdb:{}", db_path.display());
 
     #[cfg(unix)]
-    let bind_addr = format!(
-        "ipc://{}",
-        temp_dir.path().join("sentinel.sock").display()
-    );
+    let bind_addr = format!("ipc://{}", temp_dir.path().join("sentinel.sock").display());
     #[cfg(unix)]
-    let control_addr = format!(
-        "ipc://{}",
-        temp_dir.path().join("control.sock").display()
-    );
+    let control_addr = format!("ipc://{}", temp_dir.path().join("control.sock").display());
 
     #[cfg(not(unix))]
     let bind_addr = free_tcp_addr();
@@ -210,7 +202,7 @@ fn test_worker_sentinel_exchange() {
     let (header, body) = msg.pack().unwrap();
 
     let frames = [header.as_slice(), body.as_slice()];
-    dealer.send_multipart(&frames, 0).unwrap();
+    dealer.send_multipart(frames, 0).unwrap();
 
     let parts = router.recv_multipart(0).expect("ZMQ error on recv");
 
@@ -220,7 +212,7 @@ fn test_worker_sentinel_exchange() {
             "  Part {}: {} bytes, first byte: {:02x}",
             i,
             part.len(),
-            part.get(0).unwrap_or(&0)
+            part.first().copied().unwrap_or(0)
         );
     }
 
@@ -800,7 +792,7 @@ fn test_only_queued_jobs_are_dispatched() {
     assert!(
         job.is_none(),
         "{} should not be picked up",
-        format!(
+        format_args!(
             "{}, {}, {}, {}",
             ProcessingStatus::Pending.as_str(),
             ProcessingStatus::Running.as_str(),
@@ -839,7 +831,7 @@ fn test_full_worker_lifecycle_message_flow() {
     let (header, body) = msg.pack().unwrap();
 
     let identify_frames = [header.as_slice(), body.as_slice()];
-    dealer.send_multipart(&identify_frames, 0).unwrap();
+    dealer.send_multipart(identify_frames, 0).unwrap();
 
     // Sentinel receives IDENTIFY
     let parts = router.recv_multipart(0).unwrap();

@@ -2,13 +2,7 @@
 
 use std::io;
 
-use ratatui::{
-    backend::TestBackend,
-    buffer::Buffer,
-    layout::Rect,
-    style::Color,
-    Terminal,
-};
+use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, Terminal};
 use serde::Serialize;
 
 use super::app::{App, ShellFocus, TuiMode};

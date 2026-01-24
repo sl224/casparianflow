@@ -16,6 +16,7 @@
 //! - JOB_ID (u64): Job ID (Q = unsigned long long, 8 bytes)
 //! - LEN (u32): Payload length in bytes (I = unsigned int, 4 bytes)
 
+pub mod defaults;
 pub mod error;
 pub mod http_types;
 pub mod idempotency;
@@ -77,6 +78,7 @@ pub use idempotency::{
 
 // Re-export HTTP API types
 pub use http_types::{
+    ApiJobId,
     // Approval types
     Approval,
     // API response types

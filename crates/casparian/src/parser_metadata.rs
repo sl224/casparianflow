@@ -100,18 +100,19 @@ pub fn extract_metadata_batch(paths: &[PathBuf]) -> HashMap<String, ParserMetada
 
     let json_input = serde_json::to_string(&path_strings).ok();
     let python_output = json_input.as_deref().and_then(run_python_extractor);
-    let parsed = python_output
-        .as_deref()
-        .and_then(|output| match serde_json::from_str::<Value>(output) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                record_python_extractor_error(format!(
-                    "Python metadata extractor returned invalid JSON: {}",
-                    err
-                ));
-                None
-            }
-        });
+    let parsed =
+        python_output
+            .as_deref()
+            .and_then(|output| match serde_json::from_str::<Value>(output) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    record_python_extractor_error(format!(
+                        "Python metadata extractor returned invalid JSON: {}",
+                        err
+                    ));
+                    None
+                }
+            });
 
     for path_str in &path_strings {
         let path = PathBuf::from(path_str);

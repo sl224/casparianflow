@@ -79,13 +79,15 @@ fn sidecar_path_for(lock_path: &Path) -> PathBuf {
 fn write_lock_sidecar(lock_path: &Path, mode: &'static str) -> Option<PathBuf> {
     let sidecar = LockSidecar {
         pid: std::process::id(),
-        exe: std::env::current_exe().ok().map(|p| p.display().to_string()),
+        exe: std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string()),
         timestamp: Utc::now().to_rfc3339(),
         mode,
     };
     let sidecar_path = sidecar_path_for(lock_path);
     match serde_json::to_vec_pretty(&sidecar)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        .map_err(io::Error::other)
         .and_then(|payload| fs::write(&sidecar_path, payload))
     {
         Ok(()) => Some(sidecar_path),

@@ -16,8 +16,7 @@ use crate::intent::state::IntentState;
 use crate::intent::types::{
     Confidence, FileSetId, HumanQuestion, ParsedColumnCollision, PathField, PathFieldCollisions,
     PathFieldCoverage, PathFieldDtype, PathFieldNamespacing, PathFieldPattern, PathFieldProposal,
-    PathFieldSource, ProposalId, QuestionId, QuestionKind, QuestionOption, SameNameCollision,
-    SegmentOverlapCollision, SessionId,
+    PathFieldSource, ProposalId, QuestionId, QuestionKind, QuestionOption, SessionId,
 };
 use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;

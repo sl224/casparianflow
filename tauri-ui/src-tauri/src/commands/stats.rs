@@ -146,11 +146,9 @@ fn sum_quarantine_rows(completed: &[casparian_protocol::Job]) -> u64 {
     completed
         .iter()
         .filter_map(|job| {
-            job.result.as_ref().and_then(|r| {
-                r.metrics
-                    .get(metrics::QUARANTINE_ROWS)
-                    .map(|&v| v as u64)
-            })
+            job.result
+                .as_ref()
+                .and_then(|r| r.metrics.get(metrics::QUARANTINE_ROWS).map(|&v| v as u64))
         })
         .sum()
 }
@@ -158,12 +156,12 @@ fn sum_quarantine_rows(completed: &[casparian_protocol::Job]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::sum_quarantine_rows;
-    use casparian_protocol::{metrics, HttpJobStatus, HttpJobType, Job, JobId, JobResult};
+    use casparian_protocol::{metrics, ApiJobId, HttpJobStatus, HttpJobType, Job, JobResult};
     use std::collections::HashMap;
 
     fn base_job() -> Job {
         Job {
-            job_id: JobId::new(1),
+            job_id: ApiJobId::new(1),
             job_type: HttpJobType::Run,
             status: HttpJobStatus::Completed,
             plugin_name: "demo".to_string(),

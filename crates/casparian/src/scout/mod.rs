@@ -17,7 +17,9 @@ pub mod types;
 pub use db::Database;
 pub use extractor::{BatchExtractor, ExtractorConfig, ExtractorResult, ExtractorRunner};
 pub use patterns::{build_matcher, matches, normalize_glob_pattern};
-pub use rule_apply::{match_rules_to_files, RuleApplyFile, RuleApplyRule, RuleMatch, TaggingSummary};
+pub use rule_apply::{
+    match_rules_to_files, RuleApplyFile, RuleApplyRule, RuleMatch, TaggingSummary,
+};
 pub use scanner::{ScanCancelToken, ScanConfig, ScanProgress, Scanner};
 pub use types::{
     ExtractionStatus, Extractor, FileStatus, FileTag, ScannedFile, Source, SourceId, SourceType,

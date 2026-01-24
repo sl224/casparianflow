@@ -11,6 +11,7 @@ use crate::security::SecurityConfig;
 use crate::server::McpServerConfig;
 use crate::types::{ApprovalSummary, PluginRef, SchemasMap};
 use anyhow::Result;
+use casparian_protocol::defaults;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -103,6 +104,7 @@ impl McpTool for RunRequestTool {
         _executor: &JobExecutorHandle,
     ) -> Result<Value> {
         let args: RunRequestArgs = serde_json::from_value(args)?;
+        let _schemas = args.schemas.as_ref();
 
         // Validate input_dir path
         let input_path = security.validate_path(std::path::Path::new(&args.input_dir))?;
@@ -117,7 +119,7 @@ impl McpTool for RunRequestTool {
         // Default output path
         let output = args
             .output
-            .unwrap_or_else(|| "parquet://./output/".to_string());
+            .unwrap_or_else(|| defaults::DEFAULT_SINK_URI.to_string());
 
         // Build summary
         let summary = ApprovalSummary {

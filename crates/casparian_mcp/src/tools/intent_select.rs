@@ -18,7 +18,7 @@ use crate::intent::state::IntentState;
 use crate::intent::types::{
     Confidence, DirPrefixEvidence, ExtensionEvidence, FileSetId, NextAction, ProposalId,
     SamplingMethod, SelectionEvidence, SelectionPreview, SelectionProposal, SemanticTokenEvidence,
-    SessionId, TagCollisionEvidence,
+    SessionId,
 };
 use crate::jobs::JobExecutorHandle;
 use crate::security::SecurityConfig;

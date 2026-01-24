@@ -15,7 +15,6 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
 
-
 /// Subcommands for job management
 #[derive(Subcommand, Debug, Clone)]
 pub enum JobAction {
@@ -322,13 +321,12 @@ fn require_control_client() -> anyhow::Result<ControlClient> {
     }
 
     // Use short timeout for connection check
-    let client = ControlClient::connect_with_timeout(&addr, Duration::from_millis(500)).map_err(
-        |e| {
+    let client =
+        ControlClient::connect_with_timeout(&addr, Duration::from_millis(500)).map_err(|e| {
             HelpfulError::new(format!("Control API unavailable at {}", addr))
                 .with_context(format!("Connection error: {}", e))
                 .with_suggestion("Start sentinel (Control API is on by default)")
-        },
-    )?;
+        })?;
 
     match client.ping() {
         Ok(true) => Ok(client),
@@ -360,10 +358,14 @@ fn run_cancel_via_api(client: &ControlClient, job_id: JobId) -> anyhow::Result<(
             }
             Ok(())
         }
-        Err(e) => Err(HelpfulError::new(format!("Failed to cancel job {}", job_id))
-            .with_context(format!("Control API error: {}", e))
-            .with_suggestion("TRY: Start sentinel (Control API is on by default) or set --control-addr")
-            .into()),
+        Err(e) => Err(
+            HelpfulError::new(format!("Failed to cancel job {}", job_id))
+                .with_context(format!("Control API error: {}", e))
+                .with_suggestion(
+                    "TRY: Start sentinel (Control API is on by default) or set --control-addr",
+                )
+                .into(),
+        ),
     }
 }
 

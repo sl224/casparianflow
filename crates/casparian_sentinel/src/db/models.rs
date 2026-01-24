@@ -5,76 +5,82 @@
 use casparian_db::{BackendError, DbTimestamp, UnifiedDbRow};
 use casparian_protocol::{
     JobStatus as ProtocolJobStatus, PluginStatus, ProcessingStatus, QuarantineConfig, SinkMode,
-    WorkerStatus,
 };
 
 // Re-export canonical enums from protocol for convenience
 pub use casparian_protocol::{PluginStatus as PluginStatusEnum, ProcessingStatus as StatusEnum};
 
-// ============================================================================
-// Core Models
-// ============================================================================
+pub const TOPIC_CONFIG_COLUMNS: &[&str] = &[
+    "id",
+    "plugin_name",
+    "topic_name",
+    "uri",
+    "mode",
+    "quarantine_allow",
+    "quarantine_max_pct",
+    "quarantine_max_count",
+    "quarantine_dir",
+];
 
-#[derive(Debug, Clone)]
-pub struct SourceRoot {
-    pub id: i32,
-    pub path: String,
-    pub root_type: String,
-    pub active: i32,
-}
+pub const PROCESSING_JOB_COLUMNS: &[&str] = &[
+    "id",
+    "file_id",
+    "pipeline_run_id",
+    "plugin_name",
+    "config_overrides",
+    "status",
+    "completion_status",
+    "priority",
+    "worker_host",
+    "worker_pid",
+    "claim_time",
+    "end_time",
+    "result_summary",
+    "error_message",
+    "retry_count",
+];
 
-#[derive(Debug, Clone)]
-pub struct FileHashRegistry {
-    pub content_hash: String,
-    pub first_seen: String,
-    pub size_bytes: i32,
-}
+pub const DEAD_LETTER_COLUMNS: &[&str] = &[
+    "id",
+    "original_job_id",
+    "file_id",
+    "plugin_name",
+    "error_message",
+    "retry_count",
+    "moved_at",
+    "reason",
+];
 
-#[derive(Debug, Clone)]
-pub struct FileLocation {
-    pub id: i32,
-    pub source_root_id: i32,
-    pub rel_path: String,
-    pub filename: String,
-    pub last_known_mtime: Option<f64>,
-    pub last_known_size: Option<i32>,
-    pub current_version_id: Option<i32>,
-    pub discovered_time: String,
-    pub last_seen_time: String,
-}
+pub const PARSER_HEALTH_COLUMNS: &[&str] = &[
+    "parser_name",
+    "total_executions",
+    "successful_executions",
+    "consecutive_failures",
+    "last_failure_reason",
+    "paused_at",
+    "created_at",
+    "updated_at",
+];
 
-#[derive(Debug, Clone)]
-pub struct FileTag {
-    pub file_id: i64,
-    pub tag: String,
-}
+pub const QUARANTINE_COLUMNS: &[&str] = &[
+    "id",
+    "job_id",
+    "row_index",
+    "error_reason",
+    "raw_data",
+    "created_at",
+];
 
-#[derive(Debug, Clone)]
-pub struct FileVersion {
-    pub id: i32,
-    pub location_id: i32,
-    pub content_hash: String,
-    pub size_bytes: i32,
-    pub modified_time: String,
-    pub detected_at: String,
-    pub applied_tags: String,
-}
+pub const QUARANTINE_LIST_COLUMNS: &[&str] =
+    &["id", "job_id", "row_index", "error_reason", "created_at"];
 
 // ============================================================================
 // Plugin Configuration
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub struct PluginConfig {
-    pub plugin_name: String,
-    pub subscription_tags: String,
-    pub default_parameters: Option<String>,
-    pub last_updated: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct TopicConfig {
-    pub id: i32,
+    pub id: i64,
     pub plugin_name: String,
     pub topic_name: String,
     pub uri: String,
@@ -134,14 +140,6 @@ impl TopicConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PluginSubscription {
-    pub id: i32,
-    pub plugin_name: String,
-    pub topic_name: String,
-    pub is_active: bool,
-}
-
 // ============================================================================
 // Job Queue
 // ============================================================================
@@ -178,7 +176,6 @@ impl ProcessingJob {
             ))
         })?;
 
-        // Parse completion_status if present - this is optional, but if present should be valid
         let completion_status_raw: Option<String> = row.get_by_name("completion_status")?;
         let completion_status = match completion_status_raw {
             Some(s) if !s.is_empty() => Some(s.parse::<ProtocolJobStatus>().map_err(|e| {
@@ -208,31 +205,12 @@ impl ProcessingJob {
 }
 
 // ============================================================================
-// Bridge / Publisher
+// Plugin Manifest
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub struct Publisher {
-    pub id: i32,
-    pub azure_oid: Option<String>,
-    pub name: String,
-    pub email: Option<String>,
-    pub created_at: DbTimestamp,
-    pub last_active: DbTimestamp,
-}
-
-#[derive(Debug, Clone)]
-pub struct PluginEnvironment {
-    pub hash: String,
-    pub lockfile_content: String,
-    pub size_mb: f64,
-    pub last_used: DbTimestamp,
-    pub created_at: DbTimestamp,
-}
-
-#[derive(Debug, Clone)]
 pub struct PluginManifest {
-    pub id: i32,
+    pub id: i64,
     pub plugin_name: String,
     pub version: String,
     pub runtime_kind: String,
@@ -253,7 +231,9 @@ pub struct PluginManifest {
     pub outputs_json: String,
     pub signature_verified: bool,
     pub signer_id: Option<String>,
-    pub publisher_id: Option<i32>,
+    pub publisher_name: Option<String>,
+    pub publisher_email: Option<String>,
+    pub azure_oid: Option<String>,
     pub system_requirements: Option<String>,
 }
 
@@ -288,62 +268,10 @@ impl PluginManifest {
             outputs_json: row.get_by_name("outputs_json")?,
             signature_verified: row.get_by_name("signature_verified")?,
             signer_id: row.get_by_name("signer_id")?,
-            publisher_id: row.get_by_name("publisher_id")?,
+            publisher_name: row.get_by_name("publisher_name")?,
+            publisher_email: row.get_by_name("publisher_email")?,
+            azure_oid: row.get_by_name("azure_oid")?,
             system_requirements: row.get_by_name("system_requirements")?,
-        })
-    }
-}
-
-// ============================================================================
-// Routing & Ignore Rules
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct RoutingRule {
-    pub id: i32,
-    pub pattern: String,
-    pub tag: String,
-    pub priority: i32,
-}
-
-#[derive(Debug, Clone)]
-pub struct IgnoreRule {
-    pub id: i32,
-    pub pattern: String,
-}
-
-// ============================================================================
-// Workers
-// ============================================================================
-
-#[derive(Debug, Clone)]
-pub struct WorkerNode {
-    pub id: i32,
-    pub host: String,
-    pub pid: i32,
-    /// Worker status - stored as WorkerStatus enum, not String.
-    /// Parsing happens at the boundary (from_row), not at access time.
-    pub status: WorkerStatus,
-    pub current_job_id: Option<i32>,
-}
-
-impl WorkerNode {
-    /// Parse WorkerNode from a database row.
-    /// Status is parsed at the boundary and errors are propagated, not swallowed.
-    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
-        let status_str: String = row.get_by_name("status")?;
-        let status = status_str.parse::<WorkerStatus>().map_err(|e| {
-            BackendError::TypeConversion(format!("Invalid worker status '{}': {}", status_str, e))
-        })?;
-
-        Ok(Self {
-            id: row.get_by_name("id")?,
-            host: row
-                .get_by_name("host")
-                .or_else(|_| row.get_by_name("hostname"))?,
-            pid: row.get_by_name("pid")?,
-            status,
-            current_job_id: row.get_by_name("current_job_id")?,
         })
     }
 }
@@ -376,6 +304,21 @@ impl DeadLetterJob {
             moved_at: row.get_by_name("moved_at")?,
             reason: row.get_by_name("reason")?,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadLetterReason {
+    MaxRetriesExceeded,
+    PermanentError,
+}
+
+impl DeadLetterReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeadLetterReason::MaxRetriesExceeded => "max_retries_exceeded",
+            DeadLetterReason::PermanentError => "permanent_error",
+        }
     }
 }
 
@@ -422,7 +365,7 @@ impl ParserHealth {
 pub struct QuarantinedRow {
     pub id: i64,
     pub job_id: i64,
-    pub row_index: i32,
+    pub row_index: i64,
     pub error_reason: String,
     pub raw_data: Option<Vec<u8>>,
     pub created_at: DbTimestamp,
@@ -447,7 +390,6 @@ mod tests {
 
     #[test]
     fn test_processing_status_serialization() {
-        // ProcessingStatus uses SCREAMING_SNAKE_CASE
         assert_eq!(
             serde_json::to_string(&ProcessingStatus::Pending).unwrap(),
             format!("\"{}\"", ProcessingStatus::Pending.as_str())

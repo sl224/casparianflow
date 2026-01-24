@@ -8,7 +8,7 @@ use casparian_db::{DbConnection, DbValue};
 use tracing::warn;
 
 /// Current schema version. Increment when schema changes.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// Known tables that will be dropped on schema mismatch.
 ///

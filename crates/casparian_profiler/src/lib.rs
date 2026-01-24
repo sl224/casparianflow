@@ -466,7 +466,7 @@ mod tests {
         profiler.end_frame();
 
         let util = profiler.budget_utilization();
-        assert!(util >= 0.5 && util <= 1.0); // Should be around 50%
+        assert!((0.5..=1.0).contains(&util)); // Should be around 50%
     }
 
     #[test]

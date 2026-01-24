@@ -47,6 +47,7 @@ arrow.workspace = true
 # Internal crates - we call these directly, not via CLI
 casparian_db = { path = "../casparian_db" }
 casparian_protocol = { path = "../casparian_protocol" }
+casparian_intent = { path = "../casparian_intent" }
 casparian_schema = { path = "../casparian_schema" }
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_backtest = { path = "../casparian_backtest" }

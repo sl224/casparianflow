@@ -43,7 +43,9 @@ impl Tagger {
     pub fn get_tag(&self, file: &ScannedFile) -> Option<&str> {
         self.rules
             .iter()
-            .find(|cr| cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path))
+            .find(|cr| {
+                cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path)
+            })
             .map(|cr| cr.rule.tag.as_str())
     }
 
@@ -52,7 +54,9 @@ impl Tagger {
     pub fn get_tag_with_rule_id(&self, file: &ScannedFile) -> Option<(&str, TaggingRuleId)> {
         self.rules
             .iter()
-            .find(|cr| cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path))
+            .find(|cr| {
+                cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path)
+            })
             .map(|cr| (cr.rule.tag.as_str(), cr.rule.id))
     }
 
@@ -60,16 +64,18 @@ impl Tagger {
     pub fn match_file(&self, file: &ScannedFile) -> Vec<&TaggingRule> {
         self.rules
             .iter()
-            .filter(|cr| cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path))
+            .filter(|cr| {
+                cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path)
+            })
             .map(|cr| &cr.rule)
             .collect()
     }
 
     /// Check if any rule matches a file
     pub fn has_match(&self, file: &ScannedFile) -> bool {
-        self.rules
-            .iter()
-            .any(|cr| cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path))
+        self.rules.iter().any(|cr| {
+            cr.rule.workspace_id == file.workspace_id && cr.pattern.matches(&file.rel_path)
+        })
     }
 
     /// Get all rules
@@ -221,7 +227,13 @@ mod tests {
                 "specific_data",
                 20,
             ),
-            create_test_rule(TaggingRuleId::new(), &workspace_id, "*.csv", "generic_csv", 10),
+            create_test_rule(
+                TaggingRuleId::new(),
+                &workspace_id,
+                "*.csv",
+                "generic_csv",
+                10,
+            ),
         ];
         let tagger = Tagger::new(rules).unwrap();
 
@@ -267,7 +279,13 @@ mod tests {
         let other_workspace_id = WorkspaceId::new();
         let rules = vec![
             create_test_rule(TaggingRuleId::new(), &workspace_id, "*.csv", "csv_data", 10),
-            create_test_rule(TaggingRuleId::new(), &workspace_id, "*.json", "json_data", 10),
+            create_test_rule(
+                TaggingRuleId::new(),
+                &workspace_id,
+                "*.json",
+                "json_data",
+                10,
+            ),
             create_test_rule(
                 TaggingRuleId::new(),
                 &workspace_id,

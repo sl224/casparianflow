@@ -4,8 +4,8 @@
 
 use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
-use crate::cli::workspace;
 use crate::cli::output::{format_size, print_table};
+use crate::cli::workspace;
 use casparian::scout::{Database, FileStatus, TaggingRuleId, WorkspaceId};
 use casparian_db::DbValue;
 use clap::Subcommand;
@@ -67,9 +67,8 @@ struct TopicFile {
 }
 
 fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
-    workspace::resolve_active_workspace_id(db).map_err(|e| {
-        e.with_context("The workspace registry is required for topics")
-    })
+    workspace::resolve_active_workspace_id(db)
+        .map_err(|e| e.with_context("The workspace registry is required for topics"))
 }
 
 /// Get all topics and their statistics from the database
@@ -322,10 +321,7 @@ fn get_rule_match_counts(
              FROM scout_file_tags \
              WHERE workspace_id = ? AND tag = ? AND rule_id IS NOT NULL \
              GROUP BY rule_id",
-            &[
-                DbValue::from(workspace_id.to_string()),
-                DbValue::from(tag),
-            ],
+            &[DbValue::from(workspace_id.to_string()), DbValue::from(tag)],
         )
         .map_err(|e| HelpfulError::new(format!("Failed to query rule matches: {}", e)))?;
 
@@ -764,8 +760,8 @@ fn list_topic_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use casparian::scout::{ScannedFile, Source, SourceId, SourceType, TaggingRule, TaggingRuleId};
+    use chrono::Utc;
 
     #[test]
     fn test_get_topic_stats() {
