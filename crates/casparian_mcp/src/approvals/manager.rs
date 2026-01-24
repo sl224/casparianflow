@@ -1,6 +1,6 @@
 //! Approval Manager - Approval Lifecycle Management
 //!
-//! DB-backed approval manager using casparian_sentinel::ApiStorage.
+//! Control API or DB-backed approval manager using casparian_sentinel.
 
 use super::{ApprovalId, ApprovalOperation, ApprovalRequest, ApprovalStatus, APPROVAL_TTL_DAYS};
 use crate::types::ApprovalSummary;
@@ -10,13 +10,19 @@ use casparian_protocol::{
     Approval as ProtocolApproval, ApprovalOperation as ProtocolApprovalOperation,
     ApprovalStatus as ProtocolApprovalStatus, JobId as ProtocolJobId,
 };
-use casparian_sentinel::ApiStorage;
+use casparian_sentinel::{ApiStorage, ControlClient, DEFAULT_CONTROL_ADDR};
 use chrono::Utc;
 use std::path::PathBuf;
+use std::time::Duration;
+
+enum ApprovalBackend {
+    Db { db_path: PathBuf },
+    Control { control_addr: String },
+}
 
 /// Approval manager for tracking approval requests (DB-backed, no cache)
 pub struct ApprovalManager {
-    db_path: PathBuf,
+    backend: ApprovalBackend,
 }
 
 impl ApprovalManager {
@@ -26,15 +32,51 @@ impl ApprovalManager {
             .with_context(|| format!("Failed to open DB at {}", db_path.display()))?;
         let storage = ApiStorage::new(conn);
         storage.init_schema().context("Failed to init schema")?;
-        Ok(Self { db_path })
+        Ok(Self {
+            backend: ApprovalBackend::Db { db_path },
+        })
+    }
+
+    /// Create a new approval manager backed by the Control API.
+    pub fn new_control(control_addr: Option<String>) -> Result<Self> {
+        let addr = control_addr.unwrap_or_else(|| DEFAULT_CONTROL_ADDR.to_string());
+        let client = ControlClient::connect_with_timeout(&addr, Duration::from_millis(500))
+            .with_context(|| format!("Failed to connect to Control API at {}", addr))?;
+        if !client.ping().unwrap_or(false) {
+            anyhow::bail!("Control API did not respond at {}", addr);
+        }
+        Ok(Self {
+            backend: ApprovalBackend::Control { control_addr: addr },
+        })
     }
 
     fn storage(&self) -> Result<ApiStorage> {
-        let conn = DbConnection::open_duckdb(&self.db_path)
-            .with_context(|| format!("Failed to open DB at {}", self.db_path.display()))?;
-        let storage = ApiStorage::new(conn);
-        storage.init_schema().context("Failed to init schema")?;
-        Ok(storage)
+        match &self.backend {
+            ApprovalBackend::Db { db_path } => {
+                let conn = DbConnection::open_duckdb(db_path)
+                    .with_context(|| format!("Failed to open DB at {}", db_path.display()))?;
+                let storage = ApiStorage::new(conn);
+                storage.init_schema().context("Failed to init schema")?;
+                Ok(storage)
+            }
+            ApprovalBackend::Control { .. } => {
+                anyhow::bail!("ApprovalManager storage is not available in Control API mode");
+            }
+        }
+    }
+
+    fn control_client(&self) -> Result<ControlClient> {
+        match &self.backend {
+            ApprovalBackend::Control { control_addr } => {
+                ControlClient::connect_with_timeout(control_addr, Duration::from_secs(5))
+                    .with_context(|| {
+                        format!("Failed to connect to Control API at {}", control_addr)
+                    })
+            }
+            ApprovalBackend::Db { .. } => {
+                anyhow::bail!("Control API client is not available in DB mode");
+            }
+        }
     }
 
     /// Create a new approval request.
@@ -46,35 +88,75 @@ impl ApprovalManager {
         let approval = ApprovalRequest::new(operation, summary);
         let protocol_op = to_protocol_operation(&approval.operation);
         let expires_in = approval.expires_at.signed_duration_since(Utc::now());
-
-        let storage = self.storage()?;
-        storage.create_approval(
-            approval.approval_id.as_ref(),
-            &protocol_op,
-            &approval.summary.description,
-            expires_in,
-        )?;
-
-        Ok(approval)
+        match &self.backend {
+            ApprovalBackend::Db { .. } => {
+                let storage = self.storage()?;
+                storage.create_approval(
+                    approval.approval_id.as_ref(),
+                    &protocol_op,
+                    &approval.summary.description,
+                    expires_in,
+                )?;
+                Ok(approval)
+            }
+            ApprovalBackend::Control { .. } => {
+                let client = self.control_client()?;
+                client.create_approval(
+                    approval.approval_id.as_ref(),
+                    protocol_op,
+                    &approval.summary.description,
+                    expires_in.num_seconds(),
+                )?;
+                Ok(approval)
+            }
+        }
     }
 
     /// Get an approval by ID.
     pub fn get_approval(&self, id: &ApprovalId) -> Result<Option<ApprovalRequest>> {
-        let storage = self.storage()?;
-        let approval = storage.get_approval(id.as_ref())?;
-        approval.map(from_protocol_approval).transpose()
+        match &self.backend {
+            ApprovalBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let approval = storage.get_approval(id.as_ref())?;
+                approval.map(from_protocol_approval).transpose()
+            }
+            ApprovalBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let approval = client.get_approval(id.as_ref())?;
+                approval.map(from_protocol_approval).transpose()
+            }
+        }
     }
 
     /// Approve an approval request.
     pub fn approve(&self, id: &ApprovalId) -> Result<bool> {
-        let storage = self.storage()?;
-        storage.approve(id.as_ref(), None)
+        match &self.backend {
+            ApprovalBackend::Db { .. } => {
+                let storage = self.storage()?;
+                storage.approve(id.as_ref(), None)
+            }
+            ApprovalBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let (success, _message) = client.approve(id.as_ref())?;
+                Ok(success)
+            }
+        }
     }
 
     /// Reject an approval request.
     pub fn reject(&self, id: &ApprovalId, reason: Option<String>) -> Result<bool> {
-        let storage = self.storage()?;
-        storage.reject(id.as_ref(), None, reason.as_deref())
+        match &self.backend {
+            ApprovalBackend::Db { .. } => {
+                let storage = self.storage()?;
+                storage.reject(id.as_ref(), None, reason.as_deref())
+            }
+            ApprovalBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let reason = reason.unwrap_or_else(|| "Rejected via MCP".to_string());
+                let (success, _message) = client.reject(id.as_ref(), &reason)?;
+                Ok(success)
+            }
+        }
     }
 
     /// Set the job ID after approval is processed.
@@ -82,8 +164,16 @@ impl ApprovalManager {
         let parsed: ProtocolJobId = job_id
             .parse()
             .with_context(|| format!("Invalid job_id: {}", job_id))?;
-        let storage = self.storage()?;
-        storage.link_approval_to_job(approval_id.as_ref(), parsed)
+        match &self.backend {
+            ApprovalBackend::Db { .. } => {
+                let storage = self.storage()?;
+                storage.link_approval_to_job(approval_id.as_ref(), parsed)
+            }
+            ApprovalBackend::Control { .. } => {
+                let client = self.control_client()?;
+                client.set_approval_job_id(approval_id.as_ref(), parsed)
+            }
+        }
     }
 
     /// List approvals with optional status filter.
@@ -96,10 +186,18 @@ impl ApprovalManager {
             Some("expired") => Some(ProtocolApprovalStatus::Expired),
             Some(other) => anyhow::bail!("Unknown approval status filter: {}", other),
         };
-
-        let storage = self.storage()?;
-        let approvals = storage.list_approvals(status)?;
-        approvals.into_iter().map(from_protocol_approval).collect()
+        match &self.backend {
+            ApprovalBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let approvals = storage.list_approvals(status)?;
+                approvals.into_iter().map(from_protocol_approval).collect()
+            }
+            ApprovalBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let approvals = client.list_approvals(status, Some(1000), Some(0))?;
+                approvals.into_iter().map(from_protocol_approval).collect()
+            }
+        }
     }
 
     /// List pending approvals.
@@ -117,8 +215,16 @@ impl ApprovalManager {
             .collect();
 
         if !expired.is_empty() {
-            let storage = self.storage()?;
-            storage.expire_approvals()?;
+            match &self.backend {
+                ApprovalBackend::Db { .. } => {
+                    let storage = self.storage()?;
+                    storage.expire_approvals()?;
+                }
+                ApprovalBackend::Control { .. } => {
+                    let client = self.control_client()?;
+                    client.expire_approvals()?;
+                }
+            }
         }
 
         Ok(expired)

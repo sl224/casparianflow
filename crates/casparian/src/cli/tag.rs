@@ -7,10 +7,12 @@
 use crate::cli::error::HelpfulError;
 use crate::cli::output::format_size;
 use crate::cli::workspace;
-use casparian::scout::{patterns, Database, FileStatus, TagSource, TaggingRuleId, WorkspaceId};
+use casparian::scout::{
+    match_rules_to_files, patterns, Database, FileStatus, RuleApplyFile, RuleApplyRule,
+    TagSource, TaggingRuleId, TaggingSummary, WorkspaceId,
+};
 use casparian_db::{DbConnection, DbValue};
 use chrono::Utc;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Arguments for the tag command
@@ -26,40 +28,6 @@ pub struct TagArgs {
 #[derive(Debug)]
 pub struct UntagArgs {
     pub path: PathBuf,
-}
-
-/// A tagging rule from the database
-#[derive(Debug, Clone)]
-struct TaggingRule {
-    id: TaggingRuleId,
-    pattern: String,
-    tag: String,
-    #[allow(dead_code)]
-    priority: i32,
-}
-
-/// A file from the database
-#[derive(Debug, Clone)]
-struct ScannedFile {
-    id: i64,
-    path: String,
-    rel_path: String,
-    size: i64,
-    #[allow(dead_code)]
-    status: String,
-}
-
-/// Summary of tagging operation
-#[derive(Debug, Default)]
-struct TaggingSummary {
-    /// Pattern -> (tag, file_count, total_bytes)
-    matches: HashMap<String, (String, usize, u64)>,
-    /// Files that would be queued
-    would_queue: usize,
-    /// New files in queue
-    new_in_queue: usize,
-    /// Untagged files (no pattern matched)
-    untagged: usize,
 }
 
 /// Get the default database path
@@ -116,7 +84,7 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 fn load_tagging_rules(
     conn: &DbConnection,
     workspace_id: &WorkspaceId,
-) -> Result<Vec<TaggingRule>, HelpfulError> {
+) -> Result<Vec<RuleApplyRule>, HelpfulError> {
     let rows = conn
         .query_all(
             "SELECT id, pattern, tag, priority \
@@ -139,7 +107,7 @@ fn load_tagging_rules(
         let id = TaggingRuleId::parse(&id_raw)
             .map_err(|e| HelpfulError::new(format!("Invalid rule id: {}", e)))?;
 
-        let rule = TaggingRule {
+        let rule = RuleApplyRule {
             id,
             pattern: row
                 .get_by_name("pattern")
@@ -161,10 +129,10 @@ fn load_tagging_rules(
 fn load_untagged_files(
     conn: &DbConnection,
     workspace_id: &WorkspaceId,
-) -> Result<Vec<ScannedFile>, HelpfulError> {
+) -> Result<Vec<RuleApplyFile>, HelpfulError> {
     let rows = conn
         .query_all(
-            "SELECT f.id, f.path, f.rel_path, f.size, f.status \
+            "SELECT f.id, f.path, f.rel_path, f.size \
              FROM scout_files f \
              LEFT JOIN scout_file_tags t \
                 ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
@@ -183,7 +151,7 @@ fn load_untagged_files(
 
     let mut files = Vec::new();
     for row in rows {
-        let file = ScannedFile {
+        let file = RuleApplyFile {
             id: row
                 .get_by_name("id")
                 .map_err(|e| HelpfulError::new(format!("Failed to read file id: {}", e)))?,
@@ -196,9 +164,6 @@ fn load_untagged_files(
             size: row
                 .get_by_name("size")
                 .map_err(|e| HelpfulError::new(format!("Failed to read file size: {}", e)))?,
-            status: row
-                .get_by_name("status")
-                .map_err(|e| HelpfulError::new(format!("Failed to read file status: {}", e)))?,
         };
         files.push(file);
     }
@@ -211,10 +176,10 @@ fn get_file_by_path(
     conn: &DbConnection,
     workspace_id: &WorkspaceId,
     path: &str,
-) -> Result<Option<ScannedFile>, HelpfulError> {
+) -> Result<Option<RuleApplyFile>, HelpfulError> {
     let row = conn
         .query_optional(
-            "SELECT id, path, rel_path, size, status \
+            "SELECT id, path, rel_path, size \
              FROM scout_files \
              WHERE workspace_id = ? AND path = ?",
             &[
@@ -229,7 +194,7 @@ fn get_file_by_path(
         None => return Ok(None),
     };
 
-    let file = ScannedFile {
+    let file = RuleApplyFile {
         id: row
             .get_by_name("id")
             .map_err(|e| HelpfulError::new(format!("Failed to read file id: {}", e)))?,
@@ -242,9 +207,6 @@ fn get_file_by_path(
         size: row
             .get_by_name("size")
             .map_err(|e| HelpfulError::new(format!("Failed to read file size: {}", e)))?,
-        status: row
-            .get_by_name("status")
-            .map_err(|e| HelpfulError::new(format!("Failed to read file status: {}", e)))?,
     };
 
     Ok(Some(file))
@@ -517,34 +479,10 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
     }
 
     // Match files to rules
-    let mut summary = TaggingSummary::default();
-    let mut matches: Vec<(ScannedFile, TaggingRule)> = Vec::new();
-
-    for file in &files {
-        // Try each rule in priority order
-        let mut matched = false;
-        for rule in &rules {
-            if pattern_matches(&rule.pattern, &file.rel_path) {
-                matches.push((file.clone(), rule.clone()));
-
-                let entry =
-                    summary
-                        .matches
-                        .entry(rule.pattern.clone())
-                        .or_insert((rule.tag.clone(), 0, 0));
-                entry.1 += 1;
-                entry.2 += file.size as u64;
-
-                matched = true;
-                break; // First matching rule wins (by priority)
-            }
-        }
-
-        if !matched {
-            summary.untagged += 1;
-        }
-    }
-
+    let (matches, mut summary) = match_rules_to_files(&files, &rules).map_err(|e| {
+        HelpfulError::new(format!("Failed to match rules: {}", e))
+            .with_context("One or more rule patterns are invalid")
+    })?;
     summary.would_queue = matches.len();
     summary.new_in_queue = matches.len(); // Simplified: all matches are "new" to queue
 
@@ -598,13 +536,13 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
     // Actually apply changes if not dry run
     if !dry_run {
         let mut applied = 0;
-        for (file, rule) in &matches {
+        for matched in &matches {
             apply_tag(
                 conn,
                 &workspace_id,
-                file.id,
-                &rule.tag,
-                Some(rule.id),
+                matched.file_id,
+                &matched.tag,
+                Some(matched.rule_id),
                 TagSource::Rule,
             )?;
             applied += 1;
@@ -903,6 +841,12 @@ mod tests {
             .unwrap();
         let tags = list_file_tags(&conn, &workspace_id, file.id).unwrap();
         assert!(tags.is_empty());
-        assert_eq!(file.status, FileStatus::Pending.as_str());
+        let status: String = conn
+            .query_scalar(
+                "SELECT status FROM scout_files WHERE id = ?",
+                &[DbValue::from(file.id)],
+            )
+            .unwrap();
+        assert_eq!(status, FileStatus::Pending.as_str());
     }
 }

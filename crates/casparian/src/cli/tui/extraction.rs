@@ -12,6 +12,8 @@
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use crate::scout::SourceId;
+
 // =============================================================================
 // Rule Draft Types
 // =============================================================================
@@ -22,7 +24,7 @@ pub struct RuleDraft {
     /// UUID for existing rules, None for new
     pub id: Option<Uuid>,
     /// Scoped to source, or None for global
-    pub source_id: Option<Uuid>,
+    pub source_id: Option<SourceId>,
     /// Rule name (required for save)
     pub name: String,
     /// Glob pattern for matching files
@@ -41,7 +43,7 @@ pub struct RuleDraft {
 
 impl RuleDraft {
     /// Create a new rule draft from a glob pattern
-    pub fn from_pattern(pattern: &str, source_id: Option<Uuid>) -> Self {
+    pub fn from_pattern(pattern: &str, source_id: Option<SourceId>) -> Self {
         Self {
             id: None,
             source_id,
@@ -1366,7 +1368,7 @@ pub struct RuleBuilderState {
     /// Rule ID if editing existing rule
     pub editing_rule_id: Option<String>,
     /// Source ID
-    pub source_id: Option<String>,
+    pub source_id: Option<SourceId>,
 }
 
 impl Default for RuleBuilderState {
@@ -1437,7 +1439,7 @@ impl Default for RuleBuilderState {
 
 impl RuleBuilderState {
     /// Create new Rule Builder for a source
-    pub fn new(source_id: Option<String>) -> Self {
+    pub fn new(source_id: Option<SourceId>) -> Self {
         Self {
             source_id,
             ..Default::default()
@@ -1445,7 +1447,7 @@ impl RuleBuilderState {
     }
 
     /// Create from existing rule draft (for editing)
-    pub fn from_draft(draft: &RuleDraft, source_id: Option<String>) -> Self {
+    pub fn from_draft(draft: &RuleDraft, source_id: Option<SourceId>) -> Self {
         Self {
             pattern: draft.glob_pattern.clone(),
             tag: draft.base_tag.clone(),
@@ -1456,7 +1458,7 @@ impl RuleBuilderState {
                 .collect(),
             enabled: draft.enabled,
             editing_rule_id: draft.id.map(|id| id.to_string()),
-            source_id,
+            source_id: draft.source_id.or(source_id),
             ..Default::default()
         }
     }
@@ -1527,7 +1529,7 @@ impl RuleBuilderState {
 
     /// Check if ready to save
     pub fn can_save(&self) -> bool {
-        !self.pattern.is_empty() && !self.tag.is_empty()
+        !self.pattern.is_empty() && !self.tag.is_empty() && self.pattern_error.is_none()
     }
 
     /// Convert to RuleDraft for saving
@@ -1537,10 +1539,7 @@ impl RuleBuilderState {
                 .editing_rule_id
                 .as_ref()
                 .and_then(|s| Uuid::parse_str(s).ok()),
-            source_id: self
-                .source_id
-                .as_ref()
-                .and_then(|s| Uuid::parse_str(s).ok()),
+            source_id: self.source_id,
             name: self.tag.clone(), // Use tag as name by default
             glob_pattern: self.pattern.clone(),
             fields: self

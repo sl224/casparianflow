@@ -1479,6 +1479,56 @@ mod tests {
     }
 
     #[test]
+    fn test_duckdb_sink_lock_conflict() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("locked.duckdb");
+
+        let _sink1 =
+            DuckDbSink::new(db_path.clone(), "records", SinkMode::Append, "job-1", "records")
+                .unwrap();
+
+        let err = match DuckDbSink::new(
+            db_path,
+            "records",
+            SinkMode::Append,
+            "job-2",
+            "records",
+        ) {
+            Ok(_) => panic!("expected lock error, got Ok"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("locked"),
+            "expected lock error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_duckdb_sink_rejects_control_plane_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("casparian_flow.duckdb");
+
+        let err = match DuckDbSink::new(
+            db_path,
+            "records",
+            SinkMode::Append,
+            "job-1",
+            "records",
+        ) {
+            Ok(_) => panic!("expected control-plane rejection, got Ok"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("control-plane"),
+            "expected control-plane rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_duckdb_sink_decimal_timestamp_tz() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_decimal_tz.duckdb");

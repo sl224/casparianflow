@@ -42,7 +42,7 @@ clap.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 dirs = "5"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"

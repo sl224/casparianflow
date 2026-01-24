@@ -52,6 +52,9 @@ pub enum ScoutError {
     #[error("Pattern error: {0}")]
     Pattern(String),
 
+    #[error("Scan cancelled")]
+    Cancelled,
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
 

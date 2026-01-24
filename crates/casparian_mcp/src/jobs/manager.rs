@@ -1,22 +1,27 @@
 //! Job Manager - Job Lifecycle Management
 //!
-//! Manages job creation, execution, and cleanup (DB-backed).
+//! Manages job creation, execution, and cleanup (Control API or DB-backed).
 
 use super::{Job, JobId, JobProgress, JobSpec, JobState, JobType};
 use crate::types::PluginRef;
 use anyhow::{Context, Result};
 use casparian_db::DbConnection;
 use casparian_protocol::{HttpJobStatus, HttpJobType};
-use casparian_sentinel::ApiStorage;
+use casparian_sentinel::{ApiStorage, ControlClient, DEFAULT_CONTROL_ADDR};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::{debug, info, warn};
+
+enum JobBackend {
+    Db { db_path: PathBuf },
+    Control { control_addr: String },
+}
 
 /// Job manager for tracking and executing jobs
 pub struct JobManager {
-    /// Database path (open per operation to avoid long-lived locks)
-    db_path: PathBuf,
+    backend: JobBackend,
 }
 
 impl JobManager {
@@ -27,15 +32,51 @@ impl JobManager {
         let storage = ApiStorage::new(conn);
         storage.init_schema().context("Failed to init schema")?;
 
-        Ok(Self { db_path })
+        Ok(Self {
+            backend: JobBackend::Db { db_path },
+        })
+    }
+
+    /// Create a new job manager backed by the Control API.
+    pub fn new_control(control_addr: Option<String>) -> Result<Self> {
+        let addr = control_addr.unwrap_or_else(|| DEFAULT_CONTROL_ADDR.to_string());
+        let client = ControlClient::connect_with_timeout(&addr, Duration::from_millis(500))
+            .with_context(|| format!("Failed to connect to Control API at {}", addr))?;
+        if !client.ping().unwrap_or(false) {
+            anyhow::bail!("Control API did not respond at {}", addr);
+        }
+        Ok(Self {
+            backend: JobBackend::Control { control_addr: addr },
+        })
     }
 
     fn storage(&self) -> Result<ApiStorage> {
-        let conn = DbConnection::open_duckdb(&self.db_path)
-            .with_context(|| format!("Failed to open DB at {}", self.db_path.display()))?;
-        let storage = ApiStorage::new(conn);
-        storage.init_schema().context("Failed to init schema")?;
-        Ok(storage)
+        match &self.backend {
+            JobBackend::Db { db_path } => {
+                let conn = DbConnection::open_duckdb(db_path)
+                    .with_context(|| format!("Failed to open DB at {}", db_path.display()))?;
+                let storage = ApiStorage::new(conn);
+                storage.init_schema().context("Failed to init schema")?;
+                Ok(storage)
+            }
+            JobBackend::Control { .. } => {
+                anyhow::bail!("JobManager storage is not available in Control API mode");
+            }
+        }
+    }
+
+    fn control_client(&self) -> Result<ControlClient> {
+        match &self.backend {
+            JobBackend::Control { control_addr } => {
+                ControlClient::connect_with_timeout(control_addr, Duration::from_secs(5))
+                    .with_context(|| {
+                        format!("Failed to connect to Control API at {}", control_addr)
+                    })
+            }
+            JobBackend::Db { .. } => {
+                anyhow::bail!("Control API client is not available in DB mode");
+            }
+        }
     }
 
     /// Create a new job with a fully-specified JobSpec.
@@ -44,74 +85,165 @@ impl JobManager {
         let (plugin_name, plugin_version) = plugin_ref_to_parts(&plugin_ref);
 
         let spec_json = serde_json::to_string(&spec).context("Failed to serialize job spec")?;
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let job_id = storage.create_job(
+                    job_type,
+                    &plugin_name,
+                    plugin_version.as_deref(),
+                    &input_dir,
+                    output_sink.as_deref(),
+                    approval_id.as_deref(),
+                    Some(&spec_json),
+                )?;
 
-        let storage = self.storage()?;
-        let job_id = storage.create_job(
-            job_type,
-            &plugin_name,
-            plugin_version.as_deref(),
-            &input_dir,
-            output_sink.as_deref(),
-            approval_id.as_deref(),
-            Some(&spec_json),
-        )?;
-
-        let protocol_job = storage
-            .get_job(job_id)?
-            .context("Job missing after create")?;
-        let job = from_protocol_job(protocol_job)?;
-        info!("Created job: {} ({})", job.id, job.job_type);
-        Ok(job)
+                let protocol_job = storage
+                    .get_job(job_id)?
+                    .context("Job missing after create")?;
+                let job = from_protocol_job(protocol_job)?;
+                info!("Created job: {} ({})", job.id, job.job_type);
+                Ok(job)
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let job_id = client.create_api_job(
+                    job_type,
+                    &plugin_name,
+                    plugin_version.as_deref(),
+                    &input_dir,
+                    output_sink.as_deref(),
+                    approval_id.as_deref(),
+                    Some(&spec_json),
+                )?;
+                let protocol_job = client
+                    .get_api_job(job_id)?
+                    .context("Job missing after create")?;
+                let job = from_protocol_job(protocol_job)?;
+                info!("Created job via Control API: {} ({})", job.id, job.job_type);
+                Ok(job)
+            }
+        }
     }
 
     /// Get a job by ID
     pub fn get_job(&self, id: &JobId) -> Result<Option<Job>> {
-        let storage = self.storage()?;
-        let job = storage.get_job(id.to_proto())?;
-        match job {
-            Some(protocol_job) => Ok(Some(from_protocol_job(protocol_job)?)),
-            None => Ok(None),
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let job = storage.get_job(id.to_proto())?;
+                match job {
+                    Some(protocol_job) => Ok(Some(from_protocol_job(protocol_job)?)),
+                    None => Ok(None),
+                }
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let job = client.get_api_job(id.to_proto())?;
+                match job {
+                    Some(protocol_job) => Ok(Some(from_protocol_job(protocol_job)?)),
+                    None => Ok(None),
+                }
+            }
         }
     }
 
     /// Start a job (transition from queued to running)
     pub fn start_job(&self, id: &JobId) -> Result<()> {
-        let storage = self.storage()?;
-        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let job = storage.get_job(id.to_proto())?.context("Job not found")?;
 
-        match job.status {
-            HttpJobStatus::Queued => {}
-            HttpJobStatus::Running => anyhow::bail!("Job is already running"),
-            HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled => {
-                anyhow::bail!("Job is already terminal")
+                match job.status {
+                    HttpJobStatus::Queued => {}
+                    HttpJobStatus::Running => anyhow::bail!("Job is already running"),
+                    HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled => {
+                        anyhow::bail!("Job is already terminal")
+                    }
+                }
+
+                storage.update_job_status(id.to_proto(), HttpJobStatus::Running)?;
+                storage.update_job_progress(id.to_proto(), "running", 0, None, None)?;
+
+                info!("Started job: {}", id);
+                Ok(())
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let job = client
+                    .get_api_job(id.to_proto())?
+                    .context("Job not found")?;
+                match job.status {
+                    HttpJobStatus::Queued => {}
+                    HttpJobStatus::Running => anyhow::bail!("Job is already running"),
+                    HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled => {
+                        anyhow::bail!("Job is already terminal")
+                    }
+                }
+                client.update_api_job_status(id.to_proto(), HttpJobStatus::Running)?;
+                client.update_api_job_progress(
+                    id.to_proto(),
+                    casparian_protocol::http_types::JobProgress {
+                        phase: "running".to_string(),
+                        items_done: 0,
+                        items_total: None,
+                        message: None,
+                    },
+                )?;
+                info!("Started job via Control API: {}", id);
+                Ok(())
             }
         }
-
-        storage.update_job_status(id.to_proto(), HttpJobStatus::Running)?;
-        storage.update_job_progress(id.to_proto(), "running", 0, None, None)?;
-
-        info!("Started job: {}", id);
-        Ok(())
     }
 
     /// Update job progress
     pub fn update_progress(&self, id: &JobId, progress: JobProgress) -> Result<()> {
-        let storage = self.storage()?;
-        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
-        if job.status != HttpJobStatus::Running {
-            anyhow::bail!("Cannot update progress for non-running job");
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+                if job.status != HttpJobStatus::Running {
+                    anyhow::bail!("Cannot update progress for non-running job");
+                }
+
+                storage.update_job_progress(
+                    id.to_proto(),
+                    progress.phase.as_deref().unwrap_or("running"),
+                    progress.items_done,
+                    progress.items_total,
+                    None,
+                )?;
+
+                debug!("Updated progress for job: {}", id);
+                Ok(())
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let job = client
+                    .get_api_job(id.to_proto())?
+                    .context("Job not found")?;
+                if job.status != HttpJobStatus::Running {
+                    anyhow::bail!("Cannot update progress for non-running job");
+                }
+
+                client.update_api_job_progress(
+                    id.to_proto(),
+                    casparian_protocol::http_types::JobProgress {
+                        phase: progress
+                            .phase
+                            .clone()
+                            .unwrap_or_else(|| "running".to_string()),
+                        items_done: progress.items_done,
+                        items_total: progress.items_total,
+                        message: None,
+                    },
+                )?;
+
+                debug!("Updated progress via Control API for job: {}", id);
+                Ok(())
+            }
         }
-
-        storage.update_job_progress(
-            id.to_proto(),
-            progress.phase.as_deref().unwrap_or("running"),
-            progress.items_done,
-            progress.items_total,
-            None,
-        )?;
-
-        debug!("Updated progress for job: {}", id);
-        Ok(())
     }
 
     /// Complete a job
@@ -119,49 +251,99 @@ impl JobManager {
         // Persist result (must be parseable)
         let wrapper: JobResultWrapper =
             serde_json::from_value(result).context("Invalid job result payload")?;
-        let storage = self.storage()?;
-        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
-        if job.status != HttpJobStatus::Running {
-            anyhow::bail!("Cannot complete a non-running job");
-        }
-        storage.update_job_result(id.to_proto(), &wrapper.into())?;
-        storage.update_job_status(id.to_proto(), HttpJobStatus::Completed)?;
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+                if job.status != HttpJobStatus::Running {
+                    anyhow::bail!("Cannot complete a non-running job");
+                }
+                storage.update_job_result(id.to_proto(), &wrapper.into())?;
+                storage.update_job_status(id.to_proto(), HttpJobStatus::Completed)?;
 
-        info!("Completed job: {}", id);
-        Ok(())
+                info!("Completed job: {}", id);
+                Ok(())
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let job = client
+                    .get_api_job(id.to_proto())?
+                    .context("Job not found")?;
+                if job.status != HttpJobStatus::Running {
+                    anyhow::bail!("Cannot complete a non-running job");
+                }
+                client.update_api_job_result(id.to_proto(), wrapper.into())?;
+                client.update_api_job_status(id.to_proto(), HttpJobStatus::Completed)?;
+
+                info!("Completed job via Control API: {}", id);
+                Ok(())
+            }
+        }
     }
 
     /// Fail a job
     pub fn fail_job(&self, id: &JobId, error: impl Into<String>) -> Result<()> {
         let error = error.into();
-        let storage = self.storage()?;
-        let job = storage.get_job(id.to_proto())?.context("Job not found")?;
-        if matches!(
-            job.status,
-            HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled
-        ) {
-            anyhow::bail!("Cannot fail a terminal job");
-        }
-        storage.update_job_status(id.to_proto(), HttpJobStatus::Failed)?;
-        storage.update_job_error(id.to_proto(), &error)?;
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let job = storage.get_job(id.to_proto())?.context("Job not found")?;
+                if matches!(
+                    job.status,
+                    HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled
+                ) {
+                    anyhow::bail!("Cannot fail a terminal job");
+                }
+                storage.update_job_status(id.to_proto(), HttpJobStatus::Failed)?;
+                storage.update_job_error(id.to_proto(), &error)?;
 
-        warn!("Failed job {}: {}", id, error);
-        Ok(())
+                warn!("Failed job {}: {}", id, error);
+                Ok(())
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let job = client
+                    .get_api_job(id.to_proto())?
+                    .context("Job not found")?;
+                if matches!(
+                    job.status,
+                    HttpJobStatus::Completed | HttpJobStatus::Failed | HttpJobStatus::Cancelled
+                ) {
+                    anyhow::bail!("Cannot fail a terminal job");
+                }
+                client.update_api_job_status(id.to_proto(), HttpJobStatus::Failed)?;
+                client.update_api_job_error(id.to_proto(), &error)?;
+
+                warn!("Failed job via Control API {}: {}", id, error);
+                Ok(())
+            }
+        }
     }
 
     /// Cancel a job
     pub fn cancel_job(&self, id: &JobId) -> Result<bool> {
-        let storage = self.storage()?;
-        let cancelled = storage.cancel_job(id.to_proto())?;
-        if cancelled {
-            info!("Cancelled job: {}", id);
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let cancelled = storage.cancel_job(id.to_proto())?;
+                if cancelled {
+                    info!("Cancelled job: {}", id);
+                }
+                Ok(cancelled)
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let cancelled = client.cancel_api_job(id.to_proto())?;
+                if cancelled {
+                    info!("Cancelled job via Control API: {}", id);
+                }
+                Ok(cancelled)
+            }
         }
-        Ok(cancelled)
     }
 
     /// List jobs with optional filter
     pub fn list_jobs(&self, status_filter: Option<&str>, limit: usize) -> Result<Vec<Job>> {
-        let storage = self.storage()?;
         let status = match status_filter {
             Some("queued") => Some(HttpJobStatus::Queued),
             Some("running") => Some(HttpJobStatus::Running),
@@ -171,8 +353,18 @@ impl JobManager {
             Some(other) => anyhow::bail!("Unsupported status filter: {}", other),
             None => None,
         };
-        let jobs = storage.list_jobs(status, limit)?;
-        jobs.into_iter().map(from_protocol_job).collect()
+        match &self.backend {
+            JobBackend::Db { .. } => {
+                let storage = self.storage()?;
+                let jobs = storage.list_jobs(status, limit)?;
+                jobs.into_iter().map(from_protocol_job).collect()
+            }
+            JobBackend::Control { .. } => {
+                let client = self.control_client()?;
+                let jobs = client.list_api_jobs(status, Some(limit as i64), Some(0))?;
+                jobs.into_iter().map(from_protocol_job).collect()
+            }
+        }
     }
 }
 

@@ -4,6 +4,7 @@
 //! Ported from Python sentinel.py with data-oriented design principles.
 
 use anyhow::{Context, Result};
+use casparian_protocol::http_types::{ApprovalOperation, ApprovalStatus};
 use casparian_protocol::types::{
     self, ArtifactV1, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, RuntimeKind,
     SchemaColumnSpec, SchemaDefinition, SinkConfig, SinkMode,
@@ -15,6 +16,7 @@ use casparian_protocol::{
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{build_outputs_json, locked_schema_from_definition, SchemaContract, SchemaStorage};
 use casparian_security::signing::compute_artifact_hash;
+use chrono::Duration as ChronoDuration;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
@@ -24,7 +26,10 @@ use zmq::{Context as ZmqContext, Socket};
 
 use crate::control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo};
 use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
-use crate::db::{models::*, JobQueue};
+use crate::db::{
+    ensure_schema_version, models::*, ApiStorage, IntentState, JobQueue, SessionId,
+    SessionStorage, SCHEMA_VERSION,
+};
 use crate::metrics::METRICS;
 use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
 
@@ -147,7 +152,6 @@ impl ConnectedWorker {
 pub struct SentinelConfig {
     pub bind_addr: String,
     pub database_url: String,
-    pub control_addr: Option<String>,
     pub max_workers: usize,
     /// Optional control API bind address (e.g., "ipc:///tmp/casparian_control.sock" or "tcp://127.0.0.1:5556")
     /// If None, control API is disabled.
@@ -163,6 +167,8 @@ pub struct Sentinel {
     workers: HashMap<Vec<u8>, ConnectedWorker>,
     queue: JobQueue,
     conn: DbConnection, // Database connection for queries
+    api_storage: ApiStorage,
+    session_storage: SessionStorage,
     schema_storage: SchemaStorage,
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     topic_map_last_refresh: f64,
@@ -186,6 +192,17 @@ impl Sentinel {
 
         let conn = DbConnection::open_from_url(&config.database_url)
             .context("Failed to connect to database")?;
+        if ensure_schema_version(&conn, SCHEMA_VERSION)? {
+            warn!(
+                "Database schema reset (pre-v1). Delete ~/.casparian_flow/casparian_flow.duckdb if this was unexpected."
+            );
+        }
+
+        let api_storage = ApiStorage::new(conn.clone());
+        api_storage.init_schema()?;
+
+        let session_storage = SessionStorage::new(conn.clone());
+        session_storage.init_schema()?;
 
         // Clone connection only once for the queue
         let queue = JobQueue::new(conn.clone());
@@ -263,6 +280,8 @@ impl Sentinel {
             workers: HashMap::new(),
             queue,
             conn,
+            api_storage,
+            session_storage,
             schema_storage,
             topic_map,
             topic_map_last_refresh: current_time(),
@@ -813,6 +832,83 @@ impl Sentinel {
             ControlRequest::GetJob { job_id } => self.handle_get_job(job_id),
             ControlRequest::CancelJob { job_id } => self.handle_cancel_job(job_id),
             ControlRequest::GetQueueStats => self.handle_get_queue_stats(),
+            ControlRequest::CreateApiJob {
+                job_type,
+                plugin_name,
+                plugin_version,
+                input_dir,
+                output,
+                approval_id,
+                spec_json,
+            } => self.handle_create_api_job(
+                job_type,
+                &plugin_name,
+                plugin_version.as_deref(),
+                &input_dir,
+                output.as_deref(),
+                approval_id.as_deref(),
+                spec_json.as_deref(),
+            ),
+            ControlRequest::GetApiJob { job_id } => self.handle_get_api_job(job_id),
+            ControlRequest::ListApiJobs {
+                status,
+                limit,
+                offset,
+            } => self.handle_list_api_jobs(status, limit, offset),
+            ControlRequest::UpdateApiJobStatus { job_id, status } => {
+                self.handle_update_api_job_status(job_id, status)
+            }
+            ControlRequest::UpdateApiJobProgress { job_id, progress } => {
+                self.handle_update_api_job_progress(job_id, progress)
+            }
+            ControlRequest::UpdateApiJobResult { job_id, result } => {
+                self.handle_update_api_job_result(job_id, result)
+            }
+            ControlRequest::UpdateApiJobError { job_id, error } => {
+                self.handle_update_api_job_error(job_id, &error)
+            }
+            ControlRequest::CancelApiJob { job_id } => self.handle_cancel_api_job(job_id),
+            ControlRequest::ListApprovals {
+                status,
+                limit,
+                offset,
+            } => self.handle_list_approvals(status, limit, offset),
+            ControlRequest::CreateApproval {
+                approval_id,
+                operation,
+                summary,
+                expires_in_seconds,
+            } => self.handle_create_approval(
+                &approval_id,
+                operation,
+                &summary,
+                expires_in_seconds,
+            ),
+            ControlRequest::GetApproval { approval_id } => self.handle_get_approval(&approval_id),
+            ControlRequest::Approve { approval_id } => self.handle_approve(&approval_id),
+            ControlRequest::Reject { approval_id, reason } => {
+                self.handle_reject(&approval_id, &reason)
+            }
+            ControlRequest::SetApprovalJobId { approval_id, job_id } => {
+                self.handle_set_approval_job_id(&approval_id, job_id)
+            }
+            ControlRequest::ExpireApprovals => self.handle_expire_approvals(),
+            ControlRequest::CreateSession {
+                intent_text,
+                input_dir,
+            } => self.handle_create_session(&intent_text, input_dir.as_deref()),
+            ControlRequest::GetSession { session_id } => self.handle_get_session(session_id),
+            ControlRequest::ListSessions { state, limit } => {
+                self.handle_list_sessions(state, limit)
+            }
+            ControlRequest::ListSessionsNeedingInput { limit } => {
+                self.handle_list_sessions_needing_input(limit)
+            }
+            ControlRequest::AdvanceSession {
+                session_id,
+                target_state,
+            } => self.handle_advance_session(session_id, target_state),
+            ControlRequest::CancelSession { session_id } => self.handle_cancel_session(session_id),
             ControlRequest::Ping => ControlResponse::Pong,
         }
     }
@@ -910,6 +1006,385 @@ impl Sentinel {
                 })
             }
             Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get stats: {}", e)),
+        }
+    }
+
+    /// Handle CreateApiJob request
+    fn handle_create_api_job(
+        &self,
+        job_type: casparian_protocol::HttpJobType,
+        plugin_name: &str,
+        plugin_version: Option<&str>,
+        input_dir: &str,
+        output: Option<&str>,
+        approval_id: Option<&str>,
+        spec_json: Option<&str>,
+    ) -> ControlResponse {
+        match self.api_storage.create_job(
+            job_type,
+            plugin_name,
+            plugin_version,
+            input_dir,
+            output,
+            approval_id,
+            spec_json,
+        ) {
+            Ok(job_id) => ControlResponse::ApiJobCreated { job_id },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to create API job: {}", e),
+            ),
+        }
+    }
+
+    /// Handle GetApiJob request
+    fn handle_get_api_job(&self, job_id: JobId) -> ControlResponse {
+        match self.api_storage.get_job(job_id) {
+            Ok(job) => ControlResponse::ApiJob(job),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to get API job {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    /// Handle ListApiJobs request
+    fn handle_list_api_jobs(
+        &self,
+        status: Option<casparian_protocol::HttpJobStatus>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        let offset = offset.unwrap_or(0).max(0) as usize;
+        match self.api_storage.list_jobs(status, limit.saturating_add(offset)) {
+            Ok(jobs) => {
+                let jobs = jobs
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                ControlResponse::ApiJobs(jobs)
+            }
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to list API jobs: {}", e),
+            ),
+        }
+    }
+
+    /// Handle UpdateApiJobStatus request
+    fn handle_update_api_job_status(
+        &self,
+        job_id: JobId,
+        status: casparian_protocol::HttpJobStatus,
+    ) -> ControlResponse {
+        match self.api_storage.update_job_status(job_id, status) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Status updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job status {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    /// Handle UpdateApiJobProgress request
+    fn handle_update_api_job_progress(
+        &self,
+        job_id: JobId,
+        progress: casparian_protocol::http_types::JobProgress,
+    ) -> ControlResponse {
+        match self.api_storage.update_job_progress(
+            job_id,
+            &progress.phase,
+            progress.items_done,
+            progress.items_total,
+            progress.message.as_deref(),
+        ) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Progress updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job progress {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    /// Handle UpdateApiJobResult request
+    fn handle_update_api_job_result(
+        &self,
+        job_id: JobId,
+        result: casparian_protocol::http_types::JobResult,
+    ) -> ControlResponse {
+        match self.api_storage.update_job_result(job_id, &result) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Result updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job result {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    /// Handle UpdateApiJobError request
+    fn handle_update_api_job_error(&self, job_id: JobId, error: &str) -> ControlResponse {
+        match self.api_storage.update_job_error(job_id, error) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Error updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job error {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    /// Handle CancelApiJob request
+    fn handle_cancel_api_job(&self, job_id: JobId) -> ControlResponse {
+        match self.api_storage.cancel_job(job_id) {
+            Ok(success) => ControlResponse::ApiJobResult {
+                success,
+                message: if success {
+                    "Job cancelled".to_string()
+                } else {
+                    "Job not found".to_string()
+                },
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to cancel API job {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    /// Handle ListApprovals request
+    fn handle_list_approvals(
+        &self,
+        status: Option<ApprovalStatus>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        let offset = offset.unwrap_or(0).max(0) as usize;
+        match self.api_storage.list_approvals(status) {
+            Ok(approvals) => {
+                let approvals = approvals
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                ControlResponse::Approvals(approvals)
+            }
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to list approvals: {}", e),
+            ),
+        }
+    }
+
+    /// Handle CreateApproval request
+    fn handle_create_approval(
+        &self,
+        approval_id: &str,
+        operation: ApprovalOperation,
+        summary: &str,
+        expires_in_seconds: i64,
+    ) -> ControlResponse {
+        let expires_in = ChronoDuration::seconds(expires_in_seconds.max(0));
+        match self
+            .api_storage
+            .create_approval(approval_id, &operation, summary, expires_in)
+        {
+            Ok(()) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval created".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to create approval {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    /// Handle GetApproval request
+    fn handle_get_approval(&self, approval_id: &str) -> ControlResponse {
+        match self.api_storage.get_approval(approval_id) {
+            Ok(approval) => ControlResponse::Approval(approval),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to get approval {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    /// Handle Approve request
+    fn handle_approve(&self, approval_id: &str) -> ControlResponse {
+        match self.api_storage.approve(approval_id, None) {
+            Ok(true) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval accepted".to_string(),
+            },
+            Ok(false) => ControlResponse::ApprovalResult {
+                success: false,
+                message: "Approval not found or not pending".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to approve {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    /// Handle Reject request
+    fn handle_reject(&self, approval_id: &str, reason: &str) -> ControlResponse {
+        match self
+            .api_storage
+            .reject(approval_id, None, Some(reason))
+        {
+            Ok(true) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval rejected".to_string(),
+            },
+            Ok(false) => ControlResponse::ApprovalResult {
+                success: false,
+                message: "Approval not found or not pending".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to reject {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    /// Handle SetApprovalJobId request
+    fn handle_set_approval_job_id(&self, approval_id: &str, job_id: JobId) -> ControlResponse {
+        match self.api_storage.link_approval_to_job(approval_id, job_id) {
+            Ok(()) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval linked to job".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to link approval {} to job {}: {}", approval_id, job_id, e),
+            ),
+        }
+    }
+
+    /// Handle ExpireApprovals request
+    fn handle_expire_approvals(&self) -> ControlResponse {
+        match self.api_storage.expire_approvals() {
+            Ok(count) => ControlResponse::ApprovalResult {
+                success: true,
+                message: format!("Expired {} approvals", count),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to expire approvals: {}", e),
+            ),
+        }
+    }
+
+    /// Handle CreateSession request
+    fn handle_create_session(&self, intent_text: &str, input_dir: Option<&str>) -> ControlResponse {
+        match self
+            .session_storage
+            .create_session(intent_text, input_dir)
+        {
+            Ok(session_id) => ControlResponse::SessionCreated { session_id },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to create session: {}", e),
+            ),
+        }
+    }
+
+    /// Handle GetSession request
+    fn handle_get_session(&self, session_id: SessionId) -> ControlResponse {
+        match self.session_storage.get_session(session_id) {
+            Ok(session) => ControlResponse::Session(session),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to get session {}: {}", session_id, e),
+            ),
+        }
+    }
+
+    /// Handle ListSessions request
+    fn handle_list_sessions(
+        &self,
+        state: Option<IntentState>,
+        limit: Option<i64>,
+    ) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        match self.session_storage.list_sessions(state, limit) {
+            Ok(sessions) => ControlResponse::Sessions(sessions),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to list sessions: {}", e),
+            ),
+        }
+    }
+
+    /// Handle ListSessionsNeedingInput request
+    fn handle_list_sessions_needing_input(&self, limit: Option<i64>) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        match self.session_storage.list_sessions_needing_input(limit) {
+            Ok(sessions) => ControlResponse::Sessions(sessions),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to list sessions needing input: {}", e),
+            ),
+        }
+    }
+
+    /// Handle AdvanceSession request
+    fn handle_advance_session(
+        &self,
+        session_id: SessionId,
+        target_state: IntentState,
+    ) -> ControlResponse {
+        match self
+            .session_storage
+            .update_session_state(session_id, target_state)
+        {
+            Ok(true) => ControlResponse::SessionResult {
+                success: true,
+                message: "Session advanced".to_string(),
+            },
+            Ok(false) => ControlResponse::SessionResult {
+                success: false,
+                message: "Session not found".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to advance session {}: {}", session_id, e),
+            ),
+        }
+    }
+
+    /// Handle CancelSession request
+    fn handle_cancel_session(&self, session_id: SessionId) -> ControlResponse {
+        match self.session_storage.cancel_session(session_id) {
+            Ok(true) => ControlResponse::SessionResult {
+                success: true,
+                message: "Session cancelled".to_string(),
+            },
+            Ok(false) => ControlResponse::SessionResult {
+                success: false,
+                message: "Session not found".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to cancel session {}: {}", session_id, e),
+            ),
         }
     }
 

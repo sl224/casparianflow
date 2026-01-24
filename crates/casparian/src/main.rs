@@ -70,6 +70,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
+pub use casparian::scout;
+
 mod cli;
 
 /// Shutdown timeout in seconds
@@ -397,6 +399,14 @@ enum Commands {
         /// Default: ~/.casparian_flow/venvs
         #[arg(long, env = "CASPARIAN_VENVS_DIR")]
         venvs_dir: Option<std::path::PathBuf>,
+
+        /// Control API bind address (default: tcp://127.0.0.1:5556)
+        #[arg(long)]
+        control_addr: Option<String>,
+
+        /// Disable the Control API entirely.
+        #[arg(long)]
+        no_control_api: bool,
     },
 
     /// Start only the Sentinel (Control Plane)
@@ -764,11 +774,21 @@ fn run_command(cli: Cli, telemetry: Option<TelemetryRecorder>) -> Result<()> {
             output,
             data_threads,
             venvs_dir,
+            control_addr,
+            no_control_api,
         } => {
             // Use config module for defaults
             let db_path = database.unwrap_or_else(cli::config::active_db_path);
             let output_dir = output.unwrap_or_else(cli::config::output_dir);
-            run_unified(addr, db_path, output_dir, data_threads, venvs_dir)
+            run_unified(
+                addr,
+                db_path,
+                output_dir,
+                data_threads,
+                venvs_dir,
+                control_addr,
+                no_control_api,
+            )
         }
 
         Commands::Sentinel { args } => run_sentinel_standalone(args),
@@ -1009,13 +1029,22 @@ fn run_unified(
     output: std::path::PathBuf,
     data_threads: Option<usize>,
     venvs_dir: Option<std::path::PathBuf>,
+    control_addr: Option<String>,
+    no_control_api: bool,
 ) -> Result<()> {
     // Ensure config directories exist
     cli::config::ensure_casparian_home()?;
     std::fs::create_dir_all(&output)?;
 
     let addr = addr.unwrap_or_else(get_default_ipc_addr);
-    let control_addr = Some("tcp://127.0.0.1:5556".to_string());
+    let control_addr = if no_control_api {
+        None
+    } else {
+        Some(
+            control_addr
+                .unwrap_or_else(|| casparian_sentinel::DEFAULT_CONTROL_ADDR.to_string()),
+        )
+    };
     info!("Starting Unified Casparian Stack (Split-Runtime Architecture)");
     info!("Transport: {}", addr);
     info!(
@@ -1068,9 +1097,8 @@ fn run_unified(
         let config = SentinelConfig {
             bind_addr: sentinel_addr,
             database_url: sentinel_db,
-            control_addr,
             max_workers: 1,
-            control_addr: None, // No control API for integrated run
+            control_addr,
         };
 
         let mut sentinel = Sentinel::bind(config)?;
@@ -1192,12 +1220,20 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
         args.database
     };
 
+    let control_addr = if args.no_control_api {
+        None
+    } else {
+        Some(
+            args.control_addr
+                .unwrap_or_else(|| casparian_sentinel::DEFAULT_CONTROL_ADDR.to_string()),
+        )
+    };
+
     let config = SentinelConfig {
         bind_addr: args.bind,
         database_url,
-        control_addr: None,
         max_workers: args.max_workers,
-        control_addr: args.control_api.clone(), // Optional control API
+        control_addr,
     };
     let mut sentinel = Sentinel::bind(config)?;
 

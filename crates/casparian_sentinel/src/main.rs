@@ -29,9 +29,13 @@ struct Args {
     max_workers: usize,
 
     /// Control API bind address (e.g., "ipc:///tmp/casparian_control.sock" or "tcp://127.0.0.1:5556")
-    /// If not specified, control API is disabled.
+    /// If not specified, defaults to tcp://127.0.0.1:5556 unless --no-control-api is set.
     #[arg(long)]
-    control: Option<String>,
+    control_addr: Option<String>,
+
+    /// Disable the Control API entirely.
+    #[arg(long)]
+    no_control_api: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,16 +74,23 @@ fn main() -> anyhow::Result<()> {
     let database = args.database.unwrap_or_else(default_db_url);
     tracing::info!("  Database: {}", database);
     tracing::info!("  Max workers: {}", args.max_workers);
-    if let Some(ref control) = args.control {
+    let control_addr = if args.no_control_api {
+        None
+    } else {
+        Some(
+            args.control_addr
+                .unwrap_or_else(|| casparian_sentinel::DEFAULT_CONTROL_ADDR.to_string()),
+        )
+    };
+    if let Some(ref control) = control_addr {
         tracing::info!("  Control API: {}", control);
     }
 
     let config = SentinelConfig {
         bind_addr: args.bind,
         database_url: database,
-        control_addr: None,
         max_workers: args.max_workers,
-        control_addr: args.control,
+        control_addr,
     };
 
     // Bind and run

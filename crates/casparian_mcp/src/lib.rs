@@ -1,12 +1,6 @@
 // TODO(Phase 3): Fix these clippy warnings properly during silent corruption sweep
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-#![allow(unused_macros)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::unwrap_or_default)]
-#![allow(clippy::clone_on_copy)]
-#![allow(clippy::redundant_closure)]
 
 //! MCP (Model Context Protocol) Server for Casparian Flow
 //!
@@ -88,7 +82,10 @@ pub use db_store::{DbApprovalStore, DbJobStore};
 pub use jobs::{JobId, JobManager, JobProgress, JobState};
 
 // Core module re-exports (Phase 1B - sync architecture)
-pub use core::{spawn_core, CancellationToken, Command, Core, CoreHandle, Event, Responder};
+pub use core::{
+    spawn_core, spawn_core_with_config, CancellationToken, Command, Core, CoreConfig, CoreHandle,
+    Event, Responder,
+};
 pub use protocol::{ErrorCode, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use security::{OutputBudget, PathAllowlist, SecurityConfig};
 pub use server::{McpServer, McpServerConfig};

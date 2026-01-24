@@ -27,6 +27,24 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use tracing::{debug, error, info, warn};
 
+/// Configuration for Core backend selection.
+#[derive(Debug, Clone)]
+pub struct CoreConfig {
+    pub db_path: PathBuf,
+    pub control_addr: Option<String>,
+    pub standalone_db_writer: bool,
+}
+
+impl CoreConfig {
+    pub fn db_only(db_path: PathBuf) -> Self {
+        Self {
+            db_path,
+            control_addr: None,
+            standalone_db_writer: true,
+        }
+    }
+}
+
 /// Handle for interacting with the Core from other threads.
 ///
 /// Can be cloned and shared. All operations send Commands to Core
@@ -215,13 +233,26 @@ impl Core {
     /// Returns (Core, CoreHandle, EventReceiver).
     /// The Core should be run in its own thread via `run()`.
     pub fn new(db_path: PathBuf) -> Result<(Self, CoreHandle, Receiver<Event>)> {
+        Self::new_with_config(CoreConfig::db_only(db_path))
+    }
+
+    /// Create a new Core from config.
+    pub fn new_with_config(config: CoreConfig) -> Result<(Self, CoreHandle, Receiver<Event>)> {
         // Create channels
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
 
         // Initialize managers
-        let job_manager = JobManager::new(db_path.clone())?;
-        let approval_manager = ApprovalManager::new(db_path)?;
+        let (job_manager, approval_manager) = if config.standalone_db_writer {
+            let job_manager = JobManager::new(config.db_path.clone())?;
+            let approval_manager = ApprovalManager::new(config.db_path)?;
+            (job_manager, approval_manager)
+        } else {
+            let control_addr = config.control_addr;
+            let job_manager = JobManager::new_control(control_addr.clone())?;
+            let approval_manager = ApprovalManager::new_control(control_addr)?;
+            (job_manager, approval_manager)
+        };
 
         let core = Self {
             job_manager,
@@ -409,8 +440,10 @@ impl Core {
 }
 
 /// Spawn Core in a dedicated thread
-pub fn spawn_core(db_path: PathBuf) -> Result<(CoreHandle, Receiver<Event>, JoinHandle<()>)> {
-    let (mut core, handle, events) = Core::new(db_path)?;
+pub fn spawn_core_with_config(
+    config: CoreConfig,
+) -> Result<(CoreHandle, Receiver<Event>, JoinHandle<()>)> {
+    let (mut core, handle, events) = Core::new_with_config(config)?;
 
     let thread_handle = thread::Builder::new()
         .name("mcp-core".to_string())
@@ -419,4 +452,9 @@ pub fn spawn_core(db_path: PathBuf) -> Result<(CoreHandle, Receiver<Event>, Join
         })?;
 
     Ok((handle, events, thread_handle))
+}
+
+/// Spawn Core in a dedicated thread (DB-only backend).
+pub fn spawn_core(db_path: PathBuf) -> Result<(CoreHandle, Receiver<Event>, JoinHandle<()>)> {
+    spawn_core_with_config(CoreConfig::db_only(db_path))
 }

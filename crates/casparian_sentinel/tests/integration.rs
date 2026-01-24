@@ -7,7 +7,10 @@ use casparian_protocol::types::{IdentifyPayload, JobReceipt, JobStatus};
 use casparian_protocol::{
     metrics, JobId, Message, OpCode, PipelineRunStatus, ProcessingStatus,
 };
+use casparian_sentinel::{ControlClient, Sentinel, SentinelConfig};
 use std::time::Duration;
+use std::{sync::mpsc, thread};
+use tempfile::TempDir;
 use zmq::Context;
 
 fn setup_queue_db() -> DbConnection {
@@ -44,6 +47,14 @@ fn setup_queue_db() -> DbConnection {
     )
     .unwrap();
     conn
+}
+
+#[cfg(not(unix))]
+fn free_tcp_addr() -> String {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephem port");
+    let addr = listener.local_addr().expect("local addr");
+    format!("tcp://127.0.0.1:{}", addr.port())
 }
 
 /// Test protocol message roundtrip
@@ -95,6 +106,79 @@ fn test_conclude_message() {
     let parsed: JobReceipt = serde_json::from_slice(&unpacked.payload).unwrap();
     assert_eq!(parsed.status, JobStatus::Success);
     assert_eq!(parsed.metrics.get(metrics::ROWS), Some(&1000i64));
+}
+
+/// Smoke test Control API (ping + create/get session)
+#[test]
+fn test_control_api_smoke() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("casparian_flow.duckdb");
+    let db_url = format!("duckdb:{}", db_path.display());
+
+    #[cfg(unix)]
+    let bind_addr = format!(
+        "ipc://{}",
+        temp_dir.path().join("sentinel.sock").display()
+    );
+    #[cfg(unix)]
+    let control_addr = format!(
+        "ipc://{}",
+        temp_dir.path().join("control.sock").display()
+    );
+
+    #[cfg(not(unix))]
+    let bind_addr = free_tcp_addr();
+    #[cfg(not(unix))]
+    let control_addr = free_tcp_addr();
+
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let control_addr_clone = control_addr.clone();
+
+    let handle = thread::spawn(move || {
+        let config = SentinelConfig {
+            bind_addr,
+            database_url: db_url,
+            max_workers: 1,
+            control_addr: Some(control_addr_clone),
+        };
+        let mut sentinel = Sentinel::bind(config).expect("bind sentinel");
+        sentinel.run_with_shutdown(stop_rx).expect("run sentinel");
+    });
+
+    // Wait for control API to be ready
+    let ready = {
+        let mut ok = false;
+        for _ in 0..40 {
+            if let Ok(c) =
+                ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(100))
+            {
+                if c.ping().unwrap_or(false) {
+                    ok = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        ok
+    };
+    assert!(ready, "control API not ready");
+
+    let client = ControlClient::connect(&control_addr).expect("connect control client");
+
+    let session_id = client
+        .create_session("Process CSV files", Some("/data/input"))
+        .expect("create session");
+    let session = client
+        .get_session(session_id)
+        .expect("get session")
+        .expect("session exists");
+
+    assert_eq!(session.session_id, session_id);
+    assert_eq!(session.intent_text, "Process CSV files");
+    assert_eq!(session.input_dir.as_deref(), Some("/data/input"));
+
+    let _ = stop_tx.send(());
+    let _ = handle.join();
 }
 
 /// Test worker/sentinel ZMQ message exchange

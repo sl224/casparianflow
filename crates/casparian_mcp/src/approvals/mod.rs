@@ -17,9 +17,8 @@
 //!
 //! # Storage
 //!
-//! Approvals are stored in DuckDB via `ApiStorage` (table: `cf_api_approvals`).
-//! The DB path is configured by the MCP server (default:
-//! `~/.casparian_flow/casparian_flow.duckdb`).
+//! Approvals are stored in DuckDB via Sentinel's control plane (`cf_api_approvals`).
+//! In standalone mode, MCP can write directly to the DB (pre-v1 only).
 
 mod manager;
 #[cfg(test)]

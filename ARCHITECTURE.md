@@ -78,6 +78,8 @@ Exposes **Control API** (IPC/RPC) for all mutations:
 
 **Rationale:** Prevent split-brain and exclusive-lock dead ends. Enable multi-client UX without distributed systems complexity.
 
+**Policy:** Mutations MUST go through the Control API. Clients must not silently open the control-plane DB in RW mode. If the Control API is unavailable, fail loudly or require an explicit standalone-writer mode.
+
 ### Execution Plane (Worker)
 Stateless executor:
 - Accepts dispatch commands
@@ -93,6 +95,10 @@ Supports **true cancellation**:
 ### Frontends
 CLI/TUI/Tauri/MCP are **clients** of the Control API.
 Query console uses **read-only** DB connections.
+No silent fallback to RW DB access.
+
+### Pre-v1 schema resets
+Schema changes are destructive pre-v1. On schema version bumps, delete `~/.casparian_flow/casparian_flow.duckdb` (or your custom `--db-path`) and restart.
 
 ---
 
@@ -130,6 +136,8 @@ These invariants MUST hold. Violations are bugs.
 | 5 | **Lineage deterministic** | Reserved `_cf_*` namespace cannot silently break lineage injection |
 | 6 | **Incremental decisions deterministic** | Default sink configs do not cause "silent skip" when changed |
 | 7 | **UI truthful** | Cancel button and job statuses reflect reality |
+
+**Determinism note:** `_cf_processed_at` is time-derived, so outputs are not bitwise-deterministic unless you standardize or omit it.
 
 ---
 

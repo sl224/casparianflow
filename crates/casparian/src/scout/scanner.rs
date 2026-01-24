@@ -24,6 +24,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug_span, info, info_span};
 
+#[derive(Clone, Debug)]
+pub struct ScanCancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ScanCancelToken {
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
 /// GAP-SCAN-003: Normalize a path to use forward slashes consistently.
 /// This is critical for Windows compatibility since `split_rel_path()` in types.rs
 /// only looks for '/' separators.
@@ -368,7 +389,7 @@ impl Scanner {
     ///
     /// Convenience wrapper for `scan()` with no progress reporting or tagging.
     pub fn scan_source(&self, source: &Source) -> Result<ScanResult> {
-        self.scan(source, None, None)
+        self.scan_with_cancel(source, None, None, None)
     }
 
     /// Scan a source with optional progress updates and tagging.
@@ -384,6 +405,17 @@ impl Scanner {
         source: &Source,
         progress_tx: Option<mpsc::Sender<ScanProgress>>,
         tag: Option<&str>,
+    ) -> Result<ScanResult> {
+        self.scan_with_cancel(source, progress_tx, tag, None)
+    }
+
+    /// Scan a source with optional cancellation.
+    pub fn scan_with_cancel(
+        &self,
+        source: &Source,
+        progress_tx: Option<mpsc::Sender<ScanProgress>>,
+        tag: Option<&str>,
+        cancel: Option<ScanCancelToken>,
     ) -> Result<ScanResult> {
         let start = Instant::now();
         let scan_span = info_span!(
@@ -481,6 +513,7 @@ impl Scanner {
         let walk_exclude_path_patterns = self.config.exclude_path_patterns.clone();
 
         let scan_span_for_walk = scan_span.clone();
+        let walk_cancel = cancel.clone();
         let walk_handle = std::thread::spawn(move || {
             let _scan_guard = scan_span_for_walk.enter();
             let walk_span = info_span!(
@@ -504,6 +537,7 @@ impl Scanner {
                 walk_progress_counters,
                 walk_exclude_dir_names,
                 walk_exclude_path_patterns,
+                walk_cancel,
             );
             let walk_duration_ms = walk_start.elapsed().as_millis() as u64;
             walk_span.record("duration_ms", &walk_duration_ms);
@@ -602,10 +636,18 @@ impl Scanner {
             state.emit_force();
         }
 
+        let cancelled = cancel
+            .as_ref()
+            .map(|token| token.is_cancelled())
+            .unwrap_or(false);
+        if cancelled {
+            scan_ok.store(false, Ordering::Relaxed);
+        }
+
         // GAP-SCAN-001: Only mark files as deleted if ALL batches were persisted successfully
         // If any batch failed, files in that batch weren't updated with last_seen_at,
         // so marking them deleted would be incorrect (data loss)
-        let deleted = if scan_ok.load(Ordering::Relaxed) {
+        let deleted = if scan_ok.load(Ordering::Relaxed) && !cancelled {
             let mark_span = info_span!(
                 "scout.mark_deleted",
                 source_id = %source.id,
@@ -633,6 +675,14 @@ impl Scanner {
         final_stats.files_deleted = deleted;
         final_stats.duration_ms = start.elapsed().as_millis() as u64;
         final_stats.errors += walk_errors.len() as u64;
+
+        if cancelled {
+            progress_done.store(true, Ordering::Relaxed);
+            if let Some(handle) = progress_timer {
+                let _ = handle.join();
+            }
+            return Err(ScoutError::Cancelled);
+        }
 
         // Update denormalized file_count on source for fast TUI queries
         // GAP-SCAN-005: Use files_persisted (actual count in DB) not files_discovered
@@ -728,6 +778,7 @@ impl Scanner {
         progress_counters: ProgressCounters,
         exclude_dir_names: Vec<String>,
         exclude_path_patterns: Vec<String>,
+        cancel: Option<ScanCancelToken>,
     ) -> Result<(ScanStats, Vec<ScanError>)> {
         let (error_tx, error_rx) = std::sync::mpsc::channel::<ScanError>();
 
@@ -795,6 +846,7 @@ impl Scanner {
         let workspace_id = workspace_id;
         let source_path_owned = source_path.to_path_buf();
         let batch_tx = batch_tx.clone();
+        let cancel_flag = cancel.clone();
 
         walker.run(|| {
             let source_path = source_path_owned.clone();
@@ -808,6 +860,7 @@ impl Scanner {
             let progress_counters = progress_counters.clone();
             let batch_tx = batch_tx.clone();
             let thread_now = Utc::now();
+            let cancel_flag = cancel_flag.clone();
 
             // Thread-local batch - sent to channel when full
             // GAP-SCAN-007: Use u64 for byte_count to prevent overflow on 32-bit systems
@@ -847,9 +900,12 @@ impl Scanner {
                 total_files: total_files.clone(),
                 total_bytes: total_bytes.clone(),
             };
-            let mut current_dir_hint: Option<String> = None;
-
             Box::new(move |entry| {
+                if let Some(token) = cancel_flag.as_ref() {
+                    if token.is_cancelled() {
+                        return ignore::WalkState::Quit;
+                    }
+                }
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
@@ -884,7 +940,7 @@ impl Scanner {
                     total_dirs.fetch_add(1, Ordering::Relaxed);
                     let dir_count = total_dirs.load(Ordering::Relaxed);
                     if dir_count % 100 == 0 {
-                        current_dir_hint = file_path
+                        let current_dir_hint = file_path
                             .strip_prefix(&source_path)
                             .map(|p| p.display().to_string())
                             .ok();

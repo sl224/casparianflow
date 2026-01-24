@@ -49,6 +49,14 @@ pub enum McpAction {
         /// Default output directory (default: ~/.casparian_flow/output)
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Control API address (default: tcp://127.0.0.1:5556)
+        #[arg(long)]
+        control_addr: Option<String>,
+
+        /// Allow MCP to open the DB in write mode when Control API is unavailable
+        #[arg(long)]
+        standalone_db_writer: bool,
     },
 
     /// Approve a pending MCP operation
@@ -62,6 +70,14 @@ pub enum McpAction {
         /// Reject instead of approve
         #[arg(long)]
         reject: bool,
+
+        /// Control API address (default: tcp://127.0.0.1:5556)
+        #[arg(long)]
+        control_addr: Option<String>,
+
+        /// Allow MCP to open the DB in write mode when Control API is unavailable
+        #[arg(long)]
+        standalone_db_writer: bool,
     },
 
     /// List pending approvals
@@ -73,6 +89,14 @@ pub enum McpAction {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Control API address (default: tcp://127.0.0.1:5556)
+        #[arg(long)]
+        control_addr: Option<String>,
+
+        /// Allow MCP to open the DB in write mode when Control API is unavailable
+        #[arg(long)]
+        standalone_db_writer: bool,
     },
 }
 
@@ -85,6 +109,8 @@ pub fn run(action: McpAction) -> Result<()> {
             audit_log,
             database,
             output,
+            control_addr,
+            standalone_db_writer,
         } => run_serve(
             allow_paths,
             max_output_bytes,
@@ -92,12 +118,21 @@ pub fn run(action: McpAction) -> Result<()> {
             audit_log,
             database,
             output,
+            control_addr,
+            standalone_db_writer,
         ),
         McpAction::Approve {
             approval_id,
             reject,
-        } => run_approve(approval_id, reject),
-        McpAction::List { all, json } => run_list(all, json),
+            control_addr,
+            standalone_db_writer,
+        } => run_approve(approval_id, reject, control_addr, standalone_db_writer),
+        McpAction::List {
+            all,
+            json,
+            control_addr,
+            standalone_db_writer,
+        } => run_list(all, json, control_addr, standalone_db_writer),
     }
 }
 
@@ -108,6 +143,8 @@ fn run_serve(
     audit_log: Option<PathBuf>,
     database: Option<PathBuf>,
     _output: Option<PathBuf>,
+    control_addr: Option<String>,
+    standalone_db_writer: bool,
 ) -> Result<()> {
     use super::config;
     use casparian_mcp::{McpServer, McpServerConfig};
@@ -132,6 +169,8 @@ fn run_serve(
         max_rows,
         audit_log_path,
         db_path,
+        control_addr,
+        standalone_db_writer,
     };
 
     info!("Starting MCP server (stdio)");
@@ -141,12 +180,21 @@ fn run_serve(
     server.run()
 }
 
-fn run_approve(approval_id: String, reject: bool) -> Result<()> {
+fn run_approve(
+    approval_id: String,
+    reject: bool,
+    control_addr: Option<String>,
+    standalone_db_writer: bool,
+) -> Result<()> {
     use super::config;
     use casparian_mcp::approvals::{ApprovalId, ApprovalManager};
 
     let db_path = config::active_db_path();
-    let manager = ApprovalManager::new(db_path)?;
+    let manager = if standalone_db_writer {
+        ApprovalManager::new(db_path)?
+    } else {
+        ApprovalManager::new_control(control_addr)?
+    };
 
     let id = ApprovalId::from_string(&approval_id);
 
@@ -167,12 +215,21 @@ fn run_approve(approval_id: String, reject: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_list(all: bool, json: bool) -> Result<()> {
+fn run_list(
+    all: bool,
+    json: bool,
+    control_addr: Option<String>,
+    standalone_db_writer: bool,
+) -> Result<()> {
     use super::config;
     use casparian_mcp::approvals::ApprovalManager;
 
     let db_path = config::active_db_path();
-    let manager = ApprovalManager::new(db_path)?;
+    let manager = if standalone_db_writer {
+        ApprovalManager::new(db_path)?
+    } else {
+        ApprovalManager::new_control(control_addr)?
+    };
 
     let status_filter = if all { None } else { Some("pending") };
     let approvals = manager.list_approvals(status_filter)?;

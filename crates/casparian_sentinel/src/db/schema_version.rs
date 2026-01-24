@@ -8,7 +8,7 @@ use casparian_db::{DbConnection, DbValue};
 use tracing::warn;
 
 /// Current schema version. Increment when schema changes.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Known tables that will be dropped on schema mismatch.
 ///
@@ -25,6 +25,9 @@ const KNOWN_TABLES: &[&str] = &[
     "cf_selection_snapshot_files",
     "cf_pipelines",
     "cf_pipeline_runs",
+    // Schema tables (schema_storage)
+    "schema_contracts",
+    "schema_discovery_results",
     // UI session tables (tauri session_storage)
     "cf_sessions",
     // Queue tables (queue.rs)

@@ -1759,6 +1759,7 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         }
         DiscoverViewState::Scanning => draw_scanning_dialog(frame, app, area),
         DiscoverViewState::EnteringPath => draw_add_source_dialog(frame, app, area),
+        DiscoverViewState::ScanConfirm => draw_scan_confirm_dialog(frame, app, area),
         _ => {}
     }
 }
@@ -2508,6 +2509,54 @@ fn draw_add_source_dialog(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, inner_area);
 }
 
+fn draw_scan_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let dialog_area = render_centered_dialog(frame, area, 72, 9);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(Span::styled(
+            " Confirm Scan ",
+            Style::default().fg(Color::Red).bold(),
+        ));
+
+    let inner_area = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let path = app
+        .discover
+        .scan_confirm_path
+        .as_deref()
+        .unwrap_or("<unknown>");
+    let path_display = truncate_path_start(path, inner_area.width.saturating_sub(4) as usize);
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  You are about to scan a high-risk path:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", path_display),
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  This may take a long time and touch many files.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [Enter/y]", Style::default().fg(Color::Red)),
+            Span::raw(" Confirm  "),
+            Span::styled("[Esc/n]", Style::default().fg(Color::Cyan)),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let para = Paragraph::new(content);
+    frame.render_widget(para, inner_area);
+}
+
 /// Draw the Scanning progress dialog as an overlay
 fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let dialog_area = render_centered_dialog(frame, area, 60, 9);
@@ -2646,9 +2695,16 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         .as_ref()
         .and_then(|(msg, is_error)| if *is_error { Some(msg.as_str()) } else { None });
 
+    let (range_start, range_end, total_files) = app.discover_page_bounds();
+    let file_range = if total_files == 0 {
+        "Files: 0".to_string()
+    } else {
+        format!("Files: {}-{} of {}", range_start, range_end, total_files)
+    };
+
     let mut header_text = format!(
-        " [Scope] [Pattern] [Extract] [Validate]  |  Source: {}  |  Matches: {}",
-        source_name, match_count
+        " [Scope] [Pattern] [Extract] [Validate]  |  Source: {}  |  Matches: {}  |  {}",
+        source_name, match_count, file_range
     );
     if let Some(msg) = error_hint {
         header_text.push_str(&format!("  |  ⚠ {}", msg));
@@ -3338,14 +3394,11 @@ fn draw_rule_builder_right_panel(
             let warning_count: usize = preview_files.iter().map(|f| f.warnings.len()).sum();
             if warning_count > 0 {
                 format!(
-                    " PREVIEW  {} files  ⚠ {} warnings  t:tag  b:backtest",
+                    " PREVIEW  {} files  ⚠ {} warnings  t:tag",
                     file_count, warning_count
                 )
             } else {
-                format!(
-                    " PREVIEW  {} files  ✓ extractions OK  t:tag  b:backtest",
-                    file_count
-                )
+                format!(" PREVIEW  {} files  ✓ extractions OK  t:tag", file_count)
             }
         }
         FileResultsState::BacktestResults { result_filter, .. } => {
@@ -3429,7 +3482,7 @@ fn draw_rule_builder_right_panel(
                     .count();
                 let selected_count = builder.selected_preview_files.len();
                 format!(
-                    " {} files  {} OK  {} warnings  Selected: {}  [t] apply tag  [b] backtest",
+                    " {} files  {} OK  {} warnings  Selected: {}  [t] apply tag",
                     preview_files.len(),
                     ok_count,
                     preview_files.len() - ok_count,
@@ -4463,7 +4516,7 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
     let footer_text = if app.jobs_state.view_state == JobsViewState::ViolationDetail {
         " [↑/↓] Select violation  [a] Apply fix  [v/Esc] Back to details  [?] Help "
     } else {
-        " [↑/↓] Select  [Tab] Section  [Enter] Pin  [f] Filter  [v] Violations  [R] Retry  [c] Cancel  [L] Logs  [O] Open  [y] Copy  [I] Inspector  [?] Help "
+        " [↑/↓] Select  [Tab] Section  [Enter] Pin  [f] Filter  [v] Violations  [L] Logs  [O] Open  [y] Copy  [I] Inspector  [?] Help "
     };
     draw_shell_action_bar(
         frame,
@@ -5425,7 +5478,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
                     "  2              Open Tags dropdown      <name>    Extract field",
                     "  s              Scan new directory",
                     "  Ctrl+S         Save rule               FOCUS INDICATOR",
-                    "  t              Run backtest            ──────────────",
+                    "  t              Apply tag               ──────────────",
                     "                                         █ cursor   = text input active",
                     "                                         ► pointer  = list navigation",
                     "  IN DROPDOWNS",
@@ -5934,9 +5987,13 @@ fn draw_query_screen(frame: &mut Frame, app: &App, area: Rect) {
     // Draw Action Bar
     let footer_text = match app.query_state.view_state {
         QueryViewState::Editing => {
-            " [Ctrl+Enter] Execute  [Ctrl+L] Clear  [Up/Down] History  [Tab] Results "
+            if app.query_state.executing {
+                " Query running in background...  [Tab] Results "
+            } else {
+                " [Ctrl+Enter] Execute  [Ctrl+L] Clear  [Up/Down] History  [Tab] Results "
+            }
         }
-        QueryViewState::Executing => " Executing query...  [Esc] Cancel ",
+        QueryViewState::Executing => " Executing query...  [Esc] Detach ",
         QueryViewState::ViewingResults => {
             " [Tab/Esc] Editor  [Up/Down] Navigate  [Left/Right] Scroll  [PgUp/PgDn] Page "
         }
@@ -6148,7 +6205,7 @@ fn draw_query_results(frame: &mut Frame, app: &App, area: Rect) {
     use crate::cli::tui::app::QueryViewState;
 
     let is_focused = app.query_state.view_state == QueryViewState::ViewingResults;
-    let is_executing = app.query_state.view_state == QueryViewState::Executing;
+    let is_executing = app.query_state.executing;
 
     let border_style = if is_focused {
         Style::default().fg(Color::Cyan)
@@ -6395,16 +6452,18 @@ fn draw_query_inspector(frame: &mut Frame, app: &App, area: Rect) {
 
     // Current state
     lines.push(Line::from(""));
+    let state_label = if app.query_state.executing {
+        "Executing"
+    } else {
+        match app.query_state.view_state {
+            crate::cli::tui::app::QueryViewState::Editing => "Editing",
+            crate::cli::tui::app::QueryViewState::Executing => "Executing",
+            crate::cli::tui::app::QueryViewState::ViewingResults => "Viewing Results",
+        }
+    };
     lines.push(Line::from(vec![
         Span::styled("State: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            match app.query_state.view_state {
-                crate::cli::tui::app::QueryViewState::Editing => "Editing",
-                crate::cli::tui::app::QueryViewState::Executing => "Executing",
-                crate::cli::tui::app::QueryViewState::ViewingResults => "Viewing Results",
-            },
-            Style::default().fg(Color::Cyan),
-        ),
+        Span::styled(state_label, Style::default().fg(Color::Cyan)),
     ]));
 
     let para = Paragraph::new(lines);
@@ -6903,6 +6962,7 @@ mod tests {
 
         // Add some mock files
         app.discover.files.push(crate::cli::tui::app::FileInfo {
+            file_id: 1,
             path: "test_file.csv".into(),
             rel_path: "test_file.csv".into(),
             size: 1024,

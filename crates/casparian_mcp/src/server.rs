@@ -16,7 +16,7 @@
 //! server.run()?; // Blocking, no async runtime required
 //! ```
 
-use crate::core::{spawn_core, CoreHandle, Event};
+use crate::core::{spawn_core_with_config, CoreConfig, CoreHandle, Event};
 use crate::jobs::{JobExecutor, JobExecutorHandle};
 use crate::protocol::{
     methods, ContentBlock, InitializeParams, InitializeResult, JsonRpcError, JsonRpcRequest,
@@ -56,6 +56,12 @@ pub struct McpServerConfig {
 
     /// Database path
     pub db_path: PathBuf,
+
+    /// Control API address (preferred backend for mutations)
+    pub control_addr: Option<String>,
+
+    /// Allow standalone DB writer mode (no Control API)
+    pub standalone_db_writer: bool,
 }
 
 impl Default for McpServerConfig {
@@ -71,6 +77,8 @@ impl Default for McpServerConfig {
             max_rows: 10_000,
             audit_log_path: Some(casparian_dir.join("mcp_audit.ndjson")),
             db_path: casparian_dir.join("casparian_flow.duckdb"),
+            control_addr: Some(casparian_sentinel::DEFAULT_CONTROL_ADDR.to_string()),
+            standalone_db_writer: false,
         }
     }
 }
@@ -120,7 +128,12 @@ impl McpServer {
         };
 
         // Spawn the Core thread (owns JobManager, ApprovalManager - single owner, no locks)
-        let (core, events, core_thread) = spawn_core(config.db_path.clone())?;
+        let core_config = CoreConfig {
+            db_path: config.db_path.clone(),
+            control_addr: config.control_addr.clone(),
+            standalone_db_writer: config.standalone_db_writer,
+        };
+        let (core, events, core_thread) = spawn_core_with_config(core_config)?;
 
         // Initialize job executor (sync, runs in dedicated thread)
         // Uses CoreHandle for all job state operations via message passing (no locks)
@@ -480,5 +493,6 @@ mod tests {
         assert_eq!(config.server_name, "casparian-mcp");
         assert_eq!(config.max_response_bytes, 1024 * 1024);
         assert_eq!(config.max_rows, 10_000);
+        assert!(!config.standalone_db_writer);
     }
 }

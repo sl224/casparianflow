@@ -14,7 +14,7 @@ pub mod db;
 pub mod metrics;
 pub mod sentinel;
 
-pub use control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo};
+pub use control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo, DEFAULT_CONTROL_ADDR};
 pub use control_client::ControlClient;
 pub use db::api_storage::ApiStorage;
 pub use db::expected_outputs::{ExpectedOutputs, OutputSpec};
@@ -44,7 +44,11 @@ pub struct SentinelArgs {
     pub max_workers: usize,
 
     /// Control API bind address (e.g., "ipc:///tmp/casparian_control.sock" or "tcp://127.0.0.1:5556")
-    /// If not specified, control API is disabled.
+    /// If not specified, defaults to tcp://127.0.0.1:5556 unless --no-control-api is set.
     #[arg(long)]
-    pub control_api: Option<String>,
+    pub control_addr: Option<String>,
+
+    /// Disable the Control API entirely.
+    #[arg(long)]
+    pub no_control_api: bool,
 }

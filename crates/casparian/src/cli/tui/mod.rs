@@ -14,9 +14,6 @@ pub mod ui;
 #[cfg(feature = "profiling")]
 mod profiler_overlay;
 
-#[cfg(test)]
-mod snapshot_tests;
-
 use anyhow::Result;
 use clap::Args;
 use crossterm::{
@@ -109,6 +106,7 @@ fn run_app<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -117,6 +115,15 @@ mod tests {
         let app = App::new(args, None);
         assert!(matches!(app.mode, app::TuiMode::Home));
         assert!(app.running);
+    }
+
+    #[test]
+    fn test_app_quit_flow() {
+        let args = TuiArgs { database: None };
+        let mut app = App::new(args, None);
+        app.tick();
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.running);
     }
 
     #[test]

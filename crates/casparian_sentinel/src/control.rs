@@ -12,13 +12,26 @@
 //!
 //! # Supported Operations
 //!
-//! - `ListJobs` - List jobs with optional status filter
-//! - `GetJob` - Get a single job by ID
-//! - `CancelJob` - Request cancellation of a job
-//! - `GetQueueStats` - Get job counts by status
+//! - `ListJobs` / `GetJob` / `CancelJob` / `GetQueueStats`
+//! - `ListApprovals` / `CreateApproval` / `GetApproval` / `Approve` / `Reject`
+//! - `SetApprovalJobId` / `ExpireApprovals`
+//! - `CreateApiJob` / `GetApiJob` / `ListApiJobs`
+//! - `UpdateApiJobStatus` / `UpdateApiJobProgress` / `UpdateApiJobResult` / `UpdateApiJobError`
+//! - `CancelApiJob`
+//! - `CreateSession` / `GetSession` / `ListSessions` / `ListSessionsNeedingInput`
+//! - `AdvanceSession` / `CancelSession`
 
+use casparian_protocol::http_types::{
+    Approval, ApprovalOperation, ApprovalStatus, Job as ApiJob, JobProgress as ApiJobProgress,
+    JobResult as ApiJobResult, HttpJobStatus, HttpJobType,
+};
 use casparian_protocol::{JobId, ProcessingStatus};
 use serde::{Deserialize, Serialize};
+
+use crate::db::{IntentState, Session, SessionId};
+
+/// Default Control API address (TCP loopback).
+pub const DEFAULT_CONTROL_ADDR: &str = "tcp://127.0.0.1:5556";
 
 /// Control API request envelope
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +49,87 @@ pub enum ControlRequest {
     CancelJob { job_id: JobId },
     /// Get queue statistics
     GetQueueStats,
+    /// Create an API job (cf_api_jobs)
+    CreateApiJob {
+        job_type: HttpJobType,
+        plugin_name: String,
+        plugin_version: Option<String>,
+        input_dir: String,
+        output: Option<String>,
+        approval_id: Option<String>,
+        spec_json: Option<String>,
+    },
+    /// Get a single API job by ID
+    GetApiJob { job_id: JobId },
+    /// List API jobs with optional status filter
+    ListApiJobs {
+        status: Option<HttpJobStatus>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    /// Update API job status
+    UpdateApiJobStatus {
+        job_id: JobId,
+        status: HttpJobStatus,
+    },
+    /// Update API job progress
+    UpdateApiJobProgress {
+        job_id: JobId,
+        progress: ApiJobProgress,
+    },
+    /// Update API job result
+    UpdateApiJobResult {
+        job_id: JobId,
+        result: ApiJobResult,
+    },
+    /// Update API job error
+    UpdateApiJobError { job_id: JobId, error: String },
+    /// Cancel an API job
+    CancelApiJob { job_id: JobId },
+    /// List approvals with optional status filter
+    ListApprovals {
+        status: Option<ApprovalStatus>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    /// Create a new approval request
+    CreateApproval {
+        approval_id: String,
+        operation: ApprovalOperation,
+        summary: String,
+        expires_in_seconds: i64,
+    },
+    /// Get a single approval by ID
+    GetApproval { approval_id: String },
+    /// Approve an approval request
+    Approve { approval_id: String },
+    /// Reject an approval request with reason
+    Reject { approval_id: String, reason: String },
+    /// Link a job ID to an approval
+    SetApprovalJobId { approval_id: String, job_id: JobId },
+    /// Expire pending approvals that are past their expiry
+    ExpireApprovals,
+    /// Create a new session
+    CreateSession {
+        intent_text: String,
+        input_dir: Option<String>,
+    },
+    /// Get a session by ID
+    GetSession { session_id: SessionId },
+    /// List sessions with optional state filter
+    ListSessions {
+        state: Option<IntentState>,
+        limit: Option<i64>,
+    },
+    /// List sessions that need human input (at gates)
+    ListSessionsNeedingInput { limit: Option<i64> },
+    /// Advance a session to a new state
+    AdvanceSession {
+        session_id: SessionId,
+        target_state: IntentState,
+    },
+    /// Cancel a session
+    CancelSession { session_id: SessionId },
     /// Ping/health check
     Ping,
 }
@@ -52,6 +146,28 @@ pub enum ControlResponse {
     CancelResult { success: bool, message: String },
     /// Queue statistics
     QueueStats(QueueStatsInfo),
+    /// Single API job (None if not found)
+    ApiJob(Option<ApiJob>),
+    /// List of API jobs
+    ApiJobs(Vec<ApiJob>),
+    /// API job creation result
+    ApiJobCreated { job_id: JobId },
+    /// API job mutation result
+    ApiJobResult { success: bool, message: String },
+    /// List of approvals
+    Approvals(Vec<Approval>),
+    /// Single approval (None if not found)
+    Approval(Option<Approval>),
+    /// Result of approval decision
+    ApprovalResult { success: bool, message: String },
+    /// Single session (None if not found)
+    Session(Option<Session>),
+    /// List of sessions
+    Sessions(Vec<Session>),
+    /// Session creation result
+    SessionCreated { session_id: SessionId },
+    /// Result of session update
+    SessionResult { success: bool, message: String },
     /// Pong response
     Pong,
     /// Error response

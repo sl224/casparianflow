@@ -633,7 +633,7 @@ fn sample_rule_builder_empty() -> RuleBuilderState {
 }
 
 fn sample_rule_builder_basic() -> RuleBuilderState {
-    let mut builder = RuleBuilderState::new(Some("1".to_string()));
+    let mut builder = RuleBuilderState::new(Some(SourceId::new()));
     builder.pattern = "**/reports/<date>_<region>.csv".to_string();
     builder.tag = "report.financial".to_string();
     builder.excludes = vec!["**/archive/**".to_string(), "**/*.tmp".to_string()];

@@ -67,7 +67,11 @@ pub fn resolve_active_workspace_id(db: &Database) -> Result<WorkspaceId, Helpful
 fn list_workspaces() -> anyhow::Result<()> {
     let db = open_db()?;
     let workspaces = db.list_workspaces()?;
-    let active_id = context::get_active_workspace_id().ok().flatten();
+    let active_id = context::get_active_workspace_id()
+        .map_err(|err| {
+            HelpfulError::new(format!("Workspace context error: {}", err))
+                .with_context("Delete the context file to reset")
+        })?;
 
     if workspaces.is_empty() {
         println!("No workspaces found.");
@@ -107,7 +111,11 @@ fn set_workspace(workspace_ref: Option<&str>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let active_id = context::get_active_workspace_id().ok().flatten();
+    let active_id = context::get_active_workspace_id()
+        .map_err(|err| {
+            HelpfulError::new(format!("Workspace context error: {}", err))
+                .with_context("Delete the context file to reset")
+        })?;
     if let Some(active_id) = active_id {
         if let Some(workspace) = db.get_workspace(&active_id)? {
             println!("Active workspace: '{}' ({})", workspace.name, workspace.id);

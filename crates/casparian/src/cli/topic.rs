@@ -504,9 +504,9 @@ fn show_topic(
 
     // Get files with this topic
     let files = if name == "(untagged)" {
-        list_untagged_files(conn, workspace_id, 1000).unwrap_or_default()
+        list_untagged_files(conn, workspace_id, 1000)?
     } else {
-        list_files_for_tag(conn, workspace_id, name, 1000).unwrap_or_default()
+        list_files_for_tag(conn, workspace_id, name, 1000)?
     };
 
     let parser: Option<(String, Option<i64>)> = None;
@@ -553,7 +553,7 @@ fn show_topic(
     if topic_rules.is_empty() {
         println!("  (no rules configured)");
     } else {
-        let rule_matches = get_rule_match_counts(conn, workspace_id, name).unwrap_or_default();
+        let rule_matches = get_rule_match_counts(conn, workspace_id, name)?;
         for rule in &topic_rules {
             let matched = rule_matches.get(&rule.id).copied().unwrap_or(0);
             println!("  {}     {} files matched", rule.pattern, matched);

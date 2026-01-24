@@ -391,6 +391,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
         ScoutError::Pattern(_) => ("pattern".to_string(), None),
         ScoutError::InvalidState(_) => ("invalid_state".to_string(), None),
         ScoutError::Extractor(_) => ("extractor".to_string(), None),
+        ScoutError::Cancelled => ("cancelled".to_string(), None),
         ScoutError::SourceIsChildOfExisting { .. } => ("source_overlap".to_string(), None),
         ScoutError::SourceIsParentOfExisting { .. } => ("source_overlap".to_string(), None),
     }

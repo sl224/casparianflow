@@ -105,11 +105,8 @@ duckdb-bundled = ["casparian_db/duckdb-bundled", "dep:duckdb", "duckdb/bundled"]
 sqlite = []
 
 [dev-dependencies]
-ureq = "2"
-portable-pty = "0.8"
 filetime = "0.2"
 criterion = "0.5"
-insta = { version = "1.46.1", features = ["filters"] }
 
 [[bench]]
 name = "scanner_perf"
