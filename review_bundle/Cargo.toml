@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/casparian_protocol",
+    "crates/casparian_worker",
+    "crates/casparian_sentinel",
+    "crates/casparian_sinks",
+    "crates/casparian",
+    "crates/casparian_security",
+    # "crates/casparian_scout",  # Inlined into casparian::scout module
+    "crates/casparian_ids",
+    "crates/casparian_schema",
+    "crates/casparian_backtest",
+    "crates/casparian_profiler",
+    "crates/casparian_db",
+    "crates/casparian_mcp",
+    "tauri-ui/src-tauri",
+]
+default-members = [
+    "crates/casparian",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Casparian Flow Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+byteorder = "1.5"
+base64 = "0.22"
+ed25519-dalek = "2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# ZeroMQ
+zmq = "0.10"
+
+# Arrow & Parquet (for future use in data plane)
+# Upgraded to 54.x to fix chrono 0.4.43 incompatibility in arrow-arith 53.x
+arrow = "54"
+parquet = "54"
+
+# Note: We need chrono with serde for time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Tracing/Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI parsing (for future use)
+clap = { version = "4.5", features = ["derive", "env"] }

@@ -158,7 +158,10 @@ pub fn lock_path_for(db_path: &Path) -> PathBuf {
 pub fn try_lock_exclusive(db_path: &Path) -> Result<DbLockGuard, LockError> {
     let lock_path = lock_path_for(db_path);
 
-    debug!("Attempting to acquire exclusive lock: {}", lock_path.display());
+    debug!(
+        "Attempting to acquire exclusive lock: {}",
+        lock_path.display()
+    );
 
     // Create or open the lock file
     let file = OpenOptions::new()

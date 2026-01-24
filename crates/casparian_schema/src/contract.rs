@@ -58,11 +58,7 @@ impl SchemaContract {
     }
 
     /// Create a contract with multiple schemas
-    pub fn with_schemas(
-        scope_id: &str,
-        schemas: Vec<LockedSchema>,
-        approved_by: &str,
-    ) -> Self {
+    pub fn with_schemas(scope_id: &str, schemas: Vec<LockedSchema>, approved_by: &str) -> Self {
         Self {
             contract_id: ContractId::new(),
             scope_id: scope_id.to_string(),
@@ -283,11 +279,7 @@ pub struct SchemaViolation {
 
 impl SchemaViolation {
     /// Create a type mismatch violation
-    pub fn type_mismatch(
-        column: usize,
-        expected: DataType,
-        got: &str,
-    ) -> Self {
+    pub fn type_mismatch(column: usize, expected: DataType, got: &str) -> Self {
         Self {
             file_path: None,
             row: None,
@@ -311,11 +303,7 @@ impl SchemaViolation {
     }
 
     /// Create a format mismatch violation
-    pub fn format_mismatch(
-        column: usize,
-        expected_format: &str,
-        got: &str,
-    ) -> Self {
+    pub fn format_mismatch(column: usize, expected_format: &str, got: &str) -> Self {
         Self {
             file_path: None,
             row: None,
@@ -341,7 +329,11 @@ impl SchemaViolation {
 
 impl std::fmt::Display for SchemaViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: expected '{}', got '{}'", self.violation_type, self.expected, self.got)?;
+        write!(
+            f,
+            "{:?}: expected '{}', got '{}'",
+            self.violation_type, self.expected, self.got
+        )?;
         if let Some(col) = self.column {
             write!(f, " (column {})", col)?;
         }

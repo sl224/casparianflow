@@ -8,9 +8,9 @@ pub mod error;
 pub mod output;
 
 // W1: Core commands (fully implemented)
-pub mod scan;
 #[cfg(feature = "data-plane")]
 pub mod preview;
+pub mod scan;
 #[cfg(not(feature = "data-plane"))]
 pub mod preview {
     use std::path::PathBuf;
@@ -30,10 +30,10 @@ pub mod preview {
         anyhow::bail!("preview requires the `data-plane` feature")
     }
 }
-pub mod run;
-pub mod schema;
 pub mod backfill;
 pub mod pipeline;
+pub mod run;
+pub mod schema;
 
 // W2: Tagging commands (stubs)
 #[cfg(feature = "data-plane")]
@@ -70,14 +70,15 @@ pub mod parser;
 pub mod plugin;
 
 // W4: Job commands (stubs)
-pub mod jobs;
 pub mod job;
+pub mod jobs;
 pub mod worker;
 
 // W5: Resource commands (stubs)
-pub mod source;
 pub mod rule;
+pub mod source;
 pub mod topic;
+pub mod workspace;
 
 // W8: TUI
 pub mod tui;
@@ -88,6 +89,12 @@ pub mod mcp;
 // Configuration and context
 pub mod config;
 pub mod context;
+
+// Support
+pub mod support_bundle;
+
+// Tape recording and playback
+pub mod tape;
 
 // Re-exports are used by the scan, preview, and resource modules
 #[allow(unused_imports)]

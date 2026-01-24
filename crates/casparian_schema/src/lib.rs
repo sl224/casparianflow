@@ -49,5 +49,5 @@ pub use approval::{
 // Re-export key types from amendment module
 pub use amendment::{
     AmendmentAction, AmendmentError, AmendmentReason, AmendmentResult, AmendmentStatus,
-    SchemaAmendmentProposal, SchemaChange, SampleValue,
+    SampleValue, SchemaAmendmentProposal, SchemaChange,
 };

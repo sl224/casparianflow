@@ -1,0 +1,6 @@
+{
+  "columns": [
+    { "name": "value", "data_type": "int64", "nullable": false },
+    { "name": "message", "data_type": "string", "nullable": false }
+  ]
+}

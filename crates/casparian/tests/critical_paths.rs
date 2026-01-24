@@ -76,8 +76,7 @@ mod database {
             .unwrap();
         });
 
-        let readonly = DbConnection::open_duckdb_readonly(&db_path)
-            .expect("open readonly");
+        let readonly = DbConnection::open_duckdb_readonly(&db_path).expect("open readonly");
         let value: String = readonly
             .query_scalar("SELECT value FROM test WHERE id = 1", &[])
             .expect("read value");
@@ -98,8 +97,7 @@ mod database {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("concurrent.duckdb");
 
-        let writer = DbConnection::open_duckdb(&db_path)
-            .expect("open writer");
+        let writer = DbConnection::open_duckdb(&db_path).expect("open writer");
 
         let second_writer = DbConnection::open_duckdb(&db_path);
         assert!(
@@ -141,12 +139,13 @@ mod binary {
 
                 // Should contain usage info or subcommands
                 assert!(
-                    combined.contains("Usage") ||
-                    combined.contains("casparian") ||
-                    combined.contains("SUBCOMMANDS") ||
-                    combined.contains("Commands") ||
-                    combined.contains("help"),
-                    "Should show help. Got: {}", combined
+                    combined.contains("Usage")
+                        || combined.contains("casparian")
+                        || combined.contains("SUBCOMMANDS")
+                        || combined.contains("Commands")
+                        || combined.contains("help"),
+                    "Should show help. Got: {}",
+                    combined
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -164,8 +163,13 @@ mod binary {
 
         let output = Command::new("cargo")
             .args([
-                "run", "-p", "casparian", "-q", "--",
-                "scan", &temp_dir.path().to_string_lossy()
+                "run",
+                "-p",
+                "casparian",
+                "-q",
+                "--",
+                "scan",
+                &temp_dir.path().to_string_lossy(),
             ])
             .output();
 
@@ -177,10 +181,10 @@ mod binary {
                 // Should either succeed or show meaningful output
                 if out.status.success() {
                     assert!(
-                        stdout.contains("csv") ||
-                        stdout.contains("file") ||
-                        stdout.contains("1"),
-                        "Scan should show files. Got stdout: {}, stderr: {}", stdout, stderr
+                        stdout.contains("csv") || stdout.contains("file") || stdout.contains("1"),
+                        "Scan should show files. Got stdout: {}, stderr: {}",
+                        stdout,
+                        stderr
                     );
                 }
             }
@@ -198,7 +202,7 @@ mod binary {
 
 mod scout {
     use super::*;
-    use casparian::scout::{Database, Scanner, ScanProgress, Source, SourceId, SourceType};
+    use casparian::scout::{Database, ScanProgress, Scanner, Source, SourceId, SourceType};
     use std::sync::mpsc;
 
     /// Critical: Scanner must send progress updates during scan
@@ -209,14 +213,20 @@ mod scout {
         // Create test files - enough to trigger progress updates
         // (progress_interval is 500, batch_size is 1000)
         for i in 0..100 {
-            fs::write(temp_dir.path().join(format!("file_{}.txt", i)), format!("content {}", i)).unwrap();
+            fs::write(
+                temp_dir.path().join(format!("file_{}.txt", i)),
+                format!("content {}", i),
+            )
+            .unwrap();
         }
 
         // Create in-memory database
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         // Create source
         let source = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -232,7 +242,9 @@ mod scout {
         let scanner = Scanner::new(db);
 
         // Run scan with progress
-        let result = scanner.scan(&source, Some(progress_tx.clone()), None).unwrap();
+        let result = scanner
+            .scan(&source, Some(progress_tx.clone()), None)
+            .unwrap();
         drop(progress_tx);
 
         // Collect progress updates
@@ -272,8 +284,10 @@ mod scout {
         }
 
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         let source = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -296,7 +310,9 @@ mod scout {
         assert_eq!(result2.stats.files_discovered, 10);
 
         // Source should still exist
-        let loaded = db.get_source_by_path(&source.path).unwrap();
+        let loaded = db
+            .get_source_by_path(&workspace_id, &source.path)
+            .unwrap();
         assert!(loaded.is_some(), "Source should still exist after rescan");
     }
 
@@ -304,8 +320,10 @@ mod scout {
     #[test]
     fn test_unique_source_names() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         let source1 = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "data".to_string(),
             source_type: SourceType::Local,
@@ -315,6 +333,7 @@ mod scout {
         };
 
         let source2 = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "data".to_string(), // Same name!
             source_type: SourceType::Local,

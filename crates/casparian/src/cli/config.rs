@@ -85,6 +85,18 @@ pub fn parsers_dir() -> PathBuf {
     casparian_home().join("parsers")
 }
 
+/// Get logs directory: ~/.casparian_flow/logs
+pub fn logs_dir() -> PathBuf {
+    casparian_home().join("logs")
+}
+
+/// Ensure the logs directory exists
+pub fn ensure_logs_dir() -> std::io::Result<PathBuf> {
+    let dir = logs_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Arguments for the config command
 #[derive(Debug, clap::Args)]
 pub struct ConfigArgs {
@@ -134,16 +146,33 @@ pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
         println!();
         println!("Database Backend: {}", backend.as_str());
         println!("  Active:  {}", active_db.display());
-        println!("  DuckDB:  {} ({})", duckdb_db.display(), if duckdb_db.exists() { "exists" } else { "not found" });
+        println!(
+            "  DuckDB:  {} ({})",
+            duckdb_db.display(),
+            if duckdb_db.exists() {
+                "exists"
+            } else {
+                "not found"
+            }
+        );
         println!();
         println!("Output:   {}", output.display());
-        println!("          exists: {}", if output.exists() { "yes" } else { "no" });
+        println!(
+            "          exists: {}",
+            if output.exists() { "yes" } else { "no" }
+        );
         println!();
         println!("Venvs:    {}", venvs.display());
-        println!("          exists: {}", if venvs.exists() { "yes" } else { "no" });
+        println!(
+            "          exists: {}",
+            if venvs.exists() { "yes" } else { "no" }
+        );
         println!();
         println!("Parsers:  {}", parsers.display());
-        println!("          exists: {}", if parsers.exists() { "yes" } else { "no" });
+        println!(
+            "          exists: {}",
+            if parsers.exists() { "yes" } else { "no" }
+        );
     }
 
     Ok(())

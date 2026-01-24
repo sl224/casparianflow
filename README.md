@@ -1,12 +1,16 @@
 # Casparian Flow
 
-A **deterministic, governed data build system** for file artifacts.
+A **local-first ingestion and governance runtime** for file artifacts.
 
 ## What is Casparian Flow?
 
-Casparian Flow transforms dark data (file artifacts) into queryable datasets with strict
-schema contracts, quarantine semantics, and per-row lineage. v1 targets DFIR / Incident
-Response: parse Windows artifacts (EVTX as flagship) into auditable, repeatable datasets.
+Casparian Flow turns messy file corpuses into typed, queryable tables with incremental
+ingestion, per-row lineage, quarantine semantics, and schema contracts. v1 targets
+DFIR / Incident Response: parse Windows artifacts (EVTX as flagship) into auditable,
+reproducible datasets.
+
+**Core promise:** If you can point Casparian at a directory of files and a parser, you can
+reliably produce tables you can trust—and you can prove how you got them.
 
 **Core capabilities:**
 
@@ -21,9 +25,6 @@ Response: parse Windows artifacts (EVTX as flagship) into auditable, repeatable 
 - Invalid rows go to quarantine, not silent coercion (safe partial success)
 - Every output row has lineage metadata (chain of custody)
 - Content-addressed parser identity (changes trigger re-processing)
-
-**v1 is NOT:** streaming, an orchestrator, BI, "no-code", or AI-dependent.
-AI assistance is optional and outside the critical execution path.
 
 ## Quick Start
 
@@ -107,38 +108,54 @@ Test high-failure files first. If they still fail, stop early.
 ### Bridge Mode Execution
 
 Plugins run in isolated subprocesses. Host has credentials. Guest has only code.
-Worker execution is non-interactive (no `pdb`) in v1.
+Worker execution is non-interactive (no `pdb`).
 
 ## Architecture
 
 ```
-Casparian CLI / TUI
-        │
-        ▼
-  Schema Contracts
-        │
-        ▼
- Sentinel / Job Queue
-        │
-        ▼
- Worker (Bridge Mode)
-        │
-        ▼
-  Output Sinks (DuckDB/Parquet)
+┌─────────────────────────────────────────┐
+│         FRONTENDS (Clients)             │
+│     CLI / TUI / Tauri UI / MCP          │
+│   • Mutations via Control API (IPC)     │
+│   • Read-only DB for queries            │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│      CONTROL PLANE (Sentinel)           │
+│   • Single mutation authority           │
+│   • Job queue + state machine           │
+│   • Materializations (incremental)      │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│      EXECUTION PLANE (Worker)           │
+│   • Stateless executor                  │
+│   • True cancellation                   │
+│   • Atomic outputs (stage → promote)    │
+└─────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│           PERSISTENCE                   │
+│   DuckDB / Parquet / CSV sinks          │
+└─────────────────────────────────────────┘
 ```
+
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for detailed system design.
 
 ### Crates
 
 | Crate | Purpose |
 |-------|---------|
 | `casparian` | Unified CLI binary |
-| `casparian_protocol` | Binary protocol + types |
-| `casparian_schema` | Schema contracts |
-| `casparian_sentinel` | Control plane + dispatch |
+| `casparian_sentinel` | Control plane + dispatch + Control API |
 | `casparian_worker` | Execution + validation |
-| `casparian_sinks` | Sink implementations |
+| `casparian_sinks` | Sink implementations + lineage |
+| `casparian_protocol` | Binary protocol + types + idempotency |
 | `casparian_db` | DuckDB actor + DB API |
-| `casparian_security` | Gatekeeper + policy |
+| `casparian_tape` | Event recording for replay/debugging |
 | `casparian_backtest` | Multi-file validation |
 
 ## Development
@@ -160,11 +177,12 @@ cargo test --package casparian_backtest --test e2e_backtest
 
 ## Documentation
 
-- **[CLAUDE.md](CLAUDE.md)** - Entry point for LLM context
+- **[CLAUDE.md](CLAUDE.md)** - Entry point for LLM context + coding standards
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Detailed system design + invariants
 - **[docs/v1_scope.md](docs/v1_scope.md)** - v1 scope and success metrics
+- **[docs/trust_guarantees.md](docs/trust_guarantees.md)** - Trust model and security
 - **[docs/schema_rfc.md](docs/schema_rfc.md)** - Schema contract system
 - **[docs/fix_schema.md](docs/fix_schema.md)** - FIX protocol schema specification
-- **[docs/execution_plan.md](docs/execution_plan.md)** - v1 execution plan
 - **Crate docs**: Each crate has its own `CLAUDE.md`
 
 ## Requirements

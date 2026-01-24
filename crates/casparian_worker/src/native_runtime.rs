@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::bridge::OutputInfo;
+use crate::cancel::CancellationToken;
 use crate::runtime::{PluginRuntime, RunContext, RunOutputs};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,7 +45,12 @@ impl NativeSubprocessRuntime {
 }
 
 impl PluginRuntime for NativeSubprocessRuntime {
-    fn run_file(&self, ctx: &RunContext, input_path: &Path) -> Result<RunOutputs> {
+    fn run_file(
+        &self,
+        ctx: &RunContext,
+        input_path: &Path,
+        cancel_token: &CancellationToken,
+    ) -> Result<RunOutputs> {
         if ctx.entrypoint.trim().is_empty() {
             anyhow::bail!("Entrypoint is required for native runtime");
         }
@@ -99,10 +105,18 @@ impl PluginRuntime for NativeSubprocessRuntime {
         }
 
         let mut stdout_reader = BufReader::new(stdout);
+        let poll_interval = Duration::from_millis(200);
         loop {
-            let frame = match rx.recv() {
+            if cancel_token.is_cancelled() {
+                let _ = child.kill();
+                anyhow::bail!("Native plugin cancelled");
+            }
+            let frame = match rx.recv_timeout(poll_interval) {
                 Ok(frame) => frame,
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match frame {
                 ControlFrame::OutputBegin {
@@ -117,11 +131,17 @@ impl PluginRuntime for NativeSubprocessRuntime {
                             stream_index_expected
                         );
                     }
+                    // Look up expected hash, falling back to wildcard "*" if present
                     let expected_hash = ctx
                         .schema_hashes
                         .get(&output)
+                        .or_else(|| ctx.schema_hashes.get("*"))
                         .ok_or_else(|| anyhow::anyhow!("Unknown output '{}'", output))?;
-                    if expected_hash != &schema_hash {
+                    // Skip hash validation for backtest and preview modes
+                    if expected_hash != "backtest"
+                        && expected_hash != "preview"
+                        && expected_hash != &schema_hash
+                    {
                         anyhow::bail!(
                             "Schema hash mismatch for '{}': expected {}, got {}",
                             output,
@@ -191,11 +211,23 @@ impl PluginRuntime for NativeSubprocessRuntime {
             }
         }
 
-        let status = child.wait().context("Failed to wait for native plugin")?;
-        if !status.success() {
-            anyhow::bail!("Native plugin exited with status {}", status);
+        // Wait for process exit, with cancellation support
+        loop {
+            if cancel_token.is_cancelled() {
+                let _ = child.kill();
+                anyhow::bail!("Native plugin cancelled");
+            }
+            if let Some(status) = child
+                .try_wait()
+                .context("Failed to poll native plugin status")?
+            {
+                if !status.success() {
+                    anyhow::bail!("Native plugin exited with status {}", status);
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
-
         let _ = stderr_handle.join();
 
         Ok(RunOutputs {
@@ -206,7 +238,10 @@ impl PluginRuntime for NativeSubprocessRuntime {
     }
 }
 
-fn spawn_stderr_reader(stderr: std::process::ChildStderr, tx: Sender<ControlFrame>) -> thread::JoinHandle<()> {
+fn spawn_stderr_reader(
+    stderr: std::process::ChildStderr,
+    tx: Sender<ControlFrame>,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
@@ -279,7 +314,8 @@ fn parse_control_frame(line: &str) -> Result<ControlFrame> {
             stream_index: value
                 .get("stream_index")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("output_begin missing stream_index"))? as u32,
+                .ok_or_else(|| anyhow::anyhow!("output_begin missing stream_index"))?
+                as u32,
         }),
         "output_end" => Ok(ControlFrame::OutputEnd {
             output: value
@@ -291,7 +327,8 @@ fn parse_control_frame(line: &str) -> Result<ControlFrame> {
             stream_index: value
                 .get("stream_index")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("output_end missing stream_index"))? as u32,
+                .ok_or_else(|| anyhow::anyhow!("output_end missing stream_index"))?
+                as u32,
         }),
         "warning" => Ok(ControlFrame::Warning(
             value
@@ -317,8 +354,8 @@ fn parse_control_frame(line: &str) -> Result<ControlFrame> {
 fn read_arrow_stream(
     reader: &mut BufReader<std::process::ChildStdout>,
 ) -> Result<Vec<OutputBatch>> {
-    let mut stream_reader = StreamReader::try_new(reader, None)
-        .context("stdout is not valid Arrow IPC stream")?;
+    let mut stream_reader =
+        StreamReader::try_new(reader, None).context("stdout is not valid Arrow IPC stream")?;
     let mut batches = Vec::new();
     for batch in stream_reader.by_ref() {
         let batch = batch.context("Failed to read Arrow batch")?;

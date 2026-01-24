@@ -7,8 +7,13 @@
 
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{color_for_extension, format_size, format_time, print_table_colored};
+use crate::cli::workspace;
 use casparian::scout::scan_path;
-use casparian::scout::{Database, ScannedFile, Scanner, Source, SourceId, SourceType};
+use casparian::scout::{
+    Database, ScanConfig, ScannedFile, Scanner, Source, SourceId, SourceType, WorkspaceId,
+};
+use casparian::telemetry::{scan_config_telemetry, TelemetryRecorder};
+use casparian_protocol::telemetry as protocol_telemetry;
 use comfy_table::Color;
 use crossterm::{
     event::{self, Event, KeyCode},
@@ -25,7 +30,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::stdout;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::info_span;
+use uuid::Uuid;
 
 /// Arguments for the scan command
 #[derive(Debug)]
@@ -137,7 +145,7 @@ fn matches_patterns(
 ///
 /// Uses the consolidated Scanner for file discovery, storage, and cache building.
 /// CLI-specific filters are applied post-scan for display and tagging.
-pub fn run(args: ScanArgs) -> anyhow::Result<()> {
+pub fn run(args: ScanArgs, telemetry: Option<TelemetryRecorder>) -> anyhow::Result<()> {
     if args.json && args.interactive {
         return Err(HelpfulError::new("Cannot combine --json and --interactive")
             .with_context("Interactive mode renders a TUI, not JSON output")
@@ -150,10 +158,9 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
         return Err(match err {
             scan_path::ScanPathError::NotFound(path) => HelpfulError::path_not_found(&path),
             scan_path::ScanPathError::NotDirectory(path) => HelpfulError::not_a_directory(&path),
-            scan_path::ScanPathError::NotReadable(path) => HelpfulError::new(format!(
-                "Cannot read directory: {}",
-                path.display()
-            )),
+            scan_path::ScanPathError::NotReadable(path) => {
+                HelpfulError::new(format!("Cannot read directory: {}", path.display()))
+            }
         }
         .into());
     }
@@ -166,25 +173,140 @@ pub fn run(args: ScanArgs) -> anyhow::Result<()> {
     let db_dir = db_path.parent().unwrap();
     fs::create_dir_all(db_dir)?;
 
-    let db = Database::open(&db_path)
-        .map_err(|e| HelpfulError::new(format!("Failed to open database: {}", e))
-            .with_context(format!("Database path: {}", db_path.display())))?;
+    let db = Database::open(&db_path).map_err(|e| {
+        HelpfulError::new(format!("Failed to open database: {}", e))
+            .with_context(format!("Database path: {}", db_path.display()))
+    })?;
+    let workspace_id = ensure_workspace_id(&db)?;
 
     // Get or create source
-    let source = get_or_create_source(&db, &scan_path)?;
+    let source = get_or_create_source(&db, &workspace_id, &scan_path)?;
 
     // Use Scanner for discovery, storage, and cache building
     // Note: Scanner scans ALL files; CLI filters are applied post-scan
-    let scanner = Scanner::new(db.clone());
-    let scan_result = scanner
-        .scan(&source, None, None)
-        
-        .map_err(|e| HelpfulError::new(format!("Scan failed: {}", e)))?;
+    let scan_config = ScanConfig::default();
+    let scanner = Scanner::with_config(db.clone(), scan_config.clone());
+
+    let telemetry_start = Instant::now();
+    let telemetry_context = telemetry.as_ref().map(|recorder| {
+        let run_id = Uuid::new_v4().to_string();
+        let source_id = source.id.to_string();
+        let root_hash = Some(recorder.hasher().hash_path(std::path::Path::new(&source.path)));
+        let payload = protocol_telemetry::ScanStarted {
+            run_id: run_id.clone(),
+            source_id: source_id.clone(),
+            root_hash,
+            started_at: chrono::Utc::now(),
+            config: scan_config_telemetry(&scan_config),
+        };
+        let parent_id = recorder.emit_domain(
+            protocol_telemetry::events::SCAN_START,
+            Some(&run_id),
+            None,
+            &payload,
+        );
+        (run_id, source_id, parent_id)
+    });
+
+    let (progress_tx, progress_handle) = match (telemetry.clone(), telemetry_context.clone()) {
+        (Some(recorder), Some((run_id, source_id, parent_id))) => {
+            let (tx, rx) = mpsc::channel::<casparian::scout::ScanProgress>();
+            let handle = std::thread::spawn(move || {
+                let mut last_emit = Instant::now() - Duration::from_secs(1);
+                while let Ok(progress) = rx.recv() {
+                    let now = Instant::now();
+                    if now.duration_since(last_emit) < Duration::from_secs(1) {
+                        continue;
+                    }
+                    last_emit = now;
+                    let payload = protocol_telemetry::ScanProgress {
+                        run_id: run_id.clone(),
+                        source_id: source_id.clone(),
+                        elapsed_ms: progress.elapsed_ms,
+                        files_found: progress.files_found,
+                        files_persisted: progress.files_persisted,
+                        dirs_scanned: progress.dirs_scanned,
+                        files_per_sec: progress.files_per_sec,
+                        stalled: progress.stalled,
+                    };
+                    recorder.emit_domain(
+                        protocol_telemetry::events::SCAN_PROGRESS,
+                        Some(&run_id),
+                        parent_id.as_deref(),
+                        &payload,
+                    );
+                }
+            });
+            (Some(tx), Some(handle))
+        }
+        _ => (None, None),
+    };
+
+    let scan_result = if let Some((run_id, _, _)) = telemetry_context.as_ref() {
+        let span = info_span!("scan.run", run_id = %run_id, source_id = %source.id);
+        let _guard = span.enter();
+        scanner.scan(&source, progress_tx.clone(), None)
+    } else {
+        scanner.scan(&source, progress_tx.clone(), None)
+    };
+    drop(progress_tx);
+    if let Some(handle) = progress_handle {
+        let _ = handle.join();
+    }
+
+    let scan_result = match scan_result {
+        Ok(result) => {
+            if let (Some(recorder), Some((run_id, source_id, _))) =
+                (telemetry.as_ref(), telemetry_context.as_ref())
+            {
+                let payload = protocol_telemetry::ScanCompleted {
+                    run_id: run_id.clone(),
+                    source_id: source_id.clone(),
+                    duration_ms: result.stats.duration_ms,
+                    files_discovered: result.stats.files_discovered,
+                    files_persisted: result.stats.files_persisted,
+                    files_new: result.stats.files_new,
+                    files_changed: result.stats.files_changed,
+                    files_deleted: result.stats.files_deleted,
+                    dirs_scanned: result.stats.dirs_scanned,
+                    bytes_scanned: result.stats.bytes_scanned,
+                    errors: result.stats.errors,
+                };
+                recorder.emit_domain(
+                    protocol_telemetry::events::SCAN_COMPLETE,
+                    Some(run_id),
+                    None,
+                    &payload,
+                );
+            }
+            result
+        }
+        Err(err) => {
+            if let (Some(recorder), Some((run_id, source_id, _))) =
+                (telemetry.as_ref(), telemetry_context.as_ref())
+            {
+                let (error_class, io_kind) = classify_scan_error(&err);
+                let payload = protocol_telemetry::ScanFailed {
+                    run_id: run_id.clone(),
+                    source_id: source_id.clone(),
+                    duration_ms: telemetry_start.elapsed().as_millis() as u64,
+                    error_class,
+                    io_kind,
+                };
+                recorder.emit_domain(
+                    protocol_telemetry::events::SCAN_FAIL,
+                    Some(run_id),
+                    None,
+                    &payload,
+                );
+            }
+            return Err(HelpfulError::new(format!("Scan failed: {}", err)).into());
+        }
+    };
 
     // Query all files from database
     let db_files = db
         .list_files_by_source(&source.id, 1_000_000)
-        
         .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
 
     // Convert to DiscoveredFile and apply CLI filters
@@ -243,6 +365,34 @@ fn scanned_to_discovered(file: &ScannedFile) -> DiscoveredFile {
         extension,
         size: file.size,
         modified,
+    }
+}
+
+fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Option<String>) {
+    use casparian::scout::error::ScoutError;
+    match err {
+        ScoutError::Io(io_err) => (
+            "io_error".to_string(),
+            Some(format!("{:?}", io_err.kind())),
+        ),
+        ScoutError::Database(_) => ("db_error".to_string(), None),
+        ScoutError::Walk(_) => ("walk_error".to_string(), None),
+        ScoutError::Json(_) => ("json_error".to_string(), None),
+        ScoutError::Csv(_) => ("csv_error".to_string(), None),
+        ScoutError::Arrow(_) => ("arrow_error".to_string(), None),
+        ScoutError::Parquet(_) => ("parquet_error".to_string(), None),
+        ScoutError::Config(_) => ("config_error".to_string(), None),
+        ScoutError::SourceNotFound(_) => ("source_not_found".to_string(), None),
+        ScoutError::RouteNotFound(_) => ("route_not_found".to_string(), None),
+        ScoutError::FileNotFound(_) => ("file_not_found".to_string(), None),
+        ScoutError::UnsupportedFormat(_) => ("unsupported_format".to_string(), None),
+        ScoutError::SchemaInference(_) => ("schema_inference".to_string(), None),
+        ScoutError::Transform(_) => ("transform".to_string(), None),
+        ScoutError::Pattern(_) => ("pattern".to_string(), None),
+        ScoutError::InvalidState(_) => ("invalid_state".to_string(), None),
+        ScoutError::Extractor(_) => ("extractor".to_string(), None),
+        ScoutError::SourceIsChildOfExisting { .. } => ("source_overlap".to_string(), None),
+        ScoutError::SourceIsParentOfExisting { .. } => ("source_overlap".to_string(), None),
     }
 }
 
@@ -370,11 +520,22 @@ fn tag_filtered_files(
 }
 
 /// Get or create a source for the scan path
-fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<Source> {
+fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
+    workspace::resolve_active_workspace_id(db).map_err(|e| {
+        e.with_context("The workspace registry is required for scanning")
+    })
+}
+
+fn get_or_create_source(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    path: &PathBuf,
+) -> anyhow::Result<Source> {
     let path_str = path.display().to_string();
 
     // Try to find existing source by path
-    let sources = db.list_sources()
+    let sources = db
+        .list_sources(workspace_id)
         .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
     for source in sources {
@@ -385,12 +546,14 @@ fn get_or_create_source(db: &Database, path: &PathBuf) -> anyhow::Result<Source>
 
     // Create new source
     let id = SourceId::new();
-    let name = path.file_name()
+    let name = path
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("scan")
         .to_string();
 
     let source = Source {
+        workspace_id: *workspace_id,
         id: id.clone(),
         name,
         source_type: SourceType::Local,
@@ -414,11 +577,7 @@ fn build_summary(files: &[DiscoveredFile], directories_scanned: usize) -> ScanSu
     for file in files {
         total_size += file.size;
 
-        let ext = file
-            .extension
-            .as_deref()
-            .unwrap_or("(no ext)")
-            .to_string();
+        let ext = file.extension.as_deref().unwrap_or("(no ext)").to_string();
 
         *files_by_type.entry(ext.clone()).or_insert(0) += 1;
         *size_by_type.entry(ext).or_insert(0) += file.size;
@@ -460,7 +619,12 @@ fn output_stats(result: &ScanResult) {
 
         for (ext, count) in types {
             let size = summary.size_by_type.get(ext).copied().unwrap_or(0);
-            println!("  {:<12} {:>6} files  {:>10}", ext, count, format_size(size));
+            println!(
+                "  {:<12} {:>6} files  {:>10}",
+                ext,
+                count,
+                format_size(size)
+            );
         }
     }
 }
@@ -553,7 +717,10 @@ fn print_next_steps(result: &ScanResult, tag: Option<&str>) {
 
     if tag.is_some() {
         // Already tagged, show how to view and process
-        println!("  \x1b[36mView tagged files:\x1b[0m casparian files --topic {}", tag.unwrap());
+        println!(
+            "  \x1b[36mView tagged files:\x1b[0m casparian files --topic {}",
+            tag.unwrap()
+        );
         println!("  \x1b[36mList all files:\x1b[0m    casparian files");
     } else {
         // Not tagged, show how to filter and tag
@@ -799,10 +966,7 @@ fn draw_interactive(frame: &mut Frame, state: &mut InteractiveState) {
                 .to_string();
 
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<4} ", ext_display),
-                    ext_style,
-                ),
+                Span::styled(format!("{:<4} ", ext_display), ext_style),
                 Span::raw(format!("{:>8}  ", format_size(file.size))),
                 Span::raw(display_path),
             ]))
@@ -852,10 +1016,11 @@ fn draw_interactive(frame: &mut Frame, state: &mut InteractiveState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use casparian_tape::TapeWriter;
     use std::fs::File;
     use std::io::Write;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -937,7 +1102,7 @@ mod tests {
             tag: None,
         };
 
-        run(args).unwrap();
+        run(args, None).unwrap();
     }
 
     #[test]
@@ -961,7 +1126,7 @@ mod tests {
             tag: None,
         };
 
-        run(args).unwrap();
+        run(args, None).unwrap();
     }
 
     #[test]
@@ -985,7 +1150,7 @@ mod tests {
             tag: None,
         };
 
-        run(args).unwrap();
+        run(args, None).unwrap();
     }
 
     #[test]
@@ -1006,7 +1171,7 @@ mod tests {
             tag: None,
         };
 
-        let result = run(args);
+        let result = run(args, None);
         assert!(result.is_err());
     }
 
@@ -1034,7 +1199,7 @@ mod tests {
             tag: None,
         };
 
-        let result = run(args);
+        let result = run(args, None);
         assert!(result.is_err());
     }
 
@@ -1072,5 +1237,61 @@ mod tests {
         assert_eq!(summary.files_by_type.get("json"), Some(&1));
         assert_eq!(summary.size_by_type.get("csv"), Some(&300));
         assert_eq!(summary.directories_scanned, 5);
+    }
+
+    #[test]
+    fn test_scan_telemetry_progress_throttled() {
+        let _env = TestEnv::new();
+        let temp_dir = TempDir::new().unwrap();
+        create_test_files(temp_dir.path());
+
+        let tape_path = temp_dir.path().join("session.tape");
+        let writer = TapeWriter::new(&tape_path).unwrap();
+        let telemetry = TelemetryRecorder::new(Arc::new(writer)).unwrap();
+
+        let args = ScanArgs {
+            path: temp_dir.path().to_path_buf(),
+            types: vec![],
+            patterns: vec![],
+            recursive: true,
+            depth: None,
+            min_size: None,
+            max_size: None,
+            json: true,
+            stats: false,
+            quiet: false,
+            interactive: false,
+            tag: None,
+        };
+
+        run(args, Some(telemetry)).unwrap();
+
+        let contents = fs::read_to_string(&tape_path).unwrap();
+        let mut progress_events = 0usize;
+        let mut duration_ms = None;
+
+        for line in contents.lines().filter(|l| !l.trim().is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let event_name = &value["event_name"];
+            if event_name["type"] == "domain_event" {
+                if event_name["name"] == "scan.progress" {
+                    progress_events += 1;
+                }
+                if event_name["name"] == "scan.complete" {
+                    duration_ms = value
+                        .get("payload")
+                        .and_then(|payload| payload.get("duration_ms"))
+                        .and_then(|v| v.as_u64());
+                }
+            }
+        }
+
+        let expected_max = duration_ms.map(|ms| (ms / 1_000) + 2).unwrap_or(2);
+        assert!(
+            progress_events <= expected_max as usize,
+            "progress events {} exceeded expected max {}",
+            progress_events,
+            expected_max
+        );
     }
 }

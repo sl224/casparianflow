@@ -179,18 +179,14 @@ fn run_drain(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             DbValue::from(WorkerStatus::Draining.as_str()),
             DbValue::from(worker.hostname.as_str()),
         ],
-    )
-    ?;
+    )?;
 
     println!("Worker '{}' set to DRAINING", id);
     println!();
     println!("The worker will finish its current job and stop accepting new work.");
 
     if worker.current_job_id.is_some() {
-        println!(
-            "Current job: #{}",
-            worker.current_job_id.unwrap()
-        );
+        println!("Current job: #{}", worker.current_job_id.unwrap());
     }
 
     Ok(())
@@ -243,8 +239,7 @@ fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<()> {
                 DbValue::from(ProcessingStatus::Queued.as_str()),
                 DbValue::from(job_id),
             ],
-        )
-        ?;
+        )?;
 
         println!("Requeued job #{}", job_id);
     }
@@ -253,8 +248,7 @@ fn run_remove(db_path: &PathBuf, id: &str, force: bool) -> anyhow::Result<()> {
     conn.execute(
         "DELETE FROM cf_worker_node WHERE hostname = ?",
         &[DbValue::from(worker.hostname.as_str())],
-    )
-    ?;
+    )?;
 
     println!("Worker '{}' removed", id);
 
@@ -293,7 +287,10 @@ fn run_status(db_path: &PathBuf) -> anyhow::Result<()> {
         println!("ACTIVE WORKERS:");
         for worker in workers.iter().filter(|w| w.status == WorkerStatus::Busy) {
             if let Some(job_id) = worker.current_job_id {
-                println!("  {} (pid {}): Job #{}", worker.hostname, worker.pid, job_id);
+                println!(
+                    "  {} (pid {}): Job #{}",
+                    worker.hostname, worker.pid, job_id
+                );
             }
         }
     }
@@ -336,8 +333,7 @@ fn get_all_workers(conn: &DbConnection) -> anyhow::Result<Vec<Worker>> {
         return Ok(Vec::new());
     }
 
-    let rows = conn
-        .query_all(
+    let rows = conn.query_all(
         r#"
         SELECT
             hostname,
@@ -352,8 +348,7 @@ fn get_all_workers(conn: &DbConnection) -> anyhow::Result<Vec<Worker>> {
         ORDER BY last_heartbeat DESC
         "#,
         &[],
-        )
-        ?;
+    )?;
 
     let workers: Vec<Worker> = rows
         .into_iter()
@@ -381,8 +376,7 @@ fn get_worker_by_id(conn: &DbConnection, id: &str) -> anyhow::Result<Option<Work
         return Ok(None);
     }
 
-    let row = conn
-        .query_optional(
+    let row = conn.query_optional(
         r#"
         SELECT
             hostname,
@@ -398,8 +392,7 @@ fn get_worker_by_id(conn: &DbConnection, id: &str) -> anyhow::Result<Option<Work
         LIMIT 1
         "#,
         &[DbValue::from(id), DbValue::from(format!("%{}%", id))],
-        )
-        ?;
+    )?;
 
     match row {
         Some(r) => {
@@ -425,25 +418,24 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, i64)> 
         return Ok((0, 0, 0, 0));
     }
 
-    let row = conn
-        .query_one(
-            &format!(
-                r#"
+    let row = conn.query_one(
+        &format!(
+            r#"
         SELECT
             COALESCE(SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END), 0) as pending,
             COALESCE(SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END), 0) as running,
             COALESCE(SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END), 0) as completed,
-            COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed
+            COALESCE(SUM(CASE WHEN status IN ('{failed}', '{aborted}') THEN 1 ELSE 0 END), 0) as failed
         FROM cf_processing_queue
         "#,
-                queued = ProcessingStatus::Queued.as_str(),
-                running = ProcessingStatus::Running.as_str(),
-                completed = ProcessingStatus::Completed.as_str(),
-                failed = ProcessingStatus::Failed.as_str(),
-            ),
-            &[],
-        )
-        ?;
+            queued = ProcessingStatus::Queued.as_str(),
+            running = ProcessingStatus::Running.as_str(),
+            completed = ProcessingStatus::Completed.as_str(),
+            failed = ProcessingStatus::Failed.as_str(),
+            aborted = ProcessingStatus::Aborted.as_str(),
+        ),
+        &[],
+    )?;
 
     Ok((
         row.get(0).unwrap_or_default(),
@@ -454,12 +446,10 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, i64)> 
 }
 
 fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
-    let row = conn
-        .query_optional(
-            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
-            &[DbValue::from(table)],
-        )
-        ?;
+    let row = conn.query_optional(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+        &[DbValue::from(table)],
+    )?;
     Ok(row.is_some())
 }
 
@@ -511,7 +501,10 @@ fn print_workers_table(workers: &[Worker]) {
             vec![
                 (w.hostname.clone(), None),
                 (w.pid.to_string(), None),
-                (w.status.as_str().to_string(), Some(worker_status_color(&w.status))),
+                (
+                    w.status.as_str().to_string(),
+                    Some(worker_status_color(&w.status)),
+                ),
                 (job_display, None),
                 (last_seen, None),
             ]
@@ -535,7 +528,8 @@ fn print_worker_details(worker: &Worker) {
     println!();
     println!("TIMELINE:");
     println!("  Started:    {}", format_datetime(&worker.started_at));
-    println!("  Last seen:  {} ({})",
+    println!(
+        "  Last seen:  {} ({})",
         format_datetime(&worker.last_heartbeat),
         format_relative_time(&worker.last_heartbeat)
     );
@@ -554,13 +548,22 @@ fn print_worker_details(worker: &Worker) {
     println!("TRY:");
     match worker.status {
         WorkerStatus::Idle | WorkerStatus::Busy | WorkerStatus::Alive => {
-            println!("  casparian worker-cli drain {}   # Stop accepting new jobs", worker.hostname);
+            println!(
+                "  casparian worker-cli drain {}   # Stop accepting new jobs",
+                worker.hostname
+            );
         }
         WorkerStatus::Draining | WorkerStatus::ShuttingDown => {
-            println!("  casparian worker-cli remove {}  # Remove after draining", worker.hostname);
+            println!(
+                "  casparian worker-cli remove {}  # Remove after draining",
+                worker.hostname
+            );
         }
         WorkerStatus::Offline => {
-            println!("  casparian worker-cli remove {}  # Remove offline worker", worker.hostname);
+            println!(
+                "  casparian worker-cli remove {}  # Remove offline worker",
+                worker.hostname
+            );
         }
     }
 }
@@ -624,7 +627,10 @@ mod tests {
             parse_worker_status(WorkerStatus::Idle.as_str()).unwrap(),
             WorkerStatus::Idle
         );
-        assert!(parse_worker_status("unknown").is_err(), "Unknown status should return error");
+        assert!(
+            parse_worker_status("unknown").is_err(),
+            "Unknown status should return error"
+        );
     }
 
     #[test]

@@ -45,7 +45,10 @@ fn parse_i64_id(label: &str, value: &str) -> Result<i64, IdParseError> {
 
 fn validate_i64_id(label: &str, value: i64) -> Result<i64, IdParseError> {
     if value <= 0 {
-        return Err(IdParseError::new(format!("Invalid {}: must be positive", label)));
+        return Err(IdParseError::new(format!(
+            "Invalid {}: must be positive",
+            label
+        )));
     }
     Ok(value)
 }
@@ -57,6 +60,84 @@ fn new_random_id() -> i64 {
         1
     } else {
         id
+    }
+}
+
+/// Unique identifier for a workspace (UUID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkspaceId(Uuid);
+
+impl WorkspaceId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, IdParseError> {
+        let parsed = Uuid::parse_str(value)
+            .map_err(|e| IdParseError::new(format!("Invalid workspace ID: {}", e)))?;
+        Ok(Self(parsed))
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for WorkspaceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for WorkspaceId {
+    type Err = IdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        WorkspaceId::parse(s)
+    }
+}
+
+impl TryFrom<String> for WorkspaceId {
+    type Error = IdParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        WorkspaceId::parse(&value)
+    }
+}
+
+impl Serialize for WorkspaceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value = self.0.to_string();
+        serializer.serialize_str(&value)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = WorkspaceId;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("UUID workspace ID")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                WorkspaceId::parse(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -158,20 +239,22 @@ impl<'de> Deserialize<'de> for SourceId {
     }
 }
 
-/// Unique identifier for a tagging rule.
+/// Unique identifier for a tagging rule (UUID).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TaggingRuleId(i64);
+pub struct TaggingRuleId(Uuid);
 
 impl TaggingRuleId {
     pub fn new() -> Self {
-        Self(new_random_id())
+        Self(Uuid::new_v4())
     }
 
     pub fn parse(value: &str) -> Result<Self, IdParseError> {
-        Ok(Self(parse_i64_id("tagging rule ID", value)?))
+        let parsed = Uuid::parse_str(value)
+            .map_err(|e| IdParseError::new(format!("Invalid tagging rule ID: {}", e)))?;
+        Ok(Self(parsed))
     }
 
-    pub fn as_i64(&self) -> i64 {
+    pub fn as_uuid(&self) -> Uuid {
         self.0
     }
 }
@@ -198,20 +281,13 @@ impl TryFrom<String> for TaggingRuleId {
     }
 }
 
-impl TryFrom<i64> for TaggingRuleId {
-    type Error = IdParseError;
-
-    fn try_from(value: i64) -> Result<Self, Self::Error> {
-        Ok(Self(validate_i64_id("tagging rule ID", value)?))
-    }
-}
-
 impl Serialize for TaggingRuleId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_i64(self.0)
+        let value = self.0.to_string();
+        serializer.serialize_str(&value)
     }
 }
 
@@ -226,22 +302,7 @@ impl<'de> Deserialize<'de> for TaggingRuleId {
             type Value = TaggingRuleId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("positive integer tagging rule ID")
-            }
-
-            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                TaggingRuleId::try_from(value).map_err(E::custom)
-            }
-
-            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                let value = i64::try_from(value).map_err(E::custom)?;
-                TaggingRuleId::try_from(value).map_err(E::custom)
+                formatter.write_str("UUID tagging rule ID")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -260,10 +321,24 @@ impl<'de> Deserialize<'de> for TaggingRuleId {
 // Source Types
 // ============================================================================
 
+/// A workspace (case) that scopes sources, files, and rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Workspace {
+    /// Unique identifier
+    pub id: WorkspaceId,
+    /// Human-readable name
+    pub name: String,
+    /// When the workspace was created
+    pub created_at: DateTime<Utc>,
+}
+
 /// A source location to watch for files
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Source {
+    /// Workspace this source belongs to
+    pub workspace_id: WorkspaceId,
     /// Unique identifier
     pub id: SourceId,
     /// Human-readable name
@@ -318,8 +393,8 @@ pub struct TaggingRule {
     pub id: TaggingRuleId,
     /// Human-readable name
     pub name: String,
-    /// Source ID this rule applies to
-    pub source_id: SourceId,
+    /// Workspace ID this rule applies to
+    pub workspace_id: WorkspaceId,
     /// Glob pattern to match files (e.g., "*.csv", "data/**/*.json")
     pub pattern: String,
     /// Tag to assign to matching files
@@ -355,6 +430,16 @@ impl TagSource {
             _ => None,
         }
     }
+}
+
+/// A tag assigned to a file (multi-tag capable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTag {
+    pub tag: String,
+    pub tag_source: TagSource,
+    pub rule_id: Option<TaggingRuleId>,
+    pub assigned_at: DateTime<Utc>,
 }
 
 // ============================================================================
@@ -429,6 +514,8 @@ impl FileStatus {
 pub struct ScannedFile {
     /// Database ID (None if not yet persisted)
     pub id: Option<i64>,
+    /// Workspace ID this file belongs to
+    pub workspace_id: WorkspaceId,
     /// Source ID this file belongs to
     pub source_id: SourceId,
     /// Full path to the file
@@ -444,6 +531,8 @@ pub struct ScannedFile {
     /// File extension (lowercase, without dot)
     /// e.g., "csv", "json", "rs". None for files without extension.
     pub extension: Option<String>,
+    /// True if this row represents a directory entry
+    pub is_dir: bool,
     /// File size in bytes
     pub size: u64,
     /// Last modification time (Unix timestamp milliseconds)
@@ -452,12 +541,6 @@ pub struct ScannedFile {
     pub content_hash: Option<String>,
     /// Current status
     pub status: FileStatus,
-    /// Assigned tag (None = untagged)
-    pub tag: Option<String>,
-    /// How the tag was assigned: rule or manual
-    pub tag_source: Option<TagSource>,
-    /// ID of the tagging rule that matched (if tag_source = "rule")
-    pub rule_id: Option<TaggingRuleId>,
     /// Manual plugin override (None = use tag subscription)
     pub manual_plugin: Option<String>,
     /// Error message if failed
@@ -497,31 +580,37 @@ fn split_rel_path(rel_path: &str) -> (&str, &str) {
 /// - "README" → None
 fn extract_extension(name: &str) -> Option<String> {
     name.rsplit_once('.')
-        .filter(|(base, _)| !base.is_empty())  // Skip dotfiles like ".gitignore"
+        .filter(|(base, _)| !base.is_empty()) // Skip dotfiles like ".gitignore"
         .map(|(_, ext)| ext.to_lowercase())
 }
 
 impl ScannedFile {
     /// Create a new pending file
-    pub fn new(source_id: SourceId, path: &str, rel_path: &str, size: u64, mtime: i64) -> Self {
+    pub fn new(
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        path: &str,
+        rel_path: &str,
+        size: u64,
+        mtime: i64,
+    ) -> Self {
         let now = Utc::now();
         let (parent_path, name) = split_rel_path(rel_path);
         let extension = extract_extension(name);
         Self {
             id: None,
+            workspace_id,
             source_id,
             path: path.to_string(),
             rel_path: rel_path.to_string(),
             parent_path: parent_path.to_string(),
             name: name.to_string(),
             extension,
+            is_dir: false,
             size,
             mtime,
             content_hash: None,
             status: FileStatus::Pending,
-            tag: None,
-            tag_source: None,
-            rule_id: None,
             manual_plugin: None,
             error: None,
             first_seen_at: now,
@@ -540,6 +629,7 @@ impl ScannedFile {
     /// Use this in hot paths where strings are already owned (e.g., scanner).
     /// For source_id, pass the SourceId for this scan to avoid string duplication.
     pub fn from_parts(
+        workspace_id: WorkspaceId,
         source_id: SourceId,
         path: String,
         rel_path: String,
@@ -547,27 +637,43 @@ impl ScannedFile {
         mtime: i64,
     ) -> Self {
         let now = Utc::now();
+        Self::from_parts_with_now(workspace_id, source_id, path, rel_path, size, mtime, now)
+    }
+
+    /// F-007: Create from pre-allocated strings with a provided timestamp.
+    ///
+    /// This avoids per-file `Utc::now()` calls in hot paths while keeping
+    /// timestamps consistent within a scan batch or thread.
+    pub fn from_parts_with_now(
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        path: String,
+        rel_path: String,
+        size: u64,
+        mtime: i64,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let last_seen_at = now.clone();
         let (parent_path, name) = split_rel_path(&rel_path);
         let extension = extract_extension(name);
         Self {
             id: None,
+            workspace_id,
             source_id,
             path,
             parent_path: parent_path.to_string(),
             name: name.to_string(),
             extension,
             rel_path,
+            is_dir: false,
             size,
             mtime,
             content_hash: None,
             status: FileStatus::Pending,
-            tag: None,
-            tag_source: None,
-            rule_id: None,
             manual_plugin: None,
             error: None,
             first_seen_at: now,
-            last_seen_at: now,
+            last_seen_at,
             processed_at: None,
             sentinel_job_id: None,
             // Extractor metadata defaults (Phase 6)
@@ -576,7 +682,6 @@ impl ScannedFile {
             extracted_at: None,
         }
     }
-
 }
 
 // ============================================================================
@@ -848,8 +953,10 @@ pub struct BatchUpsertResult {
 /// Statistics from the database
 #[derive(Debug, Clone, Default)]
 pub struct DbStats {
+    pub total_workspaces: u64,
     pub total_sources: u64,
     pub total_tagging_rules: u64,
+    pub total_tags: u64,
     pub total_files: u64,
     pub files_pending: u64,
     pub files_tagged: u64,
@@ -947,12 +1054,12 @@ mod tests {
 
     #[test]
     fn test_tagging_rule_serialization() {
-        let source_id = SourceId::new();
+        let workspace_id = WorkspaceId::new();
         let rule_id = TaggingRuleId::new();
         let rule = TaggingRule {
             id: rule_id,
             name: "CSV Files".to_string(),
-            source_id,
+            workspace_id,
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,

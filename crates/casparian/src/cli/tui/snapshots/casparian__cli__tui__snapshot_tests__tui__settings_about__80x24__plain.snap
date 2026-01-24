@@ -1,0 +1,27 @@
+---
+source: crates/casparian/src/cli/tui/snapshot_tests.rs
+expression: plain
+---
+ Casparian Flow | View: Settings | WS: alpha-case | DB: duckdb | Run: 1 | Fai...
+
+────────────────────────────────────────────────────────────────────────────────
+╭ NAV ─────────────╮                                    ┌ Inspector ───────────┐
+│Views             │ ┌ General ───────────────────────┐ │Version: 0.1.0        │
+│[0] Home          │ │  Default source path:   ~/data │ │Database:             │
+│[1] Discover      │ │  Auto-scan on startup:  Yes    │ │SNAPSHOT_DB.duckdb    │
+│[2] Parser Bench  │ │  Confirm destructive:   Yes    │ │(duckdb)              │
+│[3] Jobs          │ │                                │ │Config:               │
+│[4] Sources       │ └────────────────────────────────┘ │~/.casparian_flow/conf│
+│[5] Approvals     │ ┌ Display ───────────────────────┐ │ig.toml               │
+│[6] Query         │ │  Theme:                 dark   │ │                      │
+│[7] Sessions      │ │  Unicode symbols:       Yes    │ │                      │
+│[,] Settings      │ │  Show hidden files:     No     │ │                      │
+│                  │ └────────────────────────────────┘ │                      │
+│Context           │ ┌ About ─────────────────────────┐ │                      │
+│Workspace: alp... │ │  Version:    0.1.0             │ │                      │
+│Category: About   │ │  Database:   SNAPSHOT_DB.duckdb│ │                      │
+│                  │ │  Config:     ~/.casparian_flow/│ │                      │
+│                  │ └────────────────────────────────┘ │                      │
+╰──────────────────╯                                    └──────────────────────┘
+────────────────────────────────────────────────────────────────────────────────
+       [↑/↓] Navigate  [Tab] Category  [Enter] Edit/Toggle  [I] Inspector

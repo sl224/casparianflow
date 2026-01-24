@@ -1,0 +1,27 @@
+---
+source: crates/casparian/src/cli/tui/snapshot_tests.rs
+expression: plain
+---
+ Casparian Flow | View: Discover | WS: alpha-case | DB: duckdb | Run: 1 | Fai...
+
+──────────┌ Tagging Rules ───────────────────────────────────────────┐──────────
+╭ NAV ────│  Pattern              Tag        On                      │─────────┐
+│Views    │  ────────────────────────────────────────────            │-lake    │
+│[0] Home │  reports/**/*.csv    report      ✓                       │         │
+│[1] Disco│► trades/**/*.par...  trade       ✓                       │         │
+│[2] Parse│  archive/**/*.zip    archive                             │iting: no│
+│[3] Jobs │                                                          │         │
+│[4] Sourc│                                                          │         │
+│[5] Appro│                                                          │ate>_<reg│
+│[6] Query│                                                          │         │
+│[7] Sessi│                                                          │         │
+│[,] Setti│                                                          │ial      │
+│         │                                                          │         │
+│Context  │                                                          │         │
+│Workspace│                                                          │         │
+│Source: a│                                                          │         │
+│Tag: All │                                                          │         │
+│         │  [n] New  [e] Edit  [d] Del  [Enter] Toggle  [Esc] Close │         │
+╰─────────│                                                          │─────────┘
+──────────└──────────────────────────────────────────────────────────┘──────────
+ [e] Sample  [E] Full  [t] Apply Tag  [b] Backtest  [Esc] Exit input then [s]...

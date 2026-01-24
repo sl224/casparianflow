@@ -13,26 +13,27 @@
 
 use super::db::Database;
 use super::error::{Result, ScoutError};
-use super::types::{ScanStats, ScannedFile, Source, SourceId};
+use super::types::{ScanStats, ScannedFile, Source, SourceId, WorkspaceId};
 use chrono::Utc;
 use ignore::WalkBuilder;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Instant;
-use tracing::info;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{debug_span, info, info_span};
 
 /// GAP-SCAN-003: Normalize a path to use forward slashes consistently.
 /// This is critical for Windows compatibility since `split_rel_path()` in types.rs
 /// only looks for '/' separators.
 fn normalize_path_to_forward_slashes(path: &Path) -> String {
-    // Use components() to get a platform-independent path representation,
-    // then join with forward slashes
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let path_str = path.to_string_lossy();
+    if cfg!(windows) {
+        path_str.replace('\\', "/")
+    } else {
+        path_str.into_owned()
+    }
 }
 
 /// Configuration for scanning operations
@@ -44,6 +45,10 @@ pub struct ScanConfig {
     pub batch_size: usize,
     /// Progress update interval (number of files between updates)
     pub progress_interval: usize,
+    /// Progress update interval (time-based)
+    pub progress_interval_time: Duration,
+    /// Threshold for reporting stalled scans (no persisted progress)
+    pub stall_threshold: Duration,
     /// Whether to follow symlinks
     pub follow_symlinks: bool,
     /// Whether to include hidden files/directories
@@ -54,6 +59,8 @@ pub struct ScanConfig {
     /// Path patterns to exclude (matched against full path)
     /// E.g., "Library/CloudStorage" will exclude any path containing this
     pub exclude_path_patterns: Vec<String>,
+    /// Whether to compute new/changed/unchanged stats during upsert
+    pub compute_stats: bool,
 }
 
 /// Default directory exclusions to avoid scanning slow/problematic filesystems
@@ -63,10 +70,10 @@ pub struct ScanConfig {
 /// 2. Are typically not useful for data processing (.Trash, Caches)
 /// 3. Can cause infinite loops or excessive I/O (node_modules, .git)
 pub const DEFAULT_EXCLUDE_DIR_NAMES: &[&str] = &[
-    "node_modules",  // Often huge and not useful for data processing
-    ".git",          // Git internals
-    "__pycache__",   // Python cache
-    ".cache",        // Various caches
+    "node_modules", // Often huge and not useful for data processing
+    ".git",         // Git internals
+    "__pycache__",  // Python cache
+    ".cache",       // Various caches
 ];
 
 /// Default path patterns to exclude
@@ -78,7 +85,7 @@ pub const DEFAULT_EXCLUDE_DIR_NAMES: &[&str] = &[
 /// indefinitely (the root cause of scan hangs).
 pub const DEFAULT_EXCLUDE_PATH_PATTERNS: &[&str] = &[
     // macOS cloud storage - uses File Provider framework (virtual FS)
-    "Library/CloudStorage",    // Google Drive, OneDrive, Dropbox via macOS
+    "Library/CloudStorage",     // Google Drive, OneDrive, Dropbox via macOS
     "Library/Mobile Documents", // iCloud Drive
     // Legacy iCloud location
     "iCloud Drive",
@@ -88,7 +95,7 @@ pub const DEFAULT_EXCLUDE_PATH_PATTERNS: &[&str] = &[
     "Dropbox",
     // macOS system directories that are slow or problematic
     ".Trash",
-    "Library/Caches",  // Can be huge and changes frequently
+    "Library/Caches", // Can be huge and changes frequently
 ];
 
 impl Default for ScanConfig {
@@ -97,10 +104,19 @@ impl Default for ScanConfig {
             threads: 0,             // Auto-detect CPU count
             batch_size: 10_000,     // Flush to DB every 10k files
             progress_interval: 100, // Progress update every 100 files for responsive TUI
+            progress_interval_time: Duration::from_secs(1),
+            stall_threshold: Duration::from_secs(30),
             follow_symlinks: false,
             include_hidden: true,
-            exclude_dir_names: DEFAULT_EXCLUDE_DIR_NAMES.iter().map(|s| s.to_string()).collect(),
-            exclude_path_patterns: DEFAULT_EXCLUDE_PATH_PATTERNS.iter().map(|s| s.to_string()).collect(),
+            exclude_dir_names: DEFAULT_EXCLUDE_DIR_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            exclude_path_patterns: DEFAULT_EXCLUDE_PATH_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            compute_stats: true,
         }
     }
 }
@@ -116,6 +132,12 @@ pub struct ScanProgress {
     pub files_persisted: usize,
     /// Current directory being scanned (hint)
     pub current_dir: Option<String>,
+    /// Elapsed time since scan start (milliseconds)
+    pub elapsed_ms: u64,
+    /// Smoothed files per second (based on persisted files)
+    pub files_per_sec: f64,
+    /// Whether the scan appears stalled
+    pub stalled: bool,
 }
 
 /// Result of a scan operation
@@ -138,6 +160,194 @@ pub struct ScanError {
 pub struct Scanner {
     db: Database,
     config: ScanConfig,
+}
+
+#[derive(Default)]
+struct FolderCacheAggregator {
+    root_folder_counts: HashMap<String, u64>,
+    root_file_names: Vec<String>,
+}
+
+impl FolderCacheAggregator {
+    fn update_batch(&mut self, batch: &[ScannedFile]) {
+        for file in batch {
+            if file.parent_path.is_empty() {
+                self.root_file_names.push(file.name.clone());
+                continue;
+            }
+
+            if let Some(root) = file.parent_path.split('/').next() {
+                if !root.is_empty() {
+                    *self.root_folder_counts.entry(root.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProgressCounters {
+    dirs_scanned: Arc<AtomicUsize>,
+    files_found: Arc<AtomicUsize>,
+    files_persisted: Arc<AtomicUsize>,
+    current_dir: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl ProgressCounters {
+    fn new(files_persisted: Arc<AtomicUsize>) -> Self {
+        Self {
+            dirs_scanned: Arc::new(AtomicUsize::new(0)),
+            files_found: Arc::new(AtomicUsize::new(0)),
+            files_persisted,
+            current_dir: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn snapshot(&self) -> (usize, usize, usize, Option<String>) {
+        let current_dir = self
+            .current_dir
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        (
+            self.dirs_scanned.load(Ordering::Relaxed),
+            self.files_found.load(Ordering::Relaxed),
+            self.files_persisted.load(Ordering::Relaxed),
+            current_dir,
+        )
+    }
+}
+
+struct ProgressEmitter {
+    start: Instant,
+    last_emit: Instant,
+    last_rate_sample: Instant,
+    last_files_persisted: usize,
+    ewma_files_per_sec: f64,
+    last_persisted_value: usize,
+    last_persisted_change: Instant,
+    stalled: bool,
+    progress_interval_time: Duration,
+    stall_threshold: Duration,
+}
+
+impl ProgressEmitter {
+    fn new(start: Instant, config: &ScanConfig) -> Self {
+        Self {
+            start,
+            last_emit: start,
+            last_rate_sample: start,
+            last_files_persisted: 0,
+            ewma_files_per_sec: 0.0,
+            last_persisted_value: 0,
+            last_persisted_change: start,
+            stalled: false,
+            progress_interval_time: config.progress_interval_time,
+            stall_threshold: config.stall_threshold,
+        }
+    }
+
+    fn maybe_emit(
+        &mut self,
+        tx: &mpsc::Sender<ScanProgress>,
+        counters: &ProgressCounters,
+        force: bool,
+    ) {
+        let now = Instant::now();
+        let (progress, stall_changed) = self.build_progress(now, counters);
+        let should_emit = force
+            || stall_changed
+            || now.duration_since(self.last_emit) >= self.progress_interval_time;
+
+        if should_emit {
+            self.last_emit = now;
+            let _ = tx.send(progress);
+        }
+    }
+
+    fn build_progress(
+        &mut self,
+        now: Instant,
+        counters: &ProgressCounters,
+    ) -> (ScanProgress, bool) {
+        let (dirs_scanned, files_found, files_persisted, current_dir) = counters.snapshot();
+        let elapsed_ms = now.duration_since(self.start).as_millis() as u64;
+
+        if files_persisted != self.last_persisted_value {
+            self.last_persisted_value = files_persisted;
+            self.last_persisted_change = now;
+        }
+
+        let stalled_now = now.duration_since(self.last_persisted_change) >= self.stall_threshold;
+        let stall_changed = stalled_now != self.stalled;
+        self.stalled = stalled_now;
+
+        let delta_time = now.duration_since(self.last_rate_sample).as_secs_f64();
+        let delta_files = files_persisted.saturating_sub(self.last_files_persisted);
+        let instant_rate = if delta_time > 0.0 {
+            delta_files as f64 / delta_time
+        } else {
+            0.0
+        };
+        if self.ewma_files_per_sec == 0.0 {
+            self.ewma_files_per_sec = instant_rate;
+        } else {
+            let alpha = 0.2;
+            self.ewma_files_per_sec =
+                (alpha * instant_rate) + ((1.0 - alpha) * self.ewma_files_per_sec);
+        }
+        if delta_time > 0.0 {
+            self.last_rate_sample = now;
+            self.last_files_persisted = files_persisted;
+        }
+
+        (
+            ScanProgress {
+                dirs_scanned,
+                files_found,
+                files_persisted,
+                current_dir,
+                elapsed_ms,
+                files_per_sec: self.ewma_files_per_sec,
+                stalled: self.stalled,
+            },
+            stall_changed,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct ProgressState {
+    tx: mpsc::Sender<ScanProgress>,
+    counters: ProgressCounters,
+    emitter: Arc<std::sync::Mutex<ProgressEmitter>>,
+    last_progress_at: Arc<AtomicUsize>,
+    progress_interval: usize,
+}
+
+impl ProgressState {
+    fn emit_if_needed(&self, current_total: usize) {
+        let last = self.last_progress_at.load(Ordering::Relaxed);
+        if current_total.saturating_sub(last) < self.progress_interval {
+            return;
+        }
+        if self
+            .last_progress_at
+            .compare_exchange(last, current_total, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if let Ok(mut emitter) = self.emitter.lock() {
+            emitter.maybe_emit(&self.tx, &self.counters, false);
+        }
+    }
+
+    fn emit_force(&self) {
+        if let Ok(mut emitter) = self.emitter.lock() {
+            emitter.maybe_emit(&self.tx, &self.counters, true);
+        }
+    }
 }
 
 impl Scanner {
@@ -176,6 +386,13 @@ impl Scanner {
         tag: Option<&str>,
     ) -> Result<ScanResult> {
         let start = Instant::now();
+        let scan_span = info_span!(
+            "scout.scan",
+            source_id = %source.id,
+            workspace_id = %source.workspace_id,
+            duration_ms = tracing::field::Empty
+        );
+        let _scan_guard = scan_span.enter();
         info!(source = %source.name, path = %source.path, "Starting streaming scan");
 
         let source_path = Path::new(&source.path);
@@ -183,14 +400,51 @@ impl Scanner {
             return Err(ScoutError::FileNotFound(source.path.clone()));
         }
 
+        let files_persisted_counter = Arc::new(AtomicUsize::new(0));
+        let progress_counters = ProgressCounters::new(files_persisted_counter.clone());
+        if let Ok(mut dir) = progress_counters.current_dir.lock() {
+            *dir = Some(source.path.clone());
+        }
+
+        let progress_emitter = progress_tx
+            .as_ref()
+            .map(|_| Arc::new(std::sync::Mutex::new(ProgressEmitter::new(start, &self.config))));
+
+        let progress_state = match (progress_tx.clone(), progress_emitter.clone()) {
+            (Some(tx), Some(emitter)) => Some(ProgressState {
+                tx,
+                counters: progress_counters.clone(),
+                emitter,
+                last_progress_at: Arc::new(AtomicUsize::new(0)),
+                progress_interval: self.config.progress_interval,
+            }),
+            _ => None,
+        };
+
+        let progress_done = Arc::new(AtomicBool::new(false));
+        let progress_timer = match (progress_tx.clone(), progress_emitter.clone()) {
+            (Some(tx), Some(emitter)) => {
+                let counters = progress_counters.clone();
+                let done = progress_done.clone();
+                let interval = self.config.progress_interval_time;
+                Some(std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        std::thread::sleep(interval);
+                        if done.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Ok(mut guard) = emitter.lock() {
+                            guard.maybe_emit(&tx, &counters, false);
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        };
+
         // Send initial progress so UI shows something immediately
-        if let Some(ref tx) = progress_tx {
-            let _ = tx.send(ScanProgress {
-                dirs_scanned: 0,
-                files_found: 0,
-                files_persisted: 0,
-                current_dir: Some(source.path.clone()),
-            });
+        if let Some(state) = progress_state.as_ref() {
+            state.emit_force();
         }
 
         // Record scan start time for deleted file detection
@@ -201,7 +455,6 @@ impl Scanner {
         let (batch_tx, batch_rx) = mpsc::sync_channel::<Vec<ScannedFile>>(10);
 
         // Shared counter for files_persisted (updated by persist task, read by walker for progress)
-        let files_persisted_counter = Arc::new(AtomicUsize::new(0));
         let files_persisted_for_persist = files_persisted_counter.clone();
 
         // Critical fix: Track if all batches succeeded (GAP-SCAN-001)
@@ -217,43 +470,84 @@ impl Scanner {
         // Run the parallel walk in a blocking task, sending batches to channel
         let walk_source_path = source_path.to_path_buf();
         let walk_source_id = source.id.clone();
+        let walk_workspace_id = source.workspace_id;
         let walk_config_batch_size = self.config.batch_size;
         let walk_config_threads = self.config.threads;
         let walk_config_include_hidden = self.config.include_hidden;
         let walk_config_follow_symlinks = self.config.follow_symlinks;
-        let walk_progress_interval = self.config.progress_interval;
-        let walk_progress_tx = progress_tx.clone();
-        let walk_files_persisted = files_persisted_counter.clone();
+        let walk_progress_state = progress_state.clone();
+        let walk_progress_counters = progress_counters.clone();
         let walk_exclude_dir_names = self.config.exclude_dir_names.clone();
         let walk_exclude_path_patterns = self.config.exclude_path_patterns.clone();
 
+        let scan_span_for_walk = scan_span.clone();
         let walk_handle = std::thread::spawn(move || {
-            Self::parallel_walk(
+            let _scan_guard = scan_span_for_walk.enter();
+            let walk_span = info_span!(
+                "scout.walk",
+                source_id = %walk_source_id,
+                workspace_id = %walk_workspace_id,
+                duration_ms = tracing::field::Empty
+            );
+            let _walk_guard = walk_span.enter();
+            let walk_start = Instant::now();
+            let walk_result = Self::parallel_walk(
                 &walk_source_path,
+                walk_workspace_id,
                 &walk_source_id,
                 batch_tx,
                 walk_config_batch_size,
                 walk_config_threads,
                 walk_config_include_hidden,
                 walk_config_follow_symlinks,
-                walk_progress_interval,
-                walk_progress_tx,
-                walk_files_persisted,
+                walk_progress_state,
+                walk_progress_counters,
                 walk_exclude_dir_names,
                 walk_exclude_path_patterns,
-            )
+            );
+            let walk_duration_ms = walk_start.elapsed().as_millis() as u64;
+            walk_span.record("duration_ms", &walk_duration_ms);
+            match &walk_result {
+                Ok((stats, _)) => {
+                    info!(
+                        dirs_scanned = stats.dirs_scanned,
+                        bytes_scanned = stats.bytes_scanned,
+                        duration_ms = walk_duration_ms,
+                        "Parallel walk complete"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, duration_ms = walk_duration_ms, "Parallel walk failed");
+                }
+            }
+            walk_result
         });
 
         let mut persist_stats = ScanStats::default();
+        let mut folder_cache = FolderCacheAggregator::default();
+        let mut persist_batches: u64 = 0;
+        let mut persist_time_ms: u64 = 0;
         while let Ok(batch) = batch_rx.recv() {
             let batch_len = batch.len();
+            let persist_span = debug_span!(
+                "scout.persist_batch",
+                batch_files = batch_len,
+                duration_ms = tracing::field::Empty
+            );
+            let _persist_guard = persist_span.enter();
+            let persist_start = Instant::now();
 
             // GAP-SCAN-005: Track files_discovered as total files received (including failed)
             // This represents what the walker found, regardless of persist success
             persist_stats.files_discovered += batch_len as u64;
 
             // GAP-002: Transactional batch persist
-            match Self::persist_batch_streaming(&db, batch, tag_owned.as_deref()) {
+            match Self::persist_batch_streaming(
+                &db,
+                &batch,
+                tag_owned.as_deref(),
+                self.config.compute_stats,
+            ) {
                 Ok(batch_stats) => {
                     persist_stats.files_new += batch_stats.files_new;
                     persist_stats.files_changed += batch_stats.files_changed;
@@ -263,6 +557,8 @@ impl Scanner {
 
                     // Update shared counter for progress reporting
                     files_persisted_for_persist.fetch_add(batch_len, Ordering::Relaxed);
+
+                    folder_cache.update_batch(&batch);
                 }
                 Err(e) => {
                     persist_stats.errors += batch_len as u64;
@@ -271,6 +567,15 @@ impl Scanner {
                     tracing::warn!(error = %e, "Batch persist failed - will skip mark_deleted_files");
                 }
             }
+            persist_batches += 1;
+            let batch_duration_ms = persist_start.elapsed().as_millis() as u64;
+            persist_span.record("duration_ms", &batch_duration_ms);
+            persist_time_ms = persist_time_ms.saturating_add(batch_duration_ms);
+            tracing::debug!(
+                batch_files = batch_len,
+                duration_ms = batch_duration_ms,
+                "Persist batch complete"
+            );
         }
 
         let walk_result = walk_handle
@@ -284,20 +589,39 @@ impl Scanner {
         final_stats.bytes_scanned = walk_stats.bytes_scanned;
 
         // Send final progress
-        if let Some(ref tx) = progress_tx {
-            let _ = tx.send(ScanProgress {
-                dirs_scanned: final_stats.dirs_scanned as usize,
-                files_found: final_stats.files_discovered as usize,
-                files_persisted: files_persisted_counter.load(Ordering::Relaxed),
-                current_dir: None,
-            });
+        progress_counters
+            .dirs_scanned
+            .store(final_stats.dirs_scanned as usize, Ordering::Relaxed);
+        progress_counters
+            .files_found
+            .store(final_stats.files_discovered as usize, Ordering::Relaxed);
+        if let Ok(mut dir) = progress_counters.current_dir.lock() {
+            *dir = None;
+        }
+        if let Some(state) = progress_state.as_ref() {
+            state.emit_force();
         }
 
         // GAP-SCAN-001: Only mark files as deleted if ALL batches were persisted successfully
         // If any batch failed, files in that batch weren't updated with last_seen_at,
         // so marking them deleted would be incorrect (data loss)
         let deleted = if scan_ok.load(Ordering::Relaxed) {
-            self.db.mark_deleted_files(&source.id, scan_start)?
+            let mark_span = info_span!(
+                "scout.mark_deleted",
+                source_id = %source.id,
+                duration_ms = tracing::field::Empty
+            );
+            let _mark_guard = mark_span.enter();
+            let mark_start = Instant::now();
+            let deleted = self.db.mark_deleted_files(&source.id, scan_start)?;
+            let mark_duration_ms = mark_start.elapsed().as_millis() as u64;
+            mark_span.record("duration_ms", &mark_duration_ms);
+            info!(
+                deleted = deleted,
+                duration_ms = mark_duration_ms,
+                "mark_deleted_files complete"
+            );
+            deleted
         } else {
             tracing::warn!(
                 source = %source.name,
@@ -312,13 +636,47 @@ impl Scanner {
 
         // Update denormalized file_count on source for fast TUI queries
         // GAP-SCAN-005: Use files_persisted (actual count in DB) not files_discovered
-        if let Err(e) = self.db.update_source_file_count(&source.id, final_stats.files_persisted as usize) {
+        if let Err(e) = self
+            .db
+            .update_source_file_count(&source.id, final_stats.files_persisted as usize)
+        {
             tracing::warn!(source_id = %source.id, error = %e, "Failed to update source file_count");
         }
 
         // Populate folder cache for O(1) TUI navigation (avoids 20+ second root folder query)
-        if let Err(e) = self.db.populate_folder_cache(&source.id) {
-            tracing::warn!(source_id = %source.id, error = %e, "Failed to populate folder cache");
+        let cache_span = info_span!(
+            "scout.populate_folder_cache",
+            source_id = %source.id,
+            duration_ms = tracing::field::Empty
+        );
+        let _cache_guard = cache_span.enter();
+        let cache_start = Instant::now();
+        if scan_ok.load(Ordering::Relaxed) {
+            if let Err(e) = self.db.populate_folder_cache_from_aggregates(
+                &source.id,
+                &folder_cache.root_folder_counts,
+                &folder_cache.root_file_names,
+            ) {
+                tracing::warn!(
+                    source_id = %source.id,
+                    error = %e,
+                    "Failed to populate folder cache from aggregates"
+                );
+            } else {
+                let cache_duration_ms = cache_start.elapsed().as_millis() as u64;
+                cache_span.record("duration_ms", &cache_duration_ms);
+                info!(duration_ms = cache_duration_ms, "populate_folder_cache (streaming) complete");
+            }
+        } else if let Err(e) = self.db.populate_folder_cache(&source.id) {
+            tracing::warn!(
+                source_id = %source.id,
+                error = %e,
+                "Failed to populate folder cache"
+            );
+        } else {
+            let cache_duration_ms = cache_start.elapsed().as_millis() as u64;
+            cache_span.record("duration_ms", &cache_duration_ms);
+            info!(duration_ms = cache_duration_ms, "populate_folder_cache complete");
         }
 
         // GAP-SCAN-005: Log both discovered (walker found) and persisted (saved to DB)
@@ -332,10 +690,21 @@ impl Scanner {
             errors = final_stats.errors,
             duration_ms = final_stats.duration_ms,
             batches = batch_size,
+            persist_batches = persist_batches,
+            persist_time_ms = persist_time_ms,
             "Streaming scan complete"
         );
 
-        Ok(ScanResult { stats: final_stats, errors: walk_errors })
+        progress_done.store(true, Ordering::Relaxed);
+        if let Some(handle) = progress_timer {
+            let _ = handle.join();
+        }
+
+        scan_span.record("duration_ms", &final_stats.duration_ms);
+        Ok(ScanResult {
+            stats: final_stats,
+            errors: walk_errors,
+        })
     }
 
     /// Streaming parallel walk - sends batches to channel instead of collecting
@@ -348,15 +717,15 @@ impl Scanner {
     #[allow(clippy::too_many_arguments)]
     fn parallel_walk(
         source_path: &Path,
+        workspace_id: WorkspaceId,
         source_id: &SourceId,
         batch_tx: mpsc::SyncSender<Vec<ScannedFile>>,
         batch_size: usize,
         threads: usize,
         include_hidden: bool,
         follow_symlinks: bool,
-        progress_interval: usize,
-        progress_tx: Option<mpsc::Sender<ScanProgress>>,
-        files_persisted: Arc<AtomicUsize>,
+        progress_state: Option<ProgressState>,
+        progress_counters: ProgressCounters,
         exclude_dir_names: Vec<String>,
         exclude_path_patterns: Vec<String>,
     ) -> Result<(ScanStats, Vec<ScanError>)> {
@@ -364,10 +733,9 @@ impl Scanner {
 
         // Atomic counters for progress
         // GAP-SCAN-007: Use AtomicU64 for bytes to prevent overflow on 32-bit systems
-        let total_files = Arc::new(AtomicUsize::new(0));
-        let total_dirs = Arc::new(AtomicUsize::new(0));
+        let total_files = progress_counters.files_found.clone();
+        let total_dirs = progress_counters.dirs_scanned.clone();
         let total_bytes = Arc::new(AtomicU64::new(0));
-        let last_progress_at = Arc::new(AtomicUsize::new(0));
         // Counter for skipped directories (for logging)
         let dirs_skipped = Arc::new(AtomicUsize::new(0));
 
@@ -424,20 +792,22 @@ impl Scanner {
             .build_parallel();
 
         let source_id_arc = source_id.clone();
+        let workspace_id = workspace_id;
         let source_path_owned = source_path.to_path_buf();
         let batch_tx = batch_tx.clone();
 
         walker.run(|| {
             let source_path = source_path_owned.clone();
             let source_id = source_id_arc.clone();
+            let workspace_id = workspace_id;
             let error_tx = error_tx.clone();
             let total_files = total_files.clone();
             let total_dirs = total_dirs.clone();
             let total_bytes = total_bytes.clone();
-            let last_progress_at = last_progress_at.clone();
-            let progress_tx = progress_tx.clone();
+            let progress_state = progress_state.clone();
+            let progress_counters = progress_counters.clone();
             let batch_tx = batch_tx.clone();
-            let files_persisted = files_persisted.clone();
+            let thread_now = Utc::now();
 
             // Thread-local batch - sent to channel when full
             // GAP-SCAN-007: Use u64 for byte_count to prevent overflow on 32-bit systems
@@ -463,7 +833,8 @@ impl Scanner {
                     // Always flush byte count (GAP-SCAN-006)
                     // Note: dir_count is now updated immediately when dirs are encountered
                     if self.byte_count > 0 {
-                        self.total_bytes.fetch_add(self.byte_count, Ordering::Relaxed);
+                        self.total_bytes
+                            .fetch_add(self.byte_count, Ordering::Relaxed);
                     }
                 }
             }
@@ -517,6 +888,9 @@ impl Scanner {
                             .strip_prefix(&source_path)
                             .map(|p| p.display().to_string())
                             .ok();
+                        if let Ok(mut guard) = progress_counters.current_dir.lock() {
+                            *guard = current_dir_hint.clone();
+                        }
                     }
                     return ignore::WalkState::Continue;
                 }
@@ -543,12 +917,14 @@ impl Scanner {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
 
-                guard.batch.push(ScannedFile::from_parts(
+                guard.batch.push(ScannedFile::from_parts_with_now(
+                    workspace_id,
                     source_id.clone(),
                     full_path,
                     rel_path,
                     size,
                     mtime,
+                    thread_now.clone(),
                 ));
                 // GAP-SCAN-007: No cast needed, both are u64
                 guard.byte_count += size;
@@ -556,32 +932,14 @@ impl Scanner {
                 // GAP-SCAN-008: Send progress updates on every N files, not just batch flush
                 // Calculate current total including in-flight batch files
                 let current_total = total_files.load(Ordering::Relaxed) + guard.batch.len();
-                let last = last_progress_at.load(Ordering::Relaxed);
-                if current_total.saturating_sub(last) >= progress_interval {
-                    if last_progress_at.compare_exchange(
-                        last,
-                        current_total,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed
-                    ).is_ok() {
-                        if let Some(tx) = &progress_tx {
-                            let dir_hint = current_dir_hint.clone();
-                            let _ = tx.send(ScanProgress {
-                                dirs_scanned: total_dirs.load(Ordering::Relaxed),
-                                files_found: current_total,
-                                files_persisted: files_persisted.load(Ordering::Relaxed),
-                                current_dir: dir_hint,
-                            });
-                        }
-                    }
+                if let Some(state) = &progress_state {
+                    state.emit_if_needed(current_total);
                 }
 
                 // Send batch to channel when full
                 if guard.batch.len() >= guard.batch_size {
-                    let batch = std::mem::replace(
-                        &mut guard.batch,
-                        Vec::with_capacity(guard.batch_size)
-                    );
+                    let batch =
+                        std::mem::replace(&mut guard.batch, Vec::with_capacity(guard.batch_size));
                     let batch_len = batch.len();
 
                     // send provides backpressure with sync_channel (waits if channel full)
@@ -596,24 +954,8 @@ impl Scanner {
                     guard.byte_count = 0;
 
                     // Send progress update
-                    let last = last_progress_at.load(Ordering::Relaxed);
-                    if new_total.saturating_sub(last) >= progress_interval {
-                    if last_progress_at.compare_exchange(
-                        last,
-                        new_total,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed
-                    ).is_ok() {
-                        if let Some(tx) = &progress_tx {
-                            let dir_hint = current_dir_hint.clone();
-                            let _ = tx.send(ScanProgress {
-                                dirs_scanned: total_dirs.load(Ordering::Relaxed),
-                                files_found: new_total,
-                                files_persisted: files_persisted.load(Ordering::Relaxed),
-                                current_dir: dir_hint,
-                                });
-                            }
-                        }
+                    if let Some(state) = &progress_state {
+                        state.emit_if_needed(new_total);
                     }
                 }
 
@@ -650,14 +992,15 @@ impl Scanner {
     /// can be set to false, preventing incorrect `mark_deleted_files` calls.
     fn persist_batch_streaming(
         db: &Database,
-        files: Vec<ScannedFile>,
+        files: &[ScannedFile],
         tag: Option<&str>,
+        compute_stats: bool,
     ) -> Result<ScanStats> {
         let mut stats = ScanStats::default();
 
         // Persist entire batch in one transaction
         // Note: batch_upsert_files handles per-file errors internally
-        let result = db.batch_upsert_files(&files, tag)?;
+        let result = db.batch_upsert_files(files, tag, compute_stats)?;
 
         stats.files_new = result.new;
         stats.files_changed = result.changed;
@@ -672,16 +1015,18 @@ impl Scanner {
 mod tests {
     use super::*;
     use crate::scout::types::{FileStatus, SourceId, SourceType};
-    use tempfile::TempDir;
+    use filetime::{set_file_mtime, FileTime};
     use std::fs::File;
     use std::io::Write;
-    use filetime::{FileTime, set_file_mtime};
+    use tempfile::TempDir;
 
     fn create_test_env() -> (TempDir, Database, Source) {
         let temp_dir = TempDir::new().unwrap();
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         let source = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "Test Source".to_string(),
             source_type: SourceType::Local,
@@ -749,25 +1094,35 @@ mod tests {
 
         let scanner = Scanner::new(db.clone());
 
-        // First scan
+        // First scan - file should be discovered and persisted
         let result = scanner.scan_source(&source).unwrap();
-        assert_eq!(result.stats.files_new, 1);
+        assert_eq!(result.stats.files_discovered, 1);
+        assert_eq!(result.stats.files_persisted, 1);
 
-        // Second scan - no changes
+        // Verify file is in database with original mtime
+        let files = db.list_pending_files(&source.id, 10).unwrap();
+        assert_eq!(files.len(), 1);
+        let original_mtime = files[0].mtime;
+
+        // Second scan - no changes, file still persisted
         let result = scanner.scan_source(&source).unwrap();
-        assert_eq!(result.stats.files_new, 0);
-        assert_eq!(result.stats.files_unchanged, 1);
-        assert_eq!(result.stats.files_changed, 0);
+        assert_eq!(result.stats.files_discovered, 1);
+        assert_eq!(result.stats.files_persisted, 1);
 
         // Modify the file with a newer mtime
         std::fs::write(&file_path, "a,b,c,d\n1,2,3,4").unwrap();
         let new_mtime = FileTime::from_unix_time(2000000, 0);
         set_file_mtime(&file_path, new_mtime).unwrap();
 
-        // Third scan - should detect change
+        // Third scan - should detect change (mtime updated in DB)
         let result = scanner.scan_source(&source).unwrap();
-        assert_eq!(result.stats.files_new, 0);
-        assert_eq!(result.stats.files_changed, 1);
+        assert_eq!(result.stats.files_discovered, 1);
+        assert_eq!(result.stats.files_persisted, 1);
+
+        // Verify mtime was updated in database
+        let files = db.list_pending_files(&source.id, 10).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_ne!(files[0].mtime, original_mtime, "mtime should be updated after file change");
     }
 
     #[test]
@@ -797,7 +1152,9 @@ mod tests {
         assert_eq!(result.stats.files_deleted, 1);
 
         // Verify deleted file is marked in database
-        let deleted = db.list_files_by_status(FileStatus::Deleted, 10).unwrap();
+        let deleted = db
+            .list_files_by_status(&source.workspace_id, FileStatus::Deleted, 10)
+            .unwrap();
         assert_eq!(deleted.len(), 1);
         assert!(deleted[0].path.contains("delete.csv"));
     }
@@ -805,7 +1162,9 @@ mod tests {
     #[test]
     fn test_scan_nonexistent_source() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "Missing".to_string(),
             source_type: SourceType::Local,

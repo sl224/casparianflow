@@ -1,0 +1,484 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+
+<BaseLayout title="Production Infrastructure for Your Parsers" description="Turn any file format into governed, queryable SQL. Schema contracts. Lineage on every row. Quarantine for bad data. Your parsers, production-grade.">
+  <style>
+    .flow-arrow {
+      position: relative;
+    }
+    .flow-arrow::after {
+      content: '';
+      position: absolute;
+      right: -20px;
+      top: 50%;
+      transform: translateY(-50%);
+      border: 8px solid transparent;
+      border-left-color: #374151;
+    }
+    @media (max-width: 768px) {
+      .flow-arrow::after {
+        display: none;
+      }
+    }
+  </style>
+
+  <!-- Hero -->
+  <section class="max-w-4xl mx-auto px-6 py-20 text-center">
+    <h1 class="text-4xl md:text-5xl font-bold mb-6 leading-tight">
+      Your parsers.<br>
+      <span class="text-gray-400">Production-grade infrastructure.</span>
+    </h1>
+    <p class="text-xl text-gray-400 max-w-2xl mx-auto mb-4">
+      Schema contracts. Lineage on every row. Quarantine for bad data.
+    </p>
+    <p class="text-gray-500 max-w-xl mx-auto mb-8">
+      Turn any file format into governed, queryable SQL. Local-first. Data never leaves your machine.
+    </p>
+    <div class="flex flex-col sm:flex-row gap-4 justify-center">
+      <a href="#DOWNLOAD_URL_PLACEHOLDER" class="px-8 py-3 bg-green-600 hover:bg-green-700 rounded-lg font-medium transition">
+        Download Free
+      </a>
+      <a href="#how-it-works" class="px-8 py-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg font-medium transition">
+        See How It Works
+      </a>
+    </div>
+  </section>
+
+  <!-- The Problem -->
+  <section class="max-w-5xl mx-auto px-6 pb-20">
+    <div class="bg-[#161b22] rounded-lg border border-gray-800 p-8 md:p-10">
+      <h2 class="text-2xl font-semibold mb-6 text-center">Why parsing scripts become graveyards</h2>
+
+      <div class="grid md:grid-cols-2 gap-6 mb-8">
+        <div class="flex gap-3">
+          <span class="text-red-400 text-lg">&#10007;</span>
+          <div>
+            <h3 class="font-medium mb-1">Test one file, pray it works on others</h3>
+            <p class="text-gray-500 text-sm">You test your parser on sample.log. It works. You deploy. It breaks on 10,000 other files you never saw.</p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="text-red-400 text-lg">&#10007;</span>
+          <div>
+            <h3 class="font-medium mb-1">Outputs drift silently</h3>
+            <p class="text-gray-500 text-sm">Someone tweaks the parser. The output schema changes. Downstream breaks weeks later. Nobody knows why.</p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="text-red-400 text-lg">&#10007;</span>
+          <div>
+            <h3 class="font-medium mb-1">One bad record kills the job</h3>
+            <p class="text-gray-500 text-sm">A single malformed row crashes the entire run. Good data waits while you debug edge cases.</p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="text-red-400 text-lg">&#10007;</span>
+          <div>
+            <h3 class="font-medium mb-1">Compliance asks, you can't answer</h3>
+            <p class="text-gray-500 text-sm">"Where did this number come from?" You have a spreadsheet. They want a source file and parser version.</p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="text-red-400 text-lg">&#10007;</span>
+          <div>
+            <h3 class="font-medium mb-1">Files move, everything breaks</h3>
+            <p class="text-gray-500 text-sm">IT reorganizes the share. Your paths are invalid. The link between data and source is gone.</p>
+          </div>
+        </div>
+        <div class="flex gap-3">
+          <span class="text-red-400 text-lg">&#10007;</span>
+          <div>
+            <h3 class="font-medium mb-1">The author leaves</h3>
+            <p class="text-gray-500 text-sm">The one person who understood the parser is gone. The script becomes a black box. The graveyard grows.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="border-t border-gray-700 pt-6 text-center">
+        <p class="text-gray-300 text-lg">
+          Casparian fixes this. <strong class="text-white">Your parser becomes a component. The system owns the contract.</strong>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- The Shift -->
+  <section class="max-w-4xl mx-auto px-6 pb-20">
+    <div class="text-center mb-10">
+      <h2 class="text-2xl font-semibold mb-4">The parser author can leave. The system keeps running.</h2>
+      <p class="text-gray-400">With DIY, the script IS the system. With Casparian, the script is just parsing logic.</p>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-8">
+      <div class="bg-[#1c1c1c] rounded-lg border border-red-900/30 p-6">
+        <h3 class="text-red-400 font-medium mb-4">DIY Scripts</h3>
+        <ul class="space-y-2 text-gray-400 text-sm">
+          <li>&#8226; Parser changes → hope nothing breaks</li>
+          <li>&#8226; No record of which version produced what</li>
+          <li>&#8226; Bad data = crashed job</li>
+          <li>&#8226; Lineage = "I think it came from that folder"</li>
+          <li>&#8226; File moves = broken paths</li>
+        </ul>
+      </div>
+      <div class="bg-[#161b22] rounded-lg border border-green-600/30 p-6">
+        <h3 class="text-green-400 font-medium mb-4">Casparian-Wrapped Parsers</h3>
+        <ul class="space-y-2 text-gray-400 text-sm">
+          <li>&#8226; Parser changes → contract validates or rejects</li>
+          <li>&#8226; Every row tagged with parser version</li>
+          <li>&#8226; Bad data → quarantine, good data flows</li>
+          <li>&#8226; Lineage = exact file hash and job ID</li>
+          <li>&#8226; Content-addressed = files can move</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- How It Works - Diagram -->
+  <section id="how-it-works" class="max-w-5xl mx-auto px-6 pb-20">
+    <h2 class="text-2xl font-semibold text-center mb-4">How it works</h2>
+    <p class="text-gray-400 text-center mb-12">Your parser emits data. Casparian validates, enriches, and routes it.</p>
+
+    <!-- Flow Diagram -->
+    <div class="bg-[#161b22] rounded-lg border border-gray-800 p-6 md:p-10 mb-8">
+
+      <!-- Desktop Flow -->
+      <div class="hidden md:flex items-center justify-between gap-4">
+        <!-- Step 1: Files -->
+        <div class="flex-1 text-center">
+          <div class="bg-[#0d1117] rounded-lg border border-gray-700 p-4 mb-3">
+            <div class="text-3xl mb-2">&#128193;</div>
+            <div class="font-medium text-sm">Your Files</div>
+            <div class="text-gray-500 text-xs">Any format</div>
+          </div>
+        </div>
+
+        <div class="text-gray-600 text-2xl">&#8594;</div>
+
+        <!-- Step 2: Parser -->
+        <div class="flex-1 text-center">
+          <div class="bg-[#0d1117] rounded-lg border border-gray-700 p-4 mb-3">
+            <div class="text-3xl mb-2">&#128013;</div>
+            <div class="font-medium text-sm">Your Parser</div>
+            <div class="text-gray-500 text-xs">Python / Binary</div>
+          </div>
+        </div>
+
+        <div class="text-gray-600 text-2xl">&#8594;</div>
+
+        <!-- Step 3: Casparian (main box) -->
+        <div class="flex-[2] text-center">
+          <div class="bg-green-600/10 rounded-lg border border-green-600/30 p-4 mb-3">
+            <div class="font-medium text-green-400 mb-3">Casparian Engine</div>
+            <div class="grid grid-cols-2 gap-2 text-xs">
+              <div class="bg-[#0d1117] rounded p-2">
+                <div class="text-gray-400">Schema Check</div>
+              </div>
+              <div class="bg-[#0d1117] rounded p-2">
+                <div class="text-gray-400">Quarantine Split</div>
+              </div>
+              <div class="bg-[#0d1117] rounded p-2">
+                <div class="text-gray-400">Lineage Inject</div>
+              </div>
+              <div class="bg-[#0d1117] rounded p-2">
+                <div class="text-gray-400">Content Hash</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="text-gray-600 text-2xl">&#8594;</div>
+
+        <!-- Step 4: Outputs -->
+        <div class="flex-1 text-center">
+          <div class="bg-[#0d1117] rounded-lg border border-gray-700 p-4 mb-3">
+            <div class="text-3xl mb-2">&#128452;</div>
+            <div class="font-medium text-sm">SQL Tables</div>
+            <div class="text-gray-500 text-xs">DuckDB / Parquet</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mobile Flow (vertical) -->
+      <div class="md:hidden space-y-4">
+        <div class="bg-[#0d1117] rounded-lg border border-gray-700 p-4 text-center">
+          <div class="text-2xl mb-1">&#128193;</div>
+          <div class="font-medium text-sm">Your Files</div>
+        </div>
+        <div class="text-center text-gray-600">&#8595;</div>
+        <div class="bg-[#0d1117] rounded-lg border border-gray-700 p-4 text-center">
+          <div class="text-2xl mb-1">&#128013;</div>
+          <div class="font-medium text-sm">Your Parser</div>
+        </div>
+        <div class="text-center text-gray-600">&#8595;</div>
+        <div class="bg-green-600/10 rounded-lg border border-green-600/30 p-4 text-center">
+          <div class="font-medium text-green-400 mb-2">Casparian Engine</div>
+          <div class="text-gray-400 text-xs">Schema &#8226; Quarantine &#8226; Lineage &#8226; Hash</div>
+        </div>
+        <div class="text-center text-gray-600">&#8595;</div>
+        <div class="bg-[#0d1117] rounded-lg border border-gray-700 p-4 text-center">
+          <div class="text-2xl mb-1">&#128452;</div>
+          <div class="font-medium text-sm">SQL Tables</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Output Details -->
+    <div class="grid md:grid-cols-2 gap-6">
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-5">
+        <h3 class="font-medium mb-3 flex items-center gap-2">
+          <span class="text-green-400">&#10003;</span> Main Output
+        </h3>
+        <p class="text-gray-400 text-sm mb-3">Valid rows with lineage columns:</p>
+        <div class="bg-[#0d1117] rounded p-3 text-xs font-mono text-gray-400">
+          <div>your_data_columns...</div>
+          <div class="text-blue-400">_cf_job_id</div>
+          <div class="text-blue-400">_cf_source_hash</div>
+          <div class="text-blue-400">_cf_parser_version</div>
+          <div class="text-blue-400">_cf_processed_at</div>
+        </div>
+      </div>
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-5">
+        <h3 class="font-medium mb-3 flex items-center gap-2">
+          <span class="text-yellow-400">&#9888;</span> Quarantine Output
+        </h3>
+        <p class="text-gray-400 text-sm mb-3">Invalid rows with error details:</p>
+        <div class="bg-[#0d1117] rounded p-3 text-xs font-mono text-gray-400">
+          <div>original_row_data...</div>
+          <div class="text-red-400">_error_msg</div>
+          <div class="text-red-400">_violation_type</div>
+          <div class="text-blue-400">_cf_job_id</div>
+          <div class="text-blue-400">_cf_source_hash</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Deep Dive Features -->
+  <section id="features" class="max-w-5xl mx-auto px-6 pb-20">
+    <h2 class="text-2xl font-semibold text-center mb-4">What makes it production-grade</h2>
+    <p class="text-gray-400 text-center mb-12">The infrastructure your DIY scripts are missing.</p>
+
+    <div class="grid md:grid-cols-2 gap-6">
+
+      <!-- Card 1: Lineage -->
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-6">
+        <div class="flex items-start justify-between mb-4">
+          <div class="text-3xl">&#128279;</div>
+          <span class="px-2 py-1 bg-blue-600/20 text-blue-400 rounded text-xs font-medium">COMPLIANCE</span>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">Lineage on Every Row</h3>
+        <p class="text-gray-500 text-sm mb-4">
+          "Where did this number come from?" Now you can answer.
+        </p>
+        <p class="text-gray-400 text-sm mb-4">
+          Every output row is tagged with job ID, source file hash, parser version, and timestamp.
+          Trace any result back to its origin. Compliance checkbox: checked.
+        </p>
+        <div class="bg-[#0d1117] rounded p-3 text-xs font-mono">
+          <span class="text-gray-500">SELECT</span> <span class="text-gray-300">*</span> <span class="text-gray-500">FROM</span> <span class="text-gray-300">output</span><br>
+          <span class="text-gray-500">WHERE</span> <span class="text-blue-400">_cf_source_hash</span> <span class="text-gray-500">=</span> <span class="text-green-400">'abc123'</span>
+        </div>
+      </div>
+
+      <!-- Card 2: Parser Dev Workflow -->
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-6">
+        <div class="flex items-start justify-between mb-4">
+          <div class="text-3xl">&#128300;</div>
+          <span class="px-2 py-1 bg-purple-600/20 text-purple-400 rounded text-xs font-medium">DIFFERENTIATED</span>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">Develop Against Real Data</h3>
+        <p class="text-gray-500 text-sm mb-4">
+          Test one file, pray it works? Not anymore.
+        </p>
+        <p class="text-gray-400 text-sm mb-4">
+          Scan your corpus. Tag files. Test your parser against all of them. See exactly which files break
+          and why. Preview changes without full runs. Backtest to catch drift before production.
+        </p>
+        <div class="flex gap-2 text-xs">
+          <span class="px-2 py-1 bg-gray-800 rounded text-gray-400">Scan corpus</span>
+          <span class="text-gray-600">&#8594;</span>
+          <span class="px-2 py-1 bg-gray-800 rounded text-gray-400">Preview</span>
+          <span class="text-gray-600">&#8594;</span>
+          <span class="px-2 py-1 bg-gray-800 rounded text-gray-400">Backtest</span>
+          <span class="text-gray-600">&#8594;</span>
+          <span class="px-2 py-1 bg-green-600/20 rounded text-green-400">Deploy</span>
+        </div>
+      </div>
+
+      <!-- Card 3: Quarantine -->
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-6">
+        <div class="flex items-start justify-between mb-4">
+          <div class="text-3xl">&#128737;</div>
+          <span class="px-2 py-1 bg-yellow-600/20 text-yellow-400 rounded text-xs font-medium">RESILIENCE</span>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">Quarantine, Not Failure</h3>
+        <p class="text-gray-500 text-sm mb-4">
+          One bad record doesn't kill the job.
+        </p>
+        <p class="text-gray-400 text-sm mb-4">
+          Invalid rows are isolated to a quarantine table with error details. Good data keeps flowing.
+          Set thresholds to fail the job if quarantine exceeds a percentage. You control the policy.
+        </p>
+        <div class="flex items-center gap-4 text-sm">
+          <div class="flex items-center gap-2">
+            <span class="w-3 h-3 rounded-full bg-green-500"></span>
+            <span class="text-gray-400">847,291 valid</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="w-3 h-3 rounded-full bg-yellow-500"></span>
+            <span class="text-gray-400">47 quarantined</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Card 4: Schema Contracts -->
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-6">
+        <div class="flex items-start justify-between mb-4">
+          <div class="text-3xl">&#128203;</div>
+          <span class="px-2 py-1 bg-green-600/20 text-green-400 rounded text-xs font-medium">GOVERNANCE</span>
+        </div>
+        <h3 class="text-lg font-semibold mb-2">Schema Contracts</h3>
+        <p class="text-gray-500 text-sm mb-4">
+          "The output changed and nobody noticed." Never again.
+        </p>
+        <p class="text-gray-400 text-sm mb-4">
+          Your parser declares a schema. Casparian enforces it in Rust. If the parser emits data that
+          doesn't match the approved contract, it's rejected at parse time&#8212;not discovered weeks later.
+        </p>
+        <div class="text-xs text-gray-500">
+          Contracts are versioned. Violations are explicit. Drift is caught immediately.
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Secondary features -->
+    <div class="mt-8 grid md:grid-cols-4 gap-4">
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-4 text-center">
+        <div class="text-xl mb-2">&#128274;</div>
+        <div class="font-medium text-sm mb-1">Local-First</div>
+        <div class="text-gray-500 text-xs">Data never leaves. Air-gapped capable.</div>
+      </div>
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-4 text-center">
+        <div class="text-xl mb-2">#&#65039;&#8419;</div>
+        <div class="font-medium text-sm mb-1">Content-Addressed</div>
+        <div class="text-gray-500 text-xs">Files identified by hash, not path.</div>
+      </div>
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-4 text-center">
+        <div class="text-xl mb-2">&#128202;</div>
+        <div class="font-medium text-sm mb-1">Excel Export</div>
+        <div class="text-gray-500 text-xs">--to-csv and --to-excel built in.</div>
+      </div>
+      <div class="bg-[#161b22] rounded-lg border border-gray-800 p-4 text-center">
+        <div class="text-xl mb-2">&#9881;</div>
+        <div class="font-medium text-sm mb-1">Job Management</div>
+        <div class="text-gray-500 text-xs">Backfills, retries, bounded memory.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Proof Point: FIX Example -->
+  <section class="max-w-4xl mx-auto px-6 pb-20">
+    <div class="bg-gradient-to-r from-green-600/10 to-transparent rounded-lg border border-green-600/30 p-8 md:p-10">
+      <div class="md:flex md:items-center md:justify-between">
+        <div class="mb-6 md:mb-0 md:mr-8">
+          <div class="text-green-400 text-sm font-medium mb-2">SEE IT IN ACTION</div>
+          <h2 class="text-2xl font-semibold mb-3">FIX Logs &#8594; Trade Breaks in 5 Minutes</h2>
+          <p class="text-gray-400 mb-4">
+            Trade Support teams use Casparian to debug trade breaks. The FIX parser turns raw logs into
+            a queryable order lifecycle table. Full lineage. Quarantine for malformed messages.
+          </p>
+          <div class="flex items-center gap-6 text-sm">
+            <div>
+              <div class="text-2xl font-bold text-white">4.8 hrs</div>
+              <div class="text-gray-500">saved per analyst/day</div>
+            </div>
+            <div>
+              <div class="text-2xl font-bold text-white">$24K</div>
+              <div class="text-gray-500">saved per analyst/year</div>
+            </div>
+          </div>
+        </div>
+        <div class="flex-shrink-0">
+          <a href="/finance" class="inline-block px-6 py-3 bg-green-600 hover:bg-green-700 rounded-lg font-medium transition">
+            See FIX Workflow &#8594;
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Premade Parsers -->
+  <section class="max-w-4xl mx-auto px-6 pb-20">
+    <div class="text-center mb-8">
+      <h2 class="text-2xl font-semibold mb-3">Don't want to write a parser?</h2>
+      <p class="text-gray-400">We ship certified parsers for common industry formats.</p>
+    </div>
+
+    <div class="grid md:grid-cols-4 gap-4 mb-6">
+      <a href="/finance" class="card-hover block bg-[#161b22] rounded-lg border border-green-600/30 p-4 text-center">
+        <div class="text-2xl mb-2">&#128200;</div>
+        <div class="font-medium mb-1">FIX Logs</div>
+        <span class="text-xs text-green-400">Available now</span>
+      </a>
+      <a href="/healthcare" class="card-hover block bg-[#161b22] rounded-lg border border-gray-800 p-4 text-center">
+        <div class="text-2xl mb-2">&#127973;</div>
+        <div class="font-medium mb-1">HL7 v2.x</div>
+        <span class="text-xs text-gray-500">Coming Q2 2026</span>
+      </a>
+      <a href="/legal" class="card-hover block bg-[#161b22] rounded-lg border border-gray-800 p-4 text-center">
+        <div class="text-2xl mb-2">&#128231;</div>
+        <div class="font-medium mb-1">PST Archives</div>
+        <span class="text-xs text-gray-500">Coming Q2 2026</span>
+      </a>
+      <a href="/defense" class="card-hover block bg-[#161b22] rounded-lg border border-gray-800 p-4 text-center">
+        <div class="text-2xl mb-2">&#128225;</div>
+        <div class="font-medium mb-1">CoT / PCAP</div>
+        <span class="text-xs text-gray-500">Coming 2026</span>
+      </a>
+    </div>
+
+    <p class="text-center text-gray-500 text-sm">
+      Certified parsers unlock with paid tiers. Custom parsers work on all tiers including Free.
+    </p>
+  </section>
+
+  <!-- Blog Preview Section -->
+  <section class="max-w-4xl mx-auto px-6 pb-20">
+    <div class="text-center mb-8">
+      <h2 class="text-2xl font-semibold mb-3">From the Blog</h2>
+      <p class="text-gray-400">Engineering notes on trustworthy Bronze layers, lineage, and local-first pipelines.</p>
+    </div>
+
+    <div class="bg-[#161b22] rounded-lg border border-gray-800 p-6">
+      <a href="/blog/2026-01-24-the-bronze-layer-is-where-trust-dies" class="block hover:bg-[#1c2129] -m-6 p-6 rounded-lg transition">
+        <h3 class="text-lg font-semibold mb-2 text-green-400">The Bronze Layer Is Where Trust Dies (Here's a Better Way)</h3>
+        <p class="text-gray-400 text-sm mb-3">Most pipelines fail before they ever reach Silver. The real problem is Bronze: messy files, silent coercion, and zero provenance.</p>
+        <span class="text-sm text-gray-500">Read more &#8594;</span>
+      </a>
+    </div>
+
+    <div class="text-center mt-6">
+      <a href="/blog" class="text-green-400 hover:text-green-300 text-sm transition">
+        View all posts &#8594;
+      </a>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="max-w-4xl mx-auto px-6 pb-20">
+    <div class="bg-[#161b22] rounded-lg border border-gray-800 p-10 text-center">
+      <h2 class="text-2xl font-semibold mb-4">Ready to make your parsers production-grade?</h2>
+      <p class="text-gray-400 mb-6">Download free. Bring your own parser or start with our FIX parser.</p>
+      <div class="flex flex-col sm:flex-row gap-4 justify-center">
+        <a href="#DOWNLOAD_URL_PLACEHOLDER" class="px-8 py-3 bg-green-600 hover:bg-green-700 rounded-lg font-medium transition">
+          Download Free
+        </a>
+        <a href="/finance" class="px-8 py-3 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-lg font-medium transition">
+          See FIX Example &#8594;
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

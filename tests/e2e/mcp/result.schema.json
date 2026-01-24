@@ -1,0 +1,246 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Casparian MCP E2E Test Result",
+  "description": "Schema for MCP E2E test results from Claude Code",
+  "type": "object",
+  "required": ["test_run_id", "timestamp", "test_type", "passed"],
+  "properties": {
+    "test_run_id": {
+      "type": "string",
+      "description": "Unique identifier for this test run"
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "ISO8601 timestamp of test execution",
+      "format": "date-time"
+    },
+    "test_type": {
+      "type": "string",
+      "description": "Type of test executed",
+      "enum": ["backtest", "approval", "evtx_workflow"]
+    },
+    "passed": {
+      "type": "boolean",
+      "description": "Whether all tests passed"
+    },
+    "error": {
+      "type": "string",
+      "description": "Error message if test failed at a high level"
+    },
+    "steps": {
+      "type": "array",
+      "description": "Individual test step results",
+      "items": {
+        "type": "object",
+        "required": ["name", "passed"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Step name identifier"
+          },
+          "passed": {
+            "type": "boolean",
+            "description": "Whether this step passed"
+          },
+          "error": {
+            "type": "string",
+            "description": "Error message if step failed"
+          },
+          "file_count": {
+            "type": "integer",
+            "description": "Number of files found (scan step)"
+          },
+          "plugin_count": {
+            "type": "integer",
+            "description": "Number of plugins found (plugins step)"
+          },
+          "has_outputs": {
+            "type": "boolean",
+            "description": "Whether preview returned outputs"
+          },
+          "job_id": {
+            "type": "string",
+            "description": "Job ID (job-related steps)"
+          },
+          "approval_id": {
+            "type": "string",
+            "description": "Approval ID (approval-related steps)"
+          },
+          "status": {
+            "type": "string",
+            "description": "Status value from response"
+          },
+          "final_status": {
+            "type": "string",
+            "description": "Final job status after polling"
+          },
+          "poll_count": {
+            "type": "integer",
+            "description": "Number of poll attempts"
+          },
+          "row_count": {
+            "type": "integer",
+            "description": "Number of rows returned (query step)"
+          },
+          "job_found": {
+            "type": "boolean",
+            "description": "Whether job was found in list"
+          },
+          "approval_found": {
+            "type": "boolean",
+            "description": "Whether approval was found in list"
+          },
+          "pending_count": {
+            "type": "integer",
+            "description": "Number of pending approvals"
+          },
+          "decision": {
+            "type": "string",
+            "description": "Approval decision made"
+          },
+          "result_status": {
+            "type": "string",
+            "description": "Status after approval decision"
+          },
+          "files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "List of file paths discovered"
+          },
+          "evtx_native_found": {
+            "type": "boolean",
+            "description": "Whether evtx_native parser was found"
+          },
+          "schema_columns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Column names from schema preview"
+          },
+          "sample_row_count": {
+            "type": "integer",
+            "description": "Number of sample rows in preview"
+          },
+          "files_processed": {
+            "type": "integer",
+            "description": "Number of files processed in job"
+          },
+          "pass_rate": {
+            "type": "number",
+            "description": "Backtest pass rate percentage"
+          },
+          "estimated_files": {
+            "type": "integer",
+            "description": "Estimated files for run request"
+          },
+          "rows_processed": {
+            "type": "integer",
+            "description": "Number of rows processed"
+          },
+          "outputs_created": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Output tables created"
+          },
+          "columns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Query result columns"
+          },
+          "has_lineage": {
+            "type": "boolean",
+            "description": "Whether lineage columns exist"
+          },
+          "lineage_columns": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Lineage column names found"
+          },
+          "total_jobs": {
+            "type": "integer",
+            "description": "Total jobs in list"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "description": "Test summary counts",
+      "properties": {
+        "total": {
+          "type": "integer",
+          "description": "Total number of steps",
+          "minimum": 0
+        },
+        "passed": {
+          "type": "integer",
+          "description": "Number of passing steps",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "description": "Number of failing steps",
+          "minimum": 0
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Test metrics",
+      "properties": {
+        "files_scanned": {
+          "type": "integer"
+        },
+        "jobs_started": {
+          "type": "integer"
+        },
+        "jobs_completed": {
+          "type": "integer"
+        },
+        "queries_executed": {
+          "type": "integer"
+        },
+        "approvals_created": {
+          "type": "integer"
+        },
+        "approvals_decided": {
+          "type": "integer"
+        },
+        "evtx_files_discovered": {
+          "type": "integer",
+          "description": "EVTX files found in discovery"
+        },
+        "schema_columns_found": {
+          "type": "integer",
+          "description": "Number of schema columns detected"
+        },
+        "backtest_files_processed": {
+          "type": "integer",
+          "description": "Files processed in backtest"
+        },
+        "run_rows_processed": {
+          "type": "integer",
+          "description": "Rows processed in run job"
+        },
+        "timeline_queries_executed": {
+          "type": "integer",
+          "description": "Timeline queries executed"
+        }
+      }
+    },
+    "workflow_summary": {
+      "type": "object",
+      "description": "Human-readable workflow summary",
+      "properties": {
+        "discovery": { "type": "string" },
+        "schema": { "type": "string" },
+        "backtest": { "type": "string" },
+        "execution": { "type": "string" },
+        "timeline": { "type": "string" }
+      }
+    },
+    "raw_output_file": {
+      "type": "string",
+      "description": "Path to raw output file if result extraction failed"
+    }
+  }
+}

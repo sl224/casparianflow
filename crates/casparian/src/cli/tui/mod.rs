@@ -6,10 +6,16 @@ pub mod app;
 pub mod event;
 pub mod extraction;
 pub mod pattern_query;
+pub mod snapshot;
+pub mod snapshot_export;
+pub mod snapshot_states;
 pub mod ui;
 
 #[cfg(feature = "profiling")]
 mod profiler_overlay;
+
+#[cfg(test)]
+mod snapshot_tests;
 
 use anyhow::Result;
 use clap::Args;
@@ -17,12 +23,13 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{prelude::*, backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, prelude::*, Terminal};
 use std::io::stdout;
 use std::path::PathBuf;
 
 use crate::cli::tui::app::App;
 use crate::cli::tui::event::{Event, EventHandler};
+use casparian::telemetry::TelemetryRecorder;
 
 /// TUI command arguments
 #[derive(Debug, Args)]
@@ -33,7 +40,7 @@ pub struct TuiArgs {
 }
 
 /// Run the TUI
-pub fn run(args: TuiArgs) -> Result<()> {
+pub fn run(args: TuiArgs, telemetry: Option<TelemetryRecorder>) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -42,7 +49,7 @@ pub fn run(args: TuiArgs) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app state
-    let mut app = App::new(args);
+    let mut app = App::new(args, telemetry);
 
     // Create event handler
     let mut events = EventHandler::new(std::time::Duration::from_millis(250));
@@ -52,10 +59,7 @@ pub fn run(args: TuiArgs) -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -109,10 +113,8 @@ mod tests {
 
     #[test]
     fn test_app_starts_in_home_mode() {
-        let args = TuiArgs {
-            database: None,
-        };
-        let app = App::new(args);
+        let args = TuiArgs { database: None };
+        let app = App::new(args, None);
         assert!(matches!(app.mode, app::TuiMode::Home));
         assert!(app.running);
     }
@@ -122,10 +124,8 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let args = TuiArgs {
-            database: None,
-        };
-        let app = App::new(args);
+        let args = TuiArgs { database: None };
+        let app = App::new(args, None);
 
         terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
 
@@ -134,5 +134,4 @@ mod tests {
         assert!(buffer.area.width == 80);
         assert!(buffer.area.height == 24);
     }
-
 }

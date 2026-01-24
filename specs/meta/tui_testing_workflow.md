@@ -21,6 +21,27 @@ This document formalizes the process for testing Terminal User Interfaces (TUI) 
 | Edge cases | Often missed | Visually apparent |
 | Layout issues | Hard to detect | Immediately visible |
 
+## Snapshot Harness (TestBackend)
+
+In addition to tmux captures, we maintain deterministic snapshots rendered with Ratatui's `TestBackend`.
+These are intended for fast regression checks and LLM review bundles.
+
+**Artifacts**
+- `.test_output/tui_snapshots/` (ignored)
+- `tui_snapshots.md` (bundle with plain + mask for each size)
+- Per-case metadata and layout JSON
+
+**Command**
+```bash
+cargo run -p casparian -- tui-snapshots --out .test_output/tui_snapshots
+```
+
+**Default sizes**
+- 80x24
+- 100x30
+- 120x40
+- 160x50
+
 ## Core Principles
 
 ### 1. Test What Users See

@@ -1,15 +1,22 @@
 //! Job command - Manage individual jobs
 //!
 //! Commands for showing, retrying, and cancelling individual jobs.
+//!
+//! WS4-05: Cancel uses Control API when sentinel is running, falls back to direct DB.
 
 use crate::cli::error::HelpfulError;
 use crate::cli::jobs::{column_exists, get_db_path, table_exists, Job};
 use crate::cli::output::format_number_signed;
 use casparian_db::{DbConnection, DbValue};
-use casparian_protocol::{JobId, ProcessingStatus};
+use casparian_protocol::{JobId, JobStatus, ProcessingStatus};
+use casparian_sentinel::ControlClient;
 use clap::Subcommand;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Default Control API address when sentinel is running
+const DEFAULT_CONTROL_ADDR: &str = "tcp://127.0.0.1:5556";
 
 /// Subcommands for job management
 #[derive(Subcommand, Debug, Clone)]
@@ -192,9 +199,9 @@ fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
         .into());
     }
 
-    let job_id_db = job_id.to_i64().map_err(|err| {
-        HelpfulError::new(format!("Invalid job ID: {}", err))
-    })?;
+    let job_id_db = job_id
+        .to_i64()
+        .map_err(|err| HelpfulError::new(format!("Invalid job ID: {}", err)))?;
 
     // Reset job to QUEUED
     conn.execute(
@@ -212,8 +219,7 @@ fn run_retry(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             DbValue::from(ProcessingStatus::Queued.as_str()),
             DbValue::from(job_id_db),
         ],
-    )
-    ?;
+    )?;
 
     println!(
         "Job {} reset to {} for retry",
@@ -248,8 +254,7 @@ fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
                 DbValue::from(ProcessingStatus::Failed.as_str()),
                 DbValue::from(t),
             ],
-        )
-        ?
+        )?
     } else {
         conn.execute(
             r#"
@@ -266,8 +271,7 @@ fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
                 DbValue::from(ProcessingStatus::Queued.as_str()),
                 DbValue::from(ProcessingStatus::Failed.as_str()),
             ],
-        )
-        ?
+        )?
     };
 
     if rows_affected == 0 {
@@ -290,12 +294,70 @@ fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// Cancel a pending or running job
+///
+/// WS4-05: Uses Control API when sentinel is running for real cancellation,
+/// falls back to direct DB update otherwise.
 fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
     let job_id: JobId = id.parse().map_err(|_| {
         HelpfulError::new(format!("Invalid job ID: '{}'", id))
             .with_context("Job ID must be a positive integer")
     })?;
 
+    // Try Control API first (enables real cancellation of running jobs)
+    if let Some(client) = try_control_client() {
+        return run_cancel_via_api(&client, job_id);
+    }
+
+    // Fall back to direct DB (limited - can only update status, not stop worker)
+    run_cancel_via_db(db_path, job_id)
+}
+
+/// Try to connect to the Control API
+fn try_control_client() -> Option<ControlClient> {
+    // Check for explicit address override
+    let addr = std::env::var("CASPARIAN_CONTROL_ADDR")
+        .unwrap_or_else(|_| DEFAULT_CONTROL_ADDR.to_string());
+
+    // Check if explicitly disabled
+    if std::env::var("CASPARIAN_CONTROL_DISABLED").is_ok() {
+        return None;
+    }
+
+    // Use short timeout for connection check
+    match ControlClient::connect_with_timeout(&addr, Duration::from_millis(500)) {
+        Ok(client) => {
+            // Quick ping to verify connection
+            match client.ping() {
+                Ok(true) => Some(client),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Cancel job via Control API (real cancellation)
+fn run_cancel_via_api(client: &ControlClient, job_id: JobId) -> anyhow::Result<()> {
+    match client.cancel_job(job_id) {
+        Ok((success, message)) => {
+            if success {
+                println!("Job {} cancelled via Control API", job_id);
+                println!("  {}", message);
+            } else {
+                println!("Job {} could not be cancelled", job_id);
+                println!("  {}", message);
+            }
+            Ok(())
+        }
+        Err(e) => Err(HelpfulError::new(format!("Failed to cancel job {}", job_id))
+            .with_context(format!("Control API error: {}", e))
+            .with_suggestion("TRY: Check if sentinel is running with --control-api")
+            .into()),
+    }
+}
+
+/// Cancel job via direct DB (limited - doesn't stop running workers)
+fn run_cancel_via_db(db_path: &PathBuf, job_id: JobId) -> anyhow::Result<()> {
     let conn = connect_db(db_path)?;
 
     // Check job exists
@@ -315,14 +377,21 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             // Staged jobs can also be cancelled
         }
         ProcessingStatus::Completed => {
-            return Err(HelpfulError::new(format!("Job {} already completed", job_id))
-                .with_context("Cannot cancel a completed job")
-                .into());
+            return Err(
+                HelpfulError::new(format!("Job {} already completed", job_id))
+                    .with_context("Cannot cancel a completed job")
+                    .into(),
+            );
         }
         ProcessingStatus::Failed => {
             return Err(HelpfulError::new(format!("Job {} already failed", job_id))
                 .with_context("Cannot cancel a failed job")
-                .with_suggestion("TRY: casparian job retry {}   # Retry the job instead", )
+                .with_suggestion("TRY: casparian job retry {}   # Retry the job instead")
+                .into());
+        }
+        ProcessingStatus::Aborted => {
+            return Err(HelpfulError::new(format!("Job {} already aborted", job_id))
+                .with_context("Job is already cancelled")
                 .into());
         }
         ProcessingStatus::Skipped => {
@@ -334,26 +403,27 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
 
     // Cancel the job
     let now = chrono::Utc::now().to_rfc3339();
-    let job_id_db = job_id.to_i64().map_err(|err| {
-        HelpfulError::new(format!("Invalid job ID: {}", err))
-    })?;
+    let job_id_db = job_id
+        .to_i64()
+        .map_err(|err| HelpfulError::new(format!("Invalid job ID: {}", err)))?;
     conn.execute(
         r#"
         UPDATE cf_processing_queue
         SET status = ?,
+            completion_status = ?,
             end_time = ?,
             error_message = 'Cancelled by user'
         WHERE id = ?
         "#,
         &[
-            DbValue::from(ProcessingStatus::Failed.as_str()),
+            DbValue::from(ProcessingStatus::Aborted.as_str()),
+            DbValue::from(JobStatus::Aborted.as_str()),
             DbValue::from(now),
             DbValue::from(job_id_db),
         ],
-    )
-    ?;
+    )?;
 
-    println!("Job {} cancelled", job_id);
+    println!("Job {} cancelled (DB only)", job_id);
 
     // If the job was running, warn about potential side effects
     if job.status == ProcessingStatus::Running {
@@ -362,8 +432,10 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             "WARNING: Job was {} when cancelled.",
             ProcessingStatus::Running.as_str()
         );
-        println!("The worker may have partially processed the file.");
+        println!("The worker may still be running (sentinel not available).");
         println!("Check output files for incomplete data.");
+        println!();
+        println!("TRY: Run sentinel with --control-api for real cancellation");
     }
 
     Ok(())
@@ -396,8 +468,7 @@ fn connect_db_readonly(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
 /// Get a single job by ID
 fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Job>> {
     let job_id_db = job_id.to_i64().map_err(|err| anyhow::anyhow!(err))?;
-    let has_quarantine_column =
-        column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
+    let has_quarantine_column = column_exists(conn, "cf_processing_queue", "quarantine_rows")?;
     let has_quarantine_table = table_exists(conn, "cf_quarantine")?;
     let quarantine_select = if has_quarantine_column {
         ", COALESCE(q.quarantine_rows, 0) as quarantine_rows"
@@ -441,9 +512,7 @@ fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Jo
         quarantine_join = quarantine_join
     );
 
-    let row = conn
-        .query_optional(&query, &[DbValue::from(job_id_db)])
-        ?;
+    let row = conn.query_optional(&query, &[DbValue::from(job_id_db)])?;
 
     let job = match row {
         Some(r) => {
@@ -451,8 +520,9 @@ fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Jo
             let id = JobId::try_from(raw_id)
                 .map_err(|err| anyhow::anyhow!("Invalid job id {}: {}", raw_id, err))?;
             let status_str: String = r.get(3)?;
-            let status = status_str.parse::<ProcessingStatus>()
-                .map_err(|e| anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e))?;
+            let status = status_str.parse::<ProcessingStatus>().map_err(|e| {
+                anyhow::anyhow!("Invalid processing status '{}': {}", status_str, e)
+            })?;
             Some(Job {
                 id,
                 file_path: r.get(1)?,
@@ -477,12 +547,10 @@ fn get_job_by_id(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<Jo
 fn get_job_failure(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<JobFailure>> {
     let job_id_db = job_id.to_i64().map_err(|err| anyhow::anyhow!(err))?;
     if !table_exists(conn, "cf_job_failures")? {
-        let error = conn
-            .query_optional(
-                "SELECT error_message FROM cf_processing_queue WHERE id = ?",
-                &[DbValue::from(job_id_db)],
-            )
-            ?;
+        let error = conn.query_optional(
+            "SELECT error_message FROM cf_processing_queue WHERE id = ?",
+            &[DbValue::from(job_id_db)],
+        )?;
         return Ok(error.and_then(|row| row.get(0).ok()).map(|msg| JobFailure {
             error_type: None,
             error_message: msg,
@@ -492,18 +560,16 @@ fn get_job_failure(conn: &DbConnection, job_id: JobId) -> anyhow::Result<Option<
         }));
     }
 
-    let row = conn
-        .query_optional(
-            r#"
+    let row = conn.query_optional(
+        r#"
             SELECT error_type, error_message, stack_trace, line_number, context
             FROM cf_job_failures
             WHERE job_id = ?
             ORDER BY id DESC
             LIMIT 1
             "#,
-            &[DbValue::from(job_id_db)],
-        )
-        ?;
+        &[DbValue::from(job_id_db)],
+    )?;
 
     Ok(row.map(|r| JobFailure {
         error_type: r.get(0).ok(),
@@ -601,13 +667,16 @@ fn print_job_details(job: &Job, failure: &Option<JobFailure>, timeline: &JobTime
     println!();
     println!("TRY:");
     if job.status == ProcessingStatus::Failed {
-        println!("  casparian job retry {}            # Retry this job", job.id);
         println!(
-            "  casparian preview {}   # Inspect the file",
-            job.file_path
+            "  casparian job retry {}            # Retry this job",
+            job.id
         );
+        println!("  casparian preview {}   # Inspect the file", job.file_path);
     } else if job.status == ProcessingStatus::Queued || job.status == ProcessingStatus::Running {
-        println!("  casparian job cancel {}           # Cancel this job", job.id);
+        println!(
+            "  casparian job cancel {}           # Cancel this job",
+            job.id
+        );
     }
     println!("  casparian jobs                    # View all jobs");
 }

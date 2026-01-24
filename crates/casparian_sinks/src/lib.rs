@@ -17,12 +17,11 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-fn job_prefix(job_id: &str) -> &str {
-    if job_id.len() >= 8 {
-        &job_id[..8]
-    } else {
-        job_id
-    }
+use casparian_protocol::SinkMode;
+
+fn job_prefix(job_id: &str) -> String {
+    // Use a stable 16-hex blake3 digest prefix to avoid collisions
+    blake3::hash(job_id.as_bytes()).to_hex()[..16].to_string()
 }
 
 pub fn output_filename(output_name: &str, job_id: &str, extension: &str) -> String {
@@ -113,14 +112,21 @@ pub struct OutputPlan {
     name: String,
     table: Option<String>,
     batches: Vec<OutputBatch>,
+    sink_mode: SinkMode,
 }
 
 impl OutputPlan {
-    pub fn new(name: impl Into<String>, table: Option<String>, batches: Vec<OutputBatch>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        table: Option<String>,
+        batches: Vec<OutputBatch>,
+        sink_mode: SinkMode,
+    ) -> Self {
         Self {
             name: name.into(),
             table,
             batches,
+            sink_mode,
         }
     }
 
@@ -134,6 +140,10 @@ impl OutputPlan {
 
     pub fn batches(&self) -> &[OutputBatch] {
         &self.batches
+    }
+
+    pub fn sink_mode(&self) -> SinkMode {
+        self.sink_mode
     }
 }
 
@@ -157,6 +167,7 @@ pub fn plan_outputs(
             default_name,
             None,
             batches,
+            SinkMode::Append,
         )]);
     }
 
@@ -172,7 +183,12 @@ pub fn plan_outputs(
         .iter()
         .zip(output_batches.iter())
         .map(|(info, batches)| {
-            OutputPlan::new(info.name.clone(), info.table.clone(), batches.clone())
+            OutputPlan::new(
+                info.name.clone(),
+                info.table.clone(),
+                batches.clone(),
+                SinkMode::Append,
+            )
         })
         .collect())
 }
@@ -199,7 +215,11 @@ pub fn artifact_uri_for_output(
             format!("file://{}", path.display())
         }
         SinkScheme::Duckdb => {
-            format!("duckdb://{}?table={}", parsed_sink.path.display(), table_name)
+            format!(
+                "duckdb://{}?table={}",
+                parsed_sink.path.display(),
+                table_name
+            )
         }
         SinkScheme::File => {
             let ext = parsed_sink
@@ -224,6 +244,7 @@ pub fn write_output_plan(
     sink_uri: &str,
     outputs: &[OutputPlan],
     job_id: &str,
+    should_commit: Option<&dyn Fn() -> bool>,
 ) -> SinkResult<Vec<OutputArtifact>> {
     let parsed = casparian_protocol::types::ParsedSinkUri::parse(sink_uri)
         .map_err(|e| SinkError::message(format!("Failed to parse sink URI: {}", e)))?;
@@ -234,6 +255,7 @@ pub fn write_output_plan(
             sink_uri,
             output.name(),
             output.table(),
+            output.sink_mode(),
             job_id,
         )?;
         registry.add(output.name(), sink);
@@ -255,12 +277,7 @@ pub fn write_output_plan(
             rows += batch.num_rows() as u64;
         }
 
-        let uri = artifact_uri_for_output(
-            &parsed,
-            output.name(),
-            output.table(),
-            job_id,
-        )?;
+        let uri = artifact_uri_for_output(&parsed, output.name(), output.table(), job_id)?;
 
         artifacts.push(OutputArtifact {
             name: output.name().to_string(),
@@ -269,7 +286,7 @@ pub fn write_output_plan(
         });
     }
 
-    registry.finish()?;
+    registry.finish_with_guard(should_commit)?;
 
     Ok(artifacts)
 }
@@ -287,13 +304,19 @@ pub struct ParquetSink {
     temp_path: Option<PathBuf>,
     /// Final file path
     final_path: Option<PathBuf>,
+    /// True once final file has been promoted
+    committed: bool,
 }
 
 impl ParquetSink {
     pub fn new(output_dir: PathBuf, output_name: &str, job_id: &str) -> Result<Self> {
         // Ensure output directory exists
-        std::fs::create_dir_all(&output_dir)
-            .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
+        std::fs::create_dir_all(&output_dir).with_context(|| {
+            format!(
+                "Failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
 
         Ok(Self {
             output_dir,
@@ -303,6 +326,7 @@ impl ParquetSink {
             rows_written: 0,
             temp_path: None,
             final_path: None,
+            committed: false,
         })
     }
 }
@@ -318,18 +342,27 @@ impl ParquetSink {
         let temp_filename = format!("{}.tmp", temp_filename);
         let temp_path = self.output_dir.join(&temp_filename);
 
-        info!("Initializing Parquet sink: {} (temp: {})", final_path.display(), temp_path.display());
+        info!(
+            "Initializing Parquet sink: {} (temp: {})",
+            final_path.display(),
+            temp_path.display()
+        );
 
-        let file = std::fs::File::create(&temp_path)
-            .with_context(|| format!("Failed to create temp parquet file: {}", temp_path.display()))?;
+        let file = std::fs::File::create(&temp_path).with_context(|| {
+            format!(
+                "Failed to create temp parquet file: {}",
+                temp_path.display()
+            )
+        })?;
 
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
 
         let arrow_schema = Arc::new(schema.clone());
-        let writer = parquet::arrow::arrow_writer::ArrowWriter::try_new(file, arrow_schema, Some(props))
-            .context("Failed to create Parquet writer")?;
+        let writer =
+            parquet::arrow::arrow_writer::ArrowWriter::try_new(file, arrow_schema, Some(props))
+                .context("Failed to create Parquet writer")?;
 
         self.writer = Some(writer);
         self.temp_path = Some(temp_path);
@@ -338,36 +371,75 @@ impl ParquetSink {
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let writer = self.writer.as_mut()
+        let writer = self
+            .writer
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Parquet sink not initialized"))?;
 
-        writer.write(batch).context("Failed to write batch to Parquet")?;
+        writer
+            .write(batch)
+            .context("Failed to write batch to Parquet")?;
 
         let rows = batch.num_rows() as u64;
         self.rows_written += rows;
-        debug!("Wrote {} rows to Parquet (total: {})", rows, self.rows_written);
+        debug!(
+            "Wrote {} rows to Parquet (total: {})",
+            rows, self.rows_written
+        );
 
         Ok(rows)
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn prepare(&mut self) -> Result<()> {
         if let Some(writer) = self.writer.take() {
             writer.close().context("Failed to close Parquet writer")?;
-
-            // Atomic rename: temp -> final
-            if let (Some(temp_path), Some(final_path)) = (&self.temp_path, &self.final_path) {
-                std::fs::rename(temp_path, final_path)
-                    .with_context(|| format!(
-                        "Failed to rename {} -> {}",
-                        temp_path.display(),
-                        final_path.display()
-                    ))?;
-                info!("Committed Parquet sink: {} ({} rows)", final_path.display(), self.rows_written);
-            }
         }
         Ok(())
     }
 
+    fn commit(&mut self) -> Result<()> {
+        if let (Some(temp_path), Some(final_path)) = (&self.temp_path, &self.final_path) {
+            std::fs::rename(temp_path, final_path).with_context(|| {
+                format!(
+                    "Failed to rename {} -> {}",
+                    temp_path.display(),
+                    final_path.display()
+                )
+            })?;
+            info!(
+                "Committed Parquet sink: {} ({} rows)",
+                final_path.display(),
+                self.rows_written
+            );
+            self.committed = true;
+        }
+        self.temp_path = None;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if self.committed {
+            if let Some(final_path) = &self.final_path {
+                if final_path.exists() {
+                    let _ = std::fs::remove_file(final_path);
+                    warn!(
+                        "Rolled back Parquet committed file: {}",
+                        final_path.display()
+                    );
+                }
+            }
+        }
+        if let Some(temp_path) = &self.temp_path {
+            if temp_path.exists() {
+                let _ = std::fs::remove_file(temp_path);
+                warn!("Rolled back Parquet temp file: {}", temp_path.display());
+            }
+        }
+        self.temp_path = None;
+        self.final_path = None;
+        self.committed = false;
+        Ok(())
+    }
 }
 
 impl Drop for ParquetSink {
@@ -395,12 +467,18 @@ pub struct CsvSink {
     temp_path: Option<PathBuf>,
     /// Final file path
     final_path: Option<PathBuf>,
+    /// True once final file has been promoted
+    committed: bool,
 }
 
 impl CsvSink {
     pub fn new(output_dir: PathBuf, output_name: &str, job_id: &str) -> Result<Self> {
-        std::fs::create_dir_all(&output_dir)
-            .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
+        std::fs::create_dir_all(&output_dir).with_context(|| {
+            format!(
+                "Failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
 
         Ok(Self {
             output_dir,
@@ -410,6 +488,7 @@ impl CsvSink {
             rows_written: 0,
             temp_path: None,
             final_path: None,
+            committed: false,
         })
     }
 }
@@ -425,7 +504,11 @@ impl CsvSink {
         let temp_filename = format!("{}.tmp", temp_filename);
         let temp_path = self.output_dir.join(&temp_filename);
 
-        info!("Initializing CSV sink: {} (temp: {})", final_path.display(), temp_path.display());
+        info!(
+            "Initializing CSV sink: {} (temp: {})",
+            final_path.display(),
+            temp_path.display()
+        );
 
         let file = std::fs::File::create(&temp_path)
             .with_context(|| format!("Failed to create temp CSV file: {}", temp_path.display()))?;
@@ -441,10 +524,14 @@ impl CsvSink {
     }
 
     fn write_batch(&mut self, batch: &RecordBatch) -> Result<u64> {
-        let writer = self.writer.as_mut()
+        let writer = self
+            .writer
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("CSV sink not initialized"))?;
 
-        writer.write(batch).context("Failed to write batch to CSV")?;
+        writer
+            .write(batch)
+            .context("Failed to write batch to CSV")?;
 
         let rows = batch.num_rows() as u64;
         self.rows_written += rows;
@@ -453,23 +540,55 @@ impl CsvSink {
         Ok(rows)
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn prepare(&mut self) -> Result<()> {
         // Drop writer to flush
         drop(self.writer.take());
-
-        // Atomic rename: temp -> final
-        if let (Some(temp_path), Some(final_path)) = (&self.temp_path, &self.final_path) {
-            std::fs::rename(temp_path, final_path)
-                .with_context(|| format!(
-                    "Failed to rename {} -> {}",
-                    temp_path.display(),
-                    final_path.display()
-                ))?;
-            info!("Committed CSV sink: {} ({} rows)", final_path.display(), self.rows_written);
-        }
         Ok(())
     }
 
+    fn commit(&mut self) -> Result<()> {
+        if let (Some(temp_path), Some(final_path)) = (&self.temp_path, &self.final_path) {
+            std::fs::rename(temp_path, final_path).with_context(|| {
+                format!(
+                    "Failed to rename {} -> {}",
+                    temp_path.display(),
+                    final_path.display()
+                )
+            })?;
+            info!(
+                "Committed CSV sink: {} ({} rows)",
+                final_path.display(),
+                self.rows_written
+            );
+            self.committed = true;
+        }
+        self.temp_path = None;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if self.committed {
+            if let Some(final_path) = &self.final_path {
+                if final_path.exists() {
+                    let _ = std::fs::remove_file(final_path);
+                    warn!(
+                        "Rolled back CSV committed file: {}",
+                        final_path.display()
+                    );
+                }
+            }
+        }
+        if let Some(temp_path) = &self.temp_path {
+            if temp_path.exists() {
+                let _ = std::fs::remove_file(temp_path);
+                warn!("Rolled back CSV temp file: {}", temp_path.display());
+            }
+        }
+        self.temp_path = None;
+        self.final_path = None;
+        self.committed = false;
+        Ok(())
+    }
 }
 
 impl Drop for CsvSink {
@@ -484,10 +603,24 @@ impl Drop for CsvSink {
     }
 }
 
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn stage_table_name(job_id: &str, output_name: &str) -> String {
+    let seed = format!("{}:{}", job_id, output_name);
+    format!(
+        "__cf_stage_{}",
+        blake3::hash(seed.as_bytes()).to_hex()[..16].to_string()
+    )
+}
+
 /// DuckDB sink writer
 pub struct DuckDbSink {
     db_path: PathBuf,
     table_name: String,
+    stage_table: String,
+    sink_mode: SinkMode,
     conn: duckdb::Connection,
     rows_written: u64,
     schema: Option<Schema>,
@@ -495,7 +628,13 @@ pub struct DuckDbSink {
 }
 
 impl DuckDbSink {
-    pub fn new(db_path: PathBuf, table_name: &str) -> Result<Self> {
+    pub fn new(
+        db_path: PathBuf,
+        table_name: &str,
+        sink_mode: SinkMode,
+        job_id: &str,
+        output_name: &str,
+    ) -> Result<Self> {
         if is_control_plane_db_path(&db_path) {
             bail!(
                 "Refusing to write sink output into control-plane database: {}",
@@ -503,8 +642,9 @@ impl DuckDbSink {
             );
         }
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create database directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create database directory: {}", parent.display())
+            })?;
         }
 
         let lock_guard = try_lock_exclusive(&db_path).map_err(|err| match err {
@@ -523,9 +663,13 @@ impl DuckDbSink {
         let conn = duckdb::Connection::open(&db_path)
             .with_context(|| format!("Failed to open DuckDB database: {}", db_path.display()))?;
 
+        let stage_table = stage_table_name(job_id, output_name);
+
         Ok(Self {
             db_path,
             table_name: table_name.to_string(),
+            stage_table,
+            sink_mode,
             conn,
             rows_written: 0,
             schema: None,
@@ -576,7 +720,12 @@ impl DuckDbSink {
 
 impl DuckDbSink {
     fn init(&mut self, schema: &Schema) -> Result<()> {
-        info!("Initializing DuckDB sink: {} (table: {})", self.db_path.display(), self.table_name);
+        info!(
+            "Initializing DuckDB sink: {} (table: {}, stage: {})",
+            self.db_path.display(),
+            self.table_name,
+            self.stage_table
+        );
 
         let columns: Vec<String> = schema
             .fields()
@@ -584,20 +733,26 @@ impl DuckDbSink {
             .map(|f| {
                 let sql_type = Self::arrow_to_duckdb_type(f.data_type());
                 let nullable = if f.is_nullable() { "" } else { " NOT NULL" };
-                format!("\"{}\" {}{}", f.name().replace('"', "\"\""), sql_type, nullable)
+                format!(
+                    "\"{}\" {}{}",
+                    f.name().replace('"', "\"\""),
+                    sql_type,
+                    nullable
+                )
             })
             .collect();
 
-        let create_sql = format!(
-            "CREATE TABLE IF NOT EXISTS \"{}\" ({})",
-            self.table_name.replace('"', "\"\""),
-            columns.join(", ")
-        );
+        let stage_ident = quote_ident(&self.stage_table);
+        let drop_sql = format!("DROP TABLE IF EXISTS {}", stage_ident);
+        let create_sql = format!("CREATE TABLE {} ({})", stage_ident, columns.join(", "));
 
+        debug!("DROP TABLE: {}", drop_sql);
         debug!("CREATE TABLE: {}", create_sql);
         self.with_conn_mut(|conn| {
+            conn.execute(&drop_sql, [])
+                .context("Failed to drop DuckDB stage table")?;
             conn.execute(&create_sql, [])
-                .context("Failed to create DuckDB table")?;
+                .context("Failed to create DuckDB stage table")?;
             Ok(())
         })?;
 
@@ -609,33 +764,103 @@ impl DuckDbSink {
         let num_rows = batch.num_rows();
         let mut appender = self
             .conn
-            .appender(&self.table_name)
+            .appender(&self.stage_table)
             .context("Failed to create DuckDB appender")?;
         appender
             .append_record_batch(batch.clone())
             .context("Failed to append DuckDB record batch")?;
 
         self.rows_written += num_rows as u64;
-        debug!("Wrote {} rows to DuckDB (total: {})", num_rows, self.rows_written);
+        debug!(
+            "Wrote {} rows to DuckDB (total: {})",
+            num_rows, self.rows_written
+        );
 
         Ok(num_rows as u64)
     }
 
-    fn finish(mut self) -> Result<()> {
+    fn prepare(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        if self.schema.is_none() {
+            return Ok(());
+        }
+
+        let target = quote_ident(&self.table_name);
+        let stage = quote_ident(&self.stage_table);
+        let sink_mode = self.sink_mode;
+        let table_name = self.table_name.clone();
+
+        self.with_conn_mut(|conn| {
+            let tx = conn
+                .transaction()
+                .context("Failed to begin DuckDB transaction")?;
+            match sink_mode {
+                SinkMode::Append => {
+                    let create_dest = format!(
+                        "CREATE TABLE IF NOT EXISTS {} AS SELECT * FROM {} WHERE 1=0",
+                        target, stage
+                    );
+                    tx.execute(&create_dest, [])
+                        .context("Failed to ensure DuckDB destination table")?;
+                    let insert_sql =
+                        format!("INSERT INTO {} SELECT * FROM {}", target, stage);
+                    tx.execute(&insert_sql, [])
+                        .context("Failed to append DuckDB stage data")?;
+                    let drop_stage = format!("DROP TABLE {}", stage);
+                    tx.execute(&drop_stage, [])
+                        .context("Failed to drop DuckDB stage table")?;
+                }
+                SinkMode::Replace => {
+                    let drop_target = format!("DROP TABLE IF EXISTS {}", target);
+                    tx.execute(&drop_target, [])
+                        .context("Failed to drop DuckDB target table")?;
+                    let rename_sql =
+                        format!("ALTER TABLE {} RENAME TO {}", stage, target);
+                    tx.execute(&rename_sql, [])
+                        .context("Failed to rename DuckDB stage table")?;
+                }
+                SinkMode::Error => {
+                    let rename_sql =
+                        format!("ALTER TABLE {} RENAME TO {}", stage, target);
+                    tx.execute(&rename_sql, [])
+                        .with_context(|| {
+                            format!(
+                                "DuckDB sink in Error mode: destination table '{}' already exists",
+                                table_name
+                            )
+                        })?;
+                }
+            }
+            tx.commit().context("Failed to commit DuckDB transaction")?;
+            Ok(())
+        })?;
+
         self.with_conn_mut(|conn| {
             conn.execute_batch("CHECKPOINT")
                 .context("Failed to checkpoint DuckDB database")?;
             Ok(())
         })?;
-        info!("Closed DuckDB sink: {} total rows", self.rows_written);
+        info!("Committed DuckDB sink: {} total rows", self.rows_written);
         Ok(())
     }
 
+    fn rollback(&mut self) -> Result<()> {
+        let stage = quote_ident(&self.stage_table);
+        self.with_conn_mut(|conn| {
+            conn.execute(&format!("DROP TABLE IF EXISTS {}", stage), [])
+                .context("Failed to drop DuckDB stage table")?;
+            Ok(())
+        })?;
+        Ok(())
+    }
 }
 
 enum Sink {
     Parquet(ParquetSink),
-    Csv(CsvSink),
+    Csv(Box<CsvSink>),
     DuckDb(DuckDbSink),
 }
 
@@ -656,11 +881,27 @@ impl Sink {
         }
     }
 
-    fn finish(self) -> Result<()> {
+    fn prepare(&mut self) -> Result<()> {
         match self {
-            Sink::Parquet(sink) => sink.finish(),
-            Sink::Csv(sink) => sink.finish(),
-            Sink::DuckDb(sink) => sink.finish(),
+            Sink::Parquet(sink) => sink.prepare(),
+            Sink::Csv(sink) => sink.prepare(),
+            Sink::DuckDb(sink) => sink.prepare(),
+        }
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        match self {
+            Sink::Parquet(sink) => sink.commit(),
+            Sink::Csv(sink) => sink.commit(),
+            Sink::DuckDb(sink) => sink.commit(),
+        }
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        match self {
+            Sink::Parquet(sink) => sink.rollback(),
+            Sink::Csv(sink) => sink.rollback(),
+            Sink::DuckDb(sink) => sink.rollback(),
         }
     }
 }
@@ -699,6 +940,12 @@ pub struct SinkRegistry {
     sinks: HashMap<String, Sink>,
 }
 
+impl Default for SinkRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SinkRegistry {
     pub fn new() -> Self {
         Self {
@@ -730,11 +977,58 @@ impl SinkRegistry {
         }
     }
 
-    /// Finish all sinks
+    /// Finish all sinks using prepare/commit with rollback on failure.
     pub fn finish(self) -> Result<()> {
-        for (name, sink) in self.sinks {
-            debug!("Finishing sink: {}", name);
-            sink.finish()?;
+        self.finish_with_guard(None)
+    }
+
+    /// Finish all sinks with an optional commit guard.
+    ///
+    /// If the guard returns false, all sinks are rolled back.
+    pub fn finish_with_guard(
+        mut self,
+        should_commit: Option<&dyn Fn() -> bool>,
+    ) -> Result<()> {
+        let mut names: Vec<String> = self.sinks.keys().cloned().collect();
+        names.sort();
+
+        for name in &names {
+            if let Some(sink) = self.sinks.get_mut(name) {
+                debug!("Preparing sink: {}", name);
+                sink.prepare()?;
+            }
+        }
+
+        if let Some(guard) = should_commit {
+            if !guard() {
+                warn!("Sink commit aborted by guard; rolling back");
+                for name in &names {
+                    if let Some(sink) = self.sinks.get_mut(name) {
+                        let _ = sink.rollback();
+                    }
+                }
+                bail!("Output commit aborted");
+            }
+        }
+
+        let commit_result: Result<()> = (|| {
+            for name in &names {
+                if let Some(sink) = self.sinks.get_mut(name) {
+                    debug!("Committing sink: {}", name);
+                    sink.commit()?;
+                }
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = commit_result {
+            warn!("Sink commit failed, rolling back: {}", err);
+            for name in &names {
+                if let Some(sink) = self.sinks.get_mut(name) {
+                    let _ = sink.rollback();
+                }
+            }
+            return Err(err);
         }
 
         Ok(())
@@ -767,12 +1061,20 @@ pub(crate) fn validate_batch_schema(
     }
 
     // Check each field
-    for (i, (batch_field, declared_field)) in batch_schema.fields().iter().zip(declared_schema.fields().iter()).enumerate() {
+    for (i, (batch_field, declared_field)) in batch_schema
+        .fields()
+        .iter()
+        .zip(declared_schema.fields().iter())
+        .enumerate()
+    {
         // Check name
         if batch_field.name() != declared_field.name() {
             bail!(
                 "Schema mismatch for sink '{}' column {}: expected name '{}', got '{}'",
-                sink_name, i, declared_field.name(), batch_field.name()
+                sink_name,
+                i,
+                declared_field.name(),
+                batch_field.name()
             );
         }
 
@@ -780,7 +1082,10 @@ pub(crate) fn validate_batch_schema(
         if !types_compatible(batch_field.data_type(), declared_field.data_type()) {
             bail!(
                 "Schema mismatch for sink '{}' column '{}': expected type {:?}, got {:?}",
-                sink_name, declared_field.name(), declared_field.data_type(), batch_field.data_type()
+                sink_name,
+                declared_field.name(),
+                declared_field.data_type(),
+                batch_field.data_type()
             );
         }
 
@@ -848,11 +1153,18 @@ pub fn inject_lineage_columns(
     // Create lineage column arrays
     let source_hash_array: ArrayRef = Arc::new(StringArray::from(vec![source_hash; num_rows]));
     let job_id_array: ArrayRef = Arc::new(StringArray::from(vec![job_id; num_rows]));
-    let processed_at_array: ArrayRef = Arc::new(StringArray::from(vec![processed_at.as_str(); num_rows]));
-    let parser_version_array: ArrayRef = Arc::new(StringArray::from(vec![parser_version; num_rows]));
+    let processed_at_array: ArrayRef =
+        Arc::new(StringArray::from(vec![processed_at.as_str(); num_rows]));
+    let parser_version_array: ArrayRef =
+        Arc::new(StringArray::from(vec![parser_version; num_rows]));
 
     // Build new schema with lineage columns
-    let mut fields: Vec<Field> = batch.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     fields.push(Field::new("_cf_source_hash", DataType::Utf8, false));
     fields.push(Field::new("_cf_job_id", DataType::Utf8, false));
     fields.push(Field::new("_cf_processed_at", DataType::Utf8, false));
@@ -877,39 +1189,96 @@ pub(crate) fn create_sink_from_uri(
     uri: &str,
     output_name: &str,
     output_table: Option<&str>,
+    sink_mode: SinkMode,
     job_id: &str,
 ) -> Result<Sink> {
-    let parsed = casparian_protocol::types::ParsedSinkUri::parse(uri)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let parsed =
+        casparian_protocol::types::ParsedSinkUri::parse(uri).map_err(|e| anyhow::anyhow!(e))?;
     let table_name = output_table.unwrap_or(output_name);
 
     match parsed.scheme {
         casparian_protocol::types::SinkScheme::Parquet => {
-            Ok(Sink::Parquet(ParquetSink::new(parsed.path, output_name, job_id)?))
+            if sink_mode != SinkMode::Append {
+                bail!(
+                    "Parquet sink does not support {:?} mode (only Append)",
+                    sink_mode
+                );
+            }
+            Ok(Sink::Parquet(ParquetSink::new(
+                parsed.path,
+                output_name,
+                job_id,
+            )?))
         }
         casparian_protocol::types::SinkScheme::Csv => {
-            Ok(Sink::Csv(CsvSink::new(parsed.path, output_name, job_id)?))
+            if sink_mode != SinkMode::Append {
+                bail!(
+                    "CSV sink does not support {:?} mode (only Append)",
+                    sink_mode
+                );
+            }
+            Ok(Sink::Csv(Box::new(CsvSink::new(
+                parsed.path,
+                output_name,
+                job_id,
+            )?)))
         }
-        casparian_protocol::types::SinkScheme::Duckdb => {
-            Ok(Sink::DuckDb(DuckDbSink::new(parsed.path, table_name)?))
-        }
+        casparian_protocol::types::SinkScheme::Duckdb => Ok(Sink::DuckDb(DuckDbSink::new(
+            parsed.path,
+            table_name,
+            sink_mode,
+            job_id,
+            output_name,
+        )?)),
         casparian_protocol::types::SinkScheme::File => {
             // File sink: infer by extension
-            let ext = parsed.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let ext = parsed
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
             match ext {
-                "parquet" => Ok(Sink::Parquet(ParquetSink::new(
-                    parsed.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
-                    output_name,
-                    job_id,
-                )?)),
-                "csv" => Ok(Sink::Csv(CsvSink::new(
-                    parsed.path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
-                    output_name,
-                    job_id,
-                )?)),
-                "duckdb" | "db" => {
-                    Ok(Sink::DuckDb(DuckDbSink::new(parsed.path, table_name)?))
+                "parquet" => {
+                    if sink_mode != SinkMode::Append {
+                        bail!(
+                            "Parquet sink does not support {:?} mode (only Append)",
+                            sink_mode
+                        );
+                    }
+                    Ok(Sink::Parquet(ParquetSink::new(
+                        parsed
+                            .path
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf(),
+                        output_name,
+                        job_id,
+                    )?))
                 }
+                "csv" => {
+                    if sink_mode != SinkMode::Append {
+                        bail!(
+                            "CSV sink does not support {:?} mode (only Append)",
+                            sink_mode
+                        );
+                    }
+                    Ok(Sink::Csv(Box::new(CsvSink::new(
+                        parsed
+                            .path
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .to_path_buf(),
+                        output_name,
+                        job_id,
+                    )?)))
+                }
+                "duckdb" | "db" => Ok(Sink::DuckDb(DuckDbSink::new(
+                    parsed.path,
+                    table_name,
+                    sink_mode,
+                    job_id,
+                    output_name,
+                )?)),
                 _ => bail!("Unsupported file sink extension: '{}'", ext),
             }
         }
@@ -920,11 +1289,7 @@ pub(crate) fn create_sink_from_uri(
 mod tests {
     use super::*;
     use arrow::array::{
-        Array,
-        Decimal128Array,
-        Decimal128Builder,
-        Int64Array,
-        StringArray,
+        Array, Decimal128Array, Decimal128Builder, Int64Array, StringArray,
         TimestampMicrosecondArray,
     };
     use arrow::datatypes::{Field, TimeUnit};
@@ -959,14 +1324,19 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        sink.finish().unwrap();
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
 
         // Verify partitioned file exists
-        let output_path = dir.path().join("test_12345678.parquet");
+        let output_path = dir
+            .path()
+            .join(output_filename("test", job_id, "parquet"));
         assert!(output_path.exists());
 
         // Verify temp file was cleaned up
-        let temp_path = dir.path().join(".test_12345678.parquet.tmp");
+        let temp_path = dir
+            .path()
+            .join(format!(".{}.tmp", output_filename("test", job_id, "parquet")));
         assert!(!temp_path.exists());
     }
 
@@ -974,7 +1344,8 @@ mod tests {
     fn test_parquet_sink_decimal_timestamp_tz_roundtrip() {
         let dir = tempdir().unwrap();
         let job_id = "12345678-abcd-1234-abcd-123456789abc";
-        let mut sink = ParquetSink::new(dir.path().to_path_buf(), "test_decimal_tz", job_id).unwrap();
+        let mut sink =
+            ParquetSink::new(dir.path().to_path_buf(), "test_decimal_tz", job_id).unwrap();
 
         let mut dec_builder =
             Decimal128Builder::with_capacity(3).with_data_type(DataType::Decimal128(10, 2));
@@ -1008,9 +1379,12 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        sink.finish().unwrap();
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
 
-        let output_path = dir.path().join("test_decimal_tz_12345678.parquet");
+        let output_path = dir
+            .path()
+            .join(output_filename("test_decimal_tz", job_id, "parquet"));
         assert!(output_path.exists());
 
         let file = File::open(&output_path).unwrap();
@@ -1061,10 +1435,13 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        sink.finish().unwrap();
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
 
         // Verify partitioned file exists and has content
-        let output_path = dir.path().join("test_12345678.csv");
+        let output_path = dir
+            .path()
+            .join(output_filename("test", job_id, "csv"));
         assert!(output_path.exists());
 
         let content = std::fs::read_to_string(&output_path).unwrap();
@@ -1072,7 +1449,9 @@ mod tests {
         assert!(content.contains("Alice"));
 
         // Verify temp file was cleaned up
-        let temp_path = dir.path().join(".test_12345678.csv.tmp");
+        let temp_path = dir
+            .path()
+            .join(format!(".{}.tmp", output_filename("test", job_id, "csv")));
         assert!(!temp_path.exists());
     }
 
@@ -1080,14 +1459,17 @@ mod tests {
     fn test_duckdb_sink() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.duckdb");
-        let mut sink = DuckDbSink::new(db_path.clone(), "records").unwrap();
+        let mut sink =
+            DuckDbSink::new(db_path.clone(), "records", SinkMode::Append, "job-1", "records")
+                .unwrap();
 
         let batch = create_test_batch();
         sink.init(batch.schema().as_ref()).unwrap();
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        sink.finish().unwrap();
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
 
         let conn = duckdb::Connection::open(db_path).unwrap();
         let count: i64 = conn
@@ -1100,7 +1482,9 @@ mod tests {
     fn test_duckdb_sink_decimal_timestamp_tz() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_decimal_tz.duckdb");
-        let mut sink = DuckDbSink::new(db_path.clone(), "records").unwrap();
+        let mut sink =
+            DuckDbSink::new(db_path.clone(), "records", SinkMode::Append, "job-1", "records")
+                .unwrap();
 
         let mut dec_builder =
             Decimal128Builder::with_capacity(3).with_data_type(DataType::Decimal128(10, 2));
@@ -1134,7 +1518,8 @@ mod tests {
         let rows = sink.write_batch(&batch).unwrap();
         assert_eq!(rows, 3);
 
-        sink.finish().unwrap();
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
 
         let conn = duckdb::Connection::open(db_path).unwrap();
         let count: i64 = conn
@@ -1146,16 +1531,24 @@ mod tests {
     #[test]
     fn test_inject_lineage_columns() {
         let batch = OutputBatch::from_record_batch(create_test_batch());
-        let with_lineage =
-            inject_lineage_columns(&batch, "abc123", "job-456", "1.0.0").unwrap();
+        let with_lineage = inject_lineage_columns(&batch, "abc123", "job-456", "1.0.0").unwrap();
         let with_lineage = with_lineage.record_batch();
 
         // Original 2 columns + 4 lineage columns
         assert_eq!(with_lineage.num_columns(), 6);
-        assert!(with_lineage.schema().field_with_name("_cf_source_hash").is_ok());
+        assert!(with_lineage
+            .schema()
+            .field_with_name("_cf_source_hash")
+            .is_ok());
         assert!(with_lineage.schema().field_with_name("_cf_job_id").is_ok());
-        assert!(with_lineage.schema().field_with_name("_cf_processed_at").is_ok());
-        assert!(with_lineage.schema().field_with_name("_cf_parser_version").is_ok());
+        assert!(with_lineage
+            .schema()
+            .field_with_name("_cf_processed_at")
+            .is_ok());
+        assert!(with_lineage
+            .schema()
+            .field_with_name("_cf_parser_version")
+            .is_ok());
 
         // Verify source_hash values
         let hash_col = with_lineage

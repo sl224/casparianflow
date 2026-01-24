@@ -18,6 +18,6 @@ pub use extractor::{BatchExtractor, ExtractorConfig, ExtractorResult, ExtractorR
 pub use patterns::{build_matcher, matches, normalize_glob_pattern};
 pub use scanner::{ScanConfig, ScanProgress, Scanner};
 pub use types::{
-    ExtractionStatus, Extractor, FileStatus, ScannedFile, Source, SourceId, SourceType, TagSource,
-    TaggingRule, TaggingRuleId,
+    ExtractionStatus, Extractor, FileStatus, FileTag, ScannedFile, Source, SourceId, SourceType,
+    TagSource, TaggingRule, TaggingRuleId, Workspace, WorkspaceId,
 };

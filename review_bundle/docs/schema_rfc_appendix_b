@@ -1,0 +1,33 @@
+Appendix B: Parser Bench Schema Summary (v1)
+
+This appendix documents the simplified v1 schema approval flow.
+
+State machine (v1 simplified):
+
+RESULT_VIEW --'s'--> SCHEMA_SUMMARY --'a'--> APPROVAL_CONFIRM --'y'--> DONE
+   |                     |                       |
+   |                     |                       +--'n'--> SCHEMA_SUMMARY
+   |                     |
+   +--(no manifest)--> No 's' key available
+
+State definitions:
+- SCHEMA_SUMMARY: Display intent vs observed summary + mismatches
+- APPROVAL_CONFIRM: Confirm approval action
+- DONE: Contract created, return to RESULT_VIEW
+
+Keybindings:
+- SCHEMA_SUMMARY: [a] approve, [j]/[k] scroll, [Esc] back
+- APPROVAL_CONFIRM: [y] confirm, [n] cancel
+
+UI example:
+
+PARSER BENCH > sales_parser > SCHEMA SUMMARY
+
+SCHEMA SUMMARY: trades  Mode: strict
+Missing columns: tags (optional)
+Extra columns: customer
+Type mismatches: price expected Decimal(18,8), observed Float64
+Nullable mismatches: none
+
+[a] Approve schema  [Esc] Back
+Warning: Cannot approve: 1 type mismatch. Fix parser or edit intent first.

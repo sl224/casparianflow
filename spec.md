@@ -20,21 +20,14 @@ into queryable datasets with strict schema contracts, quarantine, and per-row li
 - Quarantine semantics for invalid rows (partial success is safe)
 - Per-row lineage for chain of custody
 
-**What Casparian is NOT (v1):**
-- NOT a streaming platform (batch only)
-- NOT an orchestrator/scheduler (single-machine execution)
-- NOT a BI tool (outputs to DuckDB/Parquet for downstream analysis)
-- NOT "no-code" (CLI-first, requires technical users)
-- NOT AI-dependent (AI assistance is optional, outside critical path)
-
 ---
 
 ## 2. Core Principles
 
 1. **Schema is contract**: approved schemas are enforced in Rust; violations quarantine
    or fail according to policy. Invalid rows never silently coerce into clean tables.
-2. **Local-first**: runs on a single machine or on-prem server; no cloud
-   dependencies in v1. Air-gapped and sovereignty-friendly.
+2. **Local-first**: runs on a single machine or on-prem server. Air-gapped and
+   sovereignty-friendly.
 3. **Deterministic execution**: source code + lockfile hashes define parser
    identity (content-addressed); same inputs + same parser = identical outputs.
 4. **Quarantine over coercion**: bad rows go to quarantine with error context;
@@ -71,7 +64,7 @@ into queryable datasets with strict schema contracts, quarantine, and per-row li
 
 ### 3.1 Dev Loop (Iteration)
 - Use `casparian run` or `casparian preview` on a single file.
-- Uses the local Python environment (non-interactive execution in v1).
+- Uses the local Python environment.
 - Outputs sample data or a job result to DuckDB/Parquet.
 
 ### 3.2 Publish Loop (Deployment)
@@ -84,8 +77,7 @@ into queryable datasets with strict schema contracts, quarantine, and per-row li
 - Sentinel dispatches jobs to homogeneous workers.
 - Worker validates against schema contracts, splits quarantine, and writes
   outputs to configured sinks.
-- Job status uses `PartialSuccess` when quarantine occurs; `CompletedWithWarnings`
-  is treated as success if encountered but is not emitted in v1.
+- Job status uses `PartialSuccess` when quarantine occurs.
 
 ---
 
@@ -106,25 +98,9 @@ into queryable datasets with strict schema contracts, quarantine, and per-row li
 
 ---
 
-## 5. V1 Scope (Summary)
+## 5. Interfaces
 
-**In scope**
-- EVTX demo parser and quickstart flow.
-- Rust validation + quarantine split.
-- Lineage injection and per-output status.
-- DuckDB + Parquet sinks with per-output routing.
-
-**Out of scope (post-v1)**
-- Pipelines/scheduler layer.
-- Postgres/MSSQL sinks.
-- Multi-node execution or server deployment.
-- AI parser generation as a required workflow.
-
----
-
-## 6. Interfaces
-
-### 6.1 CLI (v1)
+### 5.1 CLI
 - `casparian scan <path>`: file discovery.
 - `casparian preview <file>`: schema + sample rows.
 - `casparian run <parser.py> <file>`: dev execution.
@@ -134,14 +110,14 @@ into queryable datasets with strict schema contracts, quarantine, and per-row li
 - `casparian jobs`: list/replay jobs, dead-letter view.
 - `casparian parser list/show/test/backtest/health/resume`: parser ops.
 
-### 6.2 TUI (v1)
+### 5.2 TUI
 - Discover: scan/tag/preview.
 - Parser Bench: test + approval flows (minimal).
 - Jobs: status + quarantine summary (minimal).
 
 ---
 
-## 7. Contracts + Validation
+## 6. Contracts + Validation
 
 - Contracts are defined in `docs/schema_rfc.md`.
 - Validation is authoritative in Rust, not Python.
@@ -150,14 +126,7 @@ into queryable datasets with strict schema contracts, quarantine, and per-row li
 
 ---
 
-## 8. Storage Policy (v1)
-
-- DuckDB is the only supported DB backend in v1.
-- No migrations: breaking schema changes require deleting the local DB.
-
----
-
-## 9. Post-v1 References
+## 7. Post-v1 References
 
 Detailed future-oriented specs live under `specs/` and are marked as
 reference only. Use `docs/specs_canonical.md` to find the current sources

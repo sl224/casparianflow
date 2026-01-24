@@ -17,25 +17,107 @@
 //! - LEN (u32): Payload length in bytes (I = unsigned int, 4 bytes)
 
 pub mod error;
+pub mod http_types;
 pub mod idempotency;
+pub mod metrics;
+pub mod telemetry;
 pub mod types;
 
 // Re-export types for convenience
 pub use types::{
-    // Canonical enums (use these everywhere)
-    DataType, JobId, PipelineRunStatus, PluginStatus, ProcessingStatus, RuntimeKind, SinkMode, WorkerStatus,
-    // Protocol types
-    DeployCommand, DeployResponse, DispatchCommand, ErrorPayload,
-    HeartbeatPayload, HeartbeatStatus, IdentifyPayload, JobReceipt, JobStatus,
-    JobDiagnostics, SchemaMismatch, SchemaColumnSpec, SchemaDefinition, ObservedColumn, ObservedDataType,
-    ColumnOrderMismatch, TypeMismatch, QuarantineConfig, SinkConfig,
     // Shredder types
-    AnalysisResult, DetectionConfidence, LineageBlock,
-    LineageChain, LineageFileType, LineageHop, LlmConfig, LlmProvider,
-    ShardMeta, ShredConfig, ShredResult, ShredStrategy,
+    AnalysisResult,
+    ArtifactKind,
+    ArtifactV1,
+    ColumnOrderMismatch,
+    // Canonical enums (use these everywhere)
+    DataType,
+    // Protocol types
+    DeployCommand,
+    DeployResponse,
+    DetectionConfidence,
+    DispatchCommand,
+    ErrorPayload,
+    HeartbeatPayload,
+    HeartbeatStatus,
+    IdentifyPayload,
+    JobDiagnostics,
+    JobId,
+    JobReceipt,
+    JobStatus,
+    LineageBlock,
+    LineageChain,
+    LineageFileType,
+    LineageHop,
+    LlmConfig,
+    LlmProvider,
+    ObservedColumn,
+    ObservedDataType,
+    PipelineRunStatus,
+    PluginStatus,
+    ProcessingStatus,
+    QuarantineConfig,
+    RuntimeKind,
+    SchemaColumnSpec,
+    SchemaDefinition,
+    SchemaMismatch,
+    ShardMeta,
+    ShredConfig,
+    ShredResult,
+    ShredStrategy,
+    SinkConfig,
+    SinkMode,
+    TypeMismatch,
+    WorkerStatus,
 };
 
-pub use idempotency::{materialization_key, output_target_key, schema_hash, table_name_with_schema};
+pub use idempotency::{
+    materialization_key, output_target_key, schema_hash, table_name_with_schema,
+};
+
+// Re-export HTTP API types
+pub use http_types::{
+    // Approval types
+    Approval,
+    // API response types
+    ApprovalDecideResponse,
+    ApprovalDecision,
+    ApprovalDecisionType,
+    ApprovalOperation,
+    ApprovalStatus,
+    ControlPlaneDiscovery,
+    CreateJobResponse,
+    DatasetSummary,
+    ErrorResponse,
+    // Event types
+    Event,
+    EventId,
+    EventType,
+    HealthResponse,
+    // Job types
+    HttpJobStatus,
+    HttpJobType,
+    Job,
+    JobProgress,
+    JobResult,
+    JobSpec,
+    ListApprovalsResponse,
+    ListDatasetsResponse,
+    ListEventsResponse,
+    ListJobsResponse,
+    OutputInfo,
+    QuarantineSummary,
+    // Query types
+    QueryRequest,
+    QueryResponse,
+    RedactionMode,
+    RedactionPolicy,
+    SchemaMode,
+    SchemaSpec,
+    VersionResponse,
+    ViolationSummary,
+    ViolationType,
+};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use error::{ProtocolError, Result};

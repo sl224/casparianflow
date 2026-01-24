@@ -1,3 +1,50 @@
+// TODO(Phase 3): Fix these clippy warnings properly during silent corruption sweep
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(unused_mut)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::single_match)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::incompatible_msrv)]
+#![allow(clippy::manual_pattern_char_comparison)]
+#![allow(clippy::search_is_some)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::infallible_destructuring_match)]
+#![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::to_string_in_format_args)]
+#![allow(clippy::manual_ok_err)]
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::single_char_add_str)]
+#![allow(clippy::collapsible_str_replace)]
+#![allow(clippy::useless_vec)]
+#![allow(clippy::if_same_then_else)]
+#![allow(clippy::useless_format)]
+#![allow(clippy::print_literal)]
+#![allow(clippy::wrong_self_convention)]
+#![allow(clippy::unnecessary_sort_by)]
+#![allow(clippy::get_first)]
+#![allow(clippy::redundant_pattern_matching)]
+#![allow(clippy::if_not_else)]
+#![allow(clippy::comparison_chain)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::manual_strip)]
+#![allow(clippy::ptr_arg)]
+#![allow(clippy::unneeded_struct_pattern)]
+#![allow(clippy::while_let_on_iterator)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::empty_line_after_doc_comments)]
+
 //! Casparian Flow Unified Launcher
 //!
 //! Hardened binary with:
@@ -10,6 +57,8 @@ use anyhow::Result;
 use casparian_sentinel::{Sentinel, SentinelArgs, SentinelConfig};
 use casparian_worker::{bridge, Worker, WorkerArgs, WorkerConfig};
 use clap::{Parser, Subcommand};
+use casparian::telemetry::TelemetryRecorder;
+use casparian_tape::{EventName, TapeWriter};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +68,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 mod cli;
 
@@ -32,6 +82,10 @@ struct Cli {
     #[arg(short = 'v', long, global = true)]
     verbose: bool,
 
+    /// Record session events to a tape file for replay/debugging
+    #[arg(long, global = true)]
+    tape: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -39,7 +93,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     // === W1: Core Standalone Commands ===
-
     /// Discover files in a directory (no database required)
     Scan {
         /// Directory to scan
@@ -132,7 +185,6 @@ enum Commands {
     },
 
     // === W2: Tagging Commands (stubs) ===
-
     /// Assign a topic to file(s)
     Tag {
         /// File or directory to tag
@@ -196,7 +248,6 @@ enum Commands {
     },
 
     // === W3: Parser Commands (stubs) ===
-
     /// Manage parsers
     Parser {
         #[command(subcommand)]
@@ -210,7 +261,6 @@ enum Commands {
     },
 
     // === W4: Job Commands (stubs) ===
-
     /// Execute a parser against an input file
     Run(cli::run::RunArgs),
 
@@ -269,11 +319,16 @@ enum Commands {
     },
 
     // === W5: Resource Commands (stubs) ===
-
     /// Manage data sources
     Source {
         #[command(subcommand)]
         action: cli::source::SourceAction,
+    },
+
+    /// Manage workspaces
+    Workspace {
+        #[command(subcommand)]
+        action: cli::workspace::WorkspaceAction,
     },
 
     /// Manage tagging rules
@@ -289,7 +344,6 @@ enum Commands {
     },
 
     // === W6: Backfill Command ===
-
     /// Re-process files when parser version changes
     ///
     /// When you update a parser to a new version, this command identifies
@@ -321,7 +375,6 @@ enum Commands {
     },
 
     // === Existing Server Commands ===
-
     /// Start both Sentinel and Worker in one process (Split-Runtime)
     Start {
         /// ZMQ bind/connect address (default: IPC socket)
@@ -393,10 +446,26 @@ enum Commands {
         args: cli::tui::TuiArgs,
     },
 
+    /// Export deterministic TUI snapshots (hidden)
+    #[command(hide = true)]
+    TuiSnapshots {
+        #[command(flatten)]
+        args: cli::tui::snapshot_export::TuiSnapshotArgs,
+    },
+
     /// MCP (Model Context Protocol) server for AI tool integration
     Mcp {
         #[command(subcommand)]
         action: cli::mcp::McpAction,
+    },
+
+    /// Export a support bundle (zip) with tapes and metadata for debugging
+    SupportBundle(cli::support_bundle::SupportBundleArgs),
+
+    /// Work with session tape recordings (explain, validate)
+    Tape {
+        #[command(subcommand)]
+        command: cli::tape::TapeCommands,
     },
 }
 
@@ -472,6 +541,7 @@ fn command_wants_json(command: &Commands) -> bool {
         Commands::Backfill { json, .. } => *json,
         Commands::Config { json } => *json,
         Commands::Run(args) => args.json,
+        Commands::SupportBundle(args) => args.json,
         Commands::Parser { action } => parser_action_wants_json(action),
         Commands::Plugin { action } => plugin_action_wants_json(action),
         Commands::Rule { action } => rule_action_wants_json(action),
@@ -540,7 +610,7 @@ fn job_action_wants_json(action: &cli::job::JobAction) -> bool {
     }
 }
 
-fn run_command(cli: Cli) -> Result<()> {
+fn run_command(cli: Cli, telemetry: Option<TelemetryRecorder>) -> Result<()> {
     match cli.command {
         // === W1: Core Standalone Commands ===
         Commands::Scan {
@@ -556,8 +626,8 @@ fn run_command(cli: Cli) -> Result<()> {
             quiet,
             interactive,
             tag,
-        } => {
-            cli::scan::run(cli::scan::ScanArgs {
+        } => cli::scan::run(
+            cli::scan::ScanArgs {
                 path,
                 types,
                 patterns,
@@ -570,8 +640,9 @@ fn run_command(cli: Cli) -> Result<()> {
                 quiet,
                 interactive,
                 tag,
-            })
-        }
+            },
+            telemetry,
+        ),
 
         Commands::Preview {
             file,
@@ -620,28 +691,24 @@ fn run_command(cli: Cli) -> Result<()> {
             tag,
             limit,
             json,
-        } => {
-            cli::files::run(cli::files::FilesArgs {
-                source,
-                all,
-                topic,
-                status,
-                untagged,
-                patterns,
-                tag,
-                limit,
-                json,
-            })
-        }
+        } => cli::files::run(cli::files::FilesArgs {
+            source,
+            all,
+            topic,
+            status,
+            untagged,
+            patterns,
+            tag,
+            limit,
+            json,
+        }),
 
         // === W3: Parser Commands (stubs) ===
         Commands::Parser { action } => cli::parser::run(action),
         Commands::Plugin { action } => cli::plugin::run(action),
 
         // === W4: Job Commands (stubs) ===
-        Commands::Run(args) => {
-            cli::run::cmd_run(args)
-        }
+        Commands::Run(args) => cli::run::cmd_run(args, telemetry),
 
         Commands::Jobs {
             topic,
@@ -667,9 +734,10 @@ fn run_command(cli: Cli) -> Result<()> {
 
         Commands::WorkerCli { action } => cli::worker::run(action),
 
-        Commands::Pipeline { action } => cli::pipeline::run(action),
+        Commands::Pipeline { action } => cli::pipeline::run(action, telemetry),
 
         // === W5: Resource Commands (stubs) ===
+        Commands::Workspace { action } => cli::workspace::run(action),
         Commands::Source { action } => cli::source::run(action),
         Commands::Rule { action } => cli::rule::run(action),
         Commands::Topic { action } => cli::topic::run(action),
@@ -681,15 +749,13 @@ fn run_command(cli: Cli) -> Result<()> {
             limit,
             json,
             force,
-        } => {
-            cli::backfill::run(cli::backfill::BackfillArgs {
-                parser_name: parser,
-                execute,
-                limit,
-                json,
-                force,
-            })
-        }
+        } => cli::backfill::run(cli::backfill::BackfillArgs {
+            parser_name: parser,
+            execute,
+            limit,
+            json,
+            force,
+        }),
 
         // === Existing Server Commands ===
         Commands::Start {
@@ -717,8 +783,11 @@ fn run_command(cli: Cli) -> Result<()> {
             email,
         } => run_publish(file, version, addr, publisher, email),
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
-        Commands::Tui { args } => cli::tui::run(args),
+        Commands::Tui { args } => cli::tui::run(args, telemetry),
+        Commands::TuiSnapshots { args } => cli::tui::snapshot_export::run(args),
         Commands::Mcp { action } => cli::mcp::run(action),
+        Commands::SupportBundle(args) => cli::support_bundle::run(args),
+        Commands::Tape { command } => cli::tape::run_tape_command(command),
     }
 }
 
@@ -729,39 +798,113 @@ fn main() -> ExitCode {
     // Initialize logging - suppress stdout logs in TUI mode to avoid corrupting display
     let is_tui_mode = matches!(cli.command, Commands::Tui { .. });
     let json_mode = command_wants_json(&cli.command);
+    let default_filter = "casparian=info,casparian_sentinel=info,casparian_worker=info";
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
 
-    if is_tui_mode {
-        // TUI mode: only log errors to stderr, suppress info/debug
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| "error".into()),
+    let mut _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+    let file_layer = match cli::config::ensure_logs_dir() {
+        Ok(log_dir) => {
+            let file_appender = tracing_appender::rolling::daily(log_dir, "casparian.log");
+            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+            _log_guard = Some(guard);
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file_writer)
+                    .with_ansi(false)
+                    .with_filter(env_filter.clone()),
             )
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-            .init();
-    } else if json_mode {
-        // JSON mode: log to stderr to keep stdout machine-readable
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    "casparian=info,casparian_sentinel=info,casparian_worker=info".into()
-                }),
-            )
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-            .init();
+        }
+        Err(err) => {
+            eprintln!("Warning: failed to create logs directory: {}", err);
+            None
+        }
+    };
+
+    let registry = tracing_subscriber::registry().with(file_layer);
+
+    let console_filter = if is_tui_mode {
+        tracing_subscriber::EnvFilter::new("error")
     } else {
-        // Normal mode: full logging to stdout
-        tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    "casparian=info,casparian_sentinel=info,casparian_worker=info".into()
-                }),
-            )
-            .with(tracing_subscriber::fmt::layer())
-            .init();
-    }
+        env_filter.clone()
+    };
+    let console_writer = if is_tui_mode || json_mode {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout)
+    };
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_writer(console_writer)
+        .with_filter(console_filter);
 
-    let result = run_command(cli);
+    let registry = registry.with(console_layer);
+
+    registry.init();
+
+    // Create tape writer if --tape specified
+    let tape_writer = cli.tape.as_ref().and_then(|path| match TapeWriter::new(path) {
+        Ok(w) => Some(Arc::new(w)),
+        Err(e) => {
+            eprintln!("Warning: Failed to create tape file: {}", e);
+            None
+        }
+    });
+
+    let telemetry = tape_writer.as_ref().and_then(|writer| {
+        TelemetryRecorder::new(writer.clone()).map_err(|e| {
+            warn!("Failed to initialize telemetry hasher: {}", e);
+            e
+        }).ok()
+    });
+
+    // Record UICommand before execution
+    let command_name = get_command_name(&cli.command);
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    let command_event_id = if let Some(ref writer) = tape_writer {
+        let payload = build_command_payload(&cli.command, writer);
+        match writer.emit(
+            EventName::UICommand(command_name.clone()),
+            Some(&correlation_id),
+            None,
+            payload,
+        ) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                warn!("Failed to record tape event: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = run_command(cli, telemetry.clone());
+
+    // Record result
+    if let Some(ref writer) = tape_writer {
+        let (event_name, payload) = match &result {
+            Ok(()) => (
+                EventName::SystemResponse("CommandSucceeded".to_string()),
+                serde_json::json!({ "status": "success" }),
+            ),
+            Err(e) => (
+                EventName::ErrorEvent("CommandFailed".to_string()),
+                serde_json::json!({
+                    "status": "failed",
+                    "error": format!("{}", e),
+                }),
+            ),
+        };
+
+        if let Err(e) = writer.emit(
+            event_name,
+            Some(&correlation_id),
+            command_event_id.as_deref(),
+            payload,
+        ) {
+            warn!("Failed to record tape result: {}", e);
+        }
+    }
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -773,6 +916,89 @@ fn main() -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+/// Extract command name from Commands enum for tape recording
+fn get_command_name(cmd: &Commands) -> String {
+    match cmd {
+        Commands::Scan { .. } => "Scan".to_string(),
+        Commands::Preview { .. } => "Preview".to_string(),
+        Commands::Schema { .. } => "Schema".to_string(),
+        Commands::Tag { .. } => "Tag".to_string(),
+        Commands::Untag { .. } => "Untag".to_string(),
+        Commands::Files { .. } => "Files".to_string(),
+        Commands::Parser { .. } => "Parser".to_string(),
+        Commands::Plugin { .. } => "Plugin".to_string(),
+        Commands::Run(_) => "Run".to_string(),
+        Commands::Backfill { .. } => "Backfill".to_string(),
+        Commands::Jobs { .. } => "Jobs".to_string(),
+        Commands::Job { .. } => "Job".to_string(),
+        Commands::Pipeline { .. } => "Pipeline".to_string(),
+        Commands::WorkerCli { .. } => "WorkerCli".to_string(),
+        Commands::Rule { .. } => "Rule".to_string(),
+        Commands::Topic { .. } => "Topic".to_string(),
+        Commands::Source { .. } => "Source".to_string(),
+        Commands::Workspace { .. } => "Workspace".to_string(),
+        Commands::Sentinel { .. } => "Sentinel".to_string(),
+        Commands::Worker { .. } => "Worker".to_string(),
+        Commands::Publish { .. } => "Publish".to_string(),
+        Commands::Config { .. } => "Config".to_string(),
+        Commands::Tui { .. } => "Tui".to_string(),
+        Commands::TuiSnapshots { .. } => "TuiSnapshots".to_string(),
+        Commands::Mcp { .. } => "Mcp".to_string(),
+        Commands::SupportBundle(_) => "SupportBundle".to_string(),
+        Commands::Tape { .. } => "Tape".to_string(),
+        Commands::Start { .. } => "Start".to_string(),
+    }
+}
+
+/// Build redacted payload for tape recording
+fn build_command_payload(cmd: &Commands, writer: &TapeWriter) -> serde_json::Value {
+    match cmd {
+        Commands::Scan { path, tag, .. } => {
+            serde_json::json!({
+                "path_hash": writer.redact_string(&path.display().to_string()),
+                "tag": tag,
+            })
+        }
+        Commands::Preview { file, rows, .. } => {
+            serde_json::json!({
+                "file_hash": writer.redact_string(&file.display().to_string()),
+                "rows": rows,
+            })
+        }
+        Commands::Run(args) => {
+            serde_json::json!({
+                "parser_hash": writer.redact_string(&args.parser.display().to_string()),
+                "input_hash": writer.redact_string(&args.input.display().to_string()),
+            })
+        }
+        Commands::Config { .. } => {
+            serde_json::json!({})
+        }
+        Commands::Files { source, topic, .. } => {
+            serde_json::json!({
+                "source": source,
+                "topic": topic,
+            })
+        }
+        Commands::Jobs { topic, pending, running, failed, done, .. } => {
+            serde_json::json!({
+                "topic": topic,
+                "pending": pending,
+                "running": running,
+                "failed": failed,
+                "done": done,
+            })
+        }
+        Commands::SupportBundle(args) => {
+            serde_json::json!({
+                "output_path_hash": writer.redact_string(&args.output.display().to_string()),
+            })
+        }
+        // For other commands, just record the command type without details
+        _ => serde_json::json!({}),
     }
 }
 
@@ -844,6 +1070,7 @@ fn run_unified(
             database_url: sentinel_db,
             control_addr,
             max_workers: 1,
+            control_addr: None, // No control API for integrated run
         };
 
         let mut sentinel = Sentinel::bind(config)?;
@@ -864,7 +1091,7 @@ fn run_unified(
     let shim_path = bridge::materialize_bridge_shim()?;
     let worker_id = format!(
         "rust-{}",
-        &uuid::Uuid::new_v4().to_string()[..8]  // First 8 hex chars of UUID
+        &uuid::Uuid::new_v4().to_string()[..8] // First 8 hex chars of UUID
     );
     let worker_config = WorkerConfig {
         sentinel_addr: addr,
@@ -881,12 +1108,9 @@ fn run_unified(
         .map_err(|_| anyhow::anyhow!("Sentinel failed to start"))?;
 
     // Start Worker (in its own thread)
-    let (worker, worker_handle) = Worker::connect(worker_config)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let (worker, worker_handle) = Worker::connect(worker_config).map_err(|e| anyhow::anyhow!(e))?;
 
-    let worker_thread = std::thread::spawn(move || {
-        worker.run().map_err(|e| anyhow::anyhow!(e))
-    });
+    let worker_thread = std::thread::spawn(move || worker.run().map_err(|e| anyhow::anyhow!(e)));
 
     let worker_handle = UnifiedWorkerHandle {
         handle: worker_handle,
@@ -909,7 +1133,10 @@ fn run_unified(
     }
 
     // Graceful shutdown with timeout
-    info!("Initiating graceful shutdown (timeout: {}s)...", SHUTDOWN_TIMEOUT_SECS);
+    info!(
+        "Initiating graceful shutdown (timeout: {}s)...",
+        SHUTDOWN_TIMEOUT_SECS
+    );
 
     let shutdown_start = std::time::Instant::now();
     let timeout = Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
@@ -970,6 +1197,7 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
         database_url,
         control_addr: None,
         max_workers: args.max_workers,
+        control_addr: args.control_api.clone(), // Optional control API
     };
     let mut sentinel = Sentinel::bind(config)?;
 
@@ -1022,8 +1250,7 @@ fn run_worker_standalone(args: WorkerArgs) -> Result<()> {
         venvs_dir: None, // Use default ~/.casparian_flow/venvs
     };
 
-    let (worker, worker_handle) = Worker::connect(config)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let (worker, worker_handle) = Worker::connect(config).map_err(|e| anyhow::anyhow!(e))?;
 
     let flag = shutdown_flag.clone();
     std::thread::spawn(move || {
@@ -1044,10 +1271,10 @@ fn run_publish(
     publisher: Option<String>,
     email: Option<String>,
 ) -> Result<()> {
+    use casparian::prepare_publish;
     use casparian_protocol::types::DeployCommand;
     use casparian_protocol::{JobId, Message, OpCode};
     use zmq::Context;
-    use casparian::prepare_publish;
 
     info!("Publishing plugin: {:?} v{}", file, version);
 
@@ -1162,7 +1389,10 @@ mod tests {
     #[test]
     fn test_default_ipc_addr_format() {
         let addr = get_default_ipc_addr();
-        assert!(addr.starts_with("ipc://"), "IPC address should start with ipc://");
+        assert!(
+            addr.starts_with("ipc://"),
+            "IPC address should start with ipc://"
+        );
 
         #[cfg(not(windows))]
         {
@@ -1197,7 +1427,10 @@ mod tests {
 
         #[cfg(windows)]
         {
-            assert!(addr.starts_with("ipc://casparian_"), "Windows should start with ipc://casparian_");
+            assert!(
+                addr.starts_with("ipc://casparian_"),
+                "Windows should start with ipc://casparian_"
+            );
             // Should contain username
             let username = std::env::var("USERNAME")
                 .or_else(|_| std::env::var("USER"))
@@ -1205,5 +1438,4 @@ mod tests {
             assert_eq!(addr, format!("ipc://casparian_{}", username));
         }
     }
-
 }

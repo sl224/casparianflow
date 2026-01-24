@@ -6,9 +6,10 @@
 
 use crate::cli::error::HelpfulError;
 use crate::cli::output::format_size;
-use casparian::scout::{FileStatus, SourceId, TaggingRuleId};
-use casparian::scout::patterns;
+use crate::cli::workspace;
+use casparian::scout::{patterns, Database, FileStatus, TagSource, TaggingRuleId, WorkspaceId};
 use casparian_db::{DbConnection, DbValue};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -35,7 +36,6 @@ struct TaggingRule {
     tag: String,
     #[allow(dead_code)]
     priority: i32,
-    source_id: SourceId,
 }
 
 /// A file from the database
@@ -45,10 +45,8 @@ struct ScannedFile {
     path: String,
     rel_path: String,
     size: i64,
-    tag: Option<String>,
     #[allow(dead_code)]
     status: String,
-    source_id: SourceId,
 }
 
 /// Summary of tagging operation
@@ -70,34 +68,43 @@ fn get_db_path() -> PathBuf {
 }
 
 /// Open database connection with helpful error
-fn open_db() -> Result<DbConnection, HelpfulError> {
+fn open_db() -> Result<Database, HelpfulError> {
     let db_path = get_db_path();
 
     if !db_path.exists() {
-        return Err(HelpfulError::new(format!("Database not found: {}", db_path.display()))
-            .with_context("The Scout database has not been initialized yet")
-            .with_suggestions([
-                "TRY: Start the Casparian UI to initialize the database".to_string(),
-                "TRY: Run `casparian start` to initialize the system".to_string(),
-                format!("TRY: Check the path exists: {}", db_path.display()),
-            ]));
+        return Err(
+            HelpfulError::new(format!("Database not found: {}", db_path.display()))
+                .with_context("The Scout database has not been initialized yet")
+                .with_suggestions([
+                    "TRY: Start the Casparian UI to initialize the database".to_string(),
+                    "TRY: Run `casparian start` to initialize the system".to_string(),
+                    format!("TRY: Check the path exists: {}", db_path.display()),
+                ]),
+        );
     }
 
-    let db_url = format!("duckdb:{}", db_path.display());
-    DbConnection::open_from_url(&db_url)
-        
-        .map_err(|e| {
-            let mut err = HelpfulError::new(format!("Cannot open database: {}", e))
-                .with_context(format!("Database path: {}", db_path.display()));
-            if e.to_string().contains("locked") {
-                err = err.with_suggestion(
-                    "TRY: Close other Casparian processes holding the database lock".to_string(),
-                );
-            } else {
-                err = err.with_suggestion("TRY: Ensure the database file is not corrupted".to_string());
-            }
-            err
-        })
+    Database::open(&db_path).map_err(|e| {
+        let mut err = HelpfulError::new(format!("Cannot open database: {}", e))
+            .with_context(format!("Database path: {}", db_path.display()));
+        if e.to_string().contains("locked") {
+            err = err.with_suggestion(
+                "TRY: Close other Casparian processes holding the database lock".to_string(),
+            );
+        } else {
+            err = err.with_suggestion("TRY: Ensure the database file is not corrupted".to_string());
+        }
+        err
+    })
+}
+
+fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
+    workspace::resolve_active_workspace_id(db).map_err(|e| {
+        e.with_context("The workspace registry is required for tagging")
+    })
+}
+
+fn now_millis() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
 /// Check if a glob pattern matches a path
@@ -106,36 +113,31 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 }
 
 /// Load all enabled tagging rules from the database
-fn load_tagging_rules(conn: &DbConnection) -> Result<Vec<TaggingRule>, HelpfulError> {
+fn load_tagging_rules(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<Vec<TaggingRule>, HelpfulError> {
     let rows = conn
         .query_all(
-            "SELECT id, pattern, tag, priority, source_id \
-             FROM scout_tagging_rules \
-             WHERE enabled = 1 \
-             ORDER BY priority DESC, id",
-            &[],
+            "SELECT id, pattern, tag, priority \
+             FROM scout_rules \
+             WHERE workspace_id = ? AND kind = 'tagging' AND enabled = 1 \
+             ORDER BY priority DESC, name",
+            &[DbValue::from(workspace_id.to_string())],
         )
-        
         .map_err(|e| {
             HelpfulError::new(format!("Failed to query tagging rules: {}", e))
-                .with_context("The scout_tagging_rules table may not exist")
+                .with_context("The scout_rules table may not exist")
                 .with_suggestion("TRY: Ensure the database schema is up to date")
         })?;
 
     let mut rules = Vec::new();
     for row in rows {
-        let id_raw: i64 = row
+        let id_raw: String = row
             .get_by_name("id")
             .map_err(|e| HelpfulError::new(format!("Failed to read rule id: {}", e)))?;
-        let source_id_raw: i64 = row
-            .get_by_name("source_id")
-            .map_err(|e| HelpfulError::new(format!("Failed to read rule source_id: {}", e)))?;
-        let id = TaggingRuleId::try_from(id_raw).map_err(|e| {
-            HelpfulError::new(format!("Invalid rule id: {}", e))
-        })?;
-        let source_id = SourceId::try_from(source_id_raw).map_err(|e| {
-            HelpfulError::new(format!("Invalid rule source_id: {}", e))
-        })?;
+        let id = TaggingRuleId::parse(&id_raw)
+            .map_err(|e| HelpfulError::new(format!("Invalid rule id: {}", e)))?;
 
         let rule = TaggingRule {
             id,
@@ -148,7 +150,6 @@ fn load_tagging_rules(conn: &DbConnection) -> Result<Vec<TaggingRule>, HelpfulEr
             priority: row
                 .get_by_name("priority")
                 .map_err(|e| HelpfulError::new(format!("Failed to read rule priority: {}", e)))?,
-            source_id,
         };
         rules.push(rule);
     }
@@ -157,16 +158,23 @@ fn load_tagging_rules(conn: &DbConnection) -> Result<Vec<TaggingRule>, HelpfulEr
 }
 
 /// Load untagged files from the database
-fn load_untagged_files(conn: &DbConnection) -> Result<Vec<ScannedFile>, HelpfulError> {
+fn load_untagged_files(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<Vec<ScannedFile>, HelpfulError> {
     let rows = conn
         .query_all(
-            "SELECT id, path, rel_path, size, tag, status, source_id \
-             FROM scout_files \
-             WHERE tag IS NULL AND status = ? \
-             ORDER BY path",
-            &[DbValue::from(FileStatus::Pending.as_str())],
+            "SELECT f.id, f.path, f.rel_path, f.size, f.status \
+             FROM scout_files f \
+             LEFT JOIN scout_file_tags t \
+                ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
+             WHERE f.workspace_id = ? AND t.file_id IS NULL AND f.status = ? \
+             ORDER BY f.path",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(FileStatus::Pending.as_str()),
+            ],
         )
-        
         .map_err(|e| {
             HelpfulError::new(format!("Failed to query files: {}", e))
                 .with_context("The scout_files table may not exist")
@@ -175,12 +183,6 @@ fn load_untagged_files(conn: &DbConnection) -> Result<Vec<ScannedFile>, HelpfulE
 
     let mut files = Vec::new();
     for row in rows {
-        let source_id_raw: i64 = row
-            .get_by_name("source_id")
-            .map_err(|e| HelpfulError::new(format!("Failed to read file source_id: {}", e)))?;
-        let source_id = SourceId::try_from(source_id_raw).map_err(|e| {
-            HelpfulError::new(format!("Invalid file source_id: {}", e))
-        })?;
         let file = ScannedFile {
             id: row
                 .get_by_name("id")
@@ -194,13 +196,9 @@ fn load_untagged_files(conn: &DbConnection) -> Result<Vec<ScannedFile>, HelpfulE
             size: row
                 .get_by_name("size")
                 .map_err(|e| HelpfulError::new(format!("Failed to read file size: {}", e)))?,
-            tag: row
-                .get_by_name("tag")
-                .map_err(|e| HelpfulError::new(format!("Failed to read file tag: {}", e)))?,
             status: row
                 .get_by_name("status")
                 .map_err(|e| HelpfulError::new(format!("Failed to read file status: {}", e)))?,
-            source_id,
         };
         files.push(file);
     }
@@ -211,29 +209,25 @@ fn load_untagged_files(conn: &DbConnection) -> Result<Vec<ScannedFile>, HelpfulE
 /// Get file by path
 fn get_file_by_path(
     conn: &DbConnection,
+    workspace_id: &WorkspaceId,
     path: &str,
 ) -> Result<Option<ScannedFile>, HelpfulError> {
     let row = conn
         .query_optional(
-            "SELECT id, path, rel_path, size, tag, status, source_id \
+            "SELECT id, path, rel_path, size, status \
              FROM scout_files \
-             WHERE path = ?",
-            &[DbValue::from(path)],
+             WHERE workspace_id = ? AND path = ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(path),
+            ],
         )
-        
         .map_err(|e| HelpfulError::new(format!("Failed to query file: {}", e)))?;
 
     let row = match row {
         Some(row) => row,
         None => return Ok(None),
     };
-
-    let source_id_raw: i64 = row
-        .get_by_name("source_id")
-        .map_err(|e| HelpfulError::new(format!("Failed to read file source_id: {}", e)))?;
-    let source_id = SourceId::try_from(source_id_raw).map_err(|e| {
-        HelpfulError::new(format!("Invalid file source_id: {}", e))
-    })?;
 
     let file = ScannedFile {
         id: row
@@ -248,13 +242,9 @@ fn get_file_by_path(
         size: row
             .get_by_name("size")
             .map_err(|e| HelpfulError::new(format!("Failed to read file size: {}", e)))?,
-        tag: row
-            .get_by_name("tag")
-            .map_err(|e| HelpfulError::new(format!("Failed to read file tag: {}", e)))?,
         status: row
             .get_by_name("status")
             .map_err(|e| HelpfulError::new(format!("Failed to read file status: {}", e)))?,
-        source_id,
     };
 
     Ok(Some(file))
@@ -263,30 +253,46 @@ fn get_file_by_path(
 /// Apply tag to a file in the database
 fn apply_tag(
     conn: &DbConnection,
+    workspace_id: &WorkspaceId,
     file_id: i64,
     tag: &str,
-    tag_source: &str,
     rule_id: Option<TaggingRuleId>,
+    tag_source: TagSource,
 ) -> Result<(), HelpfulError> {
-    let rule_id_value = match rule_id {
-        Some(id) => DbValue::from(id.as_i64()),
-        None => DbValue::Null,
-    };
-    let updated = conn.execute(
-        "UPDATE scout_files \
-         SET tag = ?, tag_source = ?, rule_id = ?, status = ? \
-         WHERE id = ?",
+    let rule_id_value = rule_id
+        .as_ref()
+        .map(|id| DbValue::from(id.to_string()))
+        .unwrap_or(DbValue::Null);
+    conn.execute(
+        "INSERT INTO scout_file_tags (workspace_id, file_id, tag, tag_source, rule_id, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (workspace_id, file_id, tag) DO UPDATE SET \
+            tag_source = excluded.tag_source, \
+            rule_id = excluded.rule_id, \
+            created_at = excluded.created_at",
         &[
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(file_id),
             DbValue::from(tag),
-            DbValue::from(tag_source),
+            DbValue::from(tag_source.as_str()),
             rule_id_value,
+            DbValue::from(now_millis()),
+        ],
+    )
+    .map_err(|e| {
+        HelpfulError::new(format!("Failed to update file tag: {}", e))
+            .with_context(format!("File ID: {}", file_id))
+    })?;
+
+    let updated = conn.execute(
+        "UPDATE scout_files SET status = ? WHERE id = ?",
+        &[
             DbValue::from(FileStatus::Tagged.as_str()),
             DbValue::from(file_id),
         ],
     )
-    
     .map_err(|e| {
-        HelpfulError::new(format!("Failed to update file tag: {}", e))
+        HelpfulError::new(format!("Failed to update file status: {}", e))
             .with_context(format!("File ID: {}", file_id))
     })?;
 
@@ -299,18 +305,64 @@ fn apply_tag(
     Ok(())
 }
 
-/// Remove tag from a file in the database
-fn remove_tag(conn: &DbConnection, file_id: i64) -> Result<(), HelpfulError> {
+fn list_file_tags(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+    file_id: i64,
+) -> Result<Vec<String>, HelpfulError> {
+    let rows = conn
+        .query_all(
+            "SELECT tag FROM scout_file_tags WHERE workspace_id = ? AND file_id = ? ORDER BY tag",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(file_id),
+            ],
+        )
+        .map_err(|e| HelpfulError::new(format!("Failed to query file tags: {}", e)))?;
+
+    let mut tags = Vec::new();
+    for row in rows {
+        let tag: String = row
+            .get_by_name("tag")
+            .map_err(|e| HelpfulError::new(format!("Failed to read tag: {}", e)))?;
+        tags.push(tag);
+    }
+    Ok(tags)
+}
+
+/// Remove all tags from a file in the database
+fn remove_all_tags(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+    file_id: i64,
+) -> Result<u64, HelpfulError> {
+    let result = conn
+        .execute(
+            "DELETE FROM scout_file_tags WHERE workspace_id = ? AND file_id = ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(file_id),
+            ],
+        )
+        .map_err(|e| {
+            HelpfulError::new(format!("Failed to remove file tags: {}", e))
+                .with_context(format!("File ID: {}", file_id))
+        })?;
+
+    Ok(result as u64)
+}
+
+/// Reset file status after untagging
+fn reset_file_status(conn: &DbConnection, file_id: i64) -> Result<(), HelpfulError> {
     let updated = conn.execute(
         "UPDATE scout_files \
-         SET tag = NULL, tag_source = NULL, rule_id = NULL, status = ?, sentinel_job_id = NULL \
+         SET status = ?, sentinel_job_id = NULL, manual_plugin = NULL \
          WHERE id = ?",
         &[
             DbValue::from(FileStatus::Pending.as_str()),
             DbValue::from(file_id),
         ],
     )
-    
     .map_err(|e| {
         HelpfulError::new(format!("Failed to remove file tag: {}", e))
             .with_context(format!("File ID: {}", file_id))
@@ -326,10 +378,15 @@ fn remove_tag(conn: &DbConnection, file_id: i64) -> Result<(), HelpfulError> {
 }
 
 /// Count total files
-fn count_all_files(conn: &DbConnection) -> Result<i64, HelpfulError> {
-    conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_files", &[])
-        
-        .map_err(|e| HelpfulError::new(format!("Failed to count files: {}", e)))
+fn count_all_files(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<i64, HelpfulError> {
+    conn.query_scalar::<i64>(
+        "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ?",
+        &[DbValue::from(workspace_id.to_string())],
+    )
+    .map_err(|e| HelpfulError::new(format!("Failed to count files: {}", e)))
 }
 
 /// Execute the tag command
@@ -347,56 +404,57 @@ fn run_with_args(args: TagArgs) -> anyhow::Result<()> {
         (None, None) => run_apply_rules(args.dry_run, args.no_queue),
 
         // Partial args - invalid
-        (Some(_), None) => {
-            Err(HelpfulError::new("Missing topic for manual tagging")
-                .with_context("When tagging a specific file, you must provide both path and topic")
-                .with_suggestions([
-                    "TRY: casparian tag /path/to/file.csv my_topic".to_string(),
-                    "TRY: casparian tag --dry-run   (to apply rules)".to_string(),
-                ])
-                .into())
-        }
-        (None, Some(_)) => {
-            Err(HelpfulError::new("Missing path for manual tagging")
-                .with_context("When tagging with a specific topic, you must provide the file path")
-                .with_suggestions([
-                    "TRY: casparian tag /path/to/file.csv my_topic".to_string(),
-                    "TRY: casparian tag   (to apply rules to all files)".to_string(),
-                ])
-                .into())
-        }
+        (Some(_), None) => Err(HelpfulError::new("Missing topic for manual tagging")
+            .with_context("When tagging a specific file, you must provide both path and topic")
+            .with_suggestions([
+                "TRY: casparian tag /path/to/file.csv my_topic".to_string(),
+                "TRY: casparian tag --dry-run   (to apply rules)".to_string(),
+            ])
+            .into()),
+        (None, Some(_)) => Err(HelpfulError::new("Missing path for manual tagging")
+            .with_context("When tagging with a specific topic, you must provide the file path")
+            .with_suggestions([
+                "TRY: casparian tag /path/to/file.csv my_topic".to_string(),
+                "TRY: casparian tag   (to apply rules to all files)".to_string(),
+            ])
+            .into()),
     }
 }
 
 /// Run manual tagging of a single file
 fn run_manual_tag(path: &PathBuf, topic: &str) -> anyhow::Result<()> {
-    let conn = open_db()?;
+    let db = open_db()?;
+    let workspace_id = ensure_workspace_id(&db)?;
+    let conn = db.conn();
 
     // Normalize path
     let path_str = path.to_string_lossy().to_string();
 
     // Find file in database
-    let file = get_file_by_path(&conn, &path_str)?;
+    let file = get_file_by_path(conn, &workspace_id, &path_str)?;
 
     match file {
         Some(f) => {
-            apply_tag(&conn, f.id, topic, "manual", None)?;
+            apply_tag(conn, &workspace_id, f.id, topic, None, TagSource::Manual)?;
             println!("Tagged: {} -> {}", f.path, topic);
             println!();
-            println!("File will be processed by plugins subscribed to topic '{}'", topic);
+            println!(
+                "File will be processed by plugins subscribed to topic '{}'",
+                topic
+            );
             Ok(())
         }
         None => {
             // Try to find by relative path or partial match
             let similar_rows = conn
                 .query_all(
-                    "SELECT path FROM scout_files WHERE path LIKE ? OR rel_path LIKE ? LIMIT 5",
+                    "SELECT path FROM scout_files WHERE workspace_id = ? AND (path LIKE ? OR rel_path LIKE ?) LIMIT 5",
                     &[
+                        DbValue::from(workspace_id.to_string()),
                         DbValue::from(format!("%{}%", path_str)),
                         DbValue::from(format!("%{}%", path_str)),
                     ],
                 )
-                
                 .map_err(|e| HelpfulError::new(format!("Failed to search for file: {}", e)))?;
 
             let mut similar = Vec::new();
@@ -411,7 +469,10 @@ fn run_manual_tag(path: &PathBuf, topic: &str) -> anyhow::Result<()> {
                 .with_context("The file must be discovered by Scout before it can be tagged");
 
             if !similar.is_empty() {
-                err = err.with_suggestion(format!("Did you mean one of these?\n  {}", similar.join("\n  ")));
+                err = err.with_suggestion(format!(
+                    "Did you mean one of these?\n  {}",
+                    similar.join("\n  ")
+                ));
             }
 
             err = err.with_suggestions([
@@ -426,10 +487,12 @@ fn run_manual_tag(path: &PathBuf, topic: &str) -> anyhow::Result<()> {
 
 /// Run rule-based tagging on all untagged files
 fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
-    let conn = open_db()?;
+    let db = open_db()?;
+    let workspace_id = ensure_workspace_id(&db)?;
+    let conn = db.conn();
 
     // Load tagging rules
-    let rules = load_tagging_rules(&conn)?;
+    let rules = load_tagging_rules(conn, &workspace_id)?;
 
     if rules.is_empty() {
         return Err(HelpfulError::new("No tagging rules defined")
@@ -442,8 +505,8 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
     }
 
     // Load untagged files
-    let files = load_untagged_files(&conn)?;
-    let total_files = count_all_files(&conn)?;
+    let files = load_untagged_files(conn, &workspace_id)?;
+    let total_files = count_all_files(conn, &workspace_id)?;
 
     if files.is_empty() {
         println!("No untagged files to process.");
@@ -461,17 +524,14 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
         // Try each rule in priority order
         let mut matched = false;
         for rule in &rules {
-            // Only apply rules from the same source
-            if rule.source_id != file.source_id {
-                continue;
-            }
-
             if pattern_matches(&rule.pattern, &file.rel_path) {
                 matches.push((file.clone(), rule.clone()));
 
-                let entry = summary.matches
-                    .entry(rule.pattern.clone())
-                    .or_insert((rule.tag.clone(), 0, 0));
+                let entry =
+                    summary
+                        .matches
+                        .entry(rule.pattern.clone())
+                        .or_insert((rule.tag.clone(), 0, 0));
                 entry.1 += 1;
                 entry.2 += file.size as u64;
 
@@ -494,7 +554,11 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
         println!();
     }
 
-    println!("Applying {} rules to {} untagged files...", rules.len(), files.len());
+    println!(
+        "Applying {} rules to {} untagged files...",
+        rules.len(),
+        files.len()
+    );
     println!();
 
     if !summary.matches.is_empty() {
@@ -506,10 +570,11 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
 
         // Sort by file count descending
         let mut sorted_matches: Vec<_> = summary.matches.iter().collect();
-        sorted_matches.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        sorted_matches.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
 
         for (pattern, (tag, count, bytes)) in sorted_matches {
-            println!("  {:<25} -> {:<15} {} files ({})",
+            println!(
+                "  {:<25} -> {:<15} {} files ({})",
                 pattern,
                 tag,
                 count,
@@ -520,7 +585,10 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
     }
 
     if !dry_run && !no_queue {
-        println!("WOULD QUEUE: {} files ({} new)", summary.would_queue, summary.new_in_queue);
+        println!(
+            "WOULD QUEUE: {} files ({} new)",
+            summary.would_queue, summary.new_in_queue
+        );
     }
 
     if summary.untagged > 0 {
@@ -531,7 +599,14 @@ fn run_apply_rules(dry_run: bool, no_queue: bool) -> anyhow::Result<()> {
     if !dry_run {
         let mut applied = 0;
         for (file, rule) in &matches {
-            apply_tag(&conn, file.id, &rule.tag, "rule", Some(rule.id))?;
+            apply_tag(
+                conn,
+                &workspace_id,
+                file.id,
+                &rule.tag,
+                Some(rule.id),
+                TagSource::Rule,
+            )?;
             applied += 1;
         }
 
@@ -557,43 +632,43 @@ pub fn run_untag(args: UntagArgs) -> anyhow::Result<()> {
 }
 
 fn run_untag_with_args(args: UntagArgs) -> anyhow::Result<()> {
-    let conn = open_db()?;
+    let db = open_db()?;
+    let workspace_id = ensure_workspace_id(&db)?;
+    let conn = db.conn();
 
     // Normalize path
     let path_str = args.path.to_string_lossy().to_string();
 
     // Find file in database
-    let file = get_file_by_path(&conn, &path_str)?;
+    let file = get_file_by_path(conn, &workspace_id, &path_str)?;
 
     match file {
         Some(f) => {
-            if f.tag.is_none() {
-                println!("File is not tagged: {}", f.path);
+            let tags = list_file_tags(conn, &workspace_id, f.id)?;
+            if tags.is_empty() {
+                println!("File has no tags: {}", f.path);
                 return Ok(());
             }
 
-            let old_tag = f.tag.clone().unwrap_or_default();
-            remove_tag(&conn, f.id)?;
+            remove_all_tags(conn, &workspace_id, f.id)?;
+            reset_file_status(conn, f.id)?;
 
-            println!("Untagged: {} (was: {})", f.path, old_tag);
+            println!("Untagged: {} (removed: {})", f.path, tags.join(", "));
             println!();
-            println!(
-                "File status reset to '{}'.",
-                FileStatus::Pending.as_str()
-            );
+            println!("File status reset to '{}'.", FileStatus::Pending.as_str());
             println!("It will not be processed until tagged again.");
 
             Ok(())
         }
-        None => {
-            Err(HelpfulError::new(format!("File not found in database: {}", path_str))
+        None => Err(
+            HelpfulError::new(format!("File not found in database: {}", path_str))
                 .with_context("The file must be discovered by Scout before it can be untagged")
                 .with_suggestions([
                     "TRY: casparian files   (to see discovered files)".to_string(),
                     "TRY: Check the file path is correct".to_string(),
                 ])
-                .into())
-        }
+                .into(),
+        ),
     }
 }
 
@@ -603,65 +678,89 @@ mod tests {
     use tempfile::TempDir;
 
     const SOURCE_ID: i64 = 1;
-    const RULE_CSV_ID: i64 = 2;
-    const RULE_JSON_ID: i64 = 3;
-    const RULE_TXT_ID: i64 = 4;
 
-    fn create_test_db(dir: &TempDir) -> DbConnection {
+    fn create_test_db(dir: &TempDir) -> (DbConnection, WorkspaceId) {
         let db_path = dir.path().join("test.duckdb");
         let conn = DbConnection::open_duckdb(&db_path).unwrap();
+        let workspace_id = WorkspaceId::new();
 
         // Create schema
         let schema = format!(
             r#"
+            CREATE TABLE cf_workspaces (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at BIGINT NOT NULL
+            );
+
             CREATE TABLE scout_sources (
                 id BIGINT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 source_type TEXT NOT NULL,
                 path TEXT NOT NULL,
-                poll_interval_secs INTEGER DEFAULT 30,
-                enabled INTEGER DEFAULT 1,
-                created_at INTEGER,
-                updated_at INTEGER
+                poll_interval_secs BIGINT DEFAULT 30,
+                enabled BIGINT DEFAULT 1,
+                created_at BIGINT,
+                updated_at BIGINT
             );
 
-            CREATE TABLE scout_tagging_rules (
-                id BIGINT PRIMARY KEY,
-                name TEXT,
-                source_id BIGINT NOT NULL,
+            CREATE TABLE scout_rules (
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'tagging',
                 pattern TEXT NOT NULL,
                 tag TEXT NOT NULL,
-                priority INTEGER DEFAULT 0,
-                enabled INTEGER DEFAULT 1,
-                created_at INTEGER,
-                updated_at INTEGER
+                priority BIGINT DEFAULT 0,
+                enabled BIGINT DEFAULT 1,
+                created_at BIGINT,
+                updated_at BIGINT
             );
 
             CREATE TABLE scout_files (
                 id BIGINT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
                 source_id BIGINT NOT NULL,
                 path TEXT NOT NULL,
                 rel_path TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                mtime INTEGER,
+                size BIGINT NOT NULL,
+                mtime BIGINT,
                 content_hash TEXT,
                 status TEXT DEFAULT '{}',
-                tag TEXT,
-                tag_source TEXT,
-                rule_id BIGINT,
                 manual_plugin TEXT,
                 error TEXT,
-                first_seen_at INTEGER,
-                last_seen_at INTEGER,
-                processed_at INTEGER,
-                sentinel_job_id INTEGER
+                first_seen_at BIGINT,
+                last_seen_at BIGINT,
+                processed_at BIGINT,
+                sentinel_job_id BIGINT
+            );
+
+            CREATE TABLE scout_file_tags (
+                workspace_id TEXT NOT NULL,
+                file_id BIGINT NOT NULL,
+                tag TEXT NOT NULL,
+                tag_source TEXT NOT NULL,
+                rule_id TEXT,
+                created_at BIGINT NOT NULL,
+                PRIMARY KEY (workspace_id, file_id, tag)
             );
             "#,
             FileStatus::Pending.as_str()
         );
         conn.execute_batch(&schema).unwrap();
 
-        conn
+        conn.execute(
+            "INSERT INTO cf_workspaces (id, name, created_at) VALUES (?, ?, ?)",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from("Default"),
+                DbValue::from(now_millis()),
+            ],
+        )
+        .unwrap();
+
+        (conn, workspace_id)
     }
 
     #[test]
@@ -676,63 +775,66 @@ mod tests {
     #[test]
     fn test_load_tagging_rules() {
         let temp_dir = TempDir::new().unwrap();
-        let conn = create_test_db(&temp_dir);
+        let (conn, workspace_id) = create_test_db(&temp_dir);
 
         // Insert test source
         conn.execute(
-            "INSERT INTO scout_sources (id, name, source_type, path) VALUES (?, ?, ?, ?)",
+            "INSERT INTO scout_sources (id, workspace_id, name, source_type, path) VALUES (?, ?, ?, ?, ?)",
             &[
                 DbValue::from(SOURCE_ID),
+                DbValue::from(workspace_id.to_string()),
                 DbValue::from("Test"),
                 DbValue::from("local"),
                 DbValue::from("/data"),
             ],
         )
-        
         .unwrap();
 
         // Insert test rules
         conn.execute(
-            "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO scout_rules (id, workspace_id, name, kind, pattern, tag, priority, enabled) VALUES (?, ?, ?, 'tagging', ?, ?, ?, ?)",
             &[
-                DbValue::from(RULE_CSV_ID),
-                DbValue::from(SOURCE_ID),
+                DbValue::from(TaggingRuleId::new().to_string()),
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from("csv"),
                 DbValue::from("*.csv"),
                 DbValue::from("csv_data"),
                 DbValue::from(10),
                 DbValue::from(1),
             ],
         )
-        
+
         .unwrap();
         conn.execute(
-            "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO scout_rules (id, workspace_id, name, kind, pattern, tag, priority, enabled) VALUES (?, ?, ?, 'tagging', ?, ?, ?, ?)",
             &[
-                DbValue::from(RULE_JSON_ID),
-                DbValue::from(SOURCE_ID),
+                DbValue::from(TaggingRuleId::new().to_string()),
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from("json"),
                 DbValue::from("*.json"),
                 DbValue::from("json_data"),
                 DbValue::from(5),
                 DbValue::from(1),
             ],
         )
-        
+
         .unwrap();
         conn.execute(
-            "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO scout_rules (id, workspace_id, name, kind, pattern, tag, priority, enabled) VALUES (?, ?, ?, 'tagging', ?, ?, ?, ?)",
             &[
-                DbValue::from(RULE_TXT_ID),
-                DbValue::from(SOURCE_ID),
+                DbValue::from(TaggingRuleId::new().to_string()),
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from("txt"),
                 DbValue::from("*.txt"),
                 DbValue::from("text_data"),
                 DbValue::from(0),
                 DbValue::from(0),
             ],
         )
-        
+
         .unwrap();
 
-        let rules = load_tagging_rules(&conn).unwrap();
+        let rules = load_tagging_rules(&conn, &workspace_id).unwrap();
 
         // Should only get enabled rules, sorted by priority descending
         assert_eq!(rules.len(), 2);
@@ -744,24 +846,25 @@ mod tests {
     #[test]
     fn test_apply_and_remove_tag() {
         let temp_dir = TempDir::new().unwrap();
-        let conn = create_test_db(&temp_dir);
+        let (conn, workspace_id) = create_test_db(&temp_dir);
 
         // Insert test source and file
         conn.execute(
-            "INSERT INTO scout_sources (id, name, source_type, path) VALUES (?, ?, ?, ?)",
+            "INSERT INTO scout_sources (id, workspace_id, name, source_type, path) VALUES (?, ?, ?, ?, ?)",
             &[
                 DbValue::from(SOURCE_ID),
+                DbValue::from(workspace_id.to_string()),
                 DbValue::from("Test"),
                 DbValue::from("local"),
                 DbValue::from("/data"),
             ],
         )
-        
         .unwrap();
         conn.execute(
-            "INSERT INTO scout_files (id, source_id, path, rel_path, size, status) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO scout_files (id, workspace_id, source_id, path, rel_path, size, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
             &[
                 DbValue::from(1),
+                DbValue::from(workspace_id.to_string()),
                 DbValue::from(SOURCE_ID),
                 DbValue::from("/data/test.csv"),
                 DbValue::from("test.csv"),
@@ -769,31 +872,37 @@ mod tests {
                 DbValue::from(FileStatus::Pending.as_str()),
             ],
         )
-        
+
         .unwrap();
 
         // Apply tag
-        apply_tag(&conn, 1, "csv_data", "manual", None)
-            
-            .unwrap();
+        apply_tag(
+            &conn,
+            &workspace_id,
+            1,
+            "csv_data",
+            None,
+            TagSource::Manual,
+        )
+        .unwrap();
 
         // Verify
-        let file = get_file_by_path(&conn, "/data/test.csv")
-            
+        let file = get_file_by_path(&conn, &workspace_id, "/data/test.csv")
             .unwrap()
             .unwrap();
-        assert_eq!(file.tag, Some("csv_data".to_string()));
-        assert_eq!(file.status, FileStatus::Tagged.as_str());
+        let tags = list_file_tags(&conn, &workspace_id, file.id).unwrap();
+        assert_eq!(tags, vec!["csv_data".to_string()]);
 
         // Remove tag
-        remove_tag(&conn, 1).unwrap();
+        remove_all_tags(&conn, &workspace_id, 1).unwrap();
+        reset_file_status(&conn, 1).unwrap();
 
         // Verify
-        let file = get_file_by_path(&conn, "/data/test.csv")
-            
+        let file = get_file_by_path(&conn, &workspace_id, "/data/test.csv")
             .unwrap()
             .unwrap();
-        assert!(file.tag.is_none());
+        let tags = list_file_tags(&conn, &workspace_id, file.id).unwrap();
+        assert!(tags.is_empty());
         assert_eq!(file.status, FileStatus::Pending.as_str());
     }
 }

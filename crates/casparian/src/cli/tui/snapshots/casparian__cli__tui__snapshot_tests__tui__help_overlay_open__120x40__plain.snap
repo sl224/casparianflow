@@ -1,0 +1,43 @@
+---
+source: crates/casparian/src/cli/tui/snapshot_tests.rs
+expression: plain
+---
+ Casparian Flow | View: Discover | WS: alpha-case | DB: duckdb | Run: 1 | Fail: 1 | Quarantine: 16
+
+──────────────────────┌ Help ────────────────────────────────────────────────────────────────────┐──────────────────────
+╭ NAV ─────────────╮ [│                                                                          │─────────────────────┐
+│Views             │──│  RULE BUILDER KEYS                      NAVIGATION                       │-lake                │
+│[0] Home          │╔ │  ─────────────────                      ──────────                       │                     │
+│[1] Discover      │║*│  Tab/Shift+Tab  Cycle between fields    3         Focus Files panel      │                     │
+│[2] Parser Bench  │╚═│  ↑/↓ arrows     Move between fields     4         Sources view           │iting: no            │
+│[3] Jobs          │┌ │  ←/→ arrows     Switch panels           0 / H     Home                   │                     │
+│[4] Sources       ││ │                                         Esc       Back / Close           │                     │
+│[5] Approvals     ││ │  ↑/↓            Navigate lists                                           │ate>_<region>.csv    │
+│[6] Query         │└─│  Enter          Expand folder / Save    PATTERN SYNTAX                   │ort.financial        │
+│[7] Sessions      │┌ │                                         ──────────────                   │                     │
+│[,] Settings      ││r│  ACTIONS                                **/*      All files              │                     │
+│                  │└─│  ───────                                *.rs      Rust files             │                     │
+│Context           │┌ │  1              Open Source dropdown    **/*.csv  CSV files (recursive)  │                     │
+│Workspace: alp... ││ │  2              Open Tags dropdown      <name>    Extract field          │                     │
+│Source: alpha-... ││ │  s              Scan new directory                                       │                     │
+│Tag: All          ││ │  Ctrl+S         Save rule               FOCUS INDICATOR                  │                     │
+│                  │└─│  t              Run backtest            ──────────────                   │                     │
+│                  │┌ │                                         █ cursor   = text input active   │                     │
+│                  ││[│                                         ► pointer  = list navigation     │                     │
+│                  │└─│  IN DROPDOWNS                                                            │                     │
+│                  │┌ │  ────────────                           GLOBAL                           │                     │
+│                  ││ │  /              Filter list             ──────                           │                     │
+│                  ││ │  ↑/↓           Navigate                 ?         This help              │                     │
+│                  ││ │  Enter          Select item             r         Refresh view           │                     │
+│                  ││ │  I              Toggle inspector        q         Quit                   │                     │
+│                  ││ │  Esc            Close dropdown          q         Quit                   │                     │
+│                  ││ │                                                                          │                     │
+│                  ││ │  Press ? or Esc to close                                                 │                     │
+│                  ││ │                                                                          │                     │
+│                  ││ │                                                                          │                     │
+│                  ││ │                                                                          │                     │
+│                  ││ │                                                                          │                     │
+│                  ││ │                                                                          │                     │
+╰──────────────────╯└─│                                                                          │─────────────────────┘
+──────────────────────└──────────────────────────────────────────────────────────────────────────┘──────────────────────
+ [e] Sample  [E] Full  [t] Apply Tag  [b] Backtest  [Esc] Exit input then [s] Scan  [Ctrl+S] Save  [Ctrl+N] Clear  [I...

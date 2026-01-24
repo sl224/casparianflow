@@ -5,8 +5,10 @@
 use crate::cli::config::active_db_path;
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
+use crate::cli::workspace;
 use crate::cli::output::{format_size, print_table};
-use casparian::scout::{Database, Scanner, Source, SourceId, SourceType};
+use casparian::scout::{Database, Scanner, Source, SourceId, SourceType, WorkspaceId};
+use casparian_db::DbValue;
 use clap::Subcommand;
 use std::path::PathBuf;
 
@@ -68,6 +70,20 @@ struct SourceStats {
     total_size: u64,
 }
 
+#[derive(Debug, Clone)]
+struct SourceFileRow {
+    id: i64,
+    rel_path: String,
+    size: u64,
+    status: String,
+}
+
+fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
+    workspace::resolve_active_workspace_id(db).map_err(|e| {
+        e.with_context("The workspace registry is required for sources")
+    })
+}
+
 fn find_source<'a>(sources: &'a [Source], input: &str) -> Option<&'a Source> {
     let parsed_id = SourceId::parse(input).ok();
     sources
@@ -76,12 +92,120 @@ fn find_source<'a>(sources: &'a [Source], input: &str) -> Option<&'a Source> {
 }
 
 /// Get stats for a source from the database
-fn get_source_stats(db: &Database, source_id: &SourceId) -> SourceStats {
-    // Query file count and total size for this source
-    let files = db.list_files_by_source(source_id, 100000).unwrap_or_default();
-    let file_count = files.len() as u64;
-    let total_size = files.iter().map(|f| f.size).sum();
-    SourceStats { file_count, total_size }
+fn get_source_stats(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    source_id: &SourceId,
+) -> SourceStats {
+    let row = conn
+        .query_optional(
+            "SELECT COUNT(*) as total, COALESCE(SUM(size), 0) as total_size \
+             FROM scout_files WHERE workspace_id = ? AND source_id = ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(source_id.as_i64()),
+            ],
+        )
+        .unwrap_or(None);
+
+    if let Some(row) = row {
+        let total: i64 = row.get_by_name("total").unwrap_or(0);
+        let total_size: i64 = row.get_by_name("total_size").unwrap_or(0);
+        SourceStats {
+            file_count: total as u64,
+            total_size: total_size as u64,
+        }
+    } else {
+        SourceStats {
+            file_count: 0,
+            total_size: 0,
+        }
+    }
+}
+
+fn list_source_files(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    source_id: &SourceId,
+    limit: usize,
+) -> Result<Vec<SourceFileRow>, HelpfulError> {
+    let rows = conn
+        .query_all(
+            "SELECT id, rel_path, size, status \
+             FROM scout_files \
+             WHERE workspace_id = ? AND source_id = ? \
+             ORDER BY mtime DESC \
+             LIMIT ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(source_id.as_i64()),
+                DbValue::from(limit as i64),
+            ],
+        )
+        .map_err(|e| HelpfulError::new(format!("Failed to list files: {}", e)))?;
+
+    let mut files = Vec::new();
+    for row in rows {
+        let size_raw: i64 = row
+            .get_by_name("size")
+            .map_err(|e| HelpfulError::new(format!("Failed to read size: {}", e)))?;
+        files.push(SourceFileRow {
+            id: row
+                .get_by_name("id")
+                .map_err(|e| HelpfulError::new(format!("Failed to read id: {}", e)))?,
+            rel_path: row
+                .get_by_name("rel_path")
+                .map_err(|e| HelpfulError::new(format!("Failed to read rel_path: {}", e)))?,
+            size: size_raw as u64,
+            status: row
+                .get_by_name("status")
+                .map_err(|e| HelpfulError::new(format!("Failed to read status: {}", e)))?,
+        });
+    }
+
+    Ok(files)
+}
+
+fn fetch_tags_for_files(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    file_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Vec<String>>, HelpfulError> {
+    let mut tags_by_file = std::collections::HashMap::new();
+    if file_ids.is_empty() {
+        return Ok(tags_by_file);
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(file_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut params: Vec<DbValue> = vec![DbValue::from(workspace_id.to_string())];
+    for id in file_ids {
+        params.push(DbValue::from(*id));
+    }
+
+    let sql = format!(
+        "SELECT file_id, tag FROM scout_file_tags \
+         WHERE workspace_id = ? AND file_id IN ({}) \
+         ORDER BY tag",
+        placeholders
+    );
+
+    let rows = conn
+        .query_all(&sql, &params)
+        .map_err(|e| HelpfulError::new(format!("Failed to read file tags: {}", e)))?;
+    for row in rows {
+        let file_id: i64 = row
+            .get_by_name("file_id")
+            .map_err(|e| HelpfulError::new(format!("Failed to read file_id: {}", e)))?;
+        let tag: String = row
+            .get_by_name("tag")
+            .map_err(|e| HelpfulError::new(format!("Failed to read tag: {}", e)))?;
+        tags_by_file.entry(file_id).or_default().push(tag);
+    }
+
+    Ok(tags_by_file)
 }
 
 /// Execute the source command
@@ -101,21 +225,32 @@ fn run_with_action(action: SourceAction) -> anyhow::Result<()> {
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
+    let workspace_id = ensure_workspace_id(&db)?;
+    let conn = db.conn();
 
     match action {
-        SourceAction::List { json } => list_sources(&db, json),
-        SourceAction::Add { path, name, recursive: _ } => add_source(&db, path, name),
-        SourceAction::Show { name, files, limit, json } => show_source(&db, &name, files, limit, json),
-        SourceAction::Remove { name, force } => remove_source(&db, &name, force),
-        SourceAction::Sync { name, all } => sync_sources(&db, name, all),
+        SourceAction::List { json } => list_sources(&db, &workspace_id, json),
+        SourceAction::Add {
+            path,
+            name,
+            recursive: _,
+        } => add_source(&db, &workspace_id, path, name),
+        SourceAction::Show {
+            name,
+            files,
+            limit,
+            json,
+        } => show_source(conn, &workspace_id, &db, &name, files, limit, json),
+        SourceAction::Remove { name, force } => remove_source(conn, &workspace_id, &db, &name, force),
+        SourceAction::Sync { name, all } => sync_sources(&db, &workspace_id, name, all),
         SourceAction::Use { .. } => unreachable!(), // Handled above
     }
 }
 
-fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
-    let sources = db.list_sources().map_err(|e| {
-        HelpfulError::new(format!("Failed to list sources: {}", e))
-    })?;
+fn list_sources(db: &Database, workspace_id: &WorkspaceId, json: bool) -> anyhow::Result<()> {
+    let sources = db
+        .list_sources(workspace_id)
+        .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
     if sources.is_empty() {
         println!("No sources configured.");
@@ -129,9 +264,10 @@ fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
         let output: Vec<serde_json::Value> = {
             let mut result = Vec::new();
             for s in &sources {
-                let stats = get_source_stats(db, &s.id);
+                let stats = get_source_stats(db.conn(), workspace_id, &s.id);
                 result.push(serde_json::json!({
                     "name": s.name,
+                    "workspace_id": s.workspace_id,
                     "path": s.path,
                     "enabled": s.enabled,
                     "files": stats.file_count,
@@ -151,7 +287,7 @@ fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
     let mut total_size = 0u64;
 
     for source in &sources {
-        let stats = get_source_stats(db, &source.id);
+        let stats = get_source_stats(db.conn(), workspace_id, &source.id);
         total_files += stats.file_count;
         total_size += stats.total_size;
 
@@ -175,17 +311,24 @@ fn list_sources(db: &Database, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Result<()> {
+fn add_source(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    path: PathBuf,
+    name: Option<String>,
+) -> anyhow::Result<()> {
     // Validate path exists and is a directory
     if !path.exists() {
         return Err(HelpfulError::path_not_found(&path).into());
     }
 
     if !path.is_dir() {
-        return Err(HelpfulError::new(format!("Not a directory: {}", path.display()))
-            .with_context("Sources must be directories")
-            .with_suggestion("TRY: Specify a directory path instead of a file")
-            .into());
+        return Err(
+            HelpfulError::new(format!("Not a directory: {}", path.display()))
+                .with_context("Sources must be directories")
+                .with_suggestion("TRY: Specify a directory path instead of a file")
+                .into(),
+        );
     }
 
     // Canonicalize path
@@ -204,23 +347,30 @@ fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Res
     });
 
     // Check if source with this path already exists
-    let existing = db.list_sources()?;
+    let existing = db.list_sources(workspace_id)?;
     for s in &existing {
         if s.path == canonical.display().to_string() {
-            return Err(HelpfulError::new(format!("Source already exists: {}", s.name))
-                .with_context(format!("Path: {}", s.path))
-                .with_suggestion("TRY: Use 'casparian source sync' to refresh the existing source")
-                .into());
+            return Err(
+                HelpfulError::new(format!("Source already exists: {}", s.name))
+                    .with_context(format!("Path: {}", s.path))
+                    .with_suggestion(
+                        "TRY: Use 'casparian source sync' to refresh the existing source",
+                    )
+                    .into(),
+            );
         }
         if s.name == source_name {
-            return Err(HelpfulError::new(format!("Source name already exists: {}", source_name))
-                .with_suggestion(format!("TRY: Use --name to specify a different name"))
-                .into());
+            return Err(
+                HelpfulError::new(format!("Source name already exists: {}", source_name))
+                    .with_suggestion(format!("TRY: Use --name to specify a different name"))
+                    .into(),
+            );
         }
     }
 
     // Create the source
     let source = Source {
+        workspace_id: *workspace_id,
         id: SourceId::new(),
         name: source_name.clone(),
         source_type: SourceType::Local,
@@ -229,9 +379,8 @@ fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Res
         enabled: true,
     };
 
-    db.upsert_source(&source).map_err(|e| {
-        HelpfulError::new(format!("Failed to create source: {}", e))
-    })?;
+    db.upsert_source(&source)
+        .map_err(|e| HelpfulError::new(format!("Failed to create source: {}", e)))?;
 
     println!("Added source '{}'", source_name);
     println!("  Path: {}", canonical.display());
@@ -244,8 +393,16 @@ fn add_source(db: &Database, path: PathBuf, name: Option<String>) -> anyhow::Res
     Ok(())
 }
 
-fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: bool) -> anyhow::Result<()> {
-    let sources = db.list_sources()?;
+fn show_source(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    db: &Database,
+    name: &str,
+    show_files: bool,
+    limit: usize,
+    json: bool,
+) -> anyhow::Result<()> {
+    let sources = db.list_sources(workspace_id)?;
     let source = find_source(&sources, name);
 
     let source = match source {
@@ -257,7 +414,7 @@ fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: 
         }
     };
 
-    let stats = get_source_stats(db, &source.id);
+    let stats = get_source_stats(conn, workspace_id, &source.id);
 
     if json {
         let mut output = serde_json::json!({
@@ -274,14 +431,23 @@ fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: 
         // Include files in JSON output if requested
         if show_files {
             let files = db.list_files_by_source(&source.id, limit)?;
-            let files_json: Vec<serde_json::Value> = files.iter().map(|f| {
-                serde_json::json!({
-                    "path": f.rel_path,
-                    "size": f.size,
-                    "status": f.status.as_str(),
-                    "tag": f.tag,
+            let file_ids: Vec<i64> = files.iter().filter_map(|f| f.id).collect();
+            let tags_by_file = fetch_tags_for_files(conn, workspace_id, &file_ids)?;
+            let files_json: Vec<serde_json::Value> = files
+                .iter()
+                .map(|f| {
+                    let tags = f
+                        .id
+                        .and_then(|id| tags_by_file.get(&id).cloned())
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "path": f.rel_path,
+                        "size": f.size,
+                        "status": f.status.as_str(),
+                        "tags": tags,
+                    })
                 })
-            }).collect();
+                .collect();
             output["file_list"] = serde_json::Value::Array(files_json);
         }
 
@@ -302,15 +468,15 @@ fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: 
     println!();
 
     // Show rules for this source
-    let rules = db.list_tagging_rules_for_source(&source.id)?;
+    let rules = db.list_tagging_rules_for_workspace(workspace_id)?;
     if !rules.is_empty() {
-        println!("RULES");
+        println!("RULES (WORKSPACE)");
         for rule in &rules {
             println!("  {} -> {}", rule.pattern, rule.tag);
         }
         println!();
     } else {
-        println!("No tagging rules configured for this source.");
+        println!("No tagging rules configured for this workspace.");
         println!("  TRY: casparian rule add '*.csv' --topic csv_data");
         println!();
     }
@@ -323,23 +489,37 @@ fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: 
             println!("  TRY: casparian source sync {}", source.name);
         } else {
             println!("FILES");
-            let rows: Vec<Vec<String>> = files.iter().map(|f| {
-                vec![
-                    if f.rel_path.len() > 50 {
-                        format!("...{}", &f.rel_path[f.rel_path.len().saturating_sub(47)..])
-                    } else {
-                        f.rel_path.clone()
-                    },
-                    format_size(f.size),
-                    f.tag.as_deref().unwrap_or("-").to_string(),
-                    f.status.as_str().to_string(),
-                ]
-            }).collect();
-            print_table(&["PATH", "SIZE", "TAG", "STATUS"], rows);
+            let file_ids: Vec<i64> = files.iter().filter_map(|f| f.id).collect();
+            let tags_by_file = fetch_tags_for_files(conn, workspace_id, &file_ids)?;
+            let rows: Vec<Vec<String>> = files
+                .iter()
+                .map(|f| {
+                    let tags = f
+                        .id
+                        .and_then(|id| tags_by_file.get(&id))
+                        .map(|tags| tags.join(", "))
+                        .filter(|t| !t.is_empty())
+                        .unwrap_or_else(|| "-".to_string());
+                    vec![
+                        if f.rel_path.len() > 50 {
+                            format!("...{}", &f.rel_path[f.rel_path.len().saturating_sub(47)..])
+                        } else {
+                            f.rel_path.clone()
+                        },
+                        format_size(f.size),
+                        tags,
+                        f.status.as_str().to_string(),
+                    ]
+                })
+                .collect();
+            print_table(&["PATH", "SIZE", "TAGS", "STATUS"], rows);
 
             if files.len() >= limit {
                 println!();
-                println!("Showing {} of {} files. Use --limit to see more.", limit, stats.file_count);
+                println!(
+                    "Showing {} of {} files. Use --limit to see more.",
+                    limit, stats.file_count
+                );
             }
         }
     }
@@ -347,8 +527,14 @@ fn show_source(db: &Database, name: &str, show_files: bool, limit: usize, json: 
     Ok(())
 }
 
-fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
-    let sources = db.list_sources()?;
+fn remove_source(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    db: &Database,
+    name: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let sources = db.list_sources(workspace_id)?;
     let source = find_source(&sources, name);
 
     let source = match source {
@@ -360,7 +546,7 @@ fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
         }
     };
 
-    let stats = get_source_stats(db, &source.id);
+    let stats = get_source_stats(conn, workspace_id, &source.id);
 
     if stats.file_count > 0 && !force {
         return Err(HelpfulError::new(format!(
@@ -376,9 +562,8 @@ fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
     let source_id = source.id.clone();
     let source_name = source.name.clone();
 
-    db.delete_source(&source_id).map_err(|e| {
-        HelpfulError::new(format!("Failed to remove source: {}", e))
-    })?;
+    db.delete_source(&source_id)
+        .map_err(|e| HelpfulError::new(format!("Failed to remove source: {}", e)))?;
 
     println!("Removed source '{}'", source_name);
     if stats.file_count > 0 {
@@ -388,7 +573,12 @@ fn remove_source(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow::Result<()> {
+fn sync_sources(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    name: Option<String>,
+    all: bool,
+) -> anyhow::Result<()> {
     if name.is_none() && !all {
         return Err(HelpfulError::new("No source specified")
             .with_suggestion("TRY: casparian source sync <name>")
@@ -396,7 +586,7 @@ fn sync_sources(db: &Database, name: Option<String>, all: bool) -> anyhow::Resul
             .into());
     }
 
-    let sources = db.list_sources()?;
+    let sources = db.list_sources(workspace_id)?;
 
     if sources.is_empty() {
         return Err(HelpfulError::new("No sources configured")
@@ -484,16 +674,18 @@ fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
-
-    let sources = db.list_sources()?;
+    let workspace_id = ensure_workspace_id(&db)?;
+    let sources = db.list_sources(&workspace_id)?;
     let source = find_source(&sources, &source_name);
 
     let source = match source {
         Some(s) => s,
         None => {
-            return Err(HelpfulError::new(format!("Source not found: {}", source_name))
-                .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
-                .into());
+            return Err(
+                HelpfulError::new(format!("Source not found: {}", source_name))
+                    .with_suggestion("TRY: Use 'casparian source ls' to see available sources")
+                    .into(),
+            );
         }
     };
 
@@ -502,7 +694,10 @@ fn use_source(name: Option<String>, clear: bool) -> anyhow::Result<()> {
     println!("Default source set to: {}", source.name);
     println!();
     println!("Now you can run:");
-    println!("  casparian files              # Files from '{}'", source.name);
+    println!(
+        "  casparian files              # Files from '{}'",
+        source.name
+    );
     println!("  casparian files --all        # Files from all sources");
 
     Ok(())
@@ -519,12 +714,14 @@ mod tests {
     fn test_add_source_path_validation() {
         let temp = TempDir::new().unwrap();
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         // Test adding a valid directory
         let test_dir = temp.path().join("test_data");
         fs::create_dir(&test_dir).unwrap();
 
         let source = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -534,7 +731,7 @@ mod tests {
         };
         db.upsert_source(&source).unwrap();
 
-        let sources = db.list_sources().unwrap();
+        let sources = db.list_sources(&workspace_id).unwrap();
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].name, "test");
     }
@@ -542,9 +739,11 @@ mod tests {
     #[test]
     fn test_source_stats() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source_id = SourceId::new();
 
         let source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -555,10 +754,17 @@ mod tests {
         db.upsert_source(&source).unwrap();
 
         // Add some files
-        let file = ScannedFile::new(source_id.clone(), "/data/test.csv", "test.csv", 1000, 12345);
+        let file = ScannedFile::new(
+            workspace_id,
+            source_id.clone(),
+            "/data/test.csv",
+            "test.csv",
+            1000,
+            12345,
+        );
         db.upsert_file(&file).unwrap();
 
-        let stats = get_source_stats(&db, &source_id);
+        let stats = get_source_stats(db.conn(), &workspace_id, &source_id);
         assert_eq!(stats.file_count, 1);
         assert_eq!(stats.total_size, 1000);
     }
@@ -566,9 +772,11 @@ mod tests {
     #[test]
     fn test_remove_source_with_files() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source_id = SourceId::new();
 
         let source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -579,12 +787,19 @@ mod tests {
         db.upsert_source(&source).unwrap();
 
         // Add a file
-        let file = ScannedFile::new(source_id.clone(), "/data/test.csv", "test.csv", 1000, 12345);
+        let file = ScannedFile::new(
+            workspace_id,
+            source_id.clone(),
+            "/data/test.csv",
+            "test.csv",
+            1000,
+            12345,
+        );
         db.upsert_file(&file).unwrap();
 
         // Delete source should remove files too
         db.delete_source(&source_id).unwrap();
-        let sources = db.list_sources().unwrap();
+        let sources = db.list_sources(&workspace_id).unwrap();
         assert!(sources.is_empty());
     }
 }

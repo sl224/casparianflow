@@ -1,0 +1,82 @@
+---
+interface Props {
+  title: string;
+  description?: string;
+}
+
+const { title, description = "Turn any file format into governed, queryable SQL. Schema contracts. Lineage on every row. Quarantine for bad data. Your parsers, production-grade." } = Astro.props;
+---
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title} - Casparian Flow</title>
+  <meta name="description" content={description}>
+
+  <!-- Open Graph -->
+  <meta property="og:title" content={`${title} - Casparian Flow`}>
+  <meta property="og:description" content={description}>
+  <meta property="og:type" content="website">
+  <meta property="og:url" content={Astro.url}>
+
+  <!-- Favicon -->
+  <link rel="icon" href="/assets/favicon.svg">
+
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Plausible Analytics -->
+  <script defer data-domain="casparianflow.com" src="https://plausible.io/js/script.js"></script>
+
+  <style>
+    .card-hover {
+      transition: all 0.2s ease;
+    }
+    .card-hover:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    }
+  </style>
+</head>
+<body class="bg-[#0d1117] text-gray-100 min-h-screen">
+
+  <!-- Header -->
+  <header class="border-b border-gray-800">
+    <div class="max-w-6xl mx-auto px-6 py-4 flex justify-between items-center">
+      <a href="/" class="text-xl font-semibold">Casparian Flow</a>
+      <nav class="flex gap-6 text-sm text-gray-400">
+        <a href="/blog" class="hover:text-white transition">Blog</a>
+        <a href="/#how-it-works" class="hover:text-white transition">How It Works</a>
+        <a href="/#features" class="hover:text-white transition">Features</a>
+        <a href="/finance" class="hover:text-white transition">FIX Logs</a>
+        <a href="mailto:support@casparianflow.com" class="hover:text-white transition">Contact</a>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <slot />
+
+  <!-- Footer -->
+  <footer class="border-t border-gray-800">
+    <div class="max-w-6xl mx-auto px-6 py-10">
+      <div class="flex flex-col md:flex-row justify-between items-center gap-6">
+        <div class="text-gray-500 text-sm">
+          <p>&copy; 2026 Casparian Flow</p>
+        </div>
+        <div class="flex gap-6 text-sm text-gray-500">
+          <a href="/blog" class="hover:text-gray-300 transition">Blog</a>
+          <a href="#GITHUB_REPO_PLACEHOLDER" class="hover:text-gray-300 transition">GitHub</a>
+          <a href="mailto:support@casparianflow.com" class="hover:text-gray-300 transition">support@casparianflow.com</a>
+        </div>
+      </div>
+      <p class="text-center text-gray-600 text-xs mt-6">
+        Your data stays yours. Telemetry is opt-in and anonymous. No file contents ever leave your machine.
+      </p>
+    </div>
+  </footer>
+
+</body>
+</html>

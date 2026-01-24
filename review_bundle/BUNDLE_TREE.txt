@@ -1,0 +1,606 @@
+review_bundle
+├── actionable_findings.json
+├── AGENTS.md
+├── BUNDLE_TREE.txt
+├── Cargo.toml
+├── claude_docs
+│   ├── devasting_criticsm_gemini_execution_plan.md
+│   ├── project-overview.md
+│   ├── README.md
+│   └── ui-testing.md
+├── CLAUDE.md
+├── code_execution_workflow.md
+├── crates
+│   ├── casparian
+│   │   ├── benches
+│   │   │   └── scanner_perf.rs
+│   │   ├── Cargo.toml
+│   │   ├── examples
+│   │   │   └── download_model.rs
+│   │   ├── output
+│   │   │   └── variant_grouping_fixtures
+│   │   │       ├── combined.debug.txt
+│   │   │       ├── combined.tree.txt
+│   │   │       ├── defense_telemetry.debug.txt
+│   │   │       ├── defense_telemetry.tree.txt
+│   │   │       ├── finance_exports.debug.txt
+│   │   │       ├── finance_exports.tree.txt
+│   │   │       ├── healthcare_hl7.debug.txt
+│   │   │       └── healthcare_hl7.tree.txt
+│   │   ├── src
+│   │   │   ├── ai
+│   │   │   │   ├── audit.rs
+│   │   │   │   ├── config.rs
+│   │   │   │   ├── draft.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── parser_lab
+│   │   │   │   │   ├── generator.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   ├── sample_reader.rs
+│   │   │   │   │   └── validator.rs
+│   │   │   │   ├── pathfinder
+│   │   │   │   │   ├── analyzer.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   ├── python_gen.rs
+│   │   │   │   │   ├── validator.rs
+│   │   │   │   │   └── yaml_gen.rs
+│   │   │   │   ├── semantic_path
+│   │   │   │   │   ├── detector.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   └── primitives.rs
+│   │   │   │   └── types.rs
+│   │   │   ├── bundler.rs
+│   │   │   ├── cli
+│   │   │   │   ├── backfill.rs
+│   │   │   │   ├── config.rs
+│   │   │   │   ├── context.rs
+│   │   │   │   ├── error.rs
+│   │   │   │   ├── files.rs
+│   │   │   │   ├── job.rs
+│   │   │   │   ├── jobs.rs
+│   │   │   │   ├── mcp.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── output.rs
+│   │   │   │   ├── parser.rs
+│   │   │   │   ├── pipeline.rs
+│   │   │   │   ├── plugin.rs
+│   │   │   │   ├── preview.rs
+│   │   │   │   ├── publish.rs
+│   │   │   │   ├── rule.rs
+│   │   │   │   ├── run.rs
+│   │   │   │   ├── scan.rs
+│   │   │   │   ├── schema.rs
+│   │   │   │   ├── source.rs
+│   │   │   │   ├── tag.rs
+│   │   │   │   ├── topic.rs
+│   │   │   │   ├── tui
+│   │   │   │   │   ├── app.rs
+│   │   │   │   │   ├── event.rs
+│   │   │   │   │   ├── extraction.rs
+│   │   │   │   │   ├── mod.rs
+│   │   │   │   │   ├── pattern_query.rs
+│   │   │   │   │   ├── profiler_overlay.rs
+│   │   │   │   │   └── ui.rs
+│   │   │   │   └── worker.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── main.rs
+│   │   │   ├── parser_metadata.rs
+│   │   │   ├── publish.rs
+│   │   │   ├── runner
+│   │   │   │   ├── dev.rs
+│   │   │   │   └── mod.rs
+│   │   │   ├── scout
+│   │   │   │   ├── db.rs
+│   │   │   │   ├── error.rs
+│   │   │   │   ├── extractor.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── scan_path.rs
+│   │   │   │   ├── scanner.rs
+│   │   │   │   ├── tagger.rs
+│   │   │   │   └── types.rs
+│   │   │   ├── storage
+│   │   │   │   ├── duckdb.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── types.rs
+│   │   │   └── trust
+│   │   │       ├── config.rs
+│   │   │       └── mod.rs
+│   │   └── tests
+│   │       ├── cli_files_json.rs
+│   │       ├── cli_jobs_json.rs
+│   │       ├── cli_rule_json.rs
+│   │       ├── cli_scan_preview_json.rs
+│   │       ├── cli_source_json.rs
+│   │       ├── cli_support
+│   │       │   └── mod.rs
+│   │       ├── cli_tag_pipeline_queue.rs
+│   │       ├── cli_topic_json.rs
+│   │       ├── cli_worker_json.rs
+│   │       ├── critical_paths.rs
+│   │       ├── fix_demo_e2e.rs
+│   │       ├── glob_explorer_latency_e2e.rs
+│   │       ├── pathfinder_llm_e2e.rs
+│   │       ├── publish_integration.rs
+│   │       ├── scan_progress_e2e.rs
+│   │       ├── tui_pty_e2e.rs
+│   │       ├── ultrathink_e2e.rs
+│   │       └── variant_grouping_real_world.rs
+│   ├── casparian_backtest
+│   │   ├── Cargo.toml
+│   │   ├── CLAUDE.md
+│   │   ├── src
+│   │   │   ├── failfast.rs
+│   │   │   ├── high_failure.rs
+│   │   │   ├── ids.rs
+│   │   │   ├── iteration.rs
+│   │   │   ├── lib.rs
+│   │   │   └── metrics.rs
+│   │   └── tests
+│   │       └── e2e_backtest.rs
+│   ├── casparian_db
+│   │   ├── Cargo.toml
+│   │   ├── CLAUDE.md
+│   │   └── src
+│   │       ├── backend.rs
+│   │       ├── lib.rs
+│   │       ├── license.rs
+│   │       └── lock.rs
+│   ├── casparian_ids
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── lib.rs
+│   ├── casparian_mcp
+│   │   ├── Cargo.toml
+│   │   ├── CLAUDE.md
+│   │   └── src
+│   │       ├── approvals
+│   │       │   ├── manager.rs
+│   │       │   ├── mod.rs
+│   │       │   └── store.rs
+│   │       ├── core
+│   │       │   ├── command.rs
+│   │       │   ├── event.rs
+│   │       │   └── mod.rs
+│   │       ├── db_store.rs
+│   │       ├── intent
+│   │       │   ├── confidence.rs
+│   │       │   ├── fileset.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── session.rs
+│   │       │   ├── state.rs
+│   │       │   └── types.rs
+│   │       ├── jobs
+│   │       │   ├── executor.rs
+│   │       │   ├── manager.rs
+│   │       │   ├── mod.rs
+│   │       │   └── store.rs
+│   │       ├── lib.rs
+│   │       ├── protocol.rs
+│   │       ├── redaction.rs
+│   │       ├── security
+│   │       │   ├── audit.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── output_budget.rs
+│   │       │   └── path_allowlist.rs
+│   │       ├── server.rs
+│   │       ├── tools
+│   │       │   ├── approval.rs
+│   │       │   ├── backtest.rs
+│   │       │   ├── intent_backtest.rs
+│   │       │   ├── intent_fileset.rs
+│   │       │   ├── intent_path_fields.rs
+│   │       │   ├── intent_publish.rs
+│   │       │   ├── intent_schema.rs
+│   │       │   ├── intent_select.rs
+│   │       │   ├── intent_session.rs
+│   │       │   ├── intent_tags.rs
+│   │       │   ├── job.rs
+│   │       │   ├── mod.rs
+│   │       │   ├── plugins.rs
+│   │       │   ├── preview.rs
+│   │       │   ├── query.rs
+│   │       │   ├── registry.rs
+│   │       │   ├── run.rs
+│   │       │   └── scan.rs
+│   │       └── types.rs
+│   ├── casparian_profiler
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── lib.rs
+│   ├── casparian_protocol
+│   │   ├── Cargo.toml
+│   │   ├── CLAUDE.md
+│   │   └── src
+│   │       ├── error.rs
+│   │       ├── http_types.rs
+│   │       ├── idempotency.rs
+│   │       ├── lib.rs
+│   │       └── types.rs
+│   ├── casparian_schema
+│   │   ├── Cargo.toml
+│   │   ├── CLAUDE.md
+│   │   ├── src
+│   │   │   ├── amendment.rs
+│   │   │   ├── approval.rs
+│   │   │   ├── contract.rs
+│   │   │   ├── ids.rs
+│   │   │   ├── lib.rs
+│   │   │   └── storage.rs
+│   │   └── tests
+│   │       └── e2e_contracts.rs
+│   ├── casparian_security
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       ├── gatekeeper.rs
+│   │       ├── lib.rs
+│   │       └── signing.rs
+│   ├── casparian_sentinel
+│   │   ├── Cargo.toml
+│   │   ├── CLAUDE.md
+│   │   ├── src
+│   │   │   ├── db
+│   │   │   │   ├── api_storage.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── models.rs
+│   │   │   │   └── queue.rs
+│   │   │   ├── lib.rs
+│   │   │   ├── main.rs
+│   │   │   ├── metrics.rs
+│   │   │   └── sentinel.rs
+│   │   └── tests
+│   │       └── integration.rs
+│   ├── casparian_sinks
+│   │   ├── Cargo.toml
+│   │   └── src
+│   │       └── lib.rs
+│   └── casparian_worker
+│       ├── Cargo.toml
+│       ├── CLAUDE.md
+│       ├── shim
+│       │   ├── bridge_shim.py
+│       │   └── casparian_types.py
+│       ├── src
+│       │   ├── bridge.rs
+│       │   ├── lib.rs
+│       │   ├── metrics.rs
+│       │   ├── native_runtime.rs
+│       │   ├── runtime.rs
+│       │   ├── schema_validation.rs
+│       │   ├── type_inference
+│       │   │   ├── constraints.rs
+│       │   │   ├── date_formats.rs
+│       │   │   ├── mod.rs
+│       │   │   ├── solver.rs
+│       │   │   └── streaming.rs
+│       │   ├── venv_manager.rs
+│       │   └── worker.rs
+│       └── tests
+│           ├── bridge_stability.rs
+│           ├── concurrency_test.rs
+│           ├── e2e_type_inference.rs
+│           ├── evtx_native_e2e.rs
+│           ├── integration.rs
+│           └── native_runtime.rs
+├── demo
+│   ├── generate_sample_data.py
+│   ├── parsers
+│   │   └── mcdata_parser.py
+│   ├── plugins
+│   │   ├── bad_plugin.py
+│   │   ├── csv_processor.py
+│   │   ├── data_validator.py
+│   │   ├── pyproject.toml
+│   │   ├── simple_transform.py
+│   │   └── slow_processor.py
+│   ├── process_mcdata.sh
+│   ├── run_demo.sh
+│   ├── schema.sql
+│   └── scout
+│       ├── run_scout_demo.sh
+│       ├── sample_data
+│       │   ├── events.jsonl
+│       │   ├── inventory.json
+│       │   ├── sales_2024_01.csv
+│       │   └── sales_2024_02.csv
+│       └── scout-demo.toml
+├── docs
+│   ├── agent
+│   │   ├── AGENTS_CHECKLIST.md
+│   │   ├── BASELINE.md
+│   │   ├── PROGRESS.md
+│   │   └── SCAN_REPORT.md
+│   ├── architecture
+│   │   └── mcp_sync_core.md
+│   ├── codex-multijob-spec.md
+│   ├── DECISION_WORKER_PYTHON_EXECUTION.md
+│   ├── decisions
+│   │   ├── ADR-017-tagging-vs-extraction-rules.md
+│   │   ├── ADR-018-worker-cap-simplifications.md
+│   │   ├── ADR-019-multi-output-sink-routing.md
+│   │   ├── ADR-020-tauri-gui.md
+│   │   └── ADR-021-ai-agentic-iteration-workflow.md
+│   ├── demo
+│   │   └── fix
+│   │       ├── fix_demo.fix
+│   │       ├── fix_lifecycle_parser.py
+│   │       └── quickstart.md
+│   ├── DUCKDB_MIGRATION_PLAN.md
+│   ├── enum_consolidation_plan.md
+│   ├── execution_plan_language_neutral_plugins.md
+│   ├── execution_plan_mcp.md
+│   ├── execution_plan.md
+│   ├── fix_schema.md
+│   ├── intent_pipeline_workflow.md
+│   ├── local_control_plane_api_plan.md
+│   ├── p0_parallel_prompts.md
+│   ├── ppg_spec.md
+│   ├── product
+│   │   ├── domain_intelligence.md
+│   │   ├── enterprise_lite_pricing_proposal.md
+│   │   ├── pricing_v2_refined.md
+│   │   ├── README.md
+│   │   └── validated_personas.md
+│   ├── schema_rfc_appendix_b
+│   ├── schema_rfc.md
+│   ├── specs_canonical.md
+│   ├── strategic_direction_eval.md
+│   ├── strategic_fork_evaluation.md
+│   ├── third_party_wrapping_policy.md
+│   ├── v1_checklist.md
+│   ├── v1_scope.md
+│   └── validation
+│       ├── interview_script.md
+│       ├── outreach_emails.md
+│       ├── pilot_program_terms.md
+│       └── validation_tracker.md
+├── last_proposal.json
+├── MANUAL_TESTING_GUIDE.md
+├── output
+│   └── raw_lines.duckdb
+├── parsers
+│   ├── evtx_native
+│   │   ├── Cargo.toml
+│   │   ├── schemas
+│   │   │   ├── evtx_eventdata_kv.schema.json
+│   │   │   ├── evtx_events.schema.json
+│   │   │   ├── evtx_files.schema.json
+│   │   │   ├── evtx_record_annotations.schema.json
+│   │   │   └── evtx_userdata_kv.schema.json
+│   │   └── src
+│   │       └── main.rs
+│   └── fix
+│       ├── fix_parser.py
+│       ├── pyproject.toml
+│       └── uv.lock
+├── raw_lines_parser.py
+├── README.md
+├── REVIEW_META.txt
+├── roadmap
+│   └── spec_discovery_intelligence.md
+├── scripts
+│   ├── contexts
+│   │   ├── tui_checkpoint_output_view.md
+│   │   ├── tui_checkpoint_parser_author.md
+│   │   ├── tui_checkpoint_parser_run.md
+│   │   └── tui_checkpoint_scan_tag_rule.md
+│   ├── drop_all_danger.sql
+│   ├── perf_scan_baseline.py
+│   ├── perf_scan_parallel.py
+│   ├── perf_scan_suite.py
+│   ├── profiler-test.sh
+│   ├── tui-capture-stable.sh
+│   ├── tui-capture.sh
+│   ├── tui-coverage-map.py
+│   ├── tui-debug.sh
+│   ├── tui-generate-test-paths.py
+│   ├── tui-parallel-run.sh
+│   ├── tui-select-tests.sh
+│   ├── tui-send.sh
+│   ├── tui-test-workflow.sh
+│   ├── tui-test.sh
+│   └── tui-visibility-check.sh
+├── spec.md
+├── specs
+│   ├── db_actor.md
+│   ├── db.md
+│   ├── extraction.md
+│   ├── features
+│   │   ├── export.md
+│   │   ├── README.md
+│   │   ├── streaming_scanner.md
+│   │   └── variant_grouping.md
+│   ├── job_types.md
+│   ├── jobs_progress.md
+│   ├── meta
+│   │   ├── abstraction_audit_workflow.md
+│   │   ├── code_philosophy_review_workflow.md
+│   │   ├── data_model_maintenance_workflow.md
+│   │   ├── feature_workflow.md
+│   │   ├── maintenance_report_2026-01-14.md
+│   │   ├── memory_audit_workflow.md
+│   │   ├── README.md
+│   │   ├── spec_driven_feature_workflow.md
+│   │   ├── spec_maintenance_workflow.md
+│   │   ├── spec_refinement_workflow.md
+│   │   ├── tui_parallel_coverage_workflow.md
+│   │   ├── tui_testing_workflow.md
+│   │   ├── tui_validation_workflow.md
+│   │   └── workflow_manager.md
+│   ├── parser_schema_contract_rfc.md
+│   ├── parsers
+│   │   ├── hl7_parser.md
+│   │   └── README.md
+│   ├── pipelines.md
+│   ├── profiler.md
+│   ├── refinement_report.md
+│   ├── rule_builder.md
+│   ├── simplified_approach_followups.md
+│   ├── tauri_mvp.md
+│   ├── tauri_ui.md
+│   ├── tests.md
+│   ├── tui_style_guide.md
+│   ├── tui.md
+│   ├── views
+│   │   ├── approvals.md
+│   │   ├── home.md
+│   │   ├── jobs.md
+│   │   ├── parser_bench.md
+│   │   ├── query.md
+│   │   ├── sessions.md
+│   │   └── settings.md
+│   └── website.md
+├── strategies
+│   ├── competitive_matrix.md
+│   ├── defense_tactical.md
+│   ├── dfir.md
+│   ├── dod_sbir_opportunities.md
+│   ├── ediscovery.md
+│   ├── finance.md
+│   ├── healthcare_hl7.md
+│   ├── iiot.md
+│   ├── legal_ediscovery.md
+│   ├── manufacturing.md
+│   ├── midsize_business.md
+│   ├── non_dilutive_funding.md
+│   ├── pharma.md
+│   ├── satellite.md
+│   └── streaming_redpanda.md
+├── STRATEGY.md
+├── tauri-ui
+│   ├── index.html
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── playwright.config.js
+│   ├── README.md
+│   ├── src
+│   │   ├── api
+│   │   │   ├── commands.ts
+│   │   │   ├── index.ts
+│   │   │   └── types.ts
+│   │   ├── App.tsx
+│   │   ├── components
+│   │   │   ├── intent
+│   │   │   │   ├── BacktestStep.tsx
+│   │   │   │   ├── PathFieldsStep.tsx
+│   │   │   │   ├── PublishRunStep.tsx
+│   │   │   │   ├── SchemaIntentStep.tsx
+│   │   │   │   ├── SelectionStep.tsx
+│   │   │   │   └── TagRulesStep.tsx
+│   │   │   └── Sidebar.tsx
+│   │   ├── main.tsx
+│   │   ├── screens
+│   │   │   ├── Approvals.tsx
+│   │   │   ├── Discover.tsx
+│   │   │   ├── Home.tsx
+│   │   │   ├── Jobs.tsx
+│   │   │   ├── Parsers.tsx
+│   │   │   ├── Query.tsx
+│   │   │   ├── SessionDetail.tsx
+│   │   │   ├── Sessions.tsx
+│   │   │   └── Settings.tsx
+│   │   └── styles.css
+│   ├── src-tauri
+│   │   ├── build.rs
+│   │   ├── Cargo.toml
+│   │   ├── icons
+│   │   │   ├── 128x128.png
+│   │   │   ├── 128x128@2x.png
+│   │   │   ├── 32x32.png
+│   │   │   ├── icon.icns
+│   │   │   └── icon.ico
+│   │   ├── src
+│   │   │   ├── commands
+│   │   │   │   ├── approvals.rs
+│   │   │   │   ├── intent.rs
+│   │   │   │   ├── jobs.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   ├── query.rs
+│   │   │   │   ├── sessions.rs
+│   │   │   │   └── stats.rs
+│   │   │   ├── main.rs
+│   │   │   ├── session_storage.rs
+│   │   │   ├── session_types.rs
+│   │   │   ├── state.rs
+│   │   │   └── tests.rs
+│   │   └── tauri.conf.json
+│   ├── tests
+│   │   ├── approvals.spec.ts
+│   │   ├── home.spec.ts
+│   │   ├── intent-steps.spec.ts
+│   │   ├── navigation.spec.ts
+│   │   ├── query.spec.ts
+│   │   ├── session-detail.spec.ts
+│   │   └── sessions.spec.ts
+│   ├── tsconfig.json
+│   ├── tsconfig.node.json
+│   └── vite.config.ts
+├── templates
+│   └── PARALLEL_EXECUTION_TEMPLATE.md
+├── test_paths.json
+├── tests
+│   ├── e2e
+│   │   ├── cli_coverage_test.sh
+│   │   ├── cli_files_test.sh
+│   │   ├── cli_jobs_test.sh
+│   │   ├── cli_parser_test.sh
+│   │   ├── cli_pipeline_queue_test.sh
+│   │   ├── cli_pipeline_test.sh
+│   │   ├── cli_preview_test.sh
+│   │   ├── cli_rule_test.sh
+│   │   ├── cli_scan_test.sh
+│   │   ├── cli_source_test.sh
+│   │   ├── cli_tag_test.sh
+│   │   ├── cli_topic_test.sh
+│   │   ├── cli_worker_test.sh
+│   │   ├── mcp
+│   │   │   ├── claude_prompt_approval.md
+│   │   │   ├── claude_prompt_evtx_workflow.md
+│   │   │   ├── claude_prompt.md
+│   │   │   ├── mcp_audit.ndjson
+│   │   │   ├── result.schema.json
+│   │   │   ├── results
+│   │   │   │   ├── approval_20260121_200046_1d7d9983.json
+│   │   │   │   ├── approval_20260121_200046_1d7d9983.raw
+│   │   │   │   ├── backtest_20260121_195917_4804c367.json
+│   │   │   │   ├── backtest_20260121_195917_4804c367.raw
+│   │   │   │   ├── evtx_20260121_214412_d52265d5.json
+│   │   │   │   ├── evtx_20260121_214412_d52265d5.raw
+│   │   │   │   ├── evtx_20260121_214610_7b34ea76.json
+│   │   │   │   └── evtx_20260121_214610_7b34ea76.raw
+│   │   │   ├── run_with_claude.sh
+│   │   │   └── test_mcp_server.sh
+│   │   ├── parsers
+│   │   │   └── mcdata_pipeline_parser.py
+│   │   └── test_shredder_phase1.sh
+│   └── fixtures
+│       ├── evtx
+│       │   └── sample.evtx
+│       ├── fix
+│       │   ├── decimal_rounding.fix
+│       │   ├── mixed_messages.fix
+│       │   ├── order_lifecycle.fix
+│       │   ├── prefixed_logs.fix
+│       │   ├── README.md
+│       │   ├── session_events.fix
+│       │   └── soh_delimiter.fix
+│       └── native_plugin_basic
+│           ├── Cargo.toml
+│           ├── schemas
+│           │   └── events.schema.json
+│           └── src
+│               └── main.rs
+├── uv.lock
+└── website
+    ├── _redirects
+    ├── assets
+    │   └── favicon.svg
+    ├── CLAUDE.md
+    ├── defense.html
+    ├── DEPLOYMENT.md
+    ├── finance.html
+    ├── healthcare.html
+    ├── index.html
+    ├── legal.html
+    ├── MARKETING_PLAN.md
+    ├── netlify.toml
+    └── README.md

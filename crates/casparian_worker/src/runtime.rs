@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::bridge::{self, BridgeConfig, OutputInfo};
+use crate::cancel::CancellationToken;
 use crate::venv_manager::VenvManager;
 
 pub struct RunContext {
@@ -24,7 +25,12 @@ pub struct RunOutputs {
 }
 
 pub trait PluginRuntime {
-    fn run_file(&self, ctx: &RunContext, input_path: &Path) -> Result<RunOutputs>;
+    fn run_file(
+        &self,
+        ctx: &RunContext,
+        input_path: &Path,
+        cancel_token: &CancellationToken,
+    ) -> Result<RunOutputs>;
 }
 
 pub struct PythonShimRuntime {
@@ -42,7 +48,12 @@ impl PythonShimRuntime {
 }
 
 impl PluginRuntime for PythonShimRuntime {
-    fn run_file(&self, ctx: &RunContext, input_path: &Path) -> Result<RunOutputs> {
+    fn run_file(
+        &self,
+        ctx: &RunContext,
+        input_path: &Path,
+        cancel_token: &CancellationToken,
+    ) -> Result<RunOutputs> {
         let env_hash = ctx
             .env_hash
             .as_deref()
@@ -78,6 +89,7 @@ impl PluginRuntime for PythonShimRuntime {
             file_id: ctx.file_id,
             shim_path: self.shim_path.clone(),
             inherit_stdio: false,
+            cancel_token: cancel_token.clone(),
         };
 
         let result = bridge::execute_bridge(config).context("Bridge execution failed")?;

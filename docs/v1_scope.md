@@ -5,12 +5,13 @@ Date: January 2026
 Owner: Product
 
 ## Goal
-Deliver a **deterministic, governed data build system** for DFIR artifact parsing.
-Turn Windows artifacts (EVTX as flagship) into queryable datasets with strict
-schema contracts, quarantine semantics, and per-row lineage for chain of custody.
+Deliver a **local-first ingestion and governance runtime** for DFIR artifact parsing.
+Turn Windows artifacts (EVTX as flagship) into typed, queryable tables with strict
+schema contracts, quarantine semantics, incremental ingestion, and per-row lineage for chain of custody.
 
-**Core value proposition:** "Turn DFIR parsing into an auditable, repeatable,
-backfillable dataset build process." NOT "another EVTX parser."
+**Core value proposition:** "If you can point Casparian at a directory of files and a parser, you can reliably produce tables you can trust—and you can prove how you got them."
+
+**What we are NOT:** Another EVTX parser. We are the governance + lineage layer that makes any parser's output trustworthy and reproducible.
 
 ## Target ICP
 Primary: DFIR / Incident Response artifact parsing teams
@@ -32,13 +33,21 @@ Primary: DFIR / Incident Response artifact parsing teams
 | **Per-row lineage** | Every row: `_cf_source_hash`, `_cf_job_id`, `_cf_processed_at`, `_cf_parser_version` |
 | **Authoritative validation** | Schema contracts enforced in Rust; invalid rows never silently coerce |
 | **Quarantine semantics** | Invalid rows go to quarantine with error context; partial success is safe |
+| **Atomic outputs** | Staged writes; promote only on success; cancel means stop |
+| **Incremental ingestion** | Materialization keys ensure no redundant processing |
 | **Evidence-grade manifests** | Export includes: inputs + hashes + parser IDs + outputs + timestamps |
+
+### Architectural Invariants
+See `ARCHITECTURE.md` for the complete list. Key ones for DFIR:
+- No output collisions (unique artifact names)
+- Cancel means stop (no partial outputs committed)
+- Lineage deterministic (`_cf_*` columns always present and accurate)
 
 ## Core User Journey (v1)
 
 ### Primary Workflow: Case Folder Ingestion
 1. Point Casparian at a directory of EVTX files (or extracted artifacts).
-2. Select the EVTX parser (auto-detect is a stretch goal).
+2. Select the EVTX parser.
 3. Parse into `evtx_events` and `evtx_events_quarantine`.
 4. Query by time range, host, event_id, or user to build a timeline.
 5. Review quarantine summary and lineage metadata.
@@ -50,34 +59,6 @@ Primary: DFIR / Incident Response artifact parsing teams
 | **Offline collector zip ingestion** | Extract and tag folder tree from collector output |
 | **Quarantine triage loop** | Review violations by type; sample rows; trace to source |
 | **Backfill planning** | When parser version changes, see exactly what needs reprocessing |
-
-### What v1 is NOT
-- NOT streaming (batch files at rest only)
-- NOT an orchestrator/scheduler
-- NOT a BI tool
-- NOT "no-code"
-- NOT AI-dependent (AI assistance is optional; MCP enables it but doesn't require it)
-
-## In Scope
-- EVTX parser with `evtx_events` table.
-- Rust-side schema validation with quarantine split.
-- Quarantine policy controls (allow/threshold/lineage).
-- Decimal + timezone-aware timestamps in schema types.
-- Lineage columns injected into outputs.
-- Output sinks: Parquet and DuckDB with per-output routing.
-- CLI quickstart + demo dataset for EVTX timeline walkthrough.
-- Productized onboarding sprint kit (scope, acceptance criteria, handoff checklist).
-- Minimal TUI support: Parser Bench + Jobs view.
-- **MCP Server for AI-assisted workflows** (see MCP section below).
-
-## Out of Scope
-- Additional DFIR parsers (Shimcache, Amcache, Prefetch, $MFT) beyond v1 demo.
-- Additional vertical parsers (HL7, PST, CoT, etc.).
-- Postgres/MSSQL sinks.
-- Streaming/Kafka/Redpanda integration.
-- Multi-node scheduling or server deployment.
-- Advanced approval UI.
-- Autonomous AI parser authoring (AI proposes, human approves via MCP).
 
 ## MCP Server (AI Integration)
 

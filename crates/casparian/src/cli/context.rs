@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use casparian::scout::WorkspaceId;
+
 fn context_file_path() -> anyhow::Result<PathBuf> {
     if let Ok(home) = std::env::var("CASPARIAN_HOME") {
         return Ok(PathBuf::from(home).join("context.toml"));
@@ -22,12 +24,20 @@ fn context_file_path() -> anyhow::Result<PathBuf> {
 pub struct Context {
     #[serde(default)]
     pub source: Option<SourceContext>,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceContext>,
 }
 
 /// Source context
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceContext {
     pub name: String,
+}
+
+/// Workspace context
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceContext {
+    pub id: String,
 }
 
 /// Get the default source from context file
@@ -47,6 +57,87 @@ pub fn get_default_source() -> anyhow::Result<Option<String>> {
         )
     })?;
     Ok(context.source.map(|s| s.name))
+}
+
+/// Get the active workspace ID from context file
+pub fn get_active_workspace_id() -> anyhow::Result<Option<WorkspaceId>> {
+    let path = context_file_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+    let context: Context = toml::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse context file {}: {}. Delete this file to reset.",
+            path.display(),
+            e
+        )
+    })?;
+    let Some(workspace) = context.workspace else {
+        return Ok(None);
+    };
+
+    let id = WorkspaceId::parse(&workspace.id)?;
+    Ok(Some(id))
+}
+
+/// Set the active workspace ID in context file
+pub fn set_active_workspace(id: &WorkspaceId) -> anyhow::Result<()> {
+    let path = context_file_path()?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut context = if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+        toml::from_str(&content).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse context file {}: {}. Delete this file to reset.",
+                path.display(),
+                e
+            )
+        })?
+    } else {
+        Context::default()
+    };
+
+    context.workspace = Some(WorkspaceContext {
+        id: id.to_string(),
+    });
+
+    let content = toml::to_string_pretty(&context)?;
+    std::fs::write(&path, content)?;
+
+    Ok(())
+}
+
+/// Clear the active workspace from context file
+pub fn clear_active_workspace() -> anyhow::Result<()> {
+    let path = context_file_path()?;
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file {}: {}", path.display(), e))?;
+    let mut context: Context = toml::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse context file {}: {}. Delete this file to reset.",
+            path.display(),
+            e
+        )
+    })?;
+
+    context.workspace = None;
+
+    let content = toml::to_string_pretty(&context)?;
+    std::fs::write(&path, content)?;
+
+    Ok(())
 }
 
 /// Set the default source in context file
@@ -124,6 +215,9 @@ mod tests {
             source: Some(SourceContext {
                 name: "invoices".to_string(),
             }),
+            workspace: Some(WorkspaceContext {
+                id: WorkspaceId::new().to_string(),
+            }),
         };
 
         let toml_str = toml::to_string_pretty(&context).unwrap();
@@ -137,6 +231,7 @@ mod tests {
     fn test_empty_context() {
         let context = Context::default();
         assert!(context.source.is_none());
+        assert!(context.workspace.is_none());
 
         let toml_str = toml::to_string_pretty(&context).unwrap();
         let parsed: Context = toml::from_str(&toml_str).unwrap();

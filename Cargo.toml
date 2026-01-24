@@ -5,6 +5,7 @@ members = [
     "crates/casparian_worker",
     "crates/casparian_sentinel",
     "crates/casparian_sinks",
+    "crates/casparian_tape",
     "crates/casparian",
     "crates/casparian_security",
     # "crates/casparian_scout",  # Inlined into casparian::scout module
@@ -14,6 +15,7 @@ members = [
     "crates/casparian_profiler",
     "crates/casparian_db",
     "crates/casparian_mcp",
+    "tauri-ui/src-tauri",
 ]
 default-members = [
     "crates/casparian",

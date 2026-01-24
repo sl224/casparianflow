@@ -1,0 +1,8 @@
+{
+  "test_run_id": "20260121_214412_d52265d5",
+  "timestamp": "2026-01-22T05:44:12Z",
+  "test_type": "evtx",
+  "passed": false,
+  "error": "Could not extract structured result from Claude output",
+  "raw_output_file": "/Users/shan/workspace/casparianflow/tests/e2e/mcp/results/evtx_20260121_214412_d52265d5.raw"
+}

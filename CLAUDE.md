@@ -2,10 +2,14 @@
 
 ## Quick Orientation
 
-**What is Casparian Flow?** A data processing platform that transforms "dark data" (files on disk) into queryable datasets. Users discover files, approve schemas, and execute pipelines.
+**What is Casparian Flow?** A **local-first ingestion and governance runtime** that turns messy file corpuses into **typed, queryable tables** with incremental ingestion, per-row lineage, quarantine semantics, and schema contracts.
+
+**Core Promise:** If you can point Casparian at a directory of files and a parser, you can reliably produce tables you can trust—and you can prove how you got them.
+
+**Primary Users:** DFIR / Incident Response teams (air-gapped, evidence servers, chain-of-custody requirements).
 
 **Start Here:**
-1. This file → high-level architecture
+1. This file → architecture + invariants
 2. `code_execution_workflow.md` → **coding standards and testing**
 3. `ARCHITECTURE.md` → detailed system design
 4. Crate-specific `CLAUDE.md` files → component details
@@ -65,10 +69,46 @@ Follow "make illegal states unrepresentable" (Jon Blow, Casey Muratori, John Car
 
 ---
 
-## System Architecture
+## Target Architecture
+
+The system is decomposed into four planes with clear responsibilities:
 
 ```
-CLI/TUI → Schema Contracts → Sentinel/Job Queue → Worker (Bridge) → Sinks
+┌─────────────────────────────────────────────────────────────────┐
+│                    FRONTENDS (Clients)                          │
+│              CLI / TUI / Tauri UI / MCP Server                  │
+│         • Mutations via Control API (IPC/RPC)                   │
+│         • Read-only DB for queries                              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    CONTROL PLANE (Sentinel)                     │
+│         • Single mutation authority for control-plane state     │
+│         • Job queue + state machine                             │
+│         • Approvals, sessions, output catalog                   │
+│         • Schema contract registry                              │
+│         • Exposes local Control API for all mutations           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    EXECUTION PLANE (Worker)                     │
+│         • Stateless executor                                    │
+│         • Runs parser plugins (Python/native)                   │
+│         • Validates schema, quarantines invalid rows            │
+│         • Writes outputs via sinks                              │
+│         • Emits receipts with stable identities                 │
+│         • True cancellation (kill subprocess, prevent commit)   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    PERSISTENCE                                  │
+│         • Control-plane DB (DuckDB): jobs, catalog, contracts   │
+│         • Output stores: DuckDB sink, Parquet, CSV              │
+│         • Materializations for incremental ingestion            │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Crate Architecture
@@ -76,13 +116,13 @@ CLI/TUI → Schema Contracts → Sentinel/Job Queue → Worker (Bridge) → Sink
 | Crate | Purpose |
 |-------|---------|
 | `casparian` | Unified CLI binary |
-| `casparian_schema` | Schema contracts, approval workflow |
-| `casparian_backtest` | Multi-file validation, fail-fast |
-| `casparian_worker` | Parser execution, type inference |
+| `casparian_sentinel` | Control plane: job queue, dispatch, materializations |
+| `casparian_worker` | Execution plane: parser execution, schema validation |
+| `casparian_sinks` | Output persistence + lineage injection |
+| `casparian_protocol` | Binary protocol, serialization, idempotency keys |
 | `casparian_scout` | File discovery, tagging |
-| `casparian_db` | Database abstraction, license gating |
-| `casparian_security` | Auth, Ed25519 signing |
-| `casparian_protocol` | Binary protocol, serialization |
+| `casparian_db` | Database abstraction |
+| `casparian_tape` | Event recording for replay/debugging |
 
 ---
 
@@ -120,6 +160,43 @@ class MyParser:
 ```
 
 **Key features:** Parser versioning, deduplication by (input_hash, parser_name, version), lineage columns (`_cf_source_hash`, `_cf_job_id`, `_cf_processed_at`, `_cf_parser_version`), atomic writes.
+
+---
+
+## Core Invariants ("Bad States Impossible")
+
+These invariants MUST hold. Violations are bugs to fix immediately.
+
+| Invariant | Description | Evidence |
+|-----------|-------------|----------|
+| **No output collisions** | File sink artifact names are globally unique | `casparian_sinks/src/lib.rs::output_filename` |
+| **Atomic commits** | Staged output is promoted only on success | Staging directory + rename |
+| **Cancel means stop** | Aborted job cannot commit outputs | `CancellationToken` in worker |
+| **SinkMode enforced** | Replace/Error/Append semantics are consistent | `casparian_protocol/src/types.rs::SinkMode` |
+| **Lineage deterministic** | Reserved `_cf_*` namespace cannot break lineage | `validate_lineage_columns()` |
+| **Incremental decisions deterministic** | Default sink configs do not cause "silent skip" | ExpectedOutputs expansion |
+| **UI truthful** | Cancel button and job statuses reflect reality | Control API integration |
+
+---
+
+## Domain Entities
+
+| Entity | Identity | Description |
+|--------|----------|-------------|
+| **InputFile** | `source_hash` (blake3) + optional path hash | A file to be processed |
+| **ParserArtifact** | `artifact_hash` + `env_hash` + parser version | A deployed parser with its environment |
+| **Job** | job_id | State machine: Queued → Dispatched → Running → {Completed \| Failed \| Aborted} |
+| **OutputTarget** | `output_target_key` (sink URI hash, table name, schema hash, sink_mode) | Where outputs go |
+| **Materialization** | `materialization_key` (output_target + source_hash + parser artifact) | Record that an input was processed to an output |
+| **Contract** | contract_id | Schema constraints for outputs; approval gating |
+
+### Key Identity Functions
+
+```rust
+// crates/casparian_protocol/src/idempotency.rs
+output_target_key(sink_uri, table_name, schema_hash, sink_mode) -> String
+materialization_key(output_target_key, source_hash, artifact_hash) -> String
+```
 
 ---
 
@@ -241,15 +318,51 @@ Meta-workflows for specs, code quality, data models. See `specs/meta/workflow_ma
 | Term | Definition |
 |------|------------|
 | **Scout** | File discovery + tagging |
-| **Sentinel** | Job orchestration |
+| **Sentinel** | Control plane: job orchestration, single mutation authority |
+| **Worker** | Execution plane: stateless parser executor |
+| **Control API** | IPC/RPC interface for mutations (CLI/UI → Sentinel) |
 | **Schema Contract** | Approved schema parser must conform to |
 | **High-Failure File** | Historically failed during backtest |
 | **Bridge Mode** | Host/guest isolation model |
 | **Lineage Columns** | `_cf_source_hash`, `_cf_job_id`, `_cf_processed_at`, `_cf_parser_version` |
 | **Deduplication** | Skip if (input_hash, parser_name, version) seen |
 | **Backfill** | Re-process files when parser version changes |
+| **Materialization** | Record that (input, parser, output_target) was processed |
+| **OutputTarget** | A specific sink + table + schema combination |
 | **EphemeralSchemaContract** | Temporary contract for AI iteration |
 | **ViolationContext** | Machine-readable error context for AI learning |
+
+---
+
+## Evidence Index (Key Code Locations)
+
+### Protocol / Identity
+- `crates/casparian_protocol/src/lib.rs::OpCode` - Semantic protocol boundary
+- `crates/casparian_protocol/src/types.rs::DispatchCommand` - Job dispatch
+- `crates/casparian_protocol/src/types.rs::JobReceipt` - Job completion
+- `crates/casparian_protocol/src/idempotency.rs::output_target_key` - Output identity
+- `crates/casparian_protocol/src/idempotency.rs::materialization_key` - Incremental ingestion key
+
+### Control Plane
+- `crates/casparian_sentinel/src/sentinel.rs::dispatch_loop` - Main job dispatch
+- `crates/casparian_sentinel/src/sentinel.rs::record_materializations_for_job` - Incremental tracking
+- `crates/casparian_sentinel/src/control.rs` - Control API request/response types
+- `crates/casparian_sentinel/src/db/queue.rs::Job` - Canonical job model
+
+### Execution Plane
+- `crates/casparian_worker/src/worker.rs::execute_job_inner` - Job execution
+- `crates/casparian_worker/src/worker.rs::compute_source_hash` - Input identity
+- `crates/casparian_worker/src/worker.rs::validate_lineage_columns` - Lineage validation
+- `crates/casparian_worker/src/schema_validation.rs::validate_record_batch` - Schema enforcement
+
+### Sinks
+- `crates/casparian_sinks/src/lib.rs::output_filename` - Output naming
+- `crates/casparian_sinks/src/lib.rs::inject_lineage_columns` - Lineage injection
+- `crates/casparian_sinks/src/lib.rs::DuckDbSink::write_batch` - DuckDB persistence
+
+### UI
+- `tauri-ui/src-tauri/src/commands/jobs.rs` - Job commands
+- `tauri-ui/src-tauri/src/state.rs::try_control_client` - Control API client
 
 ---
 

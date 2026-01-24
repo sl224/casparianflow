@@ -1,0 +1,43 @@
+---
+source: crates/casparian/src/cli/tui/snapshot_tests.rs
+expression: plain
+---
+ Casparian Flow | View: Sources | WS: alpha-case | DB: duckdb | Run: 1 | Fail: 1 | Quarantine: 16
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+╭ NAV ─────────────╮┌ Configured Sources ──────────────────────────────────────────┐┌ Inspector ───────────────────────┐
+│Views             ││  alpha-lake                                                  ││Name: bravo-share                 │
+│[0] Home          ││   /data/alpha (1280 files)                                   ││Path: /mnt/bravo/share            │
+│[1] Discover      ││► bravo-share                                                 ││Files: 342                        │
+│[2] Parser Bench  ││   /mnt/bravo/share (342 files)                               ││                                  │
+│[3] Jobs          ││  charlie-archive-long-name                                   ││                                  │
+│[4] Sources       ││   /Volumes/archive/2024/charlie (9050 files)                 ││                                  │
+│[5] Approvals     ││                                                              ││                                  │
+│[6] Query         ││                                                              ││                                  │
+│[7] Sessions      ││                                                              ││                                  │
+│[,] Settings      ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│Context           ││                                                              ││                                  │
+│Workspace: alp... ││                                                              ││                                  │
+│Source: bravo-... ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+│                  ││                                                              ││                                  │
+╰──────────────────╯└──────────────────────────────────────────────────────────────┘└──────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                   [↑/↓] Navigate  [n] New  [e] Edit  [r] Rescan  [d] Delete  [I] Inspector  [?] Help
