@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 casparian_protocol = { path = "../casparian_protocol" }
-casparian_db = { path = "../casparian_db" }
+casparian_db = { path = "../casparian_db", default-features = false, optional = true }
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -17,7 +17,7 @@ tracing.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 csv = "1"
-duckdb = { version = "1.4", features = ["appender-arrow"] }
+duckdb = { version = "1.4", features = ["appender-arrow"], optional = true }
 chrono.workspace = true
 rust_decimal = "1.40"
 blake3 = "1.5"
@@ -27,5 +27,9 @@ tempfile = "3"
 proptest = "1.4"
 
 [features]
+# DuckDB enabled by default.
+default = ["sink-duckdb"]
+sink-duckdb = ["dep:duckdb", "dep:casparian_db", "casparian_db/duckdb"]
+sink-duckdb-bundled = ["sink-duckdb", "casparian_db/duckdb-bundled", "duckdb/bundled"]
 # Expose internal Arrow accessors for workspace crates.
 internal = []

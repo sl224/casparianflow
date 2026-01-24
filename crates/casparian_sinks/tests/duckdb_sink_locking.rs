@@ -1,3 +1,5 @@
+#![cfg(feature = "sink-duckdb")]
+
 use casparian_protocol::types::SinkMode;
 use casparian_sinks::DuckDbSink;
 use std::env;

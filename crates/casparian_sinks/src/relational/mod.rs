@@ -1,17 +1,24 @@
+#[cfg(feature = "sink-duckdb")]
 use anyhow::Result;
+#[cfg(feature = "sink-duckdb")]
 use arrow::datatypes::Schema;
+#[cfg(feature = "sink-duckdb")]
 use arrow::record_batch::RecordBatch;
 
+#[cfg(feature = "sink-duckdb")]
 pub mod duckdb;
 
+#[cfg(feature = "sink-duckdb")]
 pub enum RelationalBackend {
     DuckDb(duckdb::DuckDbSink),
 }
 
+#[cfg(feature = "sink-duckdb")]
 pub struct RelationalSink {
     backend: RelationalBackend,
 }
 
+#[cfg(feature = "sink-duckdb")]
 impl RelationalSink {
     pub fn new(backend: RelationalBackend) -> Self {
         Self { backend }

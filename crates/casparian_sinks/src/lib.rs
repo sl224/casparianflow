@@ -18,7 +18,9 @@ use tracing::{debug, info, warn};
 
 use casparian_protocol::SinkMode;
 mod relational;
+#[cfg(feature = "sink-duckdb")]
 pub use relational::duckdb::DuckDbSink;
+#[cfg(feature = "sink-duckdb")]
 use relational::{RelationalBackend, RelationalSink};
 
 fn job_prefix(job_id: &str) -> String {
@@ -203,7 +205,8 @@ pub fn artifact_uri_for_output(
 ) -> SinkResult<String> {
     use casparian_protocol::types::SinkScheme;
 
-    let table_name = output_table.unwrap_or(output_name);
+    #[cfg(not(feature = "sink-duckdb"))]
+    let _ = output_table;
 
     let uri = match parsed_sink.scheme {
         SinkScheme::Parquet => {
@@ -217,11 +220,21 @@ pub fn artifact_uri_for_output(
             format!("file://{}", path.display())
         }
         SinkScheme::Duckdb => {
-            format!(
-                "duckdb://{}?table={}",
-                parsed_sink.path.display(),
-                table_name
-            )
+            #[cfg(feature = "sink-duckdb")]
+            {
+                let table_name = output_table.unwrap_or(output_name);
+                format!(
+                    "duckdb://{}?table={}",
+                    parsed_sink.path.display(),
+                    table_name
+                )
+            }
+            #[cfg(not(feature = "sink-duckdb"))]
+            {
+                return Err(SinkError::message(
+                    "DuckDB sink support is disabled (enable feature sink-duckdb)",
+                ));
+            }
         }
         SinkScheme::File => {
             let ext = parsed_sink
@@ -605,6 +618,7 @@ impl Drop for CsvSink {
 enum Sink {
     Parquet(ParquetSink),
     Csv(Box<CsvSink>),
+    #[cfg(feature = "sink-duckdb")]
     Relational(RelationalSink),
 }
 
@@ -613,6 +627,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.init(schema),
             Sink::Csv(sink) => sink.init(schema),
+            #[cfg(feature = "sink-duckdb")]
             Sink::Relational(sink) => sink.init(schema),
         }
     }
@@ -621,6 +636,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.write_batch(batch),
             Sink::Csv(sink) => sink.write_batch(batch),
+            #[cfg(feature = "sink-duckdb")]
             Sink::Relational(sink) => sink.write_batch(batch),
         }
     }
@@ -629,6 +645,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.prepare(),
             Sink::Csv(sink) => sink.prepare(),
+            #[cfg(feature = "sink-duckdb")]
             Sink::Relational(sink) => sink.prepare(),
         }
     }
@@ -637,6 +654,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.commit(),
             Sink::Csv(sink) => sink.commit(),
+            #[cfg(feature = "sink-duckdb")]
             Sink::Relational(sink) => sink.commit(),
         }
     }
@@ -645,6 +663,7 @@ impl Sink {
         match self {
             Sink::Parquet(sink) => sink.rollback(),
             Sink::Csv(sink) => sink.rollback(),
+            #[cfg(feature = "sink-duckdb")]
             Sink::Relational(sink) => sink.rollback(),
         }
     }
@@ -906,7 +925,9 @@ pub(crate) fn create_sink_from_uri(
 ) -> Result<Sink> {
     let parsed =
         casparian_protocol::types::ParsedSinkUri::parse(uri).map_err(|e| anyhow::anyhow!(e))?;
-    let table_name = output_table.unwrap_or(output_name);
+
+    #[cfg(not(feature = "sink-duckdb"))]
+    let _ = output_table;
 
     match parsed.scheme {
         casparian_protocol::types::SinkScheme::Parquet => {
@@ -935,15 +956,25 @@ pub(crate) fn create_sink_from_uri(
                 job_id,
             )?)))
         }
-        casparian_protocol::types::SinkScheme::Duckdb => Ok(Sink::Relational(RelationalSink::new(
-            RelationalBackend::DuckDb(DuckDbSink::new(
-                parsed.path,
-                table_name,
-                sink_mode,
-                job_id,
-                output_name,
-            )?),
-        ))),
+        casparian_protocol::types::SinkScheme::Duckdb => {
+            #[cfg(feature = "sink-duckdb")]
+            {
+                let table_name = output_table.unwrap_or(output_name);
+                Ok(Sink::Relational(RelationalSink::new(
+                    RelationalBackend::DuckDb(DuckDbSink::new(
+                        parsed.path,
+                        table_name,
+                        sink_mode,
+                        job_id,
+                        output_name,
+                    )?),
+                )))
+            }
+            #[cfg(not(feature = "sink-duckdb"))]
+            {
+                bail!("DuckDB sink support is disabled (enable feature sink-duckdb)")
+            }
+        }
         casparian_protocol::types::SinkScheme::File => {
             // File sink: infer by extension
             let ext = parsed
@@ -986,15 +1017,25 @@ pub(crate) fn create_sink_from_uri(
                         job_id,
                     )?)))
                 }
-                "duckdb" | "db" => Ok(Sink::Relational(RelationalSink::new(
-                    RelationalBackend::DuckDb(DuckDbSink::new(
-                        parsed.path,
-                        table_name,
-                        sink_mode,
-                        job_id,
-                        output_name,
-                    )?),
-                ))),
+                "duckdb" | "db" => {
+                    #[cfg(feature = "sink-duckdb")]
+                    {
+                        let table_name = output_table.unwrap_or(output_name);
+                        Ok(Sink::Relational(RelationalSink::new(
+                            RelationalBackend::DuckDb(DuckDbSink::new(
+                                parsed.path,
+                                table_name,
+                                sink_mode,
+                                job_id,
+                                output_name,
+                            )?),
+                        )))
+                    }
+                    #[cfg(not(feature = "sink-duckdb"))]
+                    {
+                        bail!("DuckDB sink support is disabled (enable feature sink-duckdb)")
+                    }
+                }
                 _ => bail!("Unsupported file sink extension: '{}'", ext),
             }
         }
@@ -1168,6 +1209,7 @@ mod tests {
         assert!(!temp_path.exists());
     }
 
+    #[cfg(feature = "sink-duckdb")]
     #[test]
     fn test_duckdb_sink() {
         let dir = tempdir().unwrap();
@@ -1196,6 +1238,7 @@ mod tests {
         assert_eq!(count, 3);
     }
 
+    #[cfg(feature = "sink-duckdb")]
     #[test]
     fn test_duckdb_sink_lock_conflict() {
         let dir = tempdir().unwrap();
@@ -1221,6 +1264,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sink-duckdb")]
     #[test]
     fn test_duckdb_sink_rejects_control_plane_db() {
         let dir = tempdir().unwrap();
@@ -1237,6 +1281,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sink-duckdb")]
     #[test]
     fn test_duckdb_sink_decimal_timestamp_tz() {
         let dir = tempdir().unwrap();

@@ -11,9 +11,9 @@ license.workspace = true
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
 casparian_protocol = { path = "../casparian_protocol" }
-casparian_sinks = { path = "../casparian_sinks" }
+casparian_sinks = { path = "../casparian_sinks", default-features = false }
 casparian_security = { path = "../casparian_security" }
-casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
+casparian_db = { path = "../casparian_db", default-features = false }
 casparian_schema = { path = "../casparian_schema" }
 casparian_ids = { path = "../casparian_ids" }
 casparian_mcp = { path = "../casparian_mcp" }
@@ -48,9 +48,6 @@ tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 uuid = { version = "1.11", features = ["v4"] }
 blake3 = "1"
 tempfile = "3.14"
-
-# Database
-duckdb = { version = "1.4", optional = true }
 
 # CLI utilities
 comfy-table = "7"
@@ -100,9 +97,9 @@ local-llm = ["llama-cpp-2", "hf-hub"]  # Local LLM via llama.cpp
 profiling = ["dep:casparian_profiler"]  # TUI profiler overlay (` or F12 toggle)
 data-plane = ["dep:arrow", "dep:parquet", "dep:csv"]
 # DuckDB: uses system libduckdb (fast dev builds, requires: brew install duckdb)
-duckdb = ["casparian_db/duckdb", "dep:duckdb"]
+duckdb = ["casparian_db/duckdb", "casparian_sinks/sink-duckdb"]
 # DuckDB bundled: compile from source (slow, but self-contained for releases)
-duckdb-bundled = ["casparian_db/duckdb-bundled", "dep:duckdb", "duckdb/bundled"]
+duckdb-bundled = ["casparian_db/duckdb-bundled", "casparian_sinks/sink-duckdb-bundled"]
 sqlite = []
 
 [dev-dependencies]
