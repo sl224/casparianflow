@@ -16,6 +16,7 @@ mod event;
 
 pub use command::{Command, Responder};
 pub use event::Event;
+pub use casparian_worker::cancel::CancellationToken;
 
 use crate::approvals::ApprovalManager;
 use crate::jobs::{Job, JobId, JobManager, JobProgress, JobSpec};
@@ -25,38 +26,6 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use tracing::{debug, error, info, warn};
-
-/// Cancellation token for cooperative job cancellation
-#[derive(Debug, Clone)]
-pub struct CancellationToken {
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl CancellationToken {
-    /// Create a new cancellation token
-    pub fn new() -> Self {
-        Self {
-            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    /// Check if cancellation was requested
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Request cancellation
-    pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Handle for interacting with the Core from other threads.
 ///

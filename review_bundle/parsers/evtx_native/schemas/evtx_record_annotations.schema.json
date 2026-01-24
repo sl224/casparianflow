@@ -1,0 +1,9 @@
+{
+  "columns": [
+    { "name": "event_record_id", "data_type": "int64", "nullable": false },
+    { "name": "note_type", "data_type": "string", "nullable": false },
+    { "name": "note_key", "data_type": "string", "nullable": false },
+    { "name": "note_value", "data_type": "string", "nullable": true },
+    { "name": "severity", "data_type": "int64", "nullable": false }
+  ]
+}

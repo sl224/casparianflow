@@ -18,10 +18,14 @@
 //! ```
 
 use anyhow::{Context, Result};
+use casparian::telemetry::TelemetryRecorder;
+use casparian_protocol::telemetry as protocol_telemetry;
 use clap::Args;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
+use uuid::Uuid;
 
 use crate::cli::error::HelpfulError;
 use casparian::runner::{DevRunner, LogDestination, ParserRef};
@@ -83,7 +87,7 @@ struct RunResult {
 }
 
 /// Execute the run command
-pub fn cmd_run(args: RunArgs) -> Result<()> {
+pub fn cmd_run(args: RunArgs, telemetry: Option<TelemetryRecorder>) -> Result<()> {
     // Validate paths
     if !args.parser.exists() {
         return Err(
@@ -138,103 +142,164 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
         println!("Sink: {}", args.sink);
     }
 
-    let parser_source = std::fs::read_to_string(&args.parser)
-        .with_context(|| format!("Failed to read parser: {}", args.parser.display()))?;
-    if let Some(venv_path) = ensure_dev_venv(&parser_source)? {
-        std::env::set_var("VIRTUAL_ENV", &venv_path);
-    }
+    let telemetry_start = Instant::now();
+    let telemetry_run_id = telemetry.as_ref().map(|recorder| {
+        let run_id = Uuid::new_v4().to_string();
+        let payload = protocol_telemetry::RunStarted {
+            run_id: run_id.clone(),
+            kind: Some("dev_run".to_string()),
+            parser_hash: Some(recorder.hasher().hash_path(&args.parser)),
+            input_hash: Some(recorder.hasher().hash_path(&args.input)),
+            sink_hash: Some(recorder.hasher().hash_str(&args.sink)),
+            started_at: chrono::Utc::now(),
+        };
+        recorder.emit_domain(
+            protocol_telemetry::events::RUN_START,
+            Some(&run_id),
+            None,
+            &payload,
+        );
+        run_id
+    });
 
-    // Create dev runner
-    let runner = DevRunner::new().context("Failed to initialize runner")?;
+    let run_result = (|| -> Result<RunResult> {
+        let parser_source = std::fs::read_to_string(&args.parser)
+            .with_context(|| format!("Failed to read parser: {}", args.parser.display()))?;
+        if let Some(venv_path) = ensure_dev_venv(&parser_source)? {
+            std::env::set_var("VIRTUAL_ENV", &venv_path);
+        }
 
-    // Execute
-    let result = runner.execute(
-        ParserRef::Path(args.parser.clone()),
-        &args.input,
-        LogDestination::Terminal,
-    )?;
+        // Create dev runner
+        let runner = DevRunner::new().context("Failed to initialize runner")?;
 
-    let batches = result
-        .output_batches
-        .iter()
-        .map(|group| group.len())
-        .sum::<usize>();
-    let total_rows = result
-        .output_batches
-        .iter()
-        .flat_map(|group| group.iter())
-        .map(|batch| batch.num_rows())
-        .sum::<usize>();
+        // Execute
+        let result = runner.execute(
+            ParserRef::Path(args.parser.clone()),
+            &args.input,
+            LogDestination::Terminal,
+        )?;
 
-    let outputs: Vec<RunOutputInfo> = result
-        .output_info
-        .iter()
-        .map(|info| RunOutputInfo {
-            name: info.name.clone(),
-            table: info.table.clone(),
-        })
-        .collect();
+        let batches = result
+            .output_batches
+            .iter()
+            .map(|group| group.len())
+            .sum::<usize>();
+        let total_rows = result
+            .output_batches
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|batch| batch.num_rows())
+            .sum::<usize>();
 
-    let mut artifacts: Vec<RunArtifact> = Vec::new();
-
-    if !result.output_batches.is_empty() {
-        let descriptors: Vec<OutputDescriptor> = result
+        let outputs: Vec<RunOutputInfo> = result
             .output_info
             .iter()
-            .map(|info| OutputDescriptor {
+            .map(|info| RunOutputInfo {
                 name: info.name.clone(),
                 table: info.table.clone(),
             })
             .collect();
 
-        let outputs = plan_outputs(&descriptors, &result.output_batches, "output")?;
-        let output_artifacts = write_output_plan(&args.sink, &outputs, "dev")?;
-        for artifact in output_artifacts {
-            let name = artifact.name;
-            let uri = artifact.uri;
-            let rows = artifact.rows;
-            if !args.json {
-                println!("  Wrote {}", uri);
+        let mut artifacts: Vec<RunArtifact> = Vec::new();
+
+        if !result.output_batches.is_empty() {
+            let descriptors: Vec<OutputDescriptor> = result
+                .output_info
+                .iter()
+                .map(|info| OutputDescriptor {
+                    name: info.name.clone(),
+                    table: info.table.clone(),
+                })
+                .collect();
+
+            let outputs = plan_outputs(&descriptors, &result.output_batches, "output")?;
+            let output_artifacts = write_output_plan(&args.sink, &outputs, "dev", None)?;
+            for artifact in output_artifacts {
+                let name = artifact.name;
+                let uri = artifact.uri;
+                let rows = artifact.rows;
+                if !args.json {
+                    println!("  Wrote {}", uri);
+                }
+                artifacts.push(RunArtifact { name, uri, rows });
             }
-            artifacts.push(RunArtifact { name, uri, rows });
+        }
+
+        let logs = if result.logs.is_empty() {
+            None
+        } else {
+            Some(result.logs)
+        };
+
+        Ok(RunResult {
+            parser: args.parser.clone(),
+            input: args.input.clone(),
+            sink: args.sink.clone(),
+            whatif: false,
+            batches,
+            total_rows,
+            outputs,
+            artifacts,
+            logs,
+        })
+    })();
+
+    match run_result {
+        Ok(output) => {
+            if let (Some(recorder), Some(run_id)) = (telemetry.as_ref(), telemetry_run_id.as_ref())
+            {
+                let payload = protocol_telemetry::RunCompleted {
+                    run_id: run_id.clone(),
+                    kind: Some("dev_run".to_string()),
+                    duration_ms: telemetry_start.elapsed().as_millis() as u64,
+                    total_rows: output.total_rows as u64,
+                    outputs: output.outputs.len(),
+                };
+                recorder.emit_domain(
+                    protocol_telemetry::events::RUN_COMPLETE,
+                    Some(run_id),
+                    None,
+                    &payload,
+                );
+            }
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!();
+                println!("Execution complete:");
+                println!("  Batches: {}", output.batches);
+                println!("  Total rows: {}", output.total_rows);
+                for info in &output.outputs {
+                    println!("  Output '{}'", info.name);
+                }
+                if let Some(logs) = &output.logs {
+                    println!();
+                    println!("Parser logs:\n{}", logs);
+                }
+            }
+
+            Ok(())
+        }
+        Err(err) => {
+            if let (Some(recorder), Some(run_id)) = (telemetry.as_ref(), telemetry_run_id.as_ref())
+            {
+                let payload = protocol_telemetry::RunFailed {
+                    run_id: run_id.clone(),
+                    kind: Some("dev_run".to_string()),
+                    duration_ms: telemetry_start.elapsed().as_millis() as u64,
+                    error_class: classify_run_error(&err),
+                };
+                recorder.emit_domain(
+                    protocol_telemetry::events::RUN_FAIL,
+                    Some(run_id),
+                    None,
+                    &payload,
+                );
+            }
+            Err(err)
         }
     }
-
-    let logs = if result.logs.is_empty() {
-        None
-    } else {
-        Some(result.logs)
-    };
-
-    let output = RunResult {
-        parser: args.parser,
-        input: args.input,
-        sink: args.sink,
-        whatif: false,
-        batches,
-        total_rows,
-        outputs,
-        artifacts,
-        logs,
-    };
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!();
-        println!("Execution complete:");
-        println!("  Batches: {}", output.batches);
-        println!("  Total rows: {}", output.total_rows);
-        for info in &output.outputs {
-            println!("  Output '{}'", info.name);
-        }
-        if let Some(logs) = &output.logs {
-            println!();
-            println!("Parser logs:\n{}", logs);
-        }
-    }
-
-    Ok(())
 }
 
 pub(crate) fn ensure_dev_venv(source: &str) -> Result<Option<PathBuf>> {
@@ -304,6 +369,14 @@ pub(crate) fn ensure_dev_venv(source: &str) -> Result<Option<PathBuf>> {
     }
 
     Ok(Some(venv_path))
+}
+
+fn classify_run_error(err: &anyhow::Error) -> String {
+    if err.is::<std::io::Error>() {
+        "io_error".to_string()
+    } else {
+        "run_error".to_string()
+    }
 }
 
 fn python_supports_modules(python: &PathBuf, modules: &[String]) -> bool {

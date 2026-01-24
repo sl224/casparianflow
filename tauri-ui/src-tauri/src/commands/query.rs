@@ -1,6 +1,10 @@
 //! SQL query execution commands.
 //!
 //! These commands execute read-only SQL queries against the database.
+//!
+//! Tape instrumentation (WS7-05):
+//! - SQL queries are hashed (not stored in plaintext) for privacy
+//! - Only row counts and execution times are recorded
 
 use crate::state::{AppState, CommandError, CommandResult};
 use casparian_db::DbValue;
@@ -91,6 +95,22 @@ pub async fn query_execute(
     request: QueryRequest,
     state: State<'_, AppState>,
 ) -> CommandResult<QueryResult> {
+    // Record tape event before execution
+    let tape_ids = {
+        let tape = state.tape().read().ok();
+        tape.as_ref().and_then(|t| {
+            // Hash the SQL query for privacy - don't record raw SQL
+            let sql_hash = t.redact(&request.sql);
+            t.emit_command(
+                "QueryExecute",
+                serde_json::json!({
+                    "sql_hash": sql_hash,
+                    "limit": request.limit,
+                }),
+            )
+        })
+    };
+
     // Validate the SQL
     validate_sql(&request.sql)?;
 
@@ -112,7 +132,20 @@ pub async fn query_execute(
     // Execute query
     let rows = conn
         .query_all(&sql_with_limit, &[])
-        .map_err(|e| CommandError::Database(e.to_string()))?;
+        .map_err(|e| {
+            // Record error in tape
+            if let Some((event_id, correlation_id)) = &tape_ids {
+                if let Ok(tape) = state.tape().read() {
+                    tape.emit_error(
+                        correlation_id,
+                        event_id,
+                        &e.to_string(),
+                        serde_json::json!({"status": "failed"}),
+                    );
+                }
+            }
+            CommandError::Database(e.to_string())
+        })?;
 
     let exec_time_ms = start.elapsed().as_millis() as u64;
 
@@ -134,6 +167,22 @@ pub async fn query_execute(
         .collect();
 
     let row_count = json_rows.len();
+
+    // Record success in tape (row count and exec time, NOT the actual data)
+    if let Some((event_id, correlation_id)) = tape_ids {
+        if let Ok(tape) = state.tape().read() {
+            tape.emit_success(
+                &correlation_id,
+                &event_id,
+                serde_json::json!({
+                    "status": "success",
+                    "row_count": row_count,
+                    "column_count": columns.len(),
+                    "exec_time_ms": exec_time_ms,
+                }),
+            );
+        }
+    }
 
     Ok(QueryResult {
         columns,

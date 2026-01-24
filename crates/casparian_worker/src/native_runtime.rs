@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::bridge::OutputInfo;
+use crate::cancel::CancellationToken;
 use crate::runtime::{PluginRuntime, RunContext, RunOutputs};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,7 +45,12 @@ impl NativeSubprocessRuntime {
 }
 
 impl PluginRuntime for NativeSubprocessRuntime {
-    fn run_file(&self, ctx: &RunContext, input_path: &Path) -> Result<RunOutputs> {
+    fn run_file(
+        &self,
+        ctx: &RunContext,
+        input_path: &Path,
+        cancel_token: &CancellationToken,
+    ) -> Result<RunOutputs> {
         if ctx.entrypoint.trim().is_empty() {
             anyhow::bail!("Entrypoint is required for native runtime");
         }
@@ -99,10 +105,18 @@ impl PluginRuntime for NativeSubprocessRuntime {
         }
 
         let mut stdout_reader = BufReader::new(stdout);
+        let poll_interval = Duration::from_millis(200);
         loop {
-            let frame = match rx.recv() {
+            if cancel_token.is_cancelled() {
+                let _ = child.kill();
+                anyhow::bail!("Native plugin cancelled");
+            }
+            let frame = match rx.recv_timeout(poll_interval) {
                 Ok(frame) => frame,
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match frame {
                 ControlFrame::OutputBegin {
@@ -197,11 +211,23 @@ impl PluginRuntime for NativeSubprocessRuntime {
             }
         }
 
-        let status = child.wait().context("Failed to wait for native plugin")?;
-        if !status.success() {
-            anyhow::bail!("Native plugin exited with status {}", status);
+        // Wait for process exit, with cancellation support
+        loop {
+            if cancel_token.is_cancelled() {
+                let _ = child.kill();
+                anyhow::bail!("Native plugin cancelled");
+            }
+            if let Some(status) = child
+                .try_wait()
+                .context("Failed to poll native plugin status")?
+            {
+                if !status.success() {
+                    anyhow::bail!("Native plugin exited with status {}", status);
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
         }
-
         let _ = stderr_handle.join();
 
         Ok(RunOutputs {

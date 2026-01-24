@@ -6,9 +6,9 @@ use ratatui::{
 };
 
 use super::app::{
-    App, ApprovalsViewState, CommandPaletteMode, DiscoverFocus, DiscoverViewState, JobInfo,
-    JobStatus, JobType, JobsListSection, JobsViewState, ParserHealth, ShellFocus, SuggestedFix,
-    ThroughputSample, TuiMode, ViolationSummary, ViolationType,
+    App, ApprovalsViewState, CommandPaletteMode, CommandPaletteState, DiscoverFocus,
+    DiscoverViewState, JobInfo, JobStatus, JobType, JobsListSection, JobsViewState, ParserHealth,
+    ShellFocus, SuggestedFix, ThroughputSample, TuiMode, ViolationSummary, ViolationType,
 };
 use crate::cli::config::active_db_path;
 use crate::cli::output::format_number;
@@ -56,6 +56,29 @@ pub fn render_centered_dialog(
     dialog_area
 }
 
+pub(super) fn help_overlay_area(area: Rect) -> Rect {
+    let help_width = 76.min(area.width.saturating_sub(4));
+    let help_height = 36.min(area.height.saturating_sub(2));
+    let help_x = (area.width.saturating_sub(help_width)) / 2;
+    let help_y = (area.height.saturating_sub(help_height)) / 2;
+
+    Rect {
+        x: area.x + help_x,
+        y: area.y + help_y,
+        width: help_width,
+        height: help_height,
+    }
+}
+
+pub(super) fn command_palette_area(palette: &CommandPaletteState, area: Rect) -> Rect {
+    let dialog_width = 56.min(area.width.saturating_sub(4));
+    let suggestion_count = palette.suggestions.len().min(6);
+    let dialog_height =
+        (4 + (suggestion_count as u16 * 2) + 3).min(area.height.saturating_sub(4));
+
+    centered_dialog_area(area, dialog_width, dialog_height)
+}
+
 /// Calculate scroll offset to keep selected item centered in view.
 /// Works for any scrollable list (files, folders, dropdowns).
 pub fn centered_scroll_offset(selected: usize, visible: usize, total: usize) -> usize {
@@ -100,15 +123,15 @@ fn violation_color(vtype: ViolationType) -> Color {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ShellAreas {
-    top: Rect,
-    rail: Rect,
-    main: Rect,
-    inspector: Rect,
-    bottom: Rect,
+pub(super) struct ShellAreas {
+    pub(super) top: Rect,
+    pub(super) rail: Rect,
+    pub(super) main: Rect,
+    pub(super) inspector: Rect,
+    pub(super) bottom: Rect,
 }
 
-fn shell_layout(area: Rect, inspector_visible: bool) -> ShellAreas {
+pub(super) fn shell_layout(area: Rect, inspector_visible: bool) -> ShellAreas {
     let top_height = 3u16.min(area.height);
     let bottom_height = 3u16.min(area.height.saturating_sub(top_height));
     let content_height = area.height.saturating_sub(top_height + bottom_height);
@@ -154,6 +177,16 @@ fn shell_layout(area: Rect, inspector_visible: bool) -> ShellAreas {
     }
 }
 
+pub(super) fn right_drawer_area(area: Rect) -> Rect {
+    let drawer_width = (area.width * 40 / 100).max(50).min(area.width);
+    Rect::new(
+        area.width.saturating_sub(drawer_width),
+        0,
+        drawer_width,
+        area.height,
+    )
+}
+
 fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect) {
     if area.height == 0 {
         return;
@@ -182,9 +215,14 @@ fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect
         .map(|rows| rows.max(0) as u64)
         .sum();
 
+    let workspace_label = app
+        .active_workspace
+        .as_ref()
+        .map(|ws| ws.name.as_str())
+        .unwrap_or("(none)");
     let text = format!(
-        " Casparian Flow | View: {} | DB: {} | Run: {} | Fail: {} | Quarantine: {} ",
-        view_label, backend_label, running, failed, quarantine_total
+        " Casparian Flow | View: {} | WS: {} | DB: {} | Run: {} | Fail: {} | Quarantine: {} ",
+        view_label, workspace_label, backend_label, running, failed, quarantine_total
     );
     let line = truncate_end(&text, area.width as usize);
     let bar = Paragraph::new(line)
@@ -273,6 +311,16 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(Span::styled(
         " Context",
         Style::default().fg(Color::DarkGray),
+    )));
+    let workspace_label = app
+        .active_workspace
+        .as_ref()
+        .map(|ws| ws.name.as_str())
+        .unwrap_or("(none)");
+    let workspace_line = format!(" Workspace: {}", workspace_label);
+    lines.push(Line::from(Span::styled(
+        truncate_end(&workspace_line, inner.width as usize),
+        Style::default().fg(Color::Gray),
     )));
 
     match app.mode {
@@ -678,14 +726,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 /// Draw the Jobs drawer overlay (global, toggles with J)
 fn draw_jobs_drawer(frame: &mut Frame, app: &App, area: Rect) {
-    // Drawer takes right 40% of screen, or at least 50 chars
-    let drawer_width = (area.width * 40 / 100).max(50).min(area.width);
-    let drawer_area = Rect::new(
-        area.width.saturating_sub(drawer_width),
-        0,
-        drawer_width,
-        area.height,
-    );
+    let drawer_area = right_drawer_area(area);
 
     // Clear background
     frame.render_widget(Clear, drawer_area);
@@ -854,14 +895,7 @@ fn draw_jobs_drawer(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Sources drawer overlay (global, toggles with S key)
 fn draw_sources_drawer(frame: &mut Frame, app: &App, area: Rect) {
-    // Drawer takes right 40% of screen, or at least 50 chars
-    let drawer_width = (area.width * 40 / 100).max(50).min(area.width);
-    let drawer_area = Rect::new(
-        area.width.saturating_sub(drawer_width),
-        0,
-        drawer_width,
-        area.height,
-    );
+    let drawer_area = right_drawer_area(area);
 
     // Clear background
     frame.render_widget(Clear, drawer_area);
@@ -2498,13 +2532,15 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let files_persisted = progress.map(|p| p.files_persisted).unwrap_or(0);
     let dirs = progress.map(|p| p.dirs_scanned).unwrap_or(0);
     let current = progress.and_then(|p| p.current_dir.clone());
+    let files_per_sec = progress.map(|p| p.files_per_sec).unwrap_or(0.0);
+    let stalled = progress.map(|p| p.stalled).unwrap_or(false);
 
     // Elapsed time from scan_start_time
-    let secs = app
-        .discover
-        .scan_start_time
-        .map(|t| t.elapsed().as_secs())
+    let elapsed_ms = progress
+        .map(|p| p.elapsed_ms)
+        .or_else(|| app.discover.scan_start_time.map(|t| t.elapsed().as_millis() as u64))
         .unwrap_or(0);
+    let secs = elapsed_ms / 1_000;
     let time_str = if secs >= 60 {
         format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
@@ -2545,9 +2581,11 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     // Line 1: empty
     // Line 2: Stats (THE MAIN PROGRESS LINE)
     // Show crawled/persisted to diagnose bottlenecks
+    let rate_str = format!("{:.1} files/s", files_per_sec);
+    let stall_str = if stalled { " | STALLED" } else { "" };
     let line2 = format!(
-        "  {}/{} files | {} dirs | {}",
-        files_found, files_persisted, dirs, time_str
+        "  {}/{} files | {} dirs | {} | {}{}",
+        files_found, files_persisted, dirs, time_str, rate_str, stall_str
     );
     // Line 3: empty
     // Line 4: Current directory hint
@@ -2556,15 +2594,20 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     // Line 6: Navigation
     let line6 = "  [Esc] Cancel  [0] Home  [4] Jobs";
 
+    let progress_style = if stalled {
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    };
+
     let text = vec![
         Line::styled(pad(&line0), Style::default().fg(Color::White)),
         Line::raw(pad("")),
-        Line::styled(
-            pad(&line2),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        ),
+        Line::styled(pad(&line2), progress_style),
         Line::raw(pad("")),
         Line::styled(pad(&line4), Style::default().fg(Color::DarkGray)),
         Line::raw(pad("")),
@@ -5197,12 +5240,8 @@ fn calculate_eta(processed: u32, total: u32, started: DateTime<Local>) -> String
 fn draw_command_palette(frame: &mut Frame, app: &App, area: Rect) {
     let palette = &app.command_palette;
 
-    // Calculate dialog size - centered, fixed width for consistent UX
-    let dialog_width = 56.min(area.width.saturating_sub(4));
-    let suggestion_count = palette.suggestions.len().min(6);
-    let dialog_height = (4 + (suggestion_count as u16 * 2) + 3).min(area.height.saturating_sub(4));
-
-    let dialog_area = render_centered_dialog(frame, area, dialog_width, dialog_height);
+    let dialog_area = command_palette_area(palette, area);
+    frame.render_widget(Clear, dialog_area);
 
     // Mode indicator and title
     let mode_indicator = palette.mode.indicator();
@@ -5360,18 +5399,7 @@ fn draw_command_palette(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     use ratatui::widgets::Clear;
 
-    // Center the help panel - larger to fit all content
-    let help_width = 76.min(area.width.saturating_sub(4));
-    let help_height = 36.min(area.height.saturating_sub(2));
-    let help_x = (area.width.saturating_sub(help_width)) / 2;
-    let help_y = (area.height.saturating_sub(help_height)) / 2;
-
-    let help_area = Rect {
-        x: area.x + help_x,
-        y: area.y + help_y,
-        width: help_width,
-        height: help_height,
-    };
+    let help_area = help_overlay_area(area);
 
     // Clear the background
     frame.render_widget(Clear, help_area);
@@ -6804,7 +6832,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Jobs;
 
         // Create a job with a UTF-8 name containing multi-byte characters
@@ -6827,7 +6855,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Jobs;
 
         // Emoji are 4-byte UTF-8 sequences
@@ -6848,7 +6876,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let app = App::new(test_args());
+        let app = App::new(test_args(), None);
 
         terminal.draw(|f| draw(f, &app)).unwrap();
 
@@ -6870,7 +6898,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.enter_discover_mode();
 
         // Add some mock files
@@ -6902,7 +6930,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         // Test Parser Bench mode
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::ParserBench;
         terminal.draw(|f| draw(f, &app)).unwrap();
 

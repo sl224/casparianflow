@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use casparian_protocol::{JobId, PipelineRunStatus};
 use std::path::Path;
 
-use casparian_db::{DbConnection, DbValue, UnifiedDbRow as DbRow};
+use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow as DbRow};
 
 use super::types::{
     Pipeline, PipelineRun, SelectionFilters, SelectionResolution, SelectionSnapshot, WatermarkField,
@@ -44,11 +44,9 @@ fn row_to_pipeline_run(row: DbRow) -> Result<PipelineRun> {
             .get_by_name("logical_date")
             .context("Failed to read 'logical_date' column from pipeline run")?,
         status,
-        started_at: row
-            .get_by_name::<Option<String>>("started_at")
+        started_at: timestamp_to_string_opt(&row, "started_at")
             .context("Failed to read 'started_at' column from pipeline run")?,
-        completed_at: row
-            .get_by_name::<Option<String>>("completed_at")
+        completed_at: timestamp_to_string_opt(&row, "completed_at")
             .context("Failed to read 'completed_at' column from pipeline run")?,
     })
 }
@@ -71,8 +69,7 @@ fn row_to_selection_snapshot(row: &DbRow) -> Result<SelectionSnapshot> {
         watermark_value: row
             .get_by_name::<Option<String>>("watermark_value")
             .context("Failed to read 'watermark_value' column from selection snapshot")?,
-        created_at: row
-            .get_by_name("created_at")
+        created_at: timestamp_to_string(row, "created_at")
             .context("Failed to read 'created_at' column from selection snapshot")?,
     })
 }
@@ -92,10 +89,19 @@ fn row_to_pipeline(row: DbRow) -> Result<Pipeline> {
         config_json: row
             .get_by_name("config_json")
             .context("Failed to read 'config_json' column from pipeline")?,
-        created_at: row
-            .get_by_name("created_at")
+        created_at: timestamp_to_string(&row, "created_at")
             .context("Failed to read 'created_at' column from pipeline")?,
     })
+}
+
+fn timestamp_to_string(row: &DbRow, name: &str) -> Result<String> {
+    let ts: DbTimestamp = row.get_by_name(name)?;
+    Ok(ts.to_rfc3339())
+}
+
+fn timestamp_to_string_opt(row: &DbRow, name: &str) -> Result<Option<String>> {
+    let ts: Option<DbTimestamp> = row.get_by_name(name)?;
+    Ok(ts.map(|value| value.to_rfc3339()))
 }
 
 pub struct DuckDbPipelineStore {
@@ -462,24 +468,37 @@ impl DuckDbPipelineStore {
         filters: &SelectionFilters,
         logical_date_ms: i64,
     ) -> Result<SelectionResolution> {
-        let mut sql = String::from("SELECT id, mtime FROM scout_files WHERE status != ?");
+        if filters.workspace_id.is_none() {
+            return Err(anyhow::anyhow!(
+                "Workspace scope required for selection resolution"
+            ));
+        }
+        let mut sql = String::from("SELECT f.id, f.mtime FROM scout_files f");
+        if filters.tag.is_some() {
+            sql.push_str(" JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id");
+        }
+        sql.push_str(" WHERE f.status != ?");
         let mut params: Vec<DbValue> = vec![DbValue::from(FileStatus::Deleted.as_str())];
 
+        if let Some(workspace_id) = &filters.workspace_id {
+            sql.push_str(" AND f.workspace_id = ?");
+            params.push(DbValue::from(workspace_id.to_string()));
+        }
         if let Some(source_id) = &filters.source_id {
-            sql.push_str(" AND source_id = ?");
+            sql.push_str(" AND f.source_id = ?");
             params.push(DbValue::from(source_id.as_i64()));
         }
         if let Some(tag) = &filters.tag {
-            sql.push_str(" AND tag = ?");
+            sql.push_str(" AND t.tag = ?");
             params.push(DbValue::from(tag.as_str()));
         }
         if let Some(extension) = &filters.extension {
-            sql.push_str(" AND extension = ?");
+            sql.push_str(" AND f.extension = ?");
             params.push(DbValue::from(extension.as_str()));
         }
         if let Some(since_ms) = filters.since_ms {
             let start_ms = logical_date_ms.saturating_sub(since_ms);
-            sql.push_str(" AND mtime >= ? AND mtime <= ?");
+            sql.push_str(" AND f.mtime >= ? AND f.mtime <= ?");
             params.push(DbValue::from(start_ms));
             params.push(DbValue::from(logical_date_ms));
         }

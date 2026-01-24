@@ -114,6 +114,7 @@ impl From<ProcessingStatus> for HttpJobStatus {
             ProcessingStatus::Pending | ProcessingStatus::Queued => HttpJobStatus::Queued,
             ProcessingStatus::Running | ProcessingStatus::Staged => HttpJobStatus::Running,
             ProcessingStatus::Completed => HttpJobStatus::Completed,
+            ProcessingStatus::Aborted => HttpJobStatus::Cancelled,
             ProcessingStatus::Failed => HttpJobStatus::Failed,
             ProcessingStatus::Skipped => HttpJobStatus::Cancelled,
         }
@@ -567,6 +568,10 @@ mod tests {
         assert_eq!(
             HttpJobStatus::from(ProcessingStatus::Failed),
             HttpJobStatus::Failed
+        );
+        assert_eq!(
+            HttpJobStatus::from(ProcessingStatus::Aborted),
+            HttpJobStatus::Cancelled
         );
         assert_eq!(
             HttpJobStatus::from(ProcessingStatus::Skipped),

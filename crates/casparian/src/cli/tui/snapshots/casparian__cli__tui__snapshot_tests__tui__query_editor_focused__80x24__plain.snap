@@ -1,0 +1,27 @@
+---
+source: crates/casparian/src/cli/tui/snapshot_tests.rs
+expression: plain
+---
+ Casparian Flow | View: Query Console | WS: alpha-case | DB: duckdb | Run: 1 ...
+
+────────────────────────────────────────────────────────────────────────────────
+╭ NAV ─────────────╮╔ SQL Editor ══════════════════════╗┌ Query Info ──────────┐
+│Views             │║  1 SELECT source, tag, COUNT(*) A║│                      │
+│[0] Home          │║  2 FROM scout_file_tags          ║│History: 2 queries    │
+│[1] Discover      │║  3 WHERE tag LIKE 'report.%'     ║│                      │
+│[2] Parser Bench  │╚══════════════════════════════════╝│State: Editing        │
+│[3] Jobs          │╭ Results ─────────────────────────╮│                      │
+│[4] Sources       ││                                  ││                      │
+│[5] Approvals     ││  No query results yet.           ││                      │
+│[6] Query         ││                                  ││                      │
+│[7] Sessions      ││  Enter a SQL query and press Ctrl││                      │
+│[,] Settings      ││                                  ││                      │
+│                  ││                                  ││                      │
+│Context           ││                                  ││                      │
+│Workspace: alp... ││                                  ││                      │
+│SQL Query Console ││                                  ││                      │
+│                  ││                                  ││                      │
+│                  ││                                  ││                      │
+╰──────────────────╯╰──────────────────────────────────╯└──────────────────────┘
+────────────────────────────────────────────────────────────────────────────────
+     [Ctrl+Enter] Execute  [Ctrl+L] Clear  [Up/Down] History  [Tab] Results

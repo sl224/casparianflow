@@ -6,6 +6,7 @@
 use super::{ExecutionResult, LogDestination, ParserRef};
 use anyhow::{Context, Result};
 use casparian_protocol::JobId;
+use casparian_worker::cancel::CancellationToken;
 use std::path::Path;
 
 /// Development mode runner that executes parsers without database integration.
@@ -58,6 +59,7 @@ impl DevRunner {
             file_id: 0,
             shim_path,
             inherit_stdio,
+            cancel_token: CancellationToken::new(),
         };
 
         // Execute with terminal output (logs captured by bridge)

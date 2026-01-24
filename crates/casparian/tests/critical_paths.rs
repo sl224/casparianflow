@@ -222,9 +222,11 @@ mod scout {
 
         // Create in-memory database
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         // Create source
         let source = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -282,8 +284,10 @@ mod scout {
         }
 
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         let source = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -306,7 +310,9 @@ mod scout {
         assert_eq!(result2.stats.files_discovered, 10);
 
         // Source should still exist
-        let loaded = db.get_source_by_path(&source.path).unwrap();
+        let loaded = db
+            .get_source_by_path(&workspace_id, &source.path)
+            .unwrap();
         assert!(loaded.is_some(), "Source should still exist after rescan");
     }
 
@@ -314,8 +320,10 @@ mod scout {
     #[test]
     fn test_unique_source_names() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
 
         let source1 = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "data".to_string(),
             source_type: SourceType::Local,
@@ -325,6 +333,7 @@ mod scout {
         };
 
         let source2 = Source {
+            workspace_id,
             id: SourceId::new(),
             name: "data".to_string(), // Same name!
             source_type: SourceType::Local,

@@ -6,8 +6,9 @@
 
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug_span, info};
 
 /// Errors from database backend operations.
 #[derive(Debug, Error)]
@@ -560,6 +561,17 @@ impl DbConnection {
         sql: &str,
         params: &[DbValue],
     ) -> Result<u64, BackendError> {
+        let op = sql_op_name(sql);
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.exec",
+            op = op,
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
+
         let mut stmt = conn.prepare(sql)?;
         let duckdb_params = Self::to_duckdb_params(params);
         let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params
@@ -567,6 +579,8 @@ impl DbConnection {
             .map(|v| v as &dyn duckdb::ToSql)
             .collect();
         let rows = stmt.execute(param_refs.as_slice())?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", &duration_ms);
         Ok(rows as u64)
     }
 
@@ -574,7 +588,18 @@ impl DbConnection {
         conn: &duckdb::Connection,
         sql: &str,
     ) -> Result<(), BackendError> {
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.exec_batch",
+            op = "BATCH",
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
         conn.execute_batch(sql)?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", &duration_ms);
         Ok(())
     }
 
@@ -583,6 +608,17 @@ impl DbConnection {
         sql: &str,
         params: &[DbValue],
     ) -> Result<Vec<DbRow>, BackendError> {
+        let op = sql_op_name(sql);
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.query",
+            op = op,
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
+
         let mut stmt = conn.prepare(sql)?;
         let duckdb_params = Self::to_duckdb_params(params);
         let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params
@@ -618,6 +654,8 @@ impl DbConnection {
             result.push(DbRow::new(columns.clone(), values));
         }
 
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", &duration_ms);
         Ok(result)
     }
 
@@ -764,4 +802,18 @@ impl<'a> DbTransaction<'a> {
 
 fn strip_url_prefix(url: &str, prefix: &str) -> Option<String> {
     url.strip_prefix(prefix).map(|rest| rest.to_string())
+}
+
+fn sql_op_name(sql: &str) -> &str {
+    sql.split_whitespace().next().unwrap_or("unknown")
+}
+
+fn hash_sql(sql: &str) -> String {
+    // FNV-1a 64-bit hash for low-cardinality, stable identification.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in sql.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
 }

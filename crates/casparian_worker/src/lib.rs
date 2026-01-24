@@ -14,6 +14,7 @@
 #![allow(clippy::redundant_guards)]
 #![allow(clippy::needless_borrows_for_generic_args)]
 
+pub mod cancel;
 pub mod bridge;
 pub mod metrics;
 pub mod native_runtime;

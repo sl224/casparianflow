@@ -64,3 +64,25 @@ structure, choose the structural approach.
 - [ ] Structs valid from construction (no `.init()`)
 - [ ] No `as i32/i64` on values that could overflow; use `try_from`
 - [ ] Multiple bools aren't encoding mutually exclusive states
+
+---
+
+## Scan + Persist Line-Rate Plan (codex/scan_persist_line_rate)
+
+Working agreements:
+- Always read and update: `codex/scan_persist_line_rate/PROGRESS.md`
+- Make changes in small milestones; keep diffs reviewable.
+- Prefer data-oriented reductions: fewer allocations, fewer copies, fewer passes over data.
+- Avoid new dependencies unless explicitly justified by benchmark wins.
+- After each milestone:
+  - run: `cargo test -p casparian`
+  - run: `cargo bench -p casparian --bench scanner_perf` (or at least the relevant group)
+  - record results + next step in `PROGRESS.md`
+
+Debuggability:
+- Add tracing timings around: walk, batch persist, and any post-scan work.
+- If behavior changes, add or adjust tests near the changed module.
+
+Exit criteria:
+- If scanner_full_scan is within ~1.2–1.5x walk_only on the criterion fixture (and db_write no longer dominates),
+  stop and write up final results in `PROGRESS.md`.

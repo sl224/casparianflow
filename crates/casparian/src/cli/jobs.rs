@@ -32,6 +32,7 @@ fn status_color(status: ProcessingStatus) -> Color {
         ProcessingStatus::Running => Color::Cyan,
         ProcessingStatus::Staged => Color::Blue,
         ProcessingStatus::Completed => Color::Green,
+        ProcessingStatus::Aborted => Color::Red,
         ProcessingStatus::Failed => Color::Red,
         ProcessingStatus::Pending => Color::Grey,
         ProcessingStatus::Skipped => Color::DarkGrey,
@@ -62,6 +63,7 @@ pub struct QueueStats {
     pub running: i64,
     pub completed: i64,
     pub failed: i64,
+    pub aborted: i64,
     pub dead_letter: i64,
 }
 
@@ -194,6 +196,7 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
     }
     if args.failed {
         statuses.push(ProcessingStatus::Failed.as_str());
+        statuses.push(ProcessingStatus::Aborted.as_str());
     }
     if args.done {
         statuses.push(ProcessingStatus::Completed.as_str());
@@ -206,6 +209,7 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
             ProcessingStatus::Running.as_str(),
             ProcessingStatus::Completed.as_str(),
             ProcessingStatus::Failed.as_str(),
+            ProcessingStatus::Aborted.as_str(),
             ProcessingStatus::Pending.as_str(),
         ]);
     }
@@ -250,13 +254,15 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
             COALESCE(SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END), 0) as queued,
             COALESCE(SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END), 0) as running,
             COALESCE(SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END), 0) as completed,
-            COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed
+            COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed,
+            COALESCE(SUM(CASE WHEN status = '{aborted}' THEN 1 ELSE 0 END), 0) as aborted
         FROM cf_processing_queue
         "#,
             queued = ProcessingStatus::Queued.as_str(),
             running = ProcessingStatus::Running.as_str(),
             completed = ProcessingStatus::Completed.as_str(),
             failed = ProcessingStatus::Failed.as_str(),
+            aborted = ProcessingStatus::Aborted.as_str(),
         ),
         &[],
     )?;
@@ -266,6 +272,7 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
     let running: i64 = row.get(2)?;
     let completed: i64 = row.get(3)?;
     let failed: i64 = row.get(4)?;
+    let aborted: i64 = row.get(5)?;
 
     let dead_letter_count = if table_exists(conn, "cf_dead_letter")? {
         conn.query_scalar::<i64>("SELECT COUNT(*) FROM cf_dead_letter", &[])
@@ -280,6 +287,7 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
         running,
         completed,
         failed,
+        aborted,
         dead_letter: dead_letter_count,
     })
 }
@@ -490,6 +498,7 @@ fn print_queue_status(stats: &QueueStats) {
         format_number_signed(stats.completed)
     );
     println!("  Failed:      {:>6}", format_number_signed(stats.failed));
+    println!("  Aborted:     {:>6}", format_number_signed(stats.aborted));
     if stats.dead_letter > 0 {
         println!(
             "  Dead Letter: {:>6}",

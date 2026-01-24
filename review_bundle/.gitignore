@@ -1,0 +1,76 @@
+# Data files
+*.pkl
+*.zip
+*.e2d
+*.parquet
+*.log
+
+# Macos
+.DS_Store
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.build/
+
+# IDE configuration
+.vscode/
+.idea/
+.vs/
+
+# environments
+venv/
+.venv/
+env/
+.claude
+
+# Python cache and artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Test output and artifacts
+.test_output/
+.demo_output/
+test_output/
+*_output/
+output_*/
+sub_output/
+test_env_*/
+tests/static_assets/
+*_test.db
+
+# Playwright test results
+ui/test-results/
+ui/playwright-report/
+ui/playwright/.cache/
+
+# DB
+*.sqlite*
+data/
+*.db
+
+# llm
+.agent
+.coverage
+
+# Session/temp files
+.sesskey
+*.json.bak
+last_proposal.json
+
+# Spec session artifacts (working files, not part of codebase)
+specs/meta/sessions/
+specs/meta/maintenance/
+
+# Archive (historical documents)
+archive/
+
+# Rust artifacts
+target/
+Cargo.lock
+**/*.rs.bk
+
+node_modules

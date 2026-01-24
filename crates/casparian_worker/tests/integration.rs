@@ -89,6 +89,7 @@ fn test_conclude_message_format() {
         artifacts: vec![],
         error_message: None,
         diagnostics: None,
+        source_hash: Some("abc123def456".to_string()),
     };
 
     let payload = serde_json::to_vec(&receipt).unwrap();

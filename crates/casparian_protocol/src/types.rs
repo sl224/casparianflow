@@ -157,6 +157,8 @@ pub enum ProcessingStatus {
     Staged,
     /// Job completed successfully
     Completed,
+    /// Job was cancelled/aborted before completion
+    Aborted,
     /// Job failed with an error
     Failed,
     /// Job was skipped (e.g., deduplication)
@@ -170,6 +172,7 @@ impl ProcessingStatus {
         ProcessingStatus::Running,
         ProcessingStatus::Staged,
         ProcessingStatus::Completed,
+        ProcessingStatus::Aborted,
         ProcessingStatus::Failed,
         ProcessingStatus::Skipped,
     ];
@@ -181,6 +184,7 @@ impl ProcessingStatus {
             ProcessingStatus::Running => "RUNNING",
             ProcessingStatus::Staged => "STAGED",
             ProcessingStatus::Completed => "COMPLETED",
+            ProcessingStatus::Aborted => "ABORTED",
             ProcessingStatus::Failed => "FAILED",
             ProcessingStatus::Skipped => "SKIPPED",
         }
@@ -194,6 +198,7 @@ impl ProcessingStatus {
             ProcessingStatus::Running => "running",
             ProcessingStatus::Staged => "staged",
             ProcessingStatus::Completed => "complete",
+            ProcessingStatus::Aborted => "aborted",
             ProcessingStatus::Failed => "failed",
             ProcessingStatus::Skipped => "skipped",
         }
@@ -202,7 +207,10 @@ impl ProcessingStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            ProcessingStatus::Completed | ProcessingStatus::Failed | ProcessingStatus::Skipped
+            ProcessingStatus::Completed
+                | ProcessingStatus::Aborted
+                | ProcessingStatus::Failed
+                | ProcessingStatus::Skipped
         )
     }
 
@@ -227,6 +235,7 @@ impl FromStr for ProcessingStatus {
             "RUNNING" => Ok(ProcessingStatus::Running),
             "STAGED" => Ok(ProcessingStatus::Staged),
             "COMPLETED" | "COMPLETE" => Ok(ProcessingStatus::Completed),
+            "ABORTED" | "CANCELLED" | "CANCELED" => Ok(ProcessingStatus::Aborted),
             "FAILED" => Ok(ProcessingStatus::Failed),
             "SKIPPED" => Ok(ProcessingStatus::Skipped),
             _ => Err(format!("Invalid processing status: '{}'", s)),
@@ -1165,7 +1174,8 @@ impl JobStatus {
             JobStatus::Success | JobStatus::PartialSuccess | JobStatus::CompletedWithWarnings => {
                 ProcessingStatus::Completed
             }
-            JobStatus::Failed | JobStatus::Aborted => ProcessingStatus::Failed,
+            JobStatus::Failed => ProcessingStatus::Failed,
+            JobStatus::Aborted => ProcessingStatus::Aborted,
             JobStatus::Rejected => ProcessingStatus::Queued, // Requeue on rejection
         }
     }
@@ -1252,17 +1262,66 @@ pub struct TypeMismatch {
     pub actual: ObservedDataType,
 }
 
+/// Artifact kind produced by a job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ArtifactKind {
+    Output,
+    Quarantine,
+    Log,
+    Other,
+}
+
+/// Typed artifact record (v1).
+///
+/// Structured to keep invalid states out of core logic.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactV1 {
+    Output {
+        output_name: String,
+        sink_uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        table: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rows: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        schema_hash: Option<String>,
+    },
+    Quarantine {
+        output_name: String,
+        sink_uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        table: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rows: Option<u64>,
+    },
+    Log {
+        name: String,
+        uri: String,
+    },
+    Other {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+}
+
 /// Payload for OpCode.CONCLUDE.
 /// Worker -> Sentinel: "Job finished. Here are the results."
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobReceipt {
     pub status: JobStatus,
     pub metrics: HashMap<String, i64>, // e.g., {"rows": 1500, "size_bytes": 42000}
-    pub artifacts: Vec<HashMap<String, String>>, // e.g., [{"topic": "output", "uri": "s3://..."}]
+    pub artifacts: Vec<ArtifactV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>, // Populated if status is failure
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<JobDiagnostics>,
+    /// Blake3 hash of the input file content. Used for tape replay determinism
+    /// and correlating outputs with specific input versions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
 }
 
 // ============================================================================
@@ -1679,7 +1738,7 @@ mod tests {
     #[test]
     fn test_job_receipt_serialization() {
         let mut metrics = HashMap::new();
-        metrics.insert("rows".to_string(), 1500);
+        metrics.insert(crate::metrics::ROWS.to_string(), 1500);
         metrics.insert("size_bytes".to_string(), 42000);
 
         let receipt = JobReceipt {
@@ -1688,12 +1747,47 @@ mod tests {
             artifacts: vec![],
             error_message: None,
             diagnostics: None,
+            source_hash: Some("abc123def456".to_string()),
         };
 
         let json = serde_json::to_string(&receipt).unwrap();
         let deserialized: JobReceipt = serde_json::from_str(&json).unwrap();
         assert_eq!(receipt.status, deserialized.status);
         assert_eq!(receipt.metrics, deserialized.metrics);
+        assert_eq!(receipt.source_hash, deserialized.source_hash);
+    }
+
+    #[test]
+    fn test_job_receipt_source_hash_optional() {
+        // Test that source_hash is optional for backward compatibility
+        let json_without_hash = r#"{"status":"SUCCESS","metrics":{},"artifacts":[]}"#;
+        let receipt: JobReceipt = serde_json::from_str(json_without_hash).unwrap();
+        assert!(receipt.source_hash.is_none());
+
+        // Test that source_hash serializes correctly when present
+        let receipt_with_hash = JobReceipt {
+            status: JobStatus::Success,
+            metrics: HashMap::new(),
+            artifacts: vec![],
+            error_message: None,
+            diagnostics: None,
+            source_hash: Some("abcd1234".to_string()),
+        };
+        let json = serde_json::to_string(&receipt_with_hash).unwrap();
+        assert!(json.contains("source_hash"));
+        assert!(json.contains("abcd1234"));
+
+        // Test that source_hash is skipped when None
+        let receipt_no_hash = JobReceipt {
+            status: JobStatus::Failed,
+            metrics: HashMap::new(),
+            artifacts: vec![],
+            error_message: Some("error".to_string()),
+            diagnostics: None,
+            source_hash: None,
+        };
+        let json = serde_json::to_string(&receipt_no_hash).unwrap();
+        assert!(!json.contains("source_hash"));
     }
 
     #[test]
@@ -2203,7 +2297,7 @@ mod tests {
         );
         assert_eq!(
             JobStatus::Aborted.to_processing_status(),
-            ProcessingStatus::Failed
+            ProcessingStatus::Aborted
         );
 
         // Rejected -> Queued (for requeue)

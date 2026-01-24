@@ -1,13 +1,16 @@
 //! Pipeline CLI: apply/run/backfill for deterministic selections.
 
 use crate::cli::config;
+use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use anyhow::{Context, Result};
-use casparian::scout::SourceId;
+use casparian::scout::{SourceId, WorkspaceId};
+use casparian::telemetry::TelemetryRecorder;
 use casparian::storage::{
     DuckDbPipelineStore, Pipeline, SelectionFilters, SelectionResolution, WatermarkField,
 };
 use casparian_db::{DbConnection, DbValue};
+use casparian_protocol::telemetry as protocol_telemetry;
 use casparian_protocol::types::SchemaDefinition;
 use casparian_protocol::{
     materialization_key, output_target_key, schema_hash, table_name_with_schema, PipelineRunStatus,
@@ -15,11 +18,15 @@ use casparian_protocol::{
 };
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{SchemaContract, SchemaStorage};
-use chrono::TimeZone;
+use casparian_sentinel::ExpectedOutputs;
+use chrono::{TimeZone, Utc};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
+use tracing::warn;
+use uuid::Uuid;
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum PipelineAction {
@@ -55,21 +62,44 @@ pub enum PipelineAction {
     },
 }
 
-pub fn run(action: PipelineAction) -> Result<()> {
+pub fn run(action: PipelineAction, telemetry: Option<TelemetryRecorder>) -> Result<()> {
     match action {
         PipelineAction::Apply { file } => apply_pipeline(file),
         PipelineAction::Run {
             name,
             logical_date,
             dry_run,
-        } => run_pipeline(&name, logical_date, dry_run),
+        } => run_pipeline(
+            &name,
+            logical_date,
+            dry_run,
+            telemetry,
+            Some("pipeline_run"),
+        )
+        .map(|_| ()),
         PipelineAction::Backfill {
             name,
             start,
             end,
             dry_run,
-        } => backfill_pipeline(&name, &start, &end, dry_run),
+        } => backfill_pipeline(
+            &name,
+            &start,
+            &end,
+            dry_run,
+            telemetry,
+            Some("pipeline_backfill"),
+        )
+        .map(|_| ()),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PipelineRunMetrics {
+    files_matched: usize,
+    queued: u64,
+    skipped: u64,
+    already_ran: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +124,8 @@ struct PipelineDefinition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SelectionConfig {
+    #[serde(default, alias = "workspace_id")]
+    workspace: Option<String>,
     #[serde(default)]
     tag: Option<String>,
     #[serde(default)]
@@ -238,7 +270,13 @@ fn apply_pipeline(file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_pipeline(name: &str, logical_date: Option<String>, dry_run: bool) -> Result<()> {
+fn run_pipeline(
+    name: &str,
+    logical_date: Option<String>,
+    dry_run: bool,
+    telemetry: Option<TelemetryRecorder>,
+    telemetry_kind: Option<&str>,
+) -> Result<PipelineRunMetrics> {
     let store = PipelineStoreHandle::open()?;
     let conn = store.open_db_connection()?;
     let pipeline = store
@@ -256,74 +294,166 @@ fn run_pipeline(name: &str, logical_date: Option<String>, dry_run: bool) -> Resu
     let (logical_date_str, logical_date_ms) = parse_logical_date(logical_date.as_deref())?;
     if store.pipeline_run_exists(&pipeline.id, &logical_date_str)? {
         println!("Pipeline '{}' already ran for {}", name, logical_date_str);
-        return Ok(());
+        return Ok(PipelineRunMetrics {
+            files_matched: 0,
+            queued: 0,
+            skipped: 0,
+            already_ran: true,
+        });
     }
 
-    let (filters, since_ms) = build_filters(&spec.pipeline.selection)?;
-    let filters = SelectionFilters {
-        since_ms,
-        ..filters
-    };
-    let resolution = store.resolve_selection_files(&filters, logical_date_ms)?;
-    let snapshot_hash = snapshot_hash(&selection_spec_id, &logical_date_str, &resolution.file_ids);
+    let telemetry_start = Instant::now();
+    let telemetry_run_id = telemetry.as_ref().map(|recorder| {
+        let run_id = Uuid::new_v4().to_string();
+        let payload = protocol_telemetry::RunStarted {
+            run_id: run_id.clone(),
+            kind: telemetry_kind.map(|value| value.to_string()),
+            parser_hash: Some(recorder.hasher().hash_str(&spec.pipeline.run.parser)),
+            input_hash: None,
+            sink_hash: spec
+                .pipeline
+                .run
+                .output
+                .as_ref()
+                .map(|value| recorder.hasher().hash_str(value)),
+            started_at: chrono::Utc::now(),
+        };
+        recorder.emit_domain(
+            protocol_telemetry::events::RUN_START,
+            Some(&run_id),
+            None,
+            &payload,
+        );
+        run_id
+    });
 
-    if dry_run {
-        println!("Pipeline '{}' (dry run)", name);
+    let run_result = (|| -> Result<PipelineRunMetrics> {
+        let workspace_id = resolve_workspace_id(&conn, &spec.pipeline.selection)?;
+        let (filters, since_ms) = build_filters(&spec.pipeline.selection, workspace_id)?;
+        validate_source_scope(&conn, &workspace_id, filters.source_id)?;
+        let filters = SelectionFilters {
+            since_ms,
+            ..filters
+        };
+        let resolution = store.resolve_selection_files(&filters, logical_date_ms)?;
+        let snapshot_hash =
+            snapshot_hash(&selection_spec_id, &logical_date_str, &resolution.file_ids);
+
+        if dry_run {
+            println!("Pipeline '{}' (dry run)", name);
+            println!("Logical date: {}", logical_date_str);
+            println!("Files matched: {}", resolution.file_ids.len());
+            println!("Snapshot hash: {}", snapshot_hash);
+            return Ok(PipelineRunMetrics {
+                files_matched: resolution.file_ids.len(),
+                queued: 0,
+                skipped: 0,
+                already_ran: false,
+            });
+        }
+
+        let snapshot_id = store.create_selection_snapshot(
+            &selection_spec_id,
+            &snapshot_hash,
+            &logical_date_str,
+            resolution.watermark_value.as_deref(),
+        )?;
+
+        store.insert_snapshot_files(&snapshot_id, &resolution.file_ids)?;
+
+        let status = if resolution.file_ids.is_empty() {
+            PipelineRunStatus::NoOp
+        } else {
+            PipelineRunStatus::Queued
+        };
+        let run_id = store.create_pipeline_run(
+            &pipeline.id,
+            &selection_spec_id,
+            &snapshot_hash,
+            None,
+            &logical_date_str,
+            status,
+        )?;
+
+        let summary = if status == PipelineRunStatus::NoOp {
+            store.set_pipeline_run_status(&run_id, PipelineRunStatus::NoOp)?;
+            EnqueueSummary::default()
+        } else {
+            enqueue_jobs(
+                &conn,
+                &run_id,
+                &spec.pipeline.run.parser,
+                &resolution.file_ids,
+            )?
+        };
+
+        println!("Pipeline '{}' queued (run id: {})", name, run_id);
         println!("Logical date: {}", logical_date_str);
         println!("Files matched: {}", resolution.file_ids.len());
+        if summary.queued > 0 || summary.skipped > 0 {
+            println!(
+                "Files queued: {} (skipped {})",
+                summary.queued, summary.skipped
+            );
+        }
         println!("Snapshot hash: {}", snapshot_hash);
-        return Ok(());
+        Ok(PipelineRunMetrics {
+            files_matched: resolution.file_ids.len(),
+            queued: summary.queued as u64,
+            skipped: summary.skipped as u64,
+            already_ran: false,
+        })
+    })();
+
+    match run_result {
+        Ok(metrics) => {
+            if let (Some(recorder), Some(run_id)) = (telemetry.as_ref(), telemetry_run_id.as_ref())
+            {
+                let payload = protocol_telemetry::RunCompleted {
+                    run_id: run_id.clone(),
+                    kind: telemetry_kind.map(|value| value.to_string()),
+                    duration_ms: telemetry_start.elapsed().as_millis() as u64,
+                    total_rows: metrics.files_matched as u64,
+                    outputs: metrics.queued as usize,
+                };
+                recorder.emit_domain(
+                    protocol_telemetry::events::RUN_COMPLETE,
+                    Some(run_id),
+                    None,
+                    &payload,
+                );
+            }
+            Ok(metrics)
+        }
+        Err(err) => {
+            if let (Some(recorder), Some(run_id)) = (telemetry.as_ref(), telemetry_run_id.as_ref())
+            {
+                let payload = protocol_telemetry::RunFailed {
+                    run_id: run_id.clone(),
+                    kind: telemetry_kind.map(|value| value.to_string()),
+                    duration_ms: telemetry_start.elapsed().as_millis() as u64,
+                    error_class: classify_pipeline_error(&err),
+                };
+                recorder.emit_domain(
+                    protocol_telemetry::events::RUN_FAIL,
+                    Some(run_id),
+                    None,
+                    &payload,
+                );
+            }
+            Err(err)
+        }
     }
-
-    let snapshot_id = store.create_selection_snapshot(
-        &selection_spec_id,
-        &snapshot_hash,
-        &logical_date_str,
-        resolution.watermark_value.as_deref(),
-    )?;
-
-    store.insert_snapshot_files(&snapshot_id, &resolution.file_ids)?;
-
-    let status = if resolution.file_ids.is_empty() {
-        PipelineRunStatus::NoOp
-    } else {
-        PipelineRunStatus::Queued
-    };
-    let run_id = store.create_pipeline_run(
-        &pipeline.id,
-        &selection_spec_id,
-        &snapshot_hash,
-        None,
-        &logical_date_str,
-        status,
-    )?;
-
-    let summary = if status == PipelineRunStatus::NoOp {
-        store.set_pipeline_run_status(&run_id, PipelineRunStatus::NoOp)?;
-        EnqueueSummary::default()
-    } else {
-        enqueue_jobs(
-            &conn,
-            &run_id,
-            &spec.pipeline.run.parser,
-            &resolution.file_ids,
-        )?
-    };
-
-    println!("Pipeline '{}' queued (run id: {})", name, run_id);
-    println!("Logical date: {}", logical_date_str);
-    println!("Files matched: {}", resolution.file_ids.len());
-    if summary.queued > 0 || summary.skipped > 0 {
-        println!(
-            "Files queued: {} (skipped {})",
-            summary.queued, summary.skipped
-        );
-    }
-    println!("Snapshot hash: {}", snapshot_hash);
-    Ok(())
 }
 
-fn backfill_pipeline(name: &str, start: &str, end: &str, dry_run: bool) -> Result<()> {
+fn backfill_pipeline(
+    name: &str,
+    start: &str,
+    end: &str,
+    dry_run: bool,
+    telemetry: Option<TelemetryRecorder>,
+    telemetry_kind: Option<&str>,
+) -> Result<()> {
     let start_dt = parse_logical_date(Some(start))?;
     let end_dt = parse_logical_date(Some(end))?;
     let mut current = chrono::NaiveDate::parse_from_str(&start_dt.0, "%Y-%m-%d")?;
@@ -331,7 +461,13 @@ fn backfill_pipeline(name: &str, start: &str, end: &str, dry_run: bool) -> Resul
 
     while current <= end_date {
         let date_str = current.format("%Y-%m-%d").to_string();
-        run_pipeline(name, Some(date_str), dry_run)?;
+        run_pipeline(
+            name,
+            Some(date_str),
+            dry_run,
+            telemetry.clone(),
+            telemetry_kind,
+        )?;
         current = current
             .succ_opt()
             .ok_or_else(|| anyhow::anyhow!("Invalid date increment"))?;
@@ -343,6 +479,14 @@ fn load_pipeline_file(path: &PathBuf) -> Result<PipelineFile> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read pipeline file: {}", path.display()))?;
     serde_yaml::from_str(&contents).context("Failed to parse pipeline YAML")
+}
+
+fn classify_pipeline_error(err: &anyhow::Error) -> String {
+    if err.is::<std::io::Error>() {
+        "io_error".to_string()
+    } else {
+        "pipeline_error".to_string()
+    }
 }
 
 fn parse_logical_date(input: Option<&str>) -> Result<(String, i64)> {
@@ -363,7 +507,10 @@ fn parse_logical_date(input: Option<&str>) -> Result<(String, i64)> {
     Ok((date_str, dt.timestamp_millis()))
 }
 
-fn build_filters(selection: &SelectionConfig) -> Result<(SelectionFilters, Option<i64>)> {
+fn build_filters(
+    selection: &SelectionConfig,
+    workspace_id: WorkspaceId,
+) -> Result<(SelectionFilters, Option<i64>)> {
     let watermark = selection
         .watermark
         .as_deref()
@@ -387,6 +534,7 @@ fn build_filters(selection: &SelectionConfig) -> Result<(SelectionFilters, Optio
         .context("Invalid source ID in selection config")?;
 
     let filters = SelectionFilters {
+        workspace_id: Some(workspace_id),
         source_id,
         tag: selection.tag.clone(),
         extension: selection.ext.clone(),
@@ -394,6 +542,125 @@ fn build_filters(selection: &SelectionConfig) -> Result<(SelectionFilters, Optio
         watermark,
     };
     Ok((filters, since_ms))
+}
+
+fn resolve_workspace_id(conn: &DbConnection, selection: &SelectionConfig) -> Result<WorkspaceId> {
+    if let Some(raw) = selection.workspace.as_deref() {
+        let workspace_id = resolve_workspace_ref(conn, raw)?;
+        return Ok(workspace_id);
+    }
+
+    let active = match context::get_active_workspace_id() {
+        Ok(active) => active,
+        Err(err) => {
+            warn!(error = %err, "Workspace context invalid; resetting");
+            let _ = context::clear_active_workspace();
+            None
+        }
+    };
+
+    if let Some(active_id) = active {
+        if workspace_exists(conn, &active_id)? {
+            return Ok(active_id);
+        }
+        warn!(workspace_id = %active_id, "Active workspace not found; resetting");
+        let _ = context::clear_active_workspace();
+    }
+
+    let workspace_id = ensure_default_workspace_id(conn)?;
+    let _ = context::set_active_workspace(&workspace_id);
+    Ok(workspace_id)
+}
+
+fn resolve_workspace_ref(conn: &DbConnection, raw: &str) -> Result<WorkspaceId> {
+    if let Ok(id) = WorkspaceId::parse(raw) {
+        if workspace_exists(conn, &id)? {
+            return Ok(id);
+        }
+    }
+
+    let row = conn.query_optional(
+        "SELECT id FROM cf_workspaces WHERE name = ?",
+        &[DbValue::from(raw)],
+    )?;
+    if let Some(row) = row {
+        let id_raw: String = row.get(0)?;
+        return WorkspaceId::parse(&id_raw).map_err(Into::into);
+    }
+
+    Err(anyhow::anyhow!("Workspace '{}' not found", raw))
+}
+
+fn workspace_exists(conn: &DbConnection, workspace_id: &WorkspaceId) -> Result<bool> {
+    let row = conn.query_optional(
+        "SELECT 1 FROM cf_workspaces WHERE id = ?",
+        &[DbValue::from(workspace_id.to_string())],
+    )?;
+    Ok(row.is_some())
+}
+
+fn ensure_default_workspace_id(conn: &DbConnection) -> Result<WorkspaceId> {
+    let row = conn.query_optional(
+        "SELECT id FROM cf_workspaces WHERE name = ? LIMIT 1",
+        &[DbValue::from("Default")],
+    )?;
+    if let Some(row) = row {
+        let id_raw: String = row.get(0)?;
+        return WorkspaceId::parse(&id_raw).map_err(Into::into);
+    }
+
+    let row = conn.query_optional(
+        "SELECT id FROM cf_workspaces ORDER BY created_at ASC LIMIT 1",
+        &[],
+    )?;
+    if let Some(row) = row {
+        let id_raw: String = row.get(0)?;
+        return WorkspaceId::parse(&id_raw).map_err(Into::into);
+    }
+
+    let workspace_id = WorkspaceId::new();
+    let now = Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT INTO cf_workspaces (id, name, created_at) VALUES (?, ?, ?)",
+        &[
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from("Default"),
+            DbValue::from(now),
+        ],
+    )?;
+
+    Ok(workspace_id)
+}
+
+fn validate_source_scope(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+    source_id: Option<SourceId>,
+) -> Result<()> {
+    let Some(source_id) = source_id else {
+        return Ok(());
+    };
+
+    let row = conn.query_optional(
+        "SELECT workspace_id FROM scout_sources WHERE id = ?",
+        &[DbValue::from(source_id.as_i64())],
+    )?;
+    let Some(row) = row else {
+        return Err(anyhow::anyhow!("Source '{}' not found", source_id));
+    };
+
+    let workspace_raw: String = row.get(0)?;
+    let source_workspace = WorkspaceId::parse(&workspace_raw)?;
+    if &source_workspace != workspace_id {
+        return Err(anyhow::anyhow!(
+            "Source '{}' belongs to workspace '{}', not active workspace '{}'",
+            source_id,
+            source_workspace,
+            workspace_id
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_duration_ms(raw: &str) -> Result<i64> {
@@ -625,28 +892,6 @@ fn load_sink_configs(
     apply_contract_overrides(&storage, parser, parser_version, sinks)
 }
 
-fn load_existing_output_targets(
-    conn: &DbConnection,
-    parser: &str,
-    parser_fingerprint: &str,
-) -> Result<Vec<String>> {
-    if !table_exists(conn, "cf_output_materializations")? {
-        return Ok(Vec::new());
-    }
-    let rows = conn.query_all(
-        r#"
-        SELECT DISTINCT output_target_key
-        FROM cf_output_materializations
-        WHERE plugin_name = ? AND parser_fingerprint = ?
-        "#,
-        &[DbValue::from(parser), DbValue::from(parser_fingerprint)],
-    )?;
-    Ok(rows
-        .iter()
-        .filter_map(|row| row.get_by_name::<String>("output_target_key").ok())
-        .collect())
-}
-
 fn load_file_generation(conn: &DbConnection, file_ids: &[i64]) -> Result<HashMap<i64, (i64, i64)>> {
     if file_ids.is_empty() {
         return Ok(HashMap::new());
@@ -700,22 +945,79 @@ fn load_existing_materialization_keys(
     Ok(existing)
 }
 
-fn output_target_keys_for_sinks(sinks: &[SinkConfig]) -> Vec<String> {
-    sinks
-        .iter()
-        .filter(|sink| !is_default_sink(&sink.topic))
-        .map(|sink| {
+/// Generate output target keys for the given sink configurations.
+///
+/// For explicit topics (not `*` or `output`), uses the topic name directly.
+/// For default sinks (`*` or `output`), expands to all known outputs from
+/// the plugin manifest using `ExpectedOutputs::list_for_plugin()`.
+///
+/// If the plugin has no declared outputs, returns an empty vec which triggers
+/// conservative fallback behavior in the caller (forces reprocessing).
+fn output_target_keys_for_sinks(
+    conn: &DbConnection,
+    sinks: &[SinkConfig],
+    parser: &str,
+    parser_version: &str,
+) -> Result<Vec<String>> {
+    let mut keys = Vec::new();
+    let mut default_sink: Option<&SinkConfig> = None;
+
+    // Process explicit topics directly
+    for sink in sinks {
+        if is_default_sink(&sink.topic) {
+            // Remember the default sink for later expansion
+            default_sink = Some(sink);
+        } else {
+            // Explicit topic - use directly
             let schema = schema_hash(sink.schema.as_ref());
             let table_name = table_name_with_schema(&sink.topic, schema.as_deref());
-            output_target_key(
+            keys.push(output_target_key(
                 &sink.topic,
                 &sink.uri,
                 sink.mode,
                 Some(table_name.as_str()),
                 schema.as_deref(),
-            )
-        })
-        .collect()
+            ));
+        }
+    }
+
+    // Expand default sink to all known plugin outputs
+    if let Some(sink) = default_sink {
+        let expected_outputs = ExpectedOutputs::list_for_plugin(
+            conn,
+            parser,
+            if parser_version.is_empty() {
+                None
+            } else {
+                Some(parser_version)
+            },
+        )?;
+
+        if expected_outputs.is_empty() {
+            // Unknown plugin or no declared outputs - log warning
+            // Return empty vec to trigger conservative fallback (force reprocessing)
+            warn!(
+                parser = parser,
+                "Plugin has no declared outputs in manifest; using conservative fallback (jobs will be enqueued)"
+            );
+            return Ok(Vec::new());
+        }
+
+        // Expand default sink to each known output
+        for output in &expected_outputs {
+            let table_name =
+                table_name_with_schema(&output.output_name, output.schema_hash.as_deref());
+            keys.push(output_target_key(
+                &output.output_name,
+                &sink.uri,
+                sink.mode,
+                Some(table_name.as_str()),
+                output.schema_hash.as_deref(),
+            ));
+        }
+    }
+
+    Ok(keys)
 }
 
 impl PipelineStoreHandle {
@@ -737,11 +1039,7 @@ fn enqueue_jobs(
 
     let manifest = load_parser_manifest(conn, parser)?;
     let sinks = load_sink_configs(conn, parser, &manifest.version)?;
-    let mut output_targets = output_target_keys_for_sinks(&sinks);
-
-    if output_targets.is_empty() {
-        output_targets = load_existing_output_targets(conn, parser, &manifest.fingerprint)?;
-    }
+    let output_targets = output_target_keys_for_sinks(conn, &sinks, parser, &manifest.version)?;
 
     let file_meta = load_file_generation(conn, file_ids)?;
     let mut keys_by_file: HashMap<i64, Vec<String>> = HashMap::new();
@@ -800,4 +1098,250 @@ fn ensure_queue_schema(conn: &DbConnection) -> Result<()> {
     let queue = casparian_sentinel::JobQueue::new(conn.clone());
     queue.init_queue_schema()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use casparian_db::DbTimestamp;
+
+    fn setup_db() -> DbConnection {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+        // Initialize registry schema for ExpectedOutputs
+        let queue = casparian_sentinel::JobQueue::new(conn.clone());
+        queue.init_registry_schema().unwrap();
+        conn
+    }
+
+    fn insert_plugin(conn: &DbConnection, plugin_name: &str, version: &str, outputs_json: &str) {
+        let now = DbTimestamp::now();
+        let source_hash = format!("hash_{}_{}", plugin_name, version);
+        conn.execute(
+            r#"
+            INSERT INTO cf_plugin_manifest (
+                plugin_name, version, runtime_kind, entrypoint,
+                source_code, source_hash, status, env_hash, artifact_hash,
+                manifest_json, protocol_version, schema_artifacts_json, outputs_json,
+                signature_verified, created_at, deployed_at
+            ) VALUES (?, ?, 'python_shim', 'test.py:parse', 'code', ?, 'ACTIVE', '', '',
+                      '{}', '1.0', '{}', ?, false, ?, ?)
+            "#,
+            &[
+                DbValue::from(plugin_name),
+                DbValue::from(version),
+                DbValue::from(source_hash.as_str()),
+                DbValue::from(outputs_json),
+                DbValue::from(now.clone()),
+                DbValue::from(now),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_is_default_sink_wildcard() {
+        assert!(is_default_sink("*"));
+        assert!(is_default_sink("output"));
+        assert!(!is_default_sink("orders"));
+        assert!(!is_default_sink("events"));
+        assert!(!is_default_sink(""));
+    }
+
+    #[test]
+    fn test_output_target_keys_explicit_topic() {
+        let conn = setup_db();
+        insert_plugin(&conn, "test_parser", "1.0.0", r#"{"orders": {}}"#);
+
+        let sinks = vec![SinkConfig {
+            topic: "orders".to_string(),
+            uri: "parquet://./output".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let keys = output_target_keys_for_sinks(&conn, &sinks, "test_parser", "1.0.0").unwrap();
+
+        // Should return exactly one key for the explicit topic
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn test_output_target_keys_default_sink_expands_to_plugin_outputs() {
+        let conn = setup_db();
+        // Plugin declares two outputs: orders and events
+        insert_plugin(
+            &conn,
+            "multi_output_parser",
+            "1.0.0",
+            r#"{"orders": {}, "events": {}}"#,
+        );
+
+        let sinks = vec![SinkConfig {
+            topic: "*".to_string(), // Default sink
+            uri: "parquet://./output".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let keys =
+            output_target_keys_for_sinks(&conn, &sinks, "multi_output_parser", "1.0.0").unwrap();
+
+        // Should return two keys - one for each declared output
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_output_target_keys_default_sink_with_output_topic() {
+        let conn = setup_db();
+        insert_plugin(&conn, "single_output_parser", "1.0.0", r#"{"results": {}}"#);
+
+        let sinks = vec![SinkConfig {
+            topic: "output".to_string(), // Another default sink variant
+            uri: "parquet://./data".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let keys =
+            output_target_keys_for_sinks(&conn, &sinks, "single_output_parser", "1.0.0").unwrap();
+
+        // Should return one key for the declared output
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn test_output_target_keys_unknown_plugin_returns_empty() {
+        let conn = setup_db();
+        // Don't insert any plugin
+
+        let sinks = vec![SinkConfig {
+            topic: "*".to_string(),
+            uri: "parquet://./output".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let keys = output_target_keys_for_sinks(&conn, &sinks, "nonexistent_parser", "").unwrap();
+
+        // Should return empty vec for unknown plugin (triggers conservative fallback)
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_output_target_keys_plugin_with_no_outputs_returns_empty() {
+        let conn = setup_db();
+        // Plugin exists but has empty outputs
+        insert_plugin(&conn, "empty_parser", "1.0.0", "{}");
+
+        let sinks = vec![SinkConfig {
+            topic: "*".to_string(),
+            uri: "parquet://./output".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let keys = output_target_keys_for_sinks(&conn, &sinks, "empty_parser", "1.0.0").unwrap();
+
+        // Should return empty vec (triggers conservative fallback)
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn test_output_target_keys_mixed_explicit_and_default() {
+        let conn = setup_db();
+        insert_plugin(
+            &conn,
+            "mixed_parser",
+            "1.0.0",
+            r#"{"orders": {}, "events": {}}"#,
+        );
+
+        // Mix of explicit topic and default sink
+        let sinks = vec![
+            SinkConfig {
+                topic: "custom_output".to_string(), // Explicit
+                uri: "parquet://./custom".to_string(),
+                mode: SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+            SinkConfig {
+                topic: "*".to_string(), // Default - will expand
+                uri: "parquet://./output".to_string(),
+                mode: SinkMode::Append,
+                quarantine_config: None,
+                schema: None,
+            },
+        ];
+
+        let keys = output_target_keys_for_sinks(&conn, &sinks, "mixed_parser", "1.0.0").unwrap();
+
+        // 1 explicit + 2 from expansion = 3 keys
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[test]
+    fn test_output_target_keys_changing_uri_produces_different_keys() {
+        let conn = setup_db();
+        insert_plugin(&conn, "uri_test_parser", "1.0.0", r#"{"data": {}}"#);
+
+        let sinks1 = vec![SinkConfig {
+            topic: "*".to_string(),
+            uri: "parquet://./output_v1".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let sinks2 = vec![SinkConfig {
+            topic: "*".to_string(),
+            uri: "parquet://./output_v2".to_string(), // Different URI
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let keys1 =
+            output_target_keys_for_sinks(&conn, &sinks1, "uri_test_parser", "1.0.0").unwrap();
+        let keys2 =
+            output_target_keys_for_sinks(&conn, &sinks2, "uri_test_parser", "1.0.0").unwrap();
+
+        // Keys should be different due to different URIs
+        assert_ne!(keys1, keys2);
+    }
+
+    #[test]
+    fn test_output_target_keys_changing_mode_produces_different_keys() {
+        let conn = setup_db();
+        insert_plugin(&conn, "mode_test_parser", "1.0.0", r#"{"data": {}}"#);
+
+        let sinks1 = vec![SinkConfig {
+            topic: "*".to_string(),
+            uri: "parquet://./output".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let sinks2 = vec![SinkConfig {
+            topic: "*".to_string(),
+            uri: "parquet://./output".to_string(),
+            mode: SinkMode::Replace, // Different mode
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let keys1 =
+            output_target_keys_for_sinks(&conn, &sinks1, "mode_test_parser", "1.0.0").unwrap();
+        let keys2 =
+            output_target_keys_for_sinks(&conn, &sinks2, "mode_test_parser", "1.0.0").unwrap();
+
+        // Keys should be different due to different modes
+        assert_ne!(keys1, keys2);
+    }
 }

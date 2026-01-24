@@ -38,6 +38,7 @@ pub mod publish;
 pub mod runner;
 pub mod scout;
 pub mod storage;
+pub mod telemetry;
 pub mod trust;
 
 #[path = "cli/tui/extraction.rs"]

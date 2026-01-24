@@ -1,4 +1,4 @@
-use crate::scout::SourceId;
+use crate::scout::{SourceId, WorkspaceId};
 use casparian_protocol::PipelineRunStatus;
 
 /// A resolved snapshot of files for a logical execution date.
@@ -21,6 +21,7 @@ pub enum WatermarkField {
 /// Structured filters for selecting files from the catalog.
 #[derive(Debug, Clone, Default)]
 pub struct SelectionFilters {
+    pub workspace_id: Option<WorkspaceId>,
     pub source_id: Option<SourceId>,
     pub tag: Option<String>,
     pub extension: Option<String>,

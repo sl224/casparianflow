@@ -4,8 +4,10 @@
 
 use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
+use crate::cli::workspace;
 use crate::cli::output::{format_size, print_table};
-use casparian::scout::{Database, FileStatus};
+use casparian::scout::{Database, FileStatus, TaggingRuleId, WorkspaceId};
+use casparian_db::DbValue;
 use clap::Subcommand;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -54,36 +56,292 @@ struct TopicStats {
     total_size: u64,
 }
 
+#[derive(Debug, Clone)]
+struct TopicFile {
+    id: i64,
+    path: String,
+    rel_path: String,
+    size: u64,
+    status: FileStatus,
+    error: Option<String>,
+}
+
+fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
+    workspace::resolve_active_workspace_id(db).map_err(|e| {
+        e.with_context("The workspace registry is required for topics")
+    })
+}
+
 /// Get all topics and their statistics from the database
-fn get_topic_stats(db: &Database) -> HashMap<String, TopicStats> {
+fn get_topic_stats(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<HashMap<String, TopicStats>, HelpfulError> {
     let mut stats: HashMap<String, TopicStats> = HashMap::new();
 
-    // Get all sources
-    let sources = db.list_sources().unwrap_or_default();
+    let pending = [
+        FileStatus::Pending.as_str(),
+        FileStatus::Tagged.as_str(),
+        FileStatus::Queued.as_str(),
+        FileStatus::Processing.as_str(),
+    ];
 
-    for source in sources {
-        let files = db
-            .list_files_by_source(&source.id, 100000)
-            .unwrap_or_default();
-        for file in files {
-            let topic = file.tag.clone().unwrap_or_else(|| "(untagged)".to_string());
-            let entry = stats.entry(topic).or_default();
-            entry.total += 1;
-            entry.total_size += file.size;
+    let rows = conn
+        .query_all(
+            &format!(
+                "SELECT t.tag AS tag, \
+                        COUNT(*) AS total, \
+                        SUM(CASE WHEN f.status = '{processed}' THEN 1 ELSE 0 END) AS processed, \
+                        SUM(CASE WHEN f.status IN ('{pending}', '{tagged}', '{queued}', '{processing}') THEN 1 ELSE 0 END) AS pending, \
+                        SUM(CASE WHEN f.status = '{failed}' THEN 1 ELSE 0 END) AS failed, \
+                        SUM(f.size) AS total_size \
+                 FROM scout_file_tags t \
+                 JOIN scout_files f ON f.id = t.file_id \
+                 WHERE t.workspace_id = ? \
+                 GROUP BY t.tag",
+                processed = FileStatus::Processed.as_str(),
+                pending = pending[0],
+                tagged = pending[1],
+                queued = pending[2],
+                processing = pending[3],
+                failed = FileStatus::Failed.as_str(),
+            ),
+            &[DbValue::from(workspace_id.to_string())],
+        )
+        .map_err(|e| {
+            HelpfulError::new(format!("Failed to query topic stats: {}", e))
+                .with_context("The scout_file_tags table may not exist")
+        })?;
 
-            match file.status {
-                FileStatus::Processed => entry.processed += 1,
-                FileStatus::Pending
-                | FileStatus::Tagged
-                | FileStatus::Queued
-                | FileStatus::Processing => entry.pending += 1,
-                FileStatus::Failed => entry.failed += 1,
-                FileStatus::Skipped | FileStatus::Deleted => {}
-            }
+    for row in rows {
+        let tag: String = row
+            .get_by_name("tag")
+            .map_err(|e| HelpfulError::new(format!("Failed to read tag: {}", e)))?;
+        let entry = stats.entry(tag).or_default();
+        let total: i64 = row
+            .get_by_name("total")
+            .map_err(|e| HelpfulError::new(format!("Failed to read total: {}", e)))?;
+        let processed: i64 = row
+            .get_by_name::<Option<i64>>("processed")
+            .map_err(|e| HelpfulError::new(format!("Failed to read processed: {}", e)))?
+            .unwrap_or(0);
+        let pending: i64 = row
+            .get_by_name::<Option<i64>>("pending")
+            .map_err(|e| HelpfulError::new(format!("Failed to read pending: {}", e)))?
+            .unwrap_or(0);
+        let failed: i64 = row
+            .get_by_name::<Option<i64>>("failed")
+            .map_err(|e| HelpfulError::new(format!("Failed to read failed: {}", e)))?
+            .unwrap_or(0);
+        let total_size: i64 = row
+            .get_by_name::<Option<i64>>("total_size")
+            .map_err(|e| HelpfulError::new(format!("Failed to read total_size: {}", e)))?
+            .unwrap_or(0);
+        entry.total = total as u64;
+        entry.processed = processed as u64;
+        entry.pending = pending as u64;
+        entry.failed = failed as u64;
+        entry.total_size = total_size as u64;
+    }
+
+    // Untagged files
+    let untagged_row = conn
+        .query_optional(
+            &format!(
+                "SELECT COUNT(*) AS total, \
+                        SUM(CASE WHEN f.status = '{processed}' THEN 1 ELSE 0 END) AS processed, \
+                        SUM(CASE WHEN f.status IN ('{pending}', '{tagged}', '{queued}', '{processing}') THEN 1 ELSE 0 END) AS pending, \
+                        SUM(CASE WHEN f.status = '{failed}' THEN 1 ELSE 0 END) AS failed, \
+                        SUM(f.size) AS total_size \
+                 FROM scout_files f \
+                 LEFT JOIN scout_file_tags t \
+                    ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
+                 WHERE f.workspace_id = ? AND t.file_id IS NULL",
+                processed = FileStatus::Processed.as_str(),
+                pending = pending[0],
+                tagged = pending[1],
+                queued = pending[2],
+                processing = pending[3],
+                failed = FileStatus::Failed.as_str(),
+            ),
+            &[DbValue::from(workspace_id.to_string())],
+        )
+        .map_err(|e| HelpfulError::new(format!("Failed to query untagged stats: {}", e)))?;
+
+    if let Some(row) = untagged_row {
+        let total: i64 = row
+            .get_by_name("total")
+            .map_err(|e| HelpfulError::new(format!("Failed to read untagged total: {}", e)))?;
+        if total > 0 {
+            let entry = stats.entry("(untagged)".to_string()).or_default();
+            let processed: i64 = row
+                .get_by_name::<Option<i64>>("processed")
+                .map_err(|e| HelpfulError::new(format!("Failed to read processed: {}", e)))?
+                .unwrap_or(0);
+            let pending: i64 = row
+                .get_by_name::<Option<i64>>("pending")
+                .map_err(|e| HelpfulError::new(format!("Failed to read pending: {}", e)))?
+                .unwrap_or(0);
+            let failed: i64 = row
+                .get_by_name::<Option<i64>>("failed")
+                .map_err(|e| HelpfulError::new(format!("Failed to read failed: {}", e)))?
+                .unwrap_or(0);
+            let total_size: i64 = row
+                .get_by_name::<Option<i64>>("total_size")
+                .map_err(|e| HelpfulError::new(format!("Failed to read total_size: {}", e)))?
+                .unwrap_or(0);
+            entry.total = total as u64;
+            entry.processed = processed as u64;
+            entry.pending = pending as u64;
+            entry.failed = failed as u64;
+            entry.total_size = total_size as u64;
         }
     }
 
-    stats
+    Ok(stats)
+}
+
+fn list_files_for_tag(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    tag: &str,
+    limit: usize,
+) -> Result<Vec<TopicFile>, HelpfulError> {
+    let rows = conn
+        .query_all(
+            "SELECT f.id, f.path, f.rel_path, f.size, f.status, f.error \
+             FROM scout_files f \
+             JOIN scout_file_tags t \
+                ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
+             WHERE f.workspace_id = ? AND t.tag = ? \
+             ORDER BY f.mtime DESC \
+             LIMIT ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(tag),
+                DbValue::from(limit as i64),
+            ],
+        )
+        .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+
+    rows.into_iter()
+        .map(|row| {
+            let status_raw: String = row
+                .get_by_name("status")
+                .map_err(|e| HelpfulError::new(format!("Failed to read status: {}", e)))?;
+            let status = FileStatus::parse(&status_raw).ok_or_else(|| {
+                HelpfulError::new(format!("Invalid status in database: {}", status_raw))
+            })?;
+            Ok(TopicFile {
+                id: row
+                    .get_by_name("id")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read id: {}", e)))?,
+                path: row
+                    .get_by_name("path")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read path: {}", e)))?,
+                rel_path: row
+                    .get_by_name("rel_path")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read rel_path: {}", e)))?,
+                size: {
+                    let size_raw: i64 = row
+                        .get_by_name("size")
+                        .map_err(|e| HelpfulError::new(format!("Failed to read size: {}", e)))?;
+                    size_raw as u64
+                },
+                status,
+                error: row
+                    .get_by_name("error")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read error: {}", e)))?,
+            })
+        })
+        .collect()
+}
+
+fn list_untagged_files(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    limit: usize,
+) -> Result<Vec<TopicFile>, HelpfulError> {
+    let rows = conn
+        .query_all(
+            "SELECT f.id, f.path, f.rel_path, f.size, f.status, f.error \
+             FROM scout_files f \
+             LEFT JOIN scout_file_tags t \
+                ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
+             WHERE f.workspace_id = ? AND t.file_id IS NULL \
+             ORDER BY f.mtime DESC \
+             LIMIT ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(limit as i64),
+            ],
+        )
+        .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+
+    rows.into_iter()
+        .map(|row| {
+            let status_raw: String = row
+                .get_by_name("status")
+                .map_err(|e| HelpfulError::new(format!("Failed to read status: {}", e)))?;
+            let status = FileStatus::parse(&status_raw).ok_or_else(|| {
+                HelpfulError::new(format!("Invalid status in database: {}", status_raw))
+            })?;
+            Ok(TopicFile {
+                id: row
+                    .get_by_name("id")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read id: {}", e)))?,
+                path: row
+                    .get_by_name("path")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read path: {}", e)))?,
+                rel_path: row
+                    .get_by_name("rel_path")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read rel_path: {}", e)))?,
+                size: {
+                    let size_raw: i64 = row
+                        .get_by_name("size")
+                        .map_err(|e| HelpfulError::new(format!("Failed to read size: {}", e)))?;
+                    size_raw as u64
+                },
+                status,
+                error: row
+                    .get_by_name("error")
+                    .map_err(|e| HelpfulError::new(format!("Failed to read error: {}", e)))?,
+            })
+        })
+        .collect()
+}
+
+fn get_rule_match_counts(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    tag: &str,
+) -> Result<HashMap<TaggingRuleId, u64>, HelpfulError> {
+    let rows = conn
+        .query_all(
+            "SELECT rule_id, COUNT(*) AS matched \
+             FROM scout_file_tags \
+             WHERE workspace_id = ? AND tag = ? AND rule_id IS NOT NULL \
+             GROUP BY rule_id",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(tag),
+            ],
+        )
+        .map_err(|e| HelpfulError::new(format!("Failed to query rule matches: {}", e)))?;
+
+    let mut counts = HashMap::new();
+    for row in rows {
+        let rule_id_raw: String = row
+            .get_by_name("rule_id")
+            .map_err(|e| HelpfulError::new(format!("Failed to read rule_id: {}", e)))?;
+        let rule_id = TaggingRuleId::parse(&rule_id_raw)
+            .map_err(|e| HelpfulError::new(format!("Invalid rule_id: {}", e)))?;
+        let matched_raw: i64 = row
+            .get_by_name("matched")
+            .map_err(|e| HelpfulError::new(format!("Failed to read matched: {}", e)))?;
+        counts.insert(rule_id, matched_raw as u64);
+    }
+    Ok(counts)
 }
 
 /// Execute the topic command
@@ -98,21 +356,27 @@ fn run_with_action(action: TopicAction) -> anyhow::Result<()> {
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
+    let workspace_id = ensure_workspace_id(&db)?;
+    let conn = db.conn();
 
     match action {
-        TopicAction::List { json } => list_topics(&db, json),
+        TopicAction::List { json } => list_topics(conn, &workspace_id, json),
         TopicAction::Create {
             name,
             description: _,
-        } => create_topic(&db, &name),
-        TopicAction::Show { name, json } => show_topic(&db, &name, json),
-        TopicAction::Delete { name, force } => delete_topic(&db, &name, force),
-        TopicAction::Files { name, limit } => list_topic_files(&db, &name, limit),
+        } => create_topic(&db, conn, &workspace_id, &name),
+        TopicAction::Show { name, json } => show_topic(&db, conn, &workspace_id, &name, json),
+        TopicAction::Delete { name, force } => delete_topic(&db, conn, &workspace_id, &name, force),
+        TopicAction::Files { name, limit } => list_topic_files(conn, &workspace_id, &name, limit),
     }
 }
 
-fn list_topics(db: &Database, json: bool) -> anyhow::Result<()> {
-    let stats = get_topic_stats(db);
+fn list_topics(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    json: bool,
+) -> anyhow::Result<()> {
+    let stats = get_topic_stats(conn, workspace_id)?;
 
     if stats.is_empty() {
         println!("No topics found.");
@@ -165,12 +429,17 @@ fn list_topics(db: &Database, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
+fn create_topic(
+    db: &Database,
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    name: &str,
+) -> anyhow::Result<()> {
     // Topics are implicit - they exist when files are tagged with them
     // But we can create a rule that uses this topic to make it "real"
 
     // Check if topic already has files
-    let stats = get_topic_stats(db);
+    let stats = get_topic_stats(conn, workspace_id)?;
     if stats.contains_key(name) {
         return Err(HelpfulError::new(format!("Topic already exists: {}", name))
             .with_context(format!(
@@ -182,7 +451,7 @@ fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
     }
 
     // Check if there's already a rule for this topic
-    let rules = db.list_tagging_rules()?;
+    let rules = db.list_tagging_rules(workspace_id)?;
     let has_rule = rules.iter().any(|r| r.tag == name);
 
     if has_rule {
@@ -206,13 +475,19 @@ fn create_topic(db: &Database, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
-    let stats = get_topic_stats(db);
+fn show_topic(
+    db: &Database,
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    name: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let stats = get_topic_stats(conn, workspace_id)?;
     let topic_stats = stats.get(name);
 
     if topic_stats.is_none() && name != "(untagged)" {
         // Check if there's a rule for this topic
-        let rules = db.list_tagging_rules()?;
+        let rules = db.list_tagging_rules(workspace_id)?;
         let has_rule = rules.iter().any(|r| r.tag == name);
 
         if !has_rule {
@@ -224,11 +499,15 @@ fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
     }
 
     // Get rules that produce this topic
-    let rules = db.list_tagging_rules()?;
+    let rules = db.list_tagging_rules(workspace_id)?;
     let topic_rules: Vec<_> = rules.iter().filter(|r| r.tag == name).collect();
 
     // Get files with this topic
-    let files = db.list_files_by_tag(name, 1000).unwrap_or_default();
+    let files = if name == "(untagged)" {
+        list_untagged_files(conn, workspace_id, 1000).unwrap_or_default()
+    } else {
+        list_files_for_tag(conn, workspace_id, name, 1000).unwrap_or_default()
+    };
 
     let parser: Option<(String, Option<i64>)> = None;
 
@@ -274,12 +553,9 @@ fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
     if topic_rules.is_empty() {
         println!("  (no rules configured)");
     } else {
+        let rule_matches = get_rule_match_counts(conn, workspace_id, name).unwrap_or_default();
         for rule in &topic_rules {
-            // Count matches for this rule
-            let matched = files
-                .iter()
-                .filter(|f| f.rule_id.as_ref() == Some(&rule.id))
-                .count();
+            let matched = rule_matches.get(&rule.id).copied().unwrap_or(0);
             println!("  {}     {} files matched", rule.pattern, matched);
         }
     }
@@ -375,13 +651,19 @@ fn show_topic(db: &Database, name: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
-    let stats = get_topic_stats(db);
+fn delete_topic(
+    db: &Database,
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    name: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let stats = get_topic_stats(conn, workspace_id)?;
     let topic_stats = stats.get(name);
 
     if topic_stats.is_none() {
         // Check rules
-        let rules = db.list_tagging_rules()?;
+        let rules = db.list_tagging_rules(workspace_id)?;
         let topic_rules: Vec<_> = rules.iter().filter(|r| r.tag == name).collect();
 
         if topic_rules.is_empty() {
@@ -410,18 +692,30 @@ fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
     }
 
     // Delete rules for this topic
-    let rules = db.list_tagging_rules()?;
+    let rules = db.list_tagging_rules(workspace_id)?;
     for rule in rules.iter().filter(|r| r.tag == name) {
         db.delete_tagging_rule(&rule.id).ok();
     }
 
-    // Untag files (set tag to NULL, status to pending)
-    let files = db.list_files_by_tag(name, 100000).unwrap_or_default();
-    for file in files {
-        if let Some(id) = file.id {
-            db.untag_file(id).ok();
-        }
-    }
+    // Remove tag assignments
+    let _ = conn.execute(
+        "DELETE FROM scout_file_tags WHERE workspace_id = ? AND tag = ?",
+        &[DbValue::from(workspace_id.to_string()), DbValue::from(name)],
+    );
+    let _ = conn.execute(
+        "UPDATE scout_files SET status = ?, sentinel_job_id = NULL, manual_plugin = NULL \
+         WHERE workspace_id = ? AND id IN ( \
+            SELECT f.id FROM scout_files f \
+            LEFT JOIN scout_file_tags t \
+               ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
+            WHERE f.workspace_id = ? AND t.file_id IS NULL \
+         )",
+        &[
+            DbValue::from(FileStatus::Pending.as_str()),
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(workspace_id.to_string()),
+        ],
+    );
 
     println!("Removed topic '{}'", name);
     println!("  {} files untagged", stats.total);
@@ -429,10 +723,17 @@ fn delete_topic(db: &Database, name: &str, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Result<()> {
-    let files = db
-        .list_files_by_tag(name, limit)
-        .map_err(|e| HelpfulError::new(format!("Failed to list files: {}", e)))?;
+fn list_topic_files(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    name: &str,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let files = if name == "(untagged)" {
+        list_untagged_files(conn, workspace_id, limit)?
+    } else {
+        list_files_for_tag(conn, workspace_id, name, limit)?
+    };
 
     if files.is_empty() {
         println!("No files tagged with '{}'", name);
@@ -461,14 +762,17 @@ fn list_topic_files(db: &Database, name: &str, limit: usize) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use casparian::scout::{ScannedFile, Source, SourceId, SourceType, TaggingRule, TaggingRuleId};
 
     #[test]
     fn test_get_topic_stats() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source_id = SourceId::new();
 
         let source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -488,6 +792,7 @@ mod tests {
         .enumerate()
         {
             let file = ScannedFile::new(
+                workspace_id,
                 source_id.clone(),
                 &format!("/data/{}", name),
                 name,
@@ -495,10 +800,20 @@ mod tests {
                 12345 + i as i64,
             );
             let result = db.upsert_file(&file).unwrap();
-            db.tag_file(result.id, topic).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO scout_file_tags (workspace_id, file_id, tag, tag_source, rule_id, created_at) VALUES (?, ?, ?, 'manual', NULL, ?)",
+                    &[
+                        DbValue::from(workspace_id.to_string()),
+                        DbValue::from(result.id),
+                        DbValue::from(*topic),
+                        DbValue::from(Utc::now().timestamp_millis()),
+                    ],
+                )
+                .unwrap();
         }
 
-        let stats = get_topic_stats(&db);
+        let stats = get_topic_stats(db.conn(), &workspace_id).unwrap();
         assert_eq!(stats.get("sales").map(|s| s.total), Some(2));
         assert_eq!(stats.get("invoices").map(|s| s.total), Some(1));
     }
@@ -506,9 +821,11 @@ mod tests {
     #[test]
     fn test_topic_with_rules() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source_id = SourceId::new();
 
         let source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -521,7 +838,7 @@ mod tests {
         let rule = TaggingRule {
             id: TaggingRuleId::new(),
             name: "CSV Files".to_string(),
-            source_id: source_id.clone(),
+            workspace_id,
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,
@@ -530,7 +847,7 @@ mod tests {
         db.upsert_tagging_rule(&rule).unwrap();
 
         // Check that we can find rules for the topic
-        let rules = db.list_tagging_rules().unwrap();
+        let rules = db.list_tagging_rules(&workspace_id).unwrap();
         let csv_rules: Vec<_> = rules.iter().filter(|r| r.tag == "csv_data").collect();
         assert_eq!(csv_rules.len(), 1);
     }
@@ -538,9 +855,11 @@ mod tests {
     #[test]
     fn test_delete_topic_removes_rules() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source_id = SourceId::new();
 
         let source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -553,7 +872,7 @@ mod tests {
         let rule = TaggingRule {
             id: TaggingRuleId::new(),
             name: "CSV Files".to_string(),
-            source_id: source_id.clone(),
+            workspace_id,
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,
@@ -564,7 +883,7 @@ mod tests {
         // Delete the rule
         db.delete_tagging_rule(&rule.id).unwrap();
 
-        let rules = db.list_tagging_rules().unwrap();
+        let rules = db.list_tagging_rules(&workspace_id).unwrap();
         assert!(rules.is_empty());
     }
 }

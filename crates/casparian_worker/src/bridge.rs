@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
+use crate::cancel::CancellationToken;
 /// Embedded Python bridge shim source code.
 /// This is baked into the binary at compile time for single-file distribution.
 const BRIDGE_SHIM_SOURCE: &str = include_str!("../shim/bridge_shim.py");
@@ -76,6 +77,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for read operations on the socket
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Poll interval for cancellation checks while reading
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Errors returned by bridge operations.
 #[derive(Debug, Error)]
@@ -207,6 +210,7 @@ pub struct BridgeConfig {
     pub file_id: i64,
     pub shim_path: PathBuf,
     pub inherit_stdio: bool,
+    pub cancel_token: CancellationToken,
 }
 
 /// Metadata about a single output from a parser
@@ -264,10 +268,20 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     );
 
     let mut process = spawn_guest(&config, port)?;
+    if config.cancel_token.is_cancelled() {
+        cleanup_process(&mut process);
+        anyhow::bail!("[Job {}] Cancelled before guest connected", job_id);
+    }
     let process_pid = process.id();
 
     // Accept connection WITH TIMEOUT
-    let mut stream = match accept_with_timeout(&listener, CONNECT_TIMEOUT, &mut process, job_id) {
+    let mut stream = match accept_with_timeout(
+        &listener,
+        CONNECT_TIMEOUT,
+        &mut process,
+        job_id,
+        &config.cancel_token,
+    ) {
         Ok(stream) => stream,
         Err(e) => {
             // Collect stderr for debugging before returning error
@@ -295,7 +309,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     // Set read timeout on the stream (may already be set in accept_with_timeout)
     // On macOS, this can fail with EINVAL if the peer has already closed
     // We try it anyway but don't fail if it doesn't work - the read will still work
-    if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
+    if let Err(e) = stream.set_read_timeout(Some(CANCEL_POLL_INTERVAL)) {
         warn!(
             "[Job {}] Could not set read timeout (may already be set or peer closed): {}",
             job_id, e
@@ -303,7 +317,8 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     }
 
     // Read all batches (log_writer receives sideband log messages)
-    let stream_result = match read_arrow_batches(&mut stream, job_id, &mut log_writer) {
+    let stream_result =
+        match read_arrow_batches(&mut stream, job_id, &mut log_writer, &config.cancel_token) {
         Ok(result) => result,
         Err(e) => {
             let stderr_output = collect_stderr(&mut process);
@@ -322,9 +337,10 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
     };
 
     // Wait for process to exit
-    let status = process
-        .wait()
-        .with_context(|| format!("[Job {}] Failed to wait for guest process", job_id))?;
+    let status =
+        wait_for_exit(&mut process, job_id, &config.cancel_token).with_context(|| {
+            format!("[Job {}] Failed to wait for guest process", job_id)
+        })?;
 
     // Always collect stderr for logging (even on success)
     let stderr_output = collect_stderr(&mut process);
@@ -417,6 +433,7 @@ fn accept_with_timeout(
     timeout: Duration,
     process: &mut Child,
     job_id: JobId,
+    cancel_token: &CancellationToken,
 ) -> Result<TcpStream> {
     // Use non-blocking mode with polling
     listener.set_nonblocking(true).with_context(|| {
@@ -430,6 +447,11 @@ fn accept_with_timeout(
     let poll_interval = Duration::from_millis(100);
 
     loop {
+        if cancel_token.is_cancelled() {
+            cleanup_process(process);
+            anyhow::bail!("[Job {}] Cancelled while waiting for guest", job_id);
+        }
+
         // Check if we've exceeded the timeout
         let elapsed = start.elapsed();
         if elapsed >= timeout {
@@ -448,7 +470,7 @@ fn accept_with_timeout(
             Ok((stream, _)) => {
                 // Set read timeout first (while still non-blocking) - this helps on macOS
                 // where the order of socket option calls matters
-                if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
+                if let Err(e) = stream.set_read_timeout(Some(CANCEL_POLL_INTERVAL)) {
                     debug!(
                         "[Job {}] Could not set read timeout in accept: {}",
                         job_id, e
@@ -483,7 +505,7 @@ fn accept_with_timeout(
                 match listener.accept() {
                     Ok((stream, _)) => {
                         // Try to set timeout, ignore if it fails on dead connection
-                        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+                        let _ = stream.set_read_timeout(Some(CANCEL_POLL_INTERVAL));
                         stream.set_nonblocking(false).with_context(|| {
                             format!("[Job {}] Failed to set TCP stream to blocking mode", job_id)
                         })?;
@@ -565,6 +587,24 @@ fn cleanup_process(process: &mut Child) {
     let _ = process.wait();
 }
 
+/// Wait for process exit, honoring cancellation.
+fn wait_for_exit(
+    process: &mut Child,
+    job_id: JobId,
+    cancel_token: &CancellationToken,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        if cancel_token.is_cancelled() {
+            cleanup_process(process);
+            anyhow::bail!("[Job {}] Cancelled while waiting for guest exit", job_id);
+        }
+        if let Some(status) = process.try_wait()? {
+            return Ok(status);
+        }
+        std::thread::sleep(CANCEL_POLL_INTERVAL);
+    }
+}
+
 /// Spawn the guest Python process using `uv run`
 ///
 /// Delegates to uv for correct Python environment setup on all platforms.
@@ -639,6 +679,7 @@ fn read_arrow_batches(
     stream: &mut TcpStream,
     job_id: JobId,
     log_writer: &mut JobLogWriter,
+    cancel_token: &CancellationToken,
 ) -> Result<StreamResult> {
     let mut outputs: Vec<Vec<RecordBatch>> = Vec::new();
     let mut metrics_json: Option<String> = None;
@@ -647,12 +688,18 @@ fn read_arrow_batches(
     let mut current_output_schema: Option<SchemaRef> = None;
     let mut batch_count = 0u32;
     let mut log_count = 0u32;
+    let mut last_activity = Instant::now();
 
     loop {
+        if cancel_token.is_cancelled() {
+            anyhow::bail!("[Job {}] Cancelled during bridge read", job_id);
+        }
         // Read 4-byte header
         let mut header_buf = [0u8; HEADER_SIZE];
         match stream.read_exact(&mut header_buf) {
-            Ok(_) => {}
+            Ok(_) => {
+                last_activity = Instant::now();
+            }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Connection closed cleanly
                 debug!("[Job {}] Socket closed by guest (EOF)", job_id);
@@ -662,14 +709,20 @@ fn read_arrow_batches(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                anyhow::bail!(
-                    "[Job {}] TIMEOUT: No data received from guest within {:.0}s. \
-                    The Python plugin may be hanging or performing very slow I/O. \
-                    Received {} batches before timeout.",
-                    job_id,
-                    READ_TIMEOUT.as_secs_f64(),
-                    batch_count
-                );
+                if cancel_token.is_cancelled() {
+                    anyhow::bail!("[Job {}] Cancelled during bridge read", job_id);
+                }
+                if last_activity.elapsed() >= READ_TIMEOUT {
+                    anyhow::bail!(
+                        "[Job {}] TIMEOUT: No data received from guest within {:.0}s. \
+                        The Python plugin may be hanging or performing very slow I/O. \
+                        Received {} batches before timeout.",
+                        job_id,
+                        READ_TIMEOUT.as_secs_f64(),
+                        batch_count
+                    );
+                }
+                continue;
             }
             Err(e) => {
                 anyhow::bail!(
@@ -1229,7 +1282,9 @@ mod tests {
             .unwrap();
 
         let mut log_writer = JobLogWriter::new(JobId::new(1)).unwrap();
-        let result = read_arrow_batches(&mut stream, JobId::new(1), &mut log_writer);
+        let cancel_token = CancellationToken::new();
+        let result =
+            read_arrow_batches(&mut stream, JobId::new(1), &mut log_writer, &cancel_token);
 
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();

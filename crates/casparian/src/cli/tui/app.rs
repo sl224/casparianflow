@@ -6,7 +6,7 @@
 //! They are scaffolding for active development. See specs/views/*.md.
 #![allow(dead_code)]
 
-use casparian_db::{DbConnection, DbValue};
+use casparian_db::{BackendError, DbConnection, DbValue};
 use casparian_mcp::intent::SessionStore;
 use casparian_protocol::{
     Approval as ProtoApproval, ApprovalOperation, ApprovalStatus as ProtoApprovalStatus,
@@ -15,15 +15,19 @@ use casparian_protocol::{
 use casparian_sentinel::ApiStorage;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
+use tracing::info_span;
 
 use super::TuiArgs;
 use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
 use casparian::scout::{
     scan_path, Database as ScoutDatabase, ScanProgress as ScoutProgress, Scanner as ScoutScanner,
-    Source, SourceId, SourceType, TaggingRuleId,
+    Source, SourceId, SourceType, TagSource, TaggingRuleId, Workspace, WorkspaceId,
 };
+use casparian::telemetry::{scan_config_telemetry, TelemetryRecorder};
+use casparian_protocol::telemetry as protocol_telemetry;
+use uuid::Uuid;
 
 /// Current TUI mode/screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -789,6 +793,7 @@ impl JobStatus {
             Some(ProcessingStatus::Pending) | Some(ProcessingStatus::Queued) => JobStatus::Pending,
             Some(ProcessingStatus::Running) | Some(ProcessingStatus::Staged) => JobStatus::Running,
             Some(ProcessingStatus::Skipped) => JobStatus::Completed,
+            Some(ProcessingStatus::Aborted) => JobStatus::Cancelled,
             Some(ProcessingStatus::Failed) => {
                 if matches!(completion_status, Some(ProtocolJobStatus::Aborted)) {
                     JobStatus::Cancelled
@@ -1972,6 +1977,9 @@ pub struct RuleInfo {
 pub struct PendingTagWrite {
     pub file_path: String,
     pub tag: String,
+    pub workspace_id: WorkspaceId,
+    pub tag_source: TagSource,
+    pub rule_id: Option<TaggingRuleId>,
 }
 
 /// Pending source update (name/path changes)
@@ -2045,9 +2053,10 @@ pub enum SampleEvalResult {
 /// Pending rule write for persistence
 #[derive(Debug, Clone)]
 pub struct PendingRuleWrite {
+    pub id: TaggingRuleId,
+    pub workspace_id: WorkspaceId,
     pub pattern: String,
     pub tag: String,
-    pub source_id: SourceId,
 }
 
 /// Pending rule update for persistence (enabled toggle)
@@ -2055,12 +2064,14 @@ pub struct PendingRuleWrite {
 pub struct PendingRuleUpdate {
     pub id: TaggingRuleId,
     pub enabled: bool,
+    pub workspace_id: WorkspaceId,
 }
 
 /// Pending rule delete for persistence
 #[derive(Debug, Clone)]
 pub struct PendingRuleDelete {
     pub id: TaggingRuleId,
+    pub workspace_id: WorkspaceId,
 }
 
 // ============================================================================
@@ -2096,6 +2107,8 @@ pub struct GlobExplorerState {
     pub cache_loaded: bool,
     /// Source ID for which cache was loaded (to detect source changes)
     pub cache_source_id: Option<SourceId>,
+    /// Workspace ID for which cache was loaded (to detect workspace changes)
+    pub cache_workspace_id: Option<WorkspaceId>,
 
     // --- UI state ---
     /// Currently selected folder index
@@ -2155,6 +2168,7 @@ impl Default for GlobExplorerState {
             folder_cache: HashMap::new(),
             cache_loaded: false,
             cache_source_id: None,
+            cache_workspace_id: None,
             selected_folder: 0,
             pattern_cursor: 0,
             phase: GlobExplorerPhase::Browse,
@@ -2565,9 +2579,13 @@ pub struct App {
     pub sources_drawer_open: bool,
     /// Selected source in the drawer (for Enter navigation)
     pub sources_drawer_selected: usize,
+    /// Active workspace (scopes sources/files/rules)
+    pub active_workspace: Option<Workspace>,
     /// Configuration
     #[allow(dead_code)]
     pub config: TuiArgs,
+    /// Optional telemetry recorder (Tape domain events)
+    pub telemetry: Option<TelemetryRecorder>,
     /// Last error message
     #[allow(dead_code)]
     pub error: Option<String>,
@@ -2624,6 +2642,7 @@ pub struct App {
 enum CacheLoadMessage {
     /// Loading complete (includes folder cache and tags)
     Complete {
+        workspace_id: WorkspaceId,
         source_id: SourceId,
         total_files: usize,
         tags: Vec<TagInfo>,
@@ -2637,6 +2656,7 @@ enum CacheLoadMessage {
 enum FolderQueryMessage {
     /// Query completed successfully
     Complete {
+        workspace_id: WorkspaceId,
         prefix: String,
         folders: Vec<FsEntry>,
         total_count: usize,
@@ -2721,9 +2741,11 @@ impl App {
         };
 
         let required_tables = [
+            "cf_workspaces",
             "scout_sources",
             "scout_files",
-            "scout_tagging_rules",
+            "scout_rules",
+            "scout_file_tags",
             "scout_folders",
             "scout_settings",
             "schema_migrations",
@@ -2747,13 +2769,41 @@ impl App {
             .collect();
 
         if !missing.is_empty() {
+            drop(conn);
+            let msg = format!("Missing tables: {}", missing.join(", "));
+            if self.reset_db_file(&path, &msg) {
+                return;
+            }
             self.db_read_only = true;
-            let msg = format!(
-                "Database missing tables: {}. Read-only mode.",
-                missing.join(", ")
-            );
-            self.db_health_warning = Some(msg.clone());
-            self.discover.status_message = Some((msg, true));
+            let warn = format!("Database missing tables: {}. Read-only mode.", missing.join(", "));
+            self.db_health_warning = Some(warn.clone());
+            self.discover.status_message = Some((warn, true));
+        }
+    }
+
+    fn reset_db_file(&mut self, path: &std::path::Path, reason: &str) -> bool {
+        let _ = std::fs::remove_file(path);
+        match ScoutDatabase::open(path) {
+            Ok(_) => {
+                self.db_read_only = false;
+                self.active_workspace = None;
+                self.discover.sources_loaded = false;
+                self.pending_sources_load = None;
+                self.discover.data_loaded = false;
+                self.pending_cache_load = None;
+                self.cache_load_progress = None;
+                self.discover.status_message = Some((
+                    format!("Database reset (pre-v1). Reason: {}", reason),
+                    false,
+                ));
+                true
+            }
+            Err(err) => {
+                let warn = format!("Database reset failed: {}", err);
+                self.db_health_warning = Some(warn.clone());
+                self.discover.status_message = Some((warn, true));
+                false
+            }
         }
     }
 
@@ -2835,7 +2885,7 @@ impl App {
     }
 
     /// Create new app with given args
-    pub fn new(args: TuiArgs) -> Self {
+    pub fn new(args: TuiArgs, telemetry: Option<TelemetryRecorder>) -> Self {
         Self {
             running: true,
             mode: TuiMode::Home,
@@ -2854,6 +2904,7 @@ impl App {
             jobs_drawer_selected: 0,
             sources_drawer_open: false,
             sources_drawer_selected: 0,
+            active_workspace: None,
             settings: SettingsState {
                 default_source_path: "~/data".to_string(),
                 auto_scan_on_startup: true,
@@ -2866,6 +2917,7 @@ impl App {
             sessions_state: SessionsState::default(),
             command_palette: CommandPaletteState::new(),
             config: args,
+            telemetry,
             error: None,
             pending_scan: None,
             current_scan_job_id: None,
@@ -2939,7 +2991,7 @@ impl App {
         Self::open_db_write_with(backend, &path)
     }
 
-    fn open_scout_db_for_writes(&self) -> Option<ScoutDatabase> {
+    fn open_scout_db_for_writes(&mut self) -> Option<ScoutDatabase> {
         if self.db_read_only {
             return None;
         }
@@ -2947,7 +2999,106 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        ScoutDatabase::open(&path).ok()
+        match ScoutDatabase::open(&path) {
+            Ok(db) => Some(db),
+            Err(casparian::scout::error::ScoutError::Config(msg)) => {
+                if self.reset_db_file(&path, &msg) {
+                    ScoutDatabase::open(&path).ok()
+                } else {
+                    None
+                }
+            }
+            Err(casparian::scout::error::ScoutError::Database(BackendError::Locked(msg))) => {
+                self.discover.status_message = Some((
+                    format!("Database is locked by another process: {}", msg),
+                    true,
+                ));
+                None
+            }
+            Err(casparian::scout::error::ScoutError::Database(BackendError::ReadOnly)) => {
+                self.discover.status_message = Some((
+                    "Database is read-only; cannot open for writes.".to_string(),
+                    true,
+                ));
+                None
+            }
+            Err(casparian::scout::error::ScoutError::Database(err)) => {
+                if self.reset_db_file(&path, &err.to_string()) {
+                    ScoutDatabase::open(&path).ok()
+                } else {
+                    None
+                }
+            }
+            Err(err) => {
+                self.discover.status_message = Some((
+                    format!("Database open failed: {}", err),
+                    true,
+                ));
+                None
+            }
+        }
+    }
+
+    fn active_workspace_id(&self) -> Option<WorkspaceId> {
+        self.active_workspace.as_ref().map(|workspace| workspace.id)
+    }
+
+    fn ensure_active_workspace(&mut self) {
+        if self.active_workspace.is_some() {
+            return;
+        }
+
+        if let Some(db) = self.open_scout_db_for_writes() {
+            match db.ensure_default_workspace() {
+                Ok(workspace) => {
+                    self.active_workspace = Some(workspace);
+                    return;
+                }
+                Err(err) => {
+                    self.discover.status_message =
+                        Some((format!("Workspace init failed: {}", err), true));
+                }
+            }
+        }
+
+        let conn = match self.open_db_readonly() {
+            Some(conn) => conn,
+            None => return,
+        };
+
+        let row = conn
+            .query_optional(
+                "SELECT id, name, created_at FROM cf_workspaces ORDER BY created_at ASC LIMIT 1",
+                &[],
+            )
+            .ok()
+            .flatten();
+
+        if let Some(row) = row {
+            let id_raw: String = match row.get(0) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let name: String = match row.get(1) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let created_at_ms: i64 = match row.get(2) {
+                Ok(v) => v,
+                Err(_) => 0,
+            };
+            let id = match WorkspaceId::parse(&id_raw) {
+                Ok(id) => id,
+                Err(_) => return,
+            };
+            let created_at = chrono::DateTime::from_timestamp_millis(created_at_ms)
+                .unwrap_or_else(chrono::Utc::now);
+            self.active_workspace = Some(Workspace {
+                id,
+                name,
+                created_at,
+            });
+        }
     }
 
     fn open_db_readonly_with(backend: DbBackend, path: &std::path::Path) -> Option<DbConnection> {
@@ -3303,7 +3454,10 @@ impl App {
             }
             // r: Refresh current view (per spec Section 3.3)
             // Don't intercept when in text input mode
-            KeyCode::Char('r') if !self.in_text_input_mode() => {
+            // Exempt Sources view: 'r' there means Rescan, not global refresh
+            KeyCode::Char('r')
+                if !self.in_text_input_mode() && self.mode != TuiMode::Sources =>
+            {
                 self.refresh_current_view();
                 return;
             }
@@ -5226,11 +5380,21 @@ impl App {
                         ));
                         return;
                     }
+                    let workspace_id = match self.active_workspace_id() {
+                        Some(id) => id,
+                        None => {
+                            self.discover.status_message = Some((
+                                "No workspace selected; cannot delete rule".to_string(),
+                                true,
+                            ));
+                            return;
+                        }
+                    };
                     if let Some(rule) = self.discover.rules.get(self.discover.selected_rule) {
-                        if let Some(id) = rule.id.0.clone() {
+                        if let Some(id) = rule.id.0 {
                             self.discover
                                 .pending_rule_deletes
-                                .push(PendingRuleDelete { id });
+                                .push(PendingRuleDelete { id, workspace_id });
                         }
                     }
                     self.discover.rules.remove(self.discover.selected_rule);
@@ -5243,6 +5407,16 @@ impl App {
             }
             KeyCode::Enter => {
                 // Toggle rule enabled/disabled
+                let workspace_id = match self.active_workspace_id() {
+                    Some(id) => id,
+                    None => {
+                        self.discover.status_message = Some((
+                            "No workspace selected; cannot update rule".to_string(),
+                            true,
+                        ));
+                        return;
+                    }
+                };
                 if let Some(rule) = self.discover.rules.get_mut(self.discover.selected_rule) {
                     if self.db_read_only {
                         self.discover.status_message = Some((
@@ -5252,10 +5426,11 @@ impl App {
                         return;
                     }
                     rule.enabled = !rule.enabled;
-                    if let Some(id) = rule.id.0.clone() {
+                    if let Some(id) = rule.id.0 {
                         self.discover.pending_rule_updates.push(PendingRuleUpdate {
                             id,
                             enabled: rule.enabled,
+                            workspace_id,
                         });
                     }
                 }
@@ -5400,6 +5575,7 @@ impl App {
             .as_ref()
             .map(|b| b.pattern.clone())
             .unwrap_or_default();
+        let active_workspace_id = self.active_workspace_id();
 
         let builder = match self.discover.rule_builder.as_mut() {
             Some(b) => b,
@@ -5623,21 +5799,23 @@ impl App {
                         Some(("Database is read-only; cannot save rules".to_string(), true));
                     return;
                 }
+                let workspace_id = match active_workspace_id {
+                    Some(id) => id,
+                    None => {
+                        self.discover.status_message =
+                            Some(("No workspace selected; cannot save rule".to_string(), true));
+                        return;
+                    }
+                };
                 if builder.can_save() {
                     let _draft = builder.to_draft();
-                    if let Some(source_id_raw) = builder.source_id.clone() {
-                        let source_id = match SourceId::parse(&source_id_raw) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                self.discover.status_message =
-                                    Some((format!("Invalid source ID: {}", e), true));
-                                return;
-                            }
-                        };
+                    if builder.source_id.is_some() {
+                        let rule_id = TaggingRuleId::new();
                         self.discover.pending_rule_writes.push(PendingRuleWrite {
+                            id: rule_id,
+                            workspace_id,
                             pattern: builder.pattern.clone(),
                             tag: builder.tag.clone(),
-                            source_id,
                         });
                         self.discover.status_message =
                             Some((format!("Rule '{}' saved", builder.tag), false));
@@ -6157,6 +6335,14 @@ impl App {
             ));
             return;
         }
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message =
+                    Some(("No workspace selected; cannot create source".to_string(), true));
+                return;
+            }
+        };
 
         let raw_name = name.trim();
         let source_name = if raw_name.is_empty() {
@@ -6196,6 +6382,7 @@ impl App {
         let source_id = SourceId::new();
 
         let new_source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: source_name.clone(),
             source_type: SourceType::Local,
@@ -6348,6 +6535,14 @@ impl App {
                 Some(("Database is read-only; cannot apply tags".to_string(), true));
             return;
         }
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message =
+                    Some(("No workspace selected; cannot apply tags".to_string(), true));
+                return;
+            }
+        };
         // Find the file in our list and add the tag locally
         for file in &mut self.discover.files {
             if file.path == file_path || file.rel_path == file_path {
@@ -6356,6 +6551,9 @@ impl App {
                     self.discover.pending_tag_writes.push(PendingTagWrite {
                         file_path: file.path.clone(),
                         tag: tag.to_string(),
+                        workspace_id,
+                        tag_source: TagSource::Manual,
+                        rule_id: None,
                     });
                     self.discover.status_message = Some((
                         format!(
@@ -6592,13 +6790,11 @@ impl App {
         // because the in-memory folder_cache only contains root-level entries
         if glob_pattern.contains("**") && !is_match_all {
             // Get source ID from glob_explorer
-            let source_id = match self
-                .discover
-                .glob_explorer
-                .as_ref()
-                .and_then(|e| e.cache_source_id)
-            {
-                Some(id) => id,
+            let (workspace_id, source_id) = match self.discover.glob_explorer.as_ref() {
+                Some(explorer) => match (explorer.cache_workspace_id, explorer.cache_source_id) {
+                    (Some(workspace_id), Some(source_id)) => (workspace_id, source_id),
+                    _ => return,
+                },
                 None => return,
             };
 
@@ -6658,9 +6854,9 @@ impl App {
                     })
                     .collect();
 
-                let total_count = query.count_files(&conn, source_id) as usize;
+                let total_count = query.count_files(&conn, workspace_id, source_id) as usize;
 
-                let results = query.search_files(&conn, source_id, 1000, 0);
+                let results = query.search_files(&conn, workspace_id, source_id, 1000, 0);
 
                 // Group by parent folder
                 let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
@@ -7035,6 +7231,14 @@ impl App {
             ));
             return 0;
         }
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message =
+                    Some(("No workspace selected; cannot apply rules".to_string(), true));
+                return 0;
+            }
+        };
 
         // Build the glob matcher
         let glob_pattern = if pattern.contains('/') {
@@ -7052,6 +7256,8 @@ impl App {
             Err(_) => return 0,
         };
 
+        let rule_id = TaggingRuleId::new();
+
         // Find and tag matching files
         let mut tagged_count = 0;
         for file in &mut self.discover.files {
@@ -7065,6 +7271,9 @@ impl App {
                     self.discover.pending_tag_writes.push(PendingTagWrite {
                         file_path: file.path.clone(),
                         tag: tag.to_string(),
+                        workspace_id,
+                        tag_source: TagSource::Rule,
+                        rule_id: Some(rule_id),
                     });
                 }
             }
@@ -7077,13 +7286,12 @@ impl App {
 
         // Queue rule write
         if tagged_count > 0 {
-            if let Some(source) = self.discover.selected_source() {
-                self.discover.pending_rule_writes.push(PendingRuleWrite {
-                    pattern: pattern.to_string(),
-                    tag: tag.to_string(),
-                    source_id: source.id.clone(),
-                });
-            }
+            self.discover.pending_rule_writes.push(PendingRuleWrite {
+                id: rule_id,
+                workspace_id,
+                pattern: pattern.to_string(),
+                tag: tag.to_string(),
+            });
         }
 
         tagged_count
@@ -7091,7 +7299,7 @@ impl App {
 
     /// Refresh the tags dropdown list based on current file tags
     fn refresh_tags_list(&mut self) {
-        use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
         // Count files per tag
         let mut tag_counts: HashMap<String, usize> = HashMap::new();
@@ -7553,6 +7761,15 @@ impl App {
         };
         let (backend, db_path) = self.resolve_db_target();
 
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message =
+                    Some(("No workspace selected".to_string(), true));
+                return;
+            }
+        };
+
         let (tx, rx) = mpsc::sync_channel::<SampleEvalResult>(16);
         self.pending_sample_eval = Some(rx);
 
@@ -7584,6 +7801,7 @@ impl App {
 
             let paths = super::pattern_query::sample_paths_for_eval(
                 &conn,
+                workspace_id,
                 source_id,
                 &glob_pattern,
                 &matcher,
@@ -7641,6 +7859,15 @@ impl App {
             }
         };
 
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message =
+                    Some(("No workspace selected".to_string(), true));
+                return;
+            }
+        };
+
         // Create job
         let job_id = self.add_schema_eval_job(SchemaEvalMode::Full, 0);
         self.current_schema_eval_job_id = Some(job_id);
@@ -7686,7 +7913,7 @@ impl App {
             };
 
             let query = super::pattern_query::PatternQuery::from_glob(&glob_pattern);
-            let total_candidates = query.count_files(&conn, source_id) as usize;
+            let total_candidates = query.count_files(&conn, workspace_id, source_id) as usize;
 
             let _ = tx.send(SchemaEvalResult::Progress {
                 progress: 0,
@@ -7700,7 +7927,7 @@ impl App {
             let mut matched_paths: Vec<String> = Vec::new();
 
             loop {
-                let results = query.search_files(&conn, source_id, batch_size, offset);
+                let results = query.search_files(&conn, workspace_id, source_id, batch_size, offset);
 
                 if results.is_empty() {
                     break;
@@ -7766,6 +7993,17 @@ impl App {
             return;
         }
 
+        self.ensure_active_workspace();
+
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message =
+                    Some(("No workspace available; cannot scan.".to_string(), true));
+                return;
+            }
+        };
+
         let path_input = Path::new(path);
 
         let expanded_path = scan_path::expand_scan_path(path_input);
@@ -7784,6 +8022,9 @@ impl App {
             files_found: 0,
             files_persisted: 0,
             current_dir: Some("Initializing...".to_string()),
+            elapsed_ms: 0,
+            files_per_sec: 0.0,
+            stalled: false,
         });
         self.discover.scan_start_time = Some(std::time::Instant::now());
         self.discover.view_state = DiscoverViewState::Scanning;
@@ -7811,6 +8052,7 @@ impl App {
 
         let source_path = path_display;
         let scan_job_id = job_id; // Capture for async block
+        let telemetry = self.telemetry.clone();
 
         std::thread::spawn(move || {
             // Open database
@@ -7830,7 +8072,7 @@ impl App {
             };
 
             // Check if source with this path already exists (rescan case)
-            let existing_source = match db.get_source_by_path(&source_path) {
+            let existing_source = match db.get_source_by_path(&workspace_id, &source_path) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = tui_tx.send(TuiScanResult::Error(format!("Database error: {}", e)));
@@ -7849,7 +8091,9 @@ impl App {
                     .unwrap_or_else(|| source_path.clone());
 
                 // Check if a source with this name (but different path) already exists
-                if let Ok(Some(name_conflict)) = db.get_source_by_name(&source_name) {
+                if let Ok(Some(name_conflict)) =
+                    db.get_source_by_name(&workspace_id, &source_name)
+                {
                     let _ = tui_tx.send(TuiScanResult::Error(format!(
                         "A source named '{}' already exists at '{}'. Use Sources Manager (M) to rename or delete it first.",
                         source_name, name_conflict.path
@@ -7859,7 +8103,9 @@ impl App {
 
                 // Check for overlapping sources (parent/child relationships)
                 // This prevents duplicate file tracking and conflicting tags
-                if let Err(e) = db.check_source_overlap(std::path::Path::new(&source_path)) {
+                if let Err(e) =
+                    db.check_source_overlap(&workspace_id, std::path::Path::new(&source_path))
+                {
                     let suggestion = match &e {
                         casparian::scout::error::ScoutError::SourceIsChildOfExisting {
                             existing_name,
@@ -7892,6 +8138,7 @@ impl App {
                 let source_id = SourceId::new();
 
                 let new_source = Source {
+                    workspace_id,
                     id: source_id,
                     name: source_name,
                     source_type: SourceType::Local,
@@ -7912,6 +8159,30 @@ impl App {
                 new_source
             };
 
+            let scan_config = casparian::scout::ScanConfig::default();
+            let telemetry_start = std::time::Instant::now();
+            let telemetry_context = telemetry.as_ref().map(|recorder| {
+                let run_id = Uuid::new_v4().to_string();
+                let source_id = source.id.to_string();
+                let root_hash = Some(recorder.hasher().hash_path(std::path::Path::new(
+                    &source.path,
+                )));
+                let payload = protocol_telemetry::ScanStarted {
+                    run_id: run_id.clone(),
+                    source_id: source_id.clone(),
+                    root_hash,
+                    started_at: chrono::Utc::now(),
+                    config: scan_config_telemetry(&scan_config),
+                };
+                let parent_id = recorder.emit_domain(
+                    protocol_telemetry::events::SCAN_START,
+                    Some(&run_id),
+                    None,
+                    &payload,
+                );
+                (run_id, source_id, parent_id)
+            });
+
             // Validation passed - notify TUI that scan is starting
             let _ = tui_tx.send(TuiScanResult::Started {
                 job_id: scan_job_id,
@@ -7923,17 +8194,53 @@ impl App {
 
             // Spawn a task to forward progress - use spawn_blocking context awareness
             let tui_tx_progress = tui_tx.clone();
+            let telemetry_progress = telemetry.clone();
+            let telemetry_context_progress = telemetry_context.clone();
             let forward_handle = std::thread::spawn(move || {
+                let mut last_emit = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
                 while let Ok(progress) = progress_rx.recv() {
-                    let _ = tui_tx_progress.try_send(TuiScanResult::Progress(progress));
+                    let _ = tui_tx_progress.try_send(TuiScanResult::Progress(progress.clone()));
+
+                    if let (Some(recorder), Some((run_id, source_id, parent_id))) =
+                        (telemetry_progress.as_ref(), telemetry_context_progress.as_ref())
+                    {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_emit) >= std::time::Duration::from_secs(1) {
+                            last_emit = now;
+                            let payload = protocol_telemetry::ScanProgress {
+                                run_id: run_id.clone(),
+                                source_id: source_id.clone(),
+                                elapsed_ms: progress.elapsed_ms,
+                                files_found: progress.files_found,
+                                files_persisted: progress.files_persisted,
+                                dirs_scanned: progress.dirs_scanned,
+                                files_per_sec: progress.files_per_sec,
+                                stalled: progress.stalled,
+                            };
+                            recorder.emit_domain(
+                                protocol_telemetry::events::SCAN_PROGRESS,
+                                Some(run_id),
+                                parent_id.as_deref(),
+                                &payload,
+                            );
+                        }
+                    }
                 }
             });
 
             // Create scanner with default config
-            let scanner = ScoutScanner::new(db);
+            let scanner = ScoutScanner::with_config(db, scan_config.clone());
 
             // Run the scan in a blocking task so it doesn't block the runtime
-            let scan_result = scanner.scan(&source, Some(progress_tx), None);
+            let scan_result = if let Some((run_id, _, _)) = telemetry_context.as_ref() {
+                let span = info_span!("scan.run", run_id = %run_id, source_id = %source.id);
+                let _guard = span.enter();
+                scanner.scan(&source, Some(progress_tx), None)
+            } else {
+                scanner.scan(&source, Some(progress_tx), None)
+            };
             drop(scanner);
 
             let _ = forward_handle.join();
@@ -7942,6 +8249,29 @@ impl App {
                 Ok(result) => {
                     let persisted = result.stats.files_persisted as usize;
                     let discovered = result.stats.files_discovered as usize;
+                    if let (Some(recorder), Some((run_id, source_id, _))) =
+                        (telemetry.as_ref(), telemetry_context.as_ref())
+                    {
+                        let payload = protocol_telemetry::ScanCompleted {
+                            run_id: run_id.clone(),
+                            source_id: source_id.clone(),
+                            duration_ms: result.stats.duration_ms,
+                            files_discovered: result.stats.files_discovered,
+                            files_persisted: result.stats.files_persisted,
+                            files_new: result.stats.files_new,
+                            files_changed: result.stats.files_changed,
+                            files_deleted: result.stats.files_deleted,
+                            dirs_scanned: result.stats.dirs_scanned,
+                            bytes_scanned: result.stats.bytes_scanned,
+                            errors: result.stats.errors,
+                        };
+                        recorder.emit_domain(
+                            protocol_telemetry::events::SCAN_COMPLETE,
+                            Some(run_id),
+                            None,
+                            &payload,
+                        );
+                    }
                     if persisted == 0 && discovered > 0 {
                         let _ = tui_tx.send(TuiScanResult::Error(
                             "Scan completed but no files were persisted. Check database health or locks.".to_string(),
@@ -7955,6 +8285,24 @@ impl App {
                     });
                 }
                 Err(e) => {
+                    if let (Some(recorder), Some((run_id, source_id, _))) =
+                        (telemetry.as_ref(), telemetry_context.as_ref())
+                    {
+                        let (error_class, io_kind) = classify_scan_error(&e);
+                        let payload = protocol_telemetry::ScanFailed {
+                            run_id: run_id.clone(),
+                            source_id: source_id.clone(),
+                            duration_ms: telemetry_start.elapsed().as_millis() as u64,
+                            error_class,
+                            io_kind,
+                        };
+                        recorder.emit_domain(
+                            protocol_telemetry::events::SCAN_FAIL,
+                            Some(run_id),
+                            None,
+                            &payload,
+                        );
+                    }
                     let _ = tui_tx.send(TuiScanResult::Error(format!("Scan failed: {}", e)));
                 }
             }
@@ -8058,11 +8406,9 @@ impl App {
 
     /// Load files from Scout database for the selected source (async using sqlx)
     ///
-    /// Uses the scout_files schema from scout/db.rs:
-    /// - path: TEXT
-    /// - size: INTEGER
-    /// - mtime: INTEGER (milliseconds since epoch)
-    /// - tag: TEXT (single tag per file, NULL if untagged)
+    /// Uses the scout_files + scout_file_tags schema from scout/db.rs:
+    /// - scout_files: path, rel_path, size, mtime, is_dir
+    /// - scout_file_tags: multi-tag assignments per file
     ///
     /// Files are filtered by the currently selected source. If no source is
     /// selected, the file list will be empty with a helpful message.
@@ -8099,6 +8445,15 @@ impl App {
             }
         };
 
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.scan_error = Some("No workspace selected.".to_string());
+                self.discover.data_loaded = true;
+                return;
+            }
+        };
+
         let conn = match self.open_db_readonly() {
             Some(conn) => conn,
             None => {
@@ -8110,14 +8465,20 @@ impl App {
         };
 
         let query = r#"
-            SELECT path, rel_path, source_id, size, mtime, tag
+            SELECT id, path, rel_path, size, mtime, is_dir
             FROM scout_files
-            WHERE source_id = ?
+            WHERE workspace_id = ? AND source_id = ?
             ORDER BY rel_path
             LIMIT 1000
         "#;
 
-        let rows = match conn.query_all(query, &[DbValue::Integer(selected_source_id.as_i64())]) {
+        let rows = match conn.query_all(
+            query,
+            &[
+                DbValue::Text(workspace_id.to_string()),
+                DbValue::Integer(selected_source_id.as_i64()),
+            ],
+        ) {
             Ok(rows) => rows,
             Err(e) => {
                 self.discover.scan_error = Some(format!("Query failed: {}", e));
@@ -8127,8 +8488,9 @@ impl App {
         };
 
         let mut files: Vec<FileInfo> = Vec::with_capacity(rows.len());
+        let mut file_ids: Vec<i64> = Vec::with_capacity(rows.len());
         for row in rows {
-            let path: String = match row.get(0) {
+            let file_id: i64 = match row.get(0) {
                 Ok(v) => v,
                 Err(e) => {
                     self.discover.scan_error = Some(format!("Query failed: {}", e));
@@ -8136,7 +8498,15 @@ impl App {
                     return;
                 }
             };
-            let rel_path: String = match row.get(1) {
+            let path: String = match row.get(1) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.discover.scan_error = Some(format!("Query failed: {}", e));
+                    self.discover.data_loaded = true;
+                    return;
+                }
+            };
+            let rel_path: String = match row.get(2) {
                 Ok(v) => v,
                 Err(e) => {
                     self.discover.scan_error = Some(format!("Query failed: {}", e));
@@ -8160,7 +8530,7 @@ impl App {
                     return;
                 }
             };
-            let tag: Option<String> = match row.get(5) {
+            let is_dir: i64 = match row.get(5) {
                 Ok(v) => v,
                 Err(e) => {
                     self.discover.scan_error = Some(format!("Query failed: {}", e));
@@ -8173,23 +8543,66 @@ impl App {
                 .map(|dt| dt.with_timezone(&chrono::Local))
                 .unwrap_or_else(chrono::Local::now);
 
-            let tags = tag.into_iter().collect();
-            let is_dir = std::path::Path::new(&path).is_dir();
-
+            file_ids.push(file_id);
             files.push(FileInfo {
                 path,
                 rel_path,
                 size: size as u64,
                 modified,
-                is_dir,
-                tags,
+                is_dir: is_dir != 0,
+                tags: Vec::new(),
             });
         }
 
+        let mut tags_by_file: HashMap<i64, Vec<String>> = HashMap::new();
+        if !file_ids.is_empty() {
+            let placeholders = std::iter::repeat("?")
+                .take(file_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT file_id, tag FROM scout_file_tags WHERE workspace_id = ? AND file_id IN ({})",
+                placeholders
+            );
+            let mut params: Vec<DbValue> = Vec::with_capacity(file_ids.len() + 1);
+            params.push(DbValue::Text(workspace_id.to_string()));
+            params.extend(file_ids.iter().map(|id| DbValue::Integer(*id)));
+
+            if let Ok(tag_rows) = conn.query_all(&query, &params) {
+                for row in tag_rows {
+                    let file_id: i64 = match row.get(0) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let tag: String = match row.get(1) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    tags_by_file.entry(file_id).or_default().push(tag);
+                }
+            }
+        }
+
+        for (idx, file) in files.iter_mut().enumerate() {
+            if let Some(tags) = tags_by_file.remove(&file_ids[idx]) {
+                file.tags = tags;
+            }
+        }
+
+        let mut available_tags = HashSet::new();
+        for file in &files {
+            for tag in &file.tags {
+                available_tags.insert(tag.clone());
+            }
+        }
+
         self.discover.files = files;
+        self.discover.available_tags = available_tags.into_iter().collect();
+        self.discover.available_tags.sort();
         self.discover.selected = 0;
         self.discover.data_loaded = true;
         self.discover.scan_error = None;
+        self.refresh_tags_list();
     }
 
     /// Load folder tree for Glob Explorer (hierarchical file browsing).
@@ -8207,6 +8620,10 @@ impl App {
             Some(id) => id.clone(),
             None => return,
         };
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => return,
+        };
 
         let source_id_str = source_id.to_string();
 
@@ -8218,9 +8635,11 @@ impl App {
         // Skip if cache is already loaded for this source
         if let Some(ref explorer) = self.discover.glob_explorer {
             if explorer.cache_loaded {
-                if let Some(ref cache_source) = explorer.cache_source_id {
-                    if *cache_source == source_id {
-                        // Cache already loaded for this source, no reload needed
+                if let (Some(cache_source), Some(cache_workspace)) =
+                    (explorer.cache_source_id, explorer.cache_workspace_id)
+                {
+                    if cache_source == source_id && cache_workspace == workspace_id {
+                        // Cache already loaded for this source/workspace, no reload needed
                         self.discover.data_loaded = true;
                         return;
                     }
@@ -8257,11 +8676,13 @@ impl App {
         if let Some(ref mut explorer) = self.discover.glob_explorer {
             explorer.folder_cache = HashMap::new();
             explorer.cache_source_id = Some(source_id);
+            explorer.cache_workspace_id = Some(workspace_id);
         }
 
         let (backend, db_path) = self.resolve_db_target();
 
         // Spawn background task for database queries (live folder derivation)
+        let workspace_id_str = workspace_id.to_string();
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
@@ -8273,7 +8694,8 @@ impl App {
                 }
             };
 
-            let root_folders = match App::query_folder_counts(&conn, source_id, "", None) {
+            let root_folders =
+                match App::query_folder_counts(&conn, workspace_id, source_id, "", None) {
                 Ok(folders) => folders,
                 Err(e) => {
                     let _ = tx.send(CacheLoadMessage::Error(format!("Query error: {}", e)));
@@ -8291,20 +8713,42 @@ impl App {
 
             let total_files: usize = conn
                 .query_scalar::<i64>(
-                    "SELECT file_count FROM scout_sources WHERE id = ?",
-                    &[DbValue::Integer(source_id.as_i64())],
+                    "SELECT file_count FROM scout_sources WHERE id = ? AND workspace_id = ?",
+                    &[
+                        DbValue::Integer(source_id.as_i64()),
+                        DbValue::Text(workspace_id_str.clone()),
+                    ],
                 )
                 .unwrap_or(0) as usize;
 
-            let tag_rows = conn.query_all(
-                "SELECT tag, COUNT(*) as count FROM scout_files WHERE source_id = ? AND tag IS NOT NULL GROUP BY tag ORDER BY count DESC, tag",
-                &[DbValue::Integer(source_id.as_i64())],
-            ).unwrap_or_default();
+            let tag_rows = conn
+                .query_all(
+                    "SELECT ft.tag, COUNT(*) as count \
+                     FROM scout_file_tags ft \
+                     JOIN scout_files f ON f.id = ft.file_id \
+                     WHERE ft.workspace_id = ? AND f.workspace_id = ? AND f.source_id = ? \
+                     GROUP BY ft.tag \
+                     ORDER BY count DESC, ft.tag",
+                    &[
+                        DbValue::Text(workspace_id_str.clone()),
+                        DbValue::Text(workspace_id_str.clone()),
+                        DbValue::Integer(source_id.as_i64()),
+                    ],
+                )
+                .unwrap_or_default();
 
             let untagged_count: i64 = conn
                 .query_scalar::<i64>(
-                    "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND tag IS NULL",
-                    &[DbValue::Integer(source_id.as_i64())],
+                    "SELECT COUNT(*) \
+                     FROM scout_files f \
+                     LEFT JOIN scout_file_tags ft \
+                       ON ft.file_id = f.id AND ft.workspace_id = ? \
+                     WHERE f.workspace_id = ? AND f.source_id = ? AND ft.file_id IS NULL",
+                    &[
+                        DbValue::Text(workspace_id_str.clone()),
+                        DbValue::Text(workspace_id_str.clone()),
+                        DbValue::Integer(source_id.as_i64()),
+                    ],
                 )
                 .unwrap_or(0);
 
@@ -8339,12 +8783,41 @@ impl App {
             }
 
             let _ = tx.send(CacheLoadMessage::Complete {
+                workspace_id,
                 source_id,
                 total_files,
                 tags,
                 cache,
             });
         });
+    }
+}
+
+fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Option<String>) {
+    use casparian::scout::error::ScoutError;
+    match err {
+        ScoutError::Io(io_err) => (
+            "io_error".to_string(),
+            Some(format!("{:?}", io_err.kind())),
+        ),
+        ScoutError::Database(_) => ("db_error".to_string(), None),
+        ScoutError::Walk(_) => ("walk_error".to_string(), None),
+        ScoutError::Json(_) => ("json_error".to_string(), None),
+        ScoutError::Csv(_) => ("csv_error".to_string(), None),
+        ScoutError::Arrow(_) => ("arrow_error".to_string(), None),
+        ScoutError::Parquet(_) => ("parquet_error".to_string(), None),
+        ScoutError::Config(_) => ("config_error".to_string(), None),
+        ScoutError::SourceNotFound(_) => ("source_not_found".to_string(), None),
+        ScoutError::RouteNotFound(_) => ("route_not_found".to_string(), None),
+        ScoutError::FileNotFound(_) => ("file_not_found".to_string(), None),
+        ScoutError::UnsupportedFormat(_) => ("unsupported_format".to_string(), None),
+        ScoutError::SchemaInference(_) => ("schema_inference".to_string(), None),
+        ScoutError::Transform(_) => ("transform".to_string(), None),
+        ScoutError::Pattern(_) => ("pattern".to_string(), None),
+        ScoutError::InvalidState(_) => ("invalid_state".to_string(), None),
+        ScoutError::Extractor(_) => ("extractor".to_string(), None),
+        ScoutError::SourceIsChildOfExisting { .. } => ("source_overlap".to_string(), None),
+        ScoutError::SourceIsParentOfExisting { .. } => ("source_overlap".to_string(), None),
     }
 }
 
@@ -8411,9 +8884,12 @@ impl App {
                 let pattern_for_search = pattern.clone();
 
                 // Get source ID for query
-                let source_id = match explorer.cache_source_id {
-                    Some(id) => id,
-                    None => return,
+                let (workspace_id, source_id) = match (
+                    explorer.cache_workspace_id,
+                    explorer.cache_source_id,
+                ) {
+                    (Some(workspace_id), Some(source_id)) => (workspace_id, source_id),
+                    _ => return,
                 };
 
                 // Show loading indicator immediately
@@ -8440,9 +8916,9 @@ impl App {
                         }
                     };
 
-                    let count = query.count_files(&conn, source_id);
+                    let count = query.count_files(&conn, workspace_id, source_id);
 
-                    let results = query.search_files(&conn, source_id, 100, 0);
+                    let results = query.search_files(&conn, workspace_id, source_id, 100, 0);
 
                     // Convert to FsEntry for display
                     let folders: Vec<FsEntry> = results
@@ -8507,17 +8983,25 @@ impl App {
 
         if needs_query {
             if let Some(ref explorer) = self.discover.glob_explorer {
-                if let Some(source_id) = explorer.cache_source_id.clone() {
+                if let (Some(source_id), Some(workspace_id)) =
+                    (explorer.cache_source_id, explorer.cache_workspace_id)
+                {
                     let prefix = explorer.current_prefix.clone();
                     let pattern = explorer.pattern.clone();
-                    self.start_folder_query(source_id, prefix, pattern);
+                    self.start_folder_query(workspace_id, source_id, prefix, pattern);
                 }
             }
         }
     }
 
     /// Start an async database query for a folder prefix
-    fn start_folder_query(&mut self, source_id: SourceId, prefix: String, glob_pattern: String) {
+    fn start_folder_query(
+        &mut self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        prefix: String,
+        glob_pattern: String,
+    ) {
         // Skip if already loading
         if self.pending_folder_query.is_some() {
             return;
@@ -8545,14 +9029,19 @@ impl App {
                 }
             };
 
-            let rows =
-                match App::query_folder_counts(&conn, source_id, &prefix, glob_opt.as_deref()) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = tx.send(FolderQueryMessage::Error(format!("Query error: {}", e)));
-                        return;
-                    }
-                };
+            let rows = match App::query_folder_counts(
+                &conn,
+                workspace_id,
+                source_id,
+                &prefix,
+                glob_opt.as_deref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(FolderQueryMessage::Error(format!("Query error: {}", e)));
+                    return;
+                }
+            };
 
             let folders: Vec<FsEntry> = rows
                 .into_iter()
@@ -8562,6 +9051,7 @@ impl App {
             let total_count = folders.iter().map(|f| f.file_count()).sum();
 
             let _ = tx.send(FolderQueryMessage::Complete {
+                workspace_id,
                 prefix,
                 folders,
                 total_count,
@@ -8620,6 +9110,7 @@ impl App {
 
     fn query_folder_counts(
         conn: &DbConnection,
+        workspace_id: WorkspaceId,
         source_id: SourceId,
         prefix: &str,
         glob_pattern: Option<&str>,
@@ -8650,7 +9141,7 @@ impl App {
                     COUNT(*) as file_count,
                     MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
                 FROM scout_files
-                WHERE source_id = ?
+                WHERE workspace_id = ? AND source_id = ?
                   AND rel_path LIKE ?
                   AND rel_path LIKE ?
                   AND LENGTH(rel_path) > ?
@@ -8664,6 +9155,7 @@ impl App {
                     DbValue::Integer(prefix_len),
                     DbValue::Integer(prefix_len),
                     DbValue::Integer(prefix_len),
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(path_filter),
                     DbValue::Text(like_pattern),
@@ -8686,8 +9178,9 @@ impl App {
 
         if prefix.is_empty() {
             let cached_rows = conn.query_all(
-                "SELECT name, file_count, is_folder FROM scout_folders WHERE source_id = ? AND prefix = ? ORDER BY is_folder DESC, file_count DESC, name",
+                "SELECT name, file_count, is_folder FROM scout_folders WHERE workspace_id = ? AND source_id = ? AND prefix = ? ORDER BY is_folder DESC, file_count DESC, name",
                 &[
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(prefix.to_string()),
                 ],
@@ -8706,8 +9199,9 @@ impl App {
         }
 
         let files = conn.query_all(
-            "SELECT name, size FROM scout_files WHERE source_id = ? AND parent_path = ? ORDER BY name LIMIT 200",
+            "SELECT name, size FROM scout_files WHERE workspace_id = ? AND source_id = ? AND parent_path = ? ORDER BY name LIMIT 200",
             &[
+                DbValue::Text(workspace_id.to_string()),
                 DbValue::Integer(source_id.as_i64()),
                 DbValue::Text(prefix.to_string()),
             ],
@@ -8725,12 +9219,15 @@ impl App {
                     END AS folder_name,
                     COUNT(*) as file_count
                 FROM scout_files
-                WHERE source_id = ? AND parent_path != ''
+                WHERE workspace_id = ? AND source_id = ? AND parent_path != ''
                 GROUP BY folder_name
                 ORDER BY file_count DESC
                 LIMIT 200
                 "#,
-                &[DbValue::Integer(source_id.as_i64())],
+                &[
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                ],
             )?
         } else {
             let folder_prefix = format!("{}/", prefix);
@@ -8744,7 +9241,7 @@ impl App {
                     END AS folder_name,
                     COUNT(*) as file_count
                 FROM scout_files
-                WHERE source_id = ? AND parent_path LIKE ? || '%' AND parent_path != ?
+                WHERE workspace_id = ? AND source_id = ? AND parent_path LIKE ? || '%' AND parent_path != ?
                 GROUP BY folder_name
                 ORDER BY file_count DESC
                 LIMIT 200
@@ -8754,6 +9251,7 @@ impl App {
                     DbValue::Text(folder_prefix.clone()),
                     DbValue::Text(folder_prefix.clone()),
                     DbValue::Text(folder_prefix.clone()),
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(folder_prefix.clone()),
                     DbValue::Text(prefix.to_string()),
@@ -8784,6 +9282,11 @@ impl App {
             return;
         }
 
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => return,
+        };
+
         let (backend, db_path) = self.resolve_db_target();
 
         if !db_path.exists() {
@@ -8795,6 +9298,7 @@ impl App {
         self.pending_sources_load = Some(rx);
 
         // Spawn background task for DB query
+        let workspace_id_str = workspace_id.to_string();
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
@@ -8805,32 +9309,33 @@ impl App {
             let query = r#"
                 SELECT id, name, path, file_count
                 FROM scout_sources
-                WHERE enabled = 1
+                WHERE enabled = 1 AND workspace_id = ?
                 ORDER BY updated_at DESC
             "#;
 
-            if let Ok(rows) = conn.query_all(query, &[]) {
+            if let Ok(rows) = conn.query_all(query, &[DbValue::Text(workspace_id_str)]) {
                 let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let id_raw: String = match row.get(0) {
+                    // id is BIGINT, read as i64 then convert to SourceId
+                    let id_i64: i64 = match row.get(0) {
                         Ok(v) => v,
-                        Err(_) => return,
+                        Err(_) => continue, // Skip row, don't abort entire load
                     };
-                    let id = match SourceId::try_from(id_raw) {
+                    let id = match SourceId::try_from(id_i64) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
                     let name: String = match row.get(1) {
                         Ok(v) => v,
-                        Err(_) => return,
+                        Err(_) => continue,
                     };
                     let path: String = match row.get(2) {
                         Ok(v) => v,
-                        Err(_) => return,
+                        Err(_) => continue,
                     };
                     let file_count: i64 = match row.get(3) {
                         Ok(v) => v,
-                        Err(_) => return,
+                        Err(_) => 0, // Default to 0 if missing
                     };
 
                     sources.push(SourceInfo {
@@ -8919,6 +9424,7 @@ impl App {
                         WHEN '{queued}' THEN 2
                         WHEN '{pending}' THEN 2
                         WHEN '{failed}' THEN 3
+                        WHEN '{aborted}' THEN 3
                         WHEN '{completed}' THEN 4
                         WHEN '{skipped}' THEN 5
                     END,
@@ -8932,6 +9438,7 @@ impl App {
                     queued = ProcessingStatus::Queued.as_str(),
                     pending = ProcessingStatus::Pending.as_str(),
                     failed = ProcessingStatus::Failed.as_str(),
+                    aborted = ProcessingStatus::Aborted.as_str(),
                     completed = ProcessingStatus::Completed.as_str(),
                     skipped = ProcessingStatus::Skipped.as_str(),
                 )
@@ -8958,6 +9465,7 @@ impl App {
                         WHEN '{queued}' THEN 2
                         WHEN '{pending}' THEN 2
                         WHEN '{failed}' THEN 3
+                        WHEN '{aborted}' THEN 3
                         WHEN '{completed}' THEN 4
                         WHEN '{skipped}' THEN 5
                     END,
@@ -8971,6 +9479,7 @@ impl App {
                     queued = ProcessingStatus::Queued.as_str(),
                     pending = ProcessingStatus::Pending.as_str(),
                     failed = ProcessingStatus::Failed.as_str(),
+                    aborted = ProcessingStatus::Aborted.as_str(),
                     completed = ProcessingStatus::Completed.as_str(),
                     skipped = ProcessingStatus::Skipped.as_str(),
                 )
@@ -9116,6 +9625,11 @@ impl App {
             return;
         }
 
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => return,
+        };
+
         let (backend, db_path) = self.resolve_db_target();
 
         if !db_path.exists() {
@@ -9127,6 +9641,7 @@ impl App {
         self.pending_stats_load = Some(rx);
 
         // Spawn background task for DB query
+        let workspace_id_str = workspace_id.to_string();
         std::thread::spawn(move || {
             let conn = match App::open_db_readonly_with(backend, &db_path) {
                 Some(conn) => conn,
@@ -9135,12 +9650,18 @@ impl App {
 
             let mut stats = HomeStats::default();
 
-            if let Ok(count) = conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_files", &[]) {
+            if let Ok(count) = conn.query_scalar::<i64>(
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ?",
+                &[DbValue::Text(workspace_id_str.clone())],
+            ) {
                 stats.file_count = count as usize;
             }
 
             if let Ok(count) = conn
-                .query_scalar::<i64>("SELECT COUNT(*) FROM scout_sources WHERE enabled = 1", &[])
+                .query_scalar::<i64>(
+                    "SELECT COUNT(*) FROM scout_sources WHERE enabled = 1 AND workspace_id = ?",
+                    &[DbValue::Text(workspace_id_str.clone())],
+                )
             {
                 stats.source_count = count as usize;
             }
@@ -9162,7 +9683,9 @@ impl App {
                         match queue_status {
                             ProcessingStatus::Running => stats.running_jobs = count as usize,
                             ProcessingStatus::Queued => stats.pending_jobs = count as usize,
-                            ProcessingStatus::Failed => stats.failed_jobs = count as usize,
+                            ProcessingStatus::Failed | ProcessingStatus::Aborted => {
+                                stats.failed_jobs = count as usize
+                            }
                             _ => {}
                         }
                     }
@@ -9400,30 +9923,47 @@ impl App {
         };
         let conn = db.conn();
 
-        // Persist tag updates to scout_files
+        // Persist tag updates to scout_file_tags
         let tag_writes = std::mem::take(&mut self.discover.pending_tag_writes);
         for write in tag_writes {
+            let workspace_id_str = write.workspace_id.to_string();
+            let rule_id_value = write
+                .rule_id
+                .map(|id| DbValue::Text(id.to_string()))
+                .unwrap_or(DbValue::Null);
+            let created_at = chrono::Utc::now().timestamp_millis();
             let _ = conn.execute(
-                "UPDATE scout_files SET tag = ? WHERE path = ?",
-                &[DbValue::Text(write.tag), DbValue::Text(write.file_path)],
+                r#"INSERT OR IGNORE INTO scout_file_tags
+                   (workspace_id, file_id, tag, tag_source, rule_id, created_at)
+                   SELECT ?, id, ?, ?, ?, ?
+                   FROM scout_files
+                   WHERE path = ? AND workspace_id = ?"#,
+                &[
+                    DbValue::Text(workspace_id_str.clone()),
+                    DbValue::Text(write.tag),
+                    DbValue::Text(write.tag_source.as_str().to_string()),
+                    rule_id_value,
+                    DbValue::Integer(created_at),
+                    DbValue::Text(write.file_path),
+                    DbValue::Text(workspace_id_str),
+                ],
             );
         }
 
-        // Persist rules to scout_tagging_rules
+        // Persist rules to scout_rules
         let rule_writes = std::mem::take(&mut self.discover.pending_rule_writes);
         for write in rule_writes {
-            let rule_id = TaggingRuleId::new();
             let rule_name = format!("{} → {}", write.pattern, write.tag);
-            let now = chrono::Utc::now().timestamp();
+            let now = chrono::Utc::now().timestamp_millis();
 
             let _ = conn.execute(
-                r#"INSERT OR IGNORE INTO scout_tagging_rules
-                   (id, name, source_id, pattern, tag, priority, enabled, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 100, 1, ?, ?)"#,
+                r#"INSERT OR IGNORE INTO scout_rules
+                   (id, workspace_id, name, kind, pattern, tag, priority, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, 'tagging', ?, ?, 100, 1, ?, ?)"#,
                 &[
-                    DbValue::Integer(rule_id.as_i64()),
+                    DbValue::Text(write.id.to_string()),
+                    DbValue::Text(write.workspace_id.to_string()),
                     DbValue::Text(rule_name),
-                    DbValue::Integer(write.source_id.as_i64()),
                     DbValue::Text(write.pattern),
                     DbValue::Text(write.tag),
                     DbValue::Integer(now),
@@ -9436,10 +9976,11 @@ impl App {
         let rule_updates = std::mem::take(&mut self.discover.pending_rule_updates);
         for update in rule_updates {
             let _ = conn.execute(
-                "UPDATE scout_tagging_rules SET enabled = ? WHERE id = ?",
+                "UPDATE scout_rules SET enabled = ? WHERE id = ? AND workspace_id = ?",
                 &[
                     DbValue::Integer(if update.enabled { 1 } else { 0 }),
-                    DbValue::Integer(update.id.as_i64()),
+                    DbValue::Text(update.id.to_string()),
+                    DbValue::Text(update.workspace_id.to_string()),
                 ],
             );
         }
@@ -9448,8 +9989,11 @@ impl App {
         let rule_deletes = std::mem::take(&mut self.discover.pending_rule_deletes);
         for delete in rule_deletes {
             let _ = conn.execute(
-                "DELETE FROM scout_tagging_rules WHERE id = ?",
-                &[DbValue::Integer(delete.id.as_i64())],
+                "DELETE FROM scout_rules WHERE id = ? AND workspace_id = ?",
+                &[
+                    DbValue::Text(delete.id.to_string()),
+                    DbValue::Text(delete.workspace_id.to_string()),
+                ],
             );
         }
 
@@ -9510,13 +10054,8 @@ impl App {
 
     /// Load tagging rules for the Rules Manager dialog
     fn load_rules_for_manager(&mut self) {
-        // Get source ID for selected source
-        let source_id = match self
-            .discover
-            .sources
-            .get(self.discover.selected_source_index())
-        {
-            Some(source) => source.id.clone(),
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
             None => {
                 self.discover.rules.clear();
                 return;
@@ -9530,23 +10069,23 @@ impl App {
 
         let query = r#"
             SELECT id, pattern, tag, priority, enabled
-            FROM scout_tagging_rules
-            WHERE source_id = ?
-            ORDER BY priority DESC, pattern
+            FROM scout_rules
+            WHERE workspace_id = ? AND kind = 'tagging'
+            ORDER BY priority DESC, name
         "#;
 
-        let rows = match conn.query_all(query, &[DbValue::Integer(source_id.as_i64())]) {
+        let rows = match conn.query_all(query, &[DbValue::Text(workspace_id.to_string())]) {
             Ok(rows) => rows,
             Err(_) => return,
         };
 
         let mut rules: Vec<RuleInfo> = Vec::with_capacity(rows.len());
         for row in rows {
-            let id_raw: i64 = match row.get(0) {
+            let id_raw: String = match row.get(0) {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let id = match TaggingRuleId::try_from(id_raw) {
+            let id = match TaggingRuleId::parse(&id_raw) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -9562,10 +10101,11 @@ impl App {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let enabled: bool = match row.get(4) {
+            let enabled_raw: i64 = match row.get(4) {
                 Ok(v) => v,
                 Err(_) => return,
             };
+            let enabled = enabled_raw != 0;
 
             rules.push(RuleInfo {
                 id: RuleId::new(id),
@@ -10643,6 +11183,7 @@ impl App {
         self.tick_count = self.tick_count.wrapping_add(1);
 
         self.check_db_health_once();
+        self.ensure_active_workspace();
 
         // Persist any queued writes regardless of current view.
         self.persist_pending_writes();
@@ -11115,11 +11656,16 @@ impl App {
         if let Some(ref mut rx) = self.pending_cache_load {
             match rx.try_recv() {
                 Ok(CacheLoadMessage::Complete {
+                    workspace_id,
                     source_id,
                     total_files,
                     tags,
                     cache,
                 }) => {
+                    if Some(workspace_id) != self.active_workspace_id() {
+                        self.pending_cache_load = None;
+                        return;
+                    }
                     // Record load timing before clearing progress
                     if let Some(progress) = &self.cache_load_progress {
                         let duration_ms = progress.started_at.elapsed().as_secs_f64() * 1000.0;
@@ -11141,6 +11687,7 @@ impl App {
                         explorer.folder_cache = cache;
                         explorer.cache_loaded = true;
                         explorer.cache_source_id = Some(source_id);
+                        explorer.cache_workspace_id = Some(workspace_id);
                         explorer.selected_folder = 0;
 
                         // Ensure root folders are displayed
@@ -11190,12 +11737,21 @@ impl App {
         if let Some(ref mut rx) = self.pending_folder_query {
             match rx.try_recv() {
                 Ok(FolderQueryMessage::Complete {
+                    workspace_id,
                     prefix,
                     folders,
                     total_count,
                 }) => {
+                    if Some(workspace_id) != self.active_workspace_id() {
+                        self.pending_folder_query = None;
+                        return;
+                    }
                     // Cache the result for future navigation
                     if let Some(ref mut explorer) = self.discover.glob_explorer {
+                        if explorer.cache_workspace_id != Some(workspace_id) {
+                            self.pending_folder_query = None;
+                            return;
+                        }
                         explorer
                             .folder_cache
                             .insert(prefix.clone(), folders.clone());
@@ -11381,13 +11937,16 @@ impl App {
                                 // Use accurate count from scanner (not stale progress update)
                                 let final_file_count = files_persisted;
 
-                                let source_id = match self.open_scout_db_for_writes() {
-                                    Some(db) => match db.get_source_by_path(&source_path) {
-                                        Ok(Some(source)) => Some(source.id),
-                                        Ok(None) => None,
-                                        Err(_) => None,
-                                    },
-                                    None => None,
+                                let workspace_id = self.active_workspace_id();
+                                let source_id = match (self.open_scout_db_for_writes(), workspace_id) {
+                                    (Some(db), Some(workspace_id)) => {
+                                        match db.get_source_by_path(&workspace_id, &source_path) {
+                                            Ok(Some(source)) => Some(source.id),
+                                            Ok(None) => None,
+                                            Err(_) => None,
+                                        }
+                                    }
+                                    _ => None,
                                 };
 
                                 // Trigger sources reload (non-blocking, handled by tick())
@@ -11420,6 +11979,7 @@ impl App {
                                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                                     explorer.cache_loaded = false;
                                     explorer.cache_source_id = None;
+                                    explorer.cache_workspace_id = None;
                                     explorer.folder_cache.clear();
                                     explorer.folders.clear();
                                 }
@@ -11776,7 +12336,7 @@ mod tests {
 
     #[test]
     fn test_mode_switching() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         assert!(matches!(app.mode, TuiMode::Home));
 
         // Key '1' should switch to Discover (per spec)
@@ -11806,7 +12366,7 @@ mod tests {
 
     #[test]
     fn test_home_source_navigation() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         // Add some test sources
         app.discover.sources = vec![
             SourceInfo {
@@ -11835,7 +12395,7 @@ mod tests {
 
     #[test]
     fn test_ctrl_c_quits() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         assert!(app.running);
 
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -11845,7 +12405,7 @@ mod tests {
 
     #[test]
     fn test_esc_returns_home_from_jobs() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         // Start in Jobs mode
         app.mode = TuiMode::Jobs;
 
@@ -12002,7 +12562,7 @@ mod tests {
 
     #[test]
     fn test_jobs_navigation_bounds() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Jobs;
         app.jobs_state.jobs = create_test_jobs();
         app.jobs_state.selected_index = 0;
@@ -12024,7 +12584,7 @@ mod tests {
 
     #[test]
     fn test_jobs_navigation_respects_filter() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Jobs;
         app.jobs_state.jobs = create_test_jobs();
 
@@ -12050,7 +12610,7 @@ mod tests {
     fn test_sources_dropdown_navigation_latency() {
         use std::time::Instant;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Set up sources (in-memory, no DB)
@@ -12097,7 +12657,7 @@ mod tests {
     fn test_file_list_navigation_latency() {
         use std::time::Instant;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::Files;
 
@@ -12138,7 +12698,7 @@ mod tests {
     fn test_jobs_list_navigation_latency() {
         use std::time::Instant;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Jobs;
 
         // Set up large jobs list (in-memory)
@@ -12202,7 +12762,7 @@ mod tests {
     fn test_sources_filter_typing_latency() {
         use std::time::Instant;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Set up sources
@@ -12274,7 +12834,7 @@ mod tests {
 
     #[test]
     fn test_jobs_empty_list_navigation() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Jobs;
         // Empty jobs list
         app.jobs_state.jobs = vec![];
@@ -12334,7 +12894,7 @@ mod tests {
 
     #[test]
     fn test_discover_filter_mode() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
@@ -12358,7 +12918,7 @@ mod tests {
 
     #[test]
     fn test_discover_filter_esc_cancels() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.view_state = DiscoverViewState::Filtering;
@@ -12374,7 +12934,7 @@ mod tests {
 
     #[test]
     fn test_discover_tag_dialog() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.selected = 1; // Select orders.csv
@@ -12394,7 +12954,7 @@ mod tests {
 
     #[test]
     fn test_discover_tag_dialog_esc_cancels() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.view_state = DiscoverViewState::Tagging;
@@ -12410,7 +12970,7 @@ mod tests {
 
     #[test]
     fn test_discover_scan_path_dialog() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
@@ -12428,7 +12988,7 @@ mod tests {
 
     #[test]
     fn test_discover_scan_path_esc_cancels() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = "/some/path".to_string();
@@ -12443,7 +13003,7 @@ mod tests {
 
     #[test]
     fn test_discover_bulk_tag_dialog() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
@@ -12457,7 +13017,7 @@ mod tests {
 
     #[test]
     fn test_discover_bulk_tag_toggle_save_as_rule() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.view_state = DiscoverViewState::BulkTagging;
@@ -12474,7 +13034,7 @@ mod tests {
 
     #[test]
     fn test_discover_bulk_tag_esc_cancels() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::BulkTagging;
         app.discover.bulk_tag_input = "batch".to_string();
@@ -12491,7 +13051,7 @@ mod tests {
 
     #[test]
     fn test_discover_create_source_on_directory() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.selected = 2; // Select archives directory
@@ -12511,7 +13071,7 @@ mod tests {
 
     #[test]
     fn test_discover_create_source_esc_cancels() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::CreatingSource;
         app.discover.source_name_input = "my_source".to_string();
@@ -12528,7 +13088,7 @@ mod tests {
 
     #[test]
     fn test_discover_esc_no_view_change_when_no_dialog() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         // No dialogs open - view_state should be Files
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
@@ -12540,7 +13100,7 @@ mod tests {
 
     #[test]
     fn test_discover_navigation_with_files() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
         app.discover.selected = 0;
@@ -12564,7 +13124,7 @@ mod tests {
 
     #[test]
     fn test_discover_filter_glob_pattern() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         // Use realistic absolute paths like real scans produce
         app.discover.files = vec![
@@ -12632,7 +13192,7 @@ mod tests {
 
     #[test]
     fn test_discover_filter_substring_still_works() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.files = create_test_files();
 
@@ -12650,7 +13210,7 @@ mod tests {
 
     #[test]
     fn test_discover_backspace_in_dialogs() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Test backspace in scan path
@@ -12680,7 +13240,7 @@ mod tests {
     fn test_scan_valid_directory_enters_scanning_state() {
         use tempfile::TempDir;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Create a temp directory with some files
@@ -12713,7 +13273,7 @@ mod tests {
 
     #[test]
     fn test_scan_invalid_path_shows_error() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Open scan dialog with invalid path
@@ -12747,7 +13307,7 @@ mod tests {
     fn test_scan_not_a_directory_shows_error() {
         use tempfile::NamedTempFile;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Create a temp file (not a directory)
@@ -12784,7 +13344,7 @@ mod tests {
     fn test_scan_cancel_with_esc() {
         use tempfile::TempDir;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Create a temp directory
@@ -12826,7 +13386,7 @@ mod tests {
     fn test_scan_creates_job_with_running_status() {
         use tempfile::TempDir;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Verify no jobs initially
@@ -12863,7 +13423,7 @@ mod tests {
     fn test_scan_cancel_sets_job_cancelled() {
         use tempfile::TempDir;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Create a temp directory
@@ -12899,7 +13459,7 @@ mod tests {
         use std::time::Duration;
         use tempfile::TempDir;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Create a temp directory with some files
@@ -12942,7 +13502,7 @@ mod tests {
         use std::time::Duration;
         use tempfile::TempDir;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Create a temp directory with some files
@@ -12996,7 +13556,7 @@ mod tests {
         use std::time::Duration;
         use tempfile::TempDir;
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Create a temp directory with some files
@@ -13054,7 +13614,7 @@ mod tests {
 
     #[test]
     fn test_scan_home_tilde_expansion() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         // Test ~ expansion - should not fail immediately
@@ -13080,7 +13640,7 @@ mod tests {
     #[test]
     fn test_large_file_list_navigation_performance() {
         // Test that navigating a large file list is O(1) not O(n)
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::Files;
 
@@ -13117,7 +13677,7 @@ mod tests {
 
     #[test]
     fn test_selection_bounds_with_large_list() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::Files;
 
@@ -13236,7 +13796,7 @@ mod tests {
 
     #[test]
     fn test_filter_with_large_list() {
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::Files;
 
@@ -13334,7 +13894,7 @@ mod tests {
             }
         }
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
         app.discover.view_state = DiscoverViewState::Files;
 
@@ -13382,7 +13942,7 @@ mod tests {
             std::fs::write(&file_path, format!("content {}", i)).unwrap();
         }
 
-        let mut app = App::new(test_args());
+        let mut app = App::new(test_args(), None);
         app.mode = TuiMode::Discover;
 
         let path = temp_dir.path().to_string_lossy().to_string();

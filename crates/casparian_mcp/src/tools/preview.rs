@@ -13,6 +13,7 @@ use crate::types::{
 };
 use anyhow::{Context, Result};
 use casparian_protocol::JobId as ProtoJobId;
+use casparian_worker::cancel::CancellationToken;
 use casparian_worker::native_runtime::NativeSubprocessRuntime;
 use casparian_worker::runtime::{PluginRuntime, RunContext};
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,7 @@ impl McpTool for PreviewTool {
 
         // Create runtime
         let runtime = NativeSubprocessRuntime::new();
+        let cancel_token = CancellationToken::new();
 
         let mut all_outputs: HashMap<String, OutputPreview> = HashMap::new();
         let mut errors = Vec::new();
@@ -160,7 +162,7 @@ impl McpTool for PreviewTool {
         for (idx, file_path) in validated_files.iter().enumerate() {
             let ctx = create_run_context(idx, &parser_path);
 
-            match runtime.run_file(&ctx, file_path) {
+            match runtime.run_file(&ctx, file_path, &cancel_token) {
                 Ok(run_outputs) => {
                     // Process each output from this file
                     for (batch_idx, batches) in run_outputs.output_batches.iter().enumerate() {

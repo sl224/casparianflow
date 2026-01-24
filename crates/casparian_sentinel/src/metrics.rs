@@ -20,6 +20,7 @@ pub struct Metrics {
     pub jobs_dispatched: AtomicU64,
     pub jobs_completed: AtomicU64,
     pub jobs_failed: AtomicU64,
+    pub jobs_aborted: AtomicU64,
     pub jobs_rejected: AtomicU64,
     pub jobs_retried: AtomicU64,
 
@@ -52,6 +53,7 @@ impl Metrics {
             jobs_dispatched: AtomicU64::new(0),
             jobs_completed: AtomicU64::new(0),
             jobs_failed: AtomicU64::new(0),
+            jobs_aborted: AtomicU64::new(0),
             jobs_rejected: AtomicU64::new(0),
             jobs_retried: AtomicU64::new(0),
             workers_registered: AtomicU64::new(0),
@@ -79,6 +81,11 @@ impl Metrics {
     #[inline]
     pub fn inc_jobs_failed(&self) {
         self.jobs_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_jobs_aborted(&self) {
+        self.jobs_aborted.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -143,6 +150,7 @@ impl Metrics {
             jobs_dispatched: self.jobs_dispatched.load(Ordering::Relaxed),
             jobs_completed: self.jobs_completed.load(Ordering::Relaxed),
             jobs_failed: self.jobs_failed.load(Ordering::Relaxed),
+            jobs_aborted: self.jobs_aborted.load(Ordering::Relaxed),
             jobs_rejected: self.jobs_rejected.load(Ordering::Relaxed),
             jobs_retried: self.jobs_retried.load(Ordering::Relaxed),
             workers_registered: self.workers_registered.load(Ordering::Relaxed),
@@ -171,6 +179,10 @@ casparian_jobs_completed_total {}
 # HELP casparian_jobs_failed_total Total jobs that failed
 # TYPE casparian_jobs_failed_total counter
 casparian_jobs_failed_total {}
+
+# HELP casparian_jobs_aborted_total Total jobs aborted/cancelled
+# TYPE casparian_jobs_aborted_total counter
+casparian_jobs_aborted_total {}
 
 # HELP casparian_jobs_rejected_total Total jobs rejected by workers
 # TYPE casparian_jobs_rejected_total counter
@@ -215,6 +227,7 @@ casparian_conclude_time_microseconds_total {}
             s.jobs_dispatched,
             s.jobs_completed,
             s.jobs_failed,
+            s.jobs_aborted,
             s.jobs_rejected,
             s.jobs_retried,
             s.workers_registered,
@@ -235,6 +248,7 @@ pub struct MetricsSnapshot {
     pub jobs_dispatched: u64,
     pub jobs_completed: u64,
     pub jobs_failed: u64,
+    pub jobs_aborted: u64,
     pub jobs_rejected: u64,
     pub jobs_retried: u64,
     pub workers_registered: u64,
@@ -259,10 +273,10 @@ impl MetricsSnapshot {
 
     /// Calculate average conclude time in milliseconds
     pub fn avg_conclude_time_ms(&self) -> f64 {
-        if self.jobs_completed + self.jobs_failed == 0 {
+        if self.jobs_completed + self.jobs_failed + self.jobs_aborted == 0 {
             0.0
         } else {
-            let total_concluded = self.jobs_completed + self.jobs_failed;
+            let total_concluded = self.jobs_completed + self.jobs_failed + self.jobs_aborted;
             (self.conclude_time_us as f64 / total_concluded as f64) / 1000.0
         }
     }
@@ -270,12 +284,13 @@ impl MetricsSnapshot {
     /// Format as human-readable summary
     pub fn summary(&self) -> String {
         format!(
-            "Jobs: {} dispatched, {} completed, {} failed, {} rejected | \
+            "Jobs: {} dispatched, {} completed, {} failed, {} aborted, {} rejected | \
              Workers: {} registered, {} cleaned | \
              Avg dispatch: {:.2}ms, Avg conclude: {:.2}ms",
             self.jobs_dispatched,
             self.jobs_completed,
             self.jobs_failed,
+            self.jobs_aborted,
             self.jobs_rejected,
             self.workers_registered,
             self.workers_cleaned_up,

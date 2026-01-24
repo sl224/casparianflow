@@ -15,22 +15,42 @@ mod commands;
 mod session_storage;
 mod session_types;
 mod state;
+mod tape;
 
 #[cfg(test)]
 mod tests;
 
 use state::AppState;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::Layer;
 
 fn main() {
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "casparian_flow_ui=info,casparian_sentinel=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Initialize tracing (console + rolling file)
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "casparian_flow_ui=info,casparian_sentinel=info".into());
+
+    let mut _log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+    let file_layer = match ensure_logs_dir() {
+        Ok(log_dir) => {
+            let file_appender = tracing_appender::rolling::daily(log_dir, "casparian-ui.log");
+            let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+            _log_guard = Some(guard);
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file_writer)
+                    .with_ansi(false)
+                    .with_filter(env_filter.clone()),
+            )
+        }
+        Err(err) => {
+            eprintln!("Warning: failed to create logs directory: {}", err);
+            None
+        }
+    };
+
+    let registry = tracing_subscriber::registry().with(file_layer);
+    let console_layer = tracing_subscriber::fmt::layer().with_filter(env_filter.clone());
+    registry.with(console_layer).init();
 
     tracing::info!("Starting Casparian Flow UI");
 
@@ -101,4 +121,20 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+fn casparian_home() -> Option<std::path::PathBuf> {
+    if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
+        return Some(std::path::PathBuf::from(override_path));
+    }
+    dirs::home_dir().map(|h| h.join(".casparian_flow"))
+}
+
+fn ensure_logs_dir() -> std::io::Result<std::path::PathBuf> {
+    let home = casparian_home().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
+    })?;
+    let dir = home.join("logs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }

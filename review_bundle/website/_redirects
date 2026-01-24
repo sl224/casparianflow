@@ -1,0 +1,11 @@
+# Netlify redirects for clean URLs
+# See: https://docs.netlify.com/routing/redirects/
+
+# Remove .html extension
+/finance     /finance.html     200
+/healthcare  /healthcare.html  200
+/defense     /defense.html     200
+/legal       /legal.html       200
+
+# Redirect www to non-www
+https://www.casparianflow.com/*  https://casparianflow.com/:splat  301

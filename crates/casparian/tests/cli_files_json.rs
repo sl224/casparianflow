@@ -1,5 +1,6 @@
 mod cli_support;
 
+use casparian::scout::WorkspaceId;
 use casparian_db::{DbConnection, DbValue};
 use cli_support::{init_scout_schema, run_cli, run_cli_json, with_duckdb};
 use serde::Deserialize;
@@ -18,7 +19,7 @@ struct FilesOutput {
 #[derive(Debug, Deserialize)]
 struct FileOutput {
     status: String,
-    tag: Option<String>,
+    tags: Vec<String>,
     error: Option<String>,
 }
 
@@ -44,7 +45,8 @@ fn test_files_json_filters_and_limits() {
     let now = 1_737_187_200_000i64;
 
     with_duckdb(&db_path, |conn| {
-        insert_source(&conn, SOURCE_ID, "test_source", "/data", now);
+        let workspace_id = insert_workspace(&conn, now);
+        insert_source(&conn, &workspace_id, SOURCE_ID, "test_source", "/data", now);
 
         let files = [
             (
@@ -122,7 +124,17 @@ fn test_files_json_filters_and_limits() {
         ];
         for (id, path, rel_path, size, status, tag, error) in files {
             insert_file(
-                &conn, id, SOURCE_ID, path, rel_path, size, status, tag, error, now,
+                &conn,
+                &workspace_id,
+                id,
+                SOURCE_ID,
+                path,
+                rel_path,
+                size,
+                status,
+                tag,
+                error,
+                now,
             );
         }
     });
@@ -147,7 +159,7 @@ fn test_files_json_filters_and_limits() {
     assert!(sales_output
         .files
         .iter()
-        .all(|f| f.tag.as_deref() == Some("sales")));
+        .all(|f| f.tags.iter().any(|tag| tag == "sales")));
 
     let failed_args = vec![
         "files".to_string(),
@@ -167,7 +179,7 @@ fn test_files_json_filters_and_limits() {
     ];
     let untagged_output: FilesOutput = run_cli_json(&untagged_args, &envs);
     assert_eq!(untagged_output.summary.total, 3);
-    assert!(untagged_output.files.iter().all(|f| f.tag.is_none()));
+    assert!(untagged_output.files.iter().all(|f| f.tags.is_empty()));
 
     let combined_args = vec![
         "files".to_string(),
@@ -219,13 +231,35 @@ fn test_files_json_filters_and_limits() {
     );
 }
 
-fn insert_source(conn: &DbConnection, id: i64, name: &str, path: &str, now: i64) {
+fn insert_workspace(conn: &DbConnection, now: i64) -> WorkspaceId {
+    let workspace_id = WorkspaceId::new();
+    conn.execute(
+        "INSERT INTO cf_workspaces (id, name, created_at) VALUES (?, ?, ?)",
+        &[
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from("Default"),
+            DbValue::from(now),
+        ],
+    )
+    .expect("insert workspace");
+    workspace_id
+}
+
+fn insert_source(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+    id: i64,
+    name: &str,
+    path: &str,
+    now: i64,
+) {
     let source_type = serde_json::json!({ "type": "local" }).to_string();
     conn.execute(
-        "INSERT INTO scout_sources (id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 30, 1, ?, ?)",
+        "INSERT INTO scout_sources (id, workspace_id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, 30, 1, ?, ?)",
         &[
             DbValue::from(id),
+            DbValue::from(workspace_id.to_string()),
             DbValue::from(name),
             DbValue::from(source_type),
             DbValue::from(path),
@@ -238,6 +272,7 @@ fn insert_source(conn: &DbConnection, id: i64, name: &str, path: &str, now: i64)
 
 fn insert_file(
     conn: &DbConnection,
+    workspace_id: &WorkspaceId,
     id: i64,
     source_id: i64,
     path: &str,
@@ -254,10 +289,11 @@ fn insert_file(
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_lowercase());
     conn.execute(
-        "INSERT INTO scout_files (id, source_id, path, rel_path, parent_path, name, extension, size, mtime, status, tag, error, first_seen_at, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO scout_files (id, workspace_id, source_id, path, rel_path, parent_path, name, extension, is_dir, size, mtime, status, error, first_seen_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
         &[
             DbValue::from(id),
+            DbValue::from(workspace_id.to_string()),
             DbValue::from(source_id),
             DbValue::from(path),
             DbValue::from(rel_path),
@@ -267,13 +303,30 @@ fn insert_file(
             DbValue::from(size),
             DbValue::from(now),
             DbValue::from(status),
-            DbValue::from(tag),
             DbValue::from(error),
             DbValue::from(now),
             DbValue::from(now),
         ],
     )
     .expect("insert file");
+
+    if let Some(tag) = tag {
+        insert_tag(conn, workspace_id, id, tag, now);
+    }
+}
+
+fn insert_tag(conn: &DbConnection, workspace_id: &WorkspaceId, file_id: i64, tag: &str, now: i64) {
+    conn.execute(
+        "INSERT INTO scout_file_tags (workspace_id, file_id, tag, tag_source, rule_id, created_at)
+         VALUES (?, ?, ?, 'manual', NULL, ?)",
+        &[
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(file_id),
+            DbValue::from(tag),
+            DbValue::from(now),
+        ],
+    )
+    .expect("insert file tag");
 }
 
 fn split_rel_path(rel_path: &str) -> (String, String) {

@@ -1,0 +1,30 @@
+[package]
+name = "casparian_backtest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Backtest Engine - Multi-file validation with fail-fast optimization"
+
+[lib]
+name = "casparian_backtest"
+path = "src/lib.rs"
+
+[dependencies]
+# Database abstraction
+casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
+
+# Shared IDs
+casparian_ids = { path = "../casparian_ids" }
+
+
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

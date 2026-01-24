@@ -396,3 +396,8 @@
 {"type":"request","ts":"2026-01-22T22:24:46.498627Z","method":"notifications/initialized"}
 {"type":"request","ts":"2026-01-22T22:24:46.499191Z","method":"tools/list","id":"Number(1)"}
 {"type":"response","ts":"2026-01-22T22:24:46.502862Z","id":"Number(1)","success":true}
+{"type":"request","ts":"2026-01-24T00:04:44.550858Z","method":"initialize","id":"Number(0)","params_summary":"{\"capabilities\":{\"roots\":{}},\"clientInfo\":{\"name\":\"claude-code\",\"version\":\"2.1.17\"},\"protocolVersion\":\"2025-11-25\"}"}
+{"type":"response","ts":"2026-01-24T00:04:44.561810Z","id":"Number(0)","success":true}
+{"type":"request","ts":"2026-01-24T00:04:44.738360Z","method":"notifications/initialized"}
+{"type":"request","ts":"2026-01-24T00:04:44.738397Z","method":"tools/list","id":"Number(1)"}
+{"type":"response","ts":"2026-01-24T00:04:44.743276Z","id":"Number(1)","success":true}

@@ -19,12 +19,16 @@
 pub mod error;
 pub mod http_types;
 pub mod idempotency;
+pub mod metrics;
+pub mod telemetry;
 pub mod types;
 
 // Re-export types for convenience
 pub use types::{
     // Shredder types
     AnalysisResult,
+    ArtifactKind,
+    ArtifactV1,
     ColumnOrderMismatch,
     // Canonical enums (use these everywhere)
     DataType,

@@ -1,4 +1,4 @@
-use casparian::scout::SourceId;
+use casparian::scout::{SourceId, WorkspaceId};
 use casparian_db::{DbConnection, DbValue};
 use globset::GlobMatcher;
 
@@ -60,33 +60,44 @@ impl PatternQuery {
         }
     }
 
-    pub fn count_files(&self, conn: &DbConnection, source_id: SourceId) -> i64 {
+    pub fn count_files(
+        &self,
+        conn: &DbConnection,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+    ) -> i64 {
         let (sql, params) = match (self.extension.as_deref(), self.path_pattern.as_deref()) {
             (Some(ext), Some(path_pat)) => (
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND extension = ? AND rel_path LIKE ?",
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ? AND extension = ? AND rel_path LIKE ?",
                 vec![
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                     DbValue::Text(path_pat.to_string()),
                 ],
             ),
             (Some(ext), None) => (
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND extension = ?",
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ? AND extension = ?",
                 vec![
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                 ],
             ),
             (None, Some(path_pat)) => (
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ? AND rel_path LIKE ?",
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ? AND rel_path LIKE ?",
                 vec![
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(path_pat.to_string()),
                 ],
             ),
             (None, None) => (
-                "SELECT COUNT(*) FROM scout_files WHERE source_id = ?",
-                vec![DbValue::Integer(source_id.as_i64())],
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ?",
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                ],
             ),
         };
 
@@ -96,6 +107,7 @@ impl PatternQuery {
     pub fn search_files(
         &self,
         conn: &DbConnection,
+        workspace_id: WorkspaceId,
         source_id: SourceId,
         limit: usize,
         offset: usize,
@@ -103,9 +115,10 @@ impl PatternQuery {
         let (sql, params) = match (self.extension.as_deref(), self.path_pattern.as_deref()) {
             (Some(ext), Some(path_pat)) => (
                 r#"SELECT rel_path, size, mtime FROM scout_files
-                   WHERE source_id = ? AND extension = ? AND rel_path LIKE ?
+                   WHERE workspace_id = ? AND source_id = ? AND extension = ? AND rel_path LIKE ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                     DbValue::Text(path_pat.to_string()),
@@ -115,9 +128,10 @@ impl PatternQuery {
             ),
             (Some(ext), None) => (
                 r#"SELECT rel_path, size, mtime FROM scout_files
-                   WHERE source_id = ? AND extension = ?
+                   WHERE workspace_id = ? AND source_id = ? AND extension = ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(ext.to_string()),
                     DbValue::Integer(limit as i64),
@@ -126,9 +140,10 @@ impl PatternQuery {
             ),
             (None, Some(path_pat)) => (
                 r#"SELECT rel_path, size, mtime FROM scout_files
-                   WHERE source_id = ? AND rel_path LIKE ?
+                   WHERE workspace_id = ? AND source_id = ? AND rel_path LIKE ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Text(path_pat.to_string()),
                     DbValue::Integer(limit as i64),
@@ -137,9 +152,10 @@ impl PatternQuery {
             ),
             (None, None) => (
                 r#"SELECT rel_path, size, mtime FROM scout_files
-                   WHERE source_id = ?
+                   WHERE workspace_id = ? AND source_id = ?
                    ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
                 vec![
+                    DbValue::Text(workspace_id.to_string()),
                     DbValue::Integer(source_id.as_i64()),
                     DbValue::Integer(limit as i64),
                     DbValue::Integer(offset as i64),
@@ -205,14 +221,18 @@ pub fn build_eval_matcher(glob_pattern: &str) -> Result<GlobMatcher, String> {
 
 pub fn sample_paths_for_eval(
     conn: &DbConnection,
+    workspace_id: WorkspaceId,
     source_id: SourceId,
     glob_pattern: &str,
     matcher: &GlobMatcher,
 ) -> Vec<String> {
     let query = PatternQuery::from_glob(glob_pattern);
 
-    let mut where_sql = String::from("source_id = ?");
-    let mut base_params: Vec<DbValue> = vec![DbValue::Integer(source_id.as_i64())];
+    let mut where_sql = String::from("workspace_id = ? AND source_id = ?");
+    let mut base_params: Vec<DbValue> = vec![
+        DbValue::Text(workspace_id.to_string()),
+        DbValue::Integer(source_id.as_i64()),
+    ];
 
     if let Some(ext) = query.extension.as_deref() {
         where_sql.push_str(" AND extension = ?");

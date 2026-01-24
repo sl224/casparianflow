@@ -1,15 +1,22 @@
 //! Job command - Manage individual jobs
 //!
 //! Commands for showing, retrying, and cancelling individual jobs.
+//!
+//! WS4-05: Cancel uses Control API when sentinel is running, falls back to direct DB.
 
 use crate::cli::error::HelpfulError;
 use crate::cli::jobs::{column_exists, get_db_path, table_exists, Job};
 use crate::cli::output::format_number_signed;
 use casparian_db::{DbConnection, DbValue};
-use casparian_protocol::{JobId, ProcessingStatus};
+use casparian_protocol::{JobId, JobStatus, ProcessingStatus};
+use casparian_sentinel::ControlClient;
 use clap::Subcommand;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Default Control API address when sentinel is running
+const DEFAULT_CONTROL_ADDR: &str = "tcp://127.0.0.1:5556";
 
 /// Subcommands for job management
 #[derive(Subcommand, Debug, Clone)]
@@ -287,12 +294,70 @@ fn run_retry_all(db_path: &PathBuf, topic: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// Cancel a pending or running job
+///
+/// WS4-05: Uses Control API when sentinel is running for real cancellation,
+/// falls back to direct DB update otherwise.
 fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
     let job_id: JobId = id.parse().map_err(|_| {
         HelpfulError::new(format!("Invalid job ID: '{}'", id))
             .with_context("Job ID must be a positive integer")
     })?;
 
+    // Try Control API first (enables real cancellation of running jobs)
+    if let Some(client) = try_control_client() {
+        return run_cancel_via_api(&client, job_id);
+    }
+
+    // Fall back to direct DB (limited - can only update status, not stop worker)
+    run_cancel_via_db(db_path, job_id)
+}
+
+/// Try to connect to the Control API
+fn try_control_client() -> Option<ControlClient> {
+    // Check for explicit address override
+    let addr = std::env::var("CASPARIAN_CONTROL_ADDR")
+        .unwrap_or_else(|_| DEFAULT_CONTROL_ADDR.to_string());
+
+    // Check if explicitly disabled
+    if std::env::var("CASPARIAN_CONTROL_DISABLED").is_ok() {
+        return None;
+    }
+
+    // Use short timeout for connection check
+    match ControlClient::connect_with_timeout(&addr, Duration::from_millis(500)) {
+        Ok(client) => {
+            // Quick ping to verify connection
+            match client.ping() {
+                Ok(true) => Some(client),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Cancel job via Control API (real cancellation)
+fn run_cancel_via_api(client: &ControlClient, job_id: JobId) -> anyhow::Result<()> {
+    match client.cancel_job(job_id) {
+        Ok((success, message)) => {
+            if success {
+                println!("Job {} cancelled via Control API", job_id);
+                println!("  {}", message);
+            } else {
+                println!("Job {} could not be cancelled", job_id);
+                println!("  {}", message);
+            }
+            Ok(())
+        }
+        Err(e) => Err(HelpfulError::new(format!("Failed to cancel job {}", job_id))
+            .with_context(format!("Control API error: {}", e))
+            .with_suggestion("TRY: Check if sentinel is running with --control-api")
+            .into()),
+    }
+}
+
+/// Cancel job via direct DB (limited - doesn't stop running workers)
+fn run_cancel_via_db(db_path: &PathBuf, job_id: JobId) -> anyhow::Result<()> {
     let conn = connect_db(db_path)?;
 
     // Check job exists
@@ -324,6 +389,11 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
                 .with_suggestion("TRY: casparian job retry {}   # Retry the job instead")
                 .into());
         }
+        ProcessingStatus::Aborted => {
+            return Err(HelpfulError::new(format!("Job {} already aborted", job_id))
+                .with_context("Job is already cancelled")
+                .into());
+        }
         ProcessingStatus::Skipped => {
             return Err(HelpfulError::new(format!("Job {} was skipped", job_id))
                 .with_context("Cannot cancel a skipped job")
@@ -340,18 +410,20 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
         r#"
         UPDATE cf_processing_queue
         SET status = ?,
+            completion_status = ?,
             end_time = ?,
             error_message = 'Cancelled by user'
         WHERE id = ?
         "#,
         &[
-            DbValue::from(ProcessingStatus::Failed.as_str()),
+            DbValue::from(ProcessingStatus::Aborted.as_str()),
+            DbValue::from(JobStatus::Aborted.as_str()),
             DbValue::from(now),
             DbValue::from(job_id_db),
         ],
     )?;
 
-    println!("Job {} cancelled", job_id);
+    println!("Job {} cancelled (DB only)", job_id);
 
     // If the job was running, warn about potential side effects
     if job.status == ProcessingStatus::Running {
@@ -360,8 +432,10 @@ fn run_cancel(db_path: &PathBuf, id: &str) -> anyhow::Result<()> {
             "WARNING: Job was {} when cancelled.",
             ProcessingStatus::Running.as_str()
         );
-        println!("The worker may have partially processed the file.");
+        println!("The worker may still be running (sentinel not available).");
         println!("Check output files for incomplete data.");
+        println!();
+        println!("TRY: Run sentinel with --control-api for real cancellation");
     }
 
     Ok(())

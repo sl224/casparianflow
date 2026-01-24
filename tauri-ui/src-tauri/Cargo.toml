@@ -32,6 +32,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Tracing/Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # UUID for IDs
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -52,6 +53,7 @@ casparian_sentinel = { path = "../../crates/casparian_sentinel" }
 casparian_db = { path = "../../crates/casparian_db" }
 casparian_protocol = { path = "../../crates/casparian_protocol" }
 casparian_mcp = { path = "../../crates/casparian_mcp" }
+casparian_tape = { path = "../../crates/casparian_tape" }
 
 [dev-dependencies]
 tempfile = "3"

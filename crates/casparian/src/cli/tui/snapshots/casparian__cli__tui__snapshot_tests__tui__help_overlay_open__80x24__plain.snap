@@ -1,0 +1,27 @@
+---
+source: crates/casparian/src/cli/tui/snapshot_tests.rs
+expression: plain
+---
+ Casparian Flow | View: Discover | WS: alpha-case | DB: duckdb | Run: 1 | Fai...
+  ┌ Help ────────────────────────────────────────────────────────────────────┐
+──│                                                                          │──
+╭ │  RULE BUILDER KEYS                      NAVIGATION                       │─┐
+│V│  ─────────────────                      ──────────                       │ │
+│[│  Tab/Shift+Tab  Cycle between fields    3         Focus Files panel      │ │
+│[│  ↑/↓ arrows     Move between fields     4         Sources view           │ │
+│[│  ←/→ arrows     Switch panels           0 / H     Home                   │o│
+│[│                                         Esc       Back / Close           │ │
+│[│  ↑/↓            Navigate lists                                           │ │
+│[│  Enter          Expand folder / Save    PATTERN SYNTAX                   │g│
+│[│                                         ──────────────                   │ │
+│[│  ACTIONS                                **/*      All files              │ │
+│[│  ───────                                *.rs      Rust files             │ │
+│ │  1              Open Source dropdown    **/*.csv  CSV files (recursive)  │ │
+│C│  2              Open Tags dropdown      <name>    Extract field          │ │
+│W│  s              Scan new directory                                       │ │
+│S│  Ctrl+S         Save rule               FOCUS INDICATOR                  │ │
+│T│  t              Run backtest            ──────────────                   │ │
+│ │                                         █ cursor   = text input active   │ │
+╰─│                                         ► pointer  = list navigation     │─┘
+──│  IN DROPDOWNS                                                            │──
+ [└──────────────────────────────────────────────────────────────────────────┘..

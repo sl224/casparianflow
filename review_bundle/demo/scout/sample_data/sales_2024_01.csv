@@ -1,0 +1,6 @@
+date,product,quantity,unit_price,total
+2024-01-15,Widget A,10,29.99,299.90
+2024-01-15,Widget B,5,49.99,249.95
+2024-01-16,Widget A,8,29.99,239.92
+2024-01-17,Widget C,3,99.99,299.97
+2024-01-18,Widget B,12,49.99,599.88

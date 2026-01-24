@@ -1,0 +1,119 @@
+combined
+
+Archetypes:
+- template: /defense/mission_<n>/sata/<date>/<n>/<n>/...
+  files: 58
+  sample: /defense/mission_000/satA/2024/01/15/telemetry_0000.csv
+- template: /defense/msn_<n>/sata/<date>/<n>/<n>/...
+  files: 26
+  sample: /defense/msn_000/satA/2024/01/15/telemetry_0000.csv
+- template: /health/hl7/admission_in/...
+  files: 24
+  sample: /health/hl7/admission_in/ADT_20240101_0.hl7
+- template: /health/hl7/adm_in/...
+  files: 22
+  sample: /health/hl7/adm_in/ADT_20240101_0.hl7
+- template: /finance/netsuite/exports/<date>/<n>/...
+  files: 20
+  sample: /finance/netsuite/exports/2024/01/fin_export_20240101.csv
+- template: /health/hl7/lab_in/...
+  files: 20
+  sample: /health/hl7/lab_in/ORU_20240101_0.hl7
+- template: /health/hl7/lab_out/...
+  files: 18
+  sample: /health/hl7/lab_out/ORU_2024-01-01_0.hl7
+- template: /finance/ns/exports/<date>/<n>/...
+  files: 18
+  sample: /finance/ns/exports/2024/01/fin_export_20240101.xlsx
+- template: /health/hl7/facility_a/inbound/...
+  files: 16
+  sample: /health/hl7/facility_a/inbound/ADT_20240101_0.hl7
+- template: /finance/saved_search/ap_aging/<date>/<n>/...
+  files: 16
+  sample: /finance/saved_search/ap_aging/2024/01/transactions_20240101.csv
+- template: /defense/patrol_<n>/uav_<n>/<date>/<n>/<n>/...
+  files: 16
+  sample: /defense/patrol_000/uav_01/2024/01/15/telemetry_0000.csv
+- template: /finance/saved_search/ap_age/<date>/<n>/...
+  files: 16
+  sample: /finance/saved_search/ap_age/2024/01/transactions_20240101.xlsx
+- template: /defense/ptl_<n>/uav_<n>/<date>/<n>/<n>/...
+  files: 16
+  sample: /defense/ptl_000/uav_01/2024/01/15/telemetry_0000.csv
+- template: /health/hl7/facility_a/in/...
+  files: 14
+  sample: /health/hl7/facility_a/in/ADT_20240101_0.hl7
+- template: /finance/payroll/exports/<date>/<n>/...
+  files: 12
+  sample: /finance/payroll/exports/2024/01/payroll_20240101.csv
+- template: /finance/gl/exports/<date>/<n>/...
+  files: 10
+  sample: /finance/gl/exports/2024/01/general_ledger_20240101.csv
+
+Groups:
+- Defense Data
+  - template: /defense/mission_<n>/sata/<date>/<n>/<n>/...
+    files: 58
+    sample: /defense/mission_000/satA/2024/01/15/telemetry_0000.csv
+    ext: csv
+    filename_template: telemetry_<n>
+  - template: /defense/msn_<n>/sata/<date>/<n>/<n>/...
+    files: 26
+    sample: /defense/msn_000/satA/2024/01/15/telemetry_0000.csv
+    ext: csv
+    filename_template: telemetry_<n>
+- Health Data
+  - template: /health/hl7/admission_in/...
+    files: 24
+    sample: /health/hl7/admission_in/ADT_20240101_0.hl7
+    ext: hl7
+    filename_template: adt_<date>_0
+  - template: /health/hl7/adm_in/...
+    files: 22
+    sample: /health/hl7/adm_in/ADT_20240101_0.hl7
+    ext: hl7
+    filename_template: adt_<date>_0
+- Finance Data
+  - template: /finance/netsuite/exports/<date>/<n>/...
+    files: 20
+    sample: /finance/netsuite/exports/2024/01/fin_export_20240101.csv
+    ext: csv
+    filename_template: fin_export_<date>
+  - template: /finance/ns/exports/<date>/<n>/...
+    files: 18
+    sample: /finance/ns/exports/2024/01/fin_export_20240101.xlsx
+    ext: xlsx
+    filename_template: fin_export_<date>
+- Finance Data
+  - template: /finance/saved_search/ap_aging/<date>/<n>/...
+    files: 16
+    sample: /finance/saved_search/ap_aging/2024/01/transactions_20240101.csv
+    ext: csv
+    filename_template: transactions_<date>
+  - template: /finance/saved_search/ap_age/<date>/<n>/...
+    files: 16
+    sample: /finance/saved_search/ap_age/2024/01/transactions_20240101.xlsx
+    ext: xlsx
+    filename_template: transactions_<date>
+- Defense Data
+  - template: /defense/patrol_<n>/uav_<n>/<date>/<n>/<n>/...
+    files: 16
+    sample: /defense/patrol_000/uav_01/2024/01/15/telemetry_0000.csv
+    ext: csv
+    filename_template: telemetry_<n>
+  - template: /defense/ptl_<n>/uav_<n>/<date>/<n>/<n>/...
+    files: 16
+    sample: /defense/ptl_000/uav_01/2024/01/15/telemetry_0000.csv
+    ext: csv
+    filename_template: telemetry_<n>
+- Health Data
+  - template: /health/hl7/facility_a/inbound/...
+    files: 16
+    sample: /health/hl7/facility_a/inbound/ADT_20240101_0.hl7
+    ext: hl7
+    filename_template: adt_<date>_0
+  - template: /health/hl7/facility_a/in/...
+    files: 14
+    sample: /health/hl7/facility_a/in/ADT_20240101_0.hl7
+    ext: hl7
+    filename_template: adt_<date>_0

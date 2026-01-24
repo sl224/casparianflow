@@ -5,12 +5,12 @@
 
 use anyhow::{Context, Result};
 use casparian_protocol::types::{
-    self, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, RuntimeKind, SchemaColumnSpec,
-    SchemaDefinition, SinkConfig, SinkMode,
+    self, ArtifactV1, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, RuntimeKind,
+    SchemaColumnSpec, SchemaDefinition, SinkConfig, SinkMode,
 };
 use casparian_protocol::{
-    materialization_key, output_target_key, schema_hash, table_name_with_schema, JobId, Message,
-    OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
+    materialization_key, metrics, output_target_key, schema_hash, table_name_with_schema, JobId,
+    Message, OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
 };
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{LockedColumn, LockedSchema, SchemaContract, SchemaStorage};
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 use zmq::{Context as ZmqContext, Socket};
 
+use crate::control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo};
 use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
 use crate::db::{models::*, JobQueue};
 use crate::metrics::METRICS;
@@ -146,12 +147,17 @@ pub struct SentinelConfig {
     pub bind_addr: String,
     pub database_url: String,
     pub max_workers: usize,
+    /// Optional control API bind address (e.g., "ipc:///tmp/casparian_control.sock" or "tcp://127.0.0.1:5556")
+    /// If None, control API is disabled.
+    pub control_addr: Option<String>,
 }
 
 /// Main Sentinel control plane
 pub struct Sentinel {
     context: ZmqContext,
     socket: Socket,
+    /// Optional control API socket (REP pattern)
+    control_socket: Option<Socket>,
     workers: HashMap<Vec<u8>, ConnectedWorker>,
     queue: JobQueue,
     conn: DbConnection, // Database connection for queries
@@ -219,9 +225,39 @@ impl Sentinel {
 
         info!("Sentinel bound to {}", config.bind_addr);
 
+        // Optionally create control API socket
+        let control_socket = if let Some(ref control_addr) = config.control_addr {
+            // Destructive initialization for IPC sockets
+            #[cfg(unix)]
+            if let Some(socket_path) = control_addr.strip_prefix("ipc://") {
+                let path = std::path::Path::new(socket_path);
+                if path.exists() {
+                    info!("Removing stale control IPC socket: {}", socket_path);
+                    if let Err(e) = std::fs::remove_file(path) {
+                        warn!("Failed to remove stale control socket {}: {}", socket_path, e);
+                    }
+                }
+            }
+
+            let ctrl_socket = context
+                .socket(zmq::REP)
+                .context("Failed to create control REP socket")?;
+            ctrl_socket
+                .bind(control_addr)
+                .with_context(|| format!("Failed to bind control socket to {}", control_addr))?;
+            ctrl_socket
+                .set_rcvtimeo(10) // Short timeout to not block main loop
+                .context("Failed to set control socket timeout")?;
+            info!("Control API bound to {}", control_addr);
+            Some(ctrl_socket)
+        } else {
+            None
+        };
+
         Ok(Self {
             context,
             socket,
+            control_socket,
             workers: HashMap::new(),
             queue,
             conn,
@@ -435,21 +471,33 @@ impl Sentinel {
         let mut output_rows: HashMap<String, i64> = HashMap::new();
         let mut output_status: HashMap<String, i64> = HashMap::new();
         for (key, value) in &receipt.metrics {
-            if let Some(name) = key.strip_prefix("rows.") {
+            if let Some(name) = metrics::parse_rows_by_output(key) {
                 output_rows.insert(name.to_string(), *value);
             }
-            if let Some(name) = key.strip_prefix("status.") {
+            if let Some(name) = metrics::parse_status_by_output(key) {
                 output_status.insert(name.to_string(), *value);
             }
         }
 
         let mut artifact_tables: HashMap<String, String> = HashMap::new();
         for artifact in &receipt.artifacts {
-            let Some(topic) = artifact.get("topic") else {
-                continue;
-            };
-            if let Some(table) = artifact.get("table") {
-                artifact_tables.insert(topic.clone(), table.clone());
+            match artifact {
+                ArtifactV1::Output {
+                    output_name,
+                    table: Some(table),
+                    ..
+                } => {
+                    artifact_tables.insert(output_name.clone(), table.clone());
+                }
+                ArtifactV1::Quarantine {
+                    output_name,
+                    table: Some(table),
+                    ..
+                } => {
+                    // Quarantine tables are tracked separately but may still be useful for diagnostics.
+                    artifact_tables.insert(output_name.clone(), table.clone());
+                }
+                _ => {}
             }
         }
 
@@ -603,6 +651,11 @@ impl Sentinel {
                 }
             }
 
+            // Handle control API requests (non-blocking)
+            if let Err(e) = self.handle_control_requests() {
+                error!("Control API error: {}", e);
+            }
+
             // Periodic cleanup of stale workers
             self.cleanup_stale_workers();
 
@@ -701,6 +754,192 @@ impl Sentinel {
         } else {
             debug!("Cleanup: {} workers active", self.workers.len());
         }
+    }
+
+    // ========================================================================
+    // Control API Handling
+    // ========================================================================
+
+    /// Handle control API requests (non-blocking)
+    fn handle_control_requests(&mut self) -> Result<()> {
+        if self.control_socket.is_none() {
+            return Ok(());
+        }
+
+        // Try to receive a control request (non-blocking due to short timeout)
+        // Use take/put pattern to satisfy borrow checker
+        let control_socket = self.control_socket.take().unwrap();
+        let request_bytes = match control_socket.recv_bytes(0) {
+            Ok(bytes) => {
+                self.control_socket = Some(control_socket);
+                bytes
+            }
+            Err(zmq::Error::EAGAIN) => {
+                self.control_socket = Some(control_socket);
+                return Ok(()); // No request waiting
+            }
+            Err(e) => {
+                self.control_socket = Some(control_socket);
+                return Err(anyhow::anyhow!("Control socket recv error: {}", e));
+            }
+        };
+
+        // Parse and handle the request
+        let response = match serde_json::from_slice::<ControlRequest>(&request_bytes) {
+            Ok(request) => self.handle_control_request(request),
+            Err(e) => ControlResponse::error("PARSE_ERROR", format!("Invalid request: {}", e)),
+        };
+
+        // Send response
+        let response_bytes = serde_json::to_vec(&response)?;
+        let control_socket = self.control_socket.as_ref().unwrap();
+        control_socket
+            .send(&response_bytes, 0)
+            .context("Failed to send control response")?;
+
+        Ok(())
+    }
+
+    /// Handle a single control request
+    fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
+        match request {
+            ControlRequest::ListJobs {
+                status,
+                limit,
+                offset,
+            } => self.handle_list_jobs(status, limit.unwrap_or(100), offset.unwrap_or(0)),
+            ControlRequest::GetJob { job_id } => self.handle_get_job(job_id),
+            ControlRequest::CancelJob { job_id } => self.handle_cancel_job(job_id),
+            ControlRequest::GetQueueStats => self.handle_get_queue_stats(),
+            ControlRequest::Ping => ControlResponse::Pong,
+        }
+    }
+
+    /// Handle ListJobs request
+    fn handle_list_jobs(
+        &self,
+        status: Option<ProcessingStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> ControlResponse {
+        let limit = limit.max(0) as usize;
+        let offset = offset.max(0) as usize;
+        match self.queue.list_jobs(status, limit, offset) {
+            Ok(jobs) => {
+                let job_infos: Vec<JobInfo> = jobs.into_iter().map(Self::job_to_info).collect();
+                ControlResponse::Jobs(job_infos)
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list jobs: {}", e)),
+        }
+    }
+
+    /// Handle GetJob request
+    fn handle_get_job(&self, job_id: JobId) -> ControlResponse {
+        match self.queue.get_job(job_id) {
+            Ok(Some(job)) => ControlResponse::Job(Some(Self::job_to_info(job))),
+            Ok(None) => ControlResponse::Job(None),
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get job: {}", e)),
+        }
+    }
+
+    /// Handle CancelJob request
+    fn handle_cancel_job(&mut self, job_id: JobId) -> ControlResponse {
+        // First, try to cancel in the database (for queued jobs)
+        match self.queue.cancel_job(job_id) {
+            Ok(true) => {
+                info!("Job {} cancelled via control API", job_id);
+                return ControlResponse::CancelResult {
+                    success: true,
+                    message: "Job cancelled".to_string(),
+                };
+            }
+            Ok(false) => {
+                // Job might be running - try to abort via worker
+            }
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Failed to cancel job: {}", e));
+            }
+        }
+
+        // Check if job is running on a worker
+        for (identity, worker) in &self.workers {
+            if worker.current_job_id == Some(job_id) {
+                // Send abort to worker
+                if let Err(e) = self.send_abort_to_worker(identity.clone(), job_id) {
+                    warn!("Failed to send abort for job {}: {}", job_id, e);
+                    return ControlResponse::CancelResult {
+                        success: false,
+                        message: format!("Failed to send abort: {}", e),
+                    };
+                }
+                info!("Abort sent to worker for job {}", job_id);
+                return ControlResponse::CancelResult {
+                    success: true,
+                    message: "Abort signal sent to worker".to_string(),
+                };
+            }
+        }
+
+        // Job not found in queue or running
+        ControlResponse::CancelResult {
+            success: false,
+            message: "Job not found or already completed".to_string(),
+        }
+    }
+
+    /// Handle GetQueueStats request
+    fn handle_get_queue_stats(&self) -> ControlResponse {
+        match self.queue.count_jobs_by_status() {
+            Ok(counts) => {
+                let queued = *counts.get(&ProcessingStatus::Queued).unwrap_or(&0);
+                let running = *counts.get(&ProcessingStatus::Running).unwrap_or(&0);
+                let completed = *counts.get(&ProcessingStatus::Completed).unwrap_or(&0);
+                let failed = *counts.get(&ProcessingStatus::Failed).unwrap_or(&0);
+                let aborted = *counts.get(&ProcessingStatus::Aborted).unwrap_or(&0);
+                let total = queued + running + completed + failed + aborted;
+
+                ControlResponse::QueueStats(QueueStatsInfo {
+                    queued,
+                    running,
+                    completed,
+                    failed,
+                    aborted,
+                    total,
+                })
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get stats: {}", e)),
+        }
+    }
+
+    /// Convert Job to JobInfo for API responses
+    fn job_to_info(job: crate::db::queue::Job) -> JobInfo {
+        JobInfo {
+            id: job.id,
+            file_id: job.file_id,
+            plugin_name: job.plugin_name,
+            status: job.status,
+            priority: job.priority,
+            retry_count: job.retry_count,
+            created_at: job.created_at.map(|t| t.to_rfc3339()),
+            updated_at: job.updated_at.map(|t| t.to_rfc3339()),
+            error_message: job.error_message,
+            parser_version: job.parser_version,
+            pipeline_run_id: job.pipeline_run_id,
+            quarantine_rows: job.quarantine_rows,
+        }
+    }
+
+    /// Send abort message to a specific worker
+    fn send_abort_to_worker(&self, identity: Vec<u8>, job_id: JobId) -> Result<()> {
+        // Create abort message with empty payload
+        let msg = Message::new(OpCode::Abort, job_id, vec![])?;
+        let (header, body) = msg.pack()?;
+
+        // Send ABORT message as multipart [identity, header, body]
+        let frames = [identity.as_slice(), header.as_ref(), body.as_slice()];
+        self.socket.send_multipart(&frames, 0)?;
+
+        Ok(())
     }
 
     /// Receive next message with timeout
@@ -892,7 +1131,7 @@ impl Sentinel {
                     ),
                     other => unreachable!("Non-success status in success branch: {:?}", other),
                 };
-                let quarantine_rows = receipt.metrics.get("quarantine_rows").copied();
+                let quarantine_rows = receipt.metrics.get(metrics::QUARANTINE_ROWS).copied();
                 self.queue
                     .complete_job(job_id, completion_status, summary, quarantine_rows)?;
                 METRICS.inc_jobs_completed();
@@ -934,27 +1173,24 @@ impl Sentinel {
                 self.handle_job_failure(job_id, &error, is_transient, retry_count)?;
             }
             JobStatus::Rejected => {
-                // Worker was at capacity - requeue the job (always retry)
+                // Worker was at capacity - defer the job without incrementing retry count.
+                // Capacity rejections are not failures; they should not count toward dead-letter limits.
                 warn!(
-                    "Job {} rejected by worker (at capacity), requeueing",
+                    "Job {} rejected by worker (at capacity), deferring for retry",
                     job_id
                 );
                 METRICS.inc_jobs_rejected();
-                self.queue.requeue_job(job_id)?;
+                // Use defer_job (not requeue_job) to avoid incrementing retry_count
+                let scheduled_at = DbTimestamp::now();
+                self.queue.defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
             }
             JobStatus::Aborted => {
                 let error = receipt
                     .error_message
                     .unwrap_or_else(|| "Aborted".to_string());
                 warn!("Job {} aborted: {}", job_id, error);
-                self.queue
-                    .fail_job(job_id, JobStatus::Aborted.as_str(), &error)?;
-                METRICS.inc_jobs_failed();
-
-                // Record failure for circuit breaker
-                if let Some(ref parser) = plugin_name {
-                    self.record_failure(parser, &error)?;
-                }
+                self.queue.abort_job(job_id, &error)?;
+                METRICS.inc_jobs_aborted();
             }
         }
 
@@ -1106,13 +1342,14 @@ impl Sentinel {
             &format!(
                 r#"
                 SELECT
-                    SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END) AS failed,
+                    SUM(CASE WHEN status IN ('{failed}', '{aborted}') THEN 1 ELSE 0 END) AS failed,
                     SUM(CASE WHEN status IN ('{queued}', '{running}') THEN 1 ELSE 0 END) AS active,
                     SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END) AS completed
                 FROM cf_processing_queue
                 WHERE pipeline_run_id = ?
                 "#,
                 failed = ProcessingStatus::Failed.as_str(),
+                aborted = ProcessingStatus::Aborted.as_str(),
                 queued = ProcessingStatus::Queued.as_str(),
                 running = ProcessingStatus::Running.as_str(),
                 completed = ProcessingStatus::Completed.as_str(),
@@ -1182,6 +1419,15 @@ impl Sentinel {
     /// Assign a job to a worker.
     /// Returns true when a DISPATCH was sent.
     fn assign_job(&mut self, identity: Vec<u8>, job: ProcessingJob) -> Result<bool> {
+        let span = tracing::info_span!(
+            "sentinel.dispatch_job",
+            job_id = job.id,
+            file_id = job.file_id,
+            plugin = %job.plugin_name,
+            pipeline_run_id = %job.pipeline_run_id.as_deref().unwrap_or("none"),
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
         let dispatch_start = Instant::now();
 
         // Validate job.id is non-negative before casting to u64
@@ -1357,6 +1603,8 @@ impl Sentinel {
 
         METRICS.inc_jobs_dispatched();
         METRICS.inc_messages_sent();
+        let duration_ms = dispatch_start.elapsed().as_millis() as u64;
+        span.record("duration_ms", &duration_ms);
         METRICS.record_dispatch_time(dispatch_start);
         info!("Dispatched job {} ({})", job.id, job.plugin_name);
         Ok(true)

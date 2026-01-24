@@ -1,0 +1,13 @@
+[package]
+name = "native_plugin_basic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+arrow = "54"
+blake3 = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[workspace]

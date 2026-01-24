@@ -1,0 +1,25 @@
+[package]
+name = "casparian_security"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Cryptography
+sha2 = "0.10"
+hex = "0.4"
+
+# AST Analysis
+rustpython-ast = { version = "0.4", features = ["visitor"] }
+rustpython-parser = "0.4"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]

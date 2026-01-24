@@ -1,0 +1,10 @@
+{
+  "columns": [
+    { "name": "file_path", "data_type": "string", "nullable": true },
+    { "name": "file_hash", "data_type": "string", "nullable": false },
+    { "name": "file_size", "data_type": "int64", "nullable": false },
+    { "name": "file_mtime", "data_type": { "kind": "timestamp_tz", "tz": "UTC" }, "nullable": true },
+    { "name": "record_count", "data_type": "int64", "nullable": true },
+    { "name": "parser_output_version", "data_type": "string", "nullable": false }
+  ]
+}

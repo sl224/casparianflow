@@ -15,10 +15,14 @@
 use crate::cli::context;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_size, print_table_colored};
-use casparian::scout::{Database, FileStatus, ScannedFile, Source, SourceId};
+use crate::cli::workspace;
+use casparian::scout::{Database, FileStatus, Source, SourceId, WorkspaceId};
+use casparian_db::DbValue;
+use chrono::Utc;
 use comfy_table::Color;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Arguments for the files command
@@ -50,7 +54,7 @@ struct FileOutput {
     rel_path: String,
     size: u64,
     status: String,
-    tag: Option<String>,
+    tags: Vec<String>,
     error: Option<String>,
 }
 
@@ -71,6 +75,212 @@ struct FilesFilters {
     untagged: bool,
     patterns: Vec<String>,
     tag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FileRow {
+    id: i64,
+    source_id: SourceId,
+    path: String,
+    rel_path: String,
+    size: u64,
+    status: FileStatus,
+    error: Option<String>,
+}
+
+fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
+    workspace::resolve_active_workspace_id(db).map_err(|e| {
+        e.with_context("The workspace registry is required for files")
+    })
+}
+
+fn now_millis() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn load_files(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    source_ids: &[SourceId],
+    status: Option<FileStatus>,
+    topic: Option<&str>,
+    untagged: bool,
+    limit: usize,
+) -> Result<Vec<FileRow>, HelpfulError> {
+    let mut sql = String::from(
+        "SELECT f.id, f.source_id, f.path, f.rel_path, f.size, f.status, f.error \
+         FROM scout_files f ",
+    );
+    if topic.is_some() {
+        sql.push_str("JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id ");
+    } else if untagged {
+        sql.push_str(
+            "LEFT JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id ",
+        );
+    }
+    sql.push_str("WHERE f.workspace_id = ? ");
+
+    let mut params: Vec<DbValue> = vec![DbValue::from(workspace_id.to_string())];
+
+    if let Some(tag) = topic {
+        sql.push_str("AND t.tag = ? ");
+        params.push(DbValue::from(tag));
+    } else if untagged {
+        sql.push_str("AND t.file_id IS NULL ");
+    }
+
+    if !source_ids.is_empty() {
+        let placeholders = std::iter::repeat("?")
+            .take(source_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!("AND f.source_id IN ({}) ", placeholders));
+        for source_id in source_ids {
+            params.push(DbValue::from(source_id.as_i64()));
+        }
+    }
+
+    if let Some(status) = status {
+        sql.push_str("AND f.status = ? ");
+        params.push(DbValue::from(status.as_str()));
+    }
+
+    sql.push_str("ORDER BY f.mtime DESC LIMIT ? ");
+    params.push(DbValue::from(limit as i64));
+
+    let rows = conn
+        .query_all(&sql, &params)
+        .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
+
+    let mut files = Vec::new();
+    for row in rows {
+        let status_raw: String = row
+            .get_by_name("status")
+            .map_err(|e| HelpfulError::new(format!("Failed to read status: {}", e)))?;
+        let status = FileStatus::parse(&status_raw).ok_or_else(|| {
+            HelpfulError::new(format!("Invalid file status in database: {}", status_raw))
+        })?;
+        let source_id_raw: i64 = row
+            .get_by_name("source_id")
+            .map_err(|e| HelpfulError::new(format!("Failed to read source_id: {}", e)))?;
+        let source_id = SourceId::try_from(source_id_raw)
+            .map_err(|e| HelpfulError::new(format!("Invalid source_id: {}", e)))?;
+        let size_raw: i64 = row
+            .get_by_name("size")
+            .map_err(|e| HelpfulError::new(format!("Failed to read size: {}", e)))?;
+        files.push(FileRow {
+            id: row
+                .get_by_name("id")
+                .map_err(|e| HelpfulError::new(format!("Failed to read id: {}", e)))?,
+            source_id,
+            path: row
+                .get_by_name("path")
+                .map_err(|e| HelpfulError::new(format!("Failed to read path: {}", e)))?,
+            rel_path: row
+                .get_by_name("rel_path")
+                .map_err(|e| HelpfulError::new(format!("Failed to read rel_path: {}", e)))?,
+            size: size_raw as u64,
+            status,
+            error: row
+                .get_by_name("error")
+                .map_err(|e| HelpfulError::new(format!("Failed to read error: {}", e)))?,
+        });
+    }
+
+    Ok(files)
+}
+
+fn fetch_tags_for_files(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    file_ids: &[i64],
+) -> Result<HashMap<i64, Vec<String>>, HelpfulError> {
+    let mut tags_by_file: HashMap<i64, Vec<String>> = HashMap::new();
+    if file_ids.is_empty() {
+        return Ok(tags_by_file);
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(file_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut params: Vec<DbValue> = vec![DbValue::from(workspace_id.to_string())];
+    for id in file_ids {
+        params.push(DbValue::from(*id));
+    }
+
+    let sql = format!(
+        "SELECT file_id, tag FROM scout_file_tags \
+         WHERE workspace_id = ? AND file_id IN ({}) \
+         ORDER BY tag",
+        placeholders
+    );
+
+    let rows = conn
+        .query_all(&sql, &params)
+        .map_err(|e| HelpfulError::new(format!("Failed to query file tags: {}", e)))?;
+
+    for row in rows {
+        let file_id: i64 = row
+            .get_by_name("file_id")
+            .map_err(|e| HelpfulError::new(format!("Failed to read file_id: {}", e)))?;
+        let tag: String = row
+            .get_by_name("tag")
+            .map_err(|e| HelpfulError::new(format!("Failed to read tag: {}", e)))?;
+        tags_by_file.entry(file_id).or_default().push(tag);
+    }
+
+    Ok(tags_by_file)
+}
+
+fn apply_manual_tag(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+    file_ids: &[i64],
+    tag: &str,
+) -> Result<u64, HelpfulError> {
+    if file_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tagged = 0u64;
+    for file_id in file_ids {
+        let result = conn
+            .execute(
+                "INSERT INTO scout_file_tags (workspace_id, file_id, tag, tag_source, rule_id, created_at) \
+                 VALUES (?, ?, ?, 'manual', NULL, ?) \
+                 ON CONFLICT (workspace_id, file_id, tag) DO UPDATE SET \
+                    tag_source = excluded.tag_source, \
+                    created_at = excluded.created_at",
+                &[
+                    DbValue::from(workspace_id.to_string()),
+                    DbValue::from(*file_id),
+                    DbValue::from(tag),
+                    DbValue::from(now_millis()),
+                ],
+            )
+            .map_err(|e| HelpfulError::new(format!("Failed to tag files: {}", e)))?;
+        tagged += result as u64;
+        let _ = conn.execute(
+            "UPDATE scout_files SET status = ? WHERE id = ?",
+            &[DbValue::from(FileStatus::Tagged.as_str()), DbValue::from(*file_id)],
+        );
+    }
+
+    Ok(tagged)
+}
+
+fn count_total_files(
+    conn: &casparian_db::DbConnection,
+    workspace_id: &WorkspaceId,
+) -> Result<u64, HelpfulError> {
+    let total = conn
+        .query_scalar::<i64>(
+            "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ?",
+            &[DbValue::from(workspace_id.to_string())],
+        )
+        .map_err(|e| HelpfulError::new(format!("Failed to get stats: {}", e)))?;
+    Ok(total as u64)
 }
 
 fn valid_statuses_list() -> String {
@@ -192,11 +402,13 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the database file is not corrupted or locked")
     })?;
+    let workspace_id = ensure_workspace_id(&db)?;
+    let conn = db.conn();
 
     // Determine which source(s) to query
     // Priority: explicit --source > --all > default context > all sources (with hint)
     let sources = db
-        .list_sources()
+        .list_sources(&workspace_id)
         .map_err(|e| HelpfulError::new(format!("Failed to list sources: {}", e)))?;
 
     let (source_ids, source_context_name, source_context_msg): (
@@ -243,69 +455,22 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
         (sources.iter().map(|s| s.id.clone()).collect(), None, None)
     };
 
-    // Query files based on filters, restricted to selected sources
-    let all_files: Vec<ScannedFile> = if let Some(topic) = &args.topic {
-        // Filter by topic - this queries across all sources, then we filter
-        let topic_files = db
-            .list_files_by_tag(topic, 10000)
-            .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
-        topic_files
-            .into_iter()
-            .filter(|f| source_ids.iter().any(|s| s == &f.source_id))
-            .collect()
-    } else if let Some(status) = &validated_status {
-        // Filter by status - queries across all sources, then we filter
-        let status_files = db
-            .list_files_by_status(*status, 10000)
-            .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
-        status_files
-            .into_iter()
-            .filter(|f| source_ids.iter().any(|s| s == &f.source_id))
-            .collect()
-    } else if args.untagged {
-        // Get untagged files from selected sources
-        let mut untagged_files = Vec::new();
-        for source_id in &source_ids {
-            let files = db
-                .list_untagged_files(source_id, 10000)
-                .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
-            untagged_files.extend(files);
-        }
-        untagged_files
-    } else {
-        // Get all files from selected sources
-        let mut all = Vec::new();
-        for source_id in &source_ids {
-            let files = db
-                .list_files_by_source(source_id, 10000)
-                .map_err(|e| HelpfulError::new(format!("Failed to query files: {}", e)))?;
-            all.extend(files);
-        }
-        all
-    };
+    let query_limit = args.limit.max(10_000);
+    let untagged = args.untagged && args.topic.is_none();
 
-    let all_files: Vec<ScannedFile> = all_files
-        .into_iter()
-        .filter(|f| {
-            if let Some(topic) = &args.topic {
-                if f.tag.as_deref() != Some(topic) {
-                    return false;
-                }
-            }
-            if let Some(status) = &validated_status {
-                if f.status != *status {
-                    return false;
-                }
-            }
-            if args.untagged && f.tag.is_some() {
-                return false;
-            }
-            true
-        })
-        .collect();
+    // Query files based on filters, restricted to selected sources
+    let all_files: Vec<FileRow> = load_files(
+        conn,
+        &workspace_id,
+        &source_ids,
+        validated_status,
+        args.topic.as_deref(),
+        untagged,
+        query_limit,
+    )?;
 
     // Apply pattern filtering in memory (limit applied after)
-    let filtered_files: Vec<ScannedFile> = if args.patterns.is_empty() {
+    let filtered_files: Vec<FileRow> = if args.patterns.is_empty() {
         all_files
     } else {
         let (include_set, exclude_set) = build_glob_set(&args.patterns)?;
@@ -316,7 +481,7 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
             .collect()
     };
     let total_matching = filtered_files.len();
-    let files: Vec<ScannedFile> = filtered_files.into_iter().take(args.limit).collect();
+    let files: Vec<FileRow> = filtered_files.into_iter().take(args.limit).collect();
 
     let normalized_status = validated_status
         .as_ref()
@@ -377,22 +542,20 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
         }
 
         // Get total file count
-        let stats = db
-            .get_stats()
-            .map_err(|e| HelpfulError::new(format!("Failed to get stats: {}", e)))?;
+        let total_files = count_total_files(conn, &workspace_id)?;
 
-        if stats.total_files > 0 {
+        if total_files > 0 {
             println!();
             if source_context_msg.is_some() {
                 println!(
                     "Hint: There are {} total files across all sources.",
-                    stats.total_files
+                    total_files
                 );
                 println!("TRY: casparian files --all   (to see files from all sources)");
             } else {
                 println!(
                     "Hint: There are {} total files in the database.",
-                    stats.total_files
+                    total_files
                 );
                 println!("TRY: casparian files   (to see all files)");
             }
@@ -403,10 +566,8 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
 
     // Tag files if requested
     let tagged_count = if let Some(ref new_tag) = args.tag {
-        let ids: Vec<i64> = files.iter().filter_map(|f| f.id).collect();
-        let tagged = db
-            .tag_files(&ids, new_tag)
-            .map_err(|e| HelpfulError::new(format!("Failed to tag files: {}", e)))?;
+        let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+        let tagged = apply_manual_tag(conn, &workspace_id, &ids, new_tag)?;
         if !args.json {
             println!("Tagged {} files with: \x1b[36m{}\x1b[0m", tagged, new_tag);
             println!();
@@ -416,19 +577,20 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
         None
     };
 
+    let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    let tags_by_file = fetch_tags_for_files(conn, &workspace_id, &file_ids)?;
+
     if args.json {
         let files_output: Vec<FileOutput> = files
             .iter()
             .map(|f| FileOutput {
-                id: f.id,
+                id: Some(f.id),
                 source_id: f.source_id,
                 path: f.path.clone(),
                 rel_path: f.rel_path.clone(),
                 size: f.size,
                 status: f.status.as_str().to_string(),
-                tag: tagged_count
-                    .and_then(|_| args.tag.clone())
-                    .or_else(|| f.tag.clone()),
+                tags: tags_by_file.get(&f.id).cloned().unwrap_or_default(),
                 error: f.error.clone(),
             })
             .collect();
@@ -482,15 +644,15 @@ pub fn run(args: FilesArgs) -> anyhow::Result<()> {
     println!();
 
     // Build table rows
-    let headers = &["PATH", "SIZE", "TOPIC", "STATUS", "ERROR"];
+    let headers = &["PATH", "SIZE", "TAGS", "STATUS", "ERROR"];
     let rows: Vec<Vec<(String, Option<Color>)>> = files
         .iter()
         .map(|f| {
-            // Show the new tag if we just tagged, otherwise show existing tag
-            let topic_display = if tagged_count.is_some() {
-                args.tag.as_deref().unwrap_or("-").to_string()
+            let tag_list = tags_by_file.get(&f.id).cloned().unwrap_or_default();
+            let topic_display = if tag_list.is_empty() {
+                "-".to_string()
             } else {
-                f.tag.as_deref().unwrap_or("-").to_string()
+                tag_list.join(", ")
             };
             let error_display = f.error.as_deref().unwrap_or("-").to_string();
             let status_str = f.status.as_str();

@@ -12,6 +12,7 @@ use casparian_protocol::{
 use chrono::Duration;
 use std::collections::HashMap;
 use uuid::Uuid;
+use super::schema_version::{ensure_schema_version, SCHEMA_VERSION};
 
 /// Storage for Control Plane API data.
 ///
@@ -40,6 +41,8 @@ impl ApiStorage {
 
     /// Initialize the API schema (DDL).
     pub fn init_schema(&self) -> Result<()> {
+        // Pre-v1: reset schema if version mismatched
+        let _ = ensure_schema_version(&self.conn, SCHEMA_VERSION)?;
         let job_status_values = "'queued','running','completed','failed','cancelled'";
         let job_type_values = "'run','backtest','preview'";
         let approval_status_values = "'pending','approved','rejected','expired'";

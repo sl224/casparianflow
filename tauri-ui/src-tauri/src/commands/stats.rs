@@ -3,7 +3,7 @@
 //! These commands provide aggregate statistics for the home dashboard.
 
 use crate::state::{AppState, CommandError, CommandResult};
-use casparian_protocol::HttpJobStatus;
+use casparian_protocol::{metrics, HttpJobStatus};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -130,14 +130,7 @@ pub async fn dashboard_stats(state: State<'_, AppState>) -> CommandResult<Dashbo
 
     // Quarantined rows would come from job results
     // For now, sum quarantined from completed jobs
-    let quarantined_rows: u64 = completed
-        .iter()
-        .filter_map(|job| {
-            job.result
-                .as_ref()
-                .and_then(|r| r.metrics.get("quarantined_rows").map(|&v| v as u64))
-        })
-        .sum();
+    let quarantined_rows = sum_quarantine_rows(&completed);
 
     Ok(DashboardStats {
         ready_outputs,
@@ -147,4 +140,78 @@ pub async fn dashboard_stats(state: State<'_, AppState>) -> CommandResult<Dashbo
         recent_outputs,
         active_runs,
     })
+}
+
+fn sum_quarantine_rows(completed: &[casparian_protocol::Job]) -> u64 {
+    completed
+        .iter()
+        .filter_map(|job| {
+            job.result.as_ref().and_then(|r| {
+                r.metrics
+                    .get(metrics::QUARANTINE_ROWS)
+                    .map(|&v| v as u64)
+            })
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sum_quarantine_rows;
+    use casparian_protocol::{metrics, HttpJobStatus, HttpJobType, Job, JobId, JobResult};
+    use std::collections::HashMap;
+
+    fn base_job() -> Job {
+        Job {
+            job_id: JobId::new(1),
+            job_type: HttpJobType::Run,
+            status: HttpJobStatus::Completed,
+            plugin_name: "demo".to_string(),
+            plugin_version: None,
+            input_dir: "/tmp".to_string(),
+            output: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            started_at: None,
+            finished_at: None,
+            error_message: None,
+            approval_id: None,
+            progress: None,
+            result: None,
+            spec_json: None,
+        }
+    }
+
+    #[test]
+    fn quarantine_rows_uses_canonical_key() {
+        let mut metrics_map = HashMap::new();
+        metrics_map.insert(metrics::QUARANTINE_ROWS.to_string(), 12);
+        let job = Job {
+            result: Some(JobResult {
+                rows_processed: 100,
+                bytes_written: None,
+                outputs: Vec::new(),
+                metrics: metrics_map,
+            }),
+            ..base_job()
+        };
+
+        assert_eq!(sum_quarantine_rows(&[job]), 12);
+    }
+
+    #[test]
+    fn quarantine_rows_ignores_legacy_key() {
+        let mut metrics_map = HashMap::new();
+        metrics_map.insert("quarantined_rows".to_string(), 9);
+        let job = Job {
+            result: Some(JobResult {
+                rows_processed: 100,
+                bytes_written: None,
+                outputs: Vec::new(),
+                metrics: metrics_map,
+            }),
+            ..base_job()
+        };
+
+        assert_eq!(sum_quarantine_rows(&[job]), 0);
+    }
 }

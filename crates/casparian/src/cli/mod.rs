@@ -78,6 +78,7 @@ pub mod worker;
 pub mod rule;
 pub mod source;
 pub mod topic;
+pub mod workspace;
 
 // W8: TUI
 pub mod tui;
@@ -88,6 +89,12 @@ pub mod mcp;
 // Configuration and context
 pub mod config;
 pub mod context;
+
+// Support
+pub mod support_bundle;
+
+// Tape recording and playback
+pub mod tape;
 
 // Re-exports are used by the scan, preview, and resource modules
 #[allow(unused_imports)]

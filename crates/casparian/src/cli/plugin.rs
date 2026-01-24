@@ -903,6 +903,7 @@ mod tests {
             allowed_signers: Vec::new(),
             keys: BTreeMap::new(),
             allow_unsigned_native: false,
+            allow_unsigned_python: false,
         };
         let err = verify_bundle_signature(b"{}", temp.path().join("bundle.sig"), &trust)
             .expect_err("expected missing bundle.sig to be rejected");

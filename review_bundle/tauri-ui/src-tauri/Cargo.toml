@@ -1,0 +1,61 @@
+[package]
+name = "casparian-flow-ui"
+version = "0.1.0"
+description = "Casparian Flow Desktop UI"
+authors = ["Casparian Flow Team"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.75"
+
+[build-dependencies]
+tauri-build = { version = "1", features = [] }
+
+[dependencies]
+# Tauri framework
+tauri = { version = "1", features = ["shell-open"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime (Tauri uses tokio internally)
+tokio = { version = "1", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Tracing/Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID for IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Base64 for blob encoding
+base64 = "0.22"
+
+# Directory paths
+dirs = "5"
+
+# File scanning
+walkdir = "2"
+glob = "0.3"
+md5 = "0.7"
+
+# Casparian crates (workspace members)
+casparian_sentinel = { path = "../../crates/casparian_sentinel" }
+casparian_db = { path = "../../crates/casparian_db" }
+casparian_protocol = { path = "../../crates/casparian_protocol" }
+casparian_mcp = { path = "../../crates/casparian_mcp" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

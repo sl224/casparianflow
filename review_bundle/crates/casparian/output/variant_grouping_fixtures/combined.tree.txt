@@ -1,0 +1,787 @@
+combined
+├── defense
+│   ├── mission_000
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0000.tif
+│   │                   ├── telemetry_0000.csv
+│   │                   └── telemetry_0000.json
+│   ├── mission_001
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0001.tif
+│   │                   ├── telemetry_0001.csv
+│   │                   └── telemetry_0001.json
+│   ├── mission_002
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0002.tif
+│   │                   ├── telemetry_0002.csv
+│   │                   └── telemetry_0002.json
+│   ├── mission_003
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0003.tif
+│   │                   ├── telemetry_0003.csv
+│   │                   └── telemetry_0003.json
+│   ├── mission_004
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0004.tif
+│   │                   ├── telemetry_0004.csv
+│   │                   └── telemetry_0004.json
+│   ├── mission_005
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0005.tif
+│   │                   ├── telemetry_0005.csv
+│   │                   └── telemetry_0005.json
+│   ├── mission_006
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0006.tif
+│   │                   ├── telemetry_0006.csv
+│   │                   └── telemetry_0006.json
+│   ├── mission_007
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0007.tif
+│   │                   ├── telemetry_0007.csv
+│   │                   └── telemetry_0007.json
+│   ├── mission_008
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0008.tif
+│   │                   ├── telemetry_0008.csv
+│   │                   └── telemetry_0008.json
+│   ├── mission_009
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0009.tif
+│   │                   ├── telemetry_0009.csv
+│   │                   └── telemetry_0009.json
+│   ├── mission_010
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0010.tif
+│   │                   ├── telemetry_0010.csv
+│   │                   └── telemetry_0010.json
+│   ├── mission_011
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── imagery_0011.tif
+│   │                   ├── telemetry_0011.csv
+│   │                   └── telemetry_0011.json
+│   ├── mission_012
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── telemetry_0012.csv
+│   │                   └── telemetry_0012.json
+│   ├── mission_013
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── telemetry_0013.csv
+│   │                   └── telemetry_0013.json
+│   ├── mission_014
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── telemetry_0014.csv
+│   │                   └── telemetry_0014.json
+│   ├── mission_015
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── telemetry_0015.csv
+│   │                   └── telemetry_0015.json
+│   ├── mission_016
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── telemetry_0016.csv
+│   │                   └── telemetry_0016.json
+│   ├── mission_017
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   ├── telemetry_0017.csv
+│   │                   └── telemetry_0017.json
+│   ├── mission_018
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0018.csv
+│   ├── mission_019
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0019.csv
+│   ├── mission_020
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0020.csv
+│   ├── mission_021
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0021.csv
+│   ├── mission_022
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0022.csv
+│   ├── mission_023
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0023.csv
+│   ├── mission_024
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0024.csv
+│   ├── mission_025
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0025.csv
+│   ├── mission_026
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0026.csv
+│   ├── mission_027
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0027.csv
+│   ├── msn_000
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0000.csv
+│   ├── msn_001
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0001.csv
+│   ├── msn_002
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0002.csv
+│   ├── msn_003
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0003.csv
+│   ├── msn_004
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0004.csv
+│   ├── msn_005
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0005.csv
+│   ├── msn_006
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0006.csv
+│   ├── msn_007
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0007.csv
+│   ├── msn_008
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0008.csv
+│   ├── msn_009
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0009.csv
+│   ├── msn_010
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0010.csv
+│   ├── msn_011
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0011.csv
+│   ├── msn_012
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0012.csv
+│   ├── msn_013
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0013.csv
+│   ├── msn_014
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0014.csv
+│   ├── msn_015
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0015.csv
+│   ├── msn_016
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0016.csv
+│   ├── msn_017
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0017.csv
+│   ├── msn_018
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0018.csv
+│   ├── msn_019
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0019.csv
+│   ├── msn_020
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0020.csv
+│   ├── msn_021
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0021.csv
+│   ├── msn_022
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0022.csv
+│   ├── msn_023
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0023.csv
+│   ├── msn_024
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0024.csv
+│   ├── msn_025
+│   │   └── satA
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0025.csv
+│   ├── patrol_000
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0000.csv
+│   ├── patrol_001
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0001.csv
+│   ├── patrol_002
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0002.csv
+│   ├── patrol_003
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0003.csv
+│   ├── patrol_004
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0004.csv
+│   ├── patrol_005
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0005.csv
+│   ├── patrol_006
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0006.csv
+│   ├── patrol_007
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0007.csv
+│   ├── patrol_008
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0008.csv
+│   ├── patrol_009
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0009.csv
+│   ├── patrol_010
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0010.csv
+│   ├── patrol_011
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0011.csv
+│   ├── patrol_012
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0012.csv
+│   ├── patrol_013
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0013.csv
+│   ├── patrol_014
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0014.csv
+│   ├── patrol_015
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0015.csv
+│   ├── ptl_000
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0000.csv
+│   ├── ptl_001
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0001.csv
+│   ├── ptl_002
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0002.csv
+│   ├── ptl_003
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0003.csv
+│   ├── ptl_004
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0004.csv
+│   ├── ptl_005
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0005.csv
+│   ├── ptl_006
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0006.csv
+│   ├── ptl_007
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0007.csv
+│   ├── ptl_008
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0008.csv
+│   ├── ptl_009
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0009.csv
+│   ├── ptl_010
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0010.csv
+│   ├── ptl_011
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0011.csv
+│   ├── ptl_012
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0012.csv
+│   ├── ptl_013
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0013.csv
+│   ├── ptl_014
+│   │   └── uav_01
+│   │       └── 2024
+│   │           └── 01
+│   │               └── 15
+│   │                   └── telemetry_0014.csv
+│   └── ptl_015
+│       └── uav_01
+│           └── 2024
+│               └── 01
+│                   └── 15
+│                       └── telemetry_0015.csv
+├── finance
+│   ├── gl
+│   │   └── exports
+│   │       └── 2024
+│   │           └── 01
+│   │               ├── general_ledger_20240101.csv
+│   │               ├── general_ledger_20240102.csv
+│   │               ├── general_ledger_20240103.csv
+│   │               ├── general_ledger_20240104.csv
+│   │               ├── general_ledger_20240105.csv
+│   │               ├── general_ledger_20240106.csv
+│   │               ├── general_ledger_20240107.csv
+│   │               ├── general_ledger_20240108.csv
+│   │               ├── general_ledger_20240109.csv
+│   │               └── general_ledger_20240110.csv
+│   ├── netsuite
+│   │   └── exports
+│   │       └── 2024
+│   │           └── 01
+│   │               ├── fin_export_20240101.csv
+│   │               ├── fin_export_20240102.csv
+│   │               ├── fin_export_20240103.csv
+│   │               ├── fin_export_20240104.csv
+│   │               ├── fin_export_20240105.csv
+│   │               ├── fin_export_20240106.csv
+│   │               ├── fin_export_20240107.csv
+│   │               ├── fin_export_20240108.csv
+│   │               ├── fin_export_20240109.csv
+│   │               ├── fin_export_20240110.csv
+│   │               ├── fin_export_20240111.csv
+│   │               ├── fin_export_20240112.csv
+│   │               ├── fin_export_20240113.csv
+│   │               ├── fin_export_20240114.csv
+│   │               ├── fin_export_20240115.csv
+│   │               ├── fin_export_20240116.csv
+│   │               ├── fin_export_20240117.csv
+│   │               ├── fin_export_20240118.csv
+│   │               ├── fin_export_20240119.csv
+│   │               └── fin_export_20240120.csv
+│   ├── ns
+│   │   └── exports
+│   │       └── 2024
+│   │           └── 01
+│   │               ├── fin_export_20240101.xlsx
+│   │               ├── fin_export_20240102.xlsx
+│   │               ├── fin_export_20240103.xlsx
+│   │               ├── fin_export_20240104.xlsx
+│   │               ├── fin_export_20240105.xlsx
+│   │               ├── fin_export_20240106.xlsx
+│   │               ├── fin_export_20240107.xlsx
+│   │               ├── fin_export_20240108.xlsx
+│   │               ├── fin_export_20240109.xlsx
+│   │               ├── fin_export_20240110.xlsx
+│   │               ├── fin_export_20240111.xlsx
+│   │               ├── fin_export_20240112.xlsx
+│   │               ├── fin_export_20240113.xlsx
+│   │               ├── fin_export_20240114.xlsx
+│   │               ├── fin_export_20240115.xlsx
+│   │               ├── fin_export_20240116.xlsx
+│   │               ├── fin_export_20240117.xlsx
+│   │               └── fin_export_20240118.xlsx
+│   ├── payroll
+│   │   └── exports
+│   │       └── 2024
+│   │           └── 01
+│   │               ├── payroll_20240101.csv
+│   │               ├── payroll_20240102.csv
+│   │               ├── payroll_20240103.csv
+│   │               ├── payroll_20240104.csv
+│   │               ├── payroll_20240105.csv
+│   │               ├── payroll_20240106.csv
+│   │               ├── payroll_20240107.csv
+│   │               ├── payroll_20240108.csv
+│   │               ├── payroll_20240109.csv
+│   │               ├── payroll_20240110.csv
+│   │               ├── payroll_20240111.csv
+│   │               └── payroll_20240112.csv
+│   └── saved_search
+│       ├── ap_age
+│       │   └── 2024
+│       │       └── 01
+│       │           ├── transactions_20240101.xlsx
+│       │           ├── transactions_20240102.xlsx
+│       │           ├── transactions_20240103.xlsx
+│       │           ├── transactions_20240104.xlsx
+│       │           ├── transactions_20240105.xlsx
+│       │           ├── transactions_20240106.xlsx
+│       │           ├── transactions_20240107.xlsx
+│       │           ├── transactions_20240108.xlsx
+│       │           ├── transactions_20240109.xlsx
+│       │           ├── transactions_20240110.xlsx
+│       │           ├── transactions_20240111.xlsx
+│       │           ├── transactions_20240112.xlsx
+│       │           ├── transactions_20240113.xlsx
+│       │           ├── transactions_20240114.xlsx
+│       │           ├── transactions_20240115.xlsx
+│       │           └── transactions_20240116.xlsx
+│       └── ap_aging
+│           └── 2024
+│               └── 01
+│                   ├── transactions_20240101.csv
+│                   ├── transactions_20240102.csv
+│                   ├── transactions_20240103.csv
+│                   ├── transactions_20240104.csv
+│                   ├── transactions_20240105.csv
+│                   ├── transactions_20240106.csv
+│                   ├── transactions_20240107.csv
+│                   ├── transactions_20240108.csv
+│                   ├── transactions_20240109.csv
+│                   ├── transactions_20240110.csv
+│                   ├── transactions_20240111.csv
+│                   ├── transactions_20240112.csv
+│                   ├── transactions_20240113.csv
+│                   ├── transactions_20240114.csv
+│                   ├── transactions_20240115.csv
+│                   └── transactions_20240116.csv
+└── health
+    └── hl7
+        ├── adm_in
+        │   ├── ADT_20240101_0.hl7
+        │   ├── ADT_20240102_1.hl7
+        │   ├── ADT_20240103_2.hl7
+        │   ├── ADT_20240104_3.hl7
+        │   ├── ADT_20240105_4.hl7
+        │   ├── ADT_20240106_5.hl7
+        │   ├── ADT_20240107_6.hl7
+        │   ├── ADT_20240108_7.hl7
+        │   ├── ADT_20240109_8.hl7
+        │   ├── ADT_20240110_9.hl7
+        │   ├── ADT_20240111_10.hl7
+        │   ├── ADT_20240112_11.hl7
+        │   ├── ADT_20240113_12.hl7
+        │   ├── ADT_20240114_13.hl7
+        │   ├── ADT_20240115_14.hl7
+        │   ├── ADT_20240116_15.hl7
+        │   ├── ADT_20240117_16.hl7
+        │   ├── ADT_20240118_17.hl7
+        │   ├── ADT_20240119_18.hl7
+        │   ├── ADT_20240120_19.hl7
+        │   ├── ADT_20240121_20.hl7
+        │   └── ADT_20240122_21.hl7
+        ├── admission_in
+        │   ├── ADT_20240101_0.hl7
+        │   ├── ADT_20240102_1.hl7
+        │   ├── ADT_20240103_2.hl7
+        │   ├── ADT_20240104_3.hl7
+        │   ├── ADT_20240105_4.hl7
+        │   ├── ADT_20240106_5.hl7
+        │   ├── ADT_20240107_6.hl7
+        │   ├── ADT_20240108_7.hl7
+        │   ├── ADT_20240109_8.hl7
+        │   ├── ADT_20240110_9.hl7
+        │   ├── ADT_20240111_10.hl7
+        │   ├── ADT_20240112_11.hl7
+        │   ├── ADT_20240113_12.hl7
+        │   ├── ADT_20240114_13.hl7
+        │   ├── ADT_20240115_14.hl7
+        │   ├── ADT_20240116_15.hl7
+        │   ├── ADT_20240117_16.hl7
+        │   ├── ADT_20240118_17.hl7
+        │   ├── ADT_20240119_18.hl7
+        │   ├── ADT_20240120_19.hl7
+        │   ├── ADT_20240121_20.hl7
+        │   ├── ADT_20240122_21.hl7
+        │   ├── ADT_20240123_22.hl7
+        │   └── ADT_20240124_23.hl7
+        ├── facility_a
+        │   ├── in
+        │   │   ├── ADT_20240101_0.hl7
+        │   │   ├── ADT_20240102_1.hl7
+        │   │   ├── ADT_20240103_2.hl7
+        │   │   ├── ADT_20240104_3.hl7
+        │   │   ├── ADT_20240105_4.hl7
+        │   │   ├── ADT_20240106_5.hl7
+        │   │   ├── ADT_20240107_6.hl7
+        │   │   ├── ADT_20240108_7.hl7
+        │   │   ├── ADT_20240109_8.hl7
+        │   │   ├── ADT_20240110_9.hl7
+        │   │   ├── ADT_20240111_10.hl7
+        │   │   ├── ADT_20240112_11.hl7
+        │   │   ├── ADT_20240113_12.hl7
+        │   │   └── ADT_20240114_13.hl7
+        │   └── inbound
+        │       ├── ADT_20240101_0.hl7
+        │       ├── ADT_20240102_1.hl7
+        │       ├── ADT_20240103_2.hl7
+        │       ├── ADT_20240104_3.hl7
+        │       ├── ADT_20240105_4.hl7
+        │       ├── ADT_20240106_5.hl7
+        │       ├── ADT_20240107_6.hl7
+        │       ├── ADT_20240108_7.hl7
+        │       ├── ADT_20240109_8.hl7
+        │       ├── ADT_20240110_9.hl7
+        │       ├── ADT_20240111_10.hl7
+        │       ├── ADT_20240112_11.hl7
+        │       ├── ADT_20240113_12.hl7
+        │       ├── ADT_20240114_13.hl7
+        │       ├── ADT_20240115_14.hl7
+        │       └── ADT_20240116_15.hl7
+        ├── lab_in
+        │   ├── ORU_20240101_0.hl7
+        │   ├── ORU_20240102_1.hl7
+        │   ├── ORU_20240103_2.hl7
+        │   ├── ORU_20240104_3.hl7
+        │   ├── ORU_20240105_4.hl7
+        │   ├── ORU_20240106_5.hl7
+        │   ├── ORU_20240107_6.hl7
+        │   ├── ORU_20240108_7.hl7
+        │   ├── ORU_20240109_8.hl7
+        │   ├── ORU_20240110_9.hl7
+        │   ├── ORU_20240111_10.hl7
+        │   ├── ORU_20240112_11.hl7
+        │   ├── ORU_20240113_12.hl7
+        │   ├── ORU_20240114_13.hl7
+        │   ├── ORU_20240115_14.hl7
+        │   ├── ORU_20240116_15.hl7
+        │   ├── ORU_20240117_16.hl7
+        │   ├── ORU_20240118_17.hl7
+        │   ├── ORU_20240119_18.hl7
+        │   └── ORU_20240120_19.hl7
+        └── lab_out
+            ├── ORU_2024-01-01_0.hl7
+            ├── ORU_2024-01-02_1.hl7
+            ├── ORU_2024-01-03_2.hl7
+            ├── ORU_2024-01-04_3.hl7
+            ├── ORU_2024-01-05_4.hl7
+            ├── ORU_2024-01-06_5.hl7
+            ├── ORU_2024-01-07_6.hl7
+            ├── ORU_2024-01-08_7.hl7
+            ├── ORU_2024-01-09_8.hl7
+            ├── ORU_2024-01-10_9.hl7
+            ├── ORU_2024-01-11_10.hl7
+            ├── ORU_2024-01-12_11.hl7
+            ├── ORU_2024-01-13_12.hl7
+            ├── ORU_2024-01-14_13.hl7
+            ├── ORU_2024-01-15_14.hl7
+            ├── ORU_2024-01-16_15.hl7
+            ├── ORU_2024-01-17_16.hl7
+            └── ORU_2024-01-18_17.hl7

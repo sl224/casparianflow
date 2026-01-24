@@ -1,15 +1,14 @@
 mod cli_support;
 
-use casparian::scout::FileStatus;
+use casparian::scout::{FileStatus, TaggingRuleId, WorkspaceId};
 use casparian_db::{DbConnection, DbValue};
-use cli_support::with_duckdb;
-use std::path::PathBuf;
+use casparian_sentinel::JobQueue;
+use cli_support::{init_scout_schema, with_duckdb};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const SOURCE_ID: i64 = 1;
-const RULE_CSV_ID: i64 = 2;
-const RULE_JSON_ID: i64 = 3;
 
 fn casparian_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_casparian"))
@@ -34,81 +33,38 @@ fn assert_cli_success(output: Output, args: &[String]) {
     );
 }
 
-fn create_tag_schema(conn: &DbConnection) {
-    let schema = format!(
-        r#"
-        CREATE TABLE scout_tagging_rules (
-            id BIGINT PRIMARY KEY,
-            name TEXT,
-            source_id BIGINT NOT NULL,
-            pattern TEXT NOT NULL,
-            tag TEXT NOT NULL,
-            priority INTEGER DEFAULT 0,
-            enabled INTEGER DEFAULT 1,
-            created_at INTEGER,
-            updated_at INTEGER
-        );
-
-        CREATE TABLE scout_files (
-            id BIGINT PRIMARY KEY,
-            source_id BIGINT NOT NULL,
-            path TEXT NOT NULL,
-            rel_path TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            mtime INTEGER,
-            content_hash TEXT,
-            status TEXT DEFAULT '{}',
-            tag TEXT,
-            tag_source TEXT,
-            rule_id BIGINT,
-            manual_plugin TEXT,
-            error TEXT,
-            first_seen_at INTEGER,
-            last_seen_at INTEGER,
-            processed_at INTEGER,
-            sentinel_job_id INTEGER
-        );
-        "#,
-        FileStatus::Pending.as_str()
-    );
-    conn.execute_batch(&schema).expect("create tag schema");
-}
-
 #[test]
 fn test_tag_and_untag_update_sqlite_db() {
     let home_dir = TempDir::new().expect("create temp home");
     let db_path = home_dir.path().join("casparian_flow.duckdb");
+    init_scout_schema(&db_path);
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [("CASPARIAN_HOME", home_str.as_str())];
+    let now = 1_737_187_200_000i64;
+    let workspace_id = WorkspaceId::new();
 
     {
         with_duckdb(&db_path, |conn| {
-            create_tag_schema(&conn);
-
-            conn.execute(
-                "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
-                 VALUES (?, ?, ?, ?, ?, 1)",
-                &[
-                    DbValue::from(RULE_CSV_ID),
-                    DbValue::from(SOURCE_ID),
-                    DbValue::from("*.csv"),
-                    DbValue::from("csv_data"),
-                    DbValue::from(10i32),
-                ],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO scout_tagging_rules (id, source_id, pattern, tag, priority, enabled)
-                 VALUES (?, ?, ?, ?, ?, 1)",
-                &[
-                    DbValue::from(RULE_JSON_ID),
-                    DbValue::from(SOURCE_ID),
-                    DbValue::from("*.json"),
-                    DbValue::from("json_data"),
-                    DbValue::from(5i32),
-                ],
-            )
-            .unwrap();
+            insert_workspace(&conn, &workspace_id, "Default", now);
+            insert_source(&conn, &workspace_id, SOURCE_ID, "test_source", "/data", now);
+            insert_rule(
+                &conn,
+                &workspace_id,
+                "csv_rule",
+                "*.csv",
+                "csv_data",
+                10,
+                now,
+            );
+            insert_rule(
+                &conn,
+                &workspace_id,
+                "json_rule",
+                "*.json",
+                "json_data",
+                5,
+                now,
+            );
 
             let files = [
                 (1i64, "/data/sales.csv", "sales.csv", 1000),
@@ -118,19 +74,17 @@ fn test_tag_and_untag_update_sqlite_db() {
                 (5i64, "/data/unknown.xyz", "unknown.xyz", 50),
             ];
             for (id, path, rel_path, size) in files {
-                conn.execute(
-                    "INSERT INTO scout_files (id, source_id, path, rel_path, size, status)
-                     VALUES (?, ?, ?, ?, ?, ?)",
-                    &[
-                        DbValue::from(id),
-                        DbValue::from(SOURCE_ID),
-                        DbValue::from(path),
-                        DbValue::from(rel_path),
-                        DbValue::from(size),
-                        DbValue::from(FileStatus::Pending.as_str()),
-                    ],
-                )
-                .unwrap();
+                insert_file(
+                    &conn,
+                    &workspace_id,
+                    id,
+                    SOURCE_ID,
+                    path,
+                    rel_path,
+                    size,
+                    FileStatus::Pending.as_str(),
+                    now,
+                );
             }
         });
     }
@@ -142,18 +96,25 @@ fn test_tag_and_untag_update_sqlite_db() {
         let (csv_count, json_count, untagged_count) = with_duckdb(&db_path, |conn| {
             let csv_count = conn
                 .query_scalar::<i64>(
-                    "SELECT COUNT(*) FROM scout_files WHERE tag = 'csv_data'",
-                    &[],
+                    "SELECT COUNT(*) FROM scout_file_tags WHERE workspace_id = ? AND tag = 'csv_data'",
+                    &[DbValue::from(workspace_id.to_string())],
                 )
                 .unwrap();
             let json_count = conn
                 .query_scalar::<i64>(
-                    "SELECT COUNT(*) FROM scout_files WHERE tag = 'json_data'",
-                    &[],
+                    "SELECT COUNT(*) FROM scout_file_tags WHERE workspace_id = ? AND tag = 'json_data'",
+                    &[DbValue::from(workspace_id.to_string())],
                 )
                 .unwrap();
             let untagged_count = conn
-                .query_scalar::<i64>("SELECT COUNT(*) FROM scout_files WHERE tag IS NULL", &[])
+                .query_scalar::<i64>(
+                    "SELECT COUNT(*) \
+                     FROM scout_files f \
+                     LEFT JOIN scout_file_tags t \
+                        ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
+                     WHERE f.workspace_id = ? AND t.file_id IS NULL",
+                    &[DbValue::from(workspace_id.to_string())],
+                )
                 .unwrap();
             (csv_count, json_count, untagged_count)
         });
@@ -173,8 +134,14 @@ fn test_tag_and_untag_update_sqlite_db() {
         let (tag, tag_source) = with_duckdb(&db_path, |conn| {
             let row = conn
                 .query_optional(
-                    "SELECT tag, tag_source FROM scout_files WHERE path = ?",
-                    &[DbValue::from("/data/unknown.xyz")],
+                    "SELECT t.tag, t.tag_source \
+                     FROM scout_file_tags t \
+                     JOIN scout_files f ON f.id = t.file_id \
+                     WHERE f.workspace_id = ? AND f.path = ?",
+                    &[
+                        DbValue::from(workspace_id.to_string()),
+                        DbValue::from("/data/unknown.xyz"),
+                    ],
                 )
                 .unwrap();
             row.and_then(|r| {
@@ -192,21 +159,31 @@ fn test_tag_and_untag_update_sqlite_db() {
     assert_cli_success(run_cli(&untag_args, &envs), &untag_args);
 
     {
-        let (final_tag, status) = with_duckdb(&db_path, |conn| {
-            let row = conn
-                .query_optional(
-                    "SELECT tag, status FROM scout_files WHERE path = ?",
-                    &[DbValue::from("/data/unknown.xyz")],
+        let (tag_count, status) = with_duckdb(&db_path, |conn| {
+            let tag_count = conn
+                .query_scalar::<i64>(
+                    "SELECT COUNT(*) \
+                     FROM scout_file_tags t \
+                     JOIN scout_files f ON f.id = t.file_id \
+                     WHERE f.workspace_id = ? AND f.path = ?",
+                    &[
+                        DbValue::from(workspace_id.to_string()),
+                        DbValue::from("/data/unknown.xyz"),
+                    ],
                 )
                 .unwrap();
-            row.and_then(|r| {
-                let final_tag: Option<String> = r.get_by_name("tag").ok().flatten();
-                let status: String = r.get_by_name("status").unwrap_or_default();
-                Some((final_tag, status))
-            })
-            .unwrap_or((None, String::new()))
+            let status: String = conn
+                .query_scalar(
+                    "SELECT status FROM scout_files WHERE workspace_id = ? AND path = ?",
+                    &[
+                        DbValue::from(workspace_id.to_string()),
+                        DbValue::from("/data/unknown.xyz"),
+                    ],
+                )
+                .unwrap_or_default();
+            (tag_count, status)
         });
-        assert!(final_tag.is_none());
+        assert_eq!(tag_count, 0);
         assert_eq!(status, FileStatus::Pending.as_str());
     }
 }
@@ -215,28 +192,21 @@ fn test_tag_and_untag_update_sqlite_db() {
 fn test_pipeline_run_enqueues_jobs() {
     let home_dir = TempDir::new().expect("create temp home");
     let db_path = home_dir.path().join("casparian_flow.duckdb");
+    init_scout_schema(&db_path);
     let home_str = home_dir.path().to_string_lossy().to_string();
     let envs = [("CASPARIAN_HOME", home_str.as_str())];
+    let now = 1_737_187_200_000i64;
+    let workspace_id = WorkspaceId::new();
 
     {
         with_duckdb(&db_path, |conn| {
-            let schema = format!(
-                r#"
-                CREATE TABLE scout_files (
-                    id BIGINT PRIMARY KEY,
-                    source_id BIGINT NOT NULL,
-                    path TEXT NOT NULL,
-                    rel_path TEXT NOT NULL,
-                    size BIGINT NOT NULL,
-                    mtime BIGINT NOT NULL,
-                    status TEXT NOT NULL DEFAULT '{}',
-                    tag TEXT,
-                    extension TEXT
-                );
-                "#,
-                FileStatus::Pending.as_str()
-            );
-            conn.execute_batch(&schema).unwrap();
+            insert_workspace(&conn, &workspace_id, "Default", now);
+            insert_source(&conn, &workspace_id, SOURCE_ID, "demo_source", "/data/demo", now);
+
+            let queue = JobQueue::new(conn.clone());
+            queue.init_queue_schema().unwrap();
+            queue.init_registry_schema().unwrap();
+            insert_plugin_manifest(&conn, "demo_parser", "1.0.0");
 
             let files = [
                 (1i64, "/data/demo/a.csv", "a.csv"),
@@ -244,18 +214,18 @@ fn test_pipeline_run_enqueues_jobs() {
                 (3i64, "/data/demo/c.csv", "c.csv"),
             ];
             for (id, path, rel_path) in files {
-                conn.execute(
-                    "INSERT INTO scout_files (id, source_id, path, rel_path, size, mtime, status, tag, extension)
-                     VALUES (?, ?, ?, ?, 100, 1737187200000, ?, 'demo', 'csv')",
-                    &[
-                        DbValue::from(id),
-                        DbValue::from(SOURCE_ID),
-                        DbValue::from(path),
-                        DbValue::from(rel_path),
-                        DbValue::from(FileStatus::Pending.as_str()),
-                    ],
-                )
-                .unwrap();
+                insert_file(
+                    &conn,
+                    &workspace_id,
+                    id,
+                    SOURCE_ID,
+                    path,
+                    rel_path,
+                    100,
+                    FileStatus::Pending.as_str(),
+                    now,
+                );
+                insert_tag(&conn, &workspace_id, id, "demo", now);
             }
         });
     }
@@ -297,4 +267,154 @@ fn test_pipeline_run_enqueues_jobs() {
         .unwrap()
     });
     assert_eq!(queued_count, 3);
+}
+
+fn insert_workspace(conn: &DbConnection, workspace_id: &WorkspaceId, name: &str, now: i64) {
+    conn.execute(
+        "INSERT INTO cf_workspaces (id, name, created_at) VALUES (?, ?, ?)",
+        &[
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(name),
+            DbValue::from(now),
+        ],
+    )
+    .expect("insert workspace");
+}
+
+fn insert_source(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+    id: i64,
+    name: &str,
+    path: &str,
+    now: i64,
+) {
+    let source_type = serde_json::json!({ "type": "local" }).to_string();
+    conn.execute(
+        "INSERT INTO scout_sources (id, workspace_id, name, source_type, path, poll_interval_secs, enabled, created_at, updated_at)\n         VALUES (?, ?, ?, ?, ?, 30, 1, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(name),
+            DbValue::from(source_type),
+            DbValue::from(path),
+            DbValue::from(now),
+            DbValue::from(now),
+        ],
+    )
+    .expect("insert source");
+}
+
+fn insert_rule(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+    name: &str,
+    pattern: &str,
+    tag: &str,
+    priority: i64,
+    now: i64,
+) {
+    let rule_id = TaggingRuleId::new();
+    conn.execute(
+        "INSERT INTO scout_rules (id, workspace_id, name, kind, pattern, tag, priority, enabled, created_at, updated_at)\n         VALUES (?, ?, ?, 'tagging', ?, ?, ?, 1, ?, ?)",
+        &[
+            DbValue::from(rule_id.to_string()),
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(name),
+            DbValue::from(pattern),
+            DbValue::from(tag),
+            DbValue::from(priority),
+            DbValue::from(now),
+            DbValue::from(now),
+        ],
+    )
+    .expect("insert rule");
+}
+
+fn insert_file(
+    conn: &DbConnection,
+    workspace_id: &WorkspaceId,
+    id: i64,
+    source_id: i64,
+    path: &str,
+    rel_path: &str,
+    size: i64,
+    status: &str,
+    now: i64,
+) {
+    let (parent_path, name) = split_rel_path(rel_path);
+    let extension = Path::new(&name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_lowercase());
+    conn.execute(
+        "INSERT INTO scout_files (id, workspace_id, source_id, path, rel_path, parent_path, name, extension, is_dir, size, mtime, status, error, first_seen_at, last_seen_at)\n         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?)",
+        &[
+            DbValue::from(id),
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(source_id),
+            DbValue::from(path),
+            DbValue::from(rel_path),
+            DbValue::from(parent_path),
+            DbValue::from(name),
+            DbValue::from(extension),
+            DbValue::from(size),
+            DbValue::from(now),
+            DbValue::from(status),
+            DbValue::from(now),
+            DbValue::from(now),
+        ],
+    )
+    .expect("insert file");
+}
+
+fn insert_tag(conn: &DbConnection, workspace_id: &WorkspaceId, file_id: i64, tag: &str, now: i64) {
+    conn.execute(
+        "INSERT INTO scout_file_tags (workspace_id, file_id, tag, tag_source, rule_id, created_at)\n         VALUES (?, ?, ?, 'manual', NULL, ?)",
+        &[
+            DbValue::from(workspace_id.to_string()),
+            DbValue::from(file_id),
+            DbValue::from(tag),
+            DbValue::from(now),
+        ],
+    )
+    .expect("insert file tag");
+}
+
+fn insert_plugin_manifest(conn: &DbConnection, plugin_name: &str, version: &str) {
+    let source_hash = format!("hash_{}_{}", plugin_name, version);
+    let manifest_json = serde_json::json!({
+        "name": plugin_name,
+        "version": version,
+        "protocol_version": "1.0",
+        "runtime_kind": "python_shim",
+        "entrypoint": format!("{}.py:parse", plugin_name),
+    })
+    .to_string();
+    let outputs_json = "{}";
+    conn.execute(
+        "INSERT INTO cf_plugin_manifest (\n            plugin_name, version, runtime_kind, entrypoint,\n            source_code, source_hash, status, env_hash, artifact_hash,\n            manifest_json, protocol_version, schema_artifacts_json, outputs_json\n        ) VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?)",
+        &[
+            DbValue::from(plugin_name),
+            DbValue::from(version),
+            DbValue::from("python_shim"),
+            DbValue::from(format!("{}.py:parse", plugin_name)),
+            DbValue::from("code"),
+            DbValue::from(source_hash.as_str()),
+            DbValue::from(source_hash.as_str()),
+            DbValue::from(source_hash.as_str()),
+            DbValue::from(manifest_json.as_str()),
+            DbValue::from("1.0"),
+            DbValue::from(outputs_json),
+            DbValue::from(outputs_json),
+        ],
+    )
+    .expect("insert plugin manifest");
+}
+
+fn split_rel_path(rel_path: &str) -> (String, String) {
+    match rel_path.rfind('/') {
+        Some(idx) => (rel_path[..idx].to_string(), rel_path[idx + 1..].to_string()),
+        None => ("".to_string(), rel_path.to_string()),
+    }
 }

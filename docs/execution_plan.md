@@ -9,13 +9,6 @@ Inputs:
 - docs/schema_rfc.md (directional)
 - docs/execution_plan.md (archived, below)
 
-Constraints:
-- Disk space is limited; avoid large artifacts and long-running local builds.
-- v1 is DFIR-first (artifact workbench); keep scope tight.
-- DuckDB + Parquet only for v1 sinks.
-- Schema-as-code is the authoring path for publish (Registry/Vault eligible). Hand-authored JSON sidecars are not supported.
-- Canonical schema artifacts (JSON/Arrow) are required for signing/registry and may be produced by tooling.
-
 Current status snapshot (from checklist + recent code work):
 - DataType extended (Decimal, timestamp_tz, list/struct) with shorthand/object serde; tzdb validation added.
 - DuckDB sink supports DECIMAL + TIMESTAMPTZ.

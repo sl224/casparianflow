@@ -4,8 +4,10 @@
 
 use crate::cli::config::active_db_path;
 use crate::cli::error::HelpfulError;
+use crate::cli::workspace;
 use crate::cli::output::print_table;
-use casparian::scout::{Database, TaggingRule, TaggingRuleId};
+use casparian::scout::{Database, TaggingRule, TaggingRuleId, WorkspaceId};
+use casparian_db::DbValue;
 use clap::Subcommand;
 use glob::Pattern;
 
@@ -64,7 +66,7 @@ fn find_rule<'a>(rules: &'a [TaggingRule], input: &str) -> Option<&'a TaggingRul
 }
 
 /// Count how many files in the database match a pattern
-fn count_matching_files(db: &Database, pattern: &str) -> u64 {
+fn count_matching_files(db: &Database, workspace_id: &WorkspaceId, pattern: &str) -> u64 {
     let pat = match Pattern::new(pattern) {
         Ok(p) => p,
         Err(_) => return 0,
@@ -77,7 +79,7 @@ fn count_matching_files(db: &Database, pattern: &str) -> u64 {
     }
 
     // Query all sources and their files
-    let sources = db.list_sources().unwrap_or_default();
+    let sources = db.list_sources(workspace_id).unwrap_or_default();
     let mut matched = 0u64;
 
     for source in sources {
@@ -96,8 +98,8 @@ fn count_matching_files(db: &Database, pattern: &str) -> u64 {
 }
 
 /// Get matched file count for a specific rule
-fn get_rule_matched_count(db: &Database, rule: &TaggingRule) -> u64 {
-    count_matching_files(db, &rule.pattern)
+fn get_rule_matched_count(db: &Database, workspace_id: &WorkspaceId, rule: &TaggingRule) -> u64 {
+    count_matching_files(db, workspace_id, &rule.pattern)
 }
 
 /// Execute the rule command
@@ -112,23 +114,30 @@ fn run_with_action(action: RuleAction) -> anyhow::Result<()> {
             .with_context(format!("Database path: {}", db_path.display()))
             .with_suggestion("TRY: Ensure the directory exists and is writable")
     })?;
+    let workspace_id = ensure_workspace_id(&db)?;
 
     match action {
-        RuleAction::List { json } => list_rules(&db, json),
+        RuleAction::List { json } => list_rules(&db, &workspace_id, json),
         RuleAction::Add {
             pattern,
             topic,
             priority,
-        } => add_rule(&db, pattern, topic, priority),
-        RuleAction::Show { id, json } => show_rule(&db, &id, json),
-        RuleAction::Remove { id, force } => remove_rule(&db, &id, force),
-        RuleAction::Test { id, path } => test_rule(&db, &id, &path),
+        } => add_rule(&db, &workspace_id, pattern, topic, priority),
+        RuleAction::Show { id, json } => show_rule(&db, &workspace_id, &id, json),
+        RuleAction::Remove { id, force } => remove_rule(&db, &workspace_id, &id, force),
+        RuleAction::Test { id, path } => test_rule(&db, &workspace_id, &id, &path),
     }
 }
 
-fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
+fn ensure_workspace_id(db: &Database) -> Result<WorkspaceId, HelpfulError> {
+    workspace::resolve_active_workspace_id(db).map_err(|e| {
+        e.with_context("The workspace registry is required for tagging rules")
+    })
+}
+
+fn list_rules(db: &Database, workspace_id: &WorkspaceId, json: bool) -> anyhow::Result<()> {
     let rules = db
-        .list_tagging_rules()
+        .list_tagging_rules(workspace_id)
         .map_err(|e| HelpfulError::new(format!("Failed to list rules: {}", e)))?;
 
     if rules.is_empty() {
@@ -142,7 +151,7 @@ fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
     if json {
         let mut output = Vec::new();
         for rule in &rules {
-            let matched = get_rule_matched_count(db, rule);
+            let matched = get_rule_matched_count(db, workspace_id, rule);
             output.push(serde_json::json!({
                 "id": rule.id,
                 "pattern": rule.pattern,
@@ -160,7 +169,7 @@ fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
 
     let mut rows = Vec::new();
     for rule in &rules {
-        let matched = get_rule_matched_count(db, rule);
+        let matched = get_rule_matched_count(db, workspace_id, rule);
         rows.push(vec![
             rule.pattern.clone(),
             rule.tag.clone(),
@@ -176,12 +185,18 @@ fn list_rules(db: &Database, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> anyhow::Result<()> {
+fn add_rule(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    pattern: String,
+    topic: String,
+    priority: i32,
+) -> anyhow::Result<()> {
     // Validate pattern
     validate_pattern(&pattern)?;
 
     // Check if we have any sources
-    let sources = db.list_sources()?;
+    let sources = db.list_sources(workspace_id)?;
     if sources.is_empty() {
         return Err(HelpfulError::new("No sources configured")
             .with_context("Rules require at least one source")
@@ -190,7 +205,7 @@ fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> any
     }
 
     // Check if pattern already exists
-    let existing = db.list_tagging_rules()?;
+    let existing = db.list_tagging_rules(workspace_id)?;
     for rule in &existing {
         if rule.pattern == pattern {
             return Err(
@@ -204,14 +219,10 @@ fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> any
         }
     }
 
-    // Create rules for each source
-    // In practice, we typically have one source - but the schema requires source_id
-    let source = &sources[0];
-
     let rule = TaggingRule {
         id: TaggingRuleId::new(),
         name: format!("{} -> {}", pattern, topic),
-        source_id: source.id.clone(),
+        workspace_id: *workspace_id,
         pattern: pattern.clone(),
         tag: topic.clone(),
         priority,
@@ -222,7 +233,7 @@ fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> any
         .map_err(|e| HelpfulError::new(format!("Failed to create rule: {}", e)))?;
 
     // Count existing matches
-    let matched = count_matching_files(db, &pattern);
+    let matched = count_matching_files(db, workspace_id, &pattern);
 
     println!("Added rule: {} -> {}", pattern, topic);
     println!("  Priority: {}", priority);
@@ -238,8 +249,13 @@ fn add_rule(db: &Database, pattern: String, topic: String, priority: i32) -> any
     Ok(())
 }
 
-fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules()?;
+fn show_rule(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let rules = db.list_tagging_rules(workspace_id)?;
     let rule = find_rule(&rules, id);
 
     let rule = match rule {
@@ -251,7 +267,7 @@ fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
         }
     };
 
-    let matched = get_rule_matched_count(db, rule);
+    let matched = get_rule_matched_count(db, workspace_id, rule);
 
     if json {
         let output = serde_json::json!({
@@ -260,7 +276,7 @@ fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
             "pattern": rule.pattern,
             "topic": rule.tag,
             "priority": rule.priority,
-            "source_id": rule.source_id,
+            "workspace_id": rule.workspace_id,
             "enabled": rule.enabled,
             "matched": matched,
         });
@@ -271,10 +287,11 @@ fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
     println!("RULE: {}", rule.pattern);
     println!();
     println!("  ID:       {}", rule.id);
-    println!("  Pattern:  {}", rule.pattern);
-    println!("  Topic:    {}", rule.tag);
-    println!("  Priority: {}", rule.priority);
-    println!("  Enabled:  {}", if rule.enabled { "yes" } else { "no" });
+    println!("  Pattern:     {}", rule.pattern);
+    println!("  Topic:       {}", rule.tag);
+    println!("  Priority:    {}", rule.priority);
+    println!("  Workspace:   {}", rule.workspace_id);
+    println!("  Enabled:     {}", if rule.enabled { "yes" } else { "no" });
     println!();
     println!("  Matched:  {} files", matched);
 
@@ -283,17 +300,23 @@ fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
         println!();
         println!("SAMPLE MATCHES (first 5):");
         let pat = Pattern::new(&rule.pattern).unwrap();
-        let files = db
-            .list_files_by_source(&rule.source_id, 1000)
-            .unwrap_or_default();
+        let sources = db.list_sources(workspace_id).unwrap_or_default();
         let mut count = 0;
-        for file in files {
-            if pat.matches(&file.rel_path) {
-                println!("  {}", file.rel_path);
-                count += 1;
-                if count >= 5 {
-                    break;
+        for source in sources {
+            let files = db
+                .list_files_by_source(&source.id, 1000)
+                .unwrap_or_default();
+            for file in files {
+                if pat.matches(&file.rel_path) {
+                    println!("  {}", file.rel_path);
+                    count += 1;
+                    if count >= 5 {
+                        break;
+                    }
                 }
+            }
+            if count >= 5 {
+                break;
             }
         }
     }
@@ -301,8 +324,13 @@ fn show_rule(db: &Database, id: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules()?;
+fn remove_rule(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    id: &str,
+    force: bool,
+) -> anyhow::Result<()> {
+    let rules = db.list_tagging_rules(workspace_id)?;
     let rule = find_rule(&rules, id);
 
     let rule = match rule {
@@ -314,18 +342,20 @@ fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()> {
         }
     };
 
-    // Count files that were tagged by this rule
-    let files = db
-        .list_files_by_source(&rule.source_id, 100000)
-        .unwrap_or_default();
-    let tagged_by_rule: Vec<_> = files
-        .iter()
-        .filter(|f| f.rule_id.as_ref() == Some(&rule.id))
-        .collect();
+    let tagged_by_rule_count = db
+        .conn()
+        .query_scalar::<i64>(
+            "SELECT COUNT(*) FROM scout_file_tags WHERE workspace_id = ? AND rule_id = ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(rule.id.to_string()),
+            ],
+        )
+        .unwrap_or(0);
 
-    if !tagged_by_rule.is_empty() && !force {
+    if tagged_by_rule_count > 0 && !force {
         return Err(
-            HelpfulError::new(format!("Rule has tagged {} files", tagged_by_rule.len()))
+            HelpfulError::new(format!("Rule has tagged {} files", tagged_by_rule_count))
                 .with_context("Removing this rule will leave files without a tag assignment rule")
                 .with_suggestion("TRY: Use --force to remove anyway")
                 .with_suggestion(
@@ -342,16 +372,21 @@ fn remove_rule(db: &Database, id: &str, force: bool) -> anyhow::Result<()> {
         .map_err(|e| HelpfulError::new(format!("Failed to remove rule: {}", e)))?;
 
     println!("Removed rule: {}", rule_pattern);
-    if !tagged_by_rule.is_empty() {
-        println!("  {} files were tagged by this rule", tagged_by_rule.len());
+    if tagged_by_rule_count > 0 {
+        println!("  {} files were tagged by this rule", tagged_by_rule_count);
         println!("  Files keep their current tags");
     }
 
     Ok(())
 }
 
-fn test_rule(db: &Database, id: &str, path: &str) -> anyhow::Result<()> {
-    let rules = db.list_tagging_rules()?;
+fn test_rule(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    id: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    let rules = db.list_tagging_rules(workspace_id)?;
     let rule = find_rule(&rules, id);
 
     let rule = match rule {
@@ -421,10 +456,12 @@ mod tests {
     #[test]
     fn test_add_rule_creates_entry() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source_id = SourceId::new();
 
         // Add a source first
         let source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -438,7 +475,7 @@ mod tests {
         let rule = TaggingRule {
             id: TaggingRuleId::new(),
             name: "CSV Files".to_string(),
-            source_id: source_id.clone(),
+            workspace_id,
             pattern: "*.csv".to_string(),
             tag: "csv_data".to_string(),
             priority: 10,
@@ -446,7 +483,7 @@ mod tests {
         };
         db.upsert_tagging_rule(&rule).unwrap();
 
-        let rules = db.list_tagging_rules().unwrap();
+        let rules = db.list_tagging_rules(&workspace_id).unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].pattern, "*.csv");
         assert_eq!(rules[0].tag, "csv_data");
@@ -455,9 +492,11 @@ mod tests {
     #[test]
     fn test_count_matching_files() {
         let db = Database::open_in_memory().unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap().id;
         let source_id = SourceId::new();
 
         let source = Source {
+            workspace_id,
             id: source_id.clone(),
             name: "test".to_string(),
             source_type: SourceType::Local,
@@ -470,6 +509,7 @@ mod tests {
         // Add files
         for name in &["test.csv", "data.csv", "info.json"] {
             let file = ScannedFile::new(
+                workspace_id,
                 source_id.clone(),
                 &format!("/data/{}", name),
                 name,
@@ -479,13 +519,13 @@ mod tests {
             db.upsert_file(&file).unwrap();
         }
 
-        let csv_matches = count_matching_files(&db, "*.csv");
+        let csv_matches = count_matching_files(&db, &workspace_id, "*.csv");
         assert_eq!(csv_matches, 2);
 
-        let json_matches = count_matching_files(&db, "*.json");
+        let json_matches = count_matching_files(&db, &workspace_id, "*.json");
         assert_eq!(json_matches, 1);
 
-        let all_matches = count_matching_files(&db, "*.*");
+        let all_matches = count_matching_files(&db, &workspace_id, "*.*");
         assert_eq!(all_matches, 3);
     }
 }

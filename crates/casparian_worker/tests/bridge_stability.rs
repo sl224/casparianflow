@@ -5,6 +5,7 @@
 
 use casparian_protocol::JobId;
 use casparian_worker::bridge::{execute_bridge, materialize_bridge_shim, BridgeConfig};
+use casparian_worker::cancel::CancellationToken;
 use std::path::PathBuf;
 
 fn make_test_config(job_id: JobId, python_code: &str) -> BridgeConfig {
@@ -20,6 +21,7 @@ fn make_test_config(job_id: JobId, python_code: &str) -> BridgeConfig {
         file_id: 1,
         shim_path,
         inherit_stdio: false,
+        cancel_token: CancellationToken::new(),
     }
 }
 

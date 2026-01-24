@@ -372,7 +372,7 @@ impl JobExecutor {
 
             // Run parser on file
             let ctx = create_run_context(idx, &parser_path);
-            match runtime.run_file(&ctx, file_path) {
+            match runtime.run_file(&ctx, file_path, &cancel_token) {
                 Ok(outputs) => {
                     passed += 1;
                     for info in outputs.output_info {
@@ -488,7 +488,7 @@ impl JobExecutor {
             );
 
             let ctx = create_run_context(idx, &parser_path);
-            match runtime.run_file(&ctx, file_path) {
+            match runtime.run_file(&ctx, file_path, &cancel_token) {
                 Ok(outputs) => {
                     processed += 1;
                     for info in outputs.output_info {

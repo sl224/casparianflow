@@ -135,6 +135,16 @@ struct TrustConfigRaw {
     /// Dev override: allow unsigned native executables
     #[serde(default)]
     allow_unsigned_native: bool,
+
+    /// Dev override: allow unsigned Python plugins (default: false)
+    /// When false, unsigned Python plugins are blocked with a clear error.
+    /// When true, unsigned Python plugins run with a warning log.
+    #[serde(default = "default_allow_unsigned_python")]
+    allow_unsigned_python: bool,
+}
+
+fn default_allow_unsigned_python() -> bool {
+    false // Default false; opt-in required
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +153,9 @@ pub struct TrustConfig {
     pub allowed_signers: Vec<SignerId>,
     pub keys: BTreeMap<SignerId, PublicKeyBase64>,
     pub allow_unsigned_native: bool,
+    /// When true, allows unsigned Python plugins with a warning.
+    /// When false, unsigned Python plugins are blocked.
+    pub allow_unsigned_python: bool,
 }
 
 impl Default for TrustConfig {
@@ -152,6 +165,7 @@ impl Default for TrustConfig {
             allowed_signers: Vec::new(),
             keys: BTreeMap::new(),
             allow_unsigned_native: false,
+            allow_unsigned_python: false, // Default false; opt-in required
         }
     }
 }
@@ -174,6 +188,7 @@ impl TrustConfig {
             allowed_signers: raw.allowed_signers,
             keys: raw.keys,
             allow_unsigned_native: raw.allow_unsigned_native,
+            allow_unsigned_python: raw.allow_unsigned_python,
         })
     }
 }
@@ -224,6 +239,7 @@ mod tests {
         assert!(config.allowed_signers.is_empty());
         assert!(config.keys.is_empty());
         assert!(!config.allow_unsigned_native);
+        assert!(!config.allow_unsigned_python); // Default false (opt-in required)
     }
 
     #[test]
@@ -237,6 +253,7 @@ mod tests {
         assert!(config.allowed_signers.is_empty());
         assert!(config.keys.is_empty());
         assert!(!config.allow_unsigned_native);
+        assert!(!config.allow_unsigned_python); // Default false
     }
 
     #[test]
@@ -359,5 +376,40 @@ mod tests {
         assert!(config.allowed_signers.is_empty());
         assert!(config.keys.is_empty());
         assert!(!config.allow_unsigned_native);
+        assert!(!config.allow_unsigned_python); // Default false
+    }
+
+    #[test]
+    fn test_allow_unsigned_python_false() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [trust]
+            allow_unsigned_python = false
+            "#,
+        )
+        .unwrap();
+
+        let config = load_trust_config(&config_path).unwrap();
+        assert!(!config.allow_unsigned_python);
+    }
+
+    #[test]
+    fn test_allow_unsigned_python_explicit_true() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+            [trust]
+            allow_unsigned_python = true
+            "#,
+        )
+        .unwrap();
+
+        let config = load_trust_config(&config_path).unwrap();
+        assert!(config.allow_unsigned_python);
     }
 }

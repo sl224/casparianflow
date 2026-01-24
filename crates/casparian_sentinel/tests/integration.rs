@@ -4,7 +4,9 @@
 
 use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::types::{IdentifyPayload, JobReceipt, JobStatus};
-use casparian_protocol::{JobId, Message, OpCode, PipelineRunStatus, ProcessingStatus};
+use casparian_protocol::{
+    metrics, JobId, Message, OpCode, PipelineRunStatus, ProcessingStatus,
+};
 use std::time::Duration;
 use zmq::Context;
 
@@ -74,10 +76,11 @@ fn test_identify_message() {
 fn test_conclude_message() {
     let receipt = JobReceipt {
         status: JobStatus::Success,
-        metrics: std::collections::HashMap::from([("rows".to_string(), 1000i64)]),
+        metrics: std::collections::HashMap::from([(metrics::ROWS.to_string(), 1000i64)]),
         artifacts: vec![],
         error_message: None,
         diagnostics: None,
+        source_hash: Some("abc123def456".to_string()),
     };
 
     let payload = serde_json::to_vec(&receipt).unwrap();
@@ -91,7 +94,7 @@ fn test_conclude_message() {
 
     let parsed: JobReceipt = serde_json::from_slice(&unpacked.payload).unwrap();
     assert_eq!(parsed.status, JobStatus::Success);
-    assert_eq!(parsed.metrics.get("rows"), Some(&1000i64));
+    assert_eq!(parsed.metrics.get(metrics::ROWS), Some(&1000i64));
 }
 
 /// Test worker/sentinel ZMQ message exchange

@@ -1,0 +1,28 @@
+[package]
+name = "casparian_sinks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+casparian_protocol = { path = "../casparian_protocol" }
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+arrow.workspace = true
+parquet.workspace = true
+csv = "1"
+duckdb = "1.4"
+chrono.workspace = true
+rust_decimal = "1.40"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Expose internal Arrow accessors for workspace crates.
+internal = []

@@ -2,6 +2,10 @@
 //!
 //! These commands manage Intent Pipeline sessions with proper type safety.
 //! Uses IntentState enum - no stringly-typed state representation.
+//!
+//! Tape instrumentation (WS7-05):
+//! - Records session creation, state transitions, and cancellation
+//! - Input directories are hashed for privacy
 
 use crate::session_types::{IntentState, QuestionKind, SessionId};
 use crate::state::{AppState, CommandError, CommandResult};
@@ -146,13 +150,66 @@ pub async fn session_create(
     request: CreateSessionRequest,
     state: State<'_, AppState>,
 ) -> CommandResult<CreateSessionResponse> {
+    // Record tape event - hash input_dir for privacy
+    let tape_ids = {
+        let tape = state.tape().read().ok();
+        tape.as_ref().and_then(|t| {
+            let input_dir_hash = request.input_dir.as_ref().map(|d| t.redact(d));
+            t.emit_command(
+                "SessionCreate",
+                serde_json::json!({
+                    "intent": request.intent,
+                    "input_dir_hash": input_dir_hash,
+                }),
+            )
+        })
+    };
+
     let storage = state
         .open_session_storage()
-        .map_err(|e| CommandError::Database(e.to_string()))?;
+        .map_err(|e| {
+            if let Some((event_id, correlation_id)) = &tape_ids {
+                if let Ok(tape) = state.tape().read() {
+                    tape.emit_error(
+                        correlation_id,
+                        event_id,
+                        &e.to_string(),
+                        serde_json::json!({"status": "failed"}),
+                    );
+                }
+            }
+            CommandError::Database(e.to_string())
+        })?;
 
     let session_id = storage
         .create_session(&request.intent, request.input_dir.as_deref())
-        .map_err(|e| CommandError::Database(e.to_string()))?;
+        .map_err(|e| {
+            if let Some((event_id, correlation_id)) = &tape_ids {
+                if let Ok(tape) = state.tape().read() {
+                    tape.emit_error(
+                        correlation_id,
+                        event_id,
+                        &e.to_string(),
+                        serde_json::json!({"status": "failed"}),
+                    );
+                }
+            }
+            CommandError::Database(e.to_string())
+        })?;
+
+    // Record success
+    if let Some((event_id, correlation_id)) = tape_ids {
+        if let Ok(tape) = state.tape().read() {
+            tape.emit_success(
+                &correlation_id,
+                &event_id,
+                serde_json::json!({
+                    "status": "success",
+                    "session_id": session_id.to_string(),
+                }),
+            );
+        }
+    }
 
     Ok(CreateSessionResponse {
         session_id: session_id.to_string(),
@@ -242,6 +299,21 @@ pub async fn session_advance(
     request: AdvanceSessionRequest,
     state: State<'_, AppState>,
 ) -> CommandResult<AdvanceSessionResponse> {
+    // Record tape event
+    let tape_ids = {
+        let tape = state.tape().read().ok();
+        tape.as_ref().and_then(|t| {
+            t.emit_command(
+                "SessionAdvance",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "target_state": request.target_state,
+                    "has_answer": request.answer.is_some(),
+                }),
+            )
+        })
+    };
+
     let storage = state
         .open_session_storage()
         .map_err(|e| CommandError::Database(e.to_string()))?;
@@ -257,18 +329,47 @@ pub async fn session_advance(
     })?;
 
     // Attempt the transition - the storage layer validates it
-    match storage.update_session_state(parsed_id, target_state) {
-        Ok(_) => Ok(AdvanceSessionResponse {
+    let result = match storage.update_session_state(parsed_id, target_state) {
+        Ok(_) => AdvanceSessionResponse {
             success: true,
             new_state: target_state.as_str().to_string(),
             error: None,
-        }),
-        Err(e) => Ok(AdvanceSessionResponse {
+        },
+        Err(e) => AdvanceSessionResponse {
             success: false,
             new_state: request.target_state,
             error: Some(e.to_string()),
-        }),
+        },
+    };
+
+    // Record success/failure in tape
+    if let Some((event_id, correlation_id)) = tape_ids {
+        if let Ok(tape) = state.tape().read() {
+            if result.success {
+                tape.emit_success(
+                    &correlation_id,
+                    &event_id,
+                    serde_json::json!({
+                        "status": "success",
+                        "session_id": session_id,
+                        "new_state": result.new_state,
+                    }),
+                );
+            } else {
+                tape.emit_error(
+                    &correlation_id,
+                    &event_id,
+                    result.error.as_deref().unwrap_or("Unknown error"),
+                    serde_json::json!({
+                        "status": "failed",
+                        "session_id": session_id,
+                    }),
+                );
+            }
+        }
     }
+
+    Ok(result)
 }
 
 /// Cancel a session.

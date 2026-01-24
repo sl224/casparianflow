@@ -1,0 +1,43 @@
+---
+source: crates/casparian/src/cli/tui/snapshot_tests.rs
+expression: plain
+---
+ Casparian Flow | View: Settings | WS: alpha-case | DB: duckdb | Run: 1 | Fail: 1 | Quarantine: 16
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+╭ NAV ─────────────╮                                                                ┌ Inspector ───────────────────────┐
+│Views             │ ┌ General ───────────────────────────────────────────────────┐ │Version: 0.1.0                    │
+│[0] Home          │ │  Default source path:   ~/data               [Edit]        │ │Database: SNAPSHOT_DB.duckdb      │
+│[1] Discover      │ │  Auto-scan on startup:  Yes                  [Toggle]      │ │(duckdb)                          │
+│[2] Parser Bench  │ │  Confirm destructive:   Yes                  [Toggle]      │ │Config:                           │
+│[3] Jobs          │ │                                                            │ │~/.casparian_flow/config.toml     │
+│[4] Sources       │ └────────────────────────────────────────────────────────────┘ │                                  │
+│[5] Approvals     │ ┌ Display ───────────────────────────────────────────────────┐ │                                  │
+│[6] Query         │ │  Theme:                 dark                 [Cycle]       │ │                                  │
+│[7] Sessions      │ │  Unicode symbols:       Yes                  [Toggle]      │ │                                  │
+│[,] Settings      │ │  Show hidden files:     No                   [Toggle]      │ │                                  │
+│                  │ │                                                            │ │                                  │
+│Context           │ └────────────────────────────────────────────────────────────┘ │                                  │
+│Workspace: alp... │ ┌ About ─────────────────────────────────────────────────────┐ │                                  │
+│Category: About   │ │  Version:    0.1.0                                         │ │                                  │
+│                  │ │  Database:   SNAPSHOT_DB.duckdb (duckdb)                   │ │                                  │
+│                  │ │  Config:     ~/.casparian_flow/config.toml                 │ │                                  │
+│                  │ └────────────────────────────────────────────────────────────┘ │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+│                  │                                                                │                                  │
+╰──────────────────╯                                                                └──────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                           [↑/↓] Navigate  [Tab] Category  [Enter] Edit/Toggle  [I] Inspector

@@ -1,4 +1,6 @@
-use casparian::scout::{Database, ScanConfig, ScannedFile, Scanner, Source, SourceId, SourceType};
+use casparian::scout::{
+    Database, ScanConfig, ScannedFile, Scanner, Source, SourceId, SourceType, WorkspaceId,
+};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use ignore::WalkBuilder;
 use std::fs::File;
@@ -49,8 +51,9 @@ fn create_fixture(file_count: usize, depth: usize, file_size: usize) -> Fixture 
     }
 }
 
-fn create_source(path: &Path) -> Source {
+fn create_source(workspace_id: WorkspaceId, path: &Path) -> Source {
     Source {
+        workspace_id,
         id: SourceId::new(),
         name: "Bench Source".to_string(),
         source_type: SourceType::Local,
@@ -152,12 +155,17 @@ fn walk_count_bytes(root: &Path, config: &ScanConfig) -> (usize, u64) {
     )
 }
 
-fn build_scanned_files(source_id: &SourceId, count: usize) -> Vec<ScannedFile> {
+fn build_scanned_files(
+    workspace_id: WorkspaceId,
+    source_id: &SourceId,
+    count: usize,
+) -> Vec<ScannedFile> {
     let mut files = Vec::with_capacity(count);
     for i in 0..count {
         let rel_path = format!("level_{}/file_{:06}.dat", i % 16, i);
         let full_path = format!("/bench/{}", rel_path);
         files.push(ScannedFile::new(
+            workspace_id,
             source_id.clone(),
             &full_path,
             &rel_path,
@@ -182,7 +190,8 @@ fn bench_scanner_full_scan(c: &mut Criterion) {
                 b.iter_batched(
                     || {
                         let db = Database::open_in_memory().expect("open db");
-                        let source = create_source(fixture.temp_dir.path());
+                        let workspace_id = db.ensure_default_workspace().expect("workspace").id;
+                        let source = create_source(workspace_id, fixture.temp_dir.path());
                         db.upsert_source(&source).expect("insert source");
                         (db, source)
                     },
@@ -217,7 +226,8 @@ fn bench_scanner_rescan(c: &mut Criterion) {
                 b.iter_batched(
                     || {
                         let db = Database::open_in_memory().expect("open db");
-                        let source = create_source(fixture.temp_dir.path());
+                        let workspace_id = db.ensure_default_workspace().expect("workspace").id;
+                        let source = create_source(workspace_id, fixture.temp_dir.path());
                         db.upsert_source(&source).expect("insert source");
                         let config = ScanConfig {
                             batch_size: batch,
@@ -263,14 +273,10 @@ fn bench_scanner_walk_only(c: &mut Criterion) {
 }
 
 fn bench_scanner_db_write(c: &mut Criterion) {
-    let source_id = SourceId::new();
-    let files = build_scanned_files(&source_id, FILE_COUNT);
-
     let mut group = c.benchmark_group("scanner_db_write");
     group.throughput(Throughput::Elements(FILE_COUNT as u64));
 
     for &batch_size in WRITE_BATCH_SIZES {
-        let source_id = source_id.clone();
         group.bench_with_input(
             BenchmarkId::new("batch_size", batch_size),
             &batch_size,
@@ -278,7 +284,10 @@ fn bench_scanner_db_write(c: &mut Criterion) {
                 b.iter_batched(
                     || {
                         let db = Database::open_in_memory().expect("open db");
+                        let workspace_id = db.ensure_default_workspace().expect("workspace").id;
+                        let source_id = SourceId::new();
                         let source = Source {
+                            workspace_id,
                             id: source_id.clone(),
                             name: "Bench Source".to_string(),
                             source_type: SourceType::Local,
@@ -287,13 +296,14 @@ fn bench_scanner_db_write(c: &mut Criterion) {
                             enabled: true,
                         };
                         db.upsert_source(&source).expect("insert source");
-                        db
+                        let files = build_scanned_files(workspace_id, &source_id, FILE_COUNT);
+                        (db, files)
                     },
-                    |db| {
+                    |(db, files)| {
                         let mut offset = 0;
                         while offset < files.len() {
                             let end = (offset + batch).min(files.len());
-                            db.batch_upsert_files(&files[offset..end], None)
+                            db.batch_upsert_files(&files[offset..end], None, true)
                                 .expect("batch upsert");
                             offset = end;
                         }

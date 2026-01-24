@@ -5,9 +5,14 @@
 
 use anyhow::{Context, Result};
 use casparian_db::DbConnection;
-use casparian_sentinel::ApiStorage;
+use casparian_sentinel::{ApiStorage, ControlClient};
 
 use crate::session_storage::SessionStorage;
+use crate::tape::{create_disabled_tape, SharedTapeState};
+use std::time::Duration;
+
+/// Default Control API address when sentinel is running.
+const DEFAULT_CONTROL_ADDR: &str = "tcp://127.0.0.1:5556";
 
 /// Application state shared across Tauri commands.
 ///
@@ -16,19 +21,26 @@ use crate::session_storage::SessionStorage;
 pub struct AppState {
     /// Path to the DuckDB database file.
     pub db_path: String,
+    /// Tape recording state (shared across commands).
+    tape: SharedTapeState,
 }
 
 impl AppState {
     /// Create a new AppState with the default database path.
     pub fn new() -> Result<Self> {
         let db_path = Self::default_db_path()?;
-        Ok(Self { db_path })
+        let tape = create_disabled_tape();
+        Ok(Self { db_path, tape })
     }
 
     /// Get the default database path.
     pub fn default_db_path() -> Result<String> {
-        let home = dirs::home_dir().context("Could not determine home directory")?;
-        let db_dir = home.join(".casparian_flow");
+        let db_dir = if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
+            std::path::PathBuf::from(override_path)
+        } else {
+            let home = dirs::home_dir().context("Could not determine home directory")?;
+            home.join(".casparian_flow")
+        };
 
         // Ensure directory exists
         std::fs::create_dir_all(&db_dir).context("Failed to create database directory")?;
@@ -59,6 +71,12 @@ impl AppState {
             .context("Failed to open read-only connection")
     }
 
+    /// Open a read-write connection for mutation operations (when control API unavailable).
+    pub fn open_rw_connection(&self) -> Result<DbConnection> {
+        DbConnection::open_duckdb(std::path::Path::new(&self.db_path))
+            .context("Failed to open read-write connection")
+    }
+
     /// Open session storage for session operations.
     ///
     /// Creates a new connection and initializes the session schema.
@@ -69,6 +87,26 @@ impl AppState {
             .init_schema()
             .context("Failed to initialize session schema")?;
         Ok(storage)
+    }
+
+    /// Access the shared tape state.
+    pub fn tape(&self) -> &SharedTapeState {
+        &self.tape
+    }
+
+    /// Attempt to connect to the control API (sentinel mutation authority).
+    pub fn try_control_client(&self) -> Option<ControlClient> {
+        if std::env::var("CASPARIAN_CONTROL_DISABLED").is_ok() {
+            return None;
+        }
+        let addr =
+            std::env::var("CASPARIAN_CONTROL_ADDR").unwrap_or_else(|_| DEFAULT_CONTROL_ADDR.into());
+        let timeout = Duration::from_millis(500);
+        let client = ControlClient::connect_with_timeout(&addr, timeout).ok()?;
+        match client.ping() {
+            Ok(true) => Some(client),
+            _ => None,
+        }
     }
 }
 

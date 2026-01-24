@@ -1,6 +1,9 @@
 //! Approval management commands.
 //!
 //! These commands manage the approval workflow for operations.
+//!
+//! Tape instrumentation (WS7-05):
+//! - Records approval decisions (approve/reject) with approval_id
 
 use crate::state::{AppState, CommandError, CommandResult};
 use casparian_protocol::ApprovalStatus as ProtocolApprovalStatus;
@@ -143,18 +146,79 @@ pub async fn approval_decide(
     decision: ApprovalDecision,
     state: State<'_, AppState>,
 ) -> CommandResult<ApprovalDecisionResponse> {
+    // Record tape event
+    let tape_ids = {
+        let tape = state.tape().read().ok();
+        tape.as_ref().and_then(|t| {
+            t.emit_command(
+                "ApprovalDecide",
+                serde_json::json!({
+                    "approval_id": decision.approval_id,
+                    "decision": decision.decision,
+                    "has_reason": decision.reason.is_some(),
+                }),
+            )
+        })
+    };
+
     let storage = state
         .open_api_storage()
-        .map_err(|e| CommandError::Database(e.to_string()))?;
+        .map_err(|e| {
+            if let Some((event_id, correlation_id)) = &tape_ids {
+                if let Ok(tape) = state.tape().read() {
+                    tape.emit_error(
+                        correlation_id,
+                        event_id,
+                        &e.to_string(),
+                        serde_json::json!({"status": "failed"}),
+                    );
+                }
+            }
+            CommandError::Database(e.to_string())
+        })?;
 
     let success = match decision.decision.as_str() {
         "approve" => storage
             .approve(&decision.approval_id, None)
-            .map_err(|e| CommandError::Database(e.to_string()))?,
+            .map_err(|e| {
+                if let Some((event_id, correlation_id)) = &tape_ids {
+                    if let Ok(tape) = state.tape().read() {
+                        tape.emit_error(
+                            correlation_id,
+                            event_id,
+                            &e.to_string(),
+                            serde_json::json!({"status": "failed"}),
+                        );
+                    }
+                }
+                CommandError::Database(e.to_string())
+            })?,
         "reject" => storage
             .reject(&decision.approval_id, None, decision.reason.as_deref())
-            .map_err(|e| CommandError::Database(e.to_string()))?,
+            .map_err(|e| {
+                if let Some((event_id, correlation_id)) = &tape_ids {
+                    if let Ok(tape) = state.tape().read() {
+                        tape.emit_error(
+                            correlation_id,
+                            event_id,
+                            &e.to_string(),
+                            serde_json::json!({"status": "failed"}),
+                        );
+                    }
+                }
+                CommandError::Database(e.to_string())
+            })?,
         _ => {
+            if let Some((event_id, correlation_id)) = &tape_ids {
+                if let Ok(tape) = state.tape().read() {
+                    tape.emit_error(
+                        correlation_id,
+                        event_id,
+                        "Invalid decision value",
+                        serde_json::json!({"status": "failed"}),
+                    );
+                }
+            }
             return Err(CommandError::InvalidArgument(
                 "Decision must be 'approve' or 'reject'".to_string(),
             ))
@@ -162,10 +226,26 @@ pub async fn approval_decide(
     };
 
     let status = if success {
-        decision.decision
+        decision.decision.clone()
     } else {
         "unchanged".to_string()
     };
+
+    // Record success
+    if let Some((event_id, correlation_id)) = tape_ids {
+        if let Ok(tape) = state.tape().read() {
+            tape.emit_success(
+                &correlation_id,
+                &event_id,
+                serde_json::json!({
+                    "status": "success",
+                    "approval_id": decision.approval_id,
+                    "decision": decision.decision,
+                    "applied": success,
+                }),
+            );
+        }
+    }
 
     Ok(ApprovalDecisionResponse { success, status })
 }

@@ -1,0 +1,36 @@
+[package]
+name = "casparian_schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Schema Contract System - Schema is Intent, then Contract"
+
+[lib]
+name = "casparian_schema"
+path = "src/lib.rs"
+
+[dependencies]
+# Serialization
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# Protocol types (canonical DataType)
+casparian_protocol = { path = "../casparian_protocol" }
+
+# Shared IDs
+casparian_ids = { path = "../casparian_ids" }
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+# Database abstraction
+casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
+
+# Hashing
+sha2 = "0.10"
+tempfile = "3"
+
+# Error handling
+thiserror.workspace = true

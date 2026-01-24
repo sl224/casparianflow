@@ -19,9 +19,11 @@ function App() {
         <Route path="/home" element={<Home />} />
         <Route path="/discover" element={<Discover />} />
         <Route path="/sessions" element={<Sessions />} />
+        <Route path="/sessions/new" element={<Navigate to="/sessions" replace />} />
         <Route path="/sessions/:sessionId" element={<SessionDetail />} />
         <Route path="/parsers" element={<Parsers />} />
         <Route path="/jobs" element={<Jobs />} />
+        <Route path="/jobs/:jobId" element={<Navigate to="/jobs" replace />} />
         <Route path="/approvals" element={<Approvals />} />
         <Route path="/query" element={<Query />} />
         <Route path="/settings" element={<Settings />} />

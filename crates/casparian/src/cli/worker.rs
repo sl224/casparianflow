@@ -425,13 +425,14 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<(i64, i64, i64, i64)> 
             COALESCE(SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END), 0) as pending,
             COALESCE(SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END), 0) as running,
             COALESCE(SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END), 0) as completed,
-            COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed
+            COALESCE(SUM(CASE WHEN status IN ('{failed}', '{aborted}') THEN 1 ELSE 0 END), 0) as failed
         FROM cf_processing_queue
         "#,
             queued = ProcessingStatus::Queued.as_str(),
             running = ProcessingStatus::Running.as_str(),
             completed = ProcessingStatus::Completed.as_str(),
             failed = ProcessingStatus::Failed.as_str(),
+            aborted = ProcessingStatus::Aborted.as_str(),
         ),
         &[],
     )?;
