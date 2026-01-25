@@ -326,6 +326,8 @@ pub struct Source {
     pub source_type: SourceType,
     /// Root path to scan
     pub path: String,
+    /// Root path as seen by workers (optional)
+    pub exec_path: Option<String>,
     /// Polling interval in seconds
     pub poll_interval_secs: u64,
     /// Whether this source is enabled

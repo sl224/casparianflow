@@ -1,73 +1,101 @@
 # Casparian Flow - Marketing & Launch Plan
 
+**Status:** Canonical
 **Last Updated:** January 2026
-**Purpose:** Marketing strategy aligned with validated personas and website structure.
+**Purpose:** Marketing strategy for DFIR-first launch
 
 ---
 
 ## Executive Summary
 
-**Product:** CLI tool that transforms industry-specific file formats into queryable SQL.
+**Product:** CLI tool that transforms DFIR artifacts into queryable SQL with governance (lineage, quarantine, reproducibility).
 
-**Go-To-Market Strategy:** Vertical-by-vertical launch starting with Finance (Trade Support), followed by Healthcare, Legal, and Defense based on waitlist demand and product readiness.
+**Go-To-Market Strategy:** Vertical-by-vertical launch starting with DFIR (Incident Response), followed by eDiscovery preflight, and Defense flight test data.
 
 **Target Buyers:**
-| Vertical | Buyer Persona | Price Point | Status |
-|----------|---------------|-------------|--------|
-| Finance | Trade Support Analyst / Manager | $300-$6,000/mo | **LIVE** |
-| Healthcare | HL7 Integration Analyst / Manager | TBD | Q2 2026 |
-| Legal | Litigation Support Specialist | TBD | Q2 2026 |
-| Defense | Intelligence Analyst (cleared) | TBD | 2026 |
+
+| Priority | Vertical | Buyer Persona | Price Point | Status |
+|----------|----------|---------------|-------------|--------|
+| P0 | DFIR | Forensic Consultant / IR Lead | $1,200-$12,000/yr | **LAUNCH** |
+| P1 | eDiscovery | Litigation Support Technologist | $1,800-$18,000/yr | Q2 2026 |
+| P2 | Defense | Flight Test Data Processor | $24,000-$60,000/yr | Q3 2026 |
+| P3 | Finance | Trade Support (via consultants) | Consultant-delivered | Deferred |
 
 ---
 
-## Part 1: Finance Vertical Launch (NOW)
+## Part 1: DFIR Vertical Launch (NOW)
 
-### Target Persona: Trade Support Analyst
+### Target Persona: DFIR Consultant
 
-**From validated research:**
-- Job title: Trade Support Analyst, FIX Connectivity Analyst, Middle Office Analyst
-- Salary: $73K-$118K (mid-range); hedge funds pay $200K+
-- Skills: SQL, Excel, Unix/Linux log parsing, VBA — NOT Python experts
-- Pain: 30-45 minutes per trade break investigation
-- Work hours: 7am start (handle overnight breaks)
+**From validated strategy:**
+- Job title: Forensic Engineer, IR Consultant, DFIR Lead, Detection Engineer
+- Salary: $100K-$200K+ (boutique firms, consulting)
+- Skills: Python, CLI, artifact parsing (Plaso, Velociraptor, custom scripts)
+- Pain: Fragile scripts, no chain of custody, silent failures
 
-**Decision maker:** Manager of Operations, Head of Trade Support
+**Decision maker:** Principal, Practice Lead, Managing Partner (boutique firms)
 
 ### Value Proposition
 
 **Short (for ads/headlines):**
-> "Debug trade breaks in 5 minutes, not 45. T+1 ready."
+> "Evidence-grade artifact parsing. Lineage + Quarantine + Reproducibility."
 
 **Long (for landing page):**
-> "Turn your file chaos into a structured database. Includes a battle-tested FIX parser, or bring your own Python scripts. We handle the lineage, errors, and quarantine."
+> "Turn your case folders into governed, queryable tables. Every row has source hash, job ID, and parser version. Quarantine catches the edge cases. Prove your work."
 
 **Quantified ROI:**
-- 40 min/break × 10 breaks/day = 6.5 hours lost daily
-- Reduced to 10 min/break = 1.7 hours
-- **Time saved: 4.8 hours/day per analyst**
-- At $50/hour loaded cost = **$24K/year saved per analyst**
-- Team pricing ($2K/mo) pays for itself with 1 analyst in <1 month
+- 2 hours/case × 20 cases/month = 40 hours on parsing
+- Reduced to 0.5 hours/case = 10 hours
+- **Time saved: 30 hours/month**
+- At $150/hour consulting rate = **$4,500/month saved**
+- Solo pricing ($1,200/year) pays for itself in <1 week
 
 ### Marketing Channels
 
-#### 1. LinkedIn Outreach (Primary)
+#### 1. DFIR Community (Primary)
+
+**Target communities:**
+- DFIR Discord
+- SANS DFIR Summit
+- DFRWS attendees
+- r/computerforensics
+- r/dfir
+
+**Community post format (not salesy):**
+```
+Title: "How do you document your artifact parsing for chain of custody?"
+
+Body:
+Working on case documentation and realized my current workflow
+(Python scripts + manual notes) doesn't give me reproducible runs.
+
+Curious how others handle:
+- Tracking which parser version processed which file
+- Documenting when malformed records are skipped
+- Proving outputs match source files
+
+(disclosure: building a tool for this, but genuinely curious
+what workflows exist)
+```
+
+#### 2. LinkedIn Outreach (Secondary)
 
 **Target search:**
-- "Trade Support Analyst"
-- "FIX Connectivity"
-- "Middle Office" + "Trading"
-- "Trade Operations"
+- "DFIR Consultant"
+- "Forensic Engineer"
+- "Incident Response"
+- "Digital Forensics"
 
 **Connection message template:**
 ```
 Hi [Name],
 
-I noticed you're in Trade Support at [Company]. We built a tool that turns FIX log grep sessions into SQL queries — goes from 45-min investigations to 5 minutes.
+I noticed you're in DFIR at [Company]. We built a tool that adds
+governance to artifact parsing — source hashes, lineage, quarantine.
 
-No cloud, runs locally, full audit trail.
+Every output row traces back to the exact input file and parser version.
 
-Would a 10-minute demo be useful? Happy to show it on your logs.
+Would a 10-minute demo be useful? Runs locally, works air-gapped.
 
 Best,
 [Your name]
@@ -77,59 +105,37 @@ Best,
 ```
 Thanks for connecting!
 
-Quick context: We're a small team that built Casparian Flow specifically for Trade Support.
+Quick context: We built Casparian Flow for IR teams who want
+reproducible, evidence-grade artifact parsing.
 
-The pitch is simple: instead of grep + Excel for trade breaks, you run SQL against a structured order_lifecycle table.
+The pitch: instead of fragile Python scripts, you get governed
+pipelines with lineage on every row and quarantine for edge cases.
 
 Here's a 60-second demo: [VIDEO_LINK]
 
-If T+1 pressure is real for your team, happy to do a quick call.
-```
-
-#### 2. Reddit (Secondary)
-
-**Target subreddits:**
-- r/financialcareers (career discussion, can mention tools)
-- r/algotrading (quant-adjacent, tech-savvy)
-- r/ExperiencedDevs (if framing as infra/tooling)
-
-**Post format (not salesy):**
-```
-Title: "Anyone have good FIX log analysis tooling?"
-
-Body:
-Been dealing with T+1 settlement pressure and our trade break workflow
-is still grep + Excel.
-
-Curious what others use for FIX log investigation — we need better
-order lifecycle reconstruction than manual grep.
-
-(disclosure: I'm working on a tool for this, but genuinely curious
-what else exists)
+If "prove your parsing" matters for your practice, happy to chat.
 ```
 
 #### 3. Direct Email to Pilot Prospects
 
-**Target:** Companies you've identified or that reach out via website.
-
 **Cold email template:**
 ```
-Subject: FIX log analysis for Trade Support
+Subject: Evidence-grade artifact parsing for IR
 
 Hi [Name],
 
-I'm reaching out because [Company] likely deals with trade break
-investigations — and T+1 makes that pain worse.
+I'm reaching out because [Company] likely deals with artifact
+processing and chain of custody documentation.
 
-We built Casparian Flow: a local CLI that turns FIX logs into a
-queryable SQL table. Instead of grep + Excel, you query
-fix_order_lifecycle by ClOrdID.
+We built Casparian Flow: a local CLI that adds governance to
+artifact parsing.
 
-- Runs on your server (data never leaves)
-- Full audit trail for compliance
-- Works with FIX 4.2/4.4/5.0 + custom tags
+- Every row has source hash, job ID, parser version
+- Quarantine catches malformed records (no silent drops)
+- Same inputs + same parser = identical outputs (reproducible)
+- Works air-gapped on evidence servers
 
-Would a 15-minute demo on your logs be useful?
+Would a 15-minute demo be useful?
 
 Best,
 [Your name]
@@ -138,15 +144,14 @@ Casparian Flow
 
 **Follow-up (3 days later, no response):**
 ```
-Subject: Re: FIX log analysis for Trade Support
+Subject: Re: Evidence-grade artifact parsing for IR
 
 Hi [Name],
 
-Following up — I know Trade Support teams are slammed in the morning
-with overnight breaks.
+Following up — I know IR teams are busy with active engagements.
 
-If timing is bad, no worries. Here's a 60-second video showing the
-workflow: [VIDEO_LINK]
+If timing is bad, here's a 60-second video showing the workflow:
+[VIDEO_LINK]
 
 Happy to connect whenever makes sense.
 
@@ -162,64 +167,64 @@ Best,
 - [ ] You can monitor HN for 4-6 hours straight
 
 **Post title options:**
-- "Show HN: SQL for FIX logs – debug trade breaks in 5 minutes"
-- "Show HN: Casparian Flow – local-first FIX log analysis for Trade Support"
+- "Show HN: Governed artifact parsing for DFIR — lineage, quarantine, reproducibility"
+- "Show HN: Casparian Flow – evidence-grade parsing for incident response"
 
 **Post body:**
 ```
-I built this for Trade Support teams dealing with T+1 settlement pressure.
+I built this for DFIR teams who need to prove their artifact processing.
 
-The problem: Trade breaks require reconstructing order lifecycles from
-FIX logs. Most teams grep through logs and paste into Excel. Takes
-30-45 minutes per break.
+The problem: Most artifact parsing uses Python scripts that crash on
+edge cases, silently drop rows, and have no audit trail.
 
-Casparian Flow scans your FIX logs, builds a structured order_lifecycle
-table, and lets you query by ClOrdID in SQL.
+Casparian Flow adds governance:
+- Source hash per input file
+- Lineage columns on every output row
+- Quarantine for malformed records
+- Reproducible runs (same inputs + parser = identical outputs)
 
-- Runs locally (data never leaves your machine)
-- Full audit trail for compliance
-- Works offline
+Runs locally (data never leaves your machine). Works air-gapped.
 
 Demo: [VIDEO_LINK]
 Download: [GITHUB_RELEASES_LINK]
 
-I'm the solo developer. Happy to answer questions about FIX parsing,
-the architecture, or trade support workflows.
+I'm the developer. Happy to answer questions about DFIR workflows,
+the architecture, or evidence handling.
 ```
 
-### Launch Checklist: Finance
+### Launch Checklist: DFIR
 
 **Pre-launch (before any outreach):**
 ```
 [ ] Demo video recorded (60-90 seconds)
-    - Show: scan logs → query order → see lifecycle
+    - Show: scan case folder → run parser → query outputs → show lineage
     - Record with OBS or Loom
     - No fancy editing needed
 
 [ ] GitHub Releases set up
     - macOS ARM64, macOS x64, Linux x64, Windows x64
-    - Download links in finance.html work
+    - Download links work
 
 [ ] Stripe Payment Links created
-    - Analyst Monthly: $300/mo
-    - Analyst Annual: $3,000/yr
-    - Team Monthly: $2,000/mo
-    - Team Annual: $20,000/yr
+    - Solo Monthly: $100/mo → Annual: $1,200/yr
+    - Team Monthly: $400/mo → Annual: $4,800/yr
+    - Enterprise Lite: $1,000/mo → Annual: $12,000/yr
+    - Paid Pilot: $1,000 (30 days, credits to annual)
 
 [ ] License key delivery process documented
     - Manual for now: receive Stripe notification → generate key → email
 
 [ ] Plausible goals configured
     - Download click
-    - Start Trial click
+    - Start Pilot click
     - Demo watched
 ```
 
 **Launch week:**
 ```
-Day 1: LinkedIn outreach to 20 Trade Support profiles
-Day 2: LinkedIn outreach to 20 more
-Day 3: Post in relevant Reddit thread (if organic opportunity)
+Day 1: DFIR Discord introduction post
+Day 2: LinkedIn outreach to 15 DFIR consultants
+Day 3: LinkedIn outreach to 15 more
 Day 4: Email pilot prospects (any warm leads)
 Day 5: Review analytics, adjust messaging
 ```
@@ -233,172 +238,156 @@ Week 4: If 5+ paying customers, consider HN Show launch
 
 ---
 
-## Part 2: Healthcare Vertical (Q2 2026)
+## Part 2: eDiscovery Preflight (Q2 2026)
 
-### Target Persona: HL7 Integration Analyst
+### Target Persona: Litigation Support Technologist
 
-**From validated research:**
-- Job title: HL7 Interface Analyst, Integration Analyst, Mirth Administrator
-- Salary: $65K-$119K; Mirth specialists up to $200K
-- Skills: HL7 v2.x (ADT, ORU, ORM), Mirth Connect, SQL, JavaScript
-- Pain: Archive analysis gap — Mirth routes, doesn't analyze
+**From validated strategy:**
+- Job title: Litigation Support Tech, eDiscovery Processing Analyst
+- Salary: $75K-$130K
+- Skills: Load file formats (DAT/OPT/LFP), Relativity, SQL
+- Pain: Production validation errors, vendor back-and-forth
 
-**Decision maker:** Director of IT, Integration Manager
-
-### Go-Live Criteria
-
-Healthcare goes live when:
-```
-[ ] HL7 parser tested on real ADT/ORU/ORM files
-[ ] 50+ waitlist signups
-[ ] Pricing validated with 3+ prospects
-[ ] Demo video for healthcare workflow recorded
-[ ] Tally waitlist converted to Stripe payment flow
-```
-
-### Marketing Channels
-
-**LinkedIn targets:**
-- "HL7 Interface Analyst"
-- "Healthcare Integration"
-- "Mirth Connect"
-- "Epic Integration"
-
-**Industry forums:**
-- HL7.org community
-- Mirth Community Forums (forum.mirthproject.io)
-- HIMSS community
-
-**Angle:** "Mirth went commercial. Get more value from your HL7 archives."
-
----
-
-## Part 3: Legal Vertical (Q2 2026)
-
-### Target Persona: Litigation Support Specialist
-
-**From validated research:**
-- Job title: Litigation Support Specialist, eDiscovery Analyst
-- Salary: $82K-$132K
-- Pain: Relativity too expensive, vendor processing costs $5-15K per matter
-- Skills: Relativity, SQL, Excel, load file formats (DAT/OPT)
-
-**Decision maker:** Director of Litigation Support, Managing Partner (small firms)
+**Decision maker:** Director of Litigation Support, Practice Group Leader
 
 ### Go-Live Criteria
 
-Legal goes live when:
+eDiscovery goes live when:
 ```
-[ ] PST parser tested on real archives
-[ ] Load file (DAT/OPT) export working
+[ ] Load file parsers tested on real DAT/OPT/LFP files
 [ ] 30+ waitlist signups
-[ ] Pricing validated with 2+ law firms
-[ ] Demo video for eDiscovery workflow recorded
+[ ] Pricing validated with 3+ prospects
+[ ] Demo video for preflight workflow recorded
+[ ] DFIR ARR > $30K (cash flow established)
 ```
 
 ### Marketing Channels
 
 **LinkedIn targets:**
 - "Litigation Support"
-- "eDiscovery"
+- "eDiscovery Processing"
 - "Legal Technology"
 
 **Industry forums:**
+- ILTA (International Legal Technology Association)
 - ACEDS (Association of Certified E-Discovery Specialists)
-- Above the Law (legal industry publication)
+- ACC (Association of Corporate Counsel)
 
-**Angle:** "Process PSTs in-house. Save $5-15K per matter."
+**Angle:** "Validate productions before they fail on import. Catch errors before they cost you."
 
 ---
 
-## Part 4: Defense Vertical (2026)
+## Part 3: Defense Flight Test (Q3 2026)
 
-### Target Persona: Intelligence Analyst (DDIL/Edge)
+### Target Persona: Flight Test Data Processor
 
-**From validated research:**
-- Job title: Intelligence Analyst, SIGINT Analyst, GEOINT Analyst
-- Clearance: TS/SCI required
-- Salary: $77K median; $175K+ for senior cleared roles
-- Pain: Closed systems (Palantir), DDIL constraints
+**From validated strategy:**
+- Job title: Telemetry Data Engineer, Flight Test Data Processor
+- Clearance: May require SECRET or higher
+- Salary: $90K-$160K
+- Pain: Manual extraction, no governance, no audit trail
 
-**Decision maker:** Program Manager, Contracting Officer
+**Decision maker:** Data Processing Lead, Program Manager
 
 ### Go-Live Criteria
 
 Defense goes live when:
 ```
-[ ] CoT/PCAP/NITF parsers tested
-[ ] Air-gapped deployment mode (no network calls)
-[ ] Security review completed
-[ ] 20+ waitlist signups from .mil/.gov
-[ ] Pricing structure for government contracts defined
+[ ] CH10/TF10 parsers tested
+[ ] Air-gapped deployment mode verified
+[ ] 10+ waitlist signups from defense contacts
+[ ] SBIR Phase I application submitted
+[ ] DFIR + eDiscovery ARR > $80K
 ```
 
 ### Marketing Channels
 
 **This vertical is different:**
-- Direct outreach to defense contractors (Palantir alumni, SAIC, Leidos)
-- Conference presence (classified)
-- Word of mouth in cleared community
+- SBIR/STTR applications (AFWERX, Army Futures Command)
+- Defense tech partnerships (smaller integrators)
+- Test range relationships (Edwards, Pax River)
+- Conference presence (ITEA, STC)
 
-**Angle:** "SQL for tactical data on your laptop. Works offline."
+**Angle:** "Governed ingestion for returned media. Chain of custody for flight test data."
+
+---
+
+## Part 4: Finance (P3 - Consultant-Delivered Only)
+
+### Status: NOT SELF-SERVE
+
+Finance is explicitly **not** a direct sales target. Reasons:
+- High-touch requirements (custom FIX tags, venue-specific formats)
+- Expects custom parser development as part of deal
+- Long enterprise sales cycle with no warm leads
+- Risk of "custom parser trap" (support costs exceed revenue)
+
+### Consultant Delivery Model
+
+If finance opportunities arise:
+- Delivered through consulting partners only
+- $25,000+ implementation fee
+- $15,000+/year platform license
+- No direct sales outreach
 
 ---
 
 ## Pricing Strategy
 
-### Current (Finance)
+### DFIR (P0)
 
-| Tier | Price | Target |
-|------|-------|--------|
-| Free | $0 | Evaluators, hobbyists |
-| Analyst | $300/mo ($3K/yr) | Individual analyst |
-| Team | $2,000/mo ($20K/yr) | Trade Support team (up to 5) |
-| Trading Desk | $6,000/mo | Enterprise (unlimited) |
+| Tier | Annual Price | Target |
+|------|--------------|--------|
+| Solo | $1,200/year | Individual consultant |
+| Team | $4,800/year | Small practice (up to 5) |
+| Enterprise Lite | $12,000/year | Mid-size firm (up to 15) |
 
-### Why These Prices
+**Paid Pilot:** $1,000 for 30 days, credits to annual.
 
-- **$300/mo** = $3,600/year = less than 1 month of analyst salary saved
-- **$2,000/mo** = $24K/year = exactly the ROI for one analyst
-- B2B pricing, not prosumer — Trade Support teams have budget
+### eDiscovery (P1)
 
-### Future Verticals
+| Tier | Annual Price | Target |
+|------|--------------|--------|
+| Solo | $1,800/year | Individual tech |
+| Team | $7,200/year | Lit support team (up to 5) |
+| Enterprise Lite | $18,000/year | Large department (up to 15) |
 
-| Vertical | Expected Pricing | Rationale |
-|----------|------------------|-----------|
-| Healthcare | $200-$500/mo | Smaller IT budgets than finance |
-| Legal | $100-$300/mo | Per-matter or monthly; cost-sensitive |
-| Defense | $500-$2,000/mo | Government contracts, longer sales cycle |
+### Defense (P2)
+
+| Tier | Annual Price | Target |
+|------|--------------|--------|
+| Tactical | $24,000/year | Per flight test program |
+| Mission | $60,000/year | Multi-program deployment |
 
 ---
 
 ## Content Calendar
 
-### Month 1 (Finance Launch)
+### Month 1 (DFIR Launch)
 
 | Week | Content | Channel |
 |------|---------|---------|
-| 1 | Demo video | Website, LinkedIn |
-| 2 | "T+1 and Trade Breaks" blog post | LinkedIn article |
-| 3 | LinkedIn outreach (40 profiles) | LinkedIn DM |
-| 4 | Reddit engagement | r/financialcareers |
+| 1 | Demo video | Website, LinkedIn, DFIR Discord |
+| 2 | "Evidence-Grade Parsing" post | LinkedIn article |
+| 3 | LinkedIn outreach (30 profiles) | LinkedIn DM |
+| 4 | Community engagement | r/dfir, r/computerforensics |
 
-### Month 2-3 (Finance Growth)
+### Month 2-3 (DFIR Growth)
 
 | Week | Content | Channel |
 |------|---------|---------|
-| 5-6 | Customer case study (if available) | Website, LinkedIn |
+| 5-6 | Customer testimonial (if available) | Website, LinkedIn |
 | 7-8 | HN Show launch (if ready) | Hacker News |
 | 9-12 | Iterate based on feedback | All |
 
-### Month 4+ (Healthcare Prep)
+### Month 4+ (eDiscovery Prep)
 
 | Week | Content | Channel |
 |------|---------|---------|
-| 13 | Healthcare demo video | Website |
-| 14 | "HL7 Archive Analysis" post | LinkedIn |
+| 13 | eDiscovery demo video | Website |
+| 14 | "Production Preflight" post | LinkedIn |
 | 15 | Waitlist → launch email | Email |
-| 16 | Healthcare live | All |
+| 16 | eDiscovery live | All |
 
 ---
 
@@ -407,14 +396,13 @@ Defense goes live when:
 ### Plausible Goals to Configure
 
 ```
-Finance:
-- "Download Free" click
-- "Start Trial" (Analyst) click
-- "Start Trial" (Team) click
-- "Contact Sales" (Trading Desk) click
+DFIR:
+- "Download" click
+- "Start Pilot" click
+- "View Pricing" click
 - "Watch Demo" click
 
-Healthcare/Legal/Defense:
+eDiscovery/Defense:
 - "Join Waitlist" submit
 ```
 
@@ -422,44 +410,38 @@ Healthcare/Legal/Defense:
 
 | Metric | Target (Month 1) |
 |--------|------------------|
-| Finance page views | 500+ |
-| Downloads | 50+ |
-| Trial starts | 10+ |
-| Paid conversions | 2-3 |
-| Waitlist signups (other verticals) | 20+ |
+| DFIR page views | 300+ |
+| Downloads | 30+ |
+| Pilot starts | 5+ |
+| Paid conversions | 3+ |
+| Waitlist signups (other verticals) | 15+ |
 
 ---
 
 ## Competitive Positioning
 
-### Finance: vs. Existing Tools
+### DFIR: vs. Existing Tools
 
 | Competitor | Their Weakness | Our Angle |
 |------------|----------------|-----------|
-| Grep + Excel | Manual, no audit trail | "SQL instead of grep" |
-| Databricks | Different team, requires credentials | "Runs on YOUR log server" |
-| Internal scripts | Knowledge walks out the door | "Standardized, documented" |
+| Plaso/log2timeline | No governance, crashes on edge cases | "Governed, reproducible" |
+| Velociraptor | Collection focus, not parsing governance | "Evidence-grade outputs" |
+| Custom Python scripts | No lineage, no quarantine | "Every row traceable" |
+| Autopsy | GUI-focused, less programmable | "CLI-first, scriptable" |
 
-### Healthcare: vs. Mirth
-
-| Their Weakness | Our Angle |
-|----------------|-----------|
-| Routes, doesn't analyze archives | "Analytics that Mirth can't do" |
-| No SQL query capability | "Query 5 years of archives" |
-
-### Legal: vs. Relativity/Vendors
+### eDiscovery: vs. Relativity/Vendors
 
 | Their Weakness | Our Angle |
 |----------------|-----------|
-| $150K+/year | "Process PSTs in-house" |
-| $5-15K per matter (vendors) | "Save $5-15K per matter" |
+| $150K+/year (Relativity) | "Preflight layer, not replacement" |
+| $5-15K per matter (vendors) | "Catch errors before import" |
 
-### Defense: vs. Palantir
+### Defense: vs. Custom Tools
 
 | Their Weakness | Our Angle |
 |----------------|-----------|
-| Closed system, requires engineers | "Open, analysts control" |
-| Cloud/server-based | "Runs on your laptop, offline" |
+| Program-specific, no governance | "Governed across programs" |
+| Brittle extraction scripts | "Reproducible, auditable" |
 
 ---
 
@@ -470,8 +452,8 @@ Healthcare/Legal/Defense:
 | No demo video | Record this week — blocks all outreach |
 | Stripe not set up | Can't accept money — do before outreach |
 | GitHub releases broken | Test download on fresh machine |
-| No early customers | Start with free tier, upgrade later |
-| Competitor emerges | Move fast, own the vertical messaging |
+| No early customers | Start with paid pilots, validate value |
+| Competitor emerges | Move fast, own the DFIR governance messaging |
 
 ---
 
@@ -479,24 +461,26 @@ Healthcare/Legal/Defense:
 
 ### This Week
 ```
-[ ] Record 60-second demo video for Finance
-[ ] Set up Stripe Payment Links (4 links)
+[ ] Record 60-second demo video for DFIR
+[ ] Set up Stripe Payment Links (4 links + pilot)
 [ ] Set up GitHub Releases with CLI binaries
-[ ] Create 3 Tally forms (Healthcare, Legal, Defense waitlists)
+[ ] Create 2 Tally forms (eDiscovery, Defense waitlists)
 [ ] Configure Plausible goals
 ```
 
 ### Next Week
 ```
-[ ] LinkedIn outreach: 20 Trade Support profiles
+[ ] DFIR Discord introduction post
+[ ] LinkedIn outreach: 15 DFIR consultants
 [ ] Test full purchase flow end-to-end
 [ ] Monitor analytics daily
 ```
 
 ### This Month
 ```
-[ ] 50+ downloads
-[ ] 2-3 paying customers
+[ ] 30+ downloads
+[ ] 5+ paid pilots
+[ ] 3+ annual conversions
 [ ] Collect feedback for iteration
 ```
 
@@ -504,19 +488,21 @@ Healthcare/Legal/Defense:
 
 ## Appendix: Email/Message Templates
 
-### LinkedIn Connection Request
+### LinkedIn Connection Request (DFIR)
 ```
-Trade Support + FIX logs? We built a tool that turns grep sessions into
-SQL queries. Would love to show you a 60-second demo.
+DFIR + artifact parsing? We built governance for evidence processing —
+lineage, quarantine, reproducibility. Would love to show you a 60-second demo.
 ```
 
 ### Cold Email (Short Version)
 ```
-Subject: FIX log analysis
+Subject: Evidence-grade artifact parsing
 
-[Name] — T+1 is live and trade breaks still take 45 minutes to investigate.
+[Name] — When opposing counsel asks "prove this output came from that file,"
+what do you show them?
 
-We built a CLI that turns FIX logs into a SQL table. Query by ClOrdID instead of grep.
+We built a CLI that adds governance to artifact parsing. Every row has
+source hash, job ID, parser version.
 
 60-second demo: [LINK]
 
@@ -525,7 +511,7 @@ Worth a look?
 
 ### Waitlist Follow-Up (When Vertical Goes Live)
 ```
-Subject: Casparian Flow for [Healthcare/Legal/Defense] is live
+Subject: Casparian Flow for [eDiscovery/Defense] is live
 
 Hi [Name],
 
@@ -533,7 +519,7 @@ You signed up for early access to Casparian Flow for [vertical].
 
 It's live now: [LINK]
 
-Early access pricing: [X% off] for first 30 days.
+Early access: First 10 customers get 20% off annual pricing.
 
 Questions? Reply to this email.
 
@@ -547,4 +533,4 @@ Best,
 
 | Date | Change |
 |------|--------|
-| 2026-01 | Initial marketing plan aligned with validated personas |
+| 2026-01 | Rewritten for DFIR-first launch (removed finance-first content) |

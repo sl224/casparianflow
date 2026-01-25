@@ -1,9 +1,9 @@
 # Casparian Flow - Validation Interview Script
 
-**Version:** 1.0
-**Date:** January 13, 2026
+**Status:** Canonical
+**Date:** January 2026
 **Duration:** 15-20 minutes
-**Purpose:** Validate pain, buyer, and willingness-to-pay
+**Purpose:** Validate pain, buyer, and willingness-to-pay for DFIR vertical
 
 ---
 
@@ -24,10 +24,10 @@
 
 ### Set Context
 > "Thanks for taking the time. I'm [name], building Casparian Flow.
-> We help trading ops teams query FIX logs with SQL.
+> We help IR teams add governance to artifact parsing - lineage, quarantine, reproducibility.
 >
 > Before we go further - I'm not here to pitch you. I'm genuinely trying
-> to understand how teams handle trade break resolution today.
+> to understand how teams handle evidence processing today.
 >
 > Is it okay if I ask a few questions about your workflow?"
 
@@ -36,33 +36,35 @@
 ## Section 1: Pain Discovery (5 min)
 
 ### Q1: Current State
-> "Walk me through what happens when you get a trade break alert today.
+> "Walk me through what happens when you get a case folder with EVTX files, registry hives, and other artifacts.
 > Step by step, what do you do?"
 
 **Listen for:**
-- Time spent (target: 30+ min per break)
-- Tools used (grep, Excel, custom scripts)
-- People involved (just them, or escalations)
-- Frequency (per day, per week)
+- Tools used (Python scripts, Plaso, Velociraptor, custom tools)
+- Pain points (crashes, silent failures, documentation)
+- Frequency (cases per week/month)
+- Time spent on parsing vs. analysis
 
-### Q2: Quantify the Pain
-> "Roughly how many trade breaks does your team handle per day/week?"
-
-> "And each one takes about how long to resolve?"
-
-**Calculate silently:** breaks × time × hourly rate = annual cost
-
-### Q3: Impact
-> "What happens when a break takes too long to resolve?"
+### Q2: Evidence Integrity
+> "How do you document what you parsed and with what tool version?
+> If opposing counsel asked 'prove this output came from that file,' what would you show them?"
 
 **Listen for:**
-- Settlement failures
-- Client complaints
-- Regulatory issues
-- Personal stress
+- Ad-hoc documentation vs. systematic tracking
+- Confidence level in reproducibility
+- Prior issues with chain of custody
+
+### Q3: Edge Cases
+> "What happens when a parsing script crashes on a corrupted file?
+> Do you have examples of artifacts that caused problems?"
+
+**Listen for:**
+- Lost data stories
+- Workarounds used
+- Time lost to debugging
 
 ### Q4: Prior Solutions
-> "Have you tried anything to speed this up? Other tools, scripts, processes?"
+> "Have you tried anything to improve this? Other tools, processes, scripts?"
 
 **Listen for:**
 - What they've tried (and why it failed)
@@ -74,7 +76,7 @@
 ## Section 2: Buyer Identification (3 min)
 
 ### Q5: Decision Process
-> "If you found a tool that cut trade break resolution from 45 min to 5 min,
+> "If you found a tool that added governance to artifact parsing - lineage, quarantine, reproducibility -
 > what would the process look like to get it approved?"
 
 **Listen for:**
@@ -84,9 +86,9 @@
 - Approval timeline
 
 ### Q6: Budget Reality
-> "Is there a budget for ops productivity tools, or does it come from IT?"
+> "Is there a budget for forensic tooling, or does it come out of general IT?"
 
-> "Roughly what range - under $10K/year, $10-50K, or above $50K?"
+> "Roughly what range - under $5K/year, $5-15K, or above $15K?"
 
 **Listen for:**
 - Budget owner
@@ -101,10 +103,9 @@
 > "Let me describe what we built in 30 seconds and you tell me if it's
 > relevant to your workflow...
 >
-> We take your FIX logs and turn them into a SQL table called
-> `fix_order_lifecycle`. You can query by ClOrdID, symbol, or time range.
-> See the full order lifecycle - new order, fills, rejects, cancels -
-> in one query.
+> We add governance to artifact parsing. Every output row has source hash,
+> job ID, and parser version. Quarantine catches malformed records.
+> Same inputs + same parser = identical outputs, guaranteed.
 >
 > Does that sound like it would help, or is the problem somewhere else?"
 
@@ -126,10 +127,9 @@
 ## Section 4: Willingness to Pay (5 min)
 
 ### Q9: Value Framing
-> "You mentioned your team spends [X hours/week] on trade breaks.
-> At a rough rate of [$75-100/hour], that's about [$X/year] in time.
->
-> If a tool cut that by 80%, what would that be worth to you?"
+> "You mentioned your team handles [X] cases per month.
+> If a tool saved you [X hours] per case in parsing time and eliminated
+> the 'prove your work' documentation burden, what would that be worth?"
 
 **Let them do the math. Don't anchor.**
 
@@ -142,8 +142,8 @@
 - "It depends" (on what?)
 
 ### Q11: Price Reaction (if they give a number)
-> "Interesting. We're thinking about pricing around [$2,000-6,000/month]
-> for a trading desk. Does that feel high, low, or about right?"
+> "Interesting. We're thinking about pricing around [$1,200-4,800/year]
+> for a Solo to Team license. Does that feel high, low, or about right?"
 
 **Listen for:**
 - "That's reasonable" (good)
@@ -161,8 +161,8 @@
 ### If Strong Interest
 > "Based on what you've shared, I think we might be able to help.
 >
-> We're running a pilot program - 30 days free, we help you get set up,
-> you tell us what works and what doesn't.
+> We're running a paid pilot program - $1,000 for 30 days, credits toward
+> annual if you convert. You get full access, we get your feedback.
 >
 > Would you be open to being one of our pilot partners?"
 
@@ -176,7 +176,7 @@
 > "Thanks for the time. It sounds like your workflow is different from
 > what we're solving for.
 >
-> Is there anyone else in your network who deals with FIX log chaos
+> Is there anyone else in your network who deals with artifact parsing
 > that I should talk to?"
 
 ---
@@ -192,9 +192,9 @@ Company: _______________
 Title: _______________
 
 PAIN SCORE (1-5): _____
-- Time per break: _____ min
-- Breaks per week: _____
-- Calculated annual cost: $_____
+- Cases per month: _____
+- Time per case on parsing: _____ hours
+- Evidence documentation: [ ] Systematic [ ] Ad-hoc [ ] None
 
 BUYER SCORE (1-5): _____
 - Budget authority: [ ] Yes [ ] Influence [ ] No
@@ -202,8 +202,8 @@ BUYER SCORE (1-5): _____
 - Decision timeline: _____
 
 WTP SCORE (1-5): _____
-- Unprompted WTP: $_____/month
-- Reaction to $2-6K: [ ] High [ ] Fair [ ] Low
+- Unprompted WTP: $_____/year
+- Reaction to $1.2-4.8K: [ ] High [ ] Fair [ ] Low
 - Budget fit: [ ] Yes [ ] Maybe [ ] No
 
 SOLUTION FIT (1-5): _____
@@ -230,17 +230,17 @@ KEY QUOTES:
 ### Pain Score
 | Score | Criteria |
 |-------|----------|
-| 5 | >1 hour/break, daily occurrence, high stakes |
-| 4 | 30-60 min/break, multiple per week |
-| 3 | 15-30 min/break, weekly occurrence |
-| 2 | <15 min/break, occasional |
+| 5 | "Scripts crash regularly," no evidence documentation, high stakes cases |
+| 4 | Some crashes, ad-hoc documentation, concerned about chain of custody |
+| 3 | Occasional issues, documentation exists but tedious |
+| 2 | Rare problems, mostly satisfied with current workflow |
 | 1 | "Not really a problem for us" |
 
 ### Buyer Score
 | Score | Criteria |
 |-------|----------|
-| 5 | Direct budget authority, $10K+ available now |
-| 4 | Influence + knows budget owner, $5-10K range |
+| 5 | Direct budget authority, $5K+ available now |
+| 4 | Influence + knows budget owner, $1-5K range |
 | 3 | Can champion internally, budget unclear |
 | 2 | Individual contributor, limited influence |
 | 1 | No authority, no path to authority |
@@ -248,9 +248,9 @@ KEY QUOTES:
 ### WTP Score
 | Score | Criteria |
 |-------|----------|
-| 5 | Unprompted >$3K/mo, "that's reasonable" at $6K |
-| 4 | Unprompted $1-3K/mo, accepts $2-4K range |
-| 3 | "Depends on value," open to $1-2K range |
+| 5 | Unprompted >$3K/year, "that's reasonable" at $4.8K |
+| 4 | Unprompted $1-3K/year, accepts $1.2-2.4K range |
+| 3 | "Depends on value," open to $1K+ range |
 | 2 | Pushback on any price, wants free |
 | 1 | "We'd never pay for this" |
 
@@ -271,24 +271,33 @@ KEY QUOTES:
 - [ ] Can't articulate their workflow (doesn't own the problem)
 - [ ] "Price doesn't matter" (not a real buyer)
 - [ ] Keeps rescheduling (not prioritized)
+- [ ] Expects custom parser development (support trap)
 
 ---
 
 ## Question Bank (If Time Permits)
 
 ### Deeper Pain Questions
-- "What's the worst trade break you've dealt with recently?"
-- "How does your team feel about the current workflow?"
-- "What would you do with the time back if this was solved?"
+- "What's the worst case you've dealt with in terms of parsing problems?"
+- "How does your team feel about the current evidence documentation workflow?"
+- "What would you do with the time back if parsing was more reliable?"
 
 ### Competitive Questions
 - "How did you evaluate [competitor] and why didn't you go with them?"
-- "What's stopping you from building this internally?"
+- "What's stopping you from building better tooling internally?"
 
 ### Expansion Questions
-- "Are there other teams in [Company] with similar problems?"
-- "Would this need to work across multiple desks/offices?"
+- "Are there other people in your firm with similar problems?"
+- "Would this need to work across multiple case types?"
 
 ### Reference Questions
 - "If this works, would you be willing to be a reference?"
 - "Do you know others in the industry dealing with this?"
+
+---
+
+## Revision History
+
+| Date | Version | Changes |
+|------|---------|---------|
+| 2026-01 | 2.0 | Rewritten for DFIR-first (file-based ingest, manifest, quarantine, reproducibility) |

@@ -73,7 +73,9 @@ const HARD_MAX_WORKERS: usize = 8;
 /// Result of the combined dispatch query (file path + manifest data)
 #[derive(Debug)]
 struct DispatchQueryResult {
-    file_path: String,
+    rel_path: String,
+    scan_root: String,
+    exec_root: Option<String>,
     source_code: String,
     parser_version: String,
     env_hash: String,
@@ -92,9 +94,19 @@ impl DispatchQueryResult {
         let runtime_kind = runtime_str
             .parse::<RuntimeKind>()
             .map_err(|err| anyhow::anyhow!(err))?;
+        let exec_root: Option<String> = row.get_by_name("exec_root")?;
+        let exec_root = exec_root.and_then(|value| {
+            if value.trim().is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        });
 
         Ok(Self {
-            file_path: row.get_by_name("file_path")?,
+            rel_path: row.get_by_name("rel_path")?,
+            scan_root: row.get_by_name("scan_root")?,
+            exec_root,
             source_code: row.get_by_name("source_code")?,
             parser_version: row.get_by_name("parser_version")?,
             env_hash: row.get_by_name("env_hash")?,
@@ -107,6 +119,44 @@ impl DispatchQueryResult {
             signer_id: row.get_by_name("signer_id")?,
         })
     }
+}
+
+fn resolve_dispatch_path(scan_root: &str, exec_root: Option<&str>, rel_path: &str) -> String {
+    let root = exec_root
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(scan_root);
+    join_root_and_rel(root, rel_path)
+}
+
+fn join_root_and_rel(root: &str, rel: &str) -> String {
+    let rel = rel.trim_start_matches('/');
+    if looks_like_windows_path(root) {
+        let root = root.trim_end_matches(|c| c == '\\' || c == '/');
+        let rel = rel.replace('/', "\\");
+        if rel.is_empty() {
+            root.to_string()
+        } else {
+            format!("{root}\\{rel}")
+        }
+    } else {
+        let root = root.trim_end_matches('/');
+        if rel.is_empty() {
+            root.to_string()
+        } else {
+            format!("{root}/{rel}")
+        }
+    }
+}
+
+fn looks_like_windows_path(path: &str) -> bool {
+    if path.starts_with(r"\\") {
+        return true;
+    }
+    let mut chars = path.chars();
+    let first = chars.next();
+    let second = chars.next();
+    matches!((first, second), (Some(letter), Some(':')) if letter.is_ascii_alphabetic())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1998,7 +2048,9 @@ impl Sentinel {
             .query_optional(
                 r#"
                 SELECT
-                    sf.path as file_path,
+                    sf.rel_path as rel_path,
+                    ss.path as scan_root,
+                    ss.exec_path as exec_root,
                     pm.source_code,
                     pm.version as parser_version,
                     pm.env_hash,
@@ -2010,6 +2062,7 @@ impl Sentinel {
                     pm.signature_verified,
                     pm.signer_id
                 FROM scout_files sf
+                JOIN scout_sources ss ON ss.id = sf.source_id
                 JOIN cf_plugin_manifest pm ON pm.plugin_name = ? AND pm.status IN (?, ?)
                 WHERE sf.id = ?
                 ORDER BY pm.created_at DESC
@@ -2027,7 +2080,9 @@ impl Sentinel {
         let dispatch_row = dispatch_row.ok_or_else(|| anyhow::anyhow!("Dispatch data missing"))?;
         let dispatch_data = DispatchQueryResult::from_row(&dispatch_row)?;
         let DispatchQueryResult {
-            file_path,
+            rel_path,
+            scan_root,
+            exec_root,
             source_code,
             parser_version,
             env_hash,
@@ -2039,6 +2094,8 @@ impl Sentinel {
             signature_verified,
             signer_id,
         } = dispatch_data;
+
+        let file_path = resolve_dispatch_path(&scan_root, exec_root.as_deref(), &rel_path);
 
         if entrypoint.trim().is_empty() {
             anyhow::bail!("Missing entrypoint for plugin '{}'", job.plugin_name);
@@ -2722,6 +2779,30 @@ fn compute_sha256(content: &str) -> String {
 mod tests {
     use super::*;
     use casparian_db::{DbConnection, DbTimestamp, DbValue};
+
+    #[test]
+    fn test_join_root_and_rel_posix() {
+        let joined = join_root_and_rel("/mnt/data", "folder/file.csv");
+        assert_eq!(joined, "/mnt/data/folder/file.csv");
+    }
+
+    #[test]
+    fn test_join_root_and_rel_windows() {
+        let joined = join_root_and_rel("C:\\\\data", "folder/file.csv");
+        assert_eq!(joined, "C:\\\\data\\folder\\file.csv");
+    }
+
+    #[test]
+    fn test_resolve_dispatch_path_fallbacks() {
+        let joined = resolve_dispatch_path("/scan/root", None, "file.txt");
+        assert_eq!(joined, "/scan/root/file.txt");
+
+        let joined = resolve_dispatch_path("/scan/root", Some(""), "file.txt");
+        assert_eq!(joined, "/scan/root/file.txt");
+
+        let joined = resolve_dispatch_path("/scan/root", Some("/exec/root"), "file.txt");
+        assert_eq!(joined, "/exec/root/file.txt");
+    }
 
     fn setup_contract_db() -> (DbConnection, SchemaStorage) {
         let conn = DbConnection::open_duckdb_memory().unwrap();

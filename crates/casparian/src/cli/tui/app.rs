@@ -24,6 +24,7 @@ use std::sync::mpsc;
 use tracing::info_span;
 
 use super::{nav, TuiArgs};
+use crate::cli::context;
 use crate::cli::config::{active_db_path, casparian_home, default_db_backend, DbBackend};
 use casparian::scout::{
     match_rules_to_files, patterns, scan_path, Database as ScoutDatabase, RuleApplyFile,
@@ -69,6 +70,14 @@ pub struct HomeStats {
     pub failed_jobs: usize,
     pub parser_count: usize,
     pub paused_parsers: usize,
+}
+
+/// Global status message shown in the shell header.
+#[derive(Debug, Clone)]
+pub struct GlobalStatusMessage {
+    pub message: String,
+    pub is_error: bool,
+    pub expires_at: std::time::Instant,
 }
 
 /// Settings category in the Settings view
@@ -385,6 +394,28 @@ impl CatalogTab {
             CatalogTab::Runs => "Runs",
         }
     }
+}
+
+// =============================================================================
+// Workspace Switcher Overlay
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceSwitcherMode {
+    #[default]
+    List,
+    Creating,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceSwitcherState {
+    pub visible: bool,
+    pub mode: WorkspaceSwitcherMode,
+    pub workspaces: Vec<Workspace>,
+    pub selected_index: usize,
+    pub input: String,
+    pub status_message: Option<String>,
+    pub loaded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1703,6 +1734,7 @@ impl CommandPaletteState {
                     ("/scan", "Scan a directory for files", "/scan"),
                     ("/query", "Query processed data", "/query"),
                     ("/approve", "Review and approve schemas", "/approve"),
+                    ("/workspace", "Switch workspace", "/workspace"),
                     ("/quarantine", "Open quarantine explorer", "/quarantine"),
                     ("/catalog", "Open pipelines catalog", "/catalog"),
                     ("/pipelines", "Open pipelines catalog", "/pipelines"),
@@ -2821,6 +2853,8 @@ pub struct App {
     pub catalog_state: CatalogState,
     /// Command palette overlay state
     pub command_palette: CommandPaletteState,
+    /// Workspace switcher overlay state
+    pub workspace_switcher: WorkspaceSwitcherState,
     /// Whether the Jobs drawer overlay is visible (toggle with J)
     pub jobs_drawer_open: bool,
     /// Selected job in the drawer (for Enter navigation)
@@ -2831,6 +2865,8 @@ pub struct App {
     pub sources_drawer_selected: usize,
     /// Active workspace (scopes sources/files/rules)
     pub active_workspace: Option<Workspace>,
+    /// Optional global status message (toast)
+    pub global_status: Option<GlobalStatusMessage>,
     /// Configuration
     #[allow(dead_code)]
     pub config: TuiArgs,
@@ -3197,6 +3233,7 @@ impl App {
             sources_drawer_open: false,
             sources_drawer_selected: 0,
             active_workspace: None,
+            global_status: None,
             settings: SettingsState {
                 default_source_path: "~/data".to_string(),
                 auto_scan_on_startup: true,
@@ -3208,6 +3245,7 @@ impl App {
             },
             sessions_state: SessionsState::default(),
             command_palette: CommandPaletteState::new(),
+            workspace_switcher: WorkspaceSwitcherState::default(),
             config: args,
             telemetry,
             error: None,
@@ -3338,10 +3376,42 @@ impl App {
             return;
         }
 
+        let active_from_context = match context::get_active_workspace_id() {
+            Ok(id) => id,
+            Err(err) => {
+                self.discover.status_message =
+                    Some((format!("Workspace context error: {}", err), true));
+                None
+            }
+        };
+
+        if let Some(active_id) = active_from_context {
+            match self.query_workspace_by_id(&active_id) {
+                Ok(Some(workspace)) => {
+                    self.active_workspace = Some(workspace);
+                    return;
+                }
+                Ok(None) => {
+                    let _ = context::clear_active_workspace();
+                }
+                Err(err) => {
+                    self.discover.status_message =
+                        Some((format!("Workspace load failed: {}", err), true));
+                }
+            }
+        }
+
         if let Some(db) = self.open_scout_db_for_writes() {
             match db.ensure_default_workspace() {
                 Ok(workspace) => {
+                    let id = workspace.id;
                     self.active_workspace = Some(workspace);
+                    if let Err(err) = context::set_active_workspace(&id) {
+                        self.discover.status_message = Some((
+                            format!("Failed to persist workspace context: {}", err),
+                            true,
+                        ));
+                    }
                     return;
                 }
                 Err(err) => {
@@ -3351,48 +3421,96 @@ impl App {
             }
         }
 
+        if let Ok(Some(workspace)) = self.query_first_workspace() {
+            let id = workspace.id;
+            self.active_workspace = Some(workspace);
+            if let Err(err) = context::set_active_workspace(&id) {
+                self.discover.status_message = Some((
+                    format!("Failed to persist workspace context: {}", err),
+                    true,
+                ));
+            }
+        }
+    }
+
+    fn query_first_workspace(&self) -> Result<Option<Workspace>, String> {
+        let workspaces = self.query_workspaces()?;
+        Ok(workspaces.into_iter().next())
+    }
+
+    fn query_workspace_by_id(&self, id: &WorkspaceId) -> Result<Option<Workspace>, String> {
         let conn = match self.open_db_readonly() {
             Ok(Some(conn)) => conn,
-            Ok(None) => return,
+            Ok(None) => return Ok(None),
             Err(err) => {
-                self.report_db_error("Workspace load failed", err);
-                return;
+                return Err(format!("Database open failed: {}", err));
             }
         };
-
-        let row = match conn.query_optional(
-            "SELECT id, name, created_at FROM cf_workspaces ORDER BY created_at ASC LIMIT 1",
-            &[],
-        ) {
-            Ok(row) => row,
-            Err(err) => {
-                self.report_db_error("Workspace load failed", err);
-                return;
-            }
-        };
-
-        if let Some(row) = row {
-            let id_raw: String = match row.get(0) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let name: String = match row.get(1) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let created_at_ms: i64 = row.get(2).unwrap_or_default();
-            let id = match WorkspaceId::parse(&id_raw) {
-                Ok(id) => id,
-                Err(_) => return,
-            };
-            let created_at = chrono::DateTime::from_timestamp_millis(created_at_ms)
-                .unwrap_or_else(chrono::Utc::now);
-            self.active_workspace = Some(Workspace {
-                id,
-                name,
-                created_at,
-            });
+        let has_table = App::table_exists(&conn, "cf_workspaces")
+            .map_err(|err| format!("Workspace schema check failed: {}", err))?;
+        if !has_table {
+            return Ok(None);
         }
+        let row = conn
+            .query_optional(
+                "SELECT id, name, created_at FROM cf_workspaces WHERE id = ?",
+                &[DbValue::Text(id.to_string())],
+            )
+            .map_err(|err| format!("Workspace query failed: {}", err))?;
+        match row {
+            Some(row) => Ok(Some(Self::row_to_workspace(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn query_workspaces(&self) -> Result<Vec<Workspace>, String> {
+        let conn = match self.open_db_readonly() {
+            Ok(Some(conn)) => conn,
+            Ok(None) => return Err("Database not found".to_string()),
+            Err(err) => {
+                return Err(format!("Database open failed: {}", err));
+            }
+        };
+        let has_table = App::table_exists(&conn, "cf_workspaces")
+            .map_err(|err| format!("Workspace schema check failed: {}", err))?;
+        if !has_table {
+            return Err("Workspace registry not initialized".to_string());
+        }
+        let rows = conn
+            .query_all(
+                "SELECT id, name, created_at FROM cf_workspaces ORDER BY created_at ASC",
+                &[],
+            )
+            .map_err(|err| format!("Workspace query failed: {}", err))?;
+        let mut workspaces = Vec::with_capacity(rows.len());
+        for row in rows {
+            workspaces.push(Self::row_to_workspace(&row)?);
+        }
+        Ok(workspaces)
+    }
+
+    fn row_to_workspace(row: &casparian_db::UnifiedDbRow) -> Result<Workspace, String> {
+        let id_raw: String = row.get(0).map_err(|err| err.to_string())?;
+        let id = WorkspaceId::parse(&id_raw).map_err(|err| err.to_string())?;
+        let name: String = row.get(1).map_err(|err| err.to_string())?;
+        let created_at_ms: i64 = row.get(2).unwrap_or_default();
+        let created_at =
+            chrono::DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now);
+        Ok(Workspace {
+            id,
+            name,
+            created_at,
+        })
+    }
+
+    fn set_global_status(&mut self, message: impl Into<String>, is_error: bool) {
+        let message = message.into();
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        self.global_status = Some(GlobalStatusMessage {
+            message,
+            is_error,
+            expires_at,
+        });
     }
 
     fn open_db_readonly_with(
@@ -3460,6 +3578,12 @@ impl App {
 
     /// Handle key event
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Workspace switcher overlay input has highest priority when visible
+        if self.workspace_switcher.visible {
+            self.handle_workspace_switcher_key(key);
+            return;
+        }
+
         // Handle command palette input when visible (highest priority)
         if self.command_palette.visible {
             self.handle_command_palette_key(key);
@@ -3477,6 +3601,13 @@ impl App {
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.command_palette.open(CommandPaletteMode::Command);
                 return;
+            }
+            // Ctrl+W: Workspace switcher
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.in_text_input_mode() {
+                    self.open_workspace_switcher();
+                    return;
+                }
             }
             // '>' = open in Intent mode (natural language)
             KeyCode::Char('>') if !self.in_text_input_mode() => {
@@ -4366,6 +4497,7 @@ impl App {
                                 "/jobs" => self.navigate_to_mode(TuiMode::Jobs),
                                 "/approve" => self.navigate_to_mode(TuiMode::Approvals),
                                 "/query" => self.navigate_to_mode(TuiMode::Query),
+                                "/workspace" => self.open_workspace_switcher(),
                                 "/quarantine" => self.open_triage(None),
                                 "/catalog" | "/pipelines" => self.open_catalog(None),
                                 "/scan" => {
@@ -4422,6 +4554,192 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn open_workspace_switcher(&mut self) {
+        self.ensure_active_workspace();
+        self.workspace_switcher.visible = true;
+        self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
+        self.workspace_switcher.input.clear();
+        self.workspace_switcher.status_message = None;
+        self.load_workspace_switcher_list();
+    }
+
+    fn close_workspace_switcher(&mut self) {
+        self.workspace_switcher.visible = false;
+        self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
+        self.workspace_switcher.input.clear();
+        self.workspace_switcher.status_message = None;
+    }
+
+    fn load_workspace_switcher_list(&mut self) {
+        self.workspace_switcher.workspaces.clear();
+        self.workspace_switcher.loaded = false;
+        match self.query_workspaces() {
+            Ok(workspaces) => {
+                self.workspace_switcher.workspaces = workspaces;
+                self.workspace_switcher.loaded = true;
+                if let Some(active_id) = self.active_workspace_id() {
+                    if let Some(idx) = self
+                        .workspace_switcher
+                        .workspaces
+                        .iter()
+                        .position(|ws| ws.id == active_id)
+                    {
+                        self.workspace_switcher.selected_index = idx;
+                    } else {
+                        self.workspace_switcher.selected_index = 0;
+                    }
+                } else {
+                    self.workspace_switcher.selected_index = 0;
+                }
+            }
+            Err(err) => {
+                self.workspace_switcher.status_message = Some(err);
+            }
+        }
+    }
+
+    fn handle_workspace_switcher_key(&mut self, key: KeyEvent) {
+        match self.workspace_switcher.mode {
+            WorkspaceSwitcherMode::List => match key.code {
+                KeyCode::Esc => {
+                    self.close_workspace_switcher();
+                }
+                KeyCode::Up => {
+                    if self.workspace_switcher.selected_index > 0 {
+                        self.workspace_switcher.selected_index -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if self.workspace_switcher.selected_index + 1
+                        < self.workspace_switcher.workspaces.len()
+                    {
+                        self.workspace_switcher.selected_index += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(workspace) = self
+                        .workspace_switcher
+                        .workspaces
+                        .get(self.workspace_switcher.selected_index)
+                        .cloned()
+                    {
+                        self.apply_active_workspace(workspace);
+                        self.close_workspace_switcher();
+                    }
+                }
+                KeyCode::Char('n') => {
+                    if self.db_read_only {
+                        self.workspace_switcher.status_message =
+                            Some("Database is read-only; cannot create workspace".to_string());
+                    } else {
+                        self.workspace_switcher.mode = WorkspaceSwitcherMode::Creating;
+                        self.workspace_switcher.input.clear();
+                        self.workspace_switcher.status_message = None;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    self.load_workspace_switcher_list();
+                }
+                _ => {}
+            },
+            WorkspaceSwitcherMode::Creating => match handle_text_input(key, &mut self.workspace_switcher.input) {
+                TextInputResult::Committed => {
+                    let name = self.workspace_switcher.input.trim().to_string();
+                    if name.is_empty() {
+                        self.workspace_switcher.status_message =
+                            Some("Workspace name is required".to_string());
+                        return;
+                    }
+                    match self.create_workspace(&name) {
+                        Ok(workspace) => {
+                            self.apply_active_workspace(workspace);
+                            self.close_workspace_switcher();
+                        }
+                        Err(err) => {
+                            self.workspace_switcher.status_message = Some(err);
+                        }
+                    }
+                }
+                TextInputResult::Cancelled => {
+                    self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
+                    self.workspace_switcher.input.clear();
+                }
+                TextInputResult::Continue => {}
+                TextInputResult::NotHandled => {}
+            },
+        }
+    }
+
+    fn create_workspace(&mut self, name: &str) -> Result<Workspace, String> {
+        let db = self
+            .open_scout_db_for_writes()
+            .ok_or_else(|| "Database unavailable for writes".to_string())?;
+        if let Ok(Some(existing)) = db.get_workspace_by_name(name) {
+            return Err(format!("Workspace '{}' already exists", existing.name));
+        }
+        db.create_workspace(name)
+            .map_err(|err| format!("Create workspace failed: {}", err))
+    }
+
+    fn apply_active_workspace(&mut self, workspace: Workspace) {
+        let name = workspace.name.clone();
+        let id = workspace.id;
+        let was_discover = self.mode == TuiMode::Discover;
+        self.reset_workspace_scoped_state();
+        self.active_workspace = Some(workspace);
+        if let Err(err) = context::set_active_workspace(&id) {
+            self.workspace_switcher
+                .status_message
+                .replace(format!("Failed to persist workspace context: {}", err));
+        } else {
+            self.set_global_status(format!("Switched workspace to {}", name), false);
+        }
+        if was_discover {
+            self.enter_discover_mode();
+        }
+    }
+
+    fn reset_workspace_scoped_state(&mut self) {
+        // Discover caches and selections
+        self.discover = DiscoverState {
+            page_size: DISCOVER_PAGE_SIZE,
+            ..Default::default()
+        };
+
+        // Cancel any pending workspace-scoped async work.
+        self.pending_cache_load = None;
+        self.pending_folder_query = None;
+        self.pending_glob_search = None;
+        self.pending_rule_builder_search = None;
+        self.cache_load_progress = None;
+        self.last_cache_load_timing = None;
+        self.glob_search_cancelled = None;
+
+        // Sources view state
+        self.sources_state = SourcesState::default();
+
+        // Home stats should reload for the new workspace
+        self.home.stats_loaded = false;
+        self.home.stats = HomeStats::default();
+        self.home.recent_jobs.clear();
+        self.home.selected_source_index = 0;
+        self.home.filter.clear();
+        self.home.filtering = false;
+
+        // Jobs may be workspace-scoped; reload and clear filters.
+        self.jobs_state.jobs.clear();
+        self.jobs_state.jobs_loaded = false;
+        self.jobs_state.status_filter = None;
+        self.jobs_state.type_filter = None;
+        self.jobs_state.selected_index = 0;
+        self.jobs_state.pinned_job_id = None;
+
+        // Invalidate cached loads.
+        self.pending_sources_load = None;
+        self.pending_stats_load = None;
+        self.pending_jobs_load = None;
     }
 
     fn create_intent_session(&self, intent: &str) -> Result<String, String> {
@@ -6979,6 +7297,7 @@ impl App {
             name: source_name.clone(),
             source_type: SourceType::Local,
             path: source_path.clone(),
+            exec_path: None,
             poll_interval_secs: 0,
             enabled: true,
         };
@@ -8252,6 +8571,11 @@ impl App {
         if self.command_palette.visible {
             return true;
         }
+        if self.workspace_switcher.visible
+            && self.workspace_switcher.mode == WorkspaceSwitcherMode::Creating
+        {
+            return true;
+        }
         match self.mode {
             TuiMode::Discover => {
                 // Check glob explorer filtering state
@@ -9111,6 +9435,7 @@ impl App {
                     name: source_name,
                     source_type: SourceType::Local,
                     path: source_path.clone(),
+                    exec_path: None,
                     poll_interval_secs: 0,
                     enabled: true,
                 };
@@ -13036,6 +13361,12 @@ impl App {
         self.check_db_health_once();
         self.ensure_active_workspace();
 
+        if let Some(status) = &self.global_status {
+            if status.expires_at <= std::time::Instant::now() {
+                self.global_status = None;
+            }
+        }
+
         // Persist any queued writes regardless of current view.
         self.persist_pending_writes();
 
@@ -14334,6 +14665,10 @@ impl App {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use std::sync::Mutex;
+    use crate::cli::context;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_args() -> TuiArgs {
         TuiArgs {
@@ -14423,6 +14758,32 @@ mod tests {
 
         // Esc returns to Home when no dialog is open
         assert!(matches!(app.mode, TuiMode::Home));
+    }
+
+    #[test]
+    fn test_workspace_context_respected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("CASPARIAN_HOME", temp_dir.path());
+
+        let db_path = temp_dir.path().join("casparian_flow.duckdb");
+        let db = ScoutDatabase::open(&db_path).unwrap();
+        let ws_alpha = db.create_workspace("alpha").unwrap();
+        let ws_bravo = db.create_workspace("bravo").unwrap();
+
+        context::set_active_workspace(&ws_bravo.id).unwrap();
+
+        let args = TuiArgs {
+            database: Some(db_path),
+        };
+        let mut app = App::new(args, None);
+        app.ensure_active_workspace();
+
+        assert_eq!(app.active_workspace_id(), Some(ws_bravo.id));
+
+        // Clean up context env override for other tests
+        let _ = context::clear_active_workspace();
+        std::env::remove_var("CASPARIAN_HOME");
     }
 
     #[test]

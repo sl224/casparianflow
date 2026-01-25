@@ -62,6 +62,18 @@ pub enum SourceAction {
         #[arg(long)]
         clear: bool,
     },
+    /// Set exec path for a source (worker-visible root)
+    SetExecPath {
+        /// Source name or ID
+        name: String,
+        /// Exec path root visible to workers
+        exec_path: String,
+    },
+    /// Clear exec path for a source
+    ClearExecPath {
+        /// Source name or ID
+        name: String,
+    },
 }
 
 /// Source statistics for display
@@ -244,6 +256,10 @@ fn run_with_action(action: SourceAction) -> anyhow::Result<()> {
             remove_source(conn, &workspace_id, &db, &name, force)
         }
         SourceAction::Sync { name, all } => sync_sources(&db, &workspace_id, name, all),
+        SourceAction::SetExecPath { name, exec_path } => {
+            set_exec_path(&db, &workspace_id, &name, &exec_path)
+        }
+        SourceAction::ClearExecPath { name } => clear_exec_path(&db, &workspace_id, &name),
         SourceAction::Use { .. } => unreachable!(), // Handled above
     }
 }
@@ -270,6 +286,7 @@ fn list_sources(db: &Database, workspace_id: &WorkspaceId, json: bool) -> anyhow
                     "name": s.name,
                     "workspace_id": s.workspace_id,
                     "path": s.path,
+                    "exec_path": s.exec_path,
                     "enabled": s.enabled,
                     "files": stats.file_count,
                     "size": stats.total_size,
@@ -295,12 +312,17 @@ fn list_sources(db: &Database, workspace_id: &WorkspaceId, json: bool) -> anyhow
         rows.push(vec![
             source.name.clone(),
             source.path.clone(),
+            source
+                .exec_path
+                .as_deref()
+                .unwrap_or("-")
+                .to_string(),
             format!("{}", stats.file_count),
             format_size(stats.total_size),
         ]);
     }
 
-    print_table(&["NAME", "PATH", "FILES", "SIZE"], rows);
+    print_table(&["NAME", "PATH", "EXEC_PATH", "FILES", "SIZE"], rows);
     println!();
     println!(
         "{} sources, {} files, {} total",
@@ -309,6 +331,51 @@ fn list_sources(db: &Database, workspace_id: &WorkspaceId, json: bool) -> anyhow
         format_size(total_size)
     );
 
+    Ok(())
+}
+
+fn set_exec_path(
+    db: &Database,
+    workspace_id: &WorkspaceId,
+    name: &str,
+    exec_path: &str,
+) -> anyhow::Result<()> {
+    let exec_path = exec_path.trim();
+    if exec_path.is_empty() {
+        return Err(HelpfulError::new("exec_path cannot be empty")
+            .with_suggestion("TRY: Use 'casparian source clear-exec-path <name>'".to_string())
+            .into());
+    }
+
+    let sources = db.list_sources(workspace_id)?;
+    let source = find_source(&sources, name).ok_or_else(|| {
+        HelpfulError::new(format!("Source not found: {}", name))
+            .with_suggestion("TRY: Use 'casparian source ls' to list sources".to_string())
+    })?;
+
+    let mut updated = source.clone();
+    updated.exec_path = Some(exec_path.to_string());
+    db.upsert_source(&updated)
+        .map_err(|e| HelpfulError::new(format!("Failed to update source: {}", e)))?;
+
+    println!("Updated exec path for '{}'", updated.name);
+    println!("  Exec Path: {}", exec_path);
+    Ok(())
+}
+
+fn clear_exec_path(db: &Database, workspace_id: &WorkspaceId, name: &str) -> anyhow::Result<()> {
+    let sources = db.list_sources(workspace_id)?;
+    let source = find_source(&sources, name).ok_or_else(|| {
+        HelpfulError::new(format!("Source not found: {}", name))
+            .with_suggestion("TRY: Use 'casparian source ls' to list sources".to_string())
+    })?;
+
+    let mut updated = source.clone();
+    updated.exec_path = None;
+    db.upsert_source(&updated)
+        .map_err(|e| HelpfulError::new(format!("Failed to update source: {}", e)))?;
+
+    println!("Cleared exec path for '{}'", updated.name);
     Ok(())
 }
 
@@ -376,6 +443,7 @@ fn add_source(
         name: source_name.clone(),
         source_type: SourceType::Local,
         path: canonical.display().to_string(),
+        exec_path: None,
         poll_interval_secs: 30,
         enabled: true,
     };
@@ -422,6 +490,7 @@ fn show_source(
             "id": source.id,
             "name": source.name,
             "path": source.path,
+            "exec_path": source.exec_path,
             "source_type": format!("{:?}", source.source_type),
             "enabled": source.enabled,
             "poll_interval_secs": source.poll_interval_secs,
@@ -459,6 +528,10 @@ fn show_source(
     println!();
     println!("  ID:       {}", source.id);
     println!("  Path:     {}", source.path);
+    println!(
+        "  Exec:     {}",
+        source.exec_path.as_deref().unwrap_or("-")
+    );
     println!("  Type:     {:?}", source.source_type);
     println!("  Enabled:  {}", if source.enabled { "yes" } else { "no" });
     println!("  Poll:     {}s", source.poll_interval_secs);
@@ -729,6 +802,7 @@ mod tests {
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: test_dir.display().to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -751,6 +825,7 @@ mod tests {
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -786,6 +861,7 @@ mod tests {
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };

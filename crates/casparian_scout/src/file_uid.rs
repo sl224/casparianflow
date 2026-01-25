@@ -1,6 +1,6 @@
 //! File identity utilities for scan/move detection.
 
-use crate::scout::types::SourceType;
+use crate::types::SourceType;
 use std::fs::Metadata;
 use std::path::Path;
 

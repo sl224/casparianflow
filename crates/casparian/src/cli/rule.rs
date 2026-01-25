@@ -465,6 +465,7 @@ mod tests {
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -500,6 +501,7 @@ mod tests {
             name: "test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };

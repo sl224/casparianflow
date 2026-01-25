@@ -1,9 +1,10 @@
 //! Scout - File Discovery & Tagging
 //!
 //! Scout discovers files from filesystem sources and assigns tags based on patterns.
-//! This is the local module, consolidated from the former casparian_scout crate.
+//! Standalone crate for scanning + tagging logic.
 
 pub mod db;
+pub mod engine;
 pub mod error;
 pub mod extractor;
 pub mod file_uid;
@@ -13,9 +14,11 @@ pub mod scan_path;
 pub mod scanner;
 pub mod tagger;
 pub mod types;
+pub mod wire;
 
 // Re-exports for CLI usage
 pub use db::Database;
+pub use engine::{InProcessEngine, ScanEngine, SubprocessEngine};
 pub use extractor::{BatchExtractor, ExtractorConfig, ExtractorResult, ExtractorRunner};
 pub use patterns::{build_matcher, matches, normalize_glob_pattern};
 pub use rule_apply::{

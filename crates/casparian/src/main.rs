@@ -186,6 +186,12 @@ enum Commands {
         json: bool,
     },
 
+    /// Performance utilities for scan throughput
+    Perf {
+        #[command(subcommand)]
+        action: cli::perf::PerfAction,
+    },
+
     // === W2: Tagging Commands (stubs) ===
     /// Assign a topic to file(s)
     Tag {
@@ -557,6 +563,7 @@ fn command_wants_json(command: &Commands) -> bool {
         Commands::Rule { action } => rule_action_wants_json(action),
         Commands::Topic { action } => topic_action_wants_json(action),
         Commands::Source { action } => source_action_wants_json(action),
+        Commands::Perf { action } => perf_action_wants_json(action),
         Commands::WorkerCli { action } => worker_action_wants_json(action),
         Commands::Job { action } => job_action_wants_json(action),
         _ => false,
@@ -578,6 +585,13 @@ fn plugin_action_wants_json(action: &cli::plugin::PluginAction) -> bool {
     match action {
         cli::plugin::PluginAction::List { json } => *json,
         _ => false,
+    }
+}
+
+fn perf_action_wants_json(action: &cli::perf::PerfAction) -> bool {
+    match action {
+        cli::perf::PerfAction::Scan { .. } => true,
+        cli::perf::PerfAction::GenFixture { .. } => false,
     }
 }
 
@@ -675,6 +689,8 @@ fn run_command(cli: Cli, telemetry: Option<TelemetryRecorder>) -> Result<()> {
         Commands::Schema { parser, json } => {
             cli::schema::run(cli::schema::SchemaArgs { parser, json })
         }
+
+        Commands::Perf { action } => cli::perf::run(action),
 
         // === W2: Tagging Commands (stubs) ===
         Commands::Tag {
@@ -950,6 +966,7 @@ fn get_command_name(cmd: &Commands) -> String {
         Commands::Scan { .. } => "Scan".to_string(),
         Commands::Preview { .. } => "Preview".to_string(),
         Commands::Schema { .. } => "Schema".to_string(),
+        Commands::Perf { .. } => "Perf".to_string(),
         Commands::Tag { .. } => "Tag".to_string(),
         Commands::Untag { .. } => "Untag".to_string(),
         Commands::Files { .. } => "Files".to_string(),

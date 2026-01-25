@@ -17,6 +17,7 @@ use super::app::{
     PipelineState, QuarantineRow, QueryResults, QueryState, QueryViewState, RuleDialogFocus,
     RuleId, RuleInfo, SavedQueriesState, SchemaMismatchRow, SessionInfo, SessionsViewState,
     SettingsCategory, SettingsState, SourceInfo, TableBrowserState, TagInfo, TriageTab, TuiMode,
+    WorkspaceSwitcherMode,
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
@@ -40,7 +41,7 @@ pub fn snapshot_cases() -> &'static [SnapshotCase] {
     &SNAPSHOT_CASES
 }
 
-const SNAPSHOT_CASES: [SnapshotCase; 19] = [
+const SNAPSHOT_CASES: [SnapshotCase; 20] = [
     SnapshotCase {
         name: "home_default",
         notes: "Home hub with seeded sources and recent jobs.",
@@ -112,6 +113,12 @@ const SNAPSHOT_CASES: [SnapshotCase; 19] = [
         notes: "Pipeline runs catalog view.",
         focus_hint: "Catalog list",
         build: case_catalog_runs_list,
+    },
+    SnapshotCase {
+        name: "workspace_switcher_open",
+        notes: "Workspace switcher overlay open.",
+        focus_hint: "Workspace list",
+        build: case_workspace_switcher_open,
     },
     SnapshotCase {
         name: "query_editor_focused",
@@ -288,6 +295,19 @@ fn case_catalog_runs_list() -> App {
     app
 }
 
+fn case_workspace_switcher_open() -> App {
+    let mut app = base_app();
+    let workspaces = sample_workspace_list();
+    app.mode = TuiMode::Home;
+    app.active_workspace = workspaces.get(1).cloned();
+    app.workspace_switcher.visible = true;
+    app.workspace_switcher.mode = WorkspaceSwitcherMode::List;
+    app.workspace_switcher.workspaces = workspaces;
+    app.workspace_switcher.selected_index = 1;
+    app.workspace_switcher.loaded = true;
+    app
+}
+
 fn case_query_editor_focused() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Query;
@@ -433,6 +453,29 @@ fn sample_workspace() -> Workspace {
         name: "alpha-case".to_string(),
         created_at: base_utc(),
     }
+}
+
+fn sample_workspace_list() -> Vec<Workspace> {
+    vec![
+        Workspace {
+            id: WorkspaceId::parse("11111111-1111-1111-1111-111111111111")
+                .expect("snapshot workspace id"),
+            name: "alpha-case".to_string(),
+            created_at: base_utc(),
+        },
+        Workspace {
+            id: WorkspaceId::parse("22222222-2222-2222-2222-222222222222")
+                .expect("snapshot workspace id"),
+            name: "bravo-ops".to_string(),
+            created_at: base_utc() + Duration::hours(2),
+        },
+        Workspace {
+            id: WorkspaceId::parse("33333333-3333-3333-3333-333333333333")
+                .expect("snapshot workspace id"),
+            name: "charlie-archive".to_string(),
+            created_at: base_utc() + Duration::hours(4),
+        },
+    ]
 }
 
 fn base_utc() -> DateTime<Utc> {

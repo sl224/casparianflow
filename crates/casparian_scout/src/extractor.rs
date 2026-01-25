@@ -21,9 +21,9 @@
 //! - `Crash`: Process exited with non-zero code
 //! - `Error`: Other errors (invalid JSON, I/O errors)
 
-use crate::scout::db::Database;
-use crate::scout::error::Result;
-use crate::scout::types::{ExtractionLogStatus, ExtractionStatus, Extractor, ScannedFile};
+use crate::db::Database;
+use crate::error::Result;
+use crate::types::{ExtractionLogStatus, ExtractionStatus, Extractor, ScannedFile};
 use anyhow::Context;
 use chrono::Utc;
 use std::io::{Read, Write};

@@ -34,6 +34,7 @@ pub mod backfill;
 pub mod pipeline;
 pub mod run;
 pub mod schema;
+pub mod perf;
 
 // W2: Tagging commands (stubs)
 #[cfg(feature = "data-plane")]

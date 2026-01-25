@@ -79,6 +79,7 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 | `0` or `H` | Go to Home | From any view |
 | `:` or `Ctrl+P` | Open command palette (Command) | From any view |
 | `>` | Open command palette (Intent) | From any view |
+| `Ctrl+W` | Open workspace switcher | From any view |
 | `Esc` | Back / Close dialog | Context-dependent |
 | `q` | Quit (with confirmation if unsaved) | From any view |
 

@@ -1,83 +1,84 @@
 # Casparian Flow - Outreach Email Templates
 
-**Version:** 1.0
-**Date:** January 13, 2026
-**Target:** Finance Vertical (Trade Support / Middle Office)
+**Status:** Canonical
+**Date:** January 2026
+**Target:** DFIR / Incident Response vertical
 
 ---
 
 ## Email 1: Cold Outreach (LinkedIn/Email)
 
 **Subject lines to A/B test:**
-- "Trade break resolution - 5 min vs 45 min?"
-- "Quick question about your FIX log workflow"
-- "T+1 pressure on your trade support team?"
+- "DFIR artifact parsing - fragile scripts vs. governed pipelines?"
+- "Quick question about your evidence processing workflow"
+- "Chain of custody for your EVTX parsing?"
 
 ---
 
 ### Version A: Pain-First
 
 ```
-Subject: Trade break resolution - 5 min vs 45 min?
+Subject: DFIR artifact parsing - fragile scripts vs. governed pipelines?
 
 Hi [First Name],
 
-Quick question: How long does it take your team to debug a trade break today?
+Quick question: How confident are you in your artifact parsing scripts?
 
-I've talked to ops teams at [similar firms] who spend 30-45 minutes per break
-grepping through FIX logs, piecing together order lifecycles in Excel.
+I've talked to IR consultants who rely on Python scripts that:
+- Crash on corrupted EVTX files
+- Silently drop rows on edge cases
+- Have no audit trail for chain of custody
 
-We built something that turns that into a 5-minute SQL query.
+We built something that turns artifact parsing into a governed, reproducible pipeline.
+Every row has source hash, job ID, and parser version. Quarantine catches the edge cases.
 
-Would you be open to a 15-minute call to see if it's relevant to [Company]?
-
-No pitch - just want to understand if this is a real pain point for your team.
+Would you be open to a 15-minute call to see if this is relevant to your practice?
 
 [Your name]
 
-P.S. - If you're not the right person, who handles trade break resolution
-on your desk?
+P.S. - If you're not the right person, who handles artifact tooling at [Company]?
 ```
 
 ---
 
-### Version B: Credibility-First
+### Version B: Evidence-First
 
 ```
-Subject: Quick question about your FIX log workflow
+Subject: Chain of custody for your EVTX parsing?
 
 Hi [First Name],
 
-I'm [Your name], founder of Casparian Flow. We help trading ops teams
-query FIX logs with SQL instead of grep.
+I'm [Your name], founder of Casparian Flow. We help DFIR practitioners
+build evidence-grade artifact parsing pipelines.
 
-Before we launch publicly, I'm talking to 20 ops leaders to understand
-how teams actually handle trade break resolution today.
+Before we launch publicly, I'm talking to 20 IR consultants to understand
+how teams handle the "prove your parsing" problem.
 
 Would you have 15 minutes this week for a quick call? Not a sales pitch -
 genuinely trying to learn.
 
-Happy to share what we're hearing from other firms in return.
-
 [Your name]
 ```
 
 ---
 
-### Version C: Value-First
+### Version C: Tool-First
 
 ```
-Subject: T+1 pressure on your trade support team?
+Subject: Quick question about your evidence processing workflow
 
 Hi [First Name],
 
-Since T+1 went live, I've heard from ops teams that trade break resolution
-is now a daily fire drill.
+When you process case folders - EVTX files, registry hives, prefetch -
+how do you track what you parsed and with what tool version?
 
-We built a tool that reconstructs FIX order lifecycles into a SQL table.
-Query by ClOrdID, see the full lifecycle in seconds.
+We built a tool that adds governance to artifact parsing:
+- Source hash per file
+- Lineage columns on every output row
+- Quarantine for malformed records
+- Reproducible runs
 
-Curious if this matches what you're seeing at [Company]?
+Curious if chain of custody documentation is a pain point for you?
 
 15 minutes to compare notes?
 
@@ -95,13 +96,13 @@ Hi [First Name],
 
 Following up on my note from [Day].
 
-I know ops teams are slammed, so I'll keep this short:
+I know IR work is time-sensitive, so I'll keep this short:
 
-We're offering 3 trading desks free access to Casparian for 30 days
-to test our FIX log analysis tool.
+We're running 30-day paid pilots ($1K, credits to annual) with DFIR
+boutiques who want to test governed artifact parsing.
 
-If trade break resolution is eating your team's time, might be worth
-a quick look.
+If "prove your parsing" or "script crashed on weird file" are real problems,
+might be worth a quick look.
 
 Open to a 15-minute call this week?
 
@@ -117,12 +118,11 @@ Subject: Closing the loop
 
 Hi [First Name],
 
-I've reached out a couple times about FIX log analysis for trade ops.
+I've reached out a couple times about artifact parsing governance for IR work.
 
 I'll assume the timing isn't right and close this out.
 
-If trade break resolution becomes a priority, feel free to reach out.
-We'll be here.
+If chain of custody or reproducibility become priorities, feel free to reach out.
 
 Best,
 [Your name]
@@ -136,9 +136,9 @@ I'd appreciate the intro.
 ## LinkedIn Connection Request
 
 ```
-Hi [First Name] - I'm researching how trading ops teams handle trade
-break resolution post-T+1. Would love to hear how [Company] approaches it.
-Open to a quick chat?
+Hi [First Name] - I'm researching how IR consultants handle artifact parsing
+tooling (EVTX, registry, etc). Would love to hear how [Company] approaches
+evidence-grade workflows. Open to a quick chat?
 ```
 
 ---
@@ -148,16 +148,14 @@ Open to a quick chat?
 ```
 Hi [First Name],
 
-I'm building a tool that helps trading ops teams query FIX logs with SQL
-instead of grep + Excel.
+I'm building a tool that adds governance to DFIR artifact parsing -
+lineage, quarantine, reproducibility.
 
-Before we launch, I'm talking to 20 ops leaders to understand the reality
-of trade break resolution today.
+Before we launch, I'm talking to 20 IR practitioners to understand
+what's working and what's not in evidence processing workflows.
 
-Would you have 15 minutes for a call? Not a sales pitch - genuinely trying
-to learn what's working and what's not.
-
-Happy to share patterns we're seeing across firms.
+Would you have 15 minutes for a call? Not a sales pitch - genuinely
+trying to learn.
 
 Thanks,
 [Your name]
@@ -173,7 +171,7 @@ Thanks,
 Great! Here's my Calendly: [link]
 
 Pick any 15-minute slot that works. Looking forward to learning about
-your workflow.
+your artifact workflow.
 
 [Your name]
 ```
@@ -183,8 +181,8 @@ your workflow.
 ```
 Thanks for the redirect! I'll reach out to [X].
 
-Quick question before I do - what's the biggest ops headache you're
-seeing right now? Just curious.
+Quick question before I do - what's the biggest tooling headache you're
+seeing in IR work right now? Just curious.
 
 [Your name]
 ```
@@ -192,8 +190,8 @@ seeing right now? Just curious.
 ### If They Say "We Don't Have This Problem"
 
 ```
-That's great to hear! Most teams I talk to are drowning in manual
-FIX log analysis.
+That's great to hear! Most IR teams I talk to have some "parsing script
+crashed on weird file" stories.
 
 What's your secret? I'd love to understand what's working for [Company].
 
@@ -207,9 +205,9 @@ Sure thing. Here's a 2-minute overview:
 
 [Loom video link OR one-pager PDF]
 
-The TL;DR: We turn FIX logs into a SQL table called `fix_order_lifecycle`.
-Query by ClOrdID, symbol, or time range. See the full trade lifecycle
-in seconds.
+The TL;DR: We add governance to artifact parsing. Every output row has
+source hash, job ID, parser version. Quarantine catches malformed records.
+Reproducible runs for chain of custody.
 
 Worth a 15-minute call to see if it fits your workflow?
 
@@ -223,26 +221,26 @@ Worth a 15-minute call to see if it fits your workflow?
 ### Where to Find Prospects
 
 1. **LinkedIn Sales Navigator**
-   - Title: "Trade Support" OR "Middle Office" OR "Operations"
-   - Industry: Financial Services, Investment Banking, Hedge Funds
-   - Company size: 50-500 (mid-market = faster decisions)
+   - Title: "Forensic" OR "Incident Response" OR "DFIR"
+   - Industry: Computer & Network Security, IT Services
+   - Company size: 5-100 (boutiques = faster decisions)
 
-2. **Conference Attendee Lists**
-   - FIX Trading Community events
-   - TradeTech
-   - WatersTechnology events
+2. **Community Presence**
+   - SANS DFIR Summit attendees
+   - DFRWS attendees
+   - DFIR Discord / Reddit
 
 3. **Warm Intros**
-   - Ask existing network: "Know anyone in trading ops?"
+   - Ask existing network: "Know anyone in IR/forensics?"
 
 ### Ideal Company Profile
 
 | Attribute | Target |
 |-----------|--------|
-| Size | 50-500 employees |
-| Type | Broker-dealer, prop trading, hedge fund |
-| Tech | Uses FIX protocol (most do) |
-| Pain signal | Recent T+1 compliance push |
+| Size | 5-100 employees |
+| Type | DFIR boutique, IR consulting, forensic services |
+| Tech | Uses Python for artifact parsing |
+| Pain signal | Mentions "evidence integrity" or "reproducibility" |
 
 ---
 
@@ -266,8 +264,16 @@ Notes: _______________
 
 | Metric | Target |
 |--------|--------|
-| Outreach sent | 50+/week |
+| Outreach sent | 30+/week |
 | Open rate (email) | >40% |
 | Reply rate | >15% |
 | Call scheduled rate | >8% |
-| Conversations completed | 20 in 4 weeks |
+| Conversations completed | 15 in 4 weeks |
+
+---
+
+## Revision History
+
+| Date | Version | Changes |
+|------|---------|---------|
+| 2026-01 | 2.0 | Rewritten for DFIR-first targeting |

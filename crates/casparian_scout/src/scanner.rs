@@ -1081,7 +1081,7 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::types::{FileStatus, SourceId, SourceType};
+    use crate::types::{FileStatus, SourceId, SourceType};
     use filetime::{set_file_mtime, FileTime};
     use std::fs::File;
     use std::io::Write;
@@ -1098,6 +1098,7 @@ mod tests {
             name: "Test Source".to_string(),
             source_type: SourceType::Local,
             path: temp_dir.path().to_string_lossy().to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -1239,6 +1240,7 @@ mod tests {
             name: "Missing".to_string(),
             source_type: SourceType::Local,
             path: "/nonexistent/path".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };

@@ -36,7 +36,7 @@ pub mod bundler;
 pub mod parser_metadata;
 pub mod publish;
 pub mod runner;
-pub mod scout;
+pub use casparian_scout as scout;
 pub mod storage;
 pub mod telemetry;
 pub mod trust;

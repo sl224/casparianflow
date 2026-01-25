@@ -75,6 +75,7 @@ fn create_source(workspace_id: WorkspaceId, path: &Path) -> Source {
         name: "Bench Source".to_string(),
         source_type: SourceType::Local,
         path: path.to_string_lossy().to_string(),
+        exec_path: None,
         poll_interval_secs: 0,
         enabled: true,
     }
@@ -311,6 +312,7 @@ fn bench_scanner_db_write(c: &mut Criterion) {
                             name: "Bench Source".to_string(),
                             source_type: SourceType::Local,
                             path: "/bench".to_string(),
+                            exec_path: None,
                             poll_interval_secs: 0,
                             enabled: true,
                         };

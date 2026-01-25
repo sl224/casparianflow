@@ -13,15 +13,18 @@ Spec posture:
 **See also:** [docs/index.md](index.md) for complete documentation index.
 
 ## Canonical (System of Record, v1)
-- STRATEGY.md: Product strategy and vertical priority.
+- STRATEGY.md: Product strategy and vertical priority (DFIR-first).
 - docs/v1_scope.md: v1 scope and success metrics.
 - docs/schema_rfc.md: Schema contract system (canonical RFC).
 - docs/execution_plan.md: Implementation plan (current).
 - docs/v1_checklist.md: v1 delivery checklist (status tracking).
 - spec.md: High-level product spec (v1 direction).
-- docs/product/pricing_v2_refined.md: Pricing system of record.
+- docs/product/pricing.md: Pricing system of record (DFIR-first, annual-first).
 - docs/product/validated_personas.md: ICP evidence and workflows.
 - docs/product/domain_intelligence.md: File format catalog and detection hints.
+
+## Archived (Superseded)
+- docs/product/_archive/pricing_v2_refined.md: Finance-first pricing (deprecated).
 
 ## Active Docs
 - README.md: Repository overview and quickstart.

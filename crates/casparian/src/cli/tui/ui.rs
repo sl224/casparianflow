@@ -189,6 +189,14 @@ pub(super) fn right_drawer_area(area: Rect) -> Rect {
     )
 }
 
+fn workspace_switcher_area(area: Rect) -> Rect {
+    let width = (area.width * 70 / 100).max(50).min(area.width);
+    let height = (area.height * 70 / 100).max(16).min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
 fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect) {
     if area.height == 0 {
         return;
@@ -222,10 +230,16 @@ fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect
         .as_ref()
         .map(|ws| ws.name.as_str())
         .unwrap_or("(none)");
-    let text = format!(
+    let mut text = format!(
         " Casparian Flow | View: {} | WS: {} | DB: {} | Run: {} | Fail: {} | Quarantine: {} ",
         view_label, workspace_label, backend_label, running, failed, quarantine_total
     );
+    if let Some(status) = &app.global_status {
+        let prefix = if status.is_error { " !" } else { " " };
+        text.push_str(prefix);
+        text.push_str(&status.message);
+        text.push(' ');
+    }
     let line = truncate_end(&text, area.width as usize);
     let bar = Paragraph::new(line)
         .style(Style::default().fg(Color::Cyan).bold())
@@ -722,6 +736,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_sources_drawer(frame, app, area);
     }
 
+    // Draw Workspace Switcher Overlay
+    if app.workspace_switcher.visible {
+        draw_workspace_switcher_overlay(frame, app, area);
+    }
+
     // Draw Command Palette Overlay (highest z-index, blocks all input when visible)
     if app.command_palette.visible {
         draw_command_palette(frame, app, area);
@@ -985,6 +1004,115 @@ fn draw_sources_drawer(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::DarkGray))
             .alignment(Alignment::Center);
     frame.render_widget(footer, chunks[2]);
+}
+
+fn draw_workspace_switcher_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    use ratatui::widgets::{List, ListItem, ListState};
+
+    let overlay = workspace_switcher_area(area);
+    frame.render_widget(Clear, overlay);
+
+    let title = match app.workspace_switcher.mode {
+        super::app::WorkspaceSwitcherMode::Creating => " Workspaces (New) ",
+        super::app::WorkspaceSwitcherMode::List => " Workspaces ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let active_label = app
+        .active_workspace
+        .as_ref()
+        .map(|ws| ws.name.as_str())
+        .unwrap_or("(none)");
+    let header = Paragraph::new(format!("Active workspace: {}", active_label))
+        .style(Style::default().fg(Color::Gray));
+    frame.render_widget(header, chunks[0]);
+
+    if app.workspace_switcher.workspaces.is_empty() && app.workspace_switcher.loaded {
+        let msg = Paragraph::new("No workspaces found. Press [n] to create one.")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, chunks[1]);
+    } else {
+        let items: Vec<ListItem> = app
+            .workspace_switcher
+            .workspaces
+            .iter()
+            .map(|ws| {
+                let marker = if Some(ws.id) == app.active_workspace.as_ref().map(|w| w.id) {
+                    "*"
+                } else {
+                    " "
+                };
+                let id = ws.id.to_string();
+                let short_id = &id[..8.min(id.len())];
+                let line = format!("{} {} ({})", marker, ws.name, short_id);
+                ListItem::new(truncate_end(&line, chunks[1].width as usize))
+            })
+            .collect();
+        let mut state = ListState::default();
+        if !app.workspace_switcher.workspaces.is_empty() {
+            state.select(Some(app.workspace_switcher.selected_index));
+        }
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+                .bg(Color::DarkGray),
+        );
+        frame.render_stateful_widget(list, chunks[1], &mut state);
+    }
+
+    let input_text = match app.workspace_switcher.mode {
+        super::app::WorkspaceSwitcherMode::Creating => {
+            format!("Name: {}_", app.workspace_switcher.input)
+        }
+        super::app::WorkspaceSwitcherMode::List => {
+            "Press [n] to create a new workspace.".to_string()
+        }
+    };
+    let input_block = Block::default()
+        .title(" Workspace ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let input = Paragraph::new(input_text).block(input_block);
+    frame.render_widget(input, chunks[2]);
+
+    if let Some(msg) = &app.workspace_switcher.status_message {
+        let status = Paragraph::new(msg.as_str())
+            .style(Style::default().fg(Color::Yellow))
+            .alignment(Alignment::Left);
+        frame.render_widget(status, chunks[3]);
+    }
+
+    let footer_text = match app.workspace_switcher.mode {
+        super::app::WorkspaceSwitcherMode::Creating => {
+            "[Enter] Create  [Esc] Cancel".to_string()
+        }
+        super::app::WorkspaceSwitcherMode::List => {
+            "[↑/↓] Select  [Enter] Set Active  [n] New  [r] Refresh  [Esc] Close".to_string()
+        }
+    };
+    let footer = Paragraph::new(footer_text)
+        .style(Style::default().fg(Color::Gray))
+        .alignment(Alignment::Center);
+    frame.render_widget(footer, chunks[4]);
 }
 
 /// Draw the home hub screen (Quick Start + Status dashboard)
@@ -5573,6 +5701,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             "  3              Jobs view               q         Quit",
             "  4              Sources view            P         Parser Bench",
             "  0 / H          Home                    S         Sources drawer",
+            "  Ctrl+W         Workspaces",
             "  I              Toggle inspector",
             "  Esc            Back / Close",
             "  ↑/↓/←/→       Navigate",

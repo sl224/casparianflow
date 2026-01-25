@@ -121,9 +121,15 @@ These docs are outdated and kept for historical reference only. **Do not rely on
 | Document | Purpose |
 |----------|---------|
 | [docs/product/README.md](product/README.md) | Product documentation index |
-| [docs/product/pricing_v2_refined.md](product/pricing_v2_refined.md) | Pricing system |
+| [docs/product/pricing.md](product/pricing.md) | Pricing system of record (DFIR-first, annual-first) |
 | [docs/product/validated_personas.md](product/validated_personas.md) | ICP and workflows |
 | [docs/product/domain_intelligence.md](product/domain_intelligence.md) | File format catalog |
+
+### Archived Product Docs
+
+| Document | Why Archived |
+|----------|--------------|
+| [docs/product/_archive/pricing_v2_refined.md](product/_archive/pricing_v2_refined.md) | Superseded by pricing.md; finance-first model deprecated |
 
 ---
 

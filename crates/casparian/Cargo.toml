@@ -7,7 +7,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# NOTE: casparian_scout has been inlined into crate::scout module
 casparian_sentinel = { path = "../casparian_sentinel" }
 casparian_worker = { path = "../casparian_worker" }
 casparian_protocol = { path = "../casparian_protocol" }
@@ -17,6 +16,8 @@ casparian_db = { path = "../casparian_db", default-features = false }
 casparian_schema = { path = "../casparian_schema" }
 casparian_ids = { path = "../casparian_ids" }
 casparian_intent = { path = "../casparian_intent" }
+casparian_ai_types = { path = "../casparian_ai_types" }
+casparian_scout = { path = "../casparian_scout", default-features = false }
 casparian_mcp = { path = "../casparian_mcp" }
 casparian_tape = { path = "../casparian_tape" }
 
@@ -96,12 +97,16 @@ default = ["profiling", "data-plane", "duckdb"]  # Profiling enabled by default 
 full = []  # Gate slow/interactive tests
 local-llm = ["llama-cpp-2", "hf-hub"]  # Local LLM via llama.cpp
 profiling = ["dep:casparian_profiler"]  # TUI profiler overlay (` or F12 toggle)
-data-plane = ["dep:arrow", "dep:parquet", "dep:csv"]
+data-plane = ["dep:arrow", "dep:parquet", "dep:csv", "casparian_scout/data-plane"]
 # DuckDB: uses system libduckdb (fast dev builds, requires: brew install duckdb)
-duckdb = ["casparian_db/duckdb", "casparian_sinks/sink-duckdb"]
+duckdb = ["casparian_db/duckdb", "casparian_scout/duckdb", "casparian_sinks/sink-duckdb"]
 # DuckDB bundled: compile from source (slow, but self-contained for releases)
-duckdb-bundled = ["casparian_db/duckdb-bundled", "casparian_sinks/sink-duckdb-bundled"]
-sqlite = []
+duckdb-bundled = [
+    "casparian_db/duckdb-bundled",
+    "casparian_scout/duckdb-bundled",
+    "casparian_sinks/sink-duckdb-bundled",
+]
+sqlite = ["casparian_scout/sqlite"]
 
 [dev-dependencies]
 filetime = "0.2"

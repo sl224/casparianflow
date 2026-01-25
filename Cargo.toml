@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/casparian_ai_types",
     "crates/casparian_protocol",
     "crates/casparian_intent",
     "crates/casparian_worker",
@@ -10,7 +11,7 @@ members = [
     "crates/casparian_tape",
     "crates/casparian",
     "crates/casparian_security",
-    # "crates/casparian_scout",  # Inlined into casparian::scout module
+    "crates/casparian_scout",
     "crates/casparian_ids",
     "crates/casparian_schema",
     "crates/casparian_backtest",

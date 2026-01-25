@@ -1,8 +1,18 @@
-# Casparian Flow - 90-Day Validation Tracker
+# Casparian Flow - Validation Tracker
 
+**Status:** Canonical
 **Sprint Start:** _____________
 **Sprint End:** _____________
-**Vertical:** Finance (Trade Operations)
+
+---
+
+## Vertical Tracks
+
+| Track | Status | Target |
+|-------|--------|--------|
+| **DFIR (P0)** | Primary | 15 conversations, 5 pilots, $30K ARR |
+| **eDiscovery (P1)** | Secondary | 8 conversations, 3 pilots, $20K ARR |
+| **Defense (P2)** | Tertiary | 5 conversations, 1 pilot, SBIR application |
 
 ---
 
@@ -10,23 +20,24 @@
 
 ### Week _____ Status
 
-| Metric | Target | Actual | Status |
-|--------|--------|--------|--------|
-| Outreach sent | 50 | | |
-| Conversations completed | 5/week | | |
-| Pilots started | - | | |
-| Pilots converting | - | | |
+| Metric | DFIR Target | DFIR Actual | eDiscovery Target | eDiscovery Actual |
+|--------|-------------|-------------|-------------------|-------------------|
+| Outreach sent | 30 | | 15 | |
+| Conversations completed | 4/week | | 2/week | |
+| Pilots started | - | | - | |
+| Pilots converting | - | | - | |
 
 ### Cumulative Progress
 
 | Metric | Target | Week 1 | Week 2 | Week 3 | Week 4 | Total |
 |--------|--------|--------|--------|--------|--------|-------|
-| Conversations | 20 | | | | | /20 |
-| Pain validated (3+) | 15 | | | | | /20 |
-| Buyer validated (3+) | 10 | | | | | /20 |
-| WTP validated (3+) | 10 | | | | | /20 |
-| Pilot candidates | 5 | | | | | |
-| Pilots started | 3 | | | | | /3 |
+| **DFIR Conversations** | 15 | | | | | /15 |
+| DFIR Pain validated (3+) | 12 | | | | | /15 |
+| DFIR Buyer validated (3+) | 8 | | | | | /15 |
+| DFIR WTP validated (3+) | 8 | | | | | /15 |
+| DFIR Pilot candidates | 5 | | | | | |
+| **eDiscovery Conversations** | 8 | | | | | /8 |
+| eDiscovery Pilot candidates | 3 | | | | | |
 
 ---
 
@@ -36,24 +47,43 @@
 
 | Outcome | Criteria | Action |
 |---------|----------|--------|
-| **KILL** | <10 conversations completed | Product/market misalignment |
-| **KILL** | <5 pain scores of 3+ | Pain hypothesis wrong |
-| **KILL** | 0 pilot candidates | No buyer exists |
-| **PIVOT** | Pain exists but WTP <$500/mo | Reprice dramatically |
-| **CONTINUE** | 3+ pilot candidates, WTP >$1K/mo | Start pilots |
+| **KILL DFIR** | <8 conversations completed | Market misalignment |
+| **KILL DFIR** | <4 pain scores of 3+ | Pain hypothesis wrong |
+| **KILL DFIR** | 0 pilot candidates | No buyer exists |
+| **PIVOT PRICING** | Pain exists but WTP <$500/year | Reprice dramatically |
+| **CONTINUE** | 3+ pilot candidates, WTP >$1K/year | Start pilots |
 
 ### Week 12 Decision Point
 
 | Outcome | Criteria | Action |
 |---------|----------|--------|
 | **KILL** | 0 pilots willing to pay | Pricing hypothesis wrong |
-| **PIVOT** | WTP <$1K/mo average | Lower price tier needed |
-| **CONTINUE** | 2+ pilots convert at $1.5K+/mo | Scale outreach |
-| **ACCELERATE** | 3 pilots convert at $2K+/mo | Hire sales |
+| **PIVOT** | WTP <$1K/year average | Lower price tier needed |
+| **CONTINUE** | 2+ pilots convert at $1.2K+/year | Expand outreach |
+| **ACCELERATE** | 4+ pilots convert | Add eDiscovery focus |
 
 ---
 
-## Conversation Log
+## Kill Criteria (Aligned with Constraints)
+
+### "Minimal Support" Kill Signals
+
+| Signal | Threshold | Action |
+|--------|-----------|--------|
+| Prospect expects custom parser dev | >30% of conversations | Messaging failure or wrong audience |
+| Support requests per pilot | >5 per 30 days | Product gaps or wrong persona |
+| "Can you just do it for me" | >20% of conversations | Wrong audience |
+
+### "Paid Pilots" Kill Signals
+
+| Signal | Threshold | Action |
+|--------|-----------|--------|
+| Refuses $1K pilot fee | >50% of qualified prospects | Reprice pilot or validate value |
+| Expects free extended trial | >30% of conversations | Messaging failure |
+
+---
+
+## DFIR Conversation Log
 
 ### Conversation #1
 ```
@@ -61,74 +91,142 @@ Date: _______________
 Name: _______________
 Company: _______________
 Title: _______________
-Source: [ ] Cold email [ ] LinkedIn [ ] Referral [ ] Other
+Source: [ ] Cold email [ ] LinkedIn [ ] Referral [ ] DFIR Discord [ ] Other
 
 SCORES:
 Pain: ___/5    Buyer: ___/5    WTP: ___/5    Fit: ___/5
 
 KEY DATA:
-- Time per break: _____ minutes
-- Breaks per week: _____
-- Annual cost: $_____
+- Cases per month: _____
+- Time per case on parsing: _____ hours
+- Evidence documentation: [ ] Systematic [ ] Ad-hoc [ ] None
 - Budget authority: [ ] Yes [ ] Influence [ ] No
-- Unprompted WTP: $_____/month
-- Reaction to $2-6K: [ ] High [ ] Fair [ ] Low
+- Unprompted WTP: $_____/year
+- Reaction to $1.2-4.8K: [ ] High [ ] Fair [ ] Low
 
 OUTCOME: [ ] Pilot candidate [ ] Follow up later [ ] Not a fit
 
 NOTES:
-_______________________________________________
 _______________________________________________
 
 KEY QUOTE:
 "_______________________________________________"
 ```
 
-*(Copy this template for conversations #2-20)*
+*(Copy for conversations #2-15)*
+
+---
+
+## eDiscovery Conversation Log
+
+### Conversation #1
+```
+Date: _______________
+Name: _______________
+Company: _______________
+Title: _______________
+Source: [ ] Cold email [ ] LinkedIn [ ] Referral [ ] ILTA [ ] Other
+
+SCORES:
+Pain: ___/5    Buyer: ___/5    WTP: ___/5    Fit: ___/5
+
+KEY DATA:
+- Productions per month: _____
+- Production errors per month: _____
+- Budget authority: [ ] Yes [ ] Influence [ ] No
+- Unprompted WTP: $_____/year
+- Reaction to $1.8-7.2K: [ ] High [ ] Fair [ ] Low
+
+OUTCOME: [ ] Pilot candidate [ ] Follow up later [ ] Not a fit
+
+NOTES:
+_______________________________________________
+
+KEY QUOTE:
+"_______________________________________________"
+```
+
+*(Copy for conversations #2-8)*
 
 ---
 
 ## Pilot Tracker
 
-### Pilot #1
+### DFIR Pilot #1
 ```
 Company: _______________
 Contact: _______________
 Start Date: _______________
+Pilot Fee: [ ] Paid $1,000
 
 TIMELINE:
 [ ] Day 0: Onboarding complete
-[ ] Day 7: Check-in 1 complete
-[ ] Day 14: Check-in 2 complete
-[ ] Day 21: Check-in 3 complete
+[ ] Day 14: Check-in complete
 [ ] Day 25: Pricing conversation complete
 [ ] Day 30: Decision made
 
 USAGE METRICS:
 - Files processed: _____
-- Queries run: _____
+- Parsers used: _____
 - Active days: _____/30
-- Time saved (reported): _____ hours
+- Quarantine rows handled: _____
 
 PRICING CONVERSATION:
-- Value articulated: $_____/month
-- Price presented: $_____/month
+- Value articulated: $_____/year
+- Price presented: $_____/year
 - Reaction: _______________
 - Objections: _______________
 
 OUTCOME:
-[ ] Converted at $_____/month
+[ ] Converted at $_____/year
 [ ] Lost - reason: _______________
-[ ] Extended pilot - reason: _______________
 
 EXIT INTERVIEW (if lost):
 - Primary blocker: _______________
 - Price they would pay: $_____
 - Feature gap: _______________
-- Competitor chosen: _______________
 ```
 
-*(Copy this template for pilots #2-3)*
+*(Copy for DFIR pilots #2-5 and eDiscovery pilots #1-3)*
+
+---
+
+## Pattern Recognition
+
+### Pain Patterns (Update as you hear them)
+
+| Pattern | DFIR Frequency | eDiscovery Frequency | Quote |
+|---------|----------------|----------------------|-------|
+| Scripts crash on edge cases | /15 | | "" |
+| No chain of custody documentation | /15 | | "" |
+| Silently dropped rows | /15 | | "" |
+| Can't reproduce old runs | /15 | | "" |
+| Production validation failures | | /8 | "" |
+| Missing native files | | /8 | "" |
+| BATES sequence errors | | /8 | "" |
+
+### Objection Patterns
+
+| Objection | Frequency | Response That Worked |
+|-----------|-----------|---------------------|
+| "I can write my own scripts" | | |
+| "Plaso/Velociraptor already does this" | | |
+| "Too expensive" | | |
+| "Need IT approval" | | |
+| "Expects custom parser dev" | | |
+
+### Willingness-to-Pay Distribution
+
+| Range | DFIR Count | eDiscovery Count |
+|-------|------------|------------------|
+| "Free only" | /15 | /8 |
+| $500-1,000/yr | /15 | /8 |
+| $1,000-2,500/yr | /15 | /8 |
+| $2,500-5,000/yr | /15 | /8 |
+| $5,000+/yr | /15 | /8 |
+
+**DFIR Median WTP:** $_____/year
+**eDiscovery Median WTP:** $_____/year
 
 ---
 
@@ -160,107 +258,49 @@ EXIT INTERVIEW (if lost):
 
 ---
 
-## Pattern Recognition
-
-### Pain Patterns (Update as you hear them)
-
-| Pattern | Frequency | Quote |
-|---------|-----------|-------|
-| FIX log grep hell | /20 | "" |
-| Excel copy-paste | /20 | "" |
-| T+1 time pressure | /20 | "" |
-| Knowledge loss (turnover) | /20 | "" |
-| Settlement failures | /20 | "" |
-| Other: _________ | /20 | "" |
-
-### Objection Patterns
-
-| Objection | Frequency | Response That Worked |
-|-----------|-----------|---------------------|
-| "Too expensive" | /20 | |
-| "Build internally" | /20 | |
-| "Already have tools" | /20 | |
-| "Need IT approval" | /20 | |
-| "Not a priority" | /20 | |
-| Other: _________ | /20 | |
-
-### Willingness-to-Pay Distribution
-
-| Range | Count |
-|-------|-------|
-| "Free only" | /20 |
-| $100-500/mo | /20 |
-| $500-1,000/mo | /20 |
-| $1,000-2,000/mo | /20 |
-| $2,000-5,000/mo | /20 |
-| $5,000+/mo | /20 |
-
-**Median WTP:** $_____/month
-**Mean WTP:** $_____/month
-
----
-
 ## Final Sprint Report (Week 12)
 
 ### Summary Statistics
 
-| Metric | Result |
-|--------|--------|
-| Total outreach sent | |
-| Total conversations | /20 |
-| Conversation → pilot rate | % |
-| Pilots started | /3 |
-| Pilots completed | /3 |
-| Pilots converted | /3 |
-| Conversion rate | % |
-| Average WTP (conversations) | $/mo |
-| Average WTP (pilots) | $/mo |
-| Total ARR signed | $ |
+| Metric | DFIR Result | eDiscovery Result |
+|--------|-------------|-------------------|
+| Total outreach sent | | |
+| Total conversations | /15 | /8 |
+| Conversation → pilot rate | % | % |
+| Pilots started | | |
+| Pilots completed | | |
+| Pilots converted | | |
+| Conversion rate | % | % |
+| Average WTP | $/yr | $/yr |
+| Total ARR signed | $ | $ |
 
 ### Hypothesis Validation
 
 | Hypothesis | Status | Evidence |
 |------------|--------|----------|
-| Pain is real | [ ] Validated [ ] Invalidated | |
-| Buyer exists | [ ] Validated [ ] Invalidated | |
-| $2K/mo is viable | [ ] Validated [ ] Invalidated | |
-| $6K/mo is viable | [ ] Validated [ ] Invalidated | |
-| Finance is right vertical | [ ] Validated [ ] Invalidated | |
-
-### Pricing Recommendation
-
-Based on validation data:
-
-| Tier | Recommended Price | Confidence |
-|------|-------------------|------------|
-| Team | $/month | High/Med/Low |
-| Trading Desk | $/month | High/Med/Low |
-| Enterprise | $/month | High/Med/Low |
+| DFIR pain is real | [ ] Validated [ ] Invalidated | |
+| DFIR buyer exists | [ ] Validated [ ] Invalidated | |
+| $1.2K/year DFIR is viable | [ ] Validated [ ] Invalidated | |
+| $4.8K/year DFIR is viable | [ ] Validated [ ] Invalidated | |
+| eDiscovery preflight pain exists | [ ] Validated [ ] Invalidated | |
+| Paid pilot filters tire-kickers | [ ] Validated [ ] Invalidated | |
 
 ### Next Steps
 
-**If validated:**
-- [ ] Hire [role]
+**If DFIR validated:**
+- [ ] Expand DFIR outreach
+- [ ] Add eDiscovery focus
 - [ ] Build [feature]
-- [ ] Expand to [vertical]
-- [ ] Raise prices to [amount]
 
-**If invalidated:**
-- [ ] Pivot to [direction]
+**If DFIR invalidated:**
+- [ ] Pivot to eDiscovery primary
 - [ ] Lower prices to [amount]
-- [ ] Change vertical to [market]
-- [ ] Kill project
+- [ ] Re-evaluate vertical priority
 
 ---
 
-## Appendix: Contact Database
+## Revision History
 
-| # | Name | Company | Title | Email | LinkedIn | Status | Notes |
-|---|------|---------|-------|-------|----------|--------|-------|
-| 1 | | | | | | | |
-| 2 | | | | | | | |
-| 3 | | | | | | | |
-| ... | | | | | | | |
-| 50 | | | | | | | |
-
-Status codes: P = Prospecting, R = Reached out, S = Scheduled, C = Completed, X = Not a fit
+| Date | Version | Changes |
+|------|---------|---------|
+| 2026-01 | 2.0 | Rewritten for DFIR-first with eDiscovery secondary track |

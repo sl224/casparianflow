@@ -12,7 +12,7 @@ use super::types::{
     FileTag, ParserValidationStatus, ScannedFile, Source, SourceId, SourceType, TagSource,
     TaggingRule, TaggingRuleId, UpsertResult, Workspace, WorkspaceId,
 };
-use crate::ai::types::DraftStatus;
+use casparian_ai_types::DraftStatus;
 use casparian_db::{BackendError, DbConnection, DbValue};
 use chrono::{DateTime, Utc};
 use std::path::Path;
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS scout_sources (
     name TEXT NOT NULL,
     source_type TEXT NOT NULL,
     path TEXT NOT NULL,
+    exec_path TEXT,
     poll_interval_secs INTEGER NOT NULL DEFAULT 30,
     enabled INTEGER NOT NULL DEFAULT 1,
     file_count INTEGER NOT NULL DEFAULT 0,
@@ -614,13 +615,31 @@ impl Database {
         }
 
         if missing.is_empty() {
+            // fall through to scout_sources validation
+        } else {
+            return Err(ScoutError::Config(format!(
+                "Database schema for 'scout_files' is missing columns: {}. \
+Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and restart.",
+                missing.join(", ")
+            )));
+        }
+
+        let required_source_columns = ["exec_path"];
+        let mut source_missing = Vec::new();
+        for col in required_source_columns {
+            if !column_exists(conn, "scout_sources", col)? {
+                source_missing.push(col);
+            }
+        }
+
+        if source_missing.is_empty() {
             return Ok(());
         }
 
         Err(ScoutError::Config(format!(
-            "Database schema for 'scout_files' is missing columns: {}. \
+            "Database schema for 'scout_sources' is missing columns: {}. \
 Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and restart.",
-            missing.join(", ")
+            source_missing.join(", ")
         )))
     }
 
@@ -745,17 +764,19 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     name,
                     source_type,
                     path,
+                    exec_path,
                     poll_interval_secs,
                     enabled,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     workspace_id = excluded.workspace_id,
                     name = excluded.name,
                     source_type = excluded.source_type,
                     path = excluded.path,
+                    exec_path = excluded.exec_path,
                     poll_interval_secs = excluded.poll_interval_secs,
                     enabled = excluded.enabled,
                     updated_at = excluded.updated_at
@@ -766,6 +787,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 source.name.as_str().into(),
                 source_type_json.into(),
                 source.path.as_str().into(),
+                DbValue::from(Self::normalize_exec_path(&source.exec_path)),
                 (source.poll_interval_secs as i64).into(),
                 source.enabled.into(),
                 now.into(),
@@ -1072,7 +1094,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let row = self
             .conn
             .query_optional(
-                "SELECT id, workspace_id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE id = ?",
+                "SELECT id, workspace_id, name, source_type, path, exec_path, poll_interval_secs, enabled FROM scout_sources WHERE id = ?",
                 &[id.as_i64().into()],
             )
             ?;
@@ -1092,7 +1114,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let row = self
             .conn
             .query_optional(
-                "SELECT id, workspace_id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND name = ?",
+                "SELECT id, workspace_id, name, source_type, path, exec_path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND name = ?",
                 &[DbValue::from(workspace_id.to_string()), name.into()],
             )
             ?;
@@ -1112,7 +1134,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let row = self
             .conn
             .query_optional(
-                "SELECT id, workspace_id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND path = ?",
+                "SELECT id, workspace_id, name, source_type, path, exec_path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND path = ?",
                 &[DbValue::from(workspace_id.to_string()), path.into()],
             )
             ?;
@@ -1128,7 +1150,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let rows = self
             .conn
             .query_all(
-                "SELECT id, workspace_id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? ORDER BY name",
+                "SELECT id, workspace_id, name, source_type, path, exec_path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? ORDER BY name",
                 &[DbValue::from(workspace_id.to_string())],
             )
             ?;
@@ -1141,7 +1163,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let rows = self
             .conn
             .query_all(
-                "SELECT id, workspace_id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND enabled = 1 ORDER BY name",
+                "SELECT id, workspace_id, name, source_type, path, exec_path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND enabled = 1 ORDER BY name",
                 &[DbValue::from(workspace_id.to_string())],
             )
             ?;
@@ -1155,7 +1177,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let rows = self
             .conn
             .query_all(
-                "SELECT id, workspace_id, name, source_type, path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND enabled = 1 ORDER BY updated_at DESC",
+                "SELECT id, workspace_id, name, source_type, path, exec_path, poll_interval_secs, enabled FROM scout_sources WHERE workspace_id = ? AND enabled = 1 ORDER BY updated_at DESC",
                 &[DbValue::from(workspace_id.to_string())],
             )
             ?;
@@ -1249,11 +1271,22 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         Ok(())
     }
 
+    fn normalize_exec_path(exec_path: &Option<String>) -> Option<String> {
+        exec_path.as_ref().and_then(|path| {
+            if path.trim().is_empty() {
+                None
+            } else {
+                Some(path.clone())
+            }
+        })
+    }
+
     fn row_to_source(row: &casparian_db::UnifiedDbRow) -> Result<Source> {
         let source_type_json: String = row.get(3)?;
         let source_type: SourceType = serde_json::from_str(&source_type_json)?;
-        let poll_interval: i64 = row.get(5)?;
-        let enabled: i64 = row.get(6)?;
+        let exec_path: Option<String> = row.get(5)?;
+        let poll_interval: i64 = row.get(6)?;
+        let enabled: i64 = row.get(7)?;
 
         let id_raw: i64 = row.get(0)?;
         let id = SourceId::try_from(id_raw)?;
@@ -1267,6 +1300,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             name: row.get(2)?,
             source_type,
             path: row.get(4)?,
+            exec_path: Self::normalize_exec_path(&exec_path),
             poll_interval_secs: poll_interval as u64,
             enabled: enabled != 0,
         })
@@ -3548,6 +3582,7 @@ mod tests {
             name: "Test Source".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -3604,6 +3639,7 @@ mod tests {
             name: "Test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -3634,7 +3670,7 @@ mod tests {
             )
 
             .unwrap();
-        let file_uid = crate::scout::file_uid::weak_uid_from_path_str("/data/test.csv");
+        let file_uid = crate::file_uid::weak_uid_from_path_str("/data/test.csv");
         let file = ScannedFile::new(
             workspace_id,
             source_id.clone(),
@@ -3681,6 +3717,7 @@ mod tests {
             name: "Source A".to_string(),
             source_type: SourceType::Local,
             path: "/data/a".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -3693,6 +3730,7 @@ mod tests {
             name: "Source B".to_string(),
             source_type: SourceType::Local,
             path: "/data/b".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -3705,6 +3743,7 @@ mod tests {
             name: "Source C".to_string(),
             source_type: SourceType::Local,
             path: "/data/c".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -3792,6 +3831,7 @@ mod tests {
             name: "Test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -3801,7 +3841,7 @@ mod tests {
         let files: Vec<ScannedFile> = (0..150)
             .map(|i| {
                 let path = format!("/data/file{}.txt", i);
-                let file_uid = crate::scout::file_uid::weak_uid_from_path_str(&path);
+                let file_uid = crate::file_uid::weak_uid_from_path_str(&path);
                 ScannedFile::new(
                     workspace_id,
                     source_id.clone(),
@@ -3845,7 +3885,7 @@ mod tests {
                 if i < 50 {
                     // First 50 files: change size
                     let path = format!("/data/file{}.txt", i);
-                    let file_uid = crate::scout::file_uid::weak_uid_from_path_str(&path);
+                    let file_uid = crate::file_uid::weak_uid_from_path_str(&path);
                     ScannedFile::new(
                         workspace_id,
                         source_id.clone(),
@@ -3858,7 +3898,7 @@ mod tests {
                 } else {
                     // Remaining 100 files: unchanged
                     let path = format!("/data/file{}.txt", i);
-                    let file_uid = crate::scout::file_uid::weak_uid_from_path_str(&path);
+                    let file_uid = crate::file_uid::weak_uid_from_path_str(&path);
                     ScannedFile::new(
                         workspace_id,
                         source_id.clone(),
@@ -3904,13 +3944,14 @@ mod tests {
             name: "Test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
         db.upsert_source(&source).unwrap();
 
         // Create file and tag it
-        let file_uid = crate::scout::file_uid::weak_uid_from_path_str("/data/test.txt");
+        let file_uid = crate::file_uid::weak_uid_from_path_str("/data/test.txt");
         let file = ScannedFile::new(
             workspace_id,
             source_id.clone(),
@@ -3971,6 +4012,7 @@ mod tests {
             name: "Test".to_string(),
             source_type: SourceType::Local,
             path: "/data".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -3983,7 +4025,7 @@ mod tests {
         // /data/logs/2024/jan.log
         // /data/logs/2024/feb.log
         let make_file = |path: &str, rel_path: &str, size: u64, mtime: i64| {
-            let file_uid = crate::scout::file_uid::weak_uid_from_path_str(path);
+            let file_uid = crate::file_uid::weak_uid_from_path_str(path);
             ScannedFile::new(
                 workspace_id,
                 source_id.clone(),
@@ -4063,7 +4105,7 @@ mod tests {
     // Source Overlap Detection Tests
     // ========================================================================
 
-    use crate::scout::error::ScoutError;
+    use crate::error::ScoutError;
 
     #[test]
     fn test_source_overlap_no_sources() {
@@ -4092,6 +4134,7 @@ mod tests {
             name: "Parent".to_string(),
             source_type: SourceType::Local,
             path: temp_dir.path().display().to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -4123,6 +4166,7 @@ mod tests {
             name: "Projects".to_string(),
             source_type: SourceType::Local,
             path: temp_dir.path().display().to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -4164,6 +4208,7 @@ mod tests {
             name: "Medical".to_string(),
             source_type: SourceType::Local,
             path: child_dir.display().to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -4208,6 +4253,7 @@ mod tests {
             name: "Projects A".to_string(),
             source_type: SourceType::Local,
             path: dir_a.display().to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -4231,6 +4277,7 @@ mod tests {
             name: "Stale Source".to_string(),
             source_type: SourceType::Local,
             path: "/nonexistent/path/that/does/not/exist".to_string(),
+            exec_path: None,
             poll_interval_secs: 30,
             enabled: true,
         };
@@ -4267,6 +4314,7 @@ mod tests {
                 name: name.to_string(),
                 source_type: SourceType::Local,
                 path: path.display().to_string(),
+                exec_path: None,
                 poll_interval_secs: 30,
                 enabled: true,
             };

@@ -562,6 +562,7 @@ fn get_or_create_source(
         name,
         source_type: SourceType::Local,
         path: path_str,
+        exec_path: None,
         poll_interval_secs: 0, // CLI scans are one-shot
         enabled: true,
     };

@@ -111,8 +111,8 @@ impl Tagger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scout::file_uid::weak_uid_from_path_str;
-    use crate::scout::types::{ScannedFile, SourceId, TaggingRuleId, WorkspaceId};
+    use crate::file_uid::weak_uid_from_path_str;
+    use crate::types::{ScannedFile, SourceId, TaggingRuleId, WorkspaceId};
 
     fn create_test_rule(
         id: TaggingRuleId,
