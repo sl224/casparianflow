@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use casparian_protocol::RedactionPolicy as ProtocolRedactionPolicy;
+use casparian_protocol::{
+    DataType as ProtocolDataType, RedactionPolicy as ProtocolRedactionPolicy,
+    SchemaColumnSpec as ProtocolSchemaColumnSpec,
+    SchemaDefinition as ProtocolSchemaDefinition, ViolationType as ProtocolViolationType,
+};
 pub use casparian_protocol::{RedactionMode, SchemaMode};
 
 // ============================================================================
@@ -182,6 +186,61 @@ pub enum ComplexDataType {
     },
 }
 
+impl DataType {
+    /// Convert MCP DataType to the canonical protocol DataType.
+    pub fn to_protocol(&self) -> Result<ProtocolDataType, String> {
+        match self {
+            DataType::Simple(simple) => Ok(match simple {
+                SimpleDataType::String => ProtocolDataType::String,
+                SimpleDataType::Int64 => ProtocolDataType::Int64,
+                SimpleDataType::Float64 => ProtocolDataType::Float64,
+                SimpleDataType::Boolean => ProtocolDataType::Boolean,
+                SimpleDataType::Date => ProtocolDataType::Date,
+                SimpleDataType::Binary => ProtocolDataType::Binary,
+            }),
+            DataType::Complex(complex) => match complex {
+                ComplexDataType::Decimal { precision, scale } => Ok(ProtocolDataType::Decimal {
+                    precision: *precision,
+                    scale: *scale,
+                }),
+                ComplexDataType::TimestampTz { timezone } => {
+                    let tz = timezone
+                        .as_deref()
+                        .ok_or_else(|| "timestamp_tz requires explicit timezone".to_string())?;
+                    Ok(ProtocolDataType::TimestampTz { tz: tz.to_string() })
+                }
+            },
+        }
+    }
+}
+
+impl TryFrom<ProtocolDataType> for DataType {
+    type Error = String;
+
+    fn try_from(value: ProtocolDataType) -> Result<Self, Self::Error> {
+        match value {
+            ProtocolDataType::String => Ok(DataType::Simple(SimpleDataType::String)),
+            ProtocolDataType::Int64 => Ok(DataType::Simple(SimpleDataType::Int64)),
+            ProtocolDataType::Float64 => Ok(DataType::Simple(SimpleDataType::Float64)),
+            ProtocolDataType::Boolean => Ok(DataType::Simple(SimpleDataType::Boolean)),
+            ProtocolDataType::Date => Ok(DataType::Simple(SimpleDataType::Date)),
+            ProtocolDataType::Binary => Ok(DataType::Simple(SimpleDataType::Binary)),
+            ProtocolDataType::Decimal { precision, scale } => {
+                Ok(DataType::Complex(ComplexDataType::Decimal {
+                    precision,
+                    scale,
+                }))
+            }
+            ProtocolDataType::TimestampTz { tz } => Ok(DataType::Complex(
+                ComplexDataType::TimestampTz {
+                    timezone: Some(tz),
+                },
+            )),
+            other => Err(format!("Unsupported protocol DataType for MCP: {}", other)),
+        }
+    }
+}
+
 // ============================================================================
 // SchemaDefinition - Per-Output Schema
 // ============================================================================
@@ -198,6 +257,36 @@ pub struct SchemaDefinition {
 
     /// Column definitions
     pub columns: Vec<ColumnDefinition>,
+}
+
+impl SchemaDefinition {
+    /// Convert to protocol SchemaDefinition (output_name/mode are MCP-only).
+    pub fn to_protocol_schema(&self) -> Result<ProtocolSchemaDefinition, String> {
+        let columns = self
+            .columns
+            .iter()
+            .map(|col| col.to_protocol_spec())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ProtocolSchemaDefinition { columns })
+    }
+
+    /// Build an MCP schema from a protocol schema with explicit output name + mode.
+    pub fn from_protocol(
+        output_name: impl Into<String>,
+        mode: SchemaMode,
+        schema: &ProtocolSchemaDefinition,
+    ) -> Result<Self, String> {
+        let columns = schema
+            .columns
+            .iter()
+            .map(ColumnDefinition::from_protocol)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            output_name: output_name.into(),
+            mode,
+            columns,
+        })
+    }
 }
 
 /// Column definition within a schema
@@ -217,6 +306,26 @@ pub struct ColumnDefinition {
     /// Optional format string (for dates/timestamps)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+}
+
+impl ColumnDefinition {
+    pub fn to_protocol_spec(&self) -> Result<ProtocolSchemaColumnSpec, String> {
+        Ok(ProtocolSchemaColumnSpec {
+            name: self.name.clone(),
+            data_type: self.data_type.to_protocol()?,
+            nullable: self.nullable,
+            format: self.format.clone(),
+        })
+    }
+
+    pub fn from_protocol(spec: &ProtocolSchemaColumnSpec) -> Result<Self, String> {
+        Ok(Self {
+            name: spec.name.clone(),
+            data_type: DataType::try_from(spec.data_type.clone())?,
+            nullable: spec.nullable,
+            format: spec.format.clone(),
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -341,6 +450,40 @@ pub enum ViolationType {
     ColumnNameMismatch,
     /// Wrong number of columns
     ColumnCountMismatch,
+}
+
+impl ViolationType {
+    pub fn to_protocol(&self) -> Result<ProtocolViolationType, String> {
+        match self {
+            ViolationType::TypeMismatch => Ok(ProtocolViolationType::TypeMismatch),
+            ViolationType::NullNotAllowed => Ok(ProtocolViolationType::NullNotAllowed),
+            ViolationType::FormatMismatch => Ok(ProtocolViolationType::FormatMismatch),
+            ViolationType::ColumnNameMismatch => Err(
+                "ColumnNameMismatch has no direct protocol equivalent".to_string(),
+            ),
+            ViolationType::ColumnCountMismatch => Err(
+                "ColumnCountMismatch has no direct protocol equivalent".to_string(),
+            ),
+        }
+    }
+}
+
+impl TryFrom<ProtocolViolationType> for ViolationType {
+    type Error = String;
+
+    fn try_from(value: ProtocolViolationType) -> Result<Self, Self::Error> {
+        match value {
+            ProtocolViolationType::TypeMismatch => Ok(ViolationType::TypeMismatch),
+            ProtocolViolationType::NullNotAllowed => Ok(ViolationType::NullNotAllowed),
+            ProtocolViolationType::FormatMismatch => Ok(ViolationType::FormatMismatch),
+            ProtocolViolationType::ColumnMissing
+            | ProtocolViolationType::ColumnExtra
+            | ProtocolViolationType::ColumnOrderMismatch => Err(format!(
+                "Unsupported protocol ViolationType for MCP: {:?}",
+                value
+            )),
+        }
+    }
 }
 
 /// Suggested fix for a violation
@@ -580,6 +723,58 @@ mod tests {
         let json = serde_json::to_string_pretty(&schema).unwrap();
         assert!(json.contains("events"));
         assert!(json.contains("int64"));
+    }
+
+    #[test]
+    fn test_mcp_data_type_protocol_conversion() {
+        let mcp_type = DataType::Complex(ComplexDataType::TimestampTz {
+            timezone: Some("UTC".to_string()),
+        });
+        let protocol_type = mcp_type.to_protocol().unwrap();
+        assert_eq!(
+            protocol_type,
+            ProtocolDataType::TimestampTz {
+                tz: "UTC".to_string()
+            }
+        );
+
+        let roundtrip = DataType::try_from(protocol_type).unwrap();
+        assert_eq!(roundtrip, mcp_type);
+    }
+
+    #[test]
+    fn test_mcp_schema_to_protocol() {
+        let schema = SchemaDefinition {
+            output_name: "orders".to_string(),
+            mode: SchemaMode::Strict,
+            columns: vec![ColumnDefinition {
+                name: "id".to_string(),
+                data_type: DataType::Simple(SimpleDataType::Int64),
+                nullable: false,
+                format: None,
+            }],
+        };
+
+        let protocol_schema = schema.to_protocol_schema().unwrap();
+        assert_eq!(protocol_schema.columns.len(), 1);
+        assert_eq!(protocol_schema.columns[0].name, "id");
+        assert_eq!(protocol_schema.columns[0].data_type, ProtocolDataType::Int64);
+    }
+
+    #[test]
+    fn test_protocol_data_type_rejects_unsupported() {
+        let err = DataType::try_from(ProtocolDataType::Timestamp)
+            .expect_err("timestamp without tz is unsupported in MCP");
+        assert!(err.contains("Unsupported protocol DataType"));
+    }
+
+    #[test]
+    fn test_violation_type_protocol_mapping() {
+        let mapped = ViolationType::TypeMismatch.to_protocol().unwrap();
+        assert_eq!(mapped, ProtocolViolationType::TypeMismatch);
+
+        let err = ViolationType::ColumnCountMismatch.to_protocol().unwrap_err();
+        assert!(err.contains("no direct protocol equivalent"));
     }
 
     #[test]

@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parquet_sink_decimal_timestamp_tz_roundtrip() {
+    fn conf_t1_parquet_decimal_timestamp_tz_roundtrip() {
         let dir = tempdir().unwrap();
         let job_id = "12345678-abcd-1234-abcd-123456789abc";
         let mut sink =
@@ -1219,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_lineage_columns() {
+    fn conf_t1_lineage_injection_appends_columns() {
         let batch = OutputBatch::from_record_batch(create_test_batch());
         let with_lineage = inject_lineage_columns(&batch, "abc123", "job-456", "1.0.0").unwrap();
         let with_lineage = with_lineage.record_batch();
@@ -1279,5 +1279,36 @@ mod tests {
         assert_eq!(version_col.value(0), "1.0.0");
         assert_eq!(version_col.value(1), "1.0.0");
         assert_eq!(version_col.value(2), "1.0.0");
+    }
+
+    #[test]
+    fn conf_t1_sink_commit_guard_aborts_without_outputs() {
+        let dir = tempdir().unwrap();
+        let job_id = "job-guard-1";
+        let output_name = "guarded";
+        let sink_uri = format!("parquet://{}", dir.path().display());
+
+        let batch = create_test_batch();
+        let output_plan = OutputPlan::new(
+            output_name,
+            None,
+            vec![OutputBatch::from_record_batch(batch)],
+            SinkMode::Append,
+        );
+
+        let err = match write_output_plan(&sink_uri, &[output_plan], job_id, Some(&|| false)) {
+            Ok(_) => panic!("commit guard should abort"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Output commit aborted"),
+            "unexpected error: {}",
+            err
+        );
+
+        let final_path = dir
+            .path()
+            .join(output_filename(output_name, job_id, "parquet"));
+        assert!(!final_path.exists(), "final output should not exist");
     }
 }

@@ -4,7 +4,8 @@
 
 use casparian_db::{BackendError, DbTimestamp, UnifiedDbRow};
 use casparian_protocol::{
-    JobStatus as ProtocolJobStatus, PluginStatus, ProcessingStatus, QuarantineConfig, SinkMode,
+    JobStatus as ProtocolJobStatus, PluginStatus, ProcessingStatus, QuarantineConfig, RuntimeKind,
+    SinkMode,
 };
 
 // Re-export canonical enums from protocol for convenience
@@ -213,7 +214,7 @@ pub struct PluginManifest {
     pub id: i64,
     pub plugin_name: String,
     pub version: String,
-    pub runtime_kind: String,
+    pub runtime_kind: RuntimeKind,
     pub entrypoint: String,
     pub platform_os: Option<String>,
     pub platform_arch: Option<String>,
@@ -245,12 +246,19 @@ impl PluginManifest {
         let status = status_str.parse::<PluginStatus>().map_err(|e| {
             BackendError::TypeConversion(format!("Invalid plugin status '{}': {}", status_str, e))
         })?;
+        let runtime_str: String = row.get_by_name("runtime_kind")?;
+        let runtime_kind = runtime_str.parse::<RuntimeKind>().map_err(|e| {
+            BackendError::TypeConversion(format!(
+                "Invalid runtime_kind '{}': {}",
+                runtime_str, e
+            ))
+        })?;
 
         Ok(Self {
             id: row.get_by_name("id")?,
             plugin_name: row.get_by_name("plugin_name")?,
             version: row.get_by_name("version")?,
-            runtime_kind: row.get_by_name("runtime_kind")?,
+            runtime_kind,
             entrypoint: row.get_by_name("entrypoint")?,
             platform_os: row.get_by_name("platform_os")?,
             platform_arch: row.get_by_name("platform_arch")?,

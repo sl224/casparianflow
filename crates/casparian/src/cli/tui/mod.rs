@@ -5,6 +5,7 @@
 pub mod app;
 pub mod event;
 pub mod extraction;
+pub mod nav;
 pub mod pattern_query;
 pub mod snapshot;
 pub mod snapshot_export;

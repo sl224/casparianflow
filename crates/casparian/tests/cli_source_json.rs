@@ -31,7 +31,7 @@ struct SourceFile {
 }
 
 #[test]
-fn test_source_json_and_sync() {
+fn conf_t0_source_json_and_sync() {
     let home_dir = TempDir::new().expect("create temp home");
     let db_path = home_dir.path().join("casparian_flow.duckdb");
     init_scout_schema(&db_path);

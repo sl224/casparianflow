@@ -59,6 +59,8 @@ fn mode_label(mode: TuiMode) -> &'static str {
         TuiMode::Query => "Query",
         TuiMode::Settings => "Settings",
         TuiMode::Sessions => "Sessions",
+        TuiMode::Triage => "Triage",
+        TuiMode::Catalog => "Catalog",
     }
 }
 

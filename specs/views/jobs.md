@@ -2,9 +2,9 @@
 
 **Status:** Redesign proposal
 **Parent:** specs/tui.md (Master TUI Spec)
-**Version:** 2.5
+**Version:** 2.6
 **Related:** specs/rule_builder.md, specs/views/parser_bench.md
-**Last Updated:** 2026-01-18
+**Last Updated:** 2026-01-25
 
 ---
 
@@ -63,6 +63,7 @@ Table queried:
 | `Tab` | Switch section | Cycles ACTIONABLE → READY |
 | `Enter` | Pin details | Detail panel reflects selected job |
 | `f` | Filter dialog | Filter by status/type/name |
+| `Backspace` / `Delete` | Clear active filters | When a filter is active |
 | `g` / `G` | First / last job | List view |
 | `r` / `R` | Retry failed | Failed jobs only |
 | `c` | Cancel running | Active jobs only |
@@ -71,6 +72,9 @@ Table queried:
 | `y` | Copy output path | Selected job |
 | `O` | Open output | Selected job if output_path present |
 | `I` | Toggle inspector | Collapse/expand details |
+| `p` | Toggle pipeline summary | Jobs list only |
+| `Q` | Open Quarantine/Triage | Selected job (uses job filter) |
+| `C` | Open Catalog | Selected job run (if pipeline_run_id present) |
 | `Esc` | Back | Returns to previous mode if set |
 
 ---

@@ -171,12 +171,12 @@ cargo check
 # Build
 cargo build --release
 
-# Test (E2E, no mocks)
-cargo test --package casparian_worker --test e2e_type_inference
-cargo test --package casparian_schema --test e2e_contracts
-cargo test --package casparian_backtest --test e2e_backtest
-# E2E test script
-./tests/e2e/run_e2e_test.sh
+# Conformance suite
+./scripts/conformance.sh t0
+./scripts/conformance.sh t1
+
+# Full test suite (slower)
+cargo test
 ```
 
 ## Documentation

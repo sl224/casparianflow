@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duckdb_sink_decimal_timestamp_tz() {
+    fn conf_t1_duckdb_decimal_timestamptz_roundtrip_values() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test_decimal_tz.duckdb");
         let mut sink = DuckDbSink::new(
@@ -414,7 +414,10 @@ mod tests {
         ])
         .with_timezone("UTC");
 
+        let id_array = Int64Array::from(vec![1, 2, 3]);
+
         let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
             Field::new("amount", DataType::Decimal128(10, 2), true),
             Field::new(
                 "event_time",
@@ -424,7 +427,7 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(
             Arc::new(schema),
-            vec![Arc::new(dec_array), Arc::new(ts_array)],
+            vec![Arc::new(id_array), Arc::new(dec_array), Arc::new(ts_array)],
         )
         .unwrap();
 
@@ -440,6 +443,69 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 3);
+
+        let amount_type: String = conn
+            .query_row(
+                "SELECT data_type FROM information_schema.columns WHERE table_name = 'records' \
+                 AND column_name = 'amount'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let amount_type_norm = amount_type.to_lowercase();
+        assert!(
+            amount_type_norm.contains("decimal"),
+            "expected decimal type, got {}",
+            amount_type
+        );
+        assert!(
+            amount_type_norm.contains("10") && amount_type_norm.contains("2"),
+            "expected precision/scale 10,2, got {}",
+            amount_type
+        );
+
+        let ts_type: String = conn
+            .query_row(
+                "SELECT data_type FROM information_schema.columns WHERE table_name = 'records' \
+                 AND column_name = 'event_time'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ts_type_norm = ts_type.to_lowercase();
+        assert!(
+            ts_type_norm.contains("timestamp")
+                && (ts_type_norm.contains("time zone") || ts_type_norm.contains("timestamptz")),
+            "expected timestamptz type, got {}",
+            ts_type
+        );
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT (amount * 100)::BIGINT as amt_scaled, \
+                 epoch_ms(event_time) as ts_ms \
+                 FROM records ORDER BY id",
+            )
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+
+        let row1 = rows.next().unwrap().unwrap();
+        let amt1: Option<i64> = row1.get(0).unwrap();
+        let ts1: Option<i64> = row1.get(1).unwrap();
+        assert_eq!(amt1, Some(12_345));
+        assert_eq!(ts1, Some(1_700_000_000_000));
+
+        let row2 = rows.next().unwrap().unwrap();
+        let amt2: Option<i64> = row2.get(0).unwrap();
+        let ts2: Option<i64> = row2.get(1).unwrap();
+        assert_eq!(amt2, None);
+        assert_eq!(ts2, None);
+
+        let row3 = rows.next().unwrap().unwrap();
+        let amt3: Option<i64> = row3.get(0).unwrap();
+        let ts3: Option<i64> = row3.get(1).unwrap();
+        assert_eq!(amt3, Some(-6_789));
+        assert_eq!(ts3, Some(1_700_000_100_000));
     }
 
     #[test]

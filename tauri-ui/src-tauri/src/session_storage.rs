@@ -50,8 +50,7 @@ impl SessionStorage {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 input_dir TEXT,
-                error_message TEXT,
-                pending_question_id TEXT
+                error_message TEXT
             );
             CREATE INDEX IF NOT EXISTS ix_sessions_state ON cf_sessions(state);
             CREATE INDEX IF NOT EXISTS ix_sessions_created ON cf_sessions(created_at DESC);
@@ -97,7 +96,7 @@ impl SessionStorage {
     pub fn get_session(&self, session_id: SessionId) -> Result<Option<Session>> {
         let sql = r#"
             SELECT session_id, intent_text, state, files_selected, created_at, updated_at,
-                   input_dir, error_message, pending_question_id
+                   input_dir, error_message
             FROM cf_sessions
             WHERE session_id = ?
         "#;
@@ -118,7 +117,7 @@ impl SessionStorage {
             Some(s) => (
                 r#"
                     SELECT session_id, intent_text, state, files_selected, created_at, updated_at,
-                           input_dir, error_message, pending_question_id
+                           input_dir, error_message
                     FROM cf_sessions
                     WHERE state = ?
                     ORDER BY created_at DESC
@@ -130,7 +129,7 @@ impl SessionStorage {
             None => (
                 r#"
                     SELECT session_id, intent_text, state, files_selected, created_at, updated_at,
-                           input_dir, error_message, pending_question_id
+                           input_dir, error_message
                     FROM cf_sessions
                     ORDER BY created_at DESC
                     LIMIT ?
@@ -154,7 +153,7 @@ impl SessionStorage {
         let sql = format!(
             r#"
             SELECT session_id, intent_text, state, files_selected, created_at, updated_at,
-                   input_dir, error_message, pending_question_id
+                   input_dir, error_message
             FROM cf_sessions
             WHERE state IN ({gate_values})
             ORDER BY created_at DESC
@@ -223,40 +222,6 @@ impl SessionStorage {
                 DbValue::from(session_id.to_string()),
             ],
         )?;
-
-        Ok(affected > 0)
-    }
-
-    /// Set pending question for a session at a gate.
-    pub fn set_pending_question(&self, session_id: SessionId, question_id: &str) -> Result<bool> {
-        let sql = r#"
-            UPDATE cf_sessions
-            SET pending_question_id = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-        "#;
-
-        let affected = self.conn.execute(
-            sql,
-            &[
-                DbValue::from(question_id),
-                DbValue::from(session_id.to_string()),
-            ],
-        )?;
-
-        Ok(affected > 0)
-    }
-
-    /// Clear pending question for a session.
-    pub fn clear_pending_question(&self, session_id: SessionId) -> Result<bool> {
-        let sql = r#"
-            UPDATE cf_sessions
-            SET pending_question_id = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-        "#;
-
-        let affected = self
-            .conn
-            .execute(sql, &[DbValue::from(session_id.to_string())])?;
 
         Ok(affected > 0)
     }
@@ -339,8 +304,7 @@ impl SessionStorage {
     ///
     /// Column order must match the SELECT statement:
     /// 0: session_id, 1: intent_text, 2: state, 3: files_selected,
-    /// 4: created_at, 5: updated_at, 6: input_dir, 7: error_message,
-    /// 8: pending_question_id
+    /// 4: created_at, 5: updated_at, 6: input_dir, 7: error_message
     fn row_to_session(&self, row: &UnifiedDbRow) -> Result<Session> {
         // Column 0: session_id
         let session_id_str: String = row.get(0)?;
@@ -377,9 +341,6 @@ impl SessionStorage {
         // Column 7: error_message (optional)
         let error_message: Option<String> = row.get(7).ok();
 
-        // Column 8: pending_question_id (optional)
-        let pending_question_id: Option<String> = row.get(8).ok();
-
         Ok(Session {
             session_id,
             intent_text,
@@ -389,7 +350,6 @@ impl SessionStorage {
             updated_at,
             input_dir,
             error_message,
-            pending_question_id,
         })
     }
 }

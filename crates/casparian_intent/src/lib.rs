@@ -3,7 +3,7 @@
 //! Canonical definitions for SessionId, IntentState, and workflow transitions.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
@@ -56,8 +56,7 @@ impl std::str::FromStr for SessionId {
 // ============================================================================
 
 /// Intent pipeline states (S0-S12) with gates (G1-G6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntentState {
     // ========== Processing States (S0-S12) ==========
     /// S0: Interpret the user's intent
@@ -327,6 +326,25 @@ impl IntentState {
     }
 }
 
+impl Serialize for IntentState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for IntentState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for IntentState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
@@ -532,8 +550,6 @@ pub struct Session {
     pub input_dir: Option<String>,
     /// Optional error message (only set when state is Failed)
     pub error_message: Option<String>,
-    /// ID of pending question if at a gate (only set when state is a gate)
-    pub pending_question_id: Option<String>,
 }
 
 impl Session {
@@ -672,6 +688,7 @@ mod tests {
     fn test_state_serde_roundtrip() {
         let state = IntentState::InferSchemaIntent;
         let encoded = serde_json::to_string(&state).unwrap();
+        assert_eq!(encoded, format!("\"{}\"", state.as_str()));
         let decoded: IntentState = serde_json::from_str(&encoded).unwrap();
         assert_eq!(state, decoded);
     }

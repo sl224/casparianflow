@@ -6,13 +6,17 @@ use std::path::PathBuf;
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 
 use casparian::scout::{SourceId, TaggingRuleId, Workspace, WorkspaceId};
+use casparian_intent::IntentState;
 
 use super::app::{
-    App, BacktestInfo, BoundFileInfo, BoundFileStatus, CommandPaletteMode, CommandPaletteState,
-    DiscoverFocus, DiscoverViewState, HomeStats, JobInfo, JobStatus, JobSummary, JobType,
-    JobsListSection, JobsViewState, ParserBenchState, ParserHealth, ParserInfo, PipelineStage,
-    PipelineState, QueryResults, QueryState, QueryViewState, RuleDialogFocus, RuleId, RuleInfo,
-    SettingsCategory, SettingsState, SourceInfo, TagInfo, TuiMode,
+    ApprovalDisplayStatus, ApprovalInfo, ApprovalOperationType, ApprovalStatusFilter,
+    ApprovalsViewState, App, BacktestInfo, BoundFileInfo, BoundFileStatus, CatalogTab,
+    CommandPaletteMode, CommandPaletteState, DeadLetterRow, DiscoverFocus, DiscoverViewState,
+    HomeStats, JobInfo, JobStatus, JobSummary, JobType, JobsListSection, JobsViewState,
+    ParserBenchState, ParserHealth, ParserInfo, PipelineInfo, PipelineRunInfo, PipelineStage,
+    PipelineState, QuarantineRow, QueryResults, QueryState, QueryViewState, RuleDialogFocus,
+    RuleId, RuleInfo, SavedQueriesState, SchemaMismatchRow, SessionInfo, SessionsViewState,
+    SettingsCategory, SettingsState, SourceInfo, TableBrowserState, TagInfo, TriageTab, TuiMode,
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
@@ -36,7 +40,7 @@ pub fn snapshot_cases() -> &'static [SnapshotCase] {
     &SNAPSHOT_CASES
 }
 
-const SNAPSHOT_CASES: [SnapshotCase; 15] = [
+const SNAPSHOT_CASES: [SnapshotCase; 19] = [
     SnapshotCase {
         name: "home_default",
         notes: "Home hub with seeded sources and recent jobs.",
@@ -84,6 +88,30 @@ const SNAPSHOT_CASES: [SnapshotCase; 15] = [
         notes: "Global Jobs drawer overlay open.",
         focus_hint: "Jobs drawer",
         build: case_jobs_drawer_open,
+    },
+    SnapshotCase {
+        name: "approvals_list_mixed",
+        notes: "Approvals view with mixed statuses.",
+        focus_hint: "Approvals list",
+        build: case_approvals_list_mixed,
+    },
+    SnapshotCase {
+        name: "sessions_list_pending_gate",
+        notes: "Sessions view showing pending gate workflows.",
+        focus_hint: "Sessions list",
+        build: case_sessions_list_pending_gate,
+    },
+    SnapshotCase {
+        name: "triage_quarantine_list",
+        notes: "Quarantine triage list with raw data preview.",
+        focus_hint: "Quarantine list",
+        build: case_triage_quarantine_list,
+    },
+    SnapshotCase {
+        name: "catalog_runs_list",
+        notes: "Pipeline runs catalog view.",
+        focus_hint: "Catalog list",
+        build: case_catalog_runs_list,
     },
     SnapshotCase {
         name: "query_editor_focused",
@@ -216,6 +244,50 @@ fn case_jobs_drawer_open() -> App {
     app
 }
 
+fn case_approvals_list_mixed() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Approvals;
+    app.approvals_state.view_state = ApprovalsViewState::List;
+    app.approvals_state.filter = ApprovalStatusFilter::All;
+    app.approvals_state.approvals = sample_approvals();
+    app.approvals_state.approvals_loaded = true;
+    app.approvals_state.selected_index = 0;
+    app
+}
+
+fn case_sessions_list_pending_gate() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sessions;
+    app.sessions_state.view_state = SessionsViewState::SessionList;
+    app.sessions_state.sessions = sample_sessions();
+    app.sessions_state.sessions_loaded = true;
+    app.sessions_state.selected_index = 0;
+    app
+}
+
+fn case_triage_quarantine_list() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Triage;
+    app.triage_state.tab = TriageTab::Quarantine;
+    app.triage_state.quarantine_rows = Some(sample_quarantine_rows());
+    app.triage_state.schema_mismatches = Some(sample_schema_mismatches());
+    app.triage_state.dead_letters = Some(sample_dead_letters());
+    app.triage_state.selected_index = 1;
+    app.triage_state.loaded = true;
+    app
+}
+
+fn case_catalog_runs_list() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Catalog;
+    app.catalog_state.tab = CatalogTab::Runs;
+    app.catalog_state.pipelines = Some(sample_pipelines());
+    app.catalog_state.runs = Some(sample_pipeline_runs());
+    app.catalog_state.selected_index = 0;
+    app.catalog_state.loaded = true;
+    app
+}
+
 fn case_query_editor_focused() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Query;
@@ -230,9 +302,12 @@ fn case_query_editor_focused() -> App {
         history_index: None,
         results: None,
         error: None,
+        status_message: None,
         executing: false,
         execution_time_ms: None,
         draft_input: None,
+        table_browser: TableBrowserState::default(),
+        saved_queries: SavedQueriesState::default(),
     };
     app
 }
@@ -253,9 +328,12 @@ fn case_query_results_table() -> App {
         history_index: None,
         results: Some(sample_query_results()),
         error: None,
+        status_message: None,
         executing: false,
         execution_time_ms: Some(128),
         draft_input: None,
+        table_browser: TableBrowserState::default(),
+        saved_queries: SavedQueriesState::default(),
     };
     app
 }
@@ -589,6 +667,184 @@ fn sample_pipeline() -> PipelineState {
         },
         active_parser: Some("trades_parser".to_string()),
     }
+}
+
+fn sample_approvals() -> Vec<ApprovalInfo> {
+    vec![
+        ApprovalInfo {
+            id: "apr-001".to_string(),
+            operation_type: ApprovalOperationType::Run,
+            plugin_ref: "parsers/trades_v1".to_string(),
+            summary: "Run trades parser on /data/trades".to_string(),
+            status: ApprovalDisplayStatus::Pending,
+            created_at: local_at(-15),
+            expires_at: local_at(45),
+            file_count: Some(1200),
+            input_dir: Some("/data/trades".to_string()),
+            job_id: None,
+        },
+        ApprovalInfo {
+            id: "apr-002".to_string(),
+            operation_type: ApprovalOperationType::SchemaPromote,
+            plugin_ref: "parsers/orders_v2".to_string(),
+            summary: "Promote schema v2 for orders".to_string(),
+            status: ApprovalDisplayStatus::Approved,
+            created_at: local_at(-120),
+            expires_at: local_at(-60),
+            file_count: None,
+            input_dir: None,
+            job_id: Some("job-4421".to_string()),
+        },
+        ApprovalInfo {
+            id: "apr-003".to_string(),
+            operation_type: ApprovalOperationType::Run,
+            plugin_ref: "parsers/hl7_v1".to_string(),
+            summary: "Backfill HL7 messages".to_string(),
+            status: ApprovalDisplayStatus::Rejected,
+            created_at: local_at(-300),
+            expires_at: local_at(-240),
+            file_count: Some(3400),
+            input_dir: Some("/data/hl7".to_string()),
+            job_id: None,
+        },
+    ]
+}
+
+fn sample_sessions() -> Vec<SessionInfo> {
+    vec![
+        SessionInfo {
+            id: "8f3b2c7a-1111-4d22-9a1b-acde00000001".to_string(),
+            intent: "Ingest trades from /data/trades".to_string(),
+            state: Some(IntentState::AwaitingSelectionApproval),
+            state_label: IntentState::AwaitingSelectionApproval.as_str().to_string(),
+            created_at: local_at(-5),
+            file_count: 1200,
+            pending_gate: Some("G1".to_string()),
+        },
+        SessionInfo {
+            id: "8f3b2c7a-1111-4d22-9a1b-acde00000002".to_string(),
+            intent: "Tag invoices by region".to_string(),
+            state: Some(IntentState::ProposeTagRules),
+            state_label: IntentState::ProposeTagRules.as_str().to_string(),
+            created_at: local_at(-45),
+            file_count: 340,
+            pending_gate: None,
+        },
+        SessionInfo {
+            id: "8f3b2c7a-1111-4d22-9a1b-acde00000003".to_string(),
+            intent: "Publish orders parser".to_string(),
+            state: Some(IntentState::Completed),
+            state_label: IntentState::Completed.as_str().to_string(),
+            created_at: local_at(-240),
+            file_count: 780,
+            pending_gate: None,
+        },
+    ]
+}
+
+fn sample_quarantine_rows() -> Vec<QuarantineRow> {
+    vec![
+        QuarantineRow {
+            id: 101,
+            job_id: 9104,
+            row_index: 42,
+            error_reason: "Invalid decimal in amount".to_string(),
+            raw_data: Some(b"{\"order_id\":42,\"amount\":\"oops\"}".to_vec()),
+            created_at: "2026-01-25T12:03:14Z".to_string(),
+        },
+        QuarantineRow {
+            id: 102,
+            job_id: 9104,
+            row_index: 108,
+            error_reason: "Missing required field: customer_id".to_string(),
+            raw_data: Some(b"{\"order_id\":108,\"amount\":19.5}".to_vec()),
+            created_at: "2026-01-25T12:03:19Z".to_string(),
+        },
+    ]
+}
+
+fn sample_schema_mismatches() -> Vec<SchemaMismatchRow> {
+    vec![SchemaMismatchRow {
+        id: 201,
+        job_id: 9103,
+        output_name: "orders".to_string(),
+        mismatch_kind: "type_mismatch".to_string(),
+        expected_name: Some("amount".to_string()),
+        actual_name: Some("amount".to_string()),
+        expected_type: Some("DECIMAL(10,2)".to_string()),
+        actual_type: Some("VARCHAR".to_string()),
+        expected_index: Some(3),
+        actual_index: Some(3),
+        created_at: "2026-01-25T12:05:00Z".to_string(),
+    }]
+}
+
+fn sample_dead_letters() -> Vec<DeadLetterRow> {
+    vec![DeadLetterRow {
+        id: 301,
+        original_job_id: 9102,
+        file_id: Some(5541),
+        plugin_name: "trades_parser".to_string(),
+        error_message: Some("Worker crash during parse".to_string()),
+        retry_count: 2,
+        moved_at: "2026-01-25T12:06:00Z".to_string(),
+        reason: Some("Exceeded retries".to_string()),
+    }]
+}
+
+fn sample_pipelines() -> Vec<PipelineInfo> {
+    vec![
+        PipelineInfo {
+            id: "pipe-001".to_string(),
+            name: "trades_daily".to_string(),
+            version: 3,
+            created_at: "2026-01-20T12:00:00Z".to_string(),
+        },
+        PipelineInfo {
+            id: "pipe-002".to_string(),
+            name: "orders_weekly".to_string(),
+            version: 1,
+            created_at: "2026-01-18T08:15:00Z".to_string(),
+        },
+    ]
+}
+
+fn sample_pipeline_runs() -> Vec<PipelineRunInfo> {
+    vec![
+        PipelineRunInfo {
+            id: "run-7781".to_string(),
+            pipeline_id: "pipe-001".to_string(),
+            pipeline_name: Some("trades_daily".to_string()),
+            pipeline_version: Some(3),
+            logical_date: "2026-01-25".to_string(),
+            status: "COMPLETED".to_string(),
+            selection_snapshot_hash: Some("ab12cd34".to_string()),
+            started_at: Some("2026-01-25T05:00:00Z".to_string()),
+            completed_at: Some("2026-01-25T05:06:12Z".to_string()),
+        },
+        PipelineRunInfo {
+            id: "run-7780".to_string(),
+            pipeline_id: "pipe-001".to_string(),
+            pipeline_name: Some("trades_daily".to_string()),
+            pipeline_version: Some(3),
+            logical_date: "2026-01-24".to_string(),
+            status: "FAILED".to_string(),
+            selection_snapshot_hash: Some("de45fa11".to_string()),
+            started_at: Some("2026-01-24T05:00:00Z".to_string()),
+            completed_at: Some("2026-01-24T05:02:44Z".to_string()),
+        },
+        PipelineRunInfo {
+            id: "run-6601".to_string(),
+            pipeline_id: "pipe-002".to_string(),
+            pipeline_name: Some("orders_weekly".to_string()),
+            pipeline_version: Some(1),
+            logical_date: "2026-01-19".to_string(),
+            status: "RUNNING".to_string(),
+            selection_snapshot_hash: None,
+            started_at: Some("2026-01-19T02:00:00Z".to_string()),
+            completed_at: None,
+        },
+    ]
 }
 
 fn sample_rules() -> Vec<RuleInfo> {

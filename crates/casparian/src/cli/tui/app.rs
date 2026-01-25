@@ -7,7 +7,11 @@
 #![allow(dead_code)]
 
 use casparian_db::{BackendError, DbConnection, DbValue};
-use casparian_mcp::intent::SessionStore;
+use casparian_intent::IntentState;
+use casparian_mcp::intent::{
+    ConfidenceLabel, Decision, DecisionRecord, DecisionTarget, NextAction, ProposalId,
+    SelectionProposal, SessionBundle, SessionId, SessionManifest, SessionStore,
+};
 use casparian_protocol::{
     Approval as ProtoApproval, ApprovalOperation, ApprovalStatus as ProtoApprovalStatus,
     JobStatus as ProtocolJobStatus, ProcessingStatus,
@@ -19,8 +23,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use tracing::info_span;
 
-use super::TuiArgs;
-use crate::cli::config::{active_db_path, default_db_backend, DbBackend};
+use super::{nav, TuiArgs};
+use crate::cli::config::{active_db_path, casparian_home, default_db_backend, DbBackend};
 use casparian::scout::{
     match_rules_to_files, patterns, scan_path, Database as ScoutDatabase, RuleApplyFile,
     RuleApplyRule, ScanCancelToken, ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source,
@@ -43,6 +47,8 @@ pub enum TuiMode {
     Query,       // SQL query console
     Settings,    // Application settings
     Sessions,    // Intent pipeline workflows
+    Triage,      // Quarantine + schema mismatch + dead-letter triage
+    Catalog,     // Pipelines + runs catalog
 }
 
 /// Focus area for global shell navigation
@@ -133,7 +139,8 @@ pub enum SessionsViewState {
 pub struct SessionInfo {
     pub id: String,
     pub intent: String, // "find all sales files"
-    pub state: String,  // current workflow state
+    pub state: Option<IntentState>, // current workflow state
+    pub state_label: String,
     pub created_at: DateTime<Local>,
     pub file_count: usize,
     pub pending_gate: Option<String>, // G1, G2, etc.
@@ -157,6 +164,11 @@ pub struct GateInfo {
     pub proposal_summary: String,
     pub evidence: Vec<String>,
     pub confidence: String, // LOW, MEDIUM, HIGH
+    pub selected_examples: Vec<String>,
+    pub near_miss_examples: Vec<String>,
+    pub next_actions: Vec<String>,
+    pub proposal_id: ProposalId,
+    pub approval_target_hash: String,
 }
 
 /// Confidence level for display
@@ -204,6 +216,8 @@ pub struct SessionsState {
     pub current_proposal: Option<ProposalInfo>,
     /// Pending gate awaiting approval
     pub pending_gate: Option<GateInfo>,
+    /// Newly created session to select after reload
+    pub pending_select_session_id: Option<String>,
     /// Whether sessions have been loaded from storage
     pub sessions_loaded: bool,
 }
@@ -237,6 +251,197 @@ impl SessionsState {
             self.view_state = SessionsViewState::SessionList;
         }
     }
+}
+
+// =============================================================================
+// Triage View Types (Quarantine + Schema Mismatch + Dead Letter)
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriageTab {
+    #[default]
+    Quarantine,
+    SchemaMismatch,
+    DeadLetter,
+}
+
+impl TriageTab {
+    pub fn next(&self) -> Self {
+        match self {
+            TriageTab::Quarantine => TriageTab::SchemaMismatch,
+            TriageTab::SchemaMismatch => TriageTab::DeadLetter,
+            TriageTab::DeadLetter => TriageTab::Quarantine,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            TriageTab::Quarantine => "Quarantine",
+            TriageTab::SchemaMismatch => "Schema Mismatch",
+            TriageTab::DeadLetter => "Dead Letter",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QuarantineRow {
+    pub id: i64,
+    pub job_id: i64,
+    pub row_index: i64,
+    pub error_reason: String,
+    pub raw_data: Option<Vec<u8>>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaMismatchRow {
+    pub id: i64,
+    pub job_id: i64,
+    pub output_name: String,
+    pub mismatch_kind: String,
+    pub expected_name: Option<String>,
+    pub actual_name: Option<String>,
+    pub expected_type: Option<String>,
+    pub actual_type: Option<String>,
+    pub expected_index: Option<i64>,
+    pub actual_index: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeadLetterRow {
+    pub id: i64,
+    pub original_job_id: i64,
+    pub file_id: Option<i64>,
+    pub plugin_name: String,
+    pub error_message: Option<String>,
+    pub retry_count: i64,
+    pub moved_at: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TriageState {
+    pub tab: TriageTab,
+    pub quarantine_rows: Option<Vec<QuarantineRow>>,
+    pub schema_mismatches: Option<Vec<SchemaMismatchRow>>,
+    pub dead_letters: Option<Vec<DeadLetterRow>>,
+    pub selected_index: usize,
+    pub previous_mode: Option<TuiMode>,
+    pub job_filter: Option<i64>,
+    pub loaded: bool,
+    pub copied_buffer: Option<String>,
+    pub status_message: Option<String>,
+}
+
+impl TriageState {
+    fn active_len(&self) -> usize {
+        match self.tab {
+            TriageTab::Quarantine => self.quarantine_rows.as_ref().map_or(0, |r| r.len()),
+            TriageTab::SchemaMismatch => self.schema_mismatches.as_ref().map_or(0, |r| r.len()),
+            TriageTab::DeadLetter => self.dead_letters.as_ref().map_or(0, |r| r.len()),
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.active_len();
+        if len == 0 {
+            self.selected_index = 0;
+        } else if self.selected_index >= len {
+            self.selected_index = len - 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TriageData {
+    quarantine_rows: Option<Vec<QuarantineRow>>,
+    schema_mismatches: Option<Vec<SchemaMismatchRow>>,
+    dead_letters: Option<Vec<DeadLetterRow>>,
+}
+
+// =============================================================================
+// Catalog View Types (Pipelines + Runs)
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogTab {
+    #[default]
+    Pipelines,
+    Runs,
+}
+
+impl CatalogTab {
+    pub fn next(&self) -> Self {
+        match self {
+            CatalogTab::Pipelines => CatalogTab::Runs,
+            CatalogTab::Runs => CatalogTab::Pipelines,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            CatalogTab::Pipelines => "Pipelines",
+            CatalogTab::Runs => "Runs",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineInfo {
+    pub id: String,
+    pub name: String,
+    pub version: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PipelineRunInfo {
+    pub id: String,
+    pub pipeline_id: String,
+    pub pipeline_name: Option<String>,
+    pub pipeline_version: Option<i64>,
+    pub logical_date: String,
+    pub status: String,
+    pub selection_snapshot_hash: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CatalogState {
+    pub tab: CatalogTab,
+    pub pipelines: Option<Vec<PipelineInfo>>,
+    pub runs: Option<Vec<PipelineRunInfo>>,
+    pub selected_index: usize,
+    pub previous_mode: Option<TuiMode>,
+    pub pending_select_run_id: Option<String>,
+    pub loaded: bool,
+    pub status_message: Option<String>,
+}
+
+impl CatalogState {
+    fn active_len(&self) -> usize {
+        match self.tab {
+            CatalogTab::Pipelines => self.pipelines.as_ref().map_or(0, |r| r.len()),
+            CatalogTab::Runs => self.runs.as_ref().map_or(0, |r| r.len()),
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.active_len();
+        if len == 0 {
+            self.selected_index = 0;
+        } else if self.selected_index >= len {
+            self.selected_index = len - 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CatalogData {
+    pipelines: Option<Vec<PipelineInfo>>,
+    runs: Option<Vec<PipelineRunInfo>>,
 }
 
 /// State for job queue mode (per jobs_redesign.md spec)
@@ -964,6 +1169,8 @@ pub struct SourcesState {
     pub edit_value: String,
     /// Whether showing delete confirmation
     pub confirm_delete: bool,
+    /// Previous app mode (for Esc navigation back to prior screen)
+    pub previous_mode: Option<TuiMode>,
 }
 
 // =============================================================================
@@ -1496,6 +1703,9 @@ impl CommandPaletteState {
                     ("/scan", "Scan a directory for files", "/scan"),
                     ("/query", "Query processed data", "/query"),
                     ("/approve", "Review and approve schemas", "/approve"),
+                    ("/quarantine", "Open quarantine explorer", "/quarantine"),
+                    ("/catalog", "Open pipelines catalog", "/catalog"),
+                    ("/pipelines", "Open pipelines catalog", "/pipelines"),
                     ("/jobs", "View job queue", "/jobs"),
                     ("/help", "Show help", "/help"),
                 ];
@@ -1511,26 +1721,12 @@ impl CommandPaletteState {
                 }
             }
             CommandPaletteMode::Navigation => {
-                let nav_items = [
-                    ("Home", "Return to home hub", TuiMode::Home),
-                    ("Discover", "File discovery and tagging", TuiMode::Discover),
-                    (
-                        "Parser Bench",
-                        "Parser development workbench",
-                        TuiMode::ParserBench,
-                    ),
-                    ("Jobs", "Job queue management", TuiMode::Jobs),
-                    ("Sources", "Sources management", TuiMode::Sources),
-                    ("Approvals", "MCP approval management", TuiMode::Approvals),
-                    ("Settings", "Application settings", TuiMode::Settings),
-                ];
-
-                for (name, desc, mode) in nav_items {
-                    if name.to_lowercase().contains(&input_lower) || self.input.is_empty() {
+                for item in nav::NAV_ITEMS {
+                    if item.label.to_lowercase().contains(&input_lower) || self.input.is_empty() {
                         self.suggestions.push(CommandSuggestion {
-                            text: name.to_string(),
-                            description: desc.to_string(),
-                            action: CommandAction::Navigate(mode),
+                            text: item.label.to_string(),
+                            description: item.description.to_string(),
+                            action: CommandAction::Navigate(item.mode),
                         });
                     }
                 }
@@ -1569,6 +1765,8 @@ pub enum QueryViewState {
     Editing, // Editing SQL in the editor
     Executing,      // Query is running
     ViewingResults, // Focus on results table
+    TableBrowser,   // Table list overlay
+    SavedQueries,   // Saved query picker
 }
 
 /// Query results from SQL execution
@@ -1588,6 +1786,28 @@ pub struct QueryResults {
     pub scroll_x: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TableBrowserState {
+    pub tables: Vec<String>,
+    pub selected_index: usize,
+    pub loaded: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SavedQueryEntry {
+    pub name: String,
+    pub path: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SavedQueriesState {
+    pub entries: Vec<SavedQueryEntry>,
+    pub selected_index: usize,
+    pub loaded: bool,
+    pub error: Option<String>,
+}
+
 /// State for Query mode (SQL query console)
 #[derive(Debug, Clone, Default)]
 pub struct QueryState {
@@ -1605,12 +1825,18 @@ pub struct QueryState {
     pub results: Option<QueryResults>,
     /// Error message from last query (None if successful)
     pub error: Option<String>,
+    /// Status/notice message (e.g., save confirmations)
+    pub status_message: Option<String>,
     /// Whether a query is currently executing
     pub executing: bool,
     /// Execution time in milliseconds (None if no query run)
     pub execution_time_ms: Option<u64>,
     /// Temporary storage for input when browsing history
     pub draft_input: Option<String>,
+    /// Table browser data
+    pub table_browser: TableBrowserState,
+    /// Saved queries data
+    pub saved_queries: SavedQueriesState,
 }
 
 impl QueryState {
@@ -2589,6 +2815,10 @@ pub struct App {
     pub settings: SettingsState,
     /// Sessions mode state (Intent Pipeline Workflow)
     pub sessions_state: SessionsState,
+    /// Triage mode state (Quarantine/Schema/Dead Letter)
+    pub triage_state: TriageState,
+    /// Catalog mode state (Pipelines/Runs)
+    pub catalog_state: CatalogState,
     /// Command palette overlay state
     pub command_palette: CommandPaletteState,
     /// Whether the Jobs drawer overlay is visible (toggle with J)
@@ -2649,6 +2879,10 @@ pub struct App {
     pending_approvals_load: Option<mpsc::Receiver<Result<Vec<ApprovalInfo>, String>>>,
     /// Pending sessions load (non-blocking file scan)
     pending_sessions_load: Option<mpsc::Receiver<Vec<SessionInfo>>>,
+    /// Pending triage load (non-blocking DB query)
+    pending_triage_load: Option<mpsc::Receiver<Result<TriageData, String>>>,
+    /// Pending catalog load (non-blocking DB query)
+    pending_catalog_load: Option<mpsc::Receiver<Result<CatalogData, String>>>,
     /// Last time jobs were polled (for incremental updates)
     last_jobs_poll: Option<std::time::Instant>,
     /// Profiler for frame timing and zone breakdown (F12 toggle)
@@ -2863,32 +3097,11 @@ impl App {
     }
 
     fn nav_index_for_mode(mode: TuiMode) -> usize {
-        match mode {
-            TuiMode::Home => 0,
-            TuiMode::Discover => 1,
-            TuiMode::ParserBench => 2,
-            TuiMode::Jobs => 3,
-            TuiMode::Sources => 4,
-            TuiMode::Approvals => 5,
-            TuiMode::Query => 6,
-            TuiMode::Settings => 7,
-            TuiMode::Sessions => 8,
-        }
+        nav::nav_index_for_mode(mode).unwrap_or(0)
     }
 
     fn nav_mode_for_index(index: usize) -> TuiMode {
-        match index {
-            0 => TuiMode::Home,
-            1 => TuiMode::Discover,
-            2 => TuiMode::ParserBench,
-            3 => TuiMode::Jobs,
-            4 => TuiMode::Sources,
-            5 => TuiMode::Approvals,
-            6 => TuiMode::Query,
-            7 => TuiMode::Settings,
-            8 => TuiMode::Sessions,
-            _ => TuiMode::Home,
-        }
+        nav::nav_mode_for_index(index)
     }
 
     fn set_mode(&mut self, mode: TuiMode) {
@@ -2911,6 +3124,9 @@ impl App {
                 self.set_mode(TuiMode::Jobs);
             }
             TuiMode::Sources => {
+                if self.mode != TuiMode::Sources {
+                    self.sources_state.previous_mode = Some(self.mode);
+                }
                 self.set_mode(TuiMode::Sources);
             }
             TuiMode::Approvals => {
@@ -2929,7 +3145,22 @@ impl App {
                 self.set_mode(TuiMode::Settings);
             }
             TuiMode::Sessions => {
+                if self.mode != TuiMode::Sessions {
+                    self.sessions_state.previous_mode = Some(self.mode);
+                }
                 self.set_mode(TuiMode::Sessions);
+            }
+            TuiMode::Triage => {
+                if self.mode != TuiMode::Triage {
+                    self.triage_state.previous_mode = Some(self.mode);
+                }
+                self.set_mode(TuiMode::Triage);
+            }
+            TuiMode::Catalog => {
+                if self.mode != TuiMode::Catalog {
+                    self.catalog_state.previous_mode = Some(self.mode);
+                }
+                self.set_mode(TuiMode::Catalog);
             }
             TuiMode::Home => {
                 self.set_mode(TuiMode::Home);
@@ -2959,6 +3190,8 @@ impl App {
             sources_state: SourcesState::default(),
             approvals_state: ApprovalsState::default(),
             query_state: QueryState::default(),
+            triage_state: TriageState::default(),
+            catalog_state: CatalogState::default(),
             jobs_drawer_open: false,
             jobs_drawer_selected: 0,
             sources_drawer_open: false,
@@ -2998,6 +3231,8 @@ impl App {
             pending_stats_load: None,
             pending_approvals_load: None,
             pending_sessions_load: None,
+            pending_triage_load: None,
+            pending_catalog_load: None,
             last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250), // 250ms frame budget
@@ -3264,63 +3499,19 @@ impl App {
                 self.profiler.enabled = !self.profiler.enabled;
                 return;
             }
-            // Discover Rule Builder shortcuts: [1]/[2] open local dropdowns
-            KeyCode::Char('1') | KeyCode::Char('2')
-                if self.mode == TuiMode::Discover
-                    && self.discover.view_state == DiscoverViewState::RuleBuilder
-                    && !self.in_text_input_mode() =>
-            {
-                match key.code {
-                    KeyCode::Char('1') => {
-                        self.transition_discover_state(DiscoverViewState::SourcesDropdown);
-                        self.discover.sources_filter.clear();
-                        self.discover.sources_filtering = false;
-                        self.discover.preview_source = Some(self.discover.selected_source_index());
-                    }
-                    KeyCode::Char('2') => {
-                        self.transition_discover_state(DiscoverViewState::TagsDropdown);
-                        self.discover.tags_filter.clear();
-                        self.discover.tags_filtering = false;
-                        self.discover.preview_tag = self.discover.selected_tag;
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            KeyCode::Char('1') | KeyCode::Char('2')
+            // Discover panel focus shortcuts: [1] Sources, [2] Tags, [3] Files
+            KeyCode::Char('1') | KeyCode::Char('2') | KeyCode::Char('3')
                 if self.mode == TuiMode::Discover
                     && !self.in_text_input_mode()
                     && matches!(
                         self.discover.view_state,
-                        DiscoverViewState::RuleBuilder | DiscoverViewState::Files
+                        DiscoverViewState::RuleBuilder
+                            | DiscoverViewState::Files
+                            | DiscoverViewState::SourcesDropdown
+                            | DiscoverViewState::TagsDropdown
                     ) =>
             {
-                match key.code {
-                    KeyCode::Char('1') => {
-                        self.transition_discover_state(DiscoverViewState::SourcesDropdown);
-                        self.discover.sources_filter.clear();
-                        self.discover.sources_filtering = false;
-                        self.discover.preview_source = Some(self.discover.selected_source_index());
-                    }
-                    KeyCode::Char('2') => {
-                        self.transition_discover_state(DiscoverViewState::TagsDropdown);
-                        self.discover.tags_filter.clear();
-                        self.discover.tags_filtering = false;
-                        self.discover.preview_tag = self.discover.selected_tag;
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            // Rule Builder shortcut: [3] focuses Files panel (no global nav)
-            KeyCode::Char('3')
-                if self.mode == TuiMode::Discover
-                    && !self.in_text_input_mode()
-                    && self.discover.view_state == DiscoverViewState::RuleBuilder =>
-            {
-                if let Some(ref mut builder) = self.discover.rule_builder {
-                    builder.focus = super::extraction::RuleBuilderFocus::FileList;
-                }
+                self.handle_discover_panel_shortcut(key.code);
                 return;
             }
             // ========== GLOBAL VIEW NAVIGATION (per keybinding matrix) ==========
@@ -3345,6 +3536,11 @@ impl App {
             // 4: Sources
             KeyCode::Char('4') if !self.in_text_input_mode() => {
                 self.navigate_to_mode(TuiMode::Sources);
+                return;
+            }
+            // 5: Approvals
+            KeyCode::Char('5') if !self.in_text_input_mode() => {
+                self.navigate_to_mode(TuiMode::Approvals);
                 return;
             }
             // 6: Query Console
@@ -3556,7 +3752,7 @@ impl App {
 
         if !self.in_text_input_mode() {
             if self.shell_focus == ShellFocus::Rail {
-                let max_index = Self::nav_index_for_mode(TuiMode::Settings);
+                let max_index = nav::nav_max_index();
                 match key.code {
                     KeyCode::Up => {
                         if self.nav_selected > 0 {
@@ -3604,6 +3800,8 @@ impl App {
             TuiMode::Query => self.handle_query_key(key),
             TuiMode::Settings => self.handle_settings_key(key),
             TuiMode::Sessions => self.handle_sessions_key(key),
+            TuiMode::Triage => self.handle_triage_key(key),
+            TuiMode::Catalog => self.handle_catalog_key(key),
         }
     }
 
@@ -3620,15 +3818,34 @@ impl App {
                 }
             }
             QueryViewState::ViewingResults => self.handle_query_results_key(key),
+            QueryViewState::TableBrowser => self.handle_query_table_browser_key(key),
+            QueryViewState::SavedQueries => self.handle_query_saved_queries_key(key),
         }
     }
 
     /// Handle keys when in query editing mode
     fn handle_query_editing_key(&mut self, key: KeyEvent) {
+        if self.query_state.status_message.is_some() {
+            self.query_state.status_message = None;
+        }
         match key.code {
             // Ctrl+Enter = execute query
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.execute_query();
+            }
+            // Ctrl+T = open table browser
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.load_table_browser();
+                self.query_state.view_state = QueryViewState::TableBrowser;
+            }
+            // Ctrl+S = save query
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.save_query_to_disk();
+            }
+            // Ctrl+O = open saved query list
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.load_saved_queries();
+                self.query_state.view_state = QueryViewState::SavedQueries;
             }
             // Ctrl+L = clear input
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3772,6 +3989,198 @@ impl App {
         }
     }
 
+    fn handle_query_table_browser_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.query_state.view_state = QueryViewState::Editing;
+            }
+            KeyCode::Up => {
+                if self.query_state.table_browser.selected_index > 0 {
+                    self.query_state.table_browser.selected_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.query_state.table_browser.selected_index + 1
+                    < self.query_state.table_browser.tables.len()
+                {
+                    self.query_state.table_browser.selected_index += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(table) = self
+                    .query_state
+                    .table_browser
+                    .tables
+                    .get(self.query_state.table_browser.selected_index)
+                {
+                    self.query_state.sql_input.insert_str(
+                        self.query_state.cursor_position,
+                        table.as_str(),
+                    );
+                    self.query_state.cursor_position += table.len();
+                }
+                self.query_state.view_state = QueryViewState::Editing;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_query_saved_queries_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.query_state.view_state = QueryViewState::Editing;
+            }
+            KeyCode::Up => {
+                if self.query_state.saved_queries.selected_index > 0 {
+                    self.query_state.saved_queries.selected_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if self.query_state.saved_queries.selected_index + 1
+                    < self.query_state.saved_queries.entries.len()
+                {
+                    self.query_state.saved_queries.selected_index += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = self
+                    .query_state
+                    .saved_queries
+                    .entries
+                    .get(self.query_state.saved_queries.selected_index)
+                {
+                    match std::fs::read_to_string(&entry.path) {
+                        Ok(sql) => {
+                            self.query_state.sql_input = sql;
+                            self.query_state.cursor_position = self.query_state.sql_input.len();
+                            self.query_state.error = None;
+                            self.query_state.results = None;
+                            self.query_state.view_state = QueryViewState::Editing;
+                        }
+                        Err(err) => {
+                            self.query_state.status_message =
+                                Some(format!("Load failed: {}", err));
+                        }
+                    }
+                } else {
+                    self.query_state.view_state = QueryViewState::Editing;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn load_table_browser(&mut self) {
+        self.query_state.table_browser.tables.clear();
+        self.query_state.table_browser.selected_index = 0;
+        self.query_state.table_browser.error = None;
+
+        let (backend, db_path) = self.resolve_db_target();
+        if !db_path.exists() {
+            self.query_state.table_browser.error = Some("Database not found".to_string());
+            return;
+        }
+
+        let conn = match App::open_db_readonly_with(backend, &db_path) {
+            Ok(Some(conn)) => conn,
+            Ok(None) => {
+                self.query_state.table_browser.error =
+                    Some("Database not available".to_string());
+                return;
+            }
+            Err(err) => {
+                self.query_state.table_browser.error =
+                    Some(format!("Database open failed: {}", err));
+                return;
+            }
+        };
+
+        let rows = match conn.query_all(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+             ORDER BY table_name",
+            &[],
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                self.query_state.table_browser.error =
+                    Some(format!("Table list failed: {}", err));
+                return;
+            }
+        };
+
+        for row in rows {
+            if let Ok(name) = row.get::<String>(0) {
+                self.query_state.table_browser.tables.push(name);
+            }
+        }
+        self.query_state.table_browser.loaded = true;
+    }
+
+    fn load_saved_queries(&mut self) {
+        self.query_state.saved_queries.entries.clear();
+        self.query_state.saved_queries.selected_index = 0;
+        self.query_state.saved_queries.error = None;
+
+        let dir = casparian_home().join("queries");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.query_state.saved_queries.error =
+                Some(format!("Create queries dir failed: {}", err));
+            return;
+        }
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.query_state.saved_queries.error =
+                    Some(format!("Read queries dir failed: {}", err));
+                return;
+            }
+        };
+
+        let mut list: Vec<SavedQueryEntry> = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().map(|e| e == "sql").unwrap_or(false))
+            .map(|entry| SavedQueryEntry {
+                name: entry
+                    .path()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("query.sql")
+                    .to_string(),
+                path: entry.path(),
+            })
+            .collect();
+
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        self.query_state.saved_queries.entries = list;
+        self.query_state.saved_queries.loaded = true;
+    }
+
+    fn save_query_to_disk(&mut self) {
+        let sql = self.query_state.sql_input.trim();
+        if sql.is_empty() {
+            self.query_state.status_message = Some("Nothing to save".to_string());
+            return;
+        }
+
+        let dir = casparian_home().join("queries");
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.query_state.status_message = Some(format!("Save failed: {}", err));
+            return;
+        }
+
+        let filename = format!("query_{}.sql", Local::now().format("%Y%m%d_%H%M%S"));
+        let path = dir.join(&filename);
+        if let Err(err) = std::fs::write(&path, sql) {
+            self.query_state.status_message = Some(format!("Save failed: {}", err));
+            return;
+        }
+
+        self.query_state.status_message = Some(format!("Saved {}", filename));
+        self.query_state.saved_queries.loaded = false;
+    }
+
     /// Execute the current SQL query
     fn execute_query(&mut self) {
         // Clone the SQL to avoid borrow issues
@@ -3881,6 +4290,43 @@ impl App {
         }
     }
 
+    fn handle_discover_panel_shortcut(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('1') => {
+                self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                self.discover.sources_filter.clear();
+                self.discover.sources_filtering = false;
+                self.discover.preview_source = Some(self.discover.selected_source_index());
+            }
+            KeyCode::Char('2') => {
+                self.transition_discover_state(DiscoverViewState::TagsDropdown);
+                self.discover.tags_filter.clear();
+                self.discover.tags_filtering = false;
+                self.discover.preview_tag = self.discover.selected_tag;
+            }
+            KeyCode::Char('3') => {
+                if matches!(
+                    self.discover.view_state,
+                    DiscoverViewState::SourcesDropdown | DiscoverViewState::TagsDropdown
+                ) {
+                    self.return_to_previous_discover_state();
+                }
+                match self.discover.view_state {
+                    DiscoverViewState::RuleBuilder => {
+                        if let Some(ref mut builder) = self.discover.rule_builder {
+                            builder.focus = super::extraction::RuleBuilderFocus::FileList;
+                        }
+                    }
+                    DiscoverViewState::Files => {}
+                    _ => {
+                        self.discover.view_state = DiscoverViewState::Files;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Handle command palette key events
     fn handle_command_palette_key(&mut self, key: KeyEvent) {
         match key.code {
@@ -3899,20 +4345,29 @@ impl App {
                             // Add to history before closing
                             self.command_palette.add_to_history(intent.clone());
                             self.command_palette.close();
-                            // Start the intent session - navigate to Discover/Sessions
-                            // For now, just navigate to Discover mode where intents will be processed
-                            self.navigate_to_mode(TuiMode::Discover);
-                            // TODO: Integrate with actual intent pipeline
-                            self.discover.status_message = Some((
-                                format!("Intent: \"{}\" - Pipeline integration pending", intent),
-                                false,
-                            ));
+                            match self.create_intent_session(&intent) {
+                                Ok(session_id) => {
+                                    self.sessions_state.pending_select_session_id =
+                                        Some(session_id);
+                                    self.sessions_state.sessions_loaded = false;
+                                    self.sessions_state.view_state = SessionsViewState::SessionList;
+                                    self.sessions_state.active_session = None;
+                                    self.navigate_to_mode(TuiMode::Sessions);
+                                }
+                                Err(err) => {
+                                    tracing::error!("{}", err);
+                                }
+                            }
                         }
                         CommandAction::RunCommand(cmd) => {
                             self.command_palette.close();
                             // Handle slash commands
                             match cmd.as_str() {
                                 "/jobs" => self.navigate_to_mode(TuiMode::Jobs),
+                                "/approve" => self.navigate_to_mode(TuiMode::Approvals),
+                                "/query" => self.navigate_to_mode(TuiMode::Query),
+                                "/quarantine" => self.open_triage(None),
+                                "/catalog" | "/pipelines" => self.open_catalog(None),
                                 "/scan" => {
                                     self.navigate_to_mode(TuiMode::Discover);
                                     self.transition_discover_state(DiscoverViewState::EnteringPath);
@@ -3968,6 +4423,15 @@ impl App {
             _ => {}
         }
     }
+
+    fn create_intent_session(&self, intent: &str) -> Result<String, String> {
+        let store = SessionStore::with_root(casparian_home().join("sessions"));
+        match store.create_session(intent, Some("tui"), Some("tui")) {
+            Ok(bundle) => Ok(bundle.session_id.to_string()),
+            Err(err) => Err(format!("Session create failed: {}", err)),
+        }
+    }
+
     /// Handle Discover mode keys - using unified state machine
     fn handle_discover_key(&mut self, key: KeyEvent) {
         // Clear status message on any key press
@@ -5273,6 +5737,10 @@ impl App {
                 // Enter filter mode
                 self.discover.sources_filtering = true;
             }
+            KeyCode::Char('3') => {
+                self.return_to_previous_discover_state();
+                self.handle_discover_panel_shortcut(KeyCode::Char('3'));
+            }
             KeyCode::Char('s') => {
                 // Open scan dialog to add new source
                 self.discover.view_state = DiscoverViewState::Files;
@@ -5422,6 +5890,10 @@ impl App {
             KeyCode::Char('/') => {
                 // Enter filter mode
                 self.discover.tags_filtering = true;
+            }
+            KeyCode::Char('3') => {
+                self.return_to_previous_discover_state();
+                self.handle_discover_panel_shortcut(KeyCode::Char('3'));
             }
             KeyCode::Enter => {
                 // Confirm selection, close dropdown, return to Rule Builder
@@ -7765,6 +8237,12 @@ impl App {
                 // Mark sessions as needing refresh
                 self.sessions_state.sessions_loaded = false;
             }
+            TuiMode::Triage => {
+                self.triage_state.loaded = false;
+            }
+            TuiMode::Catalog => {
+                self.catalog_state.loaded = false;
+            }
         }
     }
 
@@ -10017,6 +10495,12 @@ impl App {
                     Err(err) => return Err(format!("Database open failed: {}", err)),
                 };
 
+                let has_queue = App::table_exists(&conn, "cf_processing_queue")
+                    .map_err(|err| format!("Jobs schema check failed: {}", err))?;
+                if !has_queue {
+                    return Ok(Vec::new());
+                }
+
                 let has_pipeline_runs = App::table_exists(&conn, "cf_pipeline_runs")
                     .map_err(|err| format!("Jobs schema check failed: {}", err))?;
                 let has_quarantine_column =
@@ -10305,35 +10789,43 @@ impl App {
                     .map_err(|err| format!("Stats query failed: {}", err))?;
                 stats.source_count = count as usize;
 
-                let rows = conn
-                    .query_all(
-                        "SELECT status, COUNT(*) as cnt FROM cf_processing_queue GROUP BY status",
-                        &[],
-                    )
-                    .map_err(|err| format!("Stats query failed: {}", err))?;
-                for row in rows {
-                    let status: String = row
-                        .get(0)
-                        .map_err(|e| format!("Stats parse failed: {}", e))?;
-                    let count: i64 = row
-                        .get(1)
-                        .map_err(|e| format!("Stats parse failed: {}", e))?;
-                    if let Ok(queue_status) = status.parse::<ProcessingStatus>() {
-                        match queue_status {
-                            ProcessingStatus::Running => stats.running_jobs = count as usize,
-                            ProcessingStatus::Queued => stats.pending_jobs = count as usize,
-                            ProcessingStatus::Failed | ProcessingStatus::Aborted => {
-                                stats.failed_jobs = count as usize
+                let has_queue = App::table_exists(&conn, "cf_processing_queue")
+                    .map_err(|err| format!("Stats schema check failed: {}", err))?;
+                if has_queue {
+                    let rows = conn
+                        .query_all(
+                            "SELECT status, COUNT(*) as cnt FROM cf_processing_queue GROUP BY status",
+                            &[],
+                        )
+                        .map_err(|err| format!("Stats query failed: {}", err))?;
+                    for row in rows {
+                        let status: String = row
+                            .get(0)
+                            .map_err(|e| format!("Stats parse failed: {}", e))?;
+                        let count: i64 = row
+                            .get(1)
+                            .map_err(|e| format!("Stats parse failed: {}", e))?;
+                        if let Ok(queue_status) = status.parse::<ProcessingStatus>() {
+                            match queue_status {
+                                ProcessingStatus::Running => stats.running_jobs = count as usize,
+                                ProcessingStatus::Queued => stats.pending_jobs = count as usize,
+                                ProcessingStatus::Failed | ProcessingStatus::Aborted => {
+                                    stats.failed_jobs = count as usize
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
 
-                let count = conn
-                    .query_scalar::<i64>("SELECT COUNT(*) FROM cf_plugin_manifest", &[])
-                    .map_err(|err| format!("Stats query failed: {}", err))?;
-                stats.parser_count = count as usize;
+                let has_manifest = App::table_exists(&conn, "cf_plugin_manifest")
+                    .map_err(|err| format!("Stats schema check failed: {}", err))?;
+                if has_manifest {
+                    let count = conn
+                        .query_scalar::<i64>("SELECT COUNT(*) FROM cf_plugin_manifest", &[])
+                        .map_err(|err| format!("Stats query failed: {}", err))?;
+                    stats.parser_count = count as usize;
+                }
 
                 Ok(stats)
             })();
@@ -10372,7 +10864,7 @@ impl App {
                 let has_table = App::table_exists(&conn, "cf_api_approvals")
                     .map_err(|err| format!("Approvals schema check failed: {}", err))?;
                 if !has_table {
-                    return Err("Approvals table missing. Reset DB or run sentinel.".to_string());
+                    return Ok(Vec::new());
                 }
 
                 let query = r#"
@@ -10499,31 +10991,19 @@ impl App {
             for session_id in session_ids {
                 if let Ok(bundle) = store.get_session(session_id) {
                     if let Ok(manifest) = bundle.read_manifest() {
-                        // Determine pending gate from state
-                        let pending_gate = match manifest.state.as_str() {
-                            "interpret_intent" => None,
-                            "propose_selection" => None,
-                            "await_selection_approval" => Some("G1".to_string()),
-                            "propose_tags" => None,
-                            "await_tags_approval" => Some("G2".to_string()),
-                            "analyze_paths" => None,
-                            "await_path_fields_approval" => Some("G3".to_string()),
-                            "infer_schema" => None,
-                            "await_schema_approval" => Some("G4".to_string()),
-                            "generate_parser" => None,
-                            "backtest" => None,
-                            "await_publish_approval" => Some("G5".to_string()),
-                            "plan_run" => None,
-                            "await_run_approval" => Some("G6".to_string()),
-                            "complete" => None,
-                            "failed" => None,
-                            _ => None,
-                        };
+                        let parsed_state = manifest.state.parse::<IntentState>().ok();
+                        let state_label = parsed_state
+                            .map(|state| state.as_str().to_string())
+                            .unwrap_or_else(|| manifest.state.clone());
+                        let pending_gate = parsed_state
+                            .and_then(|state| state.gate_number())
+                            .map(|gate| format!("G{}", gate));
 
                         sessions.push(SessionInfo {
                             id: session_id.to_string(),
                             intent: manifest.intent_text,
-                            state: manifest.state,
+                            state: parsed_state,
+                            state_label,
                             created_at: manifest.created_at.with_timezone(&Local),
                             file_count: 0, // Would need to check corpus
                             pending_gate,
@@ -10536,6 +11016,277 @@ impl App {
             sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
             let _ = tx.send(sessions);
+        });
+    }
+
+    fn start_triage_load(&mut self) {
+        if self.pending_triage_load.is_some() {
+            return;
+        }
+
+        let (backend, db_path) = self.resolve_db_target();
+        if !db_path.exists() {
+            self.triage_state.loaded = true;
+            return;
+        }
+
+        let job_filter = self.triage_state.job_filter;
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_triage_load = Some(rx);
+
+        std::thread::spawn(move || {
+            let result: Result<TriageData, String> = (|| {
+                let conn = match App::open_db_readonly_with(backend, &db_path) {
+                    Ok(Some(conn)) => conn,
+                    Ok(None) => return Err("Database not available".to_string()),
+                    Err(err) => return Err(format!("Database open failed: {}", err)),
+                };
+
+                let quarantine_rows = if App::table_exists(&conn, "cf_quarantine")
+                    .map_err(|err| format!("Triage schema check failed: {}", err))?
+                {
+                    let mut rows = Vec::new();
+                    let (query, params) = if let Some(job_id) = job_filter {
+                        (
+                            "SELECT id, job_id, row_index, error_reason, raw_data, created_at \
+                             FROM cf_quarantine WHERE job_id = ? ORDER BY created_at DESC LIMIT 500",
+                            vec![DbValue::from(job_id)],
+                        )
+                    } else {
+                        (
+                            "SELECT id, job_id, row_index, error_reason, raw_data, created_at \
+                             FROM cf_quarantine ORDER BY created_at DESC LIMIT 500",
+                            Vec::new(),
+                        )
+                    };
+                    let result_rows = conn
+                        .query_all(query, &params)
+                        .map_err(|err| format!("Quarantine query failed: {}", err))?;
+                    for row in result_rows {
+                        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                        let job_id: i64 = row.get(1).map_err(|e| e.to_string())?;
+                        let row_index: i64 = row.get(2).map_err(|e| e.to_string())?;
+                        let error_reason: String = row.get(3).map_err(|e| e.to_string())?;
+                        let raw_data: Option<Vec<u8>> = row.get(4).ok().flatten();
+                        let created_at: Option<String> = row.get(5).ok().flatten();
+                        rows.push(QuarantineRow {
+                            id,
+                            job_id,
+                            row_index,
+                            error_reason,
+                            raw_data,
+                            created_at: created_at.unwrap_or_else(|| "-".to_string()),
+                        });
+                    }
+                    Some(rows)
+                } else {
+                    None
+                };
+
+                let schema_mismatches = if App::table_exists(&conn, "cf_job_schema_mismatch")
+                    .map_err(|err| format!("Triage schema check failed: {}", err))?
+                {
+                    let mut rows = Vec::new();
+                    let (query, params) = if let Some(job_id) = job_filter {
+                        (
+                            "SELECT id, job_id, output_name, mismatch_kind, expected_name, actual_name, \
+                             expected_type, actual_type, expected_index, actual_index, created_at \
+                             FROM cf_job_schema_mismatch WHERE job_id = ? ORDER BY created_at DESC LIMIT 500",
+                            vec![DbValue::from(job_id)],
+                        )
+                    } else {
+                        (
+                            "SELECT id, job_id, output_name, mismatch_kind, expected_name, actual_name, \
+                             expected_type, actual_type, expected_index, actual_index, created_at \
+                             FROM cf_job_schema_mismatch ORDER BY created_at DESC LIMIT 500",
+                            Vec::new(),
+                        )
+                    };
+                    let result_rows = conn
+                        .query_all(query, &params)
+                        .map_err(|err| format!("Schema mismatch query failed: {}", err))?;
+                    for row in result_rows {
+                        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                        let job_id: i64 = row.get(1).map_err(|e| e.to_string())?;
+                        let output_name: String = row.get(2).map_err(|e| e.to_string())?;
+                        let mismatch_kind: String = row.get(3).map_err(|e| e.to_string())?;
+                        let expected_name: Option<String> = row.get(4).ok().flatten();
+                        let actual_name: Option<String> = row.get(5).ok().flatten();
+                        let expected_type: Option<String> = row.get(6).ok().flatten();
+                        let actual_type: Option<String> = row.get(7).ok().flatten();
+                        let expected_index: Option<i64> = row.get(8).ok().flatten();
+                        let actual_index: Option<i64> = row.get(9).ok().flatten();
+                        let created_at: Option<String> = row.get(10).ok().flatten();
+                        rows.push(SchemaMismatchRow {
+                            id,
+                            job_id,
+                            output_name,
+                            mismatch_kind,
+                            expected_name,
+                            actual_name,
+                            expected_type,
+                            actual_type,
+                            expected_index,
+                            actual_index,
+                            created_at: created_at.unwrap_or_else(|| "-".to_string()),
+                        });
+                    }
+                    Some(rows)
+                } else {
+                    None
+                };
+
+                let dead_letters = if App::table_exists(&conn, "cf_dead_letter")
+                    .map_err(|err| format!("Triage schema check failed: {}", err))?
+                {
+                    let mut rows = Vec::new();
+                    let (query, params) = if let Some(job_id) = job_filter {
+                        (
+                            "SELECT id, original_job_id, file_id, plugin_name, error_message, retry_count, moved_at, reason \
+                             FROM cf_dead_letter WHERE original_job_id = ? ORDER BY moved_at DESC LIMIT 500",
+                            vec![DbValue::from(job_id)],
+                        )
+                    } else {
+                        (
+                            "SELECT id, original_job_id, file_id, plugin_name, error_message, retry_count, moved_at, reason \
+                             FROM cf_dead_letter ORDER BY moved_at DESC LIMIT 500",
+                            Vec::new(),
+                        )
+                    };
+                    let result_rows = conn
+                        .query_all(query, &params)
+                        .map_err(|err| format!("Dead letter query failed: {}", err))?;
+                    for row in result_rows {
+                        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                        let original_job_id: i64 = row.get(1).map_err(|e| e.to_string())?;
+                        let file_id: Option<i64> = row.get(2).ok().flatten();
+                        let plugin_name: String = row.get(3).map_err(|e| e.to_string())?;
+                        let error_message: Option<String> = row.get(4).ok().flatten();
+                        let retry_count: i64 = row.get(5).map_err(|e| e.to_string())?;
+                        let moved_at: Option<String> = row.get(6).ok().flatten();
+                        let reason: Option<String> = row.get(7).ok().flatten();
+                        rows.push(DeadLetterRow {
+                            id,
+                            original_job_id,
+                            file_id,
+                            plugin_name,
+                            error_message,
+                            retry_count,
+                            moved_at: moved_at.unwrap_or_else(|| "-".to_string()),
+                            reason,
+                        });
+                    }
+                    Some(rows)
+                } else {
+                    None
+                };
+
+                Ok(TriageData {
+                    quarantine_rows,
+                    schema_mismatches,
+                    dead_letters,
+                })
+            })();
+
+            let _ = tx.send(result);
+        });
+    }
+
+    fn start_catalog_load(&mut self) {
+        if self.pending_catalog_load.is_some() {
+            return;
+        }
+
+        let (backend, db_path) = self.resolve_db_target();
+        if !db_path.exists() {
+            self.catalog_state.loaded = true;
+            return;
+        }
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_catalog_load = Some(rx);
+
+        std::thread::spawn(move || {
+            let result: Result<CatalogData, String> = (|| {
+                let conn = match App::open_db_readonly_with(backend, &db_path) {
+                    Ok(Some(conn)) => conn,
+                    Ok(None) => return Err("Database not available".to_string()),
+                    Err(err) => return Err(format!("Database open failed: {}", err)),
+                };
+
+                let pipelines = if App::table_exists(&conn, "cf_pipelines")
+                    .map_err(|err| format!("Catalog schema check failed: {}", err))?
+                {
+                    let mut rows_out = Vec::new();
+                    let rows = conn
+                        .query_all(
+                            "SELECT id, name, version, created_at FROM cf_pipelines \
+                             ORDER BY created_at DESC LIMIT 200",
+                            &[],
+                        )
+                        .map_err(|err| format!("Pipelines query failed: {}", err))?;
+                    for row in rows {
+                        let id: String = row.get(0).map_err(|e| e.to_string())?;
+                        let name: String = row.get(1).map_err(|e| e.to_string())?;
+                        let version: i64 = row.get(2).map_err(|e| e.to_string())?;
+                        let created_at: Option<String> = row.get(3).ok().flatten();
+                        rows_out.push(PipelineInfo {
+                            id,
+                            name,
+                            version,
+                            created_at: created_at.unwrap_or_else(|| "-".to_string()),
+                        });
+                    }
+                    Some(rows_out)
+                } else {
+                    None
+                };
+
+                let runs = if App::table_exists(&conn, "cf_pipeline_runs")
+                    .map_err(|err| format!("Catalog schema check failed: {}", err))?
+                {
+                    let mut rows_out = Vec::new();
+                    let rows = conn
+                        .query_all(
+                            "SELECT pr.id, pr.pipeline_id, p.name, p.version, pr.logical_date, \
+                             pr.status, pr.selection_snapshot_hash, pr.started_at, pr.completed_at \
+                             FROM cf_pipeline_runs pr \
+                             LEFT JOIN cf_pipelines p ON p.id = pr.pipeline_id \
+                             ORDER BY pr.created_at DESC LIMIT 200",
+                            &[],
+                        )
+                        .map_err(|err| format!("Pipeline runs query failed: {}", err))?;
+                    for row in rows {
+                        let id: String = row.get(0).map_err(|e| e.to_string())?;
+                        let pipeline_id: String = row.get(1).map_err(|e| e.to_string())?;
+                        let pipeline_name: Option<String> = row.get(2).ok().flatten();
+                        let pipeline_version: Option<i64> = row.get(3).ok().flatten();
+                        let logical_date: String = row.get(4).map_err(|e| e.to_string())?;
+                        let status: String = row.get(5).map_err(|e| e.to_string())?;
+                        let selection_snapshot_hash: Option<String> = row.get(6).ok().flatten();
+                        let started_at: Option<String> = row.get(7).ok().flatten();
+                        let completed_at: Option<String> = row.get(8).ok().flatten();
+                        rows_out.push(PipelineRunInfo {
+                            id,
+                            pipeline_id,
+                            pipeline_name,
+                            pipeline_version,
+                            logical_date,
+                            status,
+                            selection_snapshot_hash,
+                            started_at,
+                            completed_at,
+                        });
+                    }
+                    Some(rows_out)
+                } else {
+                    None
+                };
+
+                Ok(CatalogData { pipelines, runs })
+            })();
+
+            let _ = tx.send(result);
         });
     }
 
@@ -11026,7 +11777,7 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                if let Some(prev_mode) = self.jobs_state.previous_mode.take() {
+                if let Some(prev_mode) = self.sources_state.previous_mode.take() {
                     self.set_mode(prev_mode);
                 } else {
                     self.set_mode(TuiMode::Home);
@@ -11322,22 +12073,41 @@ impl App {
                 self.jobs_state.clamp_selection();
             }
             // Toggle pipeline summary
-            KeyCode::Char('P') => {
+            KeyCode::Char('p') => {
                 self.jobs_state.show_pipeline = !self.jobs_state.show_pipeline;
+            }
+            // Open quarantine/triage view for selected job
+            KeyCode::Char('Q') => {
+                let jobs = self.jobs_state.focused_jobs();
+                let job_id = jobs.get(self.jobs_state.selected_index).map(|job| job.id);
+                self.open_triage(job_id);
             }
             // Open monitoring panel
             KeyCode::Char('m') => {
                 self.jobs_state
                     .transition_state(JobsViewState::MonitoringPanel);
             }
+            // Open pipeline catalog for selected run
+            KeyCode::Char('C') => {
+                let jobs = self.jobs_state.focused_jobs();
+                let run_id = jobs
+                    .get(self.jobs_state.selected_index)
+                    .and_then(|job| job.pipeline_run_id.clone());
+                self.open_catalog(run_id);
+            }
             // f: Open filter dialog (per keybinding matrix - keys 1-4 are reserved for navigation)
             KeyCode::Char('f') => {
                 self.jobs_state
                     .transition_state(JobsViewState::FilterDialog);
             }
-            // Quick filter reset (0 still works as a shortcut)
-            KeyCode::Char('0') => {
-                self.jobs_state.set_filter(None); // Show all
+            // Clear filters when active
+            KeyCode::Backspace | KeyCode::Delete => {
+                if self.jobs_state.status_filter.is_some() || self.jobs_state.type_filter.is_some()
+                {
+                    self.jobs_state.status_filter = None;
+                    self.jobs_state.type_filter = None;
+                    self.jobs_state.clamp_selection();
+                }
             }
             // Go to first job
             KeyCode::Char('g') => {
@@ -11676,6 +12446,192 @@ impl App {
         // TODO: Persist to config.toml
     }
 
+    fn load_pending_gate_info(
+        &self,
+        session_id: &str,
+        gate_id: &str,
+    ) -> Result<GateInfo, String> {
+        let session_id: SessionId = session_id
+            .parse()
+            .map_err(|err| format!("Invalid session id: {}", err))?;
+        let store = SessionStore::with_root(casparian_home().join("sessions"));
+        let bundle = store
+            .get_session(session_id)
+            .map_err(|err| format!("Failed to load session: {}", err))?;
+        let manifest = bundle
+            .read_manifest()
+            .map_err(|err| format!("Failed to read manifest: {}", err))?;
+
+        match gate_id {
+            "G1" => self.build_selection_gate_info(&bundle, &manifest),
+            _ => Err(format!("Gate {} not supported yet", gate_id)),
+        }
+    }
+
+    fn build_selection_gate_info(
+        &self,
+        bundle: &SessionBundle,
+        manifest: &SessionManifest,
+    ) -> Result<GateInfo, String> {
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .rev()
+            .find(|artifact| artifact.kind == "selection")
+            .ok_or_else(|| "No selection proposal found".to_string())?;
+        let path = bundle.session_dir().join(&artifact.reference);
+        let content =
+            std::fs::read_to_string(&path).map_err(|err| format!("Read proposal: {}", err))?;
+        let proposal: SelectionProposal =
+            serde_json::from_str(&content).map_err(|err| format!("Parse proposal: {}", err))?;
+
+        let selected_examples = proposal.preview.selected_examples.clone();
+        let near_miss_examples = proposal.preview.near_miss_examples.clone();
+        let proposal_summary = format!(
+            "Selected {} examples, {} near misses",
+            selected_examples.len(),
+            near_miss_examples.len()
+        );
+        let evidence = self.selection_evidence_lines(&proposal);
+        let confidence = Self::confidence_label_string(proposal.confidence.label);
+        let next_actions = proposal
+            .next_actions
+            .iter()
+            .map(|action| Self::next_action_label(action.clone()))
+            .collect();
+
+        Ok(GateInfo {
+            gate_id: "G1".to_string(),
+            gate_name: "File Selection".to_string(),
+            proposal_summary,
+            evidence,
+            confidence,
+            selected_examples,
+            near_miss_examples,
+            next_actions,
+            proposal_id: proposal.proposal_id,
+            approval_target_hash: proposal.proposal_hash,
+        })
+    }
+
+    fn selection_evidence_lines(&self, proposal: &SelectionProposal) -> Vec<String> {
+        let mut evidence = Vec::new();
+
+        for item in proposal.evidence.top_dir_prefixes.iter().take(3) {
+            evidence.push(format!("Dir {} ({})", item.prefix, item.count));
+        }
+        for item in proposal.evidence.extensions.iter().take(3) {
+            evidence.push(format!("Ext {} ({})", item.ext, item.count));
+        }
+        for item in proposal.evidence.semantic_tokens.iter().take(3) {
+            evidence.push(format!("Token {} ({})", item.token, item.count));
+        }
+        for item in proposal
+            .evidence
+            .collision_with_existing_tags
+            .iter()
+            .take(3)
+        {
+            evidence.push(format!("Tag collision {} ({})", item.tag, item.count));
+        }
+        for reason in proposal.confidence.reasons.iter().take(3) {
+            evidence.push(format!("Reason: {}", reason));
+        }
+
+        if evidence.is_empty() {
+            evidence.push("No evidence recorded".to_string());
+        }
+
+        evidence
+    }
+
+    fn confidence_label_string(label: ConfidenceLabel) -> String {
+        match label {
+            ConfidenceLabel::High => "HIGH".to_string(),
+            ConfidenceLabel::Med => "MEDIUM".to_string(),
+            ConfidenceLabel::Low => "LOW".to_string(),
+        }
+    }
+
+    fn next_action_label(action: NextAction) -> String {
+        let raw = format!("{:?}", action);
+        let mut out = String::new();
+        for (idx, ch) in raw.chars().enumerate() {
+            if idx > 0 && ch.is_uppercase() {
+                out.push(' ');
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    fn apply_gate_decision(&mut self, decision: Decision) -> Result<(), String> {
+        let session_id = self
+            .sessions_state
+            .active_session
+            .clone()
+            .ok_or_else(|| "No active session selected".to_string())?;
+        let gate = self
+            .sessions_state
+            .pending_gate
+            .clone()
+            .ok_or_else(|| "No pending gate loaded".to_string())?;
+
+        let next_state = match (gate.gate_id.as_str(), &decision) {
+            ("G1", Decision::Approve) => IntentState::ProposeTagRules,
+            ("G1", Decision::Reject) => IntentState::ProposeSelection,
+            _ => {
+                return Err(format!(
+                    "Decision for {} not supported yet",
+                    gate.gate_id
+                ))
+            }
+        };
+
+        let session_id_copy = session_id.clone();
+        self.record_gate_decision(&session_id, &gate, decision, next_state)?;
+        self.sessions_state.pending_select_session_id = Some(session_id_copy);
+        self.sessions_state.sessions_loaded = false;
+        Ok(())
+    }
+
+    fn record_gate_decision(
+        &self,
+        session_id: &str,
+        gate: &GateInfo,
+        decision: Decision,
+        next_state: IntentState,
+    ) -> Result<(), String> {
+        let session_id: SessionId = session_id
+            .parse()
+            .map_err(|err| format!("Invalid session id: {}", err))?;
+        let store = SessionStore::with_root(casparian_home().join("sessions"));
+        let bundle = store
+            .get_session(session_id)
+            .map_err(|err| format!("Failed to load session: {}", err))?;
+
+        let notes = format!("{} {:?} via TUI", gate.gate_id, decision);
+        let decision_record = DecisionRecord {
+            timestamp: Utc::now(),
+            actor: "tui".to_string(),
+            decision: decision.clone(),
+            target: DecisionTarget {
+                proposal_id: gate.proposal_id,
+                approval_target_hash: gate.approval_target_hash.clone(),
+            },
+            choice_payload: serde_json::json!({}),
+            notes: Some(notes),
+        };
+        bundle
+            .append_decision(&decision_record)
+            .map_err(|err| format!("Append decision failed: {}", err))?;
+        bundle
+            .update_state(next_state)
+            .map_err(|err| format!("Update state failed: {}", err))?;
+
+        Ok(())
+    }
+
     // ======== Sessions Key Handlers (Intent Pipeline Workflow) ========
 
     /// Handle key events in Sessions mode
@@ -11711,14 +12667,26 @@ impl App {
                 let session_info = self
                     .sessions_state
                     .selected_session()
-                    .map(|s| (s.id.clone(), s.pending_gate.is_some()));
-                if let Some((session_id, has_pending_gate)) = session_info {
-                    self.sessions_state.active_session = Some(session_id);
+                    .map(|s| (s.id.clone(), s.pending_gate.clone()));
+                if let Some((session_id, pending_gate)) = session_info {
+                    self.sessions_state.active_session = Some(session_id.clone());
                     // If there's a pending gate, go to gate approval, otherwise session detail
-                    if has_pending_gate {
-                        self.sessions_state
-                            .transition_state(SessionsViewState::GateApproval);
+                    if let Some(gate_id) = pending_gate {
+                        match self.load_pending_gate_info(&session_id, &gate_id) {
+                            Ok(gate) => {
+                                self.sessions_state.pending_gate = Some(gate);
+                                self.sessions_state
+                                    .transition_state(SessionsViewState::GateApproval);
+                            }
+                            Err(err) => {
+                                tracing::error!("{}", err);
+                                self.sessions_state.pending_gate = None;
+                                self.sessions_state
+                                    .transition_state(SessionsViewState::SessionDetail);
+                            }
+                        }
                     } else {
+                        self.sessions_state.pending_gate = None;
                         self.sessions_state
                             .transition_state(SessionsViewState::SessionDetail);
                     }
@@ -11726,7 +12694,7 @@ impl App {
             }
             // New session (would open command palette in full implementation)
             KeyCode::Char('n') => {
-                // TODO: Open command palette / new session dialog
+                self.command_palette.open(CommandPaletteMode::Intent);
             }
             // Escape returns to previous mode
             KeyCode::Esc => {
@@ -11753,6 +12721,29 @@ impl App {
             KeyCode::Char('w') => {
                 self.sessions_state
                     .transition_state(SessionsViewState::WorkflowProgress);
+            }
+            // Jump to Jobs view
+            KeyCode::Char('j') => {
+                self.navigate_to_mode(TuiMode::Jobs);
+            }
+            // Jump to Query view with a template
+            KeyCode::Char('q') => {
+                if let Some(session) = self.sessions_state.selected_session() {
+                    let template = format!(
+                        "-- Session {}\nSELECT * FROM cf_pipeline_runs ORDER BY started_at DESC LIMIT 50;",
+                        session.id
+                    );
+                    self.query_state.sql_input = template;
+                    self.query_state.cursor_position = self.query_state.sql_input.len();
+                    self.query_state.view_state = QueryViewState::Editing;
+                    self.query_state.error = None;
+                    self.query_state.results = None;
+                }
+                self.navigate_to_mode(TuiMode::Query);
+            }
+            // Jump to Discover view
+            KeyCode::Char('d') => {
+                self.navigate_to_mode(TuiMode::Discover);
             }
             // Back to session list
             KeyCode::Esc => {
@@ -11791,24 +12782,250 @@ impl App {
         match key.code {
             // Approve gate
             KeyCode::Char('a') | KeyCode::Enter => {
-                // TODO: Call approval API
-                // On success, clear pending gate and advance workflow
-                self.sessions_state.pending_gate = None;
-                self.sessions_state.return_to_previous_state();
+                match self.apply_gate_decision(Decision::Approve) {
+                    Ok(()) => {
+                        self.sessions_state.pending_gate = None;
+                        self.sessions_state.return_to_previous_state();
+                    }
+                    Err(err) => {
+                        tracing::error!("{}", err);
+                    }
+                }
             }
             // Reject gate
             KeyCode::Char('r') => {
-                // TODO: Call rejection API
-                // On success, clear pending gate
-                self.sessions_state.pending_gate = None;
-                self.sessions_state.return_to_previous_state();
+                match self.apply_gate_decision(Decision::Reject) {
+                    Ok(()) => {
+                        self.sessions_state.pending_gate = None;
+                        self.sessions_state.return_to_previous_state();
+                    }
+                    Err(err) => {
+                        tracing::error!("{}", err);
+                    }
+                }
             }
             // Back to session list without action
             KeyCode::Esc => {
+                self.sessions_state.pending_gate = None;
                 self.sessions_state.return_to_previous_state();
             }
             _ => {}
         }
+    }
+
+    fn handle_triage_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(prev_mode) = self.triage_state.previous_mode.take() {
+                    self.set_mode(prev_mode);
+                } else {
+                    self.set_mode(TuiMode::Home);
+                }
+            }
+            KeyCode::Tab => {
+                self.triage_state.tab = self.triage_state.tab.next();
+                self.triage_state.selected_index = 0;
+                self.triage_state.clamp_selection();
+            }
+            KeyCode::Down => {
+                let len = self.triage_state.active_len();
+                if len > 0 && self.triage_state.selected_index + 1 < len {
+                    self.triage_state.selected_index += 1;
+                }
+            }
+            KeyCode::Up => {
+                if self.triage_state.selected_index > 0 {
+                    self.triage_state.selected_index -= 1;
+                }
+            }
+            KeyCode::Char('r') => {
+                self.triage_state.loaded = false;
+            }
+            KeyCode::Char('j') => {
+                if let Some(job_id) = self.triage_selected_job_id() {
+                    self.select_job_by_id(job_id);
+                    self.navigate_to_mode(TuiMode::Jobs);
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(detail) = self.triage_selected_detail() {
+                    self.triage_state.copied_buffer = Some(detail);
+                    self.triage_state.status_message =
+                        Some("Copied diagnostics to buffer".to_string());
+                }
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
+                if self.triage_state.job_filter.is_some() {
+                    self.triage_state.job_filter = None;
+                    self.triage_state.loaded = false;
+                    self.triage_state.selected_index = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn triage_selected_job_id(&self) -> Option<i64> {
+        match self.triage_state.tab {
+            TriageTab::Quarantine => self
+                .triage_state
+                .quarantine_rows
+                .as_ref()
+                .and_then(|rows| rows.get(self.triage_state.selected_index))
+                .map(|row| row.job_id),
+            TriageTab::SchemaMismatch => self
+                .triage_state
+                .schema_mismatches
+                .as_ref()
+                .and_then(|rows| rows.get(self.triage_state.selected_index))
+                .map(|row| row.job_id),
+            TriageTab::DeadLetter => self
+                .triage_state
+                .dead_letters
+                .as_ref()
+                .and_then(|rows| rows.get(self.triage_state.selected_index))
+                .map(|row| row.original_job_id),
+        }
+    }
+
+    fn triage_selected_detail(&self) -> Option<String> {
+        match self.triage_state.tab {
+            TriageTab::Quarantine => self
+                .triage_state
+                .quarantine_rows
+                .as_ref()
+                .and_then(|rows| rows.get(self.triage_state.selected_index))
+                .map(|row| {
+                    format!(
+                        "Quarantine Row {}\nJob: {}\nRow: {}\nReason: {}\nCreated: {}\n",
+                        row.id, row.job_id, row.row_index, row.error_reason, row.created_at
+                    )
+                }),
+            TriageTab::SchemaMismatch => self
+                .triage_state
+                .schema_mismatches
+                .as_ref()
+                .and_then(|rows| rows.get(self.triage_state.selected_index))
+                .map(|row| {
+                    format!(
+                        "Schema Mismatch {}\nJob: {}\nOutput: {}\nKind: {}\nExpected: {:?} ({:?}) idx {:?}\nActual: {:?} ({:?}) idx {:?}\nCreated: {}\n",
+                        row.id,
+                        row.job_id,
+                        row.output_name,
+                        row.mismatch_kind,
+                        row.expected_name,
+                        row.expected_type,
+                        row.expected_index,
+                        row.actual_name,
+                        row.actual_type,
+                        row.actual_index,
+                        row.created_at
+                    )
+                }),
+            TriageTab::DeadLetter => self
+                .triage_state
+                .dead_letters
+                .as_ref()
+                .and_then(|rows| rows.get(self.triage_state.selected_index))
+                .map(|row| {
+                    format!(
+                        "Dead Letter {}\nOriginal Job: {}\nFile: {:?}\nPlugin: {}\nError: {:?}\nRetry: {}\nMoved: {}\nReason: {:?}\n",
+                        row.id,
+                        row.original_job_id,
+                        row.file_id,
+                        row.plugin_name,
+                        row.error_message,
+                        row.retry_count,
+                        row.moved_at,
+                        row.reason
+                    )
+                }),
+        }
+    }
+
+    fn select_job_by_id(&mut self, job_id: i64) {
+        if self.jobs_state.jobs.is_empty() {
+            return;
+        }
+
+        if let Some(job) = self.jobs_state.jobs.iter().find(|job| job.id == job_id) {
+            self.jobs_state.section_focus = match job.status {
+                JobStatus::Completed | JobStatus::PartialSuccess => JobsListSection::Ready,
+                JobStatus::Pending
+                | JobStatus::Running
+                | JobStatus::Failed
+                | JobStatus::Cancelled => JobsListSection::Actionable,
+            };
+
+            let list = match self.jobs_state.section_focus {
+                JobsListSection::Actionable => self.jobs_state.actionable_jobs(),
+                JobsListSection::Ready => self.jobs_state.ready_jobs(),
+            };
+            if let Some(pos) = list.iter().position(|job| job.id == job_id) {
+                self.jobs_state.selected_index = pos;
+                self.jobs_state.clamp_selection();
+            }
+        }
+    }
+
+    fn open_triage(&mut self, job_filter: Option<i64>) {
+        self.triage_state.job_filter = job_filter;
+        self.triage_state.tab = TriageTab::Quarantine;
+        self.triage_state.selected_index = 0;
+        self.triage_state.loaded = false;
+        self.triage_state.status_message = None;
+        self.navigate_to_mode(TuiMode::Triage);
+    }
+
+    fn handle_catalog_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(prev_mode) = self.catalog_state.previous_mode.take() {
+                    self.set_mode(prev_mode);
+                } else {
+                    self.set_mode(TuiMode::Home);
+                }
+            }
+            KeyCode::Tab => {
+                self.catalog_state.tab = self.catalog_state.tab.next();
+                self.catalog_state.selected_index = 0;
+                self.catalog_state.clamp_selection();
+            }
+            KeyCode::Down => {
+                let len = self.catalog_state.active_len();
+                if len > 0 && self.catalog_state.selected_index + 1 < len {
+                    self.catalog_state.selected_index += 1;
+                }
+            }
+            KeyCode::Up => {
+                if self.catalog_state.selected_index > 0 {
+                    self.catalog_state.selected_index -= 1;
+                }
+            }
+            KeyCode::Char('r') => {
+                self.catalog_state.loaded = false;
+            }
+            KeyCode::Enter => {
+                if self.catalog_state.tab == CatalogTab::Pipelines {
+                    self.catalog_state.tab = CatalogTab::Runs;
+                    self.catalog_state.selected_index = 0;
+                    self.catalog_state.clamp_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn open_catalog(&mut self, run_id: Option<String>) {
+        self.catalog_state.pending_select_run_id = run_id;
+        self.catalog_state.tab = CatalogTab::Pipelines;
+        if self.catalog_state.pending_select_run_id.is_some() {
+            self.catalog_state.tab = CatalogTab::Runs;
+        }
+        self.catalog_state.selected_index = 0;
+        self.catalog_state.loaded = false;
+        self.catalog_state.status_message = None;
+        self.navigate_to_mode(TuiMode::Catalog);
     }
 
     /// Periodic tick for updates
@@ -12008,12 +13225,39 @@ impl App {
             self.start_sessions_load();
         }
 
+        // Triage: Load when entering Triage mode or when refresh requested
+        if self.mode == TuiMode::Triage
+            && !self.triage_state.loaded
+            && self.pending_triage_load.is_none()
+        {
+            self.start_triage_load();
+        }
+
+        if self.mode == TuiMode::Catalog
+            && !self.catalog_state.loaded
+            && self.pending_catalog_load.is_none()
+        {
+            self.start_catalog_load();
+        }
+
         // Poll for pending sessions load results (non-blocking)
         if let Some(ref mut rx) = self.pending_sessions_load {
             match rx.try_recv() {
                 Ok(sessions) => {
                     self.sessions_state.sessions = sessions;
                     self.sessions_state.sessions_loaded = true;
+                    if let Some(pending_id) =
+                        self.sessions_state.pending_select_session_id.take()
+                    {
+                        if let Some(pos) = self
+                            .sessions_state
+                            .sessions
+                            .iter()
+                            .position(|session| session.id == pending_id)
+                        {
+                            self.sessions_state.selected_index = pos;
+                        }
+                    }
                     self.sessions_state.clamp_selection();
                     self.pending_sessions_load = None;
                 }
@@ -12024,6 +13268,59 @@ impl App {
                     // Channel closed, mark as loaded (empty sessions)
                     self.sessions_state.sessions_loaded = true;
                     self.pending_sessions_load = None;
+                }
+            }
+        }
+
+        if let Some(ref mut rx) = self.pending_triage_load {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    self.triage_state.quarantine_rows = data.quarantine_rows;
+                    self.triage_state.schema_mismatches = data.schema_mismatches;
+                    self.triage_state.dead_letters = data.dead_letters;
+                    self.triage_state.loaded = true;
+                    self.triage_state.clamp_selection();
+                    self.pending_triage_load = None;
+                }
+                Ok(Err(err)) => {
+                    self.triage_state.loaded = true;
+                    self.triage_state.status_message = Some(err);
+                    self.pending_triage_load = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.triage_state.loaded = true;
+                    self.pending_triage_load = None;
+                }
+            }
+        }
+
+        if let Some(ref mut rx) = self.pending_catalog_load {
+            match rx.try_recv() {
+                Ok(Ok(data)) => {
+                    self.catalog_state.pipelines = data.pipelines;
+                    self.catalog_state.runs = data.runs;
+                    if let Some(run_id) = self.catalog_state.pending_select_run_id.take() {
+                        if let Some(ref runs) = self.catalog_state.runs {
+                            if let Some(pos) = runs.iter().position(|run| run.id == run_id) {
+                                self.catalog_state.tab = CatalogTab::Runs;
+                                self.catalog_state.selected_index = pos;
+                            }
+                        }
+                    }
+                    self.catalog_state.loaded = true;
+                    self.catalog_state.clamp_selection();
+                    self.pending_catalog_load = None;
+                }
+                Ok(Err(err)) => {
+                    self.catalog_state.loaded = true;
+                    self.catalog_state.status_message = Some(err);
+                    self.pending_catalog_load = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.catalog_state.loaded = true;
+                    self.pending_catalog_load = None;
                 }
             }
         }
@@ -12565,7 +13862,7 @@ impl App {
                                 // Validation passed, scan is actually starting
                                 self.discover.status_message = Some((
                                     format!(
-                                        "Scan started (Job #{}) - press [4] to view Jobs",
+                                        "Scan started (Job #{}) - press [3] to view Jobs",
                                         job_id
                                     ),
                                     false,
@@ -13126,6 +14423,19 @@ mod tests {
 
         // Esc returns to Home when no dialog is open
         assert!(matches!(app.mode, TuiMode::Home));
+    }
+
+    #[test]
+    fn test_jobs_pipeline_toggle_is_not_captured_globally() {
+        let mut app = App::new(test_args(), None);
+        app.mode = TuiMode::Jobs;
+        app.jobs_state.view_state = JobsViewState::JobList;
+        app.jobs_state.show_pipeline = false;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        assert!(app.jobs_state.show_pipeline);
+        assert!(matches!(app.mode, TuiMode::Jobs));
     }
 
     // =========================================================================

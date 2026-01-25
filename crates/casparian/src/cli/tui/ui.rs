@@ -8,10 +8,13 @@ use ratatui::{
 use super::app::{
     App, ApprovalsViewState, CommandPaletteMode, CommandPaletteState, DiscoverFocus,
     DiscoverViewState, JobInfo, JobStatus, JobType, JobsListSection, JobsViewState, ParserHealth,
-    ShellFocus, SuggestedFix, ThroughputSample, TuiMode, ViolationSummary, ViolationType,
+    ShellFocus, SuggestedFix, ThroughputSample, TriageTab, TuiMode, ViolationSummary,
+    ViolationType,
 };
+use super::nav;
 use crate::cli::config::active_db_path;
 use crate::cli::output::format_number;
+use casparian_intent::IntentState;
 use chrono::{DateTime, Local};
 use ratatui::widgets::Clear;
 
@@ -273,20 +276,8 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
         },
     )));
 
-    let nav_items = [
-        ("0", "Home", TuiMode::Home),
-        ("1", "Discover", TuiMode::Discover),
-        ("2", "Parser Bench", TuiMode::ParserBench),
-        ("3", "Jobs", TuiMode::Jobs),
-        ("4", "Sources", TuiMode::Sources),
-        ("5", "Approvals", TuiMode::Approvals),
-        ("6", "Query", TuiMode::Query),
-        ("7", "Sessions", TuiMode::Sessions),
-        (",", "Settings", TuiMode::Settings),
-    ];
-
-    for (idx, (key, label, mode)) in nav_items.iter().enumerate() {
-        let is_active = app.mode == *mode;
+    for (idx, item) in nav::NAV_ITEMS.iter().enumerate() {
+        let is_active = app.mode == item.mode;
         let is_selected = is_focused && app.nav_selected == idx;
         let style = if is_selected {
             Style::default().fg(Color::White).bold().bg(Color::DarkGray)
@@ -299,7 +290,7 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        let line = format!(" [{}] {}", key, label);
+        let line = format!(" [{}] {}", item.key, item.label);
         lines.push(Line::from(Span::styled(
             truncate_end(&line, inner.width as usize),
             style,
@@ -421,6 +412,18 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
             let session_count = app.sessions_state.sessions.len();
             lines.push(Line::from(Span::styled(
                 format!(" Sessions: {}", session_count),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        TuiMode::Triage => {
+            lines.push(Line::from(Span::styled(
+                format!(" Tab: {}", app.triage_state.tab.label()),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        TuiMode::Catalog => {
+            lines.push(Line::from(Span::styled(
+                format!(" Tab: {}", app.catalog_state.tab.label()),
                 Style::default().fg(Color::Gray),
             )));
         }
@@ -691,6 +694,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         TuiMode::Query => draw_query_screen(frame, app, main_area),
         TuiMode::Settings => draw_settings_screen(frame, app, main_area),
         TuiMode::Sessions => draw_sessions_screen(frame, app, main_area),
+        TuiMode::Triage => draw_triage_screen(frame, app, main_area),
+        TuiMode::Catalog => draw_catalog_screen(frame, app, main_area),
     }
 
     if let Some(builder) = &app.discover.rule_builder {
@@ -2644,7 +2649,7 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let line4 = format!("  {}", hint);
     // Line 5: empty
     // Line 6: Navigation
-    let line6 = "  [Esc] Cancel  [0] Home  [4] Jobs";
+    let line6 = "  [Esc] Cancel  [0] Home  [3] Jobs";
 
     let progress_style = if stalled {
         Style::default()
@@ -4519,7 +4524,7 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
     let footer_text = if app.jobs_state.view_state == JobsViewState::ViolationDetail {
         " [↑/↓] Select violation  [a] Apply fix  [v/Esc] Back to details  [?] Help "
     } else {
-        " [↑/↓] Select  [Tab] Section  [Enter] Pin  [f] Filter  [v] Violations  [L] Logs  [O] Open  [y] Copy  [I] Inspector  [?] Help "
+        " [↑/↓] Select  [Tab] Section  [Enter] Pin  [p] Pipeline  [f] Filter  [Del] Clear  [Q] Quarantine  [C] Catalog  [v] Violations  [L] Logs  [O] Open  [y] Copy  [I] Inspector  [?] Help "
     };
     draw_shell_action_bar(
         frame,
@@ -4590,7 +4595,7 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
         if app.jobs_state.status_filter.is_some() || app.jobs_state.type_filter.is_some() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "Press [f] to clear filters.",
+                "Press [Del] to clear filters.",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -4808,10 +4813,12 @@ fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
                     "Quarantine: {} rows\n",
                     format_number(rows as u64)
                 ));
+                detail.push_str("Press [Q] to view\n");
             }
         } else if let Some(rows) = quarantine_rows {
             detail.push_str("\nQUARANTINE\n");
             detail.push_str(&format!("{} rows\n", format_number(rows as u64)));
+            detail.push_str("Press [Q] to view\n");
         }
 
         if job.status == JobStatus::Running {
@@ -5543,8 +5550,12 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
             "  ↑/↓           Navigate jobs           1-4       Go to view",
             "  Tab            Switch Actionable/Ready 0 / H     Home",
             "  Enter          Pin details             Esc       Back / Close",
+            "  p              Toggle pipeline         GLOBAL",
             "  o              Open output             GLOBAL",
             "  f              Filter jobs             GLOBAL",
+            "  Backspace      Clear filters           GLOBAL",
+            "  Q              Quarantine explorer     GLOBAL",
+            "  C              Pipeline catalog        GLOBAL",
             "                                         ──────",
             "                                         ?         This help",
             "                                         r         Refresh view",
@@ -5987,19 +5998,28 @@ fn draw_query_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_query_inspector(frame, app, inner);
     }
 
+    if app.query_state.view_state == QueryViewState::TableBrowser {
+        draw_query_table_browser_overlay(frame, area, app);
+    }
+    if app.query_state.view_state == QueryViewState::SavedQueries {
+        draw_query_saved_queries_overlay(frame, area, app);
+    }
+
     // Draw Action Bar
     let footer_text = match app.query_state.view_state {
         QueryViewState::Editing => {
             if app.query_state.executing {
                 " Query running in background...  [Tab] Results "
             } else {
-                " [Ctrl+Enter] Execute  [Ctrl+L] Clear  [Up/Down] History  [Tab] Results "
+                " [Ctrl+Enter] Execute  [Ctrl+L] Clear  [Ctrl+T] Tables  [Ctrl+S] Save  [Ctrl+O] Open  [Tab] Results "
             }
         }
         QueryViewState::Executing => " Executing query...  [Esc] Detach ",
         QueryViewState::ViewingResults => {
             " [Tab/Esc] Editor  [Up/Down] Navigate  [Left/Right] Scroll  [PgUp/PgDn] Page "
         }
+        QueryViewState::TableBrowser => " [Enter] Insert  [Esc] Close ",
+        QueryViewState::SavedQueries => " [Enter] Load  [Esc] Close ",
     };
     draw_shell_action_bar(
         frame,
@@ -6462,6 +6482,8 @@ fn draw_query_inspector(frame: &mut Frame, app: &App, area: Rect) {
             crate::cli::tui::app::QueryViewState::Editing => "Editing",
             crate::cli::tui::app::QueryViewState::Executing => "Executing",
             crate::cli::tui::app::QueryViewState::ViewingResults => "Viewing Results",
+            crate::cli::tui::app::QueryViewState::TableBrowser => "Table Browser",
+            crate::cli::tui::app::QueryViewState::SavedQueries => "Saved Queries",
         }
     };
     lines.push(Line::from(vec![
@@ -6471,6 +6493,104 @@ fn draw_query_inspector(frame: &mut Frame, app: &App, area: Rect) {
 
     let para = Paragraph::new(lines);
     frame.render_widget(para, area);
+}
+
+fn draw_query_table_browser_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let dialog = centered_dialog_area(area, 60, 20);
+    frame.render_widget(Clear, dialog);
+
+    let block = Block::default()
+        .title(" Tables ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(dialog);
+    frame.render_widget(block, dialog);
+
+    if let Some(error) = &app.query_state.table_browser.error {
+        let msg = Paragraph::new(error.as_str())
+            .style(Style::default().fg(Color::Red))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    if app.query_state.table_browser.tables.is_empty() {
+        let msg = Paragraph::new("No tables found.")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    let items: Vec<ratatui::widgets::ListItem> = app
+        .query_state
+        .table_browser
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let is_selected = idx == app.query_state.table_browser.selected_index;
+            let style = if is_selected {
+                Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ratatui::widgets::ListItem::new(name.as_str()).style(style)
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items);
+    frame.render_widget(list, inner);
+}
+
+fn draw_query_saved_queries_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let dialog = centered_dialog_area(area, 60, 20);
+    frame.render_widget(Clear, dialog);
+
+    let block = Block::default()
+        .title(" Saved Queries ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .border_type(BorderType::Rounded);
+    let inner = block.inner(dialog);
+    frame.render_widget(block, dialog);
+
+    if let Some(error) = &app.query_state.saved_queries.error {
+        let msg = Paragraph::new(error.as_str())
+            .style(Style::default().fg(Color::Red))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    if app.query_state.saved_queries.entries.is_empty() {
+        let msg = Paragraph::new("No saved queries.")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center);
+        frame.render_widget(msg, inner);
+        return;
+    }
+
+    let items: Vec<ratatui::widgets::ListItem> = app
+        .query_state
+        .saved_queries
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let is_selected = idx == app.query_state.saved_queries.selected_index;
+            let style = if is_selected {
+                Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ratatui::widgets::ListItem::new(entry.name.as_str()).style(style)
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items);
+    frame.render_widget(list, inner);
 }
 
 // ======== Sessions Screen (Intent Pipeline Workflow) ========
@@ -6510,6 +6630,9 @@ fn draw_sessions_screen(frame: &mut Frame, app: &App, area: Rect) {
         SessionsViewState::GateApproval => " [a] Approve  [r] Reject  [Esc] Back  [I] Inspector ",
         SessionsViewState::SessionList => {
             " [Enter] View  [n] New Session  [r] Refresh  [Esc] Back  [I] Inspector "
+        }
+        SessionsViewState::SessionDetail => {
+            " [w] Workflow  [j] Jobs  [q] Query  [d] Discover  [Esc] Back  [I] Inspector "
         }
         _ => " [Esc] Back  [I] Inspector ",
     };
@@ -6605,54 +6728,46 @@ fn draw_workflow_progress_panel(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     // Draw workflow state diagram
-    draw_workflow_state_diagram(frame, inner, &session.state);
+    draw_workflow_state_diagram(frame, inner, session.state);
 }
 
 /// Draw the workflow state diagram as a vertical list
-fn draw_workflow_state_diagram(frame: &mut Frame, area: Rect, current_state: &str) {
-    // Workflow states from the intent pipeline spec
-    let states = [
-        ("S0", "InterpretIntent", false),
-        ("S1", "ScanCorpus", false),
-        ("S2", "ProposeSelection", false),
-        ("G1", "FileSelection", true),
-        ("S3", "ProposeTagRules", false),
-        ("G2", "TagRules", true),
-        ("S4", "ProposePathFields", false),
-        ("G3", "PathFields", true),
-        ("S5", "InferSchemaIntent", false),
-        ("G4", "SchemaApproval", true),
-        ("S6", "GenerateParserDraft", false),
-        ("S7", "BacktestFailFast", false),
-        ("S8", "PromoteSchema", false),
-        ("S9", "PublishPlan", false),
-        ("G5", "PublishApproval", true),
-        ("S10", "PublishExecute", false),
-        ("S11", "RunPlan", false),
-        ("G6", "RunApproval", true),
-        ("S12", "RunExecute", false),
-    ];
+fn draw_workflow_state_diagram(frame: &mut Frame, area: Rect, current_state: Option<IntentState>) {
+    let states: Vec<IntentState> = IntentState::ALL
+        .iter()
+        .copied()
+        .filter(|state| !state.is_terminal())
+        .collect();
+    let (current_index, terminal_label, unknown_state) = match current_state {
+        Some(state) if state.is_terminal() => (None, Some(state.as_str()), false),
+        Some(state) => (states.iter().position(|s| *s == state), None, false),
+        None => (None, None, true),
+    };
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for (id, name, is_gate) in states.iter() {
-        // Determine state relative to current
-        let state_matches = current_state.starts_with(id);
-        let past_current = {
-            // Simple heuristic: compare state IDs
-            let current_num: i32 = current_state
-                .trim_start_matches(|c: char| !c.is_numeric())
-                .parse()
-                .unwrap_or(0);
-            let this_num: i32 = id
-                .trim_start_matches(|c: char| !c.is_numeric())
-                .parse()
-                .unwrap_or(0);
-            this_num < current_num
-        };
+    if let Some(label) = terminal_label {
+        lines.push(Line::from(Span::styled(
+            format!(" ! Terminal: {}", label),
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(""));
+    } else if unknown_state {
+        lines.push(Line::from(Span::styled(
+            " ? Unknown state",
+            Style::default().fg(Color::Yellow),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    for (idx, state) in states.iter().enumerate() {
+        let (id, name) = intent_state_label(*state);
+        let is_gate = state.is_gate();
+        let state_matches = current_index == Some(idx);
+        let past_current = current_index.map(|cur| idx < cur).unwrap_or(false);
 
         let (symbol, style) = if state_matches {
-            if *is_gate {
+            if is_gate {
                 ("*", Style::default().fg(Color::Yellow).bold()) // Awaiting approval
             } else {
                 ("@", Style::default().fg(Color::Cyan).bold()) // In progress
@@ -6663,7 +6778,7 @@ fn draw_workflow_state_diagram(frame: &mut Frame, area: Rect, current_state: &st
             (".", Style::default().fg(Color::DarkGray)) // Pending
         };
 
-        let status_text = if state_matches && *is_gate {
+        let status_text = if state_matches && is_gate {
             " [AWAITING APPROVAL]"
         } else if state_matches {
             " [IN PROGRESS]"
@@ -6677,6 +6792,33 @@ fn draw_workflow_state_diagram(frame: &mut Frame, area: Rect, current_state: &st
 
     let para = Paragraph::new(lines);
     frame.render_widget(para, area);
+}
+
+fn intent_state_label(state: IntentState) -> (String, String) {
+    let raw = state.as_str();
+    let mut parts = raw.splitn(2, '_');
+    let id = parts.next().unwrap_or(raw).to_string();
+    let remainder = parts.next().unwrap_or("");
+    let name = if remainder.is_empty() {
+        id.clone()
+    } else {
+        remainder
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let lower = chars.as_str().to_lowercase();
+                        format!("{}{}", first, lower)
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<String>>()
+            .join(" ")
+    };
+    (id, name)
 }
 
 /// Draw the gate/proposal details panel (right)
@@ -6730,7 +6872,7 @@ fn draw_gate_details_panel(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Gray),
         )),
         Line::from(Span::styled(
-            format!("State: {}", session.state),
+            format!("State: {}", session.state_label),
             Style::default().fg(Color::Gray),
         )),
         Line::from(Span::styled(
@@ -6784,18 +6926,87 @@ fn draw_gate_approval_content(frame: &mut Frame, area: Rect, gate: &super::app::
             &gate.proposal_summary,
             Style::default().fg(Color::Gray),
         )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Evidence:",
-            Style::default().fg(Color::White).bold(),
-        )),
     ];
 
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Selected Examples:",
+        Style::default().fg(Color::White).bold(),
+    )));
+    if gate.selected_examples.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (none)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for example in gate.selected_examples.iter().take(5) {
+            lines.push(Line::from(Span::styled(
+                format!("  - {}", example),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        if gate.selected_examples.len() > 5 {
+            lines.push(Line::from(Span::styled(
+                "  ...",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Near Misses:",
+        Style::default().fg(Color::White).bold(),
+    )));
+    if gate.near_miss_examples.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (none)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for example in gate.near_miss_examples.iter().take(5) {
+            lines.push(Line::from(Span::styled(
+                format!("  - {}", example),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        if gate.near_miss_examples.len() > 5 {
+            lines.push(Line::from(Span::styled(
+                "  ...",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Evidence:",
+        Style::default().fg(Color::White).bold(),
+    )));
     for evidence in &gate.evidence {
         lines.push(Line::from(Span::styled(
             format!("  - {}", evidence),
             Style::default().fg(Color::Gray),
         )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Next Actions:",
+        Style::default().fg(Color::White).bold(),
+    )));
+    if gate.next_actions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (none)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for action in &gate.next_actions {
+            lines.push(Line::from(Span::styled(
+                format!("  - {}", action),
+                Style::default().fg(Color::Gray),
+            )));
+        }
     }
 
     lines.push(Line::from(""));
@@ -6822,7 +7033,7 @@ fn draw_sessions_inspector(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(Span::styled(
-            format!("State: {}", session.state),
+            format!("State: {}", session.state_label),
             Style::default().fg(Color::Gray),
         )));
         lines.push(Line::from(Span::styled(
@@ -6837,6 +7048,630 @@ fn draw_sessions_inspector(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled(
             "No session selected",
             Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+// ======== Triage Screen (Quarantine + Schema + Dead Letter) ========
+
+fn draw_triage_screen(frame: &mut Frame, app: &App, area: Rect) {
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
+
+    draw_shell_top_bar(frame, app, "Triage", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(shell.main);
+
+    draw_triage_tabs(frame, app, chunks[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[1]);
+
+    draw_triage_list_panel(frame, app, body[0]);
+    draw_triage_detail_panel(frame, app, body[1]);
+
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        draw_triage_inspector(frame, app, inner);
+    }
+
+    let footer_text = if app.triage_state.job_filter.is_some() {
+        " [Tab] Next Tab  [↑/↓] Select  [j] Jobs  [y] Copy  [Del] Clear filter  [r] Refresh  [Esc] Back "
+    } else {
+        " [Tab] Next Tab  [↑/↓] Select  [j] Jobs  [y] Copy  [r] Refresh  [Esc] Back "
+    };
+    draw_shell_action_bar(
+        frame,
+        footer_text,
+        Style::default().fg(Color::DarkGray),
+        shell.bottom,
+    );
+}
+
+fn draw_triage_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let mut spans = Vec::new();
+    let tabs = [
+        TriageTab::Quarantine,
+        TriageTab::SchemaMismatch,
+        TriageTab::DeadLetter,
+    ];
+    for (idx, tab) in tabs.iter().enumerate() {
+        let is_active = app.triage_state.tab == *tab;
+        let style = if is_active {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(tab.label(), style));
+        if idx + 1 < tabs.len() {
+            spans.push(Span::styled("  |  ", Style::default().fg(Color::DarkGray)));
+        }
+    }
+
+    let filter_label = if let Some(job_id) = app.triage_state.job_filter {
+        format!("Job filter: {}", job_id)
+    } else {
+        "All jobs".to_string()
+    };
+
+    let line = Line::from(spans);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {}", filter_label));
+    let para = Paragraph::new(line).block(block);
+    frame.render_widget(para, area);
+}
+
+fn draw_triage_list_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" {} ", app.triage_state.tab.label());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    match app.triage_state.tab {
+        TriageTab::Quarantine => match app.triage_state.quarantine_rows.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No rows.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) => {
+                let items: Vec<ratatui::widgets::ListItem> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, row)| {
+                        let is_selected = idx == app.triage_state.selected_index;
+                        let style = if is_selected {
+                            Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        let text = format!(
+                            "#{} job {} row {} {}",
+                            row.id, row.job_id, row.row_index, row.error_reason
+                        );
+                        let line = truncate_end(&text, inner.width as usize);
+                        ratatui::widgets::ListItem::new(line).style(style)
+                    })
+                    .collect();
+                let list = ratatui::widgets::List::new(items);
+                frame.render_widget(list, inner);
+            }
+        },
+        TriageTab::SchemaMismatch => match app.triage_state.schema_mismatches.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No rows.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) => {
+                let items: Vec<ratatui::widgets::ListItem> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, row)| {
+                        let is_selected = idx == app.triage_state.selected_index;
+                        let style = if is_selected {
+                            Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        let text = format!("#{} job {} {}", row.id, row.job_id, row.mismatch_kind);
+                        let line = truncate_end(&text, inner.width as usize);
+                        ratatui::widgets::ListItem::new(line).style(style)
+                    })
+                    .collect();
+                let list = ratatui::widgets::List::new(items);
+                frame.render_widget(list, inner);
+            }
+        },
+        TriageTab::DeadLetter => match app.triage_state.dead_letters.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No rows.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) => {
+                let items: Vec<ratatui::widgets::ListItem> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, row)| {
+                        let is_selected = idx == app.triage_state.selected_index;
+                        let style = if is_selected {
+                            Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        let text =
+                            format!("#{} job {} {}", row.id, row.original_job_id, row.plugin_name);
+                        let line = truncate_end(&text, inner.width as usize);
+                        ratatui::widgets::ListItem::new(line).style(style)
+                    })
+                    .collect();
+                let list = ratatui::widgets::List::new(items);
+                frame.render_widget(list, inner);
+            }
+        },
+    }
+}
+
+fn draw_triage_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Details ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    match app.triage_state.tab {
+        TriageTab::Quarantine => match app.triage_state.quarantine_rows.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No selection.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) => {
+                let row = &rows[app.triage_state.selected_index];
+                lines.push(Line::from(format!("Row ID: {}", row.id)));
+                lines.push(Line::from(format!("Job ID: {}", row.job_id)));
+                lines.push(Line::from(format!("Row Index: {}", row.row_index)));
+                lines.push(Line::from(format!("Reason: {}", row.error_reason)));
+                lines.push(Line::from(format!("Created: {}", row.created_at)));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Raw Data:",
+                    Style::default().fg(Color::White).bold(),
+                )));
+                for line in raw_data_preview(&row.raw_data) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", line),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+            }
+        },
+        TriageTab::SchemaMismatch => match app.triage_state.schema_mismatches.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No selection.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) => {
+                let row = &rows[app.triage_state.selected_index];
+                lines.push(Line::from(format!("Row ID: {}", row.id)));
+                lines.push(Line::from(format!("Job ID: {}", row.job_id)));
+                lines.push(Line::from(format!("Output: {}", row.output_name)));
+                lines.push(Line::from(format!("Kind: {}", row.mismatch_kind)));
+                lines.push(Line::from(format!(
+                    "Expected: {:?} ({:?}) idx {:?}",
+                    row.expected_name, row.expected_type, row.expected_index
+                )));
+                lines.push(Line::from(format!(
+                    "Actual:   {:?} ({:?}) idx {:?}",
+                    row.actual_name, row.actual_type, row.actual_index
+                )));
+                lines.push(Line::from(format!("Created: {}", row.created_at)));
+            }
+        },
+        TriageTab::DeadLetter => match app.triage_state.dead_letters.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No selection.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) => {
+                let row = &rows[app.triage_state.selected_index];
+                lines.push(Line::from(format!("Row ID: {}", row.id)));
+                lines.push(Line::from(format!("Original Job: {}", row.original_job_id)));
+                lines.push(Line::from(format!("File ID: {:?}", row.file_id)));
+                lines.push(Line::from(format!("Plugin: {}", row.plugin_name)));
+                lines.push(Line::from(format!("Retry: {}", row.retry_count)));
+                lines.push(Line::from(format!("Moved: {}", row.moved_at)));
+                if let Some(reason) = &row.reason {
+                    lines.push(Line::from(format!("Reason: {}", reason)));
+                }
+                if let Some(error) = &row.error_message {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "Error:",
+                        Style::default().fg(Color::White).bold(),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        error,
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+            }
+        },
+    }
+
+    if let Some(message) = &app.triage_state.status_message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, inner);
+}
+
+fn draw_triage_inspector(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Triage",
+        Style::default().fg(Color::White).bold(),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Tab: {}", app.triage_state.tab.label()),
+        Style::default().fg(Color::Gray),
+    )));
+    if let Some(job_id) = app.triage_state.job_filter {
+        lines.push(Line::from(Span::styled(
+            format!("Filter: job {}", job_id),
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Filter: (none)".to_string(),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    if let Some(msg) = &app.triage_state.status_message {
+        lines.push(Line::from(Span::styled(
+            format!("Status: {}", msg),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, area);
+}
+
+fn raw_data_preview(raw: &Option<Vec<u8>>) -> Vec<String> {
+    let Some(bytes) = raw else {
+        return vec!["(empty)".to_string()];
+    };
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        let mut snippet: String = text.chars().take(400).collect();
+        if text.chars().count() > 400 {
+            snippet.push_str("...");
+        }
+        return snippet.lines().map(|line| line.to_string()).collect();
+    }
+
+    let hex = bytes
+        .iter()
+        .take(64)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<String>>()
+        .join(" ");
+    vec![format!("0x{}{}", hex, if bytes.len() > 64 { " ..." } else { "" })]
+}
+
+// ======== Catalog Screen (Pipelines + Runs) ========
+
+fn draw_catalog_screen(frame: &mut Frame, app: &App, area: Rect) {
+    let inspector_visible = !app.inspector_collapsed;
+    let shell = shell_layout(area, inspector_visible);
+
+    draw_shell_top_bar(frame, app, "Catalog", shell.top);
+    draw_shell_rail(frame, app, shell.rail);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(shell.main);
+
+    draw_catalog_tabs(frame, app, chunks[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[1]);
+
+    draw_catalog_list_panel(frame, app, body[0]);
+    draw_catalog_detail_panel(frame, app, body[1]);
+
+    if inspector_visible {
+        let inner = draw_shell_inspector_block(frame, "Inspector", shell.inspector);
+        draw_catalog_inspector(frame, app, inner);
+    }
+
+    let footer_text = " [Tab] Next Tab  [↑/↓] Select  [Enter] Runs  [r] Refresh  [Esc] Back ";
+    draw_shell_action_bar(
+        frame,
+        footer_text,
+        Style::default().fg(Color::DarkGray),
+        shell.bottom,
+    );
+}
+
+fn draw_catalog_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let mut spans = Vec::new();
+    let tabs = [super::app::CatalogTab::Pipelines, super::app::CatalogTab::Runs];
+    for (idx, tab) in tabs.iter().enumerate() {
+        let is_active = app.catalog_state.tab == *tab;
+        let style = if is_active {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(tab.label(), style));
+        if idx + 1 < tabs.len() {
+            spans.push(Span::styled("  |  ", Style::default().fg(Color::DarkGray)));
+        }
+    }
+
+    let line = Line::from(spans);
+    let block = Block::default().borders(Borders::ALL).title(" Pipelines Catalog ");
+    let para = Paragraph::new(line).block(block);
+    frame.render_widget(para, area);
+}
+
+fn draw_catalog_list_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let title = format!(" {} ", app.catalog_state.tab.label());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    match app.catalog_state.tab {
+        super::app::CatalogTab::Pipelines => match app.catalog_state.pipelines.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No pipelines.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) => {
+                let items: Vec<ratatui::widgets::ListItem> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, row)| {
+                        let is_selected = idx == app.catalog_state.selected_index;
+                        let style = if is_selected {
+                            Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        let text = format!("{} v{} ({})", row.name, row.version, row.id);
+                        let line = truncate_end(&text, inner.width as usize);
+                        ratatui::widgets::ListItem::new(line).style(style)
+                    })
+                    .collect();
+                let list = ratatui::widgets::List::new(items);
+                frame.render_widget(list, inner);
+            }
+        },
+        super::app::CatalogTab::Runs => match app.catalog_state.runs.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No runs.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+            }
+            Some(rows) => {
+                let items: Vec<ratatui::widgets::ListItem> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, row)| {
+                        let is_selected = idx == app.catalog_state.selected_index;
+                        let style = if is_selected {
+                            Style::default().fg(Color::White).bold().bg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        };
+                        let name = row
+                            .pipeline_name
+                            .as_deref()
+                            .unwrap_or(row.pipeline_id.as_str());
+                        let text = format!("{} • {} • {}", row.id, name, row.status);
+                        let line = truncate_end(&text, inner.width as usize);
+                        ratatui::widgets::ListItem::new(line).style(style)
+                    })
+                    .collect();
+                let list = ratatui::widgets::List::new(items);
+                frame.render_widget(list, inner);
+            }
+        },
+    }
+}
+
+fn draw_catalog_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Details ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    match app.catalog_state.tab {
+        super::app::CatalogTab::Pipelines => match app.catalog_state.pipelines.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No selection.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) => {
+                let row = &rows[app.catalog_state.selected_index];
+                lines.push(Line::from(format!("ID: {}", row.id)));
+                lines.push(Line::from(format!("Name: {}", row.name)));
+                lines.push(Line::from(format!("Version: {}", row.version)));
+                lines.push(Line::from(format!("Created: {}", row.created_at)));
+            }
+        },
+        super::app::CatalogTab::Runs => match app.catalog_state.runs.as_ref() {
+            None => {
+                let msg = Paragraph::new("Table not available.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) if rows.is_empty() => {
+                let msg = Paragraph::new("No selection.")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(msg, inner);
+                return;
+            }
+            Some(rows) => {
+                let row = &rows[app.catalog_state.selected_index];
+                lines.push(Line::from(format!("Run ID: {}", row.id)));
+                lines.push(Line::from(format!("Pipeline: {}", row.pipeline_id)));
+                if let Some(name) = &row.pipeline_name {
+                    lines.push(Line::from(format!("Name: {}", name)));
+                }
+                if let Some(version) = row.pipeline_version {
+                    lines.push(Line::from(format!("Version: {}", version)));
+                }
+                lines.push(Line::from(format!("Logical Date: {}", row.logical_date)));
+                lines.push(Line::from(format!("Status: {}", row.status)));
+                if let Some(snapshot) = &row.selection_snapshot_hash {
+                    lines.push(Line::from(format!("Snapshot: {}", snapshot)));
+                }
+                if let Some(started) = &row.started_at {
+                    lines.push(Line::from(format!("Started: {}", started)));
+                }
+                if let Some(done) = &row.completed_at {
+                    lines.push(Line::from(format!("Completed: {}", done)));
+                }
+            }
+        },
+    }
+
+    if let Some(message) = &app.catalog_state.status_message {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(para, inner);
+}
+
+fn draw_catalog_inspector(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Catalog",
+        Style::default().fg(Color::White).bold(),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Tab: {}", app.catalog_state.tab.label()),
+        Style::default().fg(Color::Gray),
+    )));
+    if let Some(msg) = &app.catalog_state.status_message {
+        lines.push(Line::from(Span::styled(
+            format!("Status: {}", msg),
+            Style::default().fg(Color::Yellow),
         )));
     }
 

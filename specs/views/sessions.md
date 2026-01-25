@@ -2,9 +2,9 @@
 
 **Status:** Draft
 **Parent:** specs/tui.md (Master TUI Spec)
-**Version:** 1.0
+**Version:** 1.1
 **Related:** specs/views/approvals.md, docs/intent_pipeline_workflow.md, docs/decisions/ADR-021-ai-agentic-iteration-workflow.md
-**Last Updated:** 2026-01-21
+**Last Updated:** 2026-01-25
 
 > **Note:** For global keybindings, layout patterns, and common UI elements,
 > see the master TUI spec at `specs/tui.md`.
@@ -18,15 +18,20 @@ The **Sessions** view provides visibility into intent pipeline workflows. Each s
 ### 1.1 Data Source
 
 ```
-~/.casparian_flow/casparian_flow.duckdb
+~/.casparian_flow/sessions/
 
-Tables queried:
-├── mcp_sessions         # Session metadata and state
-├── mcp_intents          # Intent proposals per session
-├── mcp_approvals        # Gate approvals
-├── cf_parsers           # Parser artifacts
-└── schema_contracts     # Schema proposals
+Session bundle layout:
+sessions/{session_id}/
+  manifest.json          # includes state = IntentState::as_str()
+  proposals/             # selection/tag_rules/path_fields/schema_intent/etc
+  approvals.jsonl        # DecisionRecord history
+  reports/               # backtest reports
+  logs/                  # tool logs
 ```
+
+Notes:
+- `manifest.state` stores the canonical `IntentState` string (e.g., `S0_INTERPRET_INTENT`).
+- The TUI derives pending gates from `IntentState::is_gate()` and `gate_number()`.
 
 ### 1.2 User Goals
 
@@ -100,12 +105,14 @@ Legend:
 
 | Gate | Name | Approval Scope | Auto/Manual |
 |------|------|----------------|-------------|
-| G1 | Intent Confirmation | User confirms AI understood request | Manual |
-| G2 | Schema Proposal | Schema contract looks correct | Manual |
-| G3 | Schema Approval | Schema ready for production | Manual |
-| G4 | Parser Validation | Backtest passes on sample files | Auto |
-| G5 | Deployment Approval | Parser ready for production | Manual |
-| G6 | Production Release | Final deployment confirmation | Manual |
+| G1 | Selection Approval | Confirm selection + corpus snapshot | Manual |
+| G2 | Tag Rules Approval | Enable persistent tagging rules | Manual |
+| G3 | Path Fields Approval | Approve derived fields + naming | Manual |
+| G4 | Schema Approval | Approve schema intent | Manual |
+| G5 | Publish Approval | Approve publish plan (schema + parser) | Manual |
+| G6 | Run Approval | Approve run/backfill scope | Manual |
+
+**Current TUI support:** G1 approval/reject is wired. Other gates are displayed but not yet actionable.
 
 ### 3.1 Gate Detail View
 
@@ -142,31 +149,29 @@ Legend:
                     | (default state)  |
                     +--------+---------+
                              |
-          +------------------+------------------+
-          |                  |                  |
-       [Enter]              [a]               [f]
-          |                  |                  |
-          v                  v                  v
-+------------------+ +------------------+ +------------------+
-|  SessionDetail   | |   GateApproval   | |   FilterDialog   |
-| (workflow view)  | | (approve gate)   | | (filter options) |
-+--------+---------+ +--------+---------+ +--------+---------+
-         |                    |                    |
-    +----+----+          [Enter/Esc]          [Enter/Esc]
-    |         |               |                    |
-  [g]       [Esc]             v                    v
-    |         |          +----+----+               |
-    v         |          |         |               |
-+--------+    |     [approve]  [reject]            |
-| GateView|   |          |         |               |
-+---+----+    |          v         v               |
-    |         |    +-----------+   |               |
-  [Esc]       |    | SessionList|<-+---------------+
-    |         |    +-----------+
-    v         v
-+------------------+
-|   SessionList    |
-+------------------+
+                           [Enter]
+                             |
+                +------------+-------------+
+                |                          |
+                v                          v
+       +------------------+       +------------------+
+       |  SessionDetail   |       |   GateApproval   |
+       | (workflow view)  |       | (G1 approve/rej) |
+       +--------+---------+       +--------+---------+
+                |                          |
+               [w]                    [a]/[r]/[Esc]
+                |                          |
+                v                          v
+       +------------------+        +---------------+
+       | WorkflowProgress |        |  SessionList  |
+       +--------+---------+        +---------------+
+                |
+              [Esc]
+                |
+                v
+       +------------------+
+       |  SessionDetail   |
+       +------------------+
 ```
 
 ### 4.1 State Descriptions
@@ -174,10 +179,10 @@ Legend:
 | State | Description |
 |-------|-------------|
 | `SessionList` | Default state, browsing sessions |
-| `SessionDetail` | Expanded view of session workflow |
-| `GateView` | Detailed view of specific gate |
-| `GateApproval` | Confirmation dialog for gate approval |
-| `FilterDialog` | Filter sessions by status/gate |
+| `SessionDetail` | Expanded view of session workflow + shortcuts |
+| `WorkflowProgress` | Gate progression diagram |
+| `GateApproval` | Approve/reject pending gate (G1 wired) |
+| `ProposalReview` | Reserved for proposal detail (not wired yet) |
 
 ---
 
@@ -185,14 +190,15 @@ Legend:
 
 | Key | Action | Context |
 |-----|--------|---------|
-| `Enter` | View session details | Opens SessionDetail |
-| `a` | Approve current gate | Sessions awaiting approval |
-| `r` | Reject current gate | Opens rejection dialog |
-| `g` | View gate details | In SessionDetail view |
-| `f` | Filter dialog | Filter by status/gate |
-| `Tab` | Cycle sections | AWAITING -> ACTIVE -> COMPLETED |
-| `I` | Toggle inspector | Show/hide details panel |
-| `v` | View failures | When backtest has failures |
+| `Enter` | Open session | If pending gate, opens approval; otherwise detail view |
+| `n` | New session | Opens command palette in Intent mode |
+| `w` | Workflow diagram | From session detail |
+| `a` / `Enter` | Approve gate | Gate approval view |
+| `r` | Reject gate | Gate approval view |
+| `j` | Jump to Jobs | From session detail |
+| `q` | Jump to Query | From session detail |
+| `d` | Jump to Discover | From session detail |
+| `r` | Refresh list | Session list |
 | `Esc` | Back / cancel | Close dialog or return |
 
 **List navigation per tui.md Section 3.2**

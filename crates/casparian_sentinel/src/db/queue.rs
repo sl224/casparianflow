@@ -56,7 +56,7 @@ pub struct OutputMaterialization {
     pub parser_fingerprint: String,
     pub output_name: String,
     pub sink_uri: String,
-    pub sink_mode: String,
+    pub sink_mode: SinkMode,
     pub table_name: Option<String>,
     pub schema_hash: Option<String>,
     pub status: String,

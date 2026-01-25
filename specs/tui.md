@@ -26,14 +26,14 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                                    HOME HUB                                      │
 │                                                                                  │
-│   [1] Discover  [2] Parser Bench  [3] Jobs  [4] Sources  [5] Approvals  [6] Query  [7] Sessions │
+│   [1] Discover  [2] Parser Bench  [3] Jobs  [4] Sources  [5] Approvals  [6] Query  [7] Sessions  [,] Settings │
 └─────────────────────────────────────────────────────────────────────────────────┘
          │              │              │           │            │           │           │
          ▼              ▼              ▼           ▼            ▼           ▼           ▼
-    ┌─────────┐   ┌───────────┐  ┌─────────┐ ┌──────────┐ ┌───────────┐ ┌───────┐ ┌──────────┐
-    │Discover │   │Parser     │  │ Jobs    │ │ Sources  │ │ Approvals │ │ Query │ │ Sessions │
-    │         │   │Bench      │  │         │ │          │ │           │ │       │ │          │
-    └─────────┘   └───────────┘  └─────────┘ └──────────┘ └───────────┘ └───────┘ └──────────┘
+    ┌─────────┐   ┌───────────┐  ┌─────────┐ ┌──────────┐ ┌───────────┐ ┌───────┐ ┌──────────┐ ┌──────────┐
+    │Discover │   │Parser     │  │ Jobs    │ │ Sources  │ │ Approvals │ │ Query │ │ Sessions │ │ Settings │
+    │         │   │Bench      │  │         │ │          │ │           │ │       │ │          │ │          │
+    └─────────┘   └───────────┘  └─────────┘ └──────────┘ └───────────┘ └───────┘ └──────────┘ └──────────┘
          │              │
          ▼              ▼
     ┌─────────┐   ┌───────────┐
@@ -55,6 +55,8 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 | Query | `views/query.md` | SQL query console |
 | Sessions | `views/sessions.md` | Intent pipeline workflows |
 | Settings | `views/settings.md` | Configuration |
+| Triage | (inline) | Quarantine + schema mismatch + dead-letter triage |
+| Catalog | (inline) | Pipelines + pipeline runs catalog |
 | Extraction Rules | `views/extraction_rules.md` | Rule creation, testing (Draft) |
 
 ---
@@ -72,21 +74,24 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 | `5` | Go to Approvals | From any view |
 | `6` | Go to Query | From any view |
 | `7` | Go to Sessions | From any view |
+| `P` | Go to Parser Bench | From any view |
+| `,` | Go to Settings | From any view |
 | `0` or `H` | Go to Home | From any view |
-| `:` or `/` | Open command palette | Natural language input |
+| `:` or `Ctrl+P` | Open command palette (Command) | From any view |
+| `>` | Open command palette (Intent) | From any view |
 | `Esc` | Back / Close dialog | Context-dependent |
 | `q` | Quit (with confirmation if unsaved) | From any view |
 
 **View-level overrides:**
 - **Discover:** `1`, `2`, `3` control panel focus (Sources/Tags/Files) instead of view navigation.
   Use `0`/`H` or `4` to navigate away. See `views/discover.md` Section 6.1.
-- **Query:** `/` opens search in results mode, use `:` for command palette.
+- **Query:** `:` opens command palette; `/` is reserved for view-specific search where implemented.
 - Views may override keys when contextually appropriate; overrides are documented in view specs.
 
 **Command Palette:**
-The command palette (`:` or `/`) provides natural language input for AI-assisted operations.
-Users can type intents like "parse orders.csv files" or "create schema for trades" which
-initiate intent pipeline sessions. See `views/sessions.md` for workflow details.
+The command palette uses `:` (command mode) or `>` (intent mode) and supports AI-assisted
+operations. Users can type intents like "parse orders.csv files" or "create schema for trades"
+which initiate intent pipeline sessions. See `views/sessions.md` for workflow details.
 
 ### 2.4 Jobs View Signals
 Jobs view emphasizes batch throughput over topology:

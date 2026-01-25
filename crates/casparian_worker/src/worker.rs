@@ -894,19 +894,6 @@ const LINEAGE_COLUMNS: [&str; 4] = [
     "_cf_parser_version",
 ];
 
-fn batch_lineage_presence(batch: &RecordBatch) -> (bool, bool) {
-    let schema = batch.schema();
-    let mut found = 0usize;
-    for col in LINEAGE_COLUMNS {
-        if schema.index_of(col).is_ok() {
-            found += 1;
-        }
-    }
-    let has_any = found > 0;
-    let has_all = found == LINEAGE_COLUMNS.len();
-    (has_any, has_all)
-}
-
 fn inject_lineage_batches(
     output_name: &str,
     batches: Vec<RecordBatch>,
@@ -920,55 +907,33 @@ fn inject_lineage_batches(
 
     let total_batches = batches.len();
     let mut with_lineage = Vec::with_capacity(total_batches);
-    let mut any_batches = 0usize;
-    let mut all_batches = 0usize;
-
+    let mut reserved: Vec<&'static str> = Vec::new();
     for batch in &batches {
-        let (has_any, has_all) = batch_lineage_presence(batch);
-        if has_any && !has_all {
-            anyhow::bail!(
-                "Output '{}' contains partial reserved lineage columns (must include all {:?})",
-                output_name,
-                LINEAGE_COLUMNS
-            );
-        }
-        if has_any {
-            any_batches += 1;
-        }
-        if has_all {
-            all_batches += 1;
+        let schema = batch.schema();
+        for col in LINEAGE_COLUMNS {
+            if schema.index_of(col).is_ok() {
+                reserved.push(col);
+            }
         }
     }
-
-    if any_batches == 0 {
-        for batch in batches {
-            let wrapped = casparian_sinks::OutputBatch::from_record_batch(batch);
-            let injected = casparian_sinks::inject_lineage_columns(
-                &wrapped,
-                source_hash,
-                job_id,
-                parser_version,
-            )?;
-            with_lineage.push(injected);
-        }
-        return Ok(with_lineage);
-    }
-
-    if all_batches == total_batches {
-        warn!(
-            "Output '{}' already includes lineage columns; skipping injection.",
-            output_name
+    if !reserved.is_empty() {
+        reserved.sort_unstable();
+        reserved.dedup();
+        anyhow::bail!(
+            "Output '{}' contains reserved runtime lineage columns {:?}; parsers must not emit these columns.",
+            output_name,
+            reserved
         );
-        return Ok(batches
-            .into_iter()
-            .map(casparian_sinks::OutputBatch::from_record_batch)
-            .collect());
     }
 
-    anyhow::bail!(
-        "Output '{}' has inconsistent lineage columns across batches",
-        output_name
-    );
+    for batch in batches {
+        let wrapped = casparian_sinks::OutputBatch::from_record_batch(batch);
+        let injected =
+            casparian_sinks::inject_lineage_columns(&wrapped, source_hash, job_id, parser_version)?;
+        with_lineage.push(injected);
+    }
+
+    Ok(with_lineage)
 }
 
 /// Per-output status for multi-output jobs.
@@ -2478,7 +2443,37 @@ mod tests {
     }
 
     #[test]
-    fn test_quarantine_artifacts_from_schema_def() {
+    fn conf_t1_worker_rejects_reserved_lineage_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_cf_source_hash", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("spoof")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let err = inject_lineage_batches(
+            "output",
+            vec![batch],
+            "src-hash",
+            "job-1",
+            "1.0.0",
+        )
+        .expect_err("expected reserved lineage rejection");
+        assert!(
+            err.to_string().contains("reserved runtime lineage columns"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn conf_t1_quarantine_writes_outputs_and_quarantine() {
         let schema_def = types::SchemaDefinition {
             columns: vec![types::SchemaColumnSpec {
                 name: "id".to_string(),

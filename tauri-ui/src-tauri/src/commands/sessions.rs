@@ -135,7 +135,7 @@ pub async fn session_list(state: State<'_, AppState>) -> CommandResult<Vec<Sessi
             state: session.state.as_str().to_string(),
             files_selected: session.files_selected,
             created_at: session.created_at, // Already RFC3339 string
-            has_question: session.pending_question_id.is_some(),
+            has_question: session.state.is_gate(),
             is_at_gate: session.state.is_gate(),
             is_terminal: session.state.is_terminal(),
         })
@@ -236,28 +236,26 @@ pub async fn session_status(
 
     // Build the current question if at a gate
     let current_question = if session.state.is_gate() {
-        session.pending_question_id.as_ref().map(|q_id| {
-            // Build a placeholder question based on the gate
-            let (kind, text) = gate_to_question(&session.state);
-            SessionQuestionResponse {
-                id: q_id.clone(),
-                kind: kind.to_string(),
-                text,
-                options: vec![
-                    QuestionOptionResponse {
-                        id: "approve".to_string(),
-                        label: "Approve".to_string(),
-                        description: "Accept the proposal and proceed".to_string(),
-                        is_default: true,
-                    },
-                    QuestionOptionResponse {
-                        id: "reject".to_string(),
-                        label: "Reject".to_string(),
-                        description: "Reject and go back".to_string(),
-                        is_default: false,
-                    },
-                ],
-            }
+        // Build a placeholder question based on the gate.
+        let (kind, text) = gate_to_question(&session.state);
+        Some(SessionQuestionResponse {
+            id: format!("{}:{}", session.session_id, session.state.as_str()),
+            kind: kind.to_string(),
+            text,
+            options: vec![
+                QuestionOptionResponse {
+                    id: "approve".to_string(),
+                    label: "Approve".to_string(),
+                    description: "Accept the proposal and proceed".to_string(),
+                    is_default: true,
+                },
+                QuestionOptionResponse {
+                    id: "reject".to_string(),
+                    label: "Reject".to_string(),
+                    description: "Reject and go back".to_string(),
+                    is_default: false,
+                },
+            ],
         })
     } else {
         None
@@ -419,7 +417,7 @@ pub async fn session_list_pending(
             state: session.state.as_str().to_string(),
             files_selected: session.files_selected,
             created_at: session.created_at, // Already RFC3339 string
-            has_question: session.pending_question_id.is_some(),
+            has_question: true,
             is_at_gate: true,
             is_terminal: false,
         })

@@ -1403,8 +1403,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     pub fn upsert_file(&self, file: &ScannedFile) -> Result<UpsertResult> {
         // Check if file exists
         let existing = self.conn.query_optional(
-            "SELECT id, size, mtime, status FROM scout_files WHERE source_id = ? AND path = ?",
-            &[file.source_id.as_i64().into(), file.path.as_str().into()],
+            "SELECT id, size, mtime, status FROM scout_files WHERE source_id = ? AND file_uid = ?",
+            &[
+                file.source_id.as_i64().into(),
+                DbValue::from(file.file_uid.as_str()),
+            ],
         )?;
 
         let now = now_millis();
@@ -1452,8 +1455,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 )?;
 
                 let id: i64 = self.conn.query_scalar(
-                    "SELECT id FROM scout_files WHERE source_id = ? AND path = ?",
-                    &[file.source_id.as_i64().into(), file.path.as_str().into()],
+                    "SELECT id FROM scout_files WHERE source_id = ? AND file_uid = ?",
+                    &[
+                        file.source_id.as_i64().into(),
+                        DbValue::from(file.file_uid.as_str()),
+                    ],
                 )?;
 
                 Ok(UpsertResult {
@@ -1474,6 +1480,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     self.conn.execute(
                         r#"
                         UPDATE scout_files SET
+                            workspace_id = ?,
+                            path = ?,
+                            rel_path = ?,
+                            parent_path = ?,
+                            name = ?,
+                            extension = ?,
+                            is_dir = ?,
                             size = ?,
                             mtime = ?,
                             content_hash = ?,
@@ -1485,6 +1498,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         WHERE id = ?
                         "#,
                         &[
+                            DbValue::from(file.workspace_id.to_string()),
+                            file.path.as_str().into(),
+                            file.rel_path.as_str().into(),
+                            file.parent_path.as_str().into(),
+                            file.name.as_str().into(),
+                            file.extension.as_deref().into(),
+                            (file.is_dir as i64).into(),
                             (file.size as i64).into(),
                             file.mtime.into(),
                             file.content_hash.as_deref().into(),
@@ -1502,8 +1522,31 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 } else {
                     // Just update last_seen_at
                     self.conn.execute(
-                        "UPDATE scout_files SET last_seen_at = ?, file_uid = ? WHERE id = ?",
-                        &[now.into(), DbValue::from(file.file_uid.as_str()), id.into()],
+                        r#"
+                        UPDATE scout_files SET
+                            workspace_id = ?,
+                            path = ?,
+                            rel_path = ?,
+                            parent_path = ?,
+                            name = ?,
+                            extension = ?,
+                            is_dir = ?,
+                            last_seen_at = ?,
+                            file_uid = ?
+                        WHERE id = ?
+                        "#,
+                        &[
+                            DbValue::from(file.workspace_id.to_string()),
+                            file.path.as_str().into(),
+                            file.rel_path.as_str().into(),
+                            file.parent_path.as_str().into(),
+                            file.name.as_str().into(),
+                            file.extension.as_deref().into(),
+                            (file.is_dir as i64).into(),
+                            now.into(),
+                            DbValue::from(file.file_uid.as_str()),
+                            id.into(),
+                        ],
                     )?;
                 }
 
@@ -1728,7 +1771,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                                     THEN 1 ELSE 0 END), 0) AS unchanged_count
                             FROM staging_scout_files AS source
                             LEFT JOIN scout_files AS target
-                              ON target.source_id = source.source_id AND target.path = source.path
+                              ON target.source_id = source.source_id AND target.file_uid = source.file_uid
                             "#,
                             &[],
                         )?;
@@ -1752,10 +1795,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         r#"
                         MERGE INTO scout_files AS target
                         USING staging_scout_files AS source
-                        ON target.source_id = source.source_id AND target.path = source.path
+                        ON target.source_id = source.source_id AND target.file_uid = source.file_uid
                         WHEN MATCHED AND (target.size != source.size OR target.mtime != source.mtime) THEN
                             UPDATE SET
                                 workspace_id = source.workspace_id,
+                                path = source.path,
+                                rel_path = source.rel_path,
                                 size = source.size,
                                 mtime = source.mtime,
                                 content_hash = source.content_hash,
@@ -1770,6 +1815,13 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                                 last_seen_at = source.last_seen_at
                         WHEN MATCHED THEN
                             UPDATE SET
+                                workspace_id = source.workspace_id,
+                                path = source.path,
+                                rel_path = source.rel_path,
+                                parent_path = source.parent_path,
+                                name = source.name,
+                                extension = source.extension,
+                                is_dir = source.is_dir,
                                 file_uid = source.file_uid,
                                 last_seen_at = source.last_seen_at
                         WHEN NOT MATCHED THEN
