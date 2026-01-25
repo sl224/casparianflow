@@ -19,6 +19,7 @@ pub fn assert_flow(
     plain: &str,
     mask: &str,
     layout_signature: &str,
+    ui_signature_key: &str,
 ) -> Result<(), FlowAssertError> {
     let mut failures = Vec::new();
 
@@ -57,6 +58,26 @@ pub fn assert_flow(
         layout_signature,
         false,
         "layout_not_contains",
+    ));
+    if let Some(expected) = assertion.ui_signature_key.as_ref() {
+        if expected != ui_signature_key {
+            failures.push(format!(
+                "ui_signature_key expected '{}' got '{}'",
+                expected, ui_signature_key
+            ));
+        }
+    }
+    failures.extend(check_patterns(
+        &assertion.ui_signature_contains,
+        ui_signature_key,
+        true,
+        "ui_signature_contains",
+    ));
+    failures.extend(check_patterns(
+        &assertion.ui_signature_not_contains,
+        ui_signature_key,
+        false,
+        "ui_signature_not_contains",
     ));
 
     if failures.is_empty() {
@@ -100,6 +121,6 @@ mod tests {
             plain_contains: vec!["hello".to_string()],
             ..FlowAssertion::default()
         };
-        assert!(assert_flow(&assertion, "hello world", "", "").is_ok());
+        assert!(assert_flow(&assertion, "hello world", "", "", "").is_ok());
     }
 }

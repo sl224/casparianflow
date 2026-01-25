@@ -71,6 +71,7 @@ struct StepMeta {
     index: usize,
     kind: String,
     label: Option<String>,
+    ui_signature_key: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +98,7 @@ struct FlowCapture {
     mask: String,
     layout: Vec<LayoutNode>,
     layout_signature: String,
+    ui_signature_key: String,
 }
 
 fn run_flow(args: TuiFlowRunArgs) -> Result<()> {
@@ -324,6 +326,7 @@ impl FlowRunner {
                         &capture.plain,
                         &capture.mask,
                         &capture.layout_signature,
+                        &capture.ui_signature_key,
                     ) {
                         Ok(_) => return Ok((capture, None)),
                         Err(err) => Some(err),
@@ -337,6 +340,7 @@ impl FlowRunner {
                             &capture.plain,
                             &capture.mask,
                             &capture.layout_signature,
+                            &capture.ui_signature_key,
                         ) {
                             Ok(_) => return Ok((capture, None)),
                             Err(err) => last_err = Some(err),
@@ -361,6 +365,7 @@ impl FlowRunner {
                     &capture.plain,
                     &capture.mask,
                     &capture.layout_signature,
+                    &capture.ui_signature_key,
                 ) {
                     Ok(_) => Ok((capture, None)),
                     Err(err) => {
@@ -379,11 +384,13 @@ impl FlowRunner {
         let mask = normalize_for_snapshot(&buffer_to_bg_mask(&buffer));
         let layout = layout_tree(&self.app, self.terminal.width, self.terminal.height);
         let layout_signature = layout_signature(&layout);
+        let ui_signature_key = self.app.ui_signature_key();
         Ok(FlowCapture {
             plain,
             mask,
             layout,
             layout_signature,
+            ui_signature_key,
         })
     }
 
@@ -405,6 +412,7 @@ impl FlowRunner {
             index,
             kind: step.kind().to_string(),
             label: step.label().map(|s| s.to_string()),
+            ui_signature_key: capture.ui_signature_key.clone(),
         };
         fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)
             .with_context(|| format!("write {}", meta_path.display()))?;

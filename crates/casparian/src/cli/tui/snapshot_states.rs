@@ -14,14 +14,14 @@ use super::app::{
     App, ApprovalDisplayStatus, ApprovalInfo, ApprovalOperationType, ApprovalStatusFilter,
     ApprovalsViewState, BacktestInfo, BoundFileInfo, BoundFileStatus, CatalogTab,
     CommandPaletteMode, CommandPaletteState, DeadLetterRow, DiscoverFocus, DiscoverViewState,
-    GateInfo, HomeStats, JobInfo, JobStatus, JobSummary, JobType, JobsListSection, JobsViewState,
-    MonitoringState, ParserBenchState, ParserHealth, ParserInfo, ParserTestResult, PipelineInfo,
-    PipelineRunInfo, PipelineStage, PipelineState, ProposalInfo, QuarantineRow, QueryResults,
-    QueryState, QueryViewState, QueueStats, RuleDialogFocus, RuleId, RuleInfo, SavedQueriesState,
-    SavedQueryEntry, SchemaColumn, SchemaMismatchRow, SessionInfo, SessionsViewState,
-    SettingsCategory, SettingsState, SinkOutput, SinkStats, SourceInfo, SuggestedFix,
-    TableBrowserState, TagInfo, ThroughputSample, TriageTab, TuiMode, ViolationSummary,
-    ViolationType, WorkspaceSwitcherMode,
+    FileInfo, GateInfo, HomeStats, JobInfo, JobStatus, JobSummary, JobType, JobsListSection,
+    JobsViewState, MonitoringState, ParserBenchState, ParserHealth, ParserInfo, ParserTestResult,
+    PipelineInfo, PipelineRunInfo, PipelineStage, PipelineState, ProposalInfo, QuarantineRow,
+    QueryResults, QueryState, QueryViewState, QueueStats, RuleDialogFocus, RuleId, RuleInfo,
+    SavedQueriesState, SavedQueryEntry, SchemaColumn, SchemaMismatchRow, SessionInfo,
+    SessionsViewState, SettingsCategory, SettingsState, SinkOutput, SinkStats, SourceInfo,
+    SuggestedFix, TableBrowserState, TagInfo, ThroughputSample, TriageTab, TuiMode,
+    ViolationSummary, ViolationType, WorkspaceSwitcherMode,
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
@@ -52,6 +52,10 @@ pub enum SnapshotCoverage {
     DiscoverSourceDeleteConfirmDialog,
     DiscoverEnteringPathDialog,
     DiscoverScanConfirmDialog,
+    DiscoverFilteringDialog,
+    DiscoverTaggingDialog,
+    DiscoverBulkTagDialog,
+    DiscoverCreateSourceDialog,
     DiscoverSuggestionsHelpOverlay,
     DiscoverSuggestionsDetailOverlay,
     DiscoverManualTagConfirmOverlay,
@@ -120,6 +124,10 @@ impl SnapshotCoverage {
         SnapshotCoverage::DiscoverSourceDeleteConfirmDialog,
         SnapshotCoverage::DiscoverEnteringPathDialog,
         SnapshotCoverage::DiscoverScanConfirmDialog,
+        SnapshotCoverage::DiscoverFilteringDialog,
+        SnapshotCoverage::DiscoverTaggingDialog,
+        SnapshotCoverage::DiscoverBulkTagDialog,
+        SnapshotCoverage::DiscoverCreateSourceDialog,
         SnapshotCoverage::DiscoverSuggestionsHelpOverlay,
         SnapshotCoverage::DiscoverSuggestionsDetailOverlay,
         SnapshotCoverage::DiscoverManualTagConfirmOverlay,
@@ -190,6 +198,10 @@ impl SnapshotCoverage {
             }
             SnapshotCoverage::DiscoverEnteringPathDialog => "discover_entering_path_dialog",
             SnapshotCoverage::DiscoverScanConfirmDialog => "discover_scan_confirm_dialog",
+            SnapshotCoverage::DiscoverFilteringDialog => "discover_filtering_dialog",
+            SnapshotCoverage::DiscoverTaggingDialog => "discover_tagging_dialog",
+            SnapshotCoverage::DiscoverBulkTagDialog => "discover_bulk_tag_dialog",
+            SnapshotCoverage::DiscoverCreateSourceDialog => "discover_create_source_dialog",
             SnapshotCoverage::DiscoverSuggestionsHelpOverlay => "discover_suggestions_help_overlay",
             SnapshotCoverage::DiscoverSuggestionsDetailOverlay => {
                 "discover_suggestions_detail_overlay"
@@ -364,6 +376,34 @@ static SNAPSHOT_CASES: &[SnapshotCase] = &[
         focus_hint: "Confirm scan",
         coverage: SnapshotCoverage::DiscoverScanConfirmDialog,
         build: case_discover_scan_confirm_dialog,
+    },
+    SnapshotCase {
+        name: "discover_filtering_dialog",
+        notes: "Filter dialog with active input.",
+        focus_hint: "Filter input",
+        coverage: SnapshotCoverage::DiscoverFilteringDialog,
+        build: case_discover_filtering_dialog,
+    },
+    SnapshotCase {
+        name: "discover_tagging_dialog",
+        notes: "Tagging dialog with suggestions.",
+        focus_hint: "Tag input",
+        coverage: SnapshotCoverage::DiscoverTaggingDialog,
+        build: case_discover_tagging_dialog,
+    },
+    SnapshotCase {
+        name: "discover_bulk_tag_dialog",
+        notes: "Bulk tag dialog with rule toggle.",
+        focus_hint: "Tag input",
+        coverage: SnapshotCoverage::DiscoverBulkTagDialog,
+        build: case_discover_bulk_tag_dialog,
+    },
+    SnapshotCase {
+        name: "discover_create_source_dialog",
+        notes: "Create source dialog with path and name input.",
+        focus_hint: "Name input",
+        coverage: SnapshotCoverage::DiscoverCreateSourceDialog,
+        build: case_discover_create_source_dialog,
     },
     SnapshotCase {
         name: "discover_suggestions_help_overlay",
@@ -877,6 +917,50 @@ fn case_discover_scan_confirm_dialog() -> App {
     app.mode = TuiMode::Discover;
     app.discover.view_state = DiscoverViewState::ScanConfirm;
     app.discover.scan_confirm_path = Some("/".to_string());
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_filtering_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::Filtering;
+    app.discover.filter = "reports/**/*.csv".to_string();
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_tagging_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::Tagging;
+    app.discover.files = sample_discover_files();
+    app.discover.selected = 1;
+    app.discover.tag_input = "rep".to_string();
+    app.discover.available_tags = sample_available_tags();
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_bulk_tag_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::BulkTagging;
+    app.discover.files = sample_discover_files();
+    app.discover.filter = "2024".to_string();
+    app.discover.bulk_tag_input = "report".to_string();
+    app.discover.bulk_tag_save_as_rule = true;
+    app.discover.available_tags = sample_available_tags();
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_create_source_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::CreatingSource;
+    app.discover.pending_source_path = Some("/data/alpha/2024".to_string());
+    app.discover.source_name_input = "alpha-2024".to_string();
     app.discover.rule_builder = Some(sample_rule_builder_basic());
     app
 }
@@ -1615,6 +1699,65 @@ fn sample_tags() -> Vec<TagInfo> {
             name: "raw".to_string(),
             count: 92,
             is_special: false,
+        },
+    ]
+}
+
+fn sample_available_tags() -> Vec<String> {
+    vec![
+        "report".to_string(),
+        "report.financial".to_string(),
+        "trade".to_string(),
+        "raw".to_string(),
+    ]
+}
+
+fn sample_discover_files() -> Vec<FileInfo> {
+    vec![
+        FileInfo {
+            file_id: 1001,
+            path: "/data/alpha/reports/2024/Q1/report_2024-01.csv".to_string(),
+            rel_path: "reports/2024/Q1/report_2024-01.csv".to_string(),
+            size: 1_048_576,
+            modified: local_at(15),
+            is_dir: false,
+            tags: vec!["report".to_string()],
+        },
+        FileInfo {
+            file_id: 1002,
+            path: "/data/alpha/reports/2024/Q2/report_2024-04.csv".to_string(),
+            rel_path: "reports/2024/Q2/report_2024-04.csv".to_string(),
+            size: 1_092_000,
+            modified: local_at(35),
+            is_dir: false,
+            tags: vec!["report".to_string()],
+        },
+        FileInfo {
+            file_id: 1003,
+            path: "/data/alpha/trades/2024/trade_2024-02.csv".to_string(),
+            rel_path: "trades/2024/trade_2024-02.csv".to_string(),
+            size: 824_320,
+            modified: local_at(55),
+            is_dir: false,
+            tags: vec!["trade".to_string()],
+        },
+        FileInfo {
+            file_id: 1004,
+            path: "/data/alpha/raw/2023/ingest_2023-12-31.json".to_string(),
+            rel_path: "raw/2023/ingest_2023-12-31.json".to_string(),
+            size: 2_097_152,
+            modified: local_at(75),
+            is_dir: false,
+            tags: vec!["raw".to_string()],
+        },
+        FileInfo {
+            file_id: 1005,
+            path: "/data/alpha/notes/readme.txt".to_string(),
+            rel_path: "notes/readme.txt".to_string(),
+            size: 12_288,
+            modified: local_at(95),
+            is_dir: false,
+            tags: vec![],
         },
     ]
 }

@@ -1,5 +1,8 @@
 #!/bin/bash
-# scripts/tui-test.sh - Run TUI test scenarios
+# scripts/tui-test.sh - Run TUI test scenarios (manual helper)
+#
+# NOTE: Manual-only. Prefer `casparian tui-flow` + `tui-state-graph --render --lint`
+# and `tui-ux-lint` for correctness checks.
 #
 # Usage:
 #   ./scripts/tui-test.sh list                    # List available scenarios

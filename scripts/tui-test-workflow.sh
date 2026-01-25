@@ -1,5 +1,7 @@
 #!/bin/bash
-# TUI Testing Workflow Helper
+# TUI Testing Workflow Helper (manual)
+# NOTE: Manual-only. Prefer `casparian tui-flow` + `tui-state-graph --render --lint`
+# and `tui-ux-lint` for correctness checks.
 # Per specs/meta/tui_testing_workflow.md
 #
 # Usage:

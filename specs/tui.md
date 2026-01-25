@@ -84,7 +84,7 @@ The Casparian Flow TUI provides a keyboard-driven interface for data discovery, 
 | `q` | Quit (with confirmation if unsaved) | From any view |
 
 **View-level overrides:**
-- **Discover:** `1`, `2`, `3` control panel focus (Sources/Tags/Files) instead of view navigation.
+- **Discover:** digits remain global view navigation; use `[S]` for Sources dropdown and `[T]` for Tags dropdown.
   Use `0`/`H` or `4` to navigate away. See `views/discover.md` Section 6.1.
 - **Query:** `:` opens command palette; `/` is reserved for view-specific search where implemented.
 - Views may override keys when contextually appropriate; overrides are documented in view specs.

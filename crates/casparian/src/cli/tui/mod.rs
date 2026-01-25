@@ -17,6 +17,7 @@ pub mod snapshot_states;
 pub mod state_graph;
 pub mod ui;
 pub mod ui_signature;
+pub mod ux_lint;
 
 #[cfg(feature = "profiling")]
 mod profiler_overlay;

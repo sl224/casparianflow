@@ -81,6 +81,17 @@ pub(super) fn command_palette_area(palette: &CommandPaletteState, area: Rect) ->
     centered_dialog_area(area, dialog_width, dialog_height)
 }
 
+/// Clear the content area beneath the top bar for modal overlays.
+fn draw_modal_scrim(frame: &mut Frame, area: Rect, top_bar: Rect) {
+    let scrim_area = Rect::new(
+        area.x,
+        top_bar.y + top_bar.height,
+        area.width,
+        area.height.saturating_sub(top_bar.height),
+    );
+    frame.render_widget(Clear, scrim_area);
+}
+
 /// Calculate scroll offset to keep selected item centered in view.
 /// Works for any scrollable list (files, folders, dropdowns).
 pub fn centered_scroll_offset(selected: usize, visible: usize, total: usize) -> usize {
@@ -710,6 +721,21 @@ pub fn draw(frame: &mut Frame, app: &App) {
         TuiMode::Sessions => draw_sessions_screen(frame, app, main_area),
         TuiMode::Triage => draw_triage_screen(frame, app, main_area),
         TuiMode::Catalog => draw_catalog_screen(frame, app, main_area),
+    }
+
+    let global_modal_active = app.show_help
+        || app.command_palette.visible
+        || app.workspace_switcher.visible
+        || app
+            .discover
+            .rule_builder
+            .as_ref()
+            .map(|builder| builder.suggestions_help_open || builder.suggestions_detail_open)
+            .unwrap_or(false);
+
+    if global_modal_active {
+        let shell = shell_layout(area, !app.inspector_collapsed);
+        draw_modal_scrim(frame, area, shell.top);
     }
 
     if let Some(builder) = &app.discover.rule_builder {
@@ -1437,6 +1463,11 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_sources_inspector(frame, app, inner);
     }
 
+    let modal_active = app.sources_state.confirm_delete || app.sources_state.editing;
+    if modal_active {
+        draw_modal_scrim(frame, area, shell.top);
+    }
+
     // Delete confirmation overlay
     if app.sources_state.confirm_delete {
         let dialog_area = render_centered_dialog(frame, area, 50, 7);
@@ -1474,14 +1505,18 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(para, dialog_area);
     }
 
-    let footer =
-        " [↑/↓] Navigate  [n] New  [e] Edit  [r] Rescan  [d] Delete  [I] Inspector  [?] Help ";
-    draw_shell_action_bar(
-        frame,
-        footer,
-        Style::default().fg(Color::DarkGray),
-        shell.bottom,
-    );
+    if modal_active {
+        frame.render_widget(Clear, shell.bottom);
+    } else {
+        let footer =
+            " [↑/↓] Navigate  [n] New  [e] Edit  [r] Rescan  [d] Delete  [I] Inspector  [?] Help ";
+        draw_shell_action_bar(
+            frame,
+            footer,
+            Style::default().fg(Color::DarkGray),
+            shell.bottom,
+        );
+    }
 }
 
 /// Draw the Approvals view screen (key 5)
@@ -1532,6 +1567,10 @@ fn draw_approvals_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_approvals_inspector(frame, app, inner);
     }
 
+    if app.approvals_state.view_state != ApprovalsViewState::List {
+        draw_modal_scrim(frame, area, shell.top);
+    }
+
     // Dialogs
     match app.approvals_state.view_state {
         ApprovalsViewState::ConfirmApprove => {
@@ -1575,13 +1614,17 @@ fn draw_approvals_screen(frame: &mut Frame, app: &App, area: Rect) {
         ApprovalsViewState::List => {}
     }
 
-    let footer = " [j/k] Navigate  [a] Approve  [r] Reject  [f] Filter  [Enter] Pin  [d] Details  [R] Refresh  [I] Inspector ";
-    draw_shell_action_bar(
-        frame,
-        footer,
-        Style::default().fg(Color::DarkGray),
-        shell.bottom,
-    );
+    if app.approvals_state.view_state == ApprovalsViewState::List {
+        let footer = " [j/k] Navigate  [a] Approve  [r] Reject  [f] Filter  [Enter] Pin  [d] Details  [R] Refresh  [I] Inspector ";
+        draw_shell_action_bar(
+            frame,
+            footer,
+            Style::default().fg(Color::DarkGray),
+            shell.bottom,
+        );
+    } else {
+        frame.render_widget(Clear, shell.bottom);
+    }
 }
 
 /// Draw the approvals list
@@ -1873,8 +1916,38 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_discover_inspector(frame, app, inner);
     }
 
-    let (footer_text, footer_style) = discover_action_bar(app);
-    draw_shell_action_bar(frame, &footer_text, footer_style, shell.bottom);
+    let modal_active = matches!(
+        app.discover.view_state,
+        DiscoverViewState::SourcesDropdown
+            | DiscoverViewState::TagsDropdown
+            | DiscoverViewState::RulesManager
+            | DiscoverViewState::RuleCreation
+            | DiscoverViewState::SourcesManager
+            | DiscoverViewState::SourceEdit
+            | DiscoverViewState::SourceDeleteConfirm
+            | DiscoverViewState::Scanning
+            | DiscoverViewState::EnteringPath
+            | DiscoverViewState::ScanConfirm
+            | DiscoverViewState::Filtering
+            | DiscoverViewState::Tagging
+            | DiscoverViewState::BulkTagging
+            | DiscoverViewState::CreatingSource
+    ) || app
+        .discover
+        .rule_builder
+        .as_ref()
+        .map(|builder| builder.manual_tag_confirm_open || builder.confirm_exit_open)
+        .unwrap_or(false);
+
+    if modal_active {
+        frame.render_widget(Clear, shell.bottom);
+    } else {
+        let (footer_text, footer_style) = discover_action_bar(app);
+        draw_shell_action_bar(frame, &footer_text, footer_style, shell.bottom);
+    }
+    if modal_active {
+        draw_modal_scrim(frame, area, shell.top);
+    }
 
     // Render dropdown/dialog overlays on top of Rule Builder
     match app.discover.view_state {
@@ -1890,7 +1963,25 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         DiscoverViewState::Scanning => draw_scanning_dialog(frame, app, area),
         DiscoverViewState::EnteringPath => draw_add_source_dialog(frame, app, area),
         DiscoverViewState::ScanConfirm => draw_scan_confirm_dialog(frame, app, area),
+        DiscoverViewState::Filtering => draw_filter_dialog(frame, app, area),
+        DiscoverViewState::Tagging => draw_tagging_dialog(frame, app, area),
+        DiscoverViewState::BulkTagging => draw_bulk_tag_dialog(frame, app, area),
+        DiscoverViewState::CreatingSource => draw_create_source_dialog(frame, app, area),
         _ => {}
+    }
+
+    if let Some(builder) = &app.discover.rule_builder {
+        if builder.manual_tag_confirm_open {
+            draw_rule_builder_manual_tag_confirm(
+                frame,
+                area,
+                builder.manual_tag_confirm_count,
+                builder.tag.as_str(),
+            );
+        }
+        if builder.confirm_exit_open {
+            draw_rule_builder_confirm_exit(frame, area);
+        }
     }
 }
 
@@ -1940,29 +2031,30 @@ fn discover_action_bar(app: &App) -> (String, Style) {
 
 /// Draw the Sources dropdown as a proper overlay dialog
 fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
-    // Calculate dialog size - takes up left 40% of screen, respecting margins
-    let width = (area.width * 40 / 100).max(30).min(area.width - 4);
-    let height = area.height.saturating_sub(8).max(10);
-
-    // Position at left side of screen
-    let dialog_area = Rect {
-        x: area.x + 2,
-        y: area.y + 3,
-        width,
-        height,
-    };
-
-    // Clear the area first (proper overlay)
-    frame.render_widget(Clear, dialog_area);
+    let max_width = area.width.saturating_sub(4).min(72).max(30);
+    let max_height = area.height.saturating_sub(6).min(20).max(10);
+    let dialog_area = render_centered_dialog(frame, area, max_width, max_height);
 
     // Expanded dropdown with optional filter line
     let is_filtering = app.discover.sources_filtering;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " [S] Select Source ",
+            Style::default().fg(Color::Cyan).bold(),
+        ))
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
 
     let inner_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .margin(1)
-        .split(dialog_area);
+        .split(inner);
 
     // Top line: filter input OR hint
     if is_filtering {
@@ -2039,18 +2131,6 @@ fn draw_sources_dropdown(frame: &mut Frame, app: &App, area: Rect) {
 
     let list = Paragraph::new(lines);
     frame.render_widget(list, inner_chunks[1]);
-
-    // Border with title
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " [1] Select Source ",
-            Style::default().fg(Color::Cyan).bold(),
-        ))
-        .title_alignment(Alignment::Left);
-    frame.render_widget(block, dialog_area);
 }
 
 /// Draw the Tags dropdown (collapsed or expanded)
@@ -2065,29 +2145,29 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     if is_open {
-        // Calculate dialog size - match Sources dropdown sizing
-        let width = (area.width * 40 / 100).max(30).min(area.width - 4);
-        let height = area.height.saturating_sub(8).max(10);
-
-        // Position at right side of screen
-        let dialog_area = Rect {
-            x: area.x + area.width.saturating_sub(width + 2),
-            y: area.y + 3,
-            width,
-            height,
-        };
-
-        // Clear the area first (proper overlay)
-        frame.render_widget(Clear, dialog_area);
+        let max_width = area.width.saturating_sub(4).min(72).max(30);
+        let max_height = area.height.saturating_sub(6).min(20).max(10);
+        let dialog_area = render_centered_dialog(frame, area, max_width, max_height);
 
         // Expanded dropdown with optional filter line
         let is_filtering = app.discover.tags_filtering;
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .border_type(BorderType::Double)
+            .title(Span::styled(
+            " [T] Select Tag ",
+            Style::default().fg(Color::Cyan).bold(),
+        ));
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
 
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(1)])
             .margin(1)
-            .split(dialog_area);
+            .split(inner);
 
         // Top line: filter input OR hint
         if is_filtering {
@@ -2171,17 +2251,6 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
 
         let list = Paragraph::new(lines);
         frame.render_widget(list, inner_chunks[1]);
-
-        // Border with title - always use double borders when open (like Sources dropdown)
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .border_type(BorderType::Double)
-            .title(Span::styled(
-                " [2] Select Tag ",
-                Style::default().fg(Color::Cyan).bold(),
-            ));
-        frame.render_widget(block, dialog_area);
     } else {
         // Collapsed: show selected tag or "All files"
         let selected_text = if let Some(tag_idx) = app.discover.selected_tag {
@@ -2206,7 +2275,7 @@ fn draw_tags_dropdown(frame: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(border_style)
             .border_type(border_type)
-            .title(Span::styled(" [2] Tags ", style.bold()));
+            .title(Span::styled(" [T] Tags ", style.bold()));
 
         let content = Paragraph::new(selected_text)
             .style(if is_focused {
@@ -2800,6 +2869,257 @@ fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(text), inner);
 }
 
+fn tag_suggestions<'a>(input: &str, tags: &'a [String], limit: usize) -> Vec<&'a str> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let input_lower = input.to_lowercase();
+    tags.iter()
+        .filter(|tag| tag.to_lowercase().starts_with(&input_lower))
+        .take(limit)
+        .map(|tag| tag.as_str())
+        .collect()
+}
+
+fn draw_filter_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let dialog_area = render_centered_dialog(frame, area, 60, 7);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Filter Files ",
+            Style::default().fg(Color::Yellow).bold(),
+        ));
+
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let filter_text = format!("/{}", app.discover.filter);
+    let input_line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(filter_text, Style::default().fg(Color::Yellow).bold()),
+        Span::styled("█", Style::default().fg(Color::Yellow)),
+    ]);
+
+    let content = vec![
+        Line::from(""),
+        input_line,
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Matches substrings or globs (e.g., *.csv)",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  [Enter] Apply  [Esc] Cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(content), inner);
+}
+
+fn draw_tagging_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let suggestions = tag_suggestions(&app.discover.tag_input, &app.discover.available_tags, 4);
+    let suggestion_rows = if suggestions.is_empty() {
+        0
+    } else {
+        suggestions.len() as u16 + 2
+    };
+    let dialog_height = 9 + suggestion_rows;
+    let dialog_area = render_centered_dialog(frame, area, 70, dialog_height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(
+            " Apply Tag ",
+            Style::default().fg(Color::Magenta).bold(),
+        ));
+
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let filtered = app.filtered_files();
+    let selected_path = filtered
+        .get(app.discover.selected)
+        .map(|file| file.rel_path.as_str())
+        .unwrap_or("<no file selected>");
+    let path_display = truncate_path_start(selected_path, inner.width.saturating_sub(4) as usize);
+
+    let tag_input = if app.discover.tag_input.is_empty() {
+        "  Tag: _".to_string()
+    } else {
+        format!("  Tag: {}_", app.discover.tag_input)
+    };
+
+    let mut content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Apply tag to file:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", path_display),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            tag_input,
+            Style::default().fg(Color::Magenta).bold(),
+        )),
+    ];
+
+    if !suggestions.is_empty() {
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled(
+            "  Suggestions:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for suggestion in suggestions {
+            content.push(Line::from(Span::styled(
+                format!("   - {}", suggestion),
+                Style::default().fg(Color::Magenta),
+            )));
+        }
+    }
+
+    content.push(Line::from(""));
+    content.push(Line::from(Span::styled(
+        "  [Tab] autocomplete  [Enter] apply  [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(content), inner);
+}
+
+fn draw_bulk_tag_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let suggestions =
+        tag_suggestions(&app.discover.bulk_tag_input, &app.discover.available_tags, 4);
+    let suggestion_rows = if suggestions.is_empty() {
+        0
+    } else {
+        suggestions.len() as u16 + 2
+    };
+    let dialog_height = 10 + suggestion_rows;
+    let dialog_area = render_centered_dialog(frame, area, 72, dialog_height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(
+            " Bulk Tag ",
+            Style::default().fg(Color::Magenta).bold(),
+        ));
+
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let file_count = app.filtered_files().len();
+    let tag_input = if app.discover.bulk_tag_input.is_empty() {
+        "  Tag: _".to_string()
+    } else {
+        format!("  Tag: {}_", app.discover.bulk_tag_input)
+    };
+    let save_rule_mark = if app.discover.bulk_tag_save_as_rule {
+        "[x]"
+    } else {
+        "[ ]"
+    };
+
+    let mut content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Apply tag to {} files", file_count),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            tag_input,
+            Style::default().fg(Color::Magenta).bold(),
+        )),
+    ];
+
+    if !suggestions.is_empty() {
+        content.push(Line::from(""));
+        content.push(Line::from(Span::styled(
+            "  Suggestions:",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for suggestion in suggestions {
+            content.push(Line::from(Span::styled(
+                format!("   - {}", suggestion),
+                Style::default().fg(Color::Magenta),
+            )));
+        }
+    }
+
+    content.push(Line::from(""));
+    content.push(Line::from(Span::styled(
+        format!("  {} Save as rule", save_rule_mark),
+        Style::default().fg(Color::DarkGray),
+    )));
+    content.push(Line::from(Span::styled(
+        "  [Space] toggle  [Enter] apply  [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(Paragraph::new(content), inner);
+}
+
+fn draw_create_source_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let dialog_area = render_centered_dialog(frame, area, 70, 9);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Create Source ",
+            Style::default().fg(Color::Cyan).bold(),
+        ));
+
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let path = app
+        .discover
+        .pending_source_path
+        .as_deref()
+        .unwrap_or("<no directory selected>");
+    let path_display = truncate_path_start(path, inner.width.saturating_sub(4) as usize);
+
+    let name_input = if app.discover.source_name_input.is_empty() {
+        "  Name: _".to_string()
+    } else {
+        format!("  Name: {}_", app.discover.source_name_input)
+    };
+
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Create source from directory:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", path_display),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            name_input,
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  [Enter] Create  [Esc] Cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    frame.render_widget(Paragraph::new(content), inner);
+}
+
 /// Draw the Rule Builder as a full-screen view (replaces Discover, not overlay)
 /// Layout: Header | Split View (40% left / 60% right) | Footer
 fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
@@ -2869,18 +3189,6 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         app.discover.scan_error.as_deref(),
     );
 
-    if builder.manual_tag_confirm_open {
-        draw_rule_builder_manual_tag_confirm(
-            frame,
-            area,
-            builder.manual_tag_confirm_count,
-            builder.tag.as_str(),
-        );
-    }
-
-    if builder.confirm_exit_open {
-        draw_rule_builder_confirm_exit(frame, area);
-    }
 }
 
 fn draw_discover_inspector(frame: &mut Frame, app: &App, area: Rect) {
@@ -5601,17 +5909,16 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
                     "",
                     "  RULE BUILDER KEYS                      NAVIGATION",
                     "  ─────────────────                      ──────────",
-                    "  Tab/Shift+Tab  Cycle between fields    3         Focus Files panel",
-                    "  ↑/↓ arrows     Move between fields     4         Sources view",
-                    "  ←/→ arrows     Switch panels           0 / H     Home",
-                    "                                         Esc       Back / Close",
+                    "  Tab/Shift+Tab  Cycle between fields    1-4       Go to view",
+                    "  ↑/↓ arrows     Move between fields     0 / H     Home",
+                    "  ←/→ arrows     Switch panels           Esc       Back / Close",
                     "  ↑/↓            Navigate lists",
                     "  Enter          Expand folder / Save    PATTERN SYNTAX",
                     "                                         ──────────────",
                     "  ACTIONS                                **/*      All files",
                     "  ───────                                *.rs      Rust files",
-                    "  1              Open Source dropdown    **/*.csv  CSV files (recursive)",
-                    "  2              Open Tags dropdown      <name>    Extract field",
+                    "  S              Sources dropdown        **/*.csv  CSV files (recursive)",
+                    "  T              Tags dropdown           <name>    Extract field",
                     "  s              Scan new directory",
                     "  Ctrl+S         Save rule               FOCUS INDICATOR",
                     "  t              Apply tag               ──────────────",
@@ -5632,11 +5939,14 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
                     "",
                     "  DISCOVER MODE                          NAVIGATION",
                     "  ─────────────                          ──────────",
-                    "  s              Scan new directory      3         Jobs view",
-                    "  n              Create new rule         4         Sources view",
-                    "  Enter          Open Rule Builder       0 / H     Home",
-                    "                                         Esc       Back / Close",
-                    "  ↑/↓           Navigate files",
+                    "  s              Scan new directory      1-4       Go to view",
+                    "  n              Create new rule         0 / H     Home",
+                    "  Enter          Open Rule Builder       Esc       Back / Close",
+                    "  t              Tag selected file",
+                    "  c              Create source from folder",
+                    "  B              Bulk tag filtered files",
+                    "  S              Sources dropdown",
+                    "  T              Tags dropdown",
                     "  /              Filter files            GLOBAL",
                     "                                         ──────",
                     "  IN SOURCES/TAGS DROPDOWN               ?         This help",
@@ -6123,6 +6433,13 @@ fn draw_query_screen(frame: &mut Frame, app: &App, area: Rect) {
     if inspector_visible {
         let inner = draw_shell_inspector_block(frame, "Query Info", shell.inspector);
         draw_query_inspector(frame, app, inner);
+    }
+
+    if matches!(
+        app.query_state.view_state,
+        QueryViewState::TableBrowser | QueryViewState::SavedQueries
+    ) {
+        draw_modal_scrim(frame, area, shell.top);
     }
 
     if app.query_state.view_state == QueryViewState::TableBrowser {

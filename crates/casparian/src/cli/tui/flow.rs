@@ -172,6 +172,12 @@ pub struct FlowAssertion {
     pub layout_contains: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub layout_not_contains: Vec<String>,
+    #[serde(default)]
+    pub ui_signature_key: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub ui_signature_contains: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub ui_signature_not_contains: Vec<String>,
 }
 
 impl FlowAssertion {
@@ -182,6 +188,9 @@ impl FlowAssertion {
             && self.mask_not_contains.is_empty()
             && self.layout_contains.is_empty()
             && self.layout_not_contains.is_empty()
+            && self.ui_signature_key.is_none()
+            && self.ui_signature_contains.is_empty()
+            && self.ui_signature_not_contains.is_empty()
     }
 }
 

@@ -3630,21 +3630,6 @@ impl App {
                 self.profiler.enabled = !self.profiler.enabled;
                 return;
             }
-            // Discover panel focus shortcuts: [1] Sources, [2] Tags, [3] Files
-            KeyCode::Char('1') | KeyCode::Char('2') | KeyCode::Char('3')
-                if self.mode == TuiMode::Discover
-                    && !self.in_text_input_mode()
-                    && matches!(
-                        self.discover.view_state,
-                        DiscoverViewState::RuleBuilder
-                            | DiscoverViewState::Files
-                            | DiscoverViewState::SourcesDropdown
-                            | DiscoverViewState::TagsDropdown
-                    ) =>
-            {
-                self.handle_discover_panel_shortcut(key.code);
-                return;
-            }
             // ========== GLOBAL VIEW NAVIGATION (per keybinding matrix) ==========
             // Keys 1-4 are RESERVED for view navigation and work from ANY view.
             // Don't intercept when in text input.
@@ -4425,36 +4410,17 @@ impl App {
 
     fn handle_discover_panel_shortcut(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Char('1') => {
+            KeyCode::Char('S') => {
                 self.transition_discover_state(DiscoverViewState::SourcesDropdown);
                 self.discover.sources_filter.clear();
                 self.discover.sources_filtering = false;
                 self.discover.preview_source = Some(self.discover.selected_source_index());
             }
-            KeyCode::Char('2') => {
+            KeyCode::Char('T') => {
                 self.transition_discover_state(DiscoverViewState::TagsDropdown);
                 self.discover.tags_filter.clear();
                 self.discover.tags_filtering = false;
                 self.discover.preview_tag = self.discover.selected_tag;
-            }
-            KeyCode::Char('3') => {
-                if matches!(
-                    self.discover.view_state,
-                    DiscoverViewState::SourcesDropdown | DiscoverViewState::TagsDropdown
-                ) {
-                    self.return_to_previous_discover_state();
-                }
-                match self.discover.view_state {
-                    DiscoverViewState::RuleBuilder => {
-                        if let Some(ref mut builder) = self.discover.rule_builder {
-                            builder.focus = super::extraction::RuleBuilderFocus::FileList;
-                        }
-                    }
-                    DiscoverViewState::Files => {}
-                    _ => {
-                        self.discover.view_state = DiscoverViewState::Files;
-                    }
-                }
             }
             _ => {}
         }
@@ -4762,7 +4728,8 @@ impl App {
         }
 
         // Global keybindings that work from most states (per spec Section 6.1)
-        // R (Rules Manager) and M (Sources Manager) work from Files, dropdowns, etc.
+        // R (Rules Manager), M (Sources Manager), S/T (Sources/Tags dropdowns)
+        // work from Files, dropdowns, etc.
         // but NOT from dialogs or text input modes
         if !self.in_text_input_mode()
             && !matches!(
@@ -4783,6 +4750,14 @@ impl App {
                 KeyCode::Char('M') => {
                     self.transition_discover_state(DiscoverViewState::SourcesManager);
                     self.discover.sources_manager_selected = self.discover.selected_source_index();
+                    return;
+                }
+                KeyCode::Char('S') => {
+                    self.handle_discover_panel_shortcut(KeyCode::Char('S'));
+                    return;
+                }
+                KeyCode::Char('T') => {
+                    self.handle_discover_panel_shortcut(KeyCode::Char('T'));
                     return;
                 }
                 _ => {}
@@ -5274,7 +5249,7 @@ impl App {
                         Some(("Enter a filter pattern first (press /)".to_string(), true));
                 }
             }
-            KeyCode::Char('S') => {
+            KeyCode::Char('c') => {
                 // Create source from selected directory
                 let file_info = self
                     .filtered_files()
@@ -5292,8 +5267,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('T') => {
-                // Bulk tag all filtered/visible files (explicit T)
+            KeyCode::Char('B') => {
+                // Bulk tag all filtered/visible files (explicit B)
                 let count = self.filtered_files().len();
                 if count > 0 {
                     self.transition_discover_state(DiscoverViewState::BulkTagging);
@@ -6059,10 +6034,6 @@ impl App {
                 // Enter filter mode
                 self.discover.sources_filtering = true;
             }
-            KeyCode::Char('3') => {
-                self.return_to_previous_discover_state();
-                self.handle_discover_panel_shortcut(KeyCode::Char('3'));
-            }
             KeyCode::Char('s') => {
                 // Open scan dialog to add new source
                 self.discover.view_state = DiscoverViewState::Files;
@@ -6212,10 +6183,6 @@ impl App {
             KeyCode::Char('/') => {
                 // Enter filter mode
                 self.discover.tags_filtering = true;
-            }
-            KeyCode::Char('3') => {
-                self.return_to_previous_discover_state();
-                self.handle_discover_panel_shortcut(KeyCode::Char('3'));
             }
             KeyCode::Enter => {
                 // Confirm selection, close dropdown, return to Rule Builder
@@ -6578,7 +6545,7 @@ impl App {
                 KeyCode::Esc => {
                     self.set_mode(TuiMode::Home);
                 }
-                KeyCode::Char('1') => {
+                KeyCode::Char('S') => {
                     self.transition_discover_state(DiscoverViewState::SourcesDropdown);
                     self.discover.sources_filter.clear();
                     self.discover.sources_filtering = false;
@@ -14697,13 +14664,9 @@ mod tests {
         // Key '1' should switch to Discover (per spec)
         app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::Discover));
+        app.discover.view_state = DiscoverViewState::Files;
 
-        // In Discover mode, '2' controls panel focus (not view navigation)
-        // So we need to go Home first with '0', then use '2'
-        app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, TuiMode::Home));
-
-        // Now '2' should switch to Parser Bench
+        // Key '2' should switch to Parser Bench even from Discover
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         assert!(matches!(app.mode, TuiMode::ParserBench));
 
@@ -15415,8 +15378,8 @@ mod tests {
         app.discover.files = create_test_files();
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
-        // Press 'T' (Shift+t) to open bulk tag dialog
-        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT));
+        // Press 'B' (Shift+b) to open bulk tag dialog
+        app.handle_key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT));
         assert_eq!(app.discover.view_state, DiscoverViewState::BulkTagging);
         assert!(app.discover.bulk_tag_input.is_empty());
         assert!(!app.discover.bulk_tag_save_as_rule);
@@ -15464,8 +15427,8 @@ mod tests {
         app.discover.selected = 2; // Select archives directory
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
-        // Press 'S' (Shift+s) on a directory to create source
-        app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        // Press 'c' on a directory to create source
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert_eq!(app.discover.view_state, DiscoverViewState::CreatingSource);
         assert!(app.discover.pending_source_path.is_some());
         assert!(app

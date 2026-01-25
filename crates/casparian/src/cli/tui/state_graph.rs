@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use super::app::{App, DiscoverViewState, TuiMode};
 use super::flow::{FlowKey, FlowKeyCode, FlowModifiers};
+use super::snapshot::{buffer_to_plain_text, normalize_for_snapshot, render_app_to_buffer};
 use super::snapshot_states::snapshot_cases;
 use super::ui_signature::UiSignature;
+use super::ux_lint::{lint_dir, write_report, UxLintMode};
 
 const ROOT_SIG: &str = "__ROOT__";
 
@@ -33,6 +35,18 @@ pub struct TuiStateGraphArgs {
     /// Maximum depth (key steps after seed)
     #[arg(long, default_value_t = 12)]
     pub max_depth: usize,
+
+    /// Render frames for each discovered signature
+    #[arg(long, default_value_t = false)]
+    pub render: bool,
+
+    /// Comma-separated list of render sizes (e.g., 80x24,120x40)
+    #[arg(long, default_value = "80x24,120x40")]
+    pub render_sizes: String,
+
+    /// Run UX lint on rendered frames
+    #[arg(long, default_value_t = false)]
+    pub lint: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +100,20 @@ struct PathsOutput {
     paths: BTreeMap<String, PathEntry>,
 }
 
+#[derive(Debug, Serialize)]
+struct FrameIndex {
+    version: u32,
+    generated_at: String,
+    frames: Vec<FrameIndexEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct FrameIndexEntry {
+    key: String,
+    hash: String,
+    sizes: Vec<String>,
+}
+
 struct GraphBuild {
     nodes: HashMap<String, UiSignature>,
     predecessors: HashMap<String, PredecessorEntry>,
@@ -100,6 +128,18 @@ pub fn run(args: TuiStateGraphArgs) -> Result<()> {
     let graph = build_graph(&seeds, &seed_map, &alphabet, args.max_nodes, args.max_depth)?;
 
     write_outputs(&args, &seeds, &alphabet, &graph)?;
+    if args.lint && !args.render {
+        bail!("--lint requires --render to be set");
+    }
+
+    if args.render {
+        let sizes = parse_sizes(&args.render_sizes)?;
+        let frames_dir = render_frames(&args, &graph, &seed_map, &sizes)?;
+        if args.lint {
+            let report = lint_dir(&frames_dir, UxLintMode::StateGraph)?;
+            write_report(&report, &args.out)?;
+        }
+    }
     Ok(())
 }
 
@@ -450,6 +490,95 @@ fn write_outputs(
         .with_context(|| format!("write {}", paths_path.display()))?;
 
     Ok(())
+}
+
+fn render_frames(
+    args: &TuiStateGraphArgs,
+    graph: &GraphBuild,
+    seed_map: &HashMap<String, fn() -> App>,
+    sizes: &[(u16, u16)],
+) -> Result<PathBuf> {
+    if sizes.is_empty() {
+        bail!("render sizes cannot be empty");
+    }
+
+    let frames_dir = args.out.join("frames");
+    fs::create_dir_all(&frames_dir)
+        .with_context(|| format!("create frames dir {}", frames_dir.display()))?;
+
+    let mut keys: Vec<String> = graph.nodes.keys().cloned().collect();
+    keys.sort();
+
+    let mut index_entries = Vec::new();
+
+    for key in keys {
+        let app = reconstruct_app(&key, &graph.predecessors, seed_map)?;
+        let hash = blake3::hash(key.as_bytes()).to_hex().to_string();
+        let mut size_labels = Vec::new();
+
+        for (width, height) in sizes {
+            let buffer = render_app_to_buffer(&app, *width, *height).with_context(|| {
+                format!("render signature {} at {}x{}", key, width, height)
+            })?;
+            let plain = normalize_for_snapshot(&buffer_to_plain_text(&buffer));
+            let label = format!("{}x{}", width, height);
+            let filename = format!("{}_{}.txt", hash, label);
+            let path = frames_dir.join(filename);
+            fs::write(&path, plain).with_context(|| format!("write {}", path.display()))?;
+            size_labels.push(label);
+        }
+
+        index_entries.push(FrameIndexEntry {
+            key,
+            hash,
+            sizes: size_labels,
+        });
+    }
+
+    let index = FrameIndex {
+        version: 1,
+        generated_at: Utc::now().to_rfc3339(),
+        frames: index_entries,
+    };
+    let index_path = frames_dir.join("index.json");
+    fs::write(&index_path, serde_json::to_string_pretty(&index)?)
+        .with_context(|| format!("write {}", index_path.display()))?;
+
+    Ok(frames_dir)
+}
+
+fn parse_sizes(input: &str) -> Result<Vec<(u16, u16)>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("render sizes cannot be empty");
+    }
+
+    let mut sizes = Vec::new();
+    for part in trimmed.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (w, h) = token
+            .split_once('x')
+            .with_context(|| format!("invalid size '{}', expected WxH", token))?;
+        let width: u16 = w
+            .parse()
+            .with_context(|| format!("invalid width '{}', expected u16", w))?;
+        let height: u16 = h
+            .parse()
+            .with_context(|| format!("invalid height '{}', expected u16", h))?;
+        if width == 0 || height == 0 {
+            bail!("invalid size '{}': width/height must be > 0", token);
+        }
+        sizes.push((width, height));
+    }
+
+    if sizes.is_empty() {
+        bail!("render sizes cannot be empty");
+    }
+
+    Ok(sizes)
 }
 
 fn build_paths(

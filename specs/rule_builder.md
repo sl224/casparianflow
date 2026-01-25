@@ -24,8 +24,8 @@ Validate panel.
 
 - Rule Builder is the default Discover view.
 - No source is required to enter Rule Builder; it prompts on actions instead.
-- Source dropdown opens with `[1]` and applies selection on `Enter` (no live reload).
-- Tags dropdown opens with `[2]` and previews tags while open.
+- Source dropdown opens with `[S]` and applies selection on `Enter` (no live reload).
+- Tags dropdown opens with `[T]` and previews tags while open.
 - Rule saving (`Ctrl+S`) persists to DB (scoped to selected source).
 
 ---
@@ -58,9 +58,8 @@ Validate panel.
 
 | Key | Action | Notes |
 |-----|--------|-------|
-| `1` | Open Sources dropdown | Applies on `Enter` |
-| `2` | Open Tags dropdown | Previews tags while open |
-| `3` | Focus Files panel | Rule Builder only |
+| `S` | Open Sources dropdown | Applies on `Enter` |
+| `T` | Open Tags dropdown | Previews tags while open |
 | `M` | Sources Manager dialog | From Rule Builder |
 | `R` | Rules dropdown | Opens rules list overlay (CRUD) |
 | `s` | Scan new directory | Only when not in text input |
@@ -95,7 +94,7 @@ Validate panel.
 ### 4.1 No Source Selected
 
 - Rule Builder stays visible.
-- Pressing `[1]` opens Sources dropdown.
+- Pressing `[S]` opens Sources dropdown.
 - Pressing `[s]` opens scan dialog.
 - Other actions surface a status hint: "Select a source before building rules".
 
