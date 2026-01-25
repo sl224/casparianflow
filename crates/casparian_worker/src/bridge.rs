@@ -26,7 +26,7 @@ use casparian_sinks::OutputBatch;
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -609,19 +609,37 @@ fn wait_for_exit(
     }
 }
 
-/// Spawn the guest Python process using `uv run`
+/// Spawn the guest Python process.
 ///
-/// Delegates to uv for correct Python environment setup on all platforms.
-/// uv reconstructs the macOS-specific env vars (like __PYVENV_LAUNCHER__)
-/// that Python's multiprocessing module needs to bootstrap correctly.
-///
-/// The guest connects to localhost TCP port specified by BRIDGE_PORT env var.
+/// Prefers `uv run` for correct Python environment setup on all platforms.
+/// Falls back to spawning the interpreter directly if uv is unavailable.
 fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
+    if let Some(uv_path) = find_uv_path() {
+        return spawn_guest_with_uv(config, port, &uv_path);
+    }
+
+    if cfg!(target_os = "macos") {
+        warn!(
+            "[Job {}] uv not found; spawning Python directly. \
+            macOS multiprocessing may require __PYVENV_LAUNCHER__. Install uv if you see failures.",
+            config.job_id
+        );
+    } else {
+        warn!(
+            "[Job {}] uv not found; spawning Python directly.",
+            config.job_id
+        );
+    }
+
+    spawn_guest_direct(config, port)
+}
+
+fn spawn_guest_with_uv(config: &BridgeConfig, port: u16, uv_path: &Path) -> Result<Child> {
     use base64::{engine::general_purpose, Engine as _};
     let source_b64 = general_purpose::STANDARD.encode(&config.source_code);
 
     // Use uv to spawn Python - it knows how to set up the environment correctly
-    let mut cmd = Command::new("uv");
+    let mut cmd = Command::new(uv_path);
 
     // NOTE: Do NOT use env_clear() - macOS Python needs inherited env vars
     // like __PYVENV_LAUNCHER__, LC_CTYPE, etc. for multiprocessing to work.
@@ -676,6 +694,84 @@ fn spawn_guest(config: &BridgeConfig, port: u16) -> Result<Child> {
     );
 
     Ok(child)
+}
+
+fn spawn_guest_direct(config: &BridgeConfig, port: u16) -> Result<Child> {
+    use base64::{engine::general_purpose, Engine as _};
+    let source_b64 = general_purpose::STANDARD.encode(&config.source_code);
+
+    let mut cmd = Command::new(&config.interpreter_path);
+    cmd.arg(&config.shim_path);
+
+    // Bridge context vars - use BRIDGE_PORT for TCP transport
+    cmd.env("BRIDGE_PORT", port.to_string())
+        .env("BRIDGE_PLUGIN_CODE", source_b64)
+        .env("BRIDGE_FILE_PATH", &config.file_path)
+        .env("BRIDGE_JOB_ID", config.job_id.to_string())
+        .env("BRIDGE_FILE_ID", config.file_id.to_string())
+        .env(
+            "BRIDGE_STDIO_MODE",
+            if config.inherit_stdio {
+                "inherit"
+            } else {
+                "piped"
+            },
+        );
+
+    if let Some(venv_root) = venv_root_for_interpreter(&config.interpreter_path) {
+        cmd.env("VIRTUAL_ENV", venv_root);
+    }
+
+    if config.inherit_stdio {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
+
+    let child = cmd.spawn().with_context(|| {
+        format!(
+            "[Job {}] Failed to spawn guest process directly. Interpreter: {}, Shim: {}",
+            config.job_id,
+            config.interpreter_path.display(),
+            config.shim_path.display()
+        )
+    })?;
+
+    info!(
+        "[Job {}] Spawned guest directly (pid={}) using interpreter {}, port {}",
+        config.job_id,
+        child.id(),
+        config.interpreter_path.display(),
+        port
+    );
+
+    Ok(child)
+}
+
+fn venv_root_for_interpreter(interpreter: &Path) -> Option<PathBuf> {
+    interpreter.parent().and_then(|bin_dir| bin_dir.parent()).map(ToOwned::to_owned)
+}
+
+fn find_uv_path() -> Option<PathBuf> {
+    if let Ok(path) = which::which("uv") {
+        return Some(path);
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        format!("{}/.cargo/bin/uv", home),
+        format!("{}/.local/bin/uv", home),
+        "/usr/local/bin/uv".to_string(),
+    ];
+
+    for candidate in candidates {
+        let path = PathBuf::from(&candidate);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    None
 }
 
 /// Read Arrow IPC batches from TCP stream, handling sideband log messages

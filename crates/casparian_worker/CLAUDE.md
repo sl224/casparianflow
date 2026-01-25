@@ -244,7 +244,8 @@ def main():
 
 ### UV for Speed
 
-All venvs are managed by [uv](https://github.com/astral-sh/uv):
+Venvs are provisioned with [uv](https://github.com/astral-sh/uv) when available
+(worker can execute preinstalled envs without uv):
 
 ```rust
 use casparian_worker::venv_manager::VenvManager;

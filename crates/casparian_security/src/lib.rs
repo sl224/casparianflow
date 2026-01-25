@@ -7,5 +7,5 @@
 pub mod gatekeeper;
 pub mod signing;
 
-pub use gatekeeper::Gatekeeper;
+pub use gatekeeper::{Gatekeeper, GatekeeperProfile, GatekeeperReport};
 pub use signing::sha256;

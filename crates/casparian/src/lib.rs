@@ -47,7 +47,8 @@ pub mod tui_extraction;
 pub use bundler::{bundle_parser, ParserBundle};
 pub use casparian_sinks as sinks;
 pub use publish::{
-    analyze_plugin, prepare_publish, PluginAnalysis, PreparedArtifact, PublishOptions,
+    analyze_plugin, analyze_plugin_with_options, prepare_publish, prepare_publish_with_options,
+    GatekeeperMode, GatekeeperOptions, PluginAnalysis, PreparedArtifact, PublishOptions,
     PublishReceipt,
 };
 pub use storage::{

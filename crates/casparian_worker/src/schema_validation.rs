@@ -1,5 +1,8 @@
 use anyhow::anyhow;
-use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray};
+use arrow::array::{
+    Array, ArrayRef, Date32Array, Decimal128Array, LargeStringArray, StringArray,
+    Time64MicrosecondArray, TimestampMicrosecondArray,
+};
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::record_batch::RecordBatch;
 use casparian_protocol::types::{
@@ -7,6 +10,7 @@ use casparian_protocol::types::{
     SchemaMismatch, TypeMismatch,
 };
 use casparian_protocol::DataType as SchemaDataType;
+use chrono::Timelike;
 use thiserror::Error;
 
 type SchemaResult<T> = std::result::Result<T, SchemaValidationError>;
@@ -173,39 +177,21 @@ fn validate_record_batch(
 
     let mut row_errors: Vec<String> = vec![String::new(); batch.num_rows()];
     let mut has_new_errors = false;
+    let mut fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
+    let mut columns = batch.columns().to_vec();
 
     for (expected, idx) in schema_def.columns.iter().zip(data_field_indices.iter()) {
         let array = batch.column(*idx);
         let type_check = type_check_mode(&expected.data_type, array.data_type(), expected);
-
-        match type_check {
+        let (next_array, cast_errors) = match type_check {
             TypeCheck::Compatible => {
-                if !expected.nullable && array.null_count() > 0 {
-                    for row in 0..array.len() {
-                        if array.is_null(row) {
-                            append_error(
-                                &mut row_errors[row],
-                                &format!("schema: null not allowed in '{}'", expected.name),
-                            );
-                            has_new_errors = true;
-                        }
-                    }
-                }
                 if validate_format_values(expected, array, &mut row_errors)? {
                     has_new_errors = true;
                 }
+                (array.clone(), false)
             }
-            TypeCheck::NullOnly => {
-                if !expected.nullable && array.len() > 0 {
-                    for row in 0..array.len() {
-                        append_error(
-                            &mut row_errors[row],
-                            &format!("schema: null not allowed in '{}'", expected.name),
-                        );
-                        has_new_errors = true;
-                    }
-                }
-            }
+            TypeCheck::NullOnly => (array.clone(), false),
+            TypeCheck::Cast => cast_utf8_column(expected, array, &mut row_errors)?,
             TypeCheck::Mismatch => {
                 return Err(build_schema_mismatch(
                     output_name,
@@ -214,20 +200,47 @@ fn validate_record_batch(
                     &data_field_indices,
                 ));
             }
+        };
+
+        if cast_errors {
+            has_new_errors = true;
         }
+
+        if !expected.nullable && next_array.null_count() > 0 {
+            for row in 0..next_array.len() {
+                if next_array.is_null(row) {
+                    append_error(
+                        &mut row_errors[row],
+                        &format!("schema: null not allowed in '{}'", expected.name),
+                    );
+                    has_new_errors = true;
+                }
+            }
+        }
+
+        columns[*idx] = next_array.clone();
+        let field_nullable = expected.nullable || next_array.null_count() > 0;
+        fields[*idx] = std::sync::Arc::new(arrow::datatypes::Field::new(
+            expected.name.as_str(),
+            next_array.data_type().clone(),
+            field_nullable,
+        ));
     }
 
-    if !has_new_errors && batch.schema().index_of("_cf_row_error").is_err() {
-        return Ok(batch.clone());
-    }
-
-    let merged = merge_error_column(batch, &row_errors)?;
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
+    let rebuilt = RecordBatch::try_new(schema, columns).map_err(|e| anyhow::anyhow!(e))?;
+    let merged = if has_new_errors {
+        merge_error_column(&rebuilt, &row_errors)?
+    } else {
+        rebuilt
+    };
     Ok(merged)
 }
 
 enum TypeCheck {
     Compatible,
     NullOnly,
+    Cast,
     Mismatch,
 }
 
@@ -243,6 +256,17 @@ fn type_check_mode(
         return TypeCheck::NullOnly;
     }
 
+    let castable_from_utf8 = matches!(actual, A::Utf8 | A::LargeUtf8)
+        && (matches!(
+            expected,
+            S::Date | S::Timestamp | S::TimestampTz { .. } | S::Time
+        ) && column.format.is_some()
+            || matches!(expected, S::Decimal { .. }));
+
+    if castable_from_utf8 {
+        return TypeCheck::Cast;
+    }
+
     let compatible = match (expected, actual) {
         (S::Null, A::Null) => true,
         (S::Boolean, A::Boolean) => true,
@@ -255,11 +279,6 @@ fn type_check_mode(
             tz_actual.as_ref().map(|s| eq_tz(s, tz)).unwrap_or(false)
         }
         (S::Time, A::Time32(_) | A::Time64(_)) => true,
-        (S::Date | S::Timestamp | S::TimestampTz { .. } | S::Time, A::Utf8 | A::LargeUtf8)
-            if column.format.is_some() =>
-        {
-            true
-        }
         (S::Duration, A::Duration(_)) => true,
         (S::String, A::Utf8 | A::LargeUtf8) => true,
         (S::Binary, A::Binary | A::LargeBinary) => true,
@@ -408,6 +427,7 @@ fn is_type_compatible(
         {
             true
         }
+        (S::Decimal { .. }, A::Utf8 | A::LargeUtf8) => true,
         (S::Duration, A::Duration(_)) => true,
         (S::String, A::Utf8 | A::LargeUtf8) => true,
         (S::Binary, A::Binary | A::LargeBinary) => true,
@@ -544,6 +564,312 @@ fn validate_format_values(
     Ok(has_errors)
 }
 
+fn cast_utf8_column(
+    expected: &ColumnDef,
+    array: &ArrayRef,
+    row_errors: &mut [String],
+) -> AnyhowResult<(ArrayRef, bool)> {
+    match expected.data_type {
+        SchemaDataType::Date => cast_utf8_date(expected, array, row_errors),
+        SchemaDataType::Time => cast_utf8_time(expected, array, row_errors),
+        SchemaDataType::Timestamp => cast_utf8_timestamp(expected, array, row_errors),
+        SchemaDataType::TimestampTz { .. } => cast_utf8_timestamp_tz(expected, array, row_errors),
+        SchemaDataType::Decimal { .. } => cast_utf8_decimal(expected, array, row_errors),
+        _ => Err(anyhow!(
+            "column '{}' cannot be cast from Utf8",
+            expected.name
+        )),
+    }
+}
+
+fn cast_utf8_date(
+    expected: &ColumnDef,
+    array: &ArrayRef,
+    row_errors: &mut [String],
+) -> AnyhowResult<(ArrayRef, bool)> {
+    let format = expected
+        .format
+        .as_deref()
+        .ok_or_else(|| anyhow!("schema: missing format for '{}'", expected.name))?;
+    let message = format!(
+        "schema: value does not match format '{}' for '{}'",
+        format, expected.name
+    );
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+        .ok_or_else(|| anyhow!("schema: invalid epoch date"))?;
+    let (values, has_errors) = cast_from_utf8_values(
+        expected,
+        array,
+        row_errors,
+        &message,
+        |value| {
+            chrono::NaiveDate::parse_from_str(value, format).ok().and_then(|date| {
+                let days = date.signed_duration_since(epoch).num_days();
+                i32::try_from(days).ok()
+            })
+        },
+    )?;
+    let array = Date32Array::from(values);
+    Ok((std::sync::Arc::new(array), has_errors))
+}
+
+fn cast_utf8_time(
+    expected: &ColumnDef,
+    array: &ArrayRef,
+    row_errors: &mut [String],
+) -> AnyhowResult<(ArrayRef, bool)> {
+    let format = expected
+        .format
+        .as_deref()
+        .ok_or_else(|| anyhow!("schema: missing format for '{}'", expected.name))?;
+    let message = format!(
+        "schema: value does not match format '{}' for '{}'",
+        format, expected.name
+    );
+    let (values, has_errors) = cast_from_utf8_values(
+        expected,
+        array,
+        row_errors,
+        &message,
+        |value| {
+            chrono::NaiveTime::parse_from_str(value, format).ok().map(|time| {
+                let secs = i64::from(time.num_seconds_from_midnight());
+                let micros = i64::from(time.nanosecond() / 1_000);
+                secs * 1_000_000 + micros
+            })
+        },
+    )?;
+    let array = Time64MicrosecondArray::from(values);
+    Ok((std::sync::Arc::new(array), has_errors))
+}
+
+fn cast_utf8_timestamp(
+    expected: &ColumnDef,
+    array: &ArrayRef,
+    row_errors: &mut [String],
+) -> AnyhowResult<(ArrayRef, bool)> {
+    let format = expected
+        .format
+        .as_deref()
+        .ok_or_else(|| anyhow!("schema: missing format for '{}'", expected.name))?;
+    let message = format!(
+        "schema: value does not match format '{}' for '{}'",
+        format, expected.name
+    );
+    let (values, has_errors) = cast_from_utf8_values(
+        expected,
+        array,
+        row_errors,
+        &message,
+        |value| {
+            chrono::NaiveDateTime::parse_from_str(value, format)
+                .ok()
+                .map(|dt| dt.and_utc().timestamp_micros())
+        },
+    )?;
+    let array = TimestampMicrosecondArray::from(values);
+    Ok((std::sync::Arc::new(array), has_errors))
+}
+
+fn cast_utf8_timestamp_tz(
+    expected: &ColumnDef,
+    array: &ArrayRef,
+    row_errors: &mut [String],
+) -> AnyhowResult<(ArrayRef, bool)> {
+    let format = expected
+        .format
+        .as_deref()
+        .ok_or_else(|| anyhow!("schema: missing format for '{}'", expected.name))?;
+    let message = format!(
+        "schema: value does not match format '{}' for '{}'",
+        format, expected.name
+    );
+    let tz = match &expected.data_type {
+        SchemaDataType::TimestampTz { tz } => tz.as_str(),
+        _ => "",
+    };
+    let (values, has_errors) = cast_from_utf8_values(
+        expected,
+        array,
+        row_errors,
+        &message,
+        |value| {
+            if !expected
+                .data_type
+                .validate_string_with_format(value, Some(format))
+            {
+                return None;
+            }
+            chrono::DateTime::parse_from_str(value, format)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_micros())
+        },
+    )?;
+    let array = TimestampMicrosecondArray::from(values).with_timezone(tz);
+    Ok((std::sync::Arc::new(array), has_errors))
+}
+
+fn cast_utf8_decimal(
+    expected: &ColumnDef,
+    array: &ArrayRef,
+    row_errors: &mut [String],
+) -> AnyhowResult<(ArrayRef, bool)> {
+    let (precision, scale) = match expected.data_type {
+        SchemaDataType::Decimal { precision, scale } => (precision, scale),
+        _ => return Err(anyhow!("schema: invalid decimal type for '{}'", expected.name)),
+    };
+    let message = format!(
+        "schema: value does not match decimal({}, {}) for '{}'",
+        precision, scale, expected.name
+    );
+    let precision_usize = precision as usize;
+    let scale_usize = scale as usize;
+    let (values, has_errors) = cast_from_utf8_values(
+        expected,
+        array,
+        row_errors,
+        &message,
+        |value| {
+            let (raw, digits, value_scale) = parse_decimal_strict(value)?;
+            if digits > precision_usize || value_scale > scale_usize {
+                return None;
+            }
+            let scale_diff = scale_usize.saturating_sub(value_scale);
+            let factor = pow10_i128(scale_diff)?;
+            raw.checked_mul(factor)
+        },
+    )?;
+    let array = Decimal128Array::from(values)
+        .with_precision_and_scale(precision, scale as i8)?;
+    Ok((std::sync::Arc::new(array), has_errors))
+}
+
+fn cast_from_utf8_values<T, F>(
+    expected: &ColumnDef,
+    array: &ArrayRef,
+    row_errors: &mut [String],
+    message: &str,
+    mut parse: F,
+) -> AnyhowResult<(Vec<Option<T>>, bool)>
+where
+    F: FnMut(&str) -> Option<T>,
+{
+    let mut values = Vec::with_capacity(array.len());
+    let mut has_errors = false;
+
+    match array.data_type() {
+        ArrowDataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow!("column '{}' is not Utf8", expected.name))?;
+            for row in 0..arr.len() {
+                if arr.is_null(row) {
+                    values.push(None);
+                    continue;
+                }
+                let value = arr.value(row);
+                if value.is_empty() {
+                    values.push(None);
+                    continue;
+                }
+                if let Some(parsed) = parse(value) {
+                    values.push(Some(parsed));
+                } else {
+                    values.push(None);
+                    append_error(&mut row_errors[row], message);
+                    has_errors = true;
+                }
+            }
+        }
+        ArrowDataType::LargeUtf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| anyhow!("column '{}' is not LargeUtf8", expected.name))?;
+            for row in 0..arr.len() {
+                if arr.is_null(row) {
+                    values.push(None);
+                    continue;
+                }
+                let value = arr.value(row);
+                if value.is_empty() {
+                    values.push(None);
+                    continue;
+                }
+                if let Some(parsed) = parse(value) {
+                    values.push(Some(parsed));
+                } else {
+                    values.push(None);
+                    append_error(&mut row_errors[row], message);
+                    has_errors = true;
+                }
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "column '{}' is not Utf8 or LargeUtf8",
+                expected.name
+            ))
+        }
+    }
+
+    Ok((values, has_errors))
+}
+
+fn parse_decimal_strict(value: &str) -> Option<(i128, usize, usize)> {
+    let mut sign = 1i128;
+    let mut total_digits = 0usize;
+    let mut scale = 0usize;
+    let mut saw_dot = false;
+    let mut saw_digit = false;
+    let mut result: i128 = 0;
+
+    for (idx, ch) in value.chars().enumerate() {
+        if ch == '+' || ch == '-' {
+            if idx != 0 {
+                return None;
+            }
+            if ch == '-' {
+                sign = -1;
+            }
+            continue;
+        }
+        if ch == '.' {
+            if saw_dot {
+                return None;
+            }
+            saw_dot = true;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            total_digits += 1;
+            if saw_dot {
+                scale += 1;
+            }
+            let digit = i128::from(ch.to_digit(10)? as u8);
+            result = result.checked_mul(10)?.checked_add(digit)?;
+            continue;
+        }
+        return None;
+    }
+
+    if !saw_digit {
+        None
+    } else {
+        Some((result * sign, total_digits, scale))
+    }
+}
+
+fn pow10_i128(exp: usize) -> Option<i128> {
+    let mut value: i128 = 1;
+    for _ in 0..exp {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
+}
+
 fn merge_error_column(batch: &RecordBatch, new_errors: &[String]) -> AnyhowResult<RecordBatch> {
     let error_idx = batch.schema().index_of("_cf_row_error").ok();
     let use_large = match error_idx {
@@ -678,8 +1004,8 @@ fn normalize_tz(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{Field, Schema};
+    use arrow::array::{Date32Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema, TimeUnit};
     use std::sync::Arc;
 
     fn schema_def(columns: Vec<SchemaColumnSpec>) -> SchemaDef {
@@ -1047,5 +1373,145 @@ mod tests {
             .unwrap();
         assert!(error_col.value(0).contains("format"));
         assert!(error_col.is_null(1));
+    }
+
+    #[test]
+    fn test_schema_cast_date_string_to_date32() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "date".to_string(),
+            data_type: SchemaDataType::Date,
+            nullable: true,
+            format: Some("%Y-%m-%d".to_string()),
+        }]);
+        let dates = StringArray::from(vec![Some("2024-01-15"), Some("bad")]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "date",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(dates) as ArrayRef],
+        )
+        .unwrap();
+
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
+        assert_eq!(validated.schema().field(0).data_type(), &ArrowDataType::Date32);
+        let date_array = validated
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .signed_duration_since(epoch)
+            .num_days() as i32;
+        assert_eq!(date_array.value(0), expected);
+        assert!(date_array.is_null(1));
+
+        let error_idx = validated.schema().index_of("_cf_row_error").unwrap();
+        let error_col = validated
+            .column(error_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(error_col.value(1).contains("format"));
+    }
+
+    #[test]
+    fn test_schema_cast_decimal_string_quarantine() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "amount".to_string(),
+            data_type: SchemaDataType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            nullable: true,
+            format: None,
+        }]);
+        let values = StringArray::from(vec![
+            Some("12.30"),
+            Some("12.345"),
+            Some("bad"),
+            Some("12"),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "amount",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(values) as ArrayRef],
+        )
+        .unwrap();
+
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
+        assert_eq!(
+            validated.schema().field(0).data_type(),
+            &ArrowDataType::Decimal128(10, 2)
+        );
+        let decimal_array = validated
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(decimal_array.value(0), 1_230);
+        assert!(decimal_array.is_null(1));
+        assert!(decimal_array.is_null(2));
+        assert_eq!(decimal_array.value(3), 1_200);
+
+        let error_idx = validated.schema().index_of("_cf_row_error").unwrap();
+        let error_col = validated
+            .column(error_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(error_col.value(1).contains("decimal"));
+        assert!(error_col.value(2).contains("decimal"));
+    }
+
+    #[test]
+    fn test_schema_cast_timestamp_tz_string_to_arrow_type() {
+        let schema = schema_def(vec![SchemaColumnSpec {
+            name: "ts".to_string(),
+            data_type: SchemaDataType::TimestampTz {
+                tz: "UTC".to_string(),
+            },
+            nullable: true,
+            format: Some("%Y-%m-%dT%H:%M:%S%z".to_string()),
+        }]);
+        let values = StringArray::from(vec![
+            Some("2024-01-15T10:30:00+00:00"),
+            Some("2024-01-15T10:30:00+01:00"),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                ArrowDataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(values) as ArrayRef],
+        )
+        .unwrap();
+
+        let validated = validate_record_batch(&batch, &schema, "output").unwrap();
+        assert_eq!(
+            validated.schema().field(0).data_type(),
+            &ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        let ts_array = validated
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert!(ts_array.is_null(1));
+
+        let error_idx = validated.schema().index_of("_cf_row_error").unwrap();
+        let error_col = validated
+            .column(error_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(error_col.value(1).contains("format"));
     }
 }

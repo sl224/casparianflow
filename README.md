@@ -195,7 +195,8 @@ cargo test --package casparian_backtest --test e2e_backtest
 - Rust 1.75+
 - Python 3 with `pyarrow` and `pandas` available in the worker environment
 - Optional: `psutil` for memory monitoring in Python bridge (warnings logged if missing)
-- [uv](https://github.com/astral-sh/uv) recommended for provisioning plugin environments
+- [uv](https://github.com/astral-sh/uv) optional for provisioning plugin environments
+  (preferred when available; worker can spawn the interpreter directly if uv is missing).
 
 ## License
 

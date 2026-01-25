@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use casparian_protocol::{DataType, RuntimeKind, SchemaColumnSpec, SchemaDefinition};
 use casparian_security::signing::{compute_artifact_hash, sha256};
-use casparian_security::Gatekeeper;
+use casparian_security::{Gatekeeper, GatekeeperProfile};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -21,10 +21,12 @@ pub struct PluginAnalysis {
     pub source_code: String,
     /// SHA256 hash of source code
     pub source_hash: String,
-    /// Whether the plugin passed Gatekeeper validation
+    /// Whether the plugin passed Gatekeeper validation under the configured mode
     pub is_valid: bool,
     /// Validation errors (empty if valid)
     pub validation_errors: Vec<String>,
+    /// Validation warnings (non-fatal by default)
+    pub validation_warnings: Vec<String>,
     /// Whether a uv.lock file exists in the plugin directory
     pub has_lockfile: bool,
     /// Environment hash (from uv.lock if present)
@@ -33,6 +35,43 @@ pub struct PluginAnalysis {
     pub handler_methods: Vec<String>,
     /// Detected topic registrations (from configure method)
     pub detected_topics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GatekeeperMode {
+    Warn,
+    Strict,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GatekeeperOptions {
+    pub mode: GatekeeperMode,
+    pub profile: GatekeeperProfile,
+}
+
+impl GatekeeperOptions {
+    pub fn from_env() -> Self {
+        let strict = std::env::var("CASPARIAN_GATEKEEPER_STRICT")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        let profile = std::env::var("CASPARIAN_GATEKEEPER_PROFILE")
+            .ok()
+            .and_then(|value| match value.to_ascii_lowercase().as_str() {
+                "dfir" => Some(GatekeeperProfile::Dfir),
+                "standard" => Some(GatekeeperProfile::Standard),
+                _ => None,
+            })
+            .unwrap_or(GatekeeperProfile::Standard);
+
+        Self {
+            mode: if strict {
+                GatekeeperMode::Strict
+            } else {
+                GatekeeperMode::Warn
+            },
+            profile,
+        }
+    }
 }
 
 const MANIFEST_FILENAME: &str = "casparian.toml";
@@ -121,6 +160,13 @@ struct ColumnSpecInput {
 /// 3. Detect Handler methods
 /// 4. Check for uv.lock
 pub fn analyze_plugin(path: &Path) -> Result<PluginAnalysis> {
+    analyze_plugin_with_options(path, GatekeeperOptions::from_env())
+}
+
+pub fn analyze_plugin_with_options(
+    path: &Path,
+    options: GatekeeperOptions,
+) -> Result<PluginAnalysis> {
     // 1. Read source code (Real I/O)
     let source_code = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read plugin file: {:?}", path))?;
@@ -141,27 +187,24 @@ pub fn analyze_plugin(path: &Path) -> Result<PluginAnalysis> {
     let source_hash = sha256(source_code.as_bytes());
 
     // 4. Validate with Gatekeeper (Real AST parsing)
-    let gatekeeper = Gatekeeper::new();
-    let validation_result = gatekeeper.validate(&source_code);
-
-    let (is_valid, validation_errors) = match validation_result {
-        Ok(_) => (true, vec![]),
-        Err(e) => {
-            let error_str = e.to_string();
-            let errors: Vec<String> = error_str
-                .lines()
-                .filter(|l| l.starts_with("- ") || l.contains("Banned") || l.contains("error"))
-                .map(|s| s.to_string())
-                .collect();
-            (
-                false,
-                if errors.is_empty() {
-                    vec![error_str]
-                } else {
-                    errors
-                },
-            )
-        }
+    let gatekeeper = Gatekeeper::with_profile(options.profile);
+    let (is_valid, validation_errors, validation_warnings) = match gatekeeper.analyze(&source_code)
+    {
+        Ok(report) => match options.mode {
+            GatekeeperMode::Warn => {
+                let mut warnings = Vec::new();
+                warnings.extend(report.errors);
+                warnings.extend(report.warnings);
+                (true, Vec::new(), warnings)
+            }
+            GatekeeperMode::Strict => {
+                let mut errors = Vec::new();
+                errors.extend(report.errors);
+                errors.extend(report.warnings);
+                (errors.is_empty(), errors, Vec::new())
+            }
+        },
+        Err(e) => (false, vec![e.to_string()], Vec::new()),
     };
 
     // 5. Check for uv.lock
@@ -190,6 +233,7 @@ pub fn analyze_plugin(path: &Path) -> Result<PluginAnalysis> {
         source_hash,
         is_valid,
         validation_errors,
+        validation_warnings,
         has_lockfile,
         env_hash,
         handler_methods,
@@ -477,13 +521,27 @@ pub struct PublishReceipt {
 /// 3. Compute hashes
 /// 4. Return prepared artifact
 pub fn prepare_publish(path: &Path) -> Result<PreparedArtifact> {
+    prepare_publish_with_options(path, GatekeeperOptions::from_env())
+}
+
+pub fn prepare_publish_with_options(
+    path: &Path,
+    options: GatekeeperOptions,
+) -> Result<PreparedArtifact> {
     // 1. Analyze the plugin
-    let analysis = analyze_plugin(path)?;
+    let analysis = analyze_plugin_with_options(path, options)?;
 
     if !analysis.is_valid {
         anyhow::bail!(
             "Plugin failed validation:\n{}",
             analysis.validation_errors.join("\n")
+        );
+    }
+
+    if !analysis.validation_warnings.is_empty() {
+        tracing::warn!(
+            "Gatekeeper warnings:\n{}",
+            analysis.validation_warnings.join("\n")
         );
     }
 
@@ -617,13 +675,14 @@ class Handler:
         assert_eq!(analysis.plugin_name, "my_plugin");
         assert!(analysis.is_valid);
         assert!(analysis.validation_errors.is_empty());
+        assert!(analysis.validation_warnings.is_empty());
         assert!(analysis.handler_methods.contains(&"configure".to_string()));
         assert!(analysis.handler_methods.contains(&"execute".to_string()));
         assert!(analysis.detected_topics.contains(&"processed".to_string()));
     }
 
     #[test]
-    fn test_analyze_plugin_invalid() {
+    fn test_analyze_plugin_warns_by_default() {
         let temp_dir = TempDir::new().unwrap();
         let plugin_path = temp_dir.path().join("bad_plugin.py");
         std::fs::write(
@@ -639,8 +698,44 @@ class Handler:
         )
         .unwrap();
 
-        let analysis = analyze_plugin(&plugin_path).unwrap();
+        let analysis = analyze_plugin_with_options(
+            &plugin_path,
+            GatekeeperOptions {
+                mode: GatekeeperMode::Warn,
+                profile: GatekeeperProfile::Standard,
+            },
+        )
+        .unwrap();
+        assert!(analysis.is_valid);
+        assert!(analysis.validation_errors.is_empty());
+        assert!(!analysis.validation_warnings.is_empty());
+    }
+
+    #[test]
+    fn test_analyze_plugin_strict_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let plugin_path = temp_dir.path().join("bad_plugin.py");
+        std::fs::write(
+            &plugin_path,
+            r#"
+import os
+
+def parse(path):
+    os.system("rm -rf /")
+"#,
+        )
+        .unwrap();
+
+        let analysis = analyze_plugin_with_options(
+            &plugin_path,
+            GatekeeperOptions {
+                mode: GatekeeperMode::Strict,
+                profile: GatekeeperProfile::Standard,
+            },
+        )
+        .unwrap();
         assert!(!analysis.is_valid);
         assert!(!analysis.validation_errors.is_empty());
+        assert!(analysis.validation_warnings.is_empty());
     }
 }

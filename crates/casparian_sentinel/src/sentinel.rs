@@ -32,8 +32,8 @@ use zmq::{Context as ZmqContext, Socket};
 use crate::control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo};
 use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
 use crate::db::{
-    ensure_schema_version, models::*, ApiStorage, IntentState, JobQueue, SessionId, SessionStorage,
-    SCHEMA_VERSION,
+    ensure_schema_version, models::*, ApiStorage, ExpectedOutputs, IntentState, JobQueue,
+    SessionId, SessionStorage, SCHEMA_VERSION,
 };
 use crate::metrics::METRICS;
 use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
@@ -394,43 +394,103 @@ impl Sentinel {
         Ok(SchemaDefinition { columns })
     }
 
+    fn apply_contract_overrides_with_storage(
+        conn: &DbConnection,
+        schema_storage: &SchemaStorage,
+        plugin_name: &str,
+        parser_version: &str,
+        sinks: Vec<SinkConfig>,
+    ) -> Result<Vec<SinkConfig>> {
+        let mut resolved = Vec::with_capacity(sinks.len());
+        let mut explicit_topics = HashSet::new();
+        let mut default_sinks = Vec::new();
+
+        for sink in sinks {
+            if Sentinel::is_default_sink(&sink.topic) {
+                default_sinks.push(sink);
+                continue;
+            }
+            explicit_topics.insert(sink.topic.clone());
+            let mut sink = sink;
+            Self::attach_contract_override(schema_storage, plugin_name, parser_version, &mut sink)?;
+            resolved.push(sink);
+        }
+
+        if default_sinks.is_empty() {
+            return Ok(resolved);
+        }
+
+        let default_sink = default_sinks.remove(0);
+        let expected_outputs = ExpectedOutputs::list_for_plugin(
+            conn,
+            plugin_name,
+            if parser_version.trim().is_empty() {
+                None
+            } else {
+                Some(parser_version)
+            },
+        )?;
+
+        if expected_outputs.is_empty() {
+            resolved.push(default_sink);
+            resolved.extend(default_sinks);
+            return Ok(resolved);
+        }
+
+        for output in expected_outputs {
+            if explicit_topics.contains(&output.output_name) {
+                continue;
+            }
+            let mut sink = default_sink.clone();
+            sink.topic = output.output_name;
+            Self::attach_contract_override(schema_storage, plugin_name, parser_version, &mut sink)?;
+            resolved.push(sink);
+        }
+
+        Ok(resolved)
+    }
+
+    fn attach_contract_override(
+        schema_storage: &SchemaStorage,
+        plugin_name: &str,
+        parser_version: &str,
+        sink: &mut SinkConfig,
+    ) -> Result<()> {
+        if parser_version.trim().is_empty() {
+            return Ok(());
+        }
+
+        let scope_id = derive_scope_id(plugin_name, parser_version, &sink.topic);
+        let contract = schema_storage
+            .get_contract_for_scope(&scope_id)
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        if let Some(contract) = contract {
+            sink.schema = Some(Self::schema_definition_from_contract(
+                &contract,
+                &sink.topic,
+            )?);
+            if contract.quarantine_config.is_some() {
+                sink.quarantine_config = contract.quarantine_config.clone();
+            }
+        }
+
+        Ok(())
+    }
+
     fn apply_contract_overrides(
         &self,
         plugin_name: &str,
         parser_version: &str,
         sinks: Vec<SinkConfig>,
     ) -> Result<Vec<SinkConfig>> {
-        if parser_version.trim().is_empty() {
-            return Ok(sinks);
-        }
-
-        let mut resolved = Vec::with_capacity(sinks.len());
-        for mut sink in sinks {
-            if sink.topic == "*" {
-                resolved.push(sink);
-                continue;
-            }
-
-            let scope_id = derive_scope_id(plugin_name, parser_version, &sink.topic);
-            let contract = self
-                .schema_storage
-                .get_contract_for_scope(&scope_id)
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            if let Some(contract) = contract {
-                sink.schema = Some(Self::schema_definition_from_contract(
-                    &contract,
-                    &sink.topic,
-                )?);
-                if contract.quarantine_config.is_some() {
-                    sink.quarantine_config = contract.quarantine_config.clone();
-                }
-            }
-
-            resolved.push(sink);
-        }
-
-        Ok(resolved)
+        Self::apply_contract_overrides_with_storage(
+            &self.conn,
+            &self.schema_storage,
+            plugin_name,
+            parser_version,
+            sinks,
+        )
     }
 
     fn is_default_sink(topic: &str) -> bool {
@@ -2661,7 +2721,65 @@ fn compute_sha256(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian_db::{DbConnection, DbValue};
+    use casparian_db::{DbConnection, DbTimestamp, DbValue};
+
+    fn setup_contract_db() -> (DbConnection, SchemaStorage) {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+        let queue = JobQueue::new(conn.clone());
+        queue.init_registry_schema().unwrap();
+        let schema_storage = SchemaStorage::new(conn.clone()).unwrap();
+        (conn, schema_storage)
+    }
+
+    fn insert_test_plugin(
+        conn: &DbConnection,
+        plugin_name: &str,
+        version: &str,
+        outputs_json: &str,
+    ) {
+        let now = DbTimestamp::now();
+        let source_hash = format!("hash_{}_{}", plugin_name, version);
+        conn.execute(
+            r#"
+            INSERT INTO cf_plugin_manifest (
+                plugin_name, version, runtime_kind, entrypoint,
+                source_code, source_hash, status, env_hash, artifact_hash,
+                manifest_json, protocol_version, schema_artifacts_json, outputs_json,
+                signature_verified, created_at, deployed_at
+            ) VALUES (?, ?, 'python_shim', 'test.py:parse', 'code', ?, 'ACTIVE', '', '',
+                      '{}', '1.0', '{}', ?, false, ?, ?)
+            "#,
+            &[
+                DbValue::from(plugin_name),
+                DbValue::from(version),
+                DbValue::from(source_hash.as_str()),
+                DbValue::from(outputs_json),
+                DbValue::from(now.clone()),
+                DbValue::from(now),
+            ],
+        )
+        .unwrap();
+    }
+
+    fn save_contract(
+        schema_storage: &SchemaStorage,
+        plugin_name: &str,
+        version: &str,
+        output_name: &str,
+    ) {
+        let schema_def = SchemaDefinition {
+            columns: vec![SchemaColumnSpec {
+                name: "id".to_string(),
+                data_type: casparian_protocol::DataType::Int64,
+                nullable: false,
+                format: None,
+            }],
+        };
+        let locked = locked_schema_from_definition(output_name, &schema_def).unwrap();
+        let scope_id = derive_scope_id(plugin_name, version, output_name);
+        let contract = SchemaContract::new(&scope_id, locked, "tester");
+        schema_storage.save_contract(&contract).unwrap();
+    }
 
     #[test]
     fn test_connected_worker() {
@@ -2718,6 +2836,70 @@ mod tests {
         assert_eq!(sinks.len(), 2);
         assert_eq!(sinks[0].topic, "alpha");
         assert_eq!(sinks[1].topic, "beta");
+    }
+
+    #[test]
+    fn test_apply_contract_overrides_expands_default_sink_output() {
+        let (conn, schema_storage) = setup_contract_db();
+        let outputs_json = r#"{"alpha": {"columns": []}, "beta": {"columns": []}}"#;
+        insert_test_plugin(&conn, "parser_a", "1.0.0", outputs_json);
+        save_contract(&schema_storage, "parser_a", "1.0.0", "alpha");
+        save_contract(&schema_storage, "parser_a", "1.0.0", "beta");
+
+        let sinks = vec![SinkConfig {
+            topic: defaults::DEFAULT_SINK_TOPIC.to_string(),
+            uri: "parquet:///tmp/default".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let resolved = Sentinel::apply_contract_overrides_with_storage(
+            &conn,
+            &schema_storage,
+            "parser_a",
+            "1.0.0",
+            sinks,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        let alpha = resolved.iter().find(|s| s.topic == "alpha").unwrap();
+        let beta = resolved.iter().find(|s| s.topic == "beta").unwrap();
+        assert!(alpha.schema.is_some());
+        assert!(beta.schema.is_some());
+    }
+
+    #[test]
+    fn test_apply_contract_overrides_expands_default_sink_wildcard() {
+        let (conn, schema_storage) = setup_contract_db();
+        let outputs_json = r#"{"alpha": {"columns": []}, "beta": {"columns": []}}"#;
+        insert_test_plugin(&conn, "parser_b", "1.2.3", outputs_json);
+        save_contract(&schema_storage, "parser_b", "1.2.3", "alpha");
+        save_contract(&schema_storage, "parser_b", "1.2.3", "beta");
+
+        let sinks = vec![SinkConfig {
+            topic: "*".to_string(),
+            uri: "parquet:///tmp/default".to_string(),
+            mode: SinkMode::Append,
+            quarantine_config: None,
+            schema: None,
+        }];
+
+        let resolved = Sentinel::apply_contract_overrides_with_storage(
+            &conn,
+            &schema_storage,
+            "parser_b",
+            "1.2.3",
+            sinks,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        let alpha = resolved.iter().find(|s| s.topic == "alpha").unwrap();
+        let beta = resolved.iter().find(|s| s.topic == "beta").unwrap();
+        assert!(alpha.schema.is_some());
+        assert!(beta.schema.is_some());
     }
 
     #[test]

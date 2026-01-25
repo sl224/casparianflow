@@ -66,7 +66,7 @@ impl VenvMetadata {
 /// so they should be called from spawn_blocking anyway.
 pub struct VenvManager {
     pub venvs_dir: PathBuf,
-    pub uv_path: PathBuf,
+    uv_path: Option<PathBuf>,
     metadata_path: PathBuf,
     metadata: Mutex<VenvMetadata>,
 }
@@ -95,7 +95,10 @@ impl VenvManager {
         let metadata_path = venvs_dir.join(".metadata.json");
         let metadata = load_metadata(&metadata_path);
 
-        let uv_path = find_uv()?;
+        let uv_path = find_uv();
+        if uv_path.is_none() {
+            warn!("uv not found; venv creation will fail unless environments are preinstalled");
+        }
 
         info!(
             "VenvManager initialized at {}: {} cached envs",
@@ -145,7 +148,13 @@ impl VenvManager {
         );
 
         let venv_path = self.venvs_dir.join(env_hash);
-        create_venv(&self.uv_path, &venv_path, lockfile_content, python_version)?;
+        let uv_path = self.uv_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "uv not found; install uv or preinstall env '{}' on this worker",
+                env_hash
+            )
+        })?;
+        create_venv(uv_path, &venv_path, lockfile_content, python_version)?;
 
         // Record metadata (under lock)
         let size = dir_size(&venv_path);
@@ -322,10 +331,10 @@ fn load_metadata(path: &Path) -> VenvMetadata {
     }
 }
 
-fn find_uv() -> Result<PathBuf> {
+fn find_uv() -> Option<PathBuf> {
     // Check PATH first
     if let Ok(path) = which::which("uv") {
-        return Ok(path);
+        return Some(path);
     }
 
     // Check common locations
@@ -339,11 +348,10 @@ fn find_uv() -> Result<PathBuf> {
     for candidate in candidates {
         let path = PathBuf::from(&candidate);
         if path.exists() {
-            return Ok(path);
+            return Some(path);
         }
     }
-
-    anyhow::bail!("uv not found. Install: curl -LsSf https://astral.sh/uv/install.sh | sh")
+    None
 }
 
 fn create_venv(

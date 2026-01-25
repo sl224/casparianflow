@@ -82,7 +82,7 @@ ln -s "$PROJECT_ROOT/.venv" "$HOME/.casparian_flow/venvs/test_env_hash_123"
 **Changes required:**
 - Worker calls `uv run` instead of `{venv}/bin/python`
 - env_hash becomes a lockfile hash (or we pass a manifest/lockfile path)
-- uv must be installed on worker machines
+- uv is optional on worker machines (fallback to direct interpreter spawn if missing)
 
 **Pros:**
 - uv is Rust-native, extremely fast (~100ms cold start)
@@ -91,7 +91,7 @@ ln -s "$PROJECT_ROOT/.venv" "$HOME/.casparian_flow/venvs/test_env_hash_123"
 - Single tool for dev and production
 
 **Cons:**
-- Hard dependency on uv being installed
+- uv dependency for best macOS compatibility (direct spawn can be less reliable)
 - Changes execution model
 - Less control over exact Python binary used
 - uv is relatively new (though backed by Astral, well-maintained)
