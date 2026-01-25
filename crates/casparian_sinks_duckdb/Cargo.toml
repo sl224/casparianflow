@@ -1,0 +1,22 @@
+[package]
+name = "casparian_sinks_duckdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+arrow.workspace = true
+blake3 = "1.5"
+duckdb = { version = "1.4", features = ["appender-arrow"] }
+casparian_db = { path = "../casparian_db", default-features = false, features = ["duckdb"] }
+casparian_protocol = { path = "../casparian_protocol" }
+
+[features]
+bundled = ["duckdb/bundled", "casparian_db/duckdb-bundled"]
+
+[dev-dependencies]
+tempfile = "3"

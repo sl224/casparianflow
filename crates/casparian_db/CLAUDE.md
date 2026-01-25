@@ -1,11 +1,14 @@
 # Claude Code Instructions for casparian_db
 
+**Status**: canonical
+**Last verified against code**: 2026-01-24
+**Key code references**: `src/backend.rs`, `src/lib.rs`, `src/lock.rs`
+
 ## Quick Reference
 
 ```bash
 cargo test -p casparian_db                    # All tests
 cargo check -p casparian_db                   # Type check
-cargo check -p casparian_db --features postgres  # With PostgreSQL
 ```
 
 ---
@@ -13,44 +16,17 @@ cargo check -p casparian_db --features postgres  # With PostgreSQL
 ## Overview
 
 `casparian_db` provides the **Database Abstraction Layer** for Casparian Flow. It enables:
-- **Feature-gated database support** (compile-time)
-- **License-controlled enterprise features** (runtime)
-- **Unified pool creation** across all crates
+- **DuckDB-only database access** (no SQLite, no PostgreSQL)
+- **File-based locking** for single-writer enforcement
+- **Unified connection API** via `DbConnection`
 
 ### Design Principles
 
-1. **SQLite is always free** - Community tier, no license required
-2. **Enterprise DBs require license** - PostgreSQL (Professional), MSSQL (Enterprise)
-3. **Single source of truth** - All crates use this crate for database types
-4. **Unified connection API** - Use `DbConnection` for backend-agnostic access
-5. **Fail at connection time** - License check happens when creating pool, not at query time
-
----
-
-## Feature Flags
-
-| Feature | Description | License Required |
-|---------|-------------|------------------|
-| `sqlite` | SQLite support (default) | No |
-| `postgres` | PostgreSQL support | Professional |
-| `mssql` | MSSQL support (planned) | Enterprise |
-
-Build with specific features:
-```bash
-cargo build --features sqlite           # Default
-cargo build --features sqlite,postgres  # Both
-cargo build --no-default-features --features postgres  # Postgres only
-```
-
----
-
-## License Tiers
-
-| Tier | SQLite | PostgreSQL | MSSQL | Price |
-|------|--------|------------|-------|-------|
-| Community | ✓ | ✗ | ✗ | Free |
-| Professional | ✓ | ✓ | ✗ | Paid |
-| Enterprise | ✓ | ✓ | ✓ | Paid |
+1. **DuckDB only** - Columnar OLAP database for analytics workloads
+2. **Single-writer enforcement** - File locking via `fs2` crate
+3. **Read-only mode** - Multiple readers allowed simultaneously
+4. **Single source of truth** - All crates use `DbConnection` for DB access
+5. **Synchronous API** - No async, uses `duckdb::Connection` directly
 
 ---
 
@@ -59,55 +35,48 @@ cargo build --no-default-features --features postgres  # Postgres only
 ### DatabaseType
 
 ```rust
-#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseType {
-    #[cfg(feature = "sqlite")]
-    Sqlite,
-    #[cfg(feature = "postgres")]
-    Postgres,
+    DuckDb,  // Only variant
 }
 ```
 
 ### DbConnection
 
 ```rust
-pub struct DbConnection { /* ... */ }
-
-// Constructors
-DbConnection::open_sqlite(Path::new("./data.db")).await?
-DbConnection::open_sqlite_memory().await?
-DbConnection::open_duckdb(Path::new("./data.duckdb")).await?
-DbConnection::open_postgres("postgres://localhost/mydb").await?
-DbConnection::open_from_url("sqlite:./data.db").await?
-```
-
-### License
-
-```rust
-pub struct License {
-    pub organization: String,
-    pub tier: LicenseTier,
-    pub expires_at: Option<i64>,
-    pub license_id: String,
+pub struct DbConnection {
+    conn: Rc<duckdb::Connection>,
+    access_mode: AccessMode,
+    lock_guard: Option<Rc<DbLockGuard>>,
 }
 
-// Load from file
-let license = License::load(Path::new("license.json"))?;
-
-// Default (Community)
-let license = License::community();
-
-// Auto-load from standard locations
-let license = load_license();
+// Constructors
+DbConnection::open_duckdb(Path::new("./data.duckdb"))?     // Read-write with exclusive lock
+DbConnection::open_duckdb_readonly(Path::new("./data.duckdb"))? // Read-only, no lock
+DbConnection::open_duckdb_memory()?                         // In-memory for testing
+DbConnection::open_from_url("duckdb:./data.duckdb")?       // URL-based
 ```
 
-### LicenseTier
+### AccessMode
 
 ```rust
-pub enum LicenseTier {
-    Community,      // SQLite only
-    Professional,   // + PostgreSQL
-    Enterprise,     // + MSSQL
+pub enum AccessMode {
+    ReadWrite,  // Requires exclusive file lock
+    ReadOnly,   // No lock required
+}
+```
+
+### DbValue
+
+```rust
+pub enum DbValue {
+    Null,
+    Integer(i64),
+    Float(f64),
+    Text(String),
+    Blob(Vec<u8>),
+    Boolean(bool),
+    Timestamp(i64),  // Microseconds since epoch
 }
 ```
 
@@ -115,31 +84,44 @@ pub enum LicenseTier {
 
 ## Usage
 
-### Unified API (recommended)
+### Standard API
 
 ```rust
 use casparian_db::DbConnection;
 
-let conn = DbConnection::open_sqlite(Path::new("./data.db")).await?;
-conn.execute("SELECT 1", &[]).await?;
-```
+// Open with exclusive lock (read-write)
+let conn = DbConnection::open_duckdb(Path::new("./data.duckdb"))?;
 
-### License File Format
+// Execute SQL
+conn.execute("INSERT INTO t VALUES (?)", &[DbValue::Integer(42)])?;
 
-```json
-{
-  "organization": "Acme Corp",
-  "tier": "Professional",
-  "expires_at": 1735689600,
-  "license_id": "lic_abc123",
-  "signature": "base64_ed25519_signature"
+// Query
+let rows = conn.query_all("SELECT * FROM t", &[])?;
+for row in rows {
+    let id: i64 = row.get_by_index(0)?;
 }
+
+// Transaction
+conn.transaction(|tx| {
+    tx.execute("INSERT INTO t VALUES (1)", &[])?;
+    tx.execute("INSERT INTO t VALUES (2)", &[])?;
+    Ok(())
+})?;
 ```
 
-License file locations (checked in order):
-1. `CASPARIAN_LICENSE` environment variable
-2. `~/.casparian_flow/license.json`
-3. `./license.json`
+### Bulk Insert (High Performance)
+
+```rust
+// Uses DuckDB APPENDER for fast row insertion
+conn.bulk_insert_rows(
+    "my_table",
+    &["col1", "col2"],
+    &[
+        vec![DbValue::Integer(1), DbValue::Text("a".into())],
+        vec![DbValue::Integer(2), DbValue::Text("b".into())],
+    ],
+)?;
+```
 
 ---
 
@@ -155,48 +137,32 @@ To use `casparian_db` in another crate:
 casparian_db = { path = "../casparian_db" }
 ```
 
-2. Replace direct pool creation:
+2. Use DbConnection:
 ```rust
-// Before
-let pool = SqlitePool::connect(&url).await?;
-
-// After (v1)
 use casparian_db::DbConnection;
 
-let conn = DbConnection::open_duckdb(Path::new(&path)).await?;
+// Read-write access (gets exclusive lock)
+let conn = DbConnection::open_duckdb(Path::new(&path))?;
+
+// Read-only access (shared)
+let conn = DbConnection::open_duckdb_readonly(Path::new(&path))?;
 ```
 
 ---
 
 ## Error Handling
 
-`DbConnection` returns `BackendError`. Pool-based APIs are not used in v1.
+`DbConnection` returns `BackendError`:
 
 ```rust
 pub enum BackendError {
-    Database(String),
-    Locked(String),
-    ReadOnly,
-    Query(String),
-    Transaction(String),
-    TypeConversion(String),
-    NotAvailable(String),
-    // backend-specific variants
-}
-
-pub enum DbError {
-    Database(sqlx::Error),           // Connection/query errors
-    License(LicenseError),           // License validation failed
-    InvalidUrl(String),              // Unrecognized database URL
-    NotCompiled(String, String),     // Feature not enabled
-}
-
-pub enum LicenseError {
-    NotFound(String),                // License file missing
-    InvalidFormat(String),           // JSON parse error
-    Expired,                         // License expired
-    FeatureNotLicensed(String),      // Tier doesn't include feature
-    InvalidSignature,                // Signature verification failed
+    Database(String),         // DuckDB errors
+    Locked(String),           // File lock acquisition failed
+    ReadOnly,                 // Write attempted on read-only connection
+    Query(String),            // Query execution error
+    Transaction(String),      // Transaction error
+    TypeConversion(String),   // Type conversion failed
+    NotAvailable(String),     // Feature not available
 }
 ```
 
@@ -207,98 +173,59 @@ pub enum LicenseError {
 ```
 casparian_db/
 ├── CLAUDE.md           # This file
-├── Cargo.toml          # Feature flags
+├── Cargo.toml
 └── src/
     ├── lib.rs          # DatabaseType, exports
-    ├── backend.rs      # DbConnection, DbValue
-    ├── license.rs      # License, LicenseTier
-    └── pool.rs         # Legacy sqlx pool API
+    ├── backend.rs      # DbConnection, DbValue, query methods
+    ├── lock.rs         # File-based locking (fs2)
+    └── sql_guard.rs    # SQL safety checks
 ```
 
 ---
 
-## Common Tasks
+## File Locking
 
-### Add a New Database Backend
-
-1. Add feature flag to `Cargo.toml`:
-```toml
-[features]
-mssql = ["tiberius"]
-```
-
-2. Add variant to `DatabaseType`:
-```rust
-#[cfg(feature = "mssql")]
-Mssql,
-```
-
-3. Update `requires_license()`:
-```rust
-#[cfg(feature = "mssql")]
-Self::Mssql => true,
-```
-
-4. Add `LicenseTier::allows()` check:
-```rust
-#[cfg(feature = "mssql")]
-DatabaseType::Mssql => matches!(self, Self::Enterprise),
-```
-
-5. Add pool creation logic in `create_pool()`
-
-6. Add tests
-
-### Validate License Programmatically
+DuckDB doesn't provide built-in distributed locking. We use `fs2` for file-based locking:
 
 ```rust
-use casparian_db::{License, DatabaseType, LicenseError};
-
-let license = License::load(Path::new("license.json"))?;
-
-// Check if license allows a specific database
-match license.allows(DatabaseType::Postgres) {
-    Ok(()) => println!("PostgreSQL allowed"),
-    Err(LicenseError::FeatureNotLicensed(db)) => {
-        println!("Upgrade to Professional for {} support", db);
-    }
-    Err(e) => return Err(e.into()),
+// In lock.rs
+pub fn try_lock_exclusive(db_path: &Path) -> Result<DbLockGuard, LockError> {
+    let lock_path = db_path.with_extension("duckdb.lock");
+    let file = File::create(&lock_path)?;
+    file.try_lock_exclusive()?;  // Non-blocking
+    Ok(DbLockGuard { file, lock_path })
 }
 ```
+
+- **Read-write connections**: Acquire exclusive lock on `.duckdb.lock` file
+- **Read-only connections**: No lock required
+- **Lock contention**: Returns `BackendError::Locked` if file is already locked
 
 ---
 
 ## Testing
 
-### Unit Tests
-
 ```rust
 #[test]
-fn test_community_license_sqlite_only() {
-    let license = License::community();
+fn test_duckdb_connection() {
+    let conn = DbConnection::open_duckdb_memory().unwrap();
 
-    #[cfg(feature = "sqlite")]
-    assert!(license.allows(DatabaseType::Sqlite).is_ok());
+    conn.execute("CREATE TABLE t (id INTEGER)", &[]).unwrap();
+    conn.execute("INSERT INTO t VALUES (?)", &[DbValue::Integer(42)]).unwrap();
 
-    #[cfg(feature = "postgres")]
-    assert!(license.allows(DatabaseType::Postgres).is_err());
+    let rows = conn.query_all("SELECT * FROM t", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
 }
-```
 
-### Integration Tests
+#[test]
+fn test_lock_contention() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("test.duckdb");
 
-```rust
-#[tokio::test]
-async fn test_sqlite_connection() {
-    let config = DbConfig::sqlite_memory();
-    let pool = create_pool(config).await.unwrap();
+    let conn1 = DbConnection::open_duckdb(&path).unwrap();  // Gets lock
+    let result = DbConnection::open_duckdb(&path);           // Should fail
 
-    let row: (i32,) = sqlx::query_as("SELECT 1")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-    assert_eq!(row.0, 1);
+    assert!(matches!(result, Err(BackendError::Locked(_))));
 }
 ```
 
@@ -306,8 +233,8 @@ async fn test_sqlite_connection() {
 
 ## Key Principles
 
-1. **License check at connection time** - Not at query time
-2. **Feature flags for compile-time gating** - Dead code elimination
-3. **Graceful degradation** - Missing license = Community tier
-4. **Single DbPool type** - Uses sqlx::AnyPool for flexibility
-5. **Standard license locations** - Predictable, documented
+1. **DuckDB only** - No SQLite, no PostgreSQL, no sqlx
+2. **Single-writer** - Exclusive file lock for write access
+3. **Synchronous API** - No async, direct duckdb::Connection usage
+4. **Bulk operations** - Use APPENDER for high-performance inserts
+5. **Read-only mode** - Explicit mode for query-only access

@@ -1,6 +1,6 @@
 ---
 plan: scan_persist_line_rate
-last_updated: 2026-01-24
+last_updated: 2026-01-25
 milestone: M3
 step: M3.1
 status: completed
@@ -23,6 +23,7 @@ notes:
   - "2026-01-24: cargo bench -p casparian --bench scanner_perf timed out after 600s; partial results: full_scan batch_size=512 time 207.11-215.47ms (thrpt 23.205-24.141 Kelem/s), batch_size=2048 time 157.36-161.95ms (thrpt 30.875-31.774 Kelem/s), batch_size=10000 time 157.82-163.76ms (thrpt 30.533-31.682 Kelem/s); rescan batch_size=512 time 301.58-317.20ms (thrpt 15.763-16.579 Kelem/s), batch_size=2048 time 244.56-255.77ms (thrpt 19.549-20.445 Kelem/s)."
   - "2026-01-24: cargo check -p casparian-flow-ui failed: tauri distDir \"../dist\" missing (generate_context! panic)."
   - "2026-01-24: cargo test -p casparian passed; cargo bench -p casparian --bench scanner_perf completed (see benchmark log)."
+  - "2026-01-25: Non-scan work: fixed bulk_insert_rows appender safety, added DuckDB sink column-order/reserved-word tests, quarantine list API, SQL guard keywords, sentinel DB URL resolution, rg fallback script. Ran: cargo test -p casparian_db; cargo test -p casparian_sinks --features sink-duckdb; cargo test -p casparian_sentinel. Did not run scanner_perf bench (not a scan milestone)."
 ---
 
 # Goal

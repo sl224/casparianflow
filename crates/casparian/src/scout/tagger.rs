@@ -111,6 +111,7 @@ impl Tagger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scout::file_uid::weak_uid_from_path_str;
     use crate::scout::types::{ScannedFile, SourceId, TaggingRuleId, WorkspaceId};
 
     fn create_test_rule(
@@ -136,10 +137,13 @@ mod tests {
         source_id: &SourceId,
         rel_path: &str,
     ) -> ScannedFile {
+        let path = format!("/data/{}", rel_path);
+        let file_uid = weak_uid_from_path_str(&path);
         ScannedFile::new(
             workspace_id,
             source_id.clone(),
-            &format!("/data/{}", rel_path),
+            &file_uid,
+            &path,
             rel_path,
             1000,
             12345,

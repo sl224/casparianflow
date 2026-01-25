@@ -293,3 +293,229 @@ impl DuckDbSink {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Decimal128Builder, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, TimeUnit};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn create_test_batch() -> RecordBatch {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+
+        let id_array = Int64Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec![Some("Alice"), Some("Bob"), None]);
+
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_duckdb_sink() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.duckdb");
+        let mut sink = DuckDbSink::new(
+            db_path.clone(),
+            "records",
+            SinkMode::Append,
+            "job-1",
+            "records",
+        )
+        .unwrap();
+
+        let batch = create_test_batch();
+        sink.init(batch.schema().as_ref()).unwrap();
+        let rows = sink.write_batch(&batch).unwrap();
+        assert_eq!(rows, 3);
+
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
+
+        let conn = duckdb::Connection::open(db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_duckdb_sink_lock_conflict() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("locked.duckdb");
+
+        let _sink1 = DuckDbSink::new(
+            db_path.clone(),
+            "records",
+            SinkMode::Append,
+            "job-1",
+            "records",
+        )
+        .unwrap();
+
+        let err = match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-2", "records") {
+            Ok(_) => panic!("expected lock error, got Ok"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("locked"),
+            "expected lock error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_duckdb_sink_rejects_control_plane_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("casparian_flow.duckdb");
+
+        let err = match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-1", "records") {
+            Ok(_) => panic!("expected control-plane rejection, got Ok"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("control-plane"),
+            "expected control-plane rejection, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_duckdb_sink_decimal_timestamp_tz() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_decimal_tz.duckdb");
+        let mut sink = DuckDbSink::new(
+            db_path.clone(),
+            "records",
+            SinkMode::Append,
+            "job-1",
+            "records",
+        )
+        .unwrap();
+
+        let mut dec_builder =
+            Decimal128Builder::with_capacity(3).with_data_type(DataType::Decimal128(10, 2));
+        dec_builder.append_value(12_345);
+        dec_builder.append_null();
+        dec_builder.append_value(-6_789);
+        let dec_array = dec_builder.finish();
+
+        let ts_array = TimestampMicrosecondArray::from(vec![
+            Some(1_700_000_000_000_000),
+            None,
+            Some(1_700_000_100_000_000),
+        ])
+        .with_timezone("UTC");
+
+        let schema = Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            ),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(dec_array), Arc::new(ts_array)],
+        )
+        .unwrap();
+
+        sink.init(batch.schema().as_ref()).unwrap();
+        let rows = sink.write_batch(&batch).unwrap();
+        assert_eq!(rows, 3);
+
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
+
+        let conn = duckdb::Connection::open(db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_duckdb_sink_quotes_reserved_columns() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("reserved.duckdb");
+        let mut sink = DuckDbSink::new(
+            db_path.clone(),
+            "records",
+            SinkMode::Append,
+            "job-1",
+            "records",
+        )
+        .unwrap();
+
+        let schema = Schema::new(vec![
+            Field::new("select", DataType::Int64, false),
+            Field::new("from", DataType::Utf8, true),
+        ]);
+        let select_array = Int64Array::from(vec![1, 2]);
+        let from_array = StringArray::from(vec![Some("alpha"), None]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(select_array), Arc::new(from_array)],
+        )
+        .unwrap();
+
+        sink.init(batch.schema().as_ref()).unwrap();
+        let rows = sink.write_batch(&batch).unwrap();
+        assert_eq!(rows, 2);
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
+
+        let conn = duckdb::Connection::open(db_path).unwrap();
+        let value: String = conn
+            .query_row(
+                "SELECT \"from\" FROM records WHERE \"select\" = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "alpha");
+    }
+
+    #[test]
+    fn test_duckdb_sink_preserves_column_order_on_existing_table() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("order.duckdb");
+        {
+            let conn = duckdb::Connection::open(&db_path).unwrap();
+            conn.execute_batch("CREATE TABLE records (\"name\" TEXT, \"id\" BIGINT)")
+                .unwrap();
+        }
+
+        let mut sink = DuckDbSink::new(
+            db_path.clone(),
+            "records",
+            SinkMode::Append,
+            "job-2",
+            "records",
+        )
+        .unwrap();
+
+        let batch = create_test_batch();
+        sink.init(batch.schema().as_ref()).unwrap();
+        let rows = sink.write_batch(&batch).unwrap();
+        assert_eq!(rows, 3);
+        sink.prepare().unwrap();
+        sink.commit().unwrap();
+
+        let conn = duckdb::Connection::open(db_path).unwrap();
+        let name: String = conn
+            .query_row("SELECT \"name\" FROM records WHERE \"id\" = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "Alice");
+    }
+}

@@ -6,6 +6,7 @@ members = [
     "crates/casparian_worker",
     "crates/casparian_sentinel",
     "crates/casparian_sinks",
+    "crates/casparian_sinks_duckdb",
     "crates/casparian_tape",
     "crates/casparian",
     "crates/casparian_security",

@@ -6,6 +6,7 @@
 pub mod db;
 pub mod error;
 pub mod extractor;
+pub mod file_uid;
 pub mod patterns;
 pub mod rule_apply;
 pub mod scan_path;

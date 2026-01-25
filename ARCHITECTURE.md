@@ -204,15 +204,18 @@ Binary header: `!BBHQI` (16 bytes)
 
 | OpCode | Name | Direction | Purpose |
 |--------|------|-----------|---------|
-| 1 | IDENTIFY | Worker → Sentinel | Handshake |
-| 2 | DISPATCH | Sentinel → Worker | Job command |
-| 3 | ABORT | Sentinel → Worker | Cancel |
-| 4 | HEARTBEAT | Worker → Sentinel | Status |
-| 5 | CONCLUDE | Worker → Sentinel | Job done |
-| 6 | ERR | Both | Error |
-| 8 | PREPARE_ENV | Sentinel → Worker | Setup venv |
-| 9 | ENV_READY | Worker → Sentinel | Venv ready |
-| 10 | DEPLOY | Publisher → Sentinel | Deploy artifact |
+| 0 | UNKNOWN | - | Fallback/invalid |
+| 1 | IDENTIFY | Worker → Sentinel | Handshake: "I am here. My capabilities are [A, B, C]." |
+| 2 | DISPATCH | Sentinel → Worker | Command: "Process this file. Here is your sink configuration." |
+| 3 | ABORT | Sentinel → Worker | Abort: "Cancel this job." |
+| 4 | HEARTBEAT | Worker → Sentinel | Keep-alive: "Still alive, working on job X." |
+| 5 | CONCLUDE | Worker → Sentinel | Completion: "Job finished. Here is the receipt." |
+| 6 | ERR | Bidirectional | Error: "Something went wrong." |
+| 7 | RELOAD | Sentinel → Worker | Config Refresh: "Reload configuration / plugins." |
+| 10 | DEPLOY | Sentinel → Worker | Bridge Mode: "Deploy this artifact (source + lockfile + signature)." |
+| 11 | ACK | Generic | Acknowledgment: "Used for DeployResponse, etc." |
+
+**Code reference:** `crates/casparian_protocol/src/lib.rs::OpCode`
 
 ---
 
@@ -220,15 +223,23 @@ Binary header: `!BBHQI` (16 bytes)
 
 | Crate | Purpose |
 |-------|---------|
-| `casparian` | Unified CLI binary, TUI |
+| `casparian` | Unified CLI binary, TUI, includes `scout` module |
 | `casparian_sentinel` | Control plane: job queue, dispatch, Control API |
 | `casparian_worker` | Execution plane: parser execution, schema validation |
-| `casparian_sinks` | Output persistence (DuckDB, Parquet, CSV) + lineage |
+| `casparian_sinks` | Output persistence abstractions + lineage |
+| `casparian_sinks_duckdb` | DuckDB-specific sink implementation |
 | `casparian_protocol` | Binary protocol, types, idempotency keys |
-| `casparian_scout` | File discovery, tagging |
-| `casparian_db` | Database abstraction, locking |
+| `casparian_db` | DuckDB abstraction via `DbConnection`, file locking |
 | `casparian_tape` | Event recording for replay/debugging |
 | `casparian_backtest` | Multi-file validation, fail-fast |
+| `casparian_schema` | Schema contract storage and validation |
+| `casparian_ids` | Strongly-typed ID definitions |
+| `casparian_security` | Trust config, signing, gatekeeper |
+| `casparian_mcp` | Model Context Protocol integration |
+| `casparian_profiler` | Performance profiling utilities |
+| `casparian_intent` | Intent handling for AI workflows |
+
+**Note:** Scout is a module in `crates/casparian/src/scout/`, not a separate crate.
 
 ---
 
@@ -239,13 +250,15 @@ Everything uses: `~/.casparian_flow/casparian_flow.duckdb`
 
 ### Table Prefixes
 
-| Prefix | Purpose |
-|--------|---------|
-| `cf_processing_queue` | Canonical job queue (execution) |
-| `cf_materializations` | Incremental ingestion tracking |
-| `cf_expected_outputs` | Expected outputs per parser/topic |
-| `scout_*` | File discovery, tagging rules |
-| `schema_*` | Schema contracts, amendments |
+| Prefix | Purpose | Code Reference |
+|--------|---------|----------------|
+| `cf_processing_queue` | Job queue entries | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_output_materializations` | Incremental ingestion tracking | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_plugin_manifest` | Parser registry with versions | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_plugin_environment` | Plugin venv caching | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_topic_config` | Topic→Parser→Sink routing | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_api_jobs`, `cf_api_events`, `cf_api_approvals` | MCP storage | `crates/casparian_sentinel/src/db/api_storage.rs` |
+| `scout_*` | File discovery, tagging rules | `crates/casparian/src/scout/db.rs` |
 
 ### Access Pattern
 - **Sentinel**: Exclusive write access via Control API
@@ -260,7 +273,8 @@ Everything uses: `~/.casparian_flow/casparian_flow.duckdb`
 ```
 Worker (Host)              Guest Process
      │                          │
-     │ AF_UNIX Socket           │
+     │ TCP Loopback             │
+     │ (127.0.0.1:0)            │
      │ ─────────────────────    │
      │                          │
      │ Credentials, secrets     │ Plugin code only
@@ -268,10 +282,17 @@ Worker (Host)              Guest Process
      │ Sink writers             │ No credentials
 ```
 
+**Transport:** TCP loopback on `127.0.0.1:0` (OS-assigned port). Port passed to guest via `BRIDGE_PORT` env var.
+
+**Code reference:** `crates/casparian_worker/src/bridge.rs`
+
 ### Trust Model
-- **Python plugins**: `allow_unsigned_python` config (default: false; explicit opt-in)
-- **Native plugins**: Signature verification
-- **Path traversal**: `validate_entrypoint()` blocks `..` and absolute paths
+- **Python plugins**: `allow_unsigned_python` config (default: `false`; explicit opt-in required)
+- **Native plugins**: `allow_unsigned_native` config (default: `false`; signature verification required)
+- **Path traversal**: `validate_entrypoint()` blocks `..`, absolute paths, and symlink escapes
+- **Environment overrides**: `CASPARIAN_ALLOW_UNSIGNED_PYTHON`, `CASPARIAN_ALLOW_UNSIGNED_NATIVE`
+
+**Code reference:** `crates/casparian_worker/src/worker.rs::validate_entrypoint()`, `crates/casparian/src/trust/config.rs`
 
 ---
 

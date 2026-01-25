@@ -1,13 +1,15 @@
 use casparian::scout::{
     Database, ScanConfig, ScannedFile, Scanner, Source, SourceId, SourceType, WorkspaceId,
 };
+use casparian::scout::file_uid::weak_uid_from_path_str;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use ignore::WalkBuilder;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tempfile::TempDir;
 
 const FILE_COUNT: usize = 5_000;
@@ -15,10 +17,27 @@ const FILE_SIZE_BYTES: usize = 256;
 const DEPTH: usize = 3;
 const BATCH_SIZES: &[usize] = &[512, 2_048, 10_000];
 const WRITE_BATCH_SIZES: &[usize] = &[256, 1_024, 4_096, 10_000];
+const WARMUP_TIME_SECS: u64 = 1;
+const MEASUREMENT_TIME_SECS: u64 = 3;
+const SAMPLE_SIZE: usize = 10;
 
 struct Fixture {
     temp_dir: TempDir,
     file_count: usize,
+}
+
+static FIXTURE: OnceLock<Fixture> = OnceLock::new();
+
+fn fixture() -> &'static Fixture {
+    FIXTURE.get_or_init(|| create_fixture(FILE_COUNT, DEPTH, FILE_SIZE_BYTES))
+}
+
+fn criterion_config() -> Criterion {
+    Criterion::default()
+        .warm_up_time(Duration::from_secs(WARMUP_TIME_SECS))
+        .measurement_time(Duration::from_secs(MEASUREMENT_TIME_SECS))
+        .sample_size(SAMPLE_SIZE)
+        .configure_from_args()
 }
 
 fn build_path(root: &Path, index: usize, depth: usize) -> PathBuf {
@@ -162,9 +181,11 @@ fn build_scanned_files(
     for i in 0..count {
         let rel_path = format!("level_{}/file_{:06}.dat", i % 16, i);
         let full_path = format!("/bench/{}", rel_path);
+        let file_uid = weak_uid_from_path_str(&full_path);
         files.push(ScannedFile::new(
             workspace_id,
             *source_id,
+            &file_uid,
             &full_path,
             &rel_path,
             FILE_SIZE_BYTES as u64,
@@ -175,7 +196,7 @@ fn build_scanned_files(
 }
 
 fn bench_scanner_full_scan(c: &mut Criterion) {
-    let fixture = create_fixture(FILE_COUNT, DEPTH, FILE_SIZE_BYTES);
+    let fixture = fixture();
 
     let mut group = c.benchmark_group("scanner_full_scan");
     group.throughput(Throughput::Elements(fixture.file_count as u64));
@@ -211,7 +232,7 @@ fn bench_scanner_full_scan(c: &mut Criterion) {
 }
 
 fn bench_scanner_rescan(c: &mut Criterion) {
-    let fixture = create_fixture(FILE_COUNT, DEPTH, FILE_SIZE_BYTES);
+    let fixture = fixture();
 
     let mut group = c.benchmark_group("scanner_rescan");
     group.throughput(Throughput::Elements(fixture.file_count as u64));
@@ -253,7 +274,7 @@ fn bench_scanner_rescan(c: &mut Criterion) {
 }
 
 fn bench_scanner_walk_only(c: &mut Criterion) {
-    let fixture = create_fixture(FILE_COUNT, DEPTH, FILE_SIZE_BYTES);
+    let fixture = fixture();
     let config = ScanConfig::default();
 
     let mut group = c.benchmark_group("scanner_walk_only");
@@ -316,7 +337,9 @@ fn bench_scanner_db_write(c: &mut Criterion) {
 }
 
 criterion_group!(
-    scanner_perf,
+    name = scanner_perf;
+    config = criterion_config();
+    targets =
     bench_scanner_full_scan,
     bench_scanner_rescan,
     bench_scanner_walk_only,

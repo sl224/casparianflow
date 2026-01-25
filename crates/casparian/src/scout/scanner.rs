@@ -13,7 +13,8 @@
 
 use super::db::Database;
 use super::error::{Result, ScoutError};
-use super::types::{ScanStats, ScannedFile, Source, SourceId, WorkspaceId};
+use super::file_uid::compute_file_uid;
+use super::types::{ScanStats, ScannedFile, Source, SourceId, SourceType, WorkspaceId};
 use chrono::Utc;
 use ignore::WalkBuilder;
 use std::collections::HashMap;
@@ -502,6 +503,7 @@ impl Scanner {
         let walk_source_path = source_path.to_path_buf();
         let walk_source_id = source.id.clone();
         let walk_workspace_id = source.workspace_id;
+        let walk_source_type = source.source_type.clone();
         let walk_config_batch_size = self.config.batch_size;
         let walk_config_threads = self.config.threads;
         let walk_config_include_hidden = self.config.include_hidden;
@@ -527,6 +529,7 @@ impl Scanner {
                 &walk_source_path,
                 walk_workspace_id,
                 &walk_source_id,
+                walk_source_type,
                 batch_tx,
                 walk_config_batch_size,
                 walk_config_threads,
@@ -774,6 +777,7 @@ impl Scanner {
         source_path: &Path,
         workspace_id: WorkspaceId,
         source_id: &SourceId,
+        source_type: SourceType,
         batch_tx: mpsc::SyncSender<Vec<ScannedFile>>,
         batch_size: usize,
         threads: usize,
@@ -848,6 +852,7 @@ impl Scanner {
             .build_parallel();
 
         let source_id_arc = source_id.clone();
+        let source_type_arc = source_type.clone();
         let source_path_owned = source_path.to_path_buf();
         let batch_tx = batch_tx.clone();
         let cancel_flag = cancel.clone();
@@ -855,6 +860,7 @@ impl Scanner {
         walker.run(|| {
             let source_path = source_path_owned.clone();
             let source_id = source_id_arc.clone();
+            let source_type = source_type_arc.clone();
             let error_tx = error_tx.clone();
             let total_files = total_files.clone();
             let total_dirs = total_dirs.clone();
@@ -976,9 +982,11 @@ impl Scanner {
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
 
+                let uid = compute_file_uid(&source_type, file_path, &metadata);
                 guard.batch.push(ScannedFile::from_parts_with_now(
                     workspace_id,
                     source_id.clone(),
+                    uid.value,
                     full_path,
                     rel_path,
                     size,

@@ -256,7 +256,7 @@ match result.status {
 
 ### SchemaStorage
 
-SQLite-backed persistence for contracts:
+DuckDB-backed persistence for contracts (via `casparian_db::DbConnection`):
 
 ```rust
 pub struct SchemaStorage {
@@ -264,43 +264,45 @@ pub struct SchemaStorage {
 }
 
 impl SchemaStorage {
-    /// Create with connection
-    pub async fn new(conn: DbConnection) -> Result<Self, StorageError>;
+    /// Create with existing connection
+    pub fn new(conn: DbConnection) -> Result<Self, StorageError>;
 
-    /// Create with file path
-    pub async fn open(path: &str) -> Result<Self, StorageError>;
+    /// Create with file path (opens DuckDB)
+    pub fn open(path: &Path) -> Result<Self, StorageError>;
 
     /// Create in-memory (for testing)
-    pub async fn in_memory() -> Result<Self, StorageError>;
+    pub fn in_memory() -> Result<Self, StorageError>;
 
     /// Save a contract
-    pub async fn save_contract(&self, contract: &SchemaContract) -> Result<(), StorageError>;
+    pub fn save_contract(&self, contract: &SchemaContract) -> Result<(), StorageError>;
 
     /// Get by contract ID
-    pub async fn get_contract(
+    pub fn get_contract(
         &self,
         id: &ContractId,
     ) -> Result<Option<SchemaContract>, StorageError>;
 
     /// Get all contracts for a scope
-    pub async fn get_contract_history(
+    pub fn get_contract_history(
         &self,
         scope_id: &str,
     ) -> Result<Vec<SchemaContract>, StorageError>;
 
     /// Get latest version for scope
-    pub async fn get_contract_for_scope(
+    pub fn get_contract_for_scope(
         &self,
         scope_id: &str,
     ) -> Result<Option<SchemaContract>, StorageError>;
 
     /// List all contracts
-    pub async fn list_contracts(&self) -> Result<Vec<SchemaContract>, StorageError>;
+    pub fn list_contracts(&self) -> Result<Vec<SchemaContract>, StorageError>;
 
     /// Delete a contract
-    pub async fn delete_contract(&self, id: &ContractId) -> Result<bool, StorageError>;
+    pub fn delete_contract(&self, id: &ContractId) -> Result<bool, StorageError>;
 }
 ```
+
+**Note:** All methods are synchronous (no async). Uses `casparian_db::DbConnection`.
 
 ---
 

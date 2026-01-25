@@ -189,14 +189,16 @@ assert_eq!(result.format, Some("%d/%m/%Y".to_string()));
 ### Architecture
 
 ```
-Worker (Host)  <──AF_UNIX──>  Guest Process (isolated venv)
-     │                              │
-     │ - Credentials              │ - Plugin code only
-     │ - Heavy drivers            │ - Minimal deps (pandas, pyarrow)
-     │ - Sink writers             │ - No secrets
-     ▼                              ▼
-  Write to DB/Parquet         Stream Arrow IPC batches
+Worker (Host)  <──TCP Loopback──>  Guest Process (isolated venv)
+     │           (127.0.0.1:0)            │
+     │ - Credentials                    │ - Plugin code only
+     │ - Heavy drivers                  │ - Minimal deps (pandas, pyarrow)
+     │ - Sink writers                   │ - No secrets
+     ▼                                    ▼
+  Write to DB/Parquet               Stream Arrow IPC batches
 ```
+
+**Transport:** TCP loopback on `127.0.0.1:0` (OS-assigned port). Port passed via `BRIDGE_PORT` env var.
 
 ### Why Bridge Mode?
 
@@ -211,27 +213,30 @@ The guest runs in an isolated subprocess:
 
 ```python
 # bridge_shim.py (simplified)
-import sys
+import os
 import socket
 import pyarrow as pa
 
 def main():
     # Get plugin code from environment
-    plugin_code = os.environ["CASPARIAN_PLUGIN_CODE"]
-    file_path = os.environ["CASPARIAN_FILE_PATH"]
-    socket_path = os.environ["CASPARIAN_SOCKET"]
+    plugin_code = base64.b64decode(os.environ["BRIDGE_PLUGIN_CODE"])
+    file_path = os.environ["BRIDGE_FILE_PATH"]
+    port = int(os.environ["BRIDGE_PORT"])
 
-    # Execute plugin
-    exec(plugin_code)
-    result = Handler().execute(file_path)
+    # Connect via TCP loopback
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect(('127.0.0.1', port))
 
-    # Stream results via Arrow IPC
-    with socket.socket(socket.AF_UNIX) as sock:
-        sock.connect(socket_path)
-        writer = pa.ipc.new_stream(sock, result.schema)
-        for batch in result.to_batches():
-            writer.write_batch(batch)
+    # Execute plugin's parse() function
+    namespace = {}
+    exec(plugin_code, namespace)
+    result = namespace['parse'](file_path)  # Returns DataFrame or list[Output]
+
+    # Stream results via Arrow IPC with framing
+    # [4-byte length][Arrow IPC batch]...
 ```
+
+**Code reference:** `shim/bridge_shim.py`, `shim/casparian_types.py`
 
 ---
 

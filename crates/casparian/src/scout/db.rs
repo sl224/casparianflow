@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS scout_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     workspace_id TEXT NOT NULL REFERENCES cf_workspaces(id),
     source_id BIGINT NOT NULL REFERENCES scout_sources(id),
+    file_uid TEXT NOT NULL,
     path TEXT NOT NULL,
     rel_path TEXT NOT NULL,
     parent_path TEXT NOT NULL DEFAULT '',    -- directory containing this file (for O(1) folder nav)
@@ -93,10 +94,14 @@ CREATE TABLE IF NOT EXISTS scout_files (
     content_hash TEXT,
     status TEXT NOT NULL DEFAULT '__FILE_STATUS_DEFAULT__'
         CHECK (status IN (__FILE_STATUS_VALUES__)),
+    status_before_delete TEXT
+        CHECK (status_before_delete IS NULL OR status_before_delete IN (__FILE_STATUS_VALUES__)),
     manual_plugin TEXT,
     error TEXT,
     first_seen_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
+    missing_scans BIGINT NOT NULL DEFAULT 0,
+    deleted_at INTEGER,
     processed_at INTEGER,
     sentinel_job_id INTEGER,
     -- Extractor metadata (Phase 6)
@@ -312,6 +317,7 @@ CREATE INDEX IF NOT EXISTS idx_files_status ON scout_files(status);
 CREATE INDEX IF NOT EXISTS idx_files_extension ON scout_files(source_id, extension);
 CREATE INDEX IF NOT EXISTS idx_files_mtime ON scout_files(mtime);
 CREATE INDEX IF NOT EXISTS idx_files_path ON scout_files(path);
+CREATE INDEX IF NOT EXISTS idx_files_uid ON scout_files(source_id, file_uid);
 CREATE INDEX IF NOT EXISTS idx_files_last_seen ON scout_files(last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_files_manual_plugin ON scout_files(manual_plugin);
 CREATE INDEX IF NOT EXISTS idx_rules_workspace ON scout_rules(workspace_id);
@@ -357,7 +363,7 @@ CREATE INDEX IF NOT EXISTS idx_sig_groups_label ON cf_signature_groups(label);
 CREATE INDEX IF NOT EXISTS idx_training_rule ON cf_ai_training_examples(rule_id);
 "#;
 
-const FILE_SELECT_COLUMNS: &str = "id, workspace_id, source_id, path, rel_path, parent_path, name, extension, is_dir, size, mtime, content_hash, status, manual_plugin, error, first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at";
+const FILE_SELECT_COLUMNS: &str = "id, workspace_id, source_id, file_uid, path, rel_path, parent_path, name, extension, is_dir, size, mtime, content_hash, status, manual_plugin, error, first_seen_at, last_seen_at, processed_at, sentinel_job_id, metadata_raw, extraction_status, extracted_at";
 
 fn schema_sql_template() -> String {
     let file_status_values = FileStatus::ALL
@@ -595,6 +601,10 @@ impl Database {
             "name",
             "extension",
             "is_dir",
+            "file_uid",
+            "missing_scans",
+            "status_before_delete",
+            "deleted_at",
         ];
         let mut missing = Vec::new();
         for col in required_columns {
@@ -1406,6 +1416,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     INSERT INTO scout_files (
                         workspace_id,
                         source_id,
+                        file_uid,
                         path,
                         rel_path,
                         parent_path,
@@ -1419,11 +1430,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         first_seen_at,
                         last_seen_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     "#,
                     &[
                         DbValue::from(file.workspace_id.to_string()),
                         file.source_id.as_i64().into(),
+                        DbValue::from(file.file_uid.as_str()),
                         file.path.as_str().into(),
                         file.rel_path.as_str().into(),
                         file.parent_path.as_str().into(),
@@ -1465,6 +1477,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                             size = ?,
                             mtime = ?,
                             content_hash = ?,
+                            file_uid = ?,
                             status = ?,
                             error = NULL,
                             sentinel_job_id = NULL,
@@ -1475,6 +1488,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                             (file.size as i64).into(),
                             file.mtime.into(),
                             file.content_hash.as_deref().into(),
+                            DbValue::from(file.file_uid.as_str()),
                             FileStatus::Pending.as_str().into(),
                             now.into(),
                             id.into(),
@@ -1488,8 +1502,8 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 } else {
                     // Just update last_seen_at
                     self.conn.execute(
-                        "UPDATE scout_files SET last_seen_at = ? WHERE id = ?",
-                        &[now.into(), id.into()],
+                        "UPDATE scout_files SET last_seen_at = ?, file_uid = ? WHERE id = ?",
+                        &[now.into(), DbValue::from(file.file_uid.as_str()), id.into()],
                     )?;
                 }
 
@@ -1639,6 +1653,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         "CREATE TEMP TABLE IF NOT EXISTS staging_scout_files (
                             workspace_id TEXT NOT NULL,
                             source_id BIGINT NOT NULL,
+                            file_uid TEXT NOT NULL,
                             path TEXT NOT NULL,
                             rel_path TEXT NOT NULL,
                             parent_path TEXT NOT NULL DEFAULT '',
@@ -1656,9 +1671,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         pending_status = pending_status
                     ))?;
 
-                    const STAGING_COLUMNS: [&str; 14] = [
+                    const STAGING_COLUMNS: [&str; 15] = [
                         "workspace_id",
                         "source_id",
+                        "file_uid",
                         "path",
                         "rel_path",
                         "parent_path",
@@ -1679,6 +1695,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                         rows.push(vec![
                             DbValue::from(workspace_id_str.as_str()),
                             DbValue::from(file.source_id.as_i64()),
+                            DbValue::from(file.file_uid.as_str()),
                             DbValue::from(file.path.as_str()),
                             DbValue::from(file.rel_path.as_str()),
                             DbValue::from(file.parent_path.as_str()),
@@ -1746,17 +1763,19 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                                 name = source.name,
                                 extension = source.extension,
                                 is_dir = source.is_dir,
+                                file_uid = source.file_uid,
                                 status = '{pending_status}',
                                 error = NULL,
                                 sentinel_job_id = NULL,
                                 last_seen_at = source.last_seen_at
                         WHEN MATCHED THEN
                             UPDATE SET
+                                file_uid = source.file_uid,
                                 last_seen_at = source.last_seen_at
                         WHEN NOT MATCHED THEN
-                            INSERT (workspace_id, source_id, path, rel_path, parent_path, name, extension, is_dir,
+                            INSERT (workspace_id, source_id, file_uid, path, rel_path, parent_path, name, extension, is_dir,
                                     size, mtime, content_hash, status, first_seen_at, last_seen_at)
-                            VALUES (source.workspace_id, source.source_id, source.path, source.rel_path, source.parent_path, source.name, source.extension, source.is_dir,
+                            VALUES (source.workspace_id, source.source_id, source.file_uid, source.path, source.rel_path, source.parent_path, source.name, source.extension, source.is_dir,
                                     source.size, source.mtime, source.content_hash, source.status, source.first_seen_at, source.last_seen_at)
                         "#,
                         pending_status = pending_status
@@ -1842,9 +1861,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         }
 
         // Build multi-row VALUES with FileStatus::Pending for status.
-        // 14 bind params per row: workspace_id, source_id, path, rel_path, parent_path, name, extension,
-        // is_dir, size, mtime, content_hash, status, first_seen_at, last_seen_at
-        let row_placeholder = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        // 15 bind params per row: workspace_id, source_id, file_uid, path, rel_path, parent_path, name,
+        // extension, is_dir, size, mtime, content_hash, status, first_seen_at, last_seen_at
+        let row_placeholder = "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let values: String = (0..files.len())
             .map(|_| row_placeholder)
             .collect::<Vec<_>>()
@@ -1852,11 +1871,12 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
         let sql = format!(
             r#"INSERT INTO scout_files
-               (workspace_id, source_id, path, rel_path, parent_path, name, extension, is_dir,
+               (workspace_id, source_id, file_uid, path, rel_path, parent_path, name, extension, is_dir,
                 size, mtime, content_hash, status, first_seen_at, last_seen_at)
                VALUES {}
                ON CONFLICT(source_id, path) DO UPDATE SET
                    workspace_id = excluded.workspace_id,
+                   file_uid = excluded.file_uid,
                    size = excluded.size,
                    mtime = excluded.mtime,
                    content_hash = excluded.content_hash,
@@ -1874,10 +1894,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             values
         );
 
-        let mut params = Vec::with_capacity(files.len() * 14);
+        let mut params = Vec::with_capacity(files.len() * 15);
         for file in files {
             params.push(DbValue::from(file.workspace_id.to_string()));
             params.push(file.source_id.as_i64().into());
+            params.push(DbValue::from(file.file_uid.as_str()));
             params.push(file.path.as_str().into());
             params.push(file.rel_path.as_str().into());
             params.push(file.parent_path.as_str().into());
@@ -1916,6 +1937,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             let params = [
                 DbValue::from(file.workspace_id.to_string()),
                 DbValue::from(file.source_id.as_i64()),
+                DbValue::from(file.file_uid.as_str()),
                 file.path.as_str().into(),
                 file.rel_path.as_str().into(),
                 file.parent_path.as_str().into(),
@@ -1932,10 +1954,11 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
             let result = tx.execute(
                 r#"INSERT INTO scout_files
-                   (workspace_id, source_id, path, rel_path, parent_path, name, extension, is_dir, size, mtime, content_hash, status, first_seen_at, last_seen_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   (workspace_id, source_id, file_uid, path, rel_path, parent_path, name, extension, is_dir, size, mtime, content_hash, status, first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(source_id, path) DO UPDATE SET
                        workspace_id = excluded.workspace_id,
+                       file_uid = excluded.file_uid,
                        size = excluded.size,
                        mtime = excluded.mtime,
                        content_hash = excluded.content_hash,
@@ -2365,29 +2388,29 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         use super::types::ExtractionStatus;
 
         // Column positions:
-        // 0:id, 1:workspace_id, 2:source_id, 3:path, 4:rel_path, 5:parent_path, 6:name,
-        // 7:extension, 8:is_dir, 9:size, 10:mtime, 11:content_hash, 12:status,
-        // 13:manual_plugin, 14:error, 15:first_seen_at, 16:last_seen_at, 17:processed_at,
-        // 18:sentinel_job_id, 19:metadata_raw, 20:extraction_status, 21:extracted_at
+        // 0:id, 1:workspace_id, 2:source_id, 3:file_uid, 4:path, 5:rel_path, 6:parent_path, 7:name,
+        // 8:extension, 9:is_dir, 10:size, 11:mtime, 12:content_hash, 13:status,
+        // 14:manual_plugin, 15:error, 16:first_seen_at, 17:last_seen_at, 18:processed_at,
+        // 19:sentinel_job_id, 20:metadata_raw, 21:extraction_status, 22:extracted_at
 
-        let status_str: String = row.get(12)?;
+        let status_str: String = row.get(13)?;
         let status = FileStatus::parse(&status_str).ok_or_else(|| {
             ScoutError::InvalidState(format!("Invalid file status: {}", status_str))
         })?;
 
-        let first_seen_millis: i64 = row.get(15)?;
-        let last_seen_millis: i64 = row.get(16)?;
-        let processed_at_millis: Option<i64> = row.get(17)?;
+        let first_seen_millis: i64 = row.get(16)?;
+        let last_seen_millis: i64 = row.get(17)?;
+        let processed_at_millis: Option<i64> = row.get(18)?;
 
         // Parse extraction status (Phase 6)
-        let extraction_status_str: Option<String> = row.get(20)?;
+        let extraction_status_str: Option<String> = row.get(21)?;
         let extraction_status = match extraction_status_str.as_deref() {
             Some(raw) => ExtractionStatus::parse(raw).ok_or_else(|| {
                 ScoutError::InvalidState(format!("Invalid extraction status: {}", raw))
             })?,
             None => ExtractionStatus::Pending,
         };
-        let extracted_at_millis: Option<i64> = row.get(21)?;
+        let extracted_at_millis: Option<i64> = row.get(22)?;
 
         let workspace_id_raw: String = row.get(1)?;
         let workspace_id = WorkspaceId::parse(&workspace_id_raw)?;
@@ -2399,24 +2422,25 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             id: Some(row.get(0)?),
             workspace_id,
             source_id,
-            path: row.get(3)?,
-            rel_path: row.get(4)?,
-            parent_path: row.get(5)?,
-            name: row.get(6)?,
-            extension: row.get(7)?,
-            is_dir: row.get::<i64>(8)? != 0,
-            size: row.get::<i64>(9)? as u64,
-            mtime: row.get(10)?,
-            content_hash: row.get(11)?,
+            file_uid: row.get(3)?,
+            path: row.get(4)?,
+            rel_path: row.get(5)?,
+            parent_path: row.get(6)?,
+            name: row.get(7)?,
+            extension: row.get(8)?,
+            is_dir: row.get::<i64>(9)? != 0,
+            size: row.get::<i64>(10)? as u64,
+            mtime: row.get(11)?,
+            content_hash: row.get(12)?,
             status,
-            manual_plugin: row.get(13)?,
-            error: row.get(14)?,
+            manual_plugin: row.get(14)?,
+            error: row.get(15)?,
             first_seen_at: millis_to_datetime(first_seen_millis),
             last_seen_at: millis_to_datetime(last_seen_millis),
             processed_at: processed_at_millis.map(millis_to_datetime),
-            sentinel_job_id: row.get(18)?,
+            sentinel_job_id: row.get(19)?,
             // Extractor metadata fields (Phase 6)
-            metadata_raw: row.get(19)?,
+            metadata_raw: row.get(20)?,
             extraction_status,
             extracted_at: extracted_at_millis.map(millis_to_datetime),
         })
@@ -3537,10 +3561,11 @@ mod tests {
         let now_ms = chrono::Utc::now().timestamp_millis();
         db.conn
             .execute(
-                "INSERT INTO scout_files (workspace_id, source_id, path, rel_path, parent_path, name, extension, is_dir, size, mtime, content_hash, status, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO scout_files (workspace_id, source_id, file_uid, path, rel_path, parent_path, name, extension, is_dir, size, mtime, content_hash, status, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     DbValue::from(workspace_id.to_string()),
                     source_id.as_i64().into(),
+                    DbValue::from("path:/data/direct.csv"),
                     "/data/direct.csv".into(),
                     "direct.csv".into(),
                     "".into(),
@@ -3557,9 +3582,11 @@ mod tests {
             )
 
             .unwrap();
+        let file_uid = crate::scout::file_uid::weak_uid_from_path_str("/data/test.csv");
         let file = ScannedFile::new(
             workspace_id,
             source_id.clone(),
+            &file_uid,
             "/data/test.csv",
             "test.csv",
             1000,
@@ -3721,10 +3748,13 @@ mod tests {
         // Create 150 files (tests chunking since limit is 100)
         let files: Vec<ScannedFile> = (0..150)
             .map(|i| {
+                let path = format!("/data/file{}.txt", i);
+                let file_uid = crate::scout::file_uid::weak_uid_from_path_str(&path);
                 ScannedFile::new(
                     workspace_id,
                     source_id.clone(),
-                    &format!("/data/file{}.txt", i),
+                    &file_uid,
+                    &path,
                     &format!("file{}.txt", i),
                     1000 + i,
                     12345,
@@ -3762,20 +3792,26 @@ mod tests {
             .map(|i| {
                 if i < 50 {
                     // First 50 files: change size
+                    let path = format!("/data/file{}.txt", i);
+                    let file_uid = crate::scout::file_uid::weak_uid_from_path_str(&path);
                     ScannedFile::new(
                         workspace_id,
                         source_id.clone(),
-                        &format!("/data/file{}.txt", i),
+                        &file_uid,
+                        &path,
                         &format!("file{}.txt", i),
                         2000 + i,
                         12345,
                     )
                 } else {
                     // Remaining 100 files: unchanged
+                    let path = format!("/data/file{}.txt", i);
+                    let file_uid = crate::scout::file_uid::weak_uid_from_path_str(&path);
                     ScannedFile::new(
                         workspace_id,
                         source_id.clone(),
-                        &format!("/data/file{}.txt", i),
+                        &file_uid,
+                        &path,
                         &format!("file{}.txt", i),
                         1000 + i,
                         12345,
@@ -3822,9 +3858,11 @@ mod tests {
         db.upsert_source(&source).unwrap();
 
         // Create file and tag it
+        let file_uid = crate::scout::file_uid::weak_uid_from_path_str("/data/test.txt");
         let file = ScannedFile::new(
             workspace_id,
             source_id.clone(),
+            &file_uid,
             "/data/test.txt",
             "test.txt",
             1000,
@@ -3892,47 +3930,24 @@ mod tests {
         // /data/docs/api/spec.json
         // /data/logs/2024/jan.log
         // /data/logs/2024/feb.log
+        let make_file = |path: &str, rel_path: &str, size: u64, mtime: i64| {
+            let file_uid = crate::scout::file_uid::weak_uid_from_path_str(path);
+            ScannedFile::new(
+                workspace_id,
+                source_id.clone(),
+                &file_uid,
+                path,
+                rel_path,
+                size,
+                mtime,
+            )
+        };
         let files = vec![
-            ScannedFile::new(
-                workspace_id,
-                source_id.clone(),
-                "/data/root.txt",
-                "root.txt",
-                100,
-                1000,
-            ),
-            ScannedFile::new(
-                workspace_id,
-                source_id.clone(),
-                "/data/docs/readme.md",
-                "docs/readme.md",
-                200,
-                2000,
-            ),
-            ScannedFile::new(
-                workspace_id,
-                source_id.clone(),
-                "/data/docs/api/spec.json",
-                "docs/api/spec.json",
-                300,
-                3000,
-            ),
-            ScannedFile::new(
-                workspace_id,
-                source_id.clone(),
-                "/data/logs/2024/jan.log",
-                "logs/2024/jan.log",
-                400,
-                4000,
-            ),
-            ScannedFile::new(
-                workspace_id,
-                source_id.clone(),
-                "/data/logs/2024/feb.log",
-                "logs/2024/feb.log",
-                500,
-                5000,
-            ),
+            make_file("/data/root.txt", "root.txt", 100, 1000),
+            make_file("/data/docs/readme.md", "docs/readme.md", 200, 2000),
+            make_file("/data/docs/api/spec.json", "docs/api/spec.json", 300, 3000),
+            make_file("/data/logs/2024/jan.log", "logs/2024/jan.log", 400, 4000),
+            make_file("/data/logs/2024/feb.log", "logs/2024/feb.log", 500, 5000),
         ];
 
         db.batch_upsert_files(&files, None, true).unwrap();

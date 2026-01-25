@@ -757,9 +757,11 @@ mod tests {
         db.upsert_source(&source).unwrap();
 
         // Add some files
+        let file_uid = crate::scout::file_uid::weak_uid_from_path_str("/data/test.csv");
         let file = ScannedFile::new(
             workspace_id,
             source_id.clone(),
+            &file_uid,
             "/data/test.csv",
             "test.csv",
             1000,
@@ -790,9 +792,11 @@ mod tests {
         db.upsert_source(&source).unwrap();
 
         // Add a file
+        let file_uid = crate::scout::file_uid::weak_uid_from_path_str("/data/test.csv");
         let file = ScannedFile::new(
             workspace_id,
             source_id.clone(),
+            &file_uid,
             "/data/test.csv",
             "test.csv",
             1000,

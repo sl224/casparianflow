@@ -9400,8 +9400,11 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
         ScoutError::Database(_) => ("db_error".to_string(), None),
         ScoutError::Walk(_) => ("walk_error".to_string(), None),
         ScoutError::Json(_) => ("json_error".to_string(), None),
+        #[cfg(feature = "data-plane")]
         ScoutError::Csv(_) => ("csv_error".to_string(), None),
+        #[cfg(feature = "data-plane")]
         ScoutError::Arrow(_) => ("arrow_error".to_string(), None),
+        #[cfg(feature = "data-plane")]
         ScoutError::Parquet(_) => ("parquet_error".to_string(), None),
         ScoutError::Config(_) => ("config_error".to_string(), None),
         ScoutError::SourceNotFound(_) => ("source_not_found".to_string(), None),

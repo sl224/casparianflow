@@ -10,9 +10,10 @@
 
 **Start Here:**
 1. This file → architecture + invariants
-2. `code_execution_workflow.md` → **coding standards and testing**
+2. `docs/agent/AGENTS_CHECKLIST.md` → **coding standards and testing**
 3. `ARCHITECTURE.md` → detailed system design
-4. Crate-specific `CLAUDE.md` files → component details
+4. `docs/index.md` → documentation index (canonical vs plan vs archived)
+5. Crate-specific `CLAUDE.md` files → component details
 
 ---
 
@@ -115,14 +116,23 @@ The system is decomposed into four planes with clear responsibilities:
 
 | Crate | Purpose |
 |-------|---------|
-| `casparian` | Unified CLI binary |
+| `casparian` | Unified CLI binary (includes `scout` module for file discovery) |
 | `casparian_sentinel` | Control plane: job queue, dispatch, materializations |
 | `casparian_worker` | Execution plane: parser execution, schema validation |
-| `casparian_sinks` | Output persistence + lineage injection |
+| `casparian_sinks` | Output persistence abstractions + lineage injection |
+| `casparian_sinks_duckdb` | DuckDB-specific sink implementation |
 | `casparian_protocol` | Binary protocol, serialization, idempotency keys |
-| `casparian_scout` | File discovery, tagging |
-| `casparian_db` | Database abstraction |
+| `casparian_db` | Database abstraction (DuckDB via `DbConnection`) |
 | `casparian_tape` | Event recording for replay/debugging |
+| `casparian_schema` | Schema contract storage and validation |
+| `casparian_ids` | Strongly-typed ID definitions |
+| `casparian_security` | Trust config, signing, gatekeeper |
+| `casparian_mcp` | Model Context Protocol integration |
+| `casparian_profiler` | Performance profiling utilities |
+| `casparian_backtest` | Multi-file validation, fail-fast testing |
+| `casparian_intent` | Intent handling for AI workflows |
+
+**Note:** Scout is a module within `casparian` at `crates/casparian/src/scout/`, not a separate crate.
 
 ---
 
@@ -145,21 +155,44 @@ Scout: `pattern → TAG`. Sentinel: `TAG → plugin → execute → sink`.
 
 ### 5. Bridge Mode Execution
 Plugins run in isolated subprocesses. Host holds secrets; guest is sandboxed.
+- **Transport:** TCP loopback (`127.0.0.1:0`), port passed via `BRIDGE_PORT` env var
+- **Wire format:** Arrow IPC with framing headers
+- **Code reference:** `crates/casparian_worker/src/bridge.rs`
 
 ### 6. Parser Execution
 
-```python
-class MyParser:
-    name = 'my_parser'           # Required
-    version = '1.0.0'            # Required
-    topics = ['sales_data']      # Required
-    outputs = {'orders': pa.schema([...])}
+Parsers are Python modules with a `parse(file_path)` function:
 
-    def parse(self, ctx):
-        yield ('orders', dataframe)  # (sink_name, data) tuples
+```python
+# Single-output parser (most common)
+TOPIC = "transactions"  # Optional, defaults to "default"
+
+def parse(file_path: str):
+    """Returns pandas DataFrame, polars DataFrame, or pyarrow Table."""
+    import pandas as pd
+    df = pd.read_csv(file_path)
+    return df  # Host wraps with TOPIC name
 ```
 
+```python
+# Multi-output parser
+from casparian_types import Output
+
+TOPIC = "orders"
+
+def parse(file_path: str):
+    """Returns list[Output] for multiple output tables."""
+    return [
+        Output("events", events_df),
+        Output("metrics", metrics_df, table="metrics_override"),
+    ]
+```
+
+**Bridge transport:** TCP loopback (`127.0.0.1:0`), not AF_UNIX. Port passed via `BRIDGE_PORT` env var.
+
 **Key features:** Parser versioning, deduplication by (input_hash, parser_name, version), lineage columns (`_cf_source_hash`, `_cf_job_id`, `_cf_processed_at`, `_cf_parser_version`), atomic writes.
+
+**Code reference:** `crates/casparian_worker/shim/bridge_shim.py`, `crates/casparian_worker/shim/casparian_types.py`
 
 ---
 
@@ -206,18 +239,24 @@ materialization_key(output_target_key, source_hash, artifact_hash) -> String
 Everything uses: `~/.casparian_flow/casparian_flow.duckdb`
 
 ### Table Prefixes
-| Prefix | Purpose |
-|--------|---------|
-| `cf_parsers`, `cf_parser_topics` | Parser registry, topic routing |
-| `cf_job_status`, `cf_processing_history` | Job tracking, deduplication |
-| `scout_*` | File discovery, tagging rules |
-| `schema_*` | Schema contracts, amendments |
-| `backtest_*` | High-failure tracking |
+| Prefix | Purpose | Code Reference |
+|--------|---------|----------------|
+| `cf_processing_queue` | Job queue entries | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_output_materializations` | Incremental ingestion tracking | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_plugin_manifest` | Parser registry with versions | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_topic_config` | Topic→Parser→Sink routing | `crates/casparian_sentinel/src/db/queue.rs` |
+| `cf_api_*` | MCP job/event/approval storage | `crates/casparian_sentinel/src/db/api_storage.rs` |
+| `scout_*` | File discovery, tagging rules | `crates/casparian/src/scout/db.rs` |
+| `parser_lab_*` | Parser validation | `crates/casparian/src/scout/db.rs` |
 
 ### Database Abstraction
-- **NEVER** use `sqlx::Sqlite*` in library code → use generic `Pool<DB>`
+- **Database:** DuckDB only (no SQLite, no sqlx)
+- **Connection type:** `casparian_db::DbConnection` wraps `duckdb::Connection`
+- **Access modes:** Read-write (exclusive lock via `fs2`) or read-only (shared)
 - **NEVER** hardcode `anthropic::*` → use `LlmProvider` trait
 - **OK** to use concrete types in: CLI entry points, tests
+
+**Code reference:** `crates/casparian_db/src/backend.rs`
 
 ---
 
@@ -241,7 +280,7 @@ casparian jobs --status pending
 | Requirement | Details |
 |-------------|---------|
 | Zero warnings | `cargo check` + `cargo clippy` clean |
-| Use sqlx | Never `rusqlite` |
+| Use DuckDB | Via `casparian_db::DbConnection` (no SQLite, no sqlx) |
 | No unwrap in lib | Use `?` or `expect()` with context |
 | Channels over locks | `tokio::sync::mpsc` or `std::sync::mpsc` |
 

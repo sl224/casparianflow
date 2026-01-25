@@ -888,7 +888,50 @@ where
         return bulk_insert_rows_generic(&mut execute, table, columns, rows, DEFAULT_MAX_PARAMS);
     }
 
-    bulk_insert_rows_duckdb(conn, table, rows)
+    if columns_match_table(conn, table, columns)? {
+        return bulk_insert_rows_duckdb(conn, table, rows);
+    }
+
+    bulk_insert_rows_generic(&mut execute, table, columns, rows, DEFAULT_MAX_PARAMS)
+}
+
+fn columns_match_table(
+    conn: &duckdb::Connection,
+    table: &str,
+    columns: &[&str],
+) -> Result<bool, BackendError> {
+    let table_columns = table_columns_in_order(conn, table)?;
+    if table_columns.len() != columns.len() {
+        return Ok(false);
+    }
+    for (table_col, col) in table_columns.iter().zip(columns.iter()) {
+        if table_col != col {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn table_columns_in_order(
+    conn: &duckdb::Connection,
+    table: &str,
+) -> Result<Vec<String>, BackendError> {
+    let escaped = table.replace('\'', "''");
+    let sql = format!("PRAGMA table_info('{}')", escaped);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut columns = Vec::new();
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        columns.push(name);
+    }
+    if columns.is_empty() {
+        return Err(BackendError::Query(format!(
+            "Table not found for bulk insert: {}",
+            table
+        )));
+    }
+    Ok(columns)
 }
 
 fn bulk_insert_rows_duckdb(
@@ -1048,5 +1091,44 @@ mod tests {
 
         let inserted = conn.bulk_insert_rows("t", &["id"], &[]).unwrap();
         assert_eq!(inserted, 0);
+    }
+
+    #[test]
+    fn bulk_insert_rows_large_subset_columns_keeps_autoincrement() {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+        conn.execute_batch("CREATE SEQUENCE seq").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id BIGINT DEFAULT nextval('seq'), name TEXT, size BIGINT)",
+        )
+        .unwrap();
+
+        let rows: Vec<Vec<DbValue>> = (0..200)
+            .map(|i| vec![DbValue::from(format!("name_{i}")), DbValue::from(i as i64)])
+            .collect();
+        let inserted = conn
+            .bulk_insert_rows("t", &["name", "size"], &rows)
+            .unwrap();
+
+        assert_eq!(inserted, 200);
+        let count: i64 = conn.query_scalar("SELECT COUNT(*) FROM t", &[]).unwrap();
+        assert_eq!(count, 200);
+    }
+
+    #[test]
+    fn bulk_insert_rows_large_full_columns_still_inserts() {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+
+        let rows: Vec<Vec<DbValue>> = (0..600)
+            .map(|i| vec![DbValue::from(i as i64), DbValue::from(format!("n{i}"))])
+            .collect();
+        let inserted = conn
+            .bulk_insert_rows("t", &["id", "name"], &rows)
+            .unwrap();
+
+        assert_eq!(inserted, 600);
+        let count: i64 = conn.query_scalar("SELECT COUNT(*) FROM t", &[]).unwrap();
+        assert_eq!(count, 600);
     }
 }

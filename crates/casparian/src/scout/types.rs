@@ -497,6 +497,8 @@ pub struct ScannedFile {
     pub workspace_id: WorkspaceId,
     /// Source ID this file belongs to
     pub source_id: SourceId,
+    /// Stable identity for move/rename detection (strength encoded in prefix)
+    pub file_uid: String,
     /// Full path to the file
     pub path: String,
     /// Relative path from source root
@@ -568,6 +570,7 @@ impl ScannedFile {
     pub fn new(
         workspace_id: WorkspaceId,
         source_id: SourceId,
+        file_uid: &str,
         path: &str,
         rel_path: &str,
         size: u64,
@@ -580,6 +583,7 @@ impl ScannedFile {
             id: None,
             workspace_id,
             source_id,
+            file_uid: file_uid.to_string(),
             path: path.to_string(),
             rel_path: rel_path.to_string(),
             parent_path: parent_path.to_string(),
@@ -610,13 +614,23 @@ impl ScannedFile {
     pub fn from_parts(
         workspace_id: WorkspaceId,
         source_id: SourceId,
+        file_uid: String,
         path: String,
         rel_path: String,
         size: u64,
         mtime: i64,
     ) -> Self {
         let now = Utc::now();
-        Self::from_parts_with_now(workspace_id, source_id, path, rel_path, size, mtime, now)
+        Self::from_parts_with_now(
+            workspace_id,
+            source_id,
+            file_uid,
+            path,
+            rel_path,
+            size,
+            mtime,
+            now,
+        )
     }
 
     /// F-007: Create from pre-allocated strings with a provided timestamp.
@@ -626,6 +640,7 @@ impl ScannedFile {
     pub fn from_parts_with_now(
         workspace_id: WorkspaceId,
         source_id: SourceId,
+        file_uid: String,
         path: String,
         rel_path: String,
         size: u64,
@@ -639,6 +654,7 @@ impl ScannedFile {
             id: None,
             workspace_id,
             source_id,
+            file_uid,
             path,
             parent_path: parent_path.to_string(),
             name: name.to_string(),

@@ -11,17 +11,17 @@ use anyhow::{bail, Context, Result};
 use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use casparian_protocol::SinkMode;
-mod relational;
 #[cfg(feature = "sink-duckdb")]
-pub use relational::duckdb::DuckDbSink;
-#[cfg(feature = "sink-duckdb")]
-use relational::{RelationalBackend, RelationalSink};
+pub use casparian_sinks_duckdb::DuckDbSink;
+
+#[cfg(not(feature = "sink-duckdb"))]
+const DUCKDB_DISABLED: &str = "DuckDB sink support is disabled (enable feature sink-duckdb)";
 
 fn job_prefix(job_id: &str) -> String {
     // Use a stable 16-hex blake3 digest prefix to avoid collisions
@@ -197,6 +197,44 @@ pub fn plan_outputs(
         .collect())
 }
 
+#[cfg(feature = "sink-duckdb")]
+fn create_duckdb_sink(
+    db_path: PathBuf,
+    table_name: &str,
+    sink_mode: SinkMode,
+    job_id: &str,
+    output_name: &str,
+) -> Result<Sink> {
+    Ok(Sink::DuckDb(DuckDbSink::new(
+        db_path,
+        table_name,
+        sink_mode,
+        job_id,
+        output_name,
+    )?))
+}
+
+#[cfg(not(feature = "sink-duckdb"))]
+fn create_duckdb_sink(
+    _db_path: PathBuf,
+    _table_name: &str,
+    _sink_mode: SinkMode,
+    _job_id: &str,
+    _output_name: &str,
+) -> Result<Sink> {
+    bail!(DUCKDB_DISABLED)
+}
+
+#[cfg(feature = "sink-duckdb")]
+fn duckdb_artifact_uri(path: &Path, table_name: &str) -> SinkResult<String> {
+    Ok(format!("duckdb://{}?table={}", path.display(), table_name))
+}
+
+#[cfg(not(feature = "sink-duckdb"))]
+fn duckdb_artifact_uri(_path: &Path, _table_name: &str) -> SinkResult<String> {
+    Err(SinkError::message(DUCKDB_DISABLED))
+}
+
 pub fn artifact_uri_for_output(
     parsed_sink: &casparian_protocol::types::ParsedSinkUri,
     output_name: &str,
@@ -204,9 +242,6 @@ pub fn artifact_uri_for_output(
     job_id: &str,
 ) -> SinkResult<String> {
     use casparian_protocol::types::SinkScheme;
-
-    #[cfg(not(feature = "sink-duckdb"))]
-    let _ = output_table;
 
     let uri = match parsed_sink.scheme {
         SinkScheme::Parquet => {
@@ -220,21 +255,8 @@ pub fn artifact_uri_for_output(
             format!("file://{}", path.display())
         }
         SinkScheme::Duckdb => {
-            #[cfg(feature = "sink-duckdb")]
-            {
-                let table_name = output_table.unwrap_or(output_name);
-                format!(
-                    "duckdb://{}?table={}",
-                    parsed_sink.path.display(),
-                    table_name
-                )
-            }
-            #[cfg(not(feature = "sink-duckdb"))]
-            {
-                return Err(SinkError::message(
-                    "DuckDB sink support is disabled (enable feature sink-duckdb)",
-                ));
-            }
+            let table_name = output_table.unwrap_or(output_name);
+            duckdb_artifact_uri(&parsed_sink.path, table_name)?
         }
         SinkScheme::File => {
             let ext = parsed_sink
@@ -619,7 +641,7 @@ enum Sink {
     Parquet(ParquetSink),
     Csv(Box<CsvSink>),
     #[cfg(feature = "sink-duckdb")]
-    Relational(RelationalSink),
+    DuckDb(DuckDbSink),
 }
 
 impl Sink {
@@ -628,7 +650,7 @@ impl Sink {
             Sink::Parquet(sink) => sink.init(schema),
             Sink::Csv(sink) => sink.init(schema),
             #[cfg(feature = "sink-duckdb")]
-            Sink::Relational(sink) => sink.init(schema),
+            Sink::DuckDb(sink) => sink.init(schema),
         }
     }
 
@@ -637,7 +659,7 @@ impl Sink {
             Sink::Parquet(sink) => sink.write_batch(batch),
             Sink::Csv(sink) => sink.write_batch(batch),
             #[cfg(feature = "sink-duckdb")]
-            Sink::Relational(sink) => sink.write_batch(batch),
+            Sink::DuckDb(sink) => sink.write_batch(batch),
         }
     }
 
@@ -646,7 +668,7 @@ impl Sink {
             Sink::Parquet(sink) => sink.prepare(),
             Sink::Csv(sink) => sink.prepare(),
             #[cfg(feature = "sink-duckdb")]
-            Sink::Relational(sink) => sink.prepare(),
+            Sink::DuckDb(sink) => sink.prepare(),
         }
     }
 
@@ -655,7 +677,7 @@ impl Sink {
             Sink::Parquet(sink) => sink.commit(),
             Sink::Csv(sink) => sink.commit(),
             #[cfg(feature = "sink-duckdb")]
-            Sink::Relational(sink) => sink.commit(),
+            Sink::DuckDb(sink) => sink.commit(),
         }
     }
 
@@ -664,7 +686,7 @@ impl Sink {
             Sink::Parquet(sink) => sink.rollback(),
             Sink::Csv(sink) => sink.rollback(),
             #[cfg(feature = "sink-duckdb")]
-            Sink::Relational(sink) => sink.rollback(),
+            Sink::DuckDb(sink) => sink.rollback(),
         }
     }
 }
@@ -926,9 +948,6 @@ pub(crate) fn create_sink_from_uri(
     let parsed =
         casparian_protocol::types::ParsedSinkUri::parse(uri).map_err(|e| anyhow::anyhow!(e))?;
 
-    #[cfg(not(feature = "sink-duckdb"))]
-    let _ = output_table;
-
     match parsed.scheme {
         casparian_protocol::types::SinkScheme::Parquet => {
             if sink_mode != SinkMode::Append {
@@ -957,23 +976,8 @@ pub(crate) fn create_sink_from_uri(
             )?)))
         }
         casparian_protocol::types::SinkScheme::Duckdb => {
-            #[cfg(feature = "sink-duckdb")]
-            {
-                let table_name = output_table.unwrap_or(output_name);
-                Ok(Sink::Relational(RelationalSink::new(
-                    RelationalBackend::DuckDb(DuckDbSink::new(
-                        parsed.path,
-                        table_name,
-                        sink_mode,
-                        job_id,
-                        output_name,
-                    )?),
-                )))
-            }
-            #[cfg(not(feature = "sink-duckdb"))]
-            {
-                bail!("DuckDB sink support is disabled (enable feature sink-duckdb)")
-            }
+            let table_name = output_table.unwrap_or(output_name);
+            create_duckdb_sink(parsed.path, table_name, sink_mode, job_id, output_name)
         }
         casparian_protocol::types::SinkScheme::File => {
             // File sink: infer by extension
@@ -1018,23 +1022,8 @@ pub(crate) fn create_sink_from_uri(
                     )?)))
                 }
                 "duckdb" | "db" => {
-                    #[cfg(feature = "sink-duckdb")]
-                    {
-                        let table_name = output_table.unwrap_or(output_name);
-                        Ok(Sink::Relational(RelationalSink::new(
-                            RelationalBackend::DuckDb(DuckDbSink::new(
-                                parsed.path,
-                                table_name,
-                                sink_mode,
-                                job_id,
-                                output_name,
-                            )?),
-                        )))
-                    }
-                    #[cfg(not(feature = "sink-duckdb"))]
-                    {
-                        bail!("DuckDB sink support is disabled (enable feature sink-duckdb)")
-                    }
+                    let table_name = output_table.unwrap_or(output_name);
+                    create_duckdb_sink(parsed.path, table_name, sink_mode, job_id, output_name)
                 }
                 _ => bail!("Unsupported file sink extension: '{}'", ext),
             }
@@ -1209,132 +1198,24 @@ mod tests {
         assert!(!temp_path.exists());
     }
 
-    #[cfg(feature = "sink-duckdb")]
+    #[cfg(not(feature = "sink-duckdb"))]
     #[test]
-    fn test_duckdb_sink() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test.duckdb");
-        let mut sink = DuckDbSink::new(
-            db_path.clone(),
-            "records",
-            SinkMode::Append,
-            "job-1",
-            "records",
-        )
-        .unwrap();
-
-        let batch = create_test_batch();
-        sink.init(batch.schema().as_ref()).unwrap();
-        let rows = sink.write_batch(&batch).unwrap();
-        assert_eq!(rows, 3);
-
-        sink.prepare().unwrap();
-        sink.commit().unwrap();
-
-        let conn = duckdb::Connection::open(db_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 3);
-    }
-
-    #[cfg(feature = "sink-duckdb")]
-    #[test]
-    fn test_duckdb_sink_lock_conflict() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("locked.duckdb");
-
-        let _sink1 = DuckDbSink::new(
-            db_path.clone(),
-            "records",
-            SinkMode::Append,
-            "job-1",
-            "records",
-        )
-        .unwrap();
-
-        let err = match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-2", "records") {
-            Ok(_) => panic!("expected lock error, got Ok"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().to_lowercase().contains("locked"),
-            "expected lock error, got: {}",
-            err
-        );
-    }
-
-    #[cfg(feature = "sink-duckdb")]
-    #[test]
-    fn test_duckdb_sink_rejects_control_plane_db() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("casparian_flow.duckdb");
-
-        let err = match DuckDbSink::new(db_path, "records", SinkMode::Append, "job-1", "records") {
-            Ok(_) => panic!("expected control-plane rejection, got Ok"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().to_lowercase().contains("control-plane"),
-            "expected control-plane rejection, got: {}",
-            err
-        );
-    }
-
-    #[cfg(feature = "sink-duckdb")]
-    #[test]
-    fn test_duckdb_sink_decimal_timestamp_tz() {
-        let dir = tempdir().unwrap();
-        let db_path = dir.path().join("test_decimal_tz.duckdb");
-        let mut sink = DuckDbSink::new(
-            db_path.clone(),
-            "records",
-            SinkMode::Append,
-            "job-1",
-            "records",
-        )
-        .unwrap();
-
-        let mut dec_builder =
-            Decimal128Builder::with_capacity(3).with_data_type(DataType::Decimal128(10, 2));
-        dec_builder.append_value(12_345);
-        dec_builder.append_null();
-        dec_builder.append_value(-6_789);
-        let dec_array = dec_builder.finish();
-
-        let ts_array = TimestampMicrosecondArray::from(vec![
-            Some(1_700_000_000_000_000),
+    fn test_duckdb_disabled_error() {
+        let err = match create_sink_from_uri(
+            "duckdb://test.duckdb",
+            "output",
             None,
-            Some(1_700_000_100_000_000),
-        ])
-        .with_timezone("UTC");
-
-        let schema = Schema::new(vec![
-            Field::new("amount", DataType::Decimal128(10, 2), true),
-            Field::new(
-                "event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                true,
-            ),
-        ]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(dec_array), Arc::new(ts_array)],
-        )
-        .unwrap();
-
-        sink.init(batch.schema().as_ref()).unwrap();
-        let rows = sink.write_batch(&batch).unwrap();
-        assert_eq!(rows, 3);
-
-        sink.prepare().unwrap();
-        sink.commit().unwrap();
-
-        let conn = duckdb::Connection::open(db_path).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM records", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 3);
+            SinkMode::Append,
+            "job-1",
+        ) {
+            Ok(_) => panic!("expected DuckDB disabled error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains(DUCKDB_DISABLED),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

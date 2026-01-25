@@ -74,7 +74,10 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Casparian Rust Sentinel");
     tracing::info!("  Bind: {}", args.bind);
-    let database = args.database.unwrap_or_else(default_db_url);
+    let database_arg = args
+        .database
+        .unwrap_or_else(|| casparian_protocol::defaults::DEFAULT_DB_URL.to_string());
+    let database = resolve_db_url(&database_arg);
     tracing::info!("  Database: {}", database);
     tracing::info!("  Max workers: {}", args.max_workers);
     let control_addr = if args.no_control_api {
@@ -103,9 +106,13 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn default_db_url() -> String {
-    let home = casparian_home();
-    format!("duckdb:{}", home.join("casparian_flow.duckdb").display())
+fn resolve_db_url(database: &str) -> String {
+    if database == casparian_protocol::defaults::DEFAULT_DB_URL {
+        let home = casparian_home();
+        format!("duckdb:{}", home.join("casparian_flow.duckdb").display())
+    } else {
+        database.to_string()
+    }
 }
 
 fn casparian_home() -> std::path::PathBuf {

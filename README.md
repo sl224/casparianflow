@@ -149,14 +149,18 @@ See **[ARCHITECTURE.md](ARCHITECTURE.md)** for detailed system design.
 
 | Crate | Purpose |
 |-------|---------|
-| `casparian` | Unified CLI binary |
+| `casparian` | Unified CLI binary (includes `scout` module) |
 | `casparian_sentinel` | Control plane + dispatch + Control API |
 | `casparian_worker` | Execution + validation |
-| `casparian_sinks` | Sink implementations + lineage |
+| `casparian_sinks` | Sink abstractions + lineage |
+| `casparian_sinks_duckdb` | DuckDB sink implementation |
 | `casparian_protocol` | Binary protocol + types + idempotency |
-| `casparian_db` | DuckDB actor + DB API |
+| `casparian_db` | DuckDB connection + locking |
 | `casparian_tape` | Event recording for replay/debugging |
 | `casparian_backtest` | Multi-file validation |
+| `casparian_schema` | Schema contract storage |
+| `casparian_mcp` | MCP integration |
+| `casparian_security` | Trust config + signing |
 
 ## Development
 
@@ -177,6 +181,7 @@ cargo test --package casparian_backtest --test e2e_backtest
 
 ## Documentation
 
+- **[docs/index.md](docs/index.md)** - Documentation index (canonical vs plan vs archived)
 - **[CLAUDE.md](CLAUDE.md)** - Entry point for LLM context + coding standards
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** - Detailed system design + invariants
 - **[docs/v1_scope.md](docs/v1_scope.md)** - v1 scope and success metrics
@@ -188,9 +193,10 @@ cargo test --package casparian_backtest --test e2e_backtest
 ## Requirements
 
 - Rust 1.75+
-- Python 3 with `pyarrow` available in the worker environment
-- [uv](https://github.com/astral-sh/uv) optional for provisioning plugin envs
+- Python 3 with `pyarrow` and `pandas` available in the worker environment
+- Optional: `psutil` for memory monitoring in Python bridge (warnings logged if missing)
+- [uv](https://github.com/astral-sh/uv) recommended for provisioning plugin environments
 
 ## License
 
-Proprietary
+MIT (see `Cargo.toml`)

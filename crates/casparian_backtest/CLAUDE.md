@@ -33,7 +33,7 @@ This provides rapid feedback during parser development.
 
 ### High-Failure Table
 
-SQLite-backed tracking of files that consistently fail:
+DuckDB-backed tracking of files that consistently fail (via `casparian_db::DbConnection`):
 
 ```rust
 pub struct HighFailureFile {
@@ -230,10 +230,10 @@ while !loop_runner.should_stop() {
 
 ```rust
 use casparian_backtest::{HighFailureTable, FailureHistoryEntry, FailureCategory};
-use rusqlite::Connection;
+use casparian_db::DbConnection;
 
 // Create table
-let conn = Connection::open("backtest.db")?;
+let conn = DbConnection::open_duckdb(Path::new("backtest.duckdb"))?;
 let table = HighFailureTable::new(conn)?;
 
 // Record a failure

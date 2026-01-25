@@ -38,7 +38,7 @@
 
 ## Code Quality Requirements
 - [ ] Zero warnings: `cargo check` + `cargo clippy` clean
-- [ ] Use sqlx/duckdb - never rusqlite
+- [ ] Use DuckDB via `casparian_db::DbConnection` - no other database libraries
 - [ ] No unwrap in lib - use `?` or `expect()` with context
 - [ ] Channels over locks: `tokio::sync::mpsc` or `std::sync::mpsc`
 

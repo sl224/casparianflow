@@ -6,7 +6,7 @@ use std::fmt;
 const ALLOWED_PREFIXES: &[&str] = &["SELECT", "WITH", "EXPLAIN"];
 const FORBIDDEN_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "COPY", "ATTACH",
-    "DETACH", "INSTALL", "LOAD",
+    "DETACH", "INSTALL", "LOAD", "EXPORT", "IMPORT", "CALL", "PRAGMA",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

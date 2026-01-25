@@ -11,7 +11,8 @@ use std::collections::HashMap;
 
 use super::models::{
     DeadLetterJob, DeadLetterReason, ParserHealth, ProcessingJob, QuarantinedRow,
-    DEAD_LETTER_COLUMNS, PARSER_HEALTH_COLUMNS, PROCESSING_JOB_COLUMNS, QUARANTINE_COLUMNS,
+    QuarantinedRowSummary, DEAD_LETTER_COLUMNS, PARSER_HEALTH_COLUMNS, PROCESSING_JOB_COLUMNS,
+    QUARANTINE_COLUMNS, QUARANTINE_LIST_COLUMNS,
 };
 use super::schema_version::{ensure_schema_version, SCHEMA_VERSION};
 
@@ -1440,7 +1441,21 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         Ok(())
     }
 
-    pub fn get_quarantined_rows(&self, job_id: i64) -> Result<Vec<QuarantinedRow>> {
+    pub fn get_quarantined_rows(&self, job_id: i64) -> Result<Vec<QuarantinedRowSummary>> {
+        let rows = self.conn.query_all(
+            &format!(
+                "SELECT {} FROM cf_quarantine WHERE job_id = ? ORDER BY row_index",
+                column_list(QUARANTINE_LIST_COLUMNS)
+            ),
+            &[DbValue::from(job_id)],
+        )?;
+        rows.iter()
+            .map(QuarantinedRowSummary::from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_quarantined_rows_with_raw(&self, job_id: i64) -> Result<Vec<QuarantinedRow>> {
         let rows = self.conn.query_all(
             &format!(
                 "SELECT {} FROM cf_quarantine WHERE job_id = ? ORDER BY row_index",

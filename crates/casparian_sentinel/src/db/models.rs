@@ -384,6 +384,27 @@ impl QuarantinedRow {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct QuarantinedRowSummary {
+    pub id: i64,
+    pub job_id: i64,
+    pub row_index: i64,
+    pub error_reason: String,
+    pub created_at: DbTimestamp,
+}
+
+impl QuarantinedRowSummary {
+    pub fn from_row(row: &UnifiedDbRow) -> Result<Self, BackendError> {
+        Ok(Self {
+            id: row.get_by_name("id")?,
+            job_id: row.get_by_name("job_id")?,
+            row_index: row.get_by_name("row_index")?,
+            error_reason: row.get_by_name("error_reason")?,
+            created_at: row.get_by_name("created_at")?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

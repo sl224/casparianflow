@@ -507,10 +507,13 @@ mod tests {
 
         // Add files
         for name in &["test.csv", "data.csv", "info.json"] {
+            let path = format!("/data/{}", name);
+            let file_uid = crate::scout::file_uid::weak_uid_from_path_str(&path);
             let file = ScannedFile::new(
                 workspace_id,
                 source_id.clone(),
-                &format!("/data/{}", name),
+                &file_uid,
+                &path,
                 name,
                 1000,
                 12345,
