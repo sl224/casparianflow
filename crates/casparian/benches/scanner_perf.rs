@@ -1,7 +1,7 @@
+use casparian::scout::file_uid::weak_uid_from_path_str;
 use casparian::scout::{
     Database, ScanConfig, ScannedFile, Scanner, Source, SourceId, SourceType, WorkspaceId,
 };
-use casparian::scout::file_uid::weak_uid_from_path_str;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use ignore::WalkBuilder;
 use std::fs::File;

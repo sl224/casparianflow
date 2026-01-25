@@ -1102,9 +1102,7 @@ fn draw_workspace_switcher_overlay(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let footer_text = match app.workspace_switcher.mode {
-        super::app::WorkspaceSwitcherMode::Creating => {
-            "[Enter] Create  [Esc] Cancel".to_string()
-        }
+        super::app::WorkspaceSwitcherMode::Creating => "[Enter] Create  [Esc] Cancel".to_string(),
         super::app::WorkspaceSwitcherMode::List => {
             "[↑/↓] Select  [Enter] Set Active  [n] New  [r] Refresh  [Esc] Close".to_string()
         }
@@ -7363,8 +7361,10 @@ fn draw_triage_list_panel(frame: &mut Frame, app: &App, area: Rect) {
                         } else {
                             Style::default().fg(Color::Gray)
                         };
-                        let text =
-                            format!("#{} job {} {}", row.id, row.original_job_id, row.plugin_name);
+                        let text = format!(
+                            "#{} job {} {}",
+                            row.id, row.original_job_id, row.plugin_name
+                        );
                         let line = truncate_end(&text, inner.width as usize);
                         ratatui::widgets::ListItem::new(line).style(style)
                     })
@@ -7556,7 +7556,11 @@ fn raw_data_preview(raw: &Option<Vec<u8>>) -> Vec<String> {
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<String>>()
         .join(" ");
-    vec![format!("0x{}{}", hex, if bytes.len() > 64 { " ..." } else { "" })]
+    vec![format!(
+        "0x{}{}",
+        hex,
+        if bytes.len() > 64 { " ..." } else { "" }
+    )]
 }
 
 // ======== Catalog Screen (Pipelines + Runs) ========
@@ -7599,7 +7603,10 @@ fn draw_catalog_screen(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_catalog_tabs(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
-    let tabs = [super::app::CatalogTab::Pipelines, super::app::CatalogTab::Runs];
+    let tabs = [
+        super::app::CatalogTab::Pipelines,
+        super::app::CatalogTab::Runs,
+    ];
     for (idx, tab) in tabs.iter().enumerate() {
         let is_active = app.catalog_state.tab == *tab;
         let style = if is_active {
@@ -7614,7 +7621,9 @@ fn draw_catalog_tabs(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     let line = Line::from(spans);
-    let block = Block::default().borders(Borders::ALL).title(" Pipelines Catalog ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Pipelines Catalog ");
     let para = Paragraph::new(line).block(block);
     frame.render_widget(para, area);
 }

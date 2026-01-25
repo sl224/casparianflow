@@ -70,7 +70,11 @@ pub struct TerminalSize {
 impl TerminalSize {
     fn validate(&self) -> Result<()> {
         if self.width == 0 || self.height == 0 {
-            bail!("terminal size must be > 0 (got {}x{})", self.width, self.height);
+            bail!(
+                "terminal size must be > 0 (got {}x{})",
+                self.width,
+                self.height
+            );
         }
         Ok(())
     }
@@ -112,7 +116,9 @@ impl FlowStep {
         match self {
             FlowStep::Key { .. } => Ok(()),
             FlowStep::Text { .. } => Ok(()),
-            FlowStep::Wait { ticks, ms, until, .. } => {
+            FlowStep::Wait {
+                ticks, ms, until, ..
+            } => {
                 let has_wait = ticks.unwrap_or(0) > 0 || ms.unwrap_or(0) > 0;
                 if !has_wait && until.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
                     bail!("wait step must set ticks/ms or an until assertion");

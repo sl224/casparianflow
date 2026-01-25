@@ -53,17 +53,15 @@ impl SubprocessEngine {
         let binary = std::env::var("CASPARIAN_SCOUT_SCAN_BIN")
             .map(PathBuf::from)
             .ok()
-            .or_else(|| std::env::current_exe().ok().and_then(|exe| {
-                exe.parent()
-                    .map(|dir| dir.join("casparian-scout-scan"))
-                    .filter(|candidate| candidate.exists())
-            }))
+            .or_else(|| {
+                std::env::current_exe().ok().and_then(|exe| {
+                    exe.parent()
+                        .map(|dir| dir.join("casparian-scout-scan"))
+                        .filter(|candidate| candidate.exists())
+                })
+            })
             .unwrap_or_else(|| PathBuf::from("casparian-scout-scan"));
-        Self {
-            db,
-            config,
-            binary,
-        }
+        Self { db, config, binary }
     }
 
     pub fn with_binary(db: Database, config: crate::scanner::ScanConfig, binary: PathBuf) -> Self {
@@ -295,10 +293,7 @@ impl FolderCacheAggregator {
 
             if let Some(root) = file.parent_path.split('/').next() {
                 if !root.is_empty() {
-                    *self
-                        .root_folder_counts
-                        .entry(root.to_string())
-                        .or_insert(0) += 1;
+                    *self.root_folder_counts.entry(root.to_string()).or_insert(0) += 1;
                 }
             }
         }

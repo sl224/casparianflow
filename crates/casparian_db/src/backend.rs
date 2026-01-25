@@ -1123,9 +1123,7 @@ mod tests {
         let rows: Vec<Vec<DbValue>> = (0..600)
             .map(|i| vec![DbValue::from(i as i64), DbValue::from(format!("n{i}"))])
             .collect();
-        let inserted = conn
-            .bulk_insert_rows("t", &["id", "name"], &rows)
-            .unwrap();
+        let inserted = conn.bulk_insert_rows("t", &["id", "name"], &rows).unwrap();
 
         assert_eq!(inserted, 600);
         let count: i64 = conn.query_scalar("SELECT COUNT(*) FROM t", &[]).unwrap();

@@ -125,10 +125,12 @@ fn run_gen_fixture(path: &Path, files: u64, depth: usize, size_bytes: u64) -> an
             println!("Fixture already exists; skipping generation.");
             return Ok(());
         }
-        return Err(HelpfulError::new("Fixture exists with different parameters")
-            .with_context(format!("Marker: {}", marker_path.display()))
-            .with_suggestion("TRY: Delete the fixture directory and re-run".to_string())
-            .into());
+        return Err(
+            HelpfulError::new("Fixture exists with different parameters")
+                .with_context(format!("Marker: {}", marker_path.display()))
+                .with_suggestion("TRY: Delete the fixture directory and re-run".to_string())
+                .into(),
+        );
     }
 
     let mut last_dir: Option<PathBuf> = None;
@@ -312,9 +314,7 @@ fn resolve_git_commit() -> String {
         }
     }
 
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output();
+    let output = Command::new("git").args(["rev-parse", "HEAD"]).output();
 
     if let Ok(output) = output {
         if output.status.success() {

@@ -31,6 +31,7 @@ struct SnapshotCaseMeta {
     mode: String,
     notes: String,
     focus_hint: String,
+    coverage: String,
     sizes: Vec<String>,
 }
 
@@ -62,6 +63,7 @@ pub fn run(args: TuiSnapshotArgs) -> Result<()> {
             mode: mode_label(app_for_meta.mode).to_string(),
             notes: case.notes.to_string(),
             focus_hint: case.focus_hint.to_string(),
+            coverage: case.coverage.as_str().to_string(),
             sizes: size_labels.clone(),
         };
         let meta_path = case_dir.join(format!("{}.meta.json", case.name));
@@ -75,6 +77,7 @@ pub fn run(args: TuiSnapshotArgs) -> Result<()> {
         if !case.focus_hint.is_empty() {
             bundle.push_str(&format!("Focus: {}\n\n", case.focus_hint));
         }
+        bundle.push_str(&format!("Coverage: {}\n\n", case.coverage.as_str()));
         bundle.push_str(&format!("Mode: {}\n\n", mode_label(app_for_meta.mode)));
 
         for (width, height) in &sizes {

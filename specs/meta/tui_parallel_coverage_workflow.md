@@ -5,7 +5,7 @@
 > **Category**: Analysis workflow (per workflow_manager.md Section 3.3.1)
 > **Last Updated**: 2026-01-17
 > **Parent**: `workflow_manager.md`
-> **Related**: `tui_testing_workflow.md` (procedures), `tui_validation_workflow.md` (orchestration)
+> **Related**: `tui_testing_workflow.md` (procedures + flow recording), `tui_validation_workflow.md` (orchestration)
 
 ---
 

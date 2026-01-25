@@ -7,14 +7,16 @@ pub mod event;
 pub mod extraction;
 pub mod flow;
 pub mod flow_assert;
-pub mod flow_runner;
 pub mod flow_record;
+pub mod flow_runner;
 pub mod nav;
 pub mod pattern_query;
 pub mod snapshot;
 pub mod snapshot_export;
 pub mod snapshot_states;
+pub mod state_graph;
 pub mod ui;
+pub mod ui_signature;
 
 #[cfg(feature = "profiling")]
 mod profiler_overlay;

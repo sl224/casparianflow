@@ -1,23 +1,27 @@
 //! Canonical snapshot states for TUI rendering tests and exports.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 
 use casparian::scout::{SourceId, TaggingRuleId, Workspace, WorkspaceId};
 use casparian_intent::IntentState;
+use casparian_mcp::intent::ProposalId;
+use uuid::Uuid;
 
 use super::app::{
-    ApprovalDisplayStatus, ApprovalInfo, ApprovalOperationType, ApprovalStatusFilter,
-    ApprovalsViewState, App, BacktestInfo, BoundFileInfo, BoundFileStatus, CatalogTab,
+    App, ApprovalDisplayStatus, ApprovalInfo, ApprovalOperationType, ApprovalStatusFilter,
+    ApprovalsViewState, BacktestInfo, BoundFileInfo, BoundFileStatus, CatalogTab,
     CommandPaletteMode, CommandPaletteState, DeadLetterRow, DiscoverFocus, DiscoverViewState,
-    HomeStats, JobInfo, JobStatus, JobSummary, JobType, JobsListSection, JobsViewState,
-    ParserBenchState, ParserHealth, ParserInfo, PipelineInfo, PipelineRunInfo, PipelineStage,
-    PipelineState, QuarantineRow, QueryResults, QueryState, QueryViewState, RuleDialogFocus,
-    RuleId, RuleInfo, SavedQueriesState, SchemaMismatchRow, SessionInfo, SessionsViewState,
-    SettingsCategory, SettingsState, SourceInfo, TableBrowserState, TagInfo, TriageTab, TuiMode,
-    WorkspaceSwitcherMode,
+    GateInfo, HomeStats, JobInfo, JobStatus, JobSummary, JobType, JobsListSection, JobsViewState,
+    MonitoringState, ParserBenchState, ParserHealth, ParserInfo, ParserTestResult, PipelineInfo,
+    PipelineRunInfo, PipelineStage, PipelineState, ProposalInfo, QuarantineRow, QueryResults,
+    QueryState, QueryViewState, QueueStats, RuleDialogFocus, RuleId, RuleInfo, SavedQueriesState,
+    SavedQueryEntry, SchemaColumn, SchemaMismatchRow, SessionInfo, SessionsViewState,
+    SettingsCategory, SettingsState, SinkOutput, SinkStats, SourceInfo, SuggestedFix,
+    TableBrowserState, TagInfo, ThroughputSample, TriageTab, TuiMode, ViolationSummary,
+    ViolationType, WorkspaceSwitcherMode,
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
@@ -31,10 +35,223 @@ pub const DEFAULT_SNAPSHOT_SIZES: &[(u16, u16)] = &[(80, 24), (100, 30), (120, 4
 
 const SNAPSHOT_DB_PATH: &str = "SNAPSHOT_DB.duckdb";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SnapshotCoverage {
+    HomeDefault,
+    HomeFiltering,
+    DiscoverEmptyNoSources,
+    DiscoverRuleBuilder,
+    DiscoverBacktestResults,
+    DiscoverScanningProgress,
+    DiscoverSourcesDropdown,
+    DiscoverTagsDropdown,
+    DiscoverRulesManagerDialog,
+    DiscoverRuleCreationDialog,
+    DiscoverSourcesManagerDialog,
+    DiscoverSourceEditDialog,
+    DiscoverSourceDeleteConfirmDialog,
+    DiscoverEnteringPathDialog,
+    DiscoverScanConfirmDialog,
+    DiscoverSuggestionsHelpOverlay,
+    DiscoverSuggestionsDetailOverlay,
+    DiscoverManualTagConfirmOverlay,
+    DiscoverConfirmExitOverlay,
+    JobsList,
+    JobsListNoPipeline,
+    JobsMonitoringPanel,
+    JobsViolationDetail,
+    JobsDrawer,
+    SourcesDrawer,
+    SourcesList,
+    SourcesEditOverlay,
+    SourcesCreateOverlay,
+    SourcesDeleteConfirmOverlay,
+    ApprovalsList,
+    ApprovalsConfirmApprove,
+    ApprovalsConfirmReject,
+    ApprovalsDetail,
+    ParserBenchList,
+    ParserBenchFiltering,
+    ParserBenchTestResult,
+    QueryEditing,
+    QueryExecuting,
+    QueryResults,
+    QueryTableBrowser,
+    QuerySavedQueries,
+    SettingsGeneral,
+    SettingsDisplay,
+    SettingsAbout,
+    SettingsEditing,
+    SessionsList,
+    SessionsDetail,
+    SessionsWorkflowProgress,
+    SessionsProposalReview,
+    SessionsGateApproval,
+    TriageQuarantine,
+    TriageSchemaMismatch,
+    TriageDeadLetter,
+    CatalogPipelines,
+    CatalogRuns,
+    WorkspaceSwitcherList,
+    WorkspaceSwitcherCreate,
+    CommandPaletteIntent,
+    CommandPaletteCommand,
+    CommandPaletteNavigation,
+    HelpOverlayDiscover,
+    HelpOverlayJobs,
+    HelpOverlayParserBench,
+    HelpOverlayDefault,
+}
+
+impl SnapshotCoverage {
+    pub const ALL: &'static [SnapshotCoverage] = &[
+        SnapshotCoverage::HomeDefault,
+        SnapshotCoverage::HomeFiltering,
+        SnapshotCoverage::DiscoverEmptyNoSources,
+        SnapshotCoverage::DiscoverRuleBuilder,
+        SnapshotCoverage::DiscoverBacktestResults,
+        SnapshotCoverage::DiscoverScanningProgress,
+        SnapshotCoverage::DiscoverSourcesDropdown,
+        SnapshotCoverage::DiscoverTagsDropdown,
+        SnapshotCoverage::DiscoverRulesManagerDialog,
+        SnapshotCoverage::DiscoverRuleCreationDialog,
+        SnapshotCoverage::DiscoverSourcesManagerDialog,
+        SnapshotCoverage::DiscoverSourceEditDialog,
+        SnapshotCoverage::DiscoverSourceDeleteConfirmDialog,
+        SnapshotCoverage::DiscoverEnteringPathDialog,
+        SnapshotCoverage::DiscoverScanConfirmDialog,
+        SnapshotCoverage::DiscoverSuggestionsHelpOverlay,
+        SnapshotCoverage::DiscoverSuggestionsDetailOverlay,
+        SnapshotCoverage::DiscoverManualTagConfirmOverlay,
+        SnapshotCoverage::DiscoverConfirmExitOverlay,
+        SnapshotCoverage::JobsList,
+        SnapshotCoverage::JobsListNoPipeline,
+        SnapshotCoverage::JobsMonitoringPanel,
+        SnapshotCoverage::JobsViolationDetail,
+        SnapshotCoverage::JobsDrawer,
+        SnapshotCoverage::SourcesDrawer,
+        SnapshotCoverage::SourcesList,
+        SnapshotCoverage::SourcesEditOverlay,
+        SnapshotCoverage::SourcesCreateOverlay,
+        SnapshotCoverage::SourcesDeleteConfirmOverlay,
+        SnapshotCoverage::ApprovalsList,
+        SnapshotCoverage::ApprovalsConfirmApprove,
+        SnapshotCoverage::ApprovalsConfirmReject,
+        SnapshotCoverage::ApprovalsDetail,
+        SnapshotCoverage::ParserBenchList,
+        SnapshotCoverage::ParserBenchFiltering,
+        SnapshotCoverage::ParserBenchTestResult,
+        SnapshotCoverage::QueryEditing,
+        SnapshotCoverage::QueryExecuting,
+        SnapshotCoverage::QueryResults,
+        SnapshotCoverage::QueryTableBrowser,
+        SnapshotCoverage::QuerySavedQueries,
+        SnapshotCoverage::SettingsGeneral,
+        SnapshotCoverage::SettingsDisplay,
+        SnapshotCoverage::SettingsAbout,
+        SnapshotCoverage::SettingsEditing,
+        SnapshotCoverage::SessionsList,
+        SnapshotCoverage::SessionsDetail,
+        SnapshotCoverage::SessionsWorkflowProgress,
+        SnapshotCoverage::SessionsProposalReview,
+        SnapshotCoverage::SessionsGateApproval,
+        SnapshotCoverage::TriageQuarantine,
+        SnapshotCoverage::TriageSchemaMismatch,
+        SnapshotCoverage::TriageDeadLetter,
+        SnapshotCoverage::CatalogPipelines,
+        SnapshotCoverage::CatalogRuns,
+        SnapshotCoverage::WorkspaceSwitcherList,
+        SnapshotCoverage::WorkspaceSwitcherCreate,
+        SnapshotCoverage::CommandPaletteIntent,
+        SnapshotCoverage::CommandPaletteCommand,
+        SnapshotCoverage::CommandPaletteNavigation,
+        SnapshotCoverage::HelpOverlayDiscover,
+        SnapshotCoverage::HelpOverlayJobs,
+        SnapshotCoverage::HelpOverlayParserBench,
+        SnapshotCoverage::HelpOverlayDefault,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SnapshotCoverage::HomeDefault => "home_default",
+            SnapshotCoverage::HomeFiltering => "home_filtering",
+            SnapshotCoverage::DiscoverEmptyNoSources => "discover_empty_no_sources",
+            SnapshotCoverage::DiscoverRuleBuilder => "discover_rule_builder",
+            SnapshotCoverage::DiscoverBacktestResults => "discover_backtest_results",
+            SnapshotCoverage::DiscoverScanningProgress => "discover_scanning_progress",
+            SnapshotCoverage::DiscoverSourcesDropdown => "discover_sources_dropdown",
+            SnapshotCoverage::DiscoverTagsDropdown => "discover_tags_dropdown",
+            SnapshotCoverage::DiscoverRulesManagerDialog => "discover_rules_manager_dialog",
+            SnapshotCoverage::DiscoverRuleCreationDialog => "discover_rule_creation_dialog",
+            SnapshotCoverage::DiscoverSourcesManagerDialog => "discover_sources_manager_dialog",
+            SnapshotCoverage::DiscoverSourceEditDialog => "discover_source_edit_dialog",
+            SnapshotCoverage::DiscoverSourceDeleteConfirmDialog => {
+                "discover_source_delete_confirm_dialog"
+            }
+            SnapshotCoverage::DiscoverEnteringPathDialog => "discover_entering_path_dialog",
+            SnapshotCoverage::DiscoverScanConfirmDialog => "discover_scan_confirm_dialog",
+            SnapshotCoverage::DiscoverSuggestionsHelpOverlay => "discover_suggestions_help_overlay",
+            SnapshotCoverage::DiscoverSuggestionsDetailOverlay => {
+                "discover_suggestions_detail_overlay"
+            }
+            SnapshotCoverage::DiscoverManualTagConfirmOverlay => {
+                "discover_manual_tag_confirm_overlay"
+            }
+            SnapshotCoverage::DiscoverConfirmExitOverlay => "discover_confirm_exit_overlay",
+            SnapshotCoverage::JobsList => "jobs_list",
+            SnapshotCoverage::JobsListNoPipeline => "jobs_list_no_pipeline",
+            SnapshotCoverage::JobsMonitoringPanel => "jobs_monitoring_panel",
+            SnapshotCoverage::JobsViolationDetail => "jobs_violation_detail",
+            SnapshotCoverage::JobsDrawer => "jobs_drawer_open",
+            SnapshotCoverage::SourcesDrawer => "sources_drawer_open",
+            SnapshotCoverage::SourcesList => "sources_screen",
+            SnapshotCoverage::SourcesEditOverlay => "sources_edit_overlay",
+            SnapshotCoverage::SourcesCreateOverlay => "sources_create_overlay",
+            SnapshotCoverage::SourcesDeleteConfirmOverlay => "sources_delete_confirm",
+            SnapshotCoverage::ApprovalsList => "approvals_list_mixed",
+            SnapshotCoverage::ApprovalsConfirmApprove => "approvals_confirm_approve",
+            SnapshotCoverage::ApprovalsConfirmReject => "approvals_confirm_reject",
+            SnapshotCoverage::ApprovalsDetail => "approvals_detail",
+            SnapshotCoverage::ParserBenchList => "parser_bench_list",
+            SnapshotCoverage::ParserBenchFiltering => "parser_bench_filtering",
+            SnapshotCoverage::ParserBenchTestResult => "parser_bench_test_result",
+            SnapshotCoverage::QueryEditing => "query_editor_focused",
+            SnapshotCoverage::QueryExecuting => "query_executing",
+            SnapshotCoverage::QueryResults => "query_results_table",
+            SnapshotCoverage::QueryTableBrowser => "query_table_browser",
+            SnapshotCoverage::QuerySavedQueries => "query_saved_queries",
+            SnapshotCoverage::SettingsGeneral => "settings_general",
+            SnapshotCoverage::SettingsDisplay => "settings_display",
+            SnapshotCoverage::SettingsAbout => "settings_about",
+            SnapshotCoverage::SettingsEditing => "settings_editing",
+            SnapshotCoverage::SessionsList => "sessions_list",
+            SnapshotCoverage::SessionsDetail => "sessions_detail",
+            SnapshotCoverage::SessionsWorkflowProgress => "sessions_workflow_progress",
+            SnapshotCoverage::SessionsProposalReview => "sessions_proposal_review",
+            SnapshotCoverage::SessionsGateApproval => "sessions_gate_approval",
+            SnapshotCoverage::TriageQuarantine => "triage_quarantine_list",
+            SnapshotCoverage::TriageSchemaMismatch => "triage_schema_mismatch_list",
+            SnapshotCoverage::TriageDeadLetter => "triage_dead_letter_list",
+            SnapshotCoverage::CatalogPipelines => "catalog_pipelines_list",
+            SnapshotCoverage::CatalogRuns => "catalog_runs_list",
+            SnapshotCoverage::WorkspaceSwitcherList => "workspace_switcher_open",
+            SnapshotCoverage::WorkspaceSwitcherCreate => "workspace_switcher_create",
+            SnapshotCoverage::CommandPaletteIntent => "command_palette_intent",
+            SnapshotCoverage::CommandPaletteCommand => "command_palette_open",
+            SnapshotCoverage::CommandPaletteNavigation => "command_palette_navigation",
+            SnapshotCoverage::HelpOverlayDiscover => "help_overlay_open",
+            SnapshotCoverage::HelpOverlayJobs => "help_overlay_jobs",
+            SnapshotCoverage::HelpOverlayParserBench => "help_overlay_parser_bench",
+            SnapshotCoverage::HelpOverlayDefault => "help_overlay_default",
+        }
+    }
+}
+
 pub struct SnapshotCase {
     pub name: &'static str,
     pub notes: &'static str,
     pub focus_hint: &'static str,
+    pub coverage: SnapshotCoverage,
     pub build: fn() -> App,
 }
 
@@ -42,126 +259,454 @@ pub fn snapshot_cases() -> &'static [SnapshotCase] {
     &SNAPSHOT_CASES
 }
 
-const SNAPSHOT_CASES: [SnapshotCase; 20] = [
+static SNAPSHOT_CASES: &[SnapshotCase] = &[
     SnapshotCase {
         name: "home_default",
         notes: "Home hub with seeded sources and recent jobs.",
         focus_hint: "Quick Start list",
+        coverage: SnapshotCoverage::HomeDefault,
         build: case_home_default,
+    },
+    SnapshotCase {
+        name: "home_filtering",
+        notes: "Home Quick Start filter input active.",
+        focus_hint: "Quick Start list",
+        coverage: SnapshotCoverage::HomeFiltering,
+        build: case_home_filtering,
     },
     SnapshotCase {
         name: "discover_empty_no_sources",
         notes: "Discover mode with no sources configured.",
         focus_hint: "Rule Builder header",
+        coverage: SnapshotCoverage::DiscoverEmptyNoSources,
         build: case_discover_empty_no_sources,
-    },
-    SnapshotCase {
-        name: "discover_scanning_progress",
-        notes: "Discover mode with scanning overlay and progress counters.",
-        focus_hint: "Scanning dialog",
-        build: case_discover_scanning_progress,
-    },
-    SnapshotCase {
-        name: "discover_files_list_with_filters_and_tags",
-        notes: "Rule Builder showing backtest results and tag focus.",
-        focus_hint: "Results list",
-        build: case_discover_files_list_with_filters_and_tags,
     },
     SnapshotCase {
         name: "discover_rule_builder",
         notes: "Rule Builder with schema suggestions populated.",
         focus_hint: "Suggestions panel",
+        coverage: SnapshotCoverage::DiscoverRuleBuilder,
         build: case_discover_rule_builder,
+    },
+    SnapshotCase {
+        name: "discover_backtest_results",
+        notes: "Rule Builder showing backtest results and tag focus.",
+        focus_hint: "Results list",
+        coverage: SnapshotCoverage::DiscoverBacktestResults,
+        build: case_discover_files_list_with_filters_and_tags,
+    },
+    SnapshotCase {
+        name: "discover_scanning_progress",
+        notes: "Discover mode with scanning overlay and progress counters.",
+        focus_hint: "Scanning dialog",
+        coverage: SnapshotCoverage::DiscoverScanningProgress,
+        build: case_discover_scanning_progress,
+    },
+    SnapshotCase {
+        name: "discover_sources_dropdown",
+        notes: "Sources dropdown open with filter input.",
+        focus_hint: "Sources dropdown",
+        coverage: SnapshotCoverage::DiscoverSourcesDropdown,
+        build: case_discover_sources_dropdown,
+    },
+    SnapshotCase {
+        name: "discover_tags_dropdown",
+        notes: "Tags dropdown open with filter input.",
+        focus_hint: "Tags dropdown",
+        coverage: SnapshotCoverage::DiscoverTagsDropdown,
+        build: case_discover_tags_dropdown,
     },
     SnapshotCase {
         name: "discover_rules_manager_dialog",
         notes: "Rules Manager overlay with multiple rules.",
         focus_hint: "Rules dialog",
+        coverage: SnapshotCoverage::DiscoverRulesManagerDialog,
         build: case_discover_rules_manager_dialog,
     },
     SnapshotCase {
-        name: "jobs_list_mixed_status",
+        name: "discover_rule_creation_dialog",
+        notes: "Rule creation dialog with live preview.",
+        focus_hint: "Pattern input",
+        coverage: SnapshotCoverage::DiscoverRuleCreationDialog,
+        build: case_discover_rule_creation_dialog,
+    },
+    SnapshotCase {
+        name: "discover_sources_manager_dialog",
+        notes: "Sources Manager dialog listing sources.",
+        focus_hint: "Sources list",
+        coverage: SnapshotCoverage::DiscoverSourcesManagerDialog,
+        build: case_discover_sources_manager_dialog,
+    },
+    SnapshotCase {
+        name: "discover_source_edit_dialog",
+        notes: "Source edit dialog open.",
+        focus_hint: "Name field",
+        coverage: SnapshotCoverage::DiscoverSourceEditDialog,
+        build: case_discover_source_edit_dialog,
+    },
+    SnapshotCase {
+        name: "discover_source_delete_confirm_dialog",
+        notes: "Source delete confirmation dialog.",
+        focus_hint: "Confirm dialog",
+        coverage: SnapshotCoverage::DiscoverSourceDeleteConfirmDialog,
+        build: case_discover_source_delete_confirm_dialog,
+    },
+    SnapshotCase {
+        name: "discover_entering_path_dialog",
+        notes: "Add source path dialog with suggestions.",
+        focus_hint: "Path input",
+        coverage: SnapshotCoverage::DiscoverEnteringPathDialog,
+        build: case_discover_entering_path_dialog,
+    },
+    SnapshotCase {
+        name: "discover_scan_confirm_dialog",
+        notes: "Scan confirmation warning dialog.",
+        focus_hint: "Confirm scan",
+        coverage: SnapshotCoverage::DiscoverScanConfirmDialog,
+        build: case_discover_scan_confirm_dialog,
+    },
+    SnapshotCase {
+        name: "discover_suggestions_help_overlay",
+        notes: "Suggestions help overlay open.",
+        focus_hint: "Help overlay",
+        coverage: SnapshotCoverage::DiscoverSuggestionsHelpOverlay,
+        build: case_discover_suggestions_help_overlay,
+    },
+    SnapshotCase {
+        name: "discover_suggestions_detail_overlay",
+        notes: "Suggestions detail overlay open.",
+        focus_hint: "Detail overlay",
+        coverage: SnapshotCoverage::DiscoverSuggestionsDetailOverlay,
+        build: case_discover_suggestions_detail_overlay,
+    },
+    SnapshotCase {
+        name: "discover_manual_tag_confirm_overlay",
+        notes: "Manual tag confirm overlay open.",
+        focus_hint: "Confirm dialog",
+        coverage: SnapshotCoverage::DiscoverManualTagConfirmOverlay,
+        build: case_discover_manual_tag_confirm_overlay,
+    },
+    SnapshotCase {
+        name: "discover_confirm_exit_overlay",
+        notes: "Confirm exit dialog open.",
+        focus_hint: "Confirm dialog",
+        coverage: SnapshotCoverage::DiscoverConfirmExitOverlay,
+        build: case_discover_confirm_exit_overlay,
+    },
+    SnapshotCase {
+        name: "jobs_list",
         notes: "Jobs view with mixed job statuses and pipeline summary.",
         focus_hint: "Actionable list",
+        coverage: SnapshotCoverage::JobsList,
         build: case_jobs_list_mixed_status,
+    },
+    SnapshotCase {
+        name: "jobs_list_no_pipeline",
+        notes: "Jobs view with pipeline summary hidden.",
+        focus_hint: "Actionable list",
+        coverage: SnapshotCoverage::JobsListNoPipeline,
+        build: case_jobs_list_no_pipeline,
+    },
+    SnapshotCase {
+        name: "jobs_monitoring_panel",
+        notes: "Jobs monitoring panel with queue and throughput.",
+        focus_hint: "Monitoring panel",
+        coverage: SnapshotCoverage::JobsMonitoringPanel,
+        build: case_jobs_monitoring_panel,
+    },
+    SnapshotCase {
+        name: "jobs_violation_detail",
+        notes: "Backtest violations detail panel.",
+        focus_hint: "Violations list",
+        coverage: SnapshotCoverage::JobsViolationDetail,
+        build: case_jobs_violation_detail,
     },
     SnapshotCase {
         name: "jobs_drawer_open",
         notes: "Global Jobs drawer overlay open.",
         focus_hint: "Jobs drawer",
+        coverage: SnapshotCoverage::JobsDrawer,
         build: case_jobs_drawer_open,
+    },
+    SnapshotCase {
+        name: "sources_drawer_open",
+        notes: "Global Sources drawer overlay open.",
+        focus_hint: "Sources drawer",
+        coverage: SnapshotCoverage::SourcesDrawer,
+        build: case_sources_drawer_open,
+    },
+    SnapshotCase {
+        name: "sources_screen",
+        notes: "Sources list with selection and inspector.",
+        focus_hint: "Sources list",
+        coverage: SnapshotCoverage::SourcesList,
+        build: case_sources_screen,
+    },
+    SnapshotCase {
+        name: "sources_edit_overlay",
+        notes: "Sources edit dialog open.",
+        focus_hint: "Edit dialog",
+        coverage: SnapshotCoverage::SourcesEditOverlay,
+        build: case_sources_edit_overlay,
+    },
+    SnapshotCase {
+        name: "sources_create_overlay",
+        notes: "Sources add dialog open.",
+        focus_hint: "Path input",
+        coverage: SnapshotCoverage::SourcesCreateOverlay,
+        build: case_sources_create_overlay,
+    },
+    SnapshotCase {
+        name: "sources_delete_confirm",
+        notes: "Sources delete confirmation open.",
+        focus_hint: "Confirm dialog",
+        coverage: SnapshotCoverage::SourcesDeleteConfirmOverlay,
+        build: case_sources_delete_confirm,
     },
     SnapshotCase {
         name: "approvals_list_mixed",
         notes: "Approvals view with mixed statuses.",
         focus_hint: "Approvals list",
+        coverage: SnapshotCoverage::ApprovalsList,
         build: case_approvals_list_mixed,
     },
     SnapshotCase {
-        name: "sessions_list_pending_gate",
-        notes: "Sessions view showing pending gate workflows.",
+        name: "approvals_confirm_approve",
+        notes: "Approve confirmation dialog.",
+        focus_hint: "Confirm dialog",
+        coverage: SnapshotCoverage::ApprovalsConfirmApprove,
+        build: case_approvals_confirm_approve,
+    },
+    SnapshotCase {
+        name: "approvals_confirm_reject",
+        notes: "Reject confirmation dialog with reason input.",
+        focus_hint: "Reason input",
+        coverage: SnapshotCoverage::ApprovalsConfirmReject,
+        build: case_approvals_confirm_reject,
+    },
+    SnapshotCase {
+        name: "approvals_detail",
+        notes: "Approval detail overlay open.",
+        focus_hint: "Approval detail",
+        coverage: SnapshotCoverage::ApprovalsDetail,
+        build: case_approvals_detail,
+    },
+    SnapshotCase {
+        name: "parser_bench_list",
+        notes: "Parser Bench with parser list and details.",
+        focus_hint: "Parser list",
+        coverage: SnapshotCoverage::ParserBenchList,
+        build: case_parser_bench_list,
+    },
+    SnapshotCase {
+        name: "parser_bench_filtering",
+        notes: "Parser Bench filter input active.",
+        focus_hint: "Filter input",
+        coverage: SnapshotCoverage::ParserBenchFiltering,
+        build: case_parser_bench_filtering,
+    },
+    SnapshotCase {
+        name: "parser_bench_test_result",
+        notes: "Parser test result view.",
+        focus_hint: "Test result",
+        coverage: SnapshotCoverage::ParserBenchTestResult,
+        build: case_parser_bench_test_result,
+    },
+    SnapshotCase {
+        name: "query_editor_focused",
+        notes: "Query console with editor focused and history.",
+        focus_hint: "SQL editor",
+        coverage: SnapshotCoverage::QueryEditing,
+        build: case_query_editor_focused,
+    },
+    SnapshotCase {
+        name: "query_executing",
+        notes: "Query console in executing state.",
+        focus_hint: "Status bar",
+        coverage: SnapshotCoverage::QueryExecuting,
+        build: case_query_executing,
+    },
+    SnapshotCase {
+        name: "query_results_table",
+        notes: "Query console with results table focused.",
+        focus_hint: "Results table",
+        coverage: SnapshotCoverage::QueryResults,
+        build: case_query_results_table,
+    },
+    SnapshotCase {
+        name: "query_table_browser",
+        notes: "Query table browser overlay open.",
+        focus_hint: "Tables list",
+        coverage: SnapshotCoverage::QueryTableBrowser,
+        build: case_query_table_browser,
+    },
+    SnapshotCase {
+        name: "query_saved_queries",
+        notes: "Saved queries overlay open.",
+        focus_hint: "Saved queries list",
+        coverage: SnapshotCoverage::QuerySavedQueries,
+        build: case_query_saved_queries,
+    },
+    SnapshotCase {
+        name: "settings_general",
+        notes: "Settings view on General section.",
+        focus_hint: "General settings",
+        coverage: SnapshotCoverage::SettingsGeneral,
+        build: case_settings_general,
+    },
+    SnapshotCase {
+        name: "settings_display",
+        notes: "Settings view on Display section.",
+        focus_hint: "Display settings",
+        coverage: SnapshotCoverage::SettingsDisplay,
+        build: case_settings_display,
+    },
+    SnapshotCase {
+        name: "settings_about",
+        notes: "Settings view on About section.",
+        focus_hint: "About panel",
+        coverage: SnapshotCoverage::SettingsAbout,
+        build: case_settings_about,
+    },
+    SnapshotCase {
+        name: "settings_editing",
+        notes: "Settings editing mode active.",
+        focus_hint: "Edit field",
+        coverage: SnapshotCoverage::SettingsEditing,
+        build: case_settings_editing,
+    },
+    SnapshotCase {
+        name: "sessions_list",
+        notes: "Sessions list with pending gate.",
         focus_hint: "Sessions list",
-        build: case_sessions_list_pending_gate,
+        coverage: SnapshotCoverage::SessionsList,
+        build: case_sessions_list,
+    },
+    SnapshotCase {
+        name: "sessions_detail",
+        notes: "Session detail view active.",
+        focus_hint: "Details panel",
+        coverage: SnapshotCoverage::SessionsDetail,
+        build: case_sessions_detail,
+    },
+    SnapshotCase {
+        name: "sessions_workflow_progress",
+        notes: "Workflow progress view active.",
+        focus_hint: "Workflow panel",
+        coverage: SnapshotCoverage::SessionsWorkflowProgress,
+        build: case_sessions_workflow_progress,
+    },
+    SnapshotCase {
+        name: "sessions_proposal_review",
+        notes: "Proposal review state active.",
+        focus_hint: "Details panel",
+        coverage: SnapshotCoverage::SessionsProposalReview,
+        build: case_sessions_proposal_review,
+    },
+    SnapshotCase {
+        name: "sessions_gate_approval",
+        notes: "Gate approval panel open.",
+        focus_hint: "Gate details",
+        coverage: SnapshotCoverage::SessionsGateApproval,
+        build: case_sessions_gate_approval,
     },
     SnapshotCase {
         name: "triage_quarantine_list",
         notes: "Quarantine triage list with raw data preview.",
         focus_hint: "Quarantine list",
+        coverage: SnapshotCoverage::TriageQuarantine,
         build: case_triage_quarantine_list,
+    },
+    SnapshotCase {
+        name: "triage_schema_mismatch_list",
+        notes: "Schema mismatch triage tab.",
+        focus_hint: "Schema mismatch list",
+        coverage: SnapshotCoverage::TriageSchemaMismatch,
+        build: case_triage_schema_mismatch_list,
+    },
+    SnapshotCase {
+        name: "triage_dead_letter_list",
+        notes: "Dead letter triage tab.",
+        focus_hint: "Dead letter list",
+        coverage: SnapshotCoverage::TriageDeadLetter,
+        build: case_triage_dead_letter_list,
+    },
+    SnapshotCase {
+        name: "catalog_pipelines_list",
+        notes: "Pipeline catalog view.",
+        focus_hint: "Pipelines list",
+        coverage: SnapshotCoverage::CatalogPipelines,
+        build: case_catalog_pipelines_list,
     },
     SnapshotCase {
         name: "catalog_runs_list",
         notes: "Pipeline runs catalog view.",
         focus_hint: "Catalog list",
+        coverage: SnapshotCoverage::CatalogRuns,
         build: case_catalog_runs_list,
     },
     SnapshotCase {
         name: "workspace_switcher_open",
         notes: "Workspace switcher overlay open.",
         focus_hint: "Workspace list",
+        coverage: SnapshotCoverage::WorkspaceSwitcherList,
         build: case_workspace_switcher_open,
     },
     SnapshotCase {
-        name: "query_editor_focused",
-        notes: "Query console with editor focused and history.",
-        focus_hint: "SQL editor",
-        build: case_query_editor_focused,
+        name: "workspace_switcher_create",
+        notes: "Workspace switcher create mode.",
+        focus_hint: "Name input",
+        coverage: SnapshotCoverage::WorkspaceSwitcherCreate,
+        build: case_workspace_switcher_create,
     },
     SnapshotCase {
-        name: "query_results_table",
-        notes: "Query console with results table focused.",
-        focus_hint: "Results table",
-        build: case_query_results_table,
-    },
-    SnapshotCase {
-        name: "settings_about",
-        notes: "Settings view on About section.",
-        focus_hint: "About panel",
-        build: case_settings_about,
+        name: "command_palette_intent",
+        notes: "Command palette in Intent mode.",
+        focus_hint: "Command palette",
+        coverage: SnapshotCoverage::CommandPaletteIntent,
+        build: case_command_palette_intent,
     },
     SnapshotCase {
         name: "command_palette_open",
-        notes: "Command palette overlay with suggestions.",
+        notes: "Command palette overlay in Command mode.",
         focus_hint: "Command palette",
+        coverage: SnapshotCoverage::CommandPaletteCommand,
         build: case_command_palette_open,
+    },
+    SnapshotCase {
+        name: "command_palette_navigation",
+        notes: "Command palette in Navigation mode.",
+        focus_hint: "Command palette",
+        coverage: SnapshotCoverage::CommandPaletteNavigation,
+        build: case_command_palette_navigation,
     },
     SnapshotCase {
         name: "help_overlay_open",
         notes: "Help overlay open on Discover mode.",
         focus_hint: "Help overlay",
+        coverage: SnapshotCoverage::HelpOverlayDiscover,
         build: case_help_overlay_open,
     },
     SnapshotCase {
-        name: "sources_screen",
-        notes: "Sources list with selection and inspector.",
-        focus_hint: "Sources list",
-        build: case_sources_screen,
+        name: "help_overlay_jobs",
+        notes: "Help overlay open on Jobs mode.",
+        focus_hint: "Help overlay",
+        coverage: SnapshotCoverage::HelpOverlayJobs,
+        build: case_help_overlay_jobs,
     },
     SnapshotCase {
-        name: "parser_bench_list",
-        notes: "Parser Bench with parser list and details.",
-        focus_hint: "Parser list",
-        build: case_parser_bench_list,
+        name: "help_overlay_parser_bench",
+        notes: "Help overlay open on Parser Bench.",
+        focus_hint: "Help overlay",
+        coverage: SnapshotCoverage::HelpOverlayParserBench,
+        build: case_help_overlay_parser_bench,
+    },
+    SnapshotCase {
+        name: "help_overlay_default",
+        notes: "Help overlay open on Home mode.",
+        focus_hint: "Help overlay",
+        coverage: SnapshotCoverage::HelpOverlayDefault,
+        build: case_help_overlay_default,
     },
 ];
 
@@ -169,6 +714,18 @@ fn case_home_default() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Home;
     app.home.selected_source_index = 1;
+    app.home.recent_jobs = sample_home_jobs();
+    app.home.stats = sample_home_stats();
+    app.home.stats_loaded = true;
+    app
+}
+
+fn case_home_filtering() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Home;
+    app.home.filtering = true;
+    app.home.filter = "alpha".to_string();
+    app.home.selected_source_index = 0;
     app.home.recent_jobs = sample_home_jobs();
     app.home.stats = sample_home_stats();
     app.home.stats_loaded = true;
@@ -223,6 +780,29 @@ fn case_discover_rule_builder() -> App {
     app
 }
 
+fn case_discover_sources_dropdown() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::SourcesDropdown;
+    app.discover.sources_filtering = true;
+    app.discover.sources_filter = "alpha".to_string();
+    app.discover.preview_source = Some(1);
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_tags_dropdown() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::TagsDropdown;
+    app.discover.focus = DiscoverFocus::Tags;
+    app.discover.tags_filtering = true;
+    app.discover.tags_filter = "rep".to_string();
+    app.discover.preview_tag = Some(2);
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
 fn case_discover_rules_manager_dialog() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Discover;
@@ -230,6 +810,118 @@ fn case_discover_rules_manager_dialog() -> App {
     app.discover.rule_builder = Some(sample_rule_builder_basic());
     app.discover.rules = sample_rules();
     app.discover.selected_rule = 1;
+    app
+}
+
+fn case_discover_rule_creation_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::RuleCreation;
+    app.discover.rule_dialog_focus = RuleDialogFocus::Pattern;
+    app.discover.rule_pattern_input = "**/reports/**/*.csv".to_string();
+    app.discover.rule_tag_input = "report.financial".to_string();
+    app.discover.rule_preview_files = vec![
+        "reports/2024/Q3/report_2024-09-30_us.csv".to_string(),
+        "reports/2024/Q4/report_2024-10-01_eu.csv".to_string(),
+    ];
+    app.discover.rule_preview_count = 128;
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_sources_manager_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::SourcesManager;
+    app.discover.sources_manager_selected = 1;
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_source_edit_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::SourceEdit;
+    app.discover.editing_source = app.discover.sources.get(1).map(|s| s.id.clone());
+    app.discover.source_edit_input = "bravo-share".to_string();
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_source_delete_confirm_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::SourceDeleteConfirm;
+    app.discover.source_to_delete = app.discover.sources.get(2).map(|s| s.id.clone());
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_entering_path_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::EnteringPath;
+    app.discover.scan_path_input = "/data/alpha/2024".to_string();
+    app.discover.path_suggestions = vec![
+        "/data/alpha/2024/Q1".to_string(),
+        "/data/alpha/2024/Q2".to_string(),
+        "/data/alpha/2024/Q3".to_string(),
+    ];
+    app.discover.path_suggestion_idx = 1;
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_scan_confirm_dialog() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::ScanConfirm;
+    app.discover.scan_confirm_path = Some("/".to_string());
+    app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app
+}
+
+fn case_discover_suggestions_help_overlay() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::RuleBuilder;
+    let mut builder = sample_rule_builder_with_suggestions();
+    builder.suggestions_help_open = true;
+    app.discover.rule_builder = Some(builder);
+    app
+}
+
+fn case_discover_suggestions_detail_overlay() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::RuleBuilder;
+    let mut builder = sample_rule_builder_with_suggestions();
+    builder.suggestions_section = SuggestionSection::Synonyms;
+    builder.selected_synonym = 1;
+    builder.suggestions_detail_open = true;
+    app.discover.rule_builder = Some(builder);
+    app
+}
+
+fn case_discover_manual_tag_confirm_overlay() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::RuleBuilder;
+    let mut builder = sample_rule_builder_backtest();
+    builder.manual_tag_confirm_open = true;
+    builder.manual_tag_confirm_count = 12;
+    app.discover.rule_builder = Some(builder);
+    app
+}
+
+fn case_discover_confirm_exit_overlay() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Discover;
+    app.discover.view_state = DiscoverViewState::RuleBuilder;
+    let mut builder = sample_rule_builder_basic();
+    builder.confirm_exit_open = true;
+    builder.dirty = true;
+    app.discover.rule_builder = Some(builder);
     app
 }
 
@@ -244,11 +936,52 @@ fn case_jobs_list_mixed_status() -> App {
     app
 }
 
+fn case_jobs_list_no_pipeline() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Jobs;
+    app.jobs_state.view_state = JobsViewState::JobList;
+    app.jobs_state.section_focus = JobsListSection::Actionable;
+    app.jobs_state.selected_index = 1;
+    app.jobs_state.show_pipeline = false;
+    app
+}
+
+fn case_jobs_monitoring_panel() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Jobs;
+    app.jobs_state.view_state = JobsViewState::MonitoringPanel;
+    app.jobs_state.monitoring = sample_monitoring_state();
+    app
+}
+
+fn case_jobs_violation_detail() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Jobs;
+    app.jobs_state.view_state = JobsViewState::ViolationDetail;
+    let mut jobs = sample_jobs();
+    if let Some(job) = jobs.get_mut(2) {
+        job.violations = sample_violation_summaries();
+        job.top_violations_loaded = true;
+        job.selected_violation_index = 1;
+        app.jobs_state.pinned_job_id = Some(job.id);
+    }
+    app.jobs_state.jobs = jobs;
+    app
+}
+
 fn case_jobs_drawer_open() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Home;
     app.jobs_drawer_open = true;
     app.jobs_drawer_selected = 2;
+    app
+}
+
+fn case_sources_drawer_open() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Home;
+    app.sources_drawer_open = true;
+    app.sources_drawer_selected = 1;
     app
 }
 
@@ -263,13 +996,86 @@ fn case_approvals_list_mixed() -> App {
     app
 }
 
-fn case_sessions_list_pending_gate() -> App {
+fn case_approvals_confirm_approve() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Approvals;
+    app.approvals_state.view_state = ApprovalsViewState::ConfirmApprove;
+    app.approvals_state.approvals = sample_approvals();
+    app.approvals_state.approvals_loaded = true;
+    app.approvals_state.selected_index = 0;
+    app
+}
+
+fn case_approvals_confirm_reject() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Approvals;
+    app.approvals_state.view_state = ApprovalsViewState::ConfirmReject;
+    app.approvals_state.approvals = sample_approvals();
+    app.approvals_state.approvals_loaded = true;
+    app.approvals_state.selected_index = 0;
+    app.approvals_state.rejection_reason = "Policy requires review".to_string();
+    app
+}
+
+fn case_approvals_detail() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Approvals;
+    app.approvals_state.view_state = ApprovalsViewState::Detail;
+    app.approvals_state.approvals = sample_approvals();
+    app.approvals_state.approvals_loaded = true;
+    app.approvals_state.selected_index = 1;
+    app
+}
+
+fn case_sessions_list() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Sessions;
     app.sessions_state.view_state = SessionsViewState::SessionList;
     app.sessions_state.sessions = sample_sessions();
     app.sessions_state.sessions_loaded = true;
     app.sessions_state.selected_index = 0;
+    app
+}
+
+fn case_sessions_detail() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sessions;
+    app.sessions_state.view_state = SessionsViewState::SessionDetail;
+    app.sessions_state.sessions = sample_sessions();
+    app.sessions_state.sessions_loaded = true;
+    app.sessions_state.selected_index = 1;
+    app
+}
+
+fn case_sessions_workflow_progress() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sessions;
+    app.sessions_state.view_state = SessionsViewState::WorkflowProgress;
+    app.sessions_state.sessions = sample_sessions();
+    app.sessions_state.sessions_loaded = true;
+    app.sessions_state.selected_index = 1;
+    app
+}
+
+fn case_sessions_proposal_review() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sessions;
+    app.sessions_state.view_state = SessionsViewState::ProposalReview;
+    app.sessions_state.sessions = sample_sessions();
+    app.sessions_state.sessions_loaded = true;
+    app.sessions_state.selected_index = 2;
+    app.sessions_state.current_proposal = Some(sample_proposal_info());
+    app
+}
+
+fn case_sessions_gate_approval() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sessions;
+    app.sessions_state.view_state = SessionsViewState::GateApproval;
+    app.sessions_state.sessions = sample_sessions();
+    app.sessions_state.sessions_loaded = true;
+    app.sessions_state.selected_index = 0;
+    app.sessions_state.pending_gate = Some(sample_gate_info());
     app
 }
 
@@ -285,10 +1091,45 @@ fn case_triage_quarantine_list() -> App {
     app
 }
 
+fn case_triage_schema_mismatch_list() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Triage;
+    app.triage_state.tab = TriageTab::SchemaMismatch;
+    app.triage_state.quarantine_rows = Some(sample_quarantine_rows());
+    app.triage_state.schema_mismatches = Some(sample_schema_mismatches());
+    app.triage_state.dead_letters = Some(sample_dead_letters());
+    app.triage_state.selected_index = 0;
+    app.triage_state.loaded = true;
+    app
+}
+
+fn case_triage_dead_letter_list() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Triage;
+    app.triage_state.tab = TriageTab::DeadLetter;
+    app.triage_state.quarantine_rows = Some(sample_quarantine_rows());
+    app.triage_state.schema_mismatches = Some(sample_schema_mismatches());
+    app.triage_state.dead_letters = Some(sample_dead_letters());
+    app.triage_state.selected_index = 0;
+    app.triage_state.loaded = true;
+    app
+}
+
 fn case_catalog_runs_list() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Catalog;
     app.catalog_state.tab = CatalogTab::Runs;
+    app.catalog_state.pipelines = Some(sample_pipelines());
+    app.catalog_state.runs = Some(sample_pipeline_runs());
+    app.catalog_state.selected_index = 0;
+    app.catalog_state.loaded = true;
+    app
+}
+
+fn case_catalog_pipelines_list() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Catalog;
+    app.catalog_state.tab = CatalogTab::Pipelines;
     app.catalog_state.pipelines = Some(sample_pipelines());
     app.catalog_state.runs = Some(sample_pipeline_runs());
     app.catalog_state.selected_index = 0;
@@ -309,6 +1150,20 @@ fn case_workspace_switcher_open() -> App {
     app
 }
 
+fn case_workspace_switcher_create() -> App {
+    let mut app = base_app();
+    let workspaces = sample_workspace_list();
+    app.mode = TuiMode::Home;
+    app.active_workspace = workspaces.first().cloned();
+    app.workspace_switcher.visible = true;
+    app.workspace_switcher.mode = WorkspaceSwitcherMode::Creating;
+    app.workspace_switcher.workspaces = workspaces;
+    app.workspace_switcher.input = "delta-lab".to_string();
+    app.workspace_switcher.status_message = Some("Name available".to_string());
+    app.workspace_switcher.loaded = true;
+    app
+}
+
 fn case_query_editor_focused() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Query;
@@ -325,6 +1180,30 @@ fn case_query_editor_focused() -> App {
         error: None,
         status_message: None,
         executing: false,
+        execution_time_ms: None,
+        draft_input: None,
+        table_browser: TableBrowserState::default(),
+        saved_queries: SavedQueriesState::default(),
+    };
+    app
+}
+
+fn case_query_executing() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Query;
+    app.query_state = QueryState {
+        view_state: QueryViewState::Executing,
+        sql_input: "SELECT * FROM scout_jobs WHERE status = 'FAILED'".to_string(),
+        cursor_position: 0,
+        history: vec![
+            "SELECT * FROM scout_jobs LIMIT 50".to_string(),
+            "SELECT tag, COUNT(*) FROM scout_file_tags GROUP BY tag".to_string(),
+        ],
+        history_index: None,
+        results: None,
+        error: None,
+        status_message: Some("Executing query...".to_string()),
+        executing: true,
         execution_time_ms: None,
         draft_input: None,
         table_browser: TableBrowserState::default(),
@@ -359,22 +1238,100 @@ fn case_query_results_table() -> App {
     app
 }
 
+fn case_query_table_browser() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Query;
+    app.query_state = QueryState {
+        view_state: QueryViewState::TableBrowser,
+        sql_input: "SELECT * FROM scout_jobs".to_string(),
+        cursor_position: 0,
+        history: vec![],
+        history_index: None,
+        results: None,
+        error: None,
+        status_message: None,
+        executing: false,
+        execution_time_ms: None,
+        draft_input: None,
+        table_browser: TableBrowserState {
+            tables: sample_query_tables(),
+            selected_index: 1,
+            loaded: true,
+            error: None,
+        },
+        saved_queries: SavedQueriesState::default(),
+    };
+    app
+}
+
+fn case_query_saved_queries() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Query;
+    app.query_state = QueryState {
+        view_state: QueryViewState::SavedQueries,
+        sql_input: "SELECT * FROM scout_jobs".to_string(),
+        cursor_position: 0,
+        history: vec![],
+        history_index: None,
+        results: None,
+        error: None,
+        status_message: None,
+        executing: false,
+        execution_time_ms: None,
+        draft_input: None,
+        table_browser: TableBrowserState::default(),
+        saved_queries: SavedQueriesState {
+            entries: sample_saved_queries(),
+            selected_index: 0,
+            loaded: true,
+            error: None,
+        },
+    };
+    app
+}
+
+fn case_settings_general() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Settings;
+    let mut settings = sample_settings_state();
+    settings.category = SettingsCategory::General;
+    settings.selected_index = 0;
+    settings.editing = false;
+    app.settings = settings;
+    app
+}
+
+fn case_settings_display() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Settings;
+    let mut settings = sample_settings_state();
+    settings.category = SettingsCategory::Display;
+    settings.selected_index = 1;
+    settings.editing = false;
+    app.settings = settings;
+    app
+}
+
 fn case_settings_about() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Settings;
-    app.settings = SettingsState {
-        category: SettingsCategory::About,
-        selected_index: 0,
-        editing: false,
-        edit_value: String::new(),
-        previous_mode: Some(TuiMode::Home),
-        default_source_path: "~/data".to_string(),
-        auto_scan_on_startup: true,
-        confirm_destructive: true,
-        theme: "dark".to_string(),
-        unicode_symbols: true,
-        show_hidden_files: false,
-    };
+    let mut settings = sample_settings_state();
+    settings.category = SettingsCategory::About;
+    settings.selected_index = 0;
+    settings.editing = false;
+    app.settings = settings;
+    app
+}
+
+fn case_settings_editing() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Settings;
+    let mut settings = sample_settings_state();
+    settings.category = SettingsCategory::General;
+    settings.selected_index = 0;
+    settings.editing = true;
+    settings.edit_value = "/data/alpha".to_string();
+    app.settings = settings;
     app
 }
 
@@ -395,11 +1352,71 @@ fn case_command_palette_open() -> App {
     app
 }
 
+fn case_command_palette_intent() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Home;
+    let mut palette = CommandPaletteState::new();
+    palette.visible = true;
+    palette.mode = CommandPaletteMode::Intent;
+    palette.input = "find all trades".to_string();
+    palette.cursor = palette.input.len();
+    palette.recent_intents = vec![
+        "process sales reports".to_string(),
+        "find all csv files in /data".to_string(),
+    ];
+    palette.update_suggestions();
+    app.command_palette = palette;
+    app
+}
+
+fn case_command_palette_navigation() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Home;
+    let mut palette = CommandPaletteState::new();
+    palette.visible = true;
+    palette.mode = CommandPaletteMode::Navigation;
+    palette.input = "jobs".to_string();
+    palette.cursor = palette.input.len();
+    palette.update_suggestions();
+    app.command_palette = palette;
+    app
+}
+
 fn case_help_overlay_open() -> App {
     let mut app = base_app();
     app.mode = TuiMode::Discover;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     app.discover.rule_builder = Some(sample_rule_builder_basic());
+    app.show_help = true;
+    app
+}
+
+fn case_help_overlay_jobs() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Jobs;
+    app.jobs_state.view_state = JobsViewState::JobList;
+    app.jobs_state.section_focus = JobsListSection::Actionable;
+    app.show_help = true;
+    app
+}
+
+fn case_help_overlay_parser_bench() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::ParserBench;
+    app.parser_bench = ParserBenchState {
+        parsers: sample_parsers(),
+        selected_parser: 1,
+        parsers_loaded: true,
+        bound_files: sample_bound_files(),
+        ..ParserBenchState::default()
+    };
+    app.show_help = true;
+    app
+}
+
+fn case_help_overlay_default() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Home;
     app.show_help = true;
     app
 }
@@ -411,6 +1428,34 @@ fn case_sources_screen() -> App {
     app
 }
 
+fn case_sources_edit_overlay() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sources;
+    app.sources_state.selected_index = 0;
+    app.sources_state.editing = true;
+    app.sources_state.creating = false;
+    app.sources_state.edit_value = "/data/alpha".to_string();
+    app
+}
+
+fn case_sources_create_overlay() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sources;
+    app.sources_state.selected_index = 0;
+    app.sources_state.editing = true;
+    app.sources_state.creating = true;
+    app.sources_state.edit_value = "/data/new_source".to_string();
+    app
+}
+
+fn case_sources_delete_confirm() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::Sources;
+    app.sources_state.selected_index = 1;
+    app.sources_state.confirm_delete = true;
+    app
+}
+
 fn case_parser_bench_list() -> App {
     let mut app = base_app();
     app.mode = TuiMode::ParserBench;
@@ -419,6 +1464,35 @@ fn case_parser_bench_list() -> App {
         selected_parser: 1,
         parsers_loaded: true,
         bound_files: sample_bound_files(),
+        ..ParserBenchState::default()
+    };
+    app
+}
+
+fn case_parser_bench_filtering() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::ParserBench;
+    app.parser_bench = ParserBenchState {
+        parsers: sample_parsers(),
+        selected_parser: 0,
+        parsers_loaded: true,
+        bound_files: sample_bound_files(),
+        filter: "report".to_string(),
+        is_filtering: true,
+        ..ParserBenchState::default()
+    };
+    app
+}
+
+fn case_parser_bench_test_result() -> App {
+    let mut app = base_app();
+    app.mode = TuiMode::ParserBench;
+    app.parser_bench = ParserBenchState {
+        parsers: sample_parsers(),
+        selected_parser: 0,
+        parsers_loaded: true,
+        bound_files: sample_bound_files(),
+        test_result: Some(sample_parser_test_result()),
         ..ParserBenchState::default()
     };
     app
@@ -557,6 +1631,22 @@ fn sample_home_stats() -> HomeStats {
     }
 }
 
+fn sample_settings_state() -> SettingsState {
+    SettingsState {
+        category: SettingsCategory::General,
+        selected_index: 0,
+        editing: false,
+        edit_value: String::new(),
+        previous_mode: Some(TuiMode::Home),
+        default_source_path: "~/data".to_string(),
+        auto_scan_on_startup: true,
+        confirm_destructive: true,
+        theme: "dark".to_string(),
+        unicode_symbols: true,
+        show_hidden_files: false,
+    }
+}
+
 fn sample_home_jobs() -> Vec<JobSummary> {
     vec![
         JobSummary {
@@ -651,6 +1741,49 @@ fn sample_jobs() -> Vec<JobInfo> {
     jobs
 }
 
+fn sample_violation_summaries() -> Vec<ViolationSummary> {
+    vec![
+        ViolationSummary {
+            violation_type: ViolationType::TypeMismatch,
+            count: 42,
+            pct_of_rows: 3.5,
+            column: "amount".to_string(),
+            samples: vec!["12.34".to_string(), "N/A".to_string(), "null".to_string()],
+            suggested_fix: Some(SuggestedFix::ChangeType {
+                from: "VARCHAR".to_string(),
+                to: "DECIMAL(10,2)".to_string(),
+            }),
+            confidence: Some("HIGH".to_string()),
+            expected: Some("DECIMAL(10,2)".to_string()),
+            actual: Some("VARCHAR".to_string()),
+        },
+        ViolationSummary {
+            violation_type: ViolationType::NullNotAllowed,
+            count: 19,
+            pct_of_rows: 1.2,
+            column: "trade_id".to_string(),
+            samples: vec!["".to_string(), "null".to_string()],
+            suggested_fix: Some(SuggestedFix::MakeNullable),
+            confidence: Some("MEDIUM".to_string()),
+            expected: Some("NOT NULL".to_string()),
+            actual: Some("NULL".to_string()),
+        },
+        ViolationSummary {
+            violation_type: ViolationType::FormatMismatch,
+            count: 11,
+            pct_of_rows: 0.7,
+            column: "trade_date".to_string(),
+            samples: vec!["2024/10/01".to_string(), "10-01-2024".to_string()],
+            suggested_fix: Some(SuggestedFix::ChangeFormat {
+                suggested: "YYYY-MM-DD".to_string(),
+            }),
+            confidence: Some("LOW".to_string()),
+            expected: Some("YYYY-MM-DD".to_string()),
+            actual: Some("MM/DD/YYYY".to_string()),
+        },
+    ]
+}
+
 fn job_info(
     id: i64,
     job_type: JobType,
@@ -713,6 +1846,68 @@ fn sample_pipeline() -> PipelineState {
             in_progress: 1,
         },
         active_parser: Some("trades_parser".to_string()),
+    }
+}
+
+fn sample_monitoring_state() -> MonitoringState {
+    let queue = QueueStats {
+        pending: 12,
+        running: 4,
+        completed: 320,
+        failed: 5,
+        depth_history: VecDeque::from(vec![2, 4, 8, 6, 10, 12, 9, 7, 6, 5, 8, 9, 11, 10, 7]),
+    };
+
+    let mut throughput_history = VecDeque::new();
+    for i in 0..20 {
+        let rows = 800.0 + (i as f64 * 75.0);
+        throughput_history.push_back(ThroughputSample {
+            timestamp: local_at(-5 + i as i64),
+            rows_per_second: rows,
+        });
+    }
+
+    let sinks = vec![
+        SinkStats {
+            uri: "duckdb://local".to_string(),
+            total_rows: 1_240_000,
+            total_bytes: 280_000_000,
+            error_count: 2,
+            latency_p50_ms: 38,
+            latency_p99_ms: 210,
+            outputs: vec![
+                SinkOutput {
+                    name: "trades".to_string(),
+                    rows: 620_000,
+                    bytes: 140_000_000,
+                },
+                SinkOutput {
+                    name: "reports".to_string(),
+                    rows: 420_000,
+                    bytes: 110_000_000,
+                },
+            ],
+        },
+        SinkStats {
+            uri: "s3://archive".to_string(),
+            total_rows: 480_000,
+            total_bytes: 90_000_000,
+            error_count: 0,
+            latency_p50_ms: 120,
+            latency_p99_ms: 480,
+            outputs: vec![SinkOutput {
+                name: "archive".to_string(),
+                rows: 480_000,
+                bytes: 90_000_000,
+            }],
+        },
+    ];
+
+    MonitoringState {
+        queue,
+        throughput_history,
+        sinks,
+        paused: false,
     }
 }
 
@@ -787,6 +1982,42 @@ fn sample_sessions() -> Vec<SessionInfo> {
             pending_gate: None,
         },
     ]
+}
+
+fn sample_proposal_info() -> ProposalInfo {
+    ProposalInfo {
+        id: "prop-01".to_string(),
+        proposal_type: "Selection".to_string(),
+        summary: "Select trades and reports from /data/alpha".to_string(),
+        confidence: "MEDIUM".to_string(),
+        created_at: local_at(-20),
+    }
+}
+
+fn sample_gate_info() -> GateInfo {
+    GateInfo {
+        gate_id: "G1".to_string(),
+        gate_name: "File Selection".to_string(),
+        proposal_summary: "Select trades and reports from /data/alpha".to_string(),
+        evidence: vec![
+            "Matched 1,240 files".to_string(),
+            "Filtered out 312 hidden files".to_string(),
+        ],
+        confidence: "HIGH".to_string(),
+        selected_examples: vec![
+            "reports/2024/Q4/report_2024-10-01_us.csv".to_string(),
+            "trades/2024/10/trade_2024-10-01.parquet".to_string(),
+        ],
+        near_miss_examples: vec!["reports/2024/Q4/README.txt".to_string()],
+        next_actions: vec![
+            "Approve selection to begin tagging".to_string(),
+            "Review ignored file types".to_string(),
+        ],
+        proposal_id: ProposalId::from_uuid(
+            Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("proposal id"),
+        ),
+        approval_target_hash: "hash-abc123".to_string(),
+    }
 }
 
 fn sample_quarantine_rows() -> Vec<QuarantineRow> {
@@ -1170,6 +2401,32 @@ fn sample_query_results() -> QueryResults {
     }
 }
 
+fn sample_query_tables() -> Vec<String> {
+    vec![
+        "scout_files".to_string(),
+        "scout_jobs".to_string(),
+        "scout_file_tags".to_string(),
+        "scout_rules".to_string(),
+    ]
+}
+
+fn sample_saved_queries() -> Vec<SavedQueryEntry> {
+    vec![
+        SavedQueryEntry {
+            name: "failed_jobs".to_string(),
+            path: PathBuf::from("/Users/demo/.casparian_flow/queries/failed_jobs.sql"),
+        },
+        SavedQueryEntry {
+            name: "tag_counts".to_string(),
+            path: PathBuf::from("/Users/demo/.casparian_flow/queries/tag_counts.sql"),
+        },
+        SavedQueryEntry {
+            name: "recent_runs".to_string(),
+            path: PathBuf::from("/Users/demo/.casparian_flow/queries/recent_runs.sql"),
+        },
+    ]
+}
+
 fn sample_parsers() -> Vec<ParserInfo> {
     vec![
         ParserInfo {
@@ -1212,6 +2469,49 @@ fn sample_parsers() -> Vec<ParserInfo> {
     ]
 }
 
+fn sample_parser_test_result() -> ParserTestResult {
+    ParserTestResult {
+        success: true,
+        rows_processed: 120,
+        execution_time_ms: 284,
+        schema: Some(vec![
+            SchemaColumn {
+                name: "trade_id".to_string(),
+                dtype: "VARCHAR".to_string(),
+            },
+            SchemaColumn {
+                name: "amount".to_string(),
+                dtype: "DECIMAL(10,2)".to_string(),
+            },
+            SchemaColumn {
+                name: "trade_date".to_string(),
+                dtype: "DATE".to_string(),
+            },
+        ]),
+        preview_rows: vec![
+            vec![
+                "T-1001".to_string(),
+                "120.50".to_string(),
+                "2024-10-01".to_string(),
+            ],
+            vec![
+                "T-1002".to_string(),
+                "98.10".to_string(),
+                "2024-10-01".to_string(),
+            ],
+        ],
+        headers: vec![
+            "trade_id".to_string(),
+            "amount".to_string(),
+            "trade_date".to_string(),
+        ],
+        errors: vec![],
+        suggestions: vec!["Consider indexing trade_id".to_string()],
+        error_type: None,
+        truncated: false,
+    }
+}
+
 fn sample_bound_files() -> Vec<BoundFileInfo> {
     vec![
         BoundFileInfo {
@@ -1230,4 +2530,44 @@ fn sample_bound_files() -> Vec<BoundFileInfo> {
             status: BoundFileStatus::Failed,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_cases_cover_all_required() {
+        let mut names = HashSet::new();
+        let mut coverage = HashSet::new();
+
+        for case in snapshot_cases() {
+            assert!(
+                names.insert(case.name),
+                "duplicate snapshot name: {}",
+                case.name
+            );
+            assert!(
+                coverage.insert(case.coverage),
+                "duplicate snapshot coverage: {}",
+                case.coverage.as_str()
+            );
+            assert_eq!(
+                case.name,
+                case.coverage.as_str(),
+                "snapshot name mismatch for coverage {}",
+                case.coverage.as_str()
+            );
+        }
+
+        let missing: Vec<_> = SnapshotCoverage::ALL
+            .iter()
+            .filter(|cov| !coverage.contains(cov))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "missing snapshot coverage: {:?}",
+            missing
+        );
+    }
 }

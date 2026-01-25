@@ -23,9 +23,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use tracing::info_span;
 
-use super::{nav, TuiArgs};
-use crate::cli::context;
+use super::{nav, ui_signature::UiSignature, TuiArgs};
 use crate::cli::config::{active_db_path, casparian_home, default_db_backend, DbBackend};
+use crate::cli::context;
 use casparian::scout::{
     match_rules_to_files, patterns, scan_path, Database as ScoutDatabase, RuleApplyFile,
     RuleApplyRule, ScanCancelToken, ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source,
@@ -147,7 +147,7 @@ pub enum SessionsViewState {
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub id: String,
-    pub intent: String, // "find all sales files"
+    pub intent: String,             // "find all sales files"
     pub state: Option<IntentState>, // current workflow state
     pub state_label: String,
     pub created_at: DateTime<Local>,
@@ -4144,10 +4144,9 @@ impl App {
                     .tables
                     .get(self.query_state.table_browser.selected_index)
                 {
-                    self.query_state.sql_input.insert_str(
-                        self.query_state.cursor_position,
-                        table.as_str(),
-                    );
+                    self.query_state
+                        .sql_input
+                        .insert_str(self.query_state.cursor_position, table.as_str());
                     self.query_state.cursor_position += table.len();
                 }
                 self.query_state.view_state = QueryViewState::Editing;
@@ -4189,8 +4188,7 @@ impl App {
                             self.query_state.view_state = QueryViewState::Editing;
                         }
                         Err(err) => {
-                            self.query_state.status_message =
-                                Some(format!("Load failed: {}", err));
+                            self.query_state.status_message = Some(format!("Load failed: {}", err));
                         }
                     }
                 } else {
@@ -4215,8 +4213,7 @@ impl App {
         let conn = match App::open_db_readonly_with(backend, &db_path) {
             Ok(Some(conn)) => conn,
             Ok(None) => {
-                self.query_state.table_browser.error =
-                    Some("Database not available".to_string());
+                self.query_state.table_browser.error = Some("Database not available".to_string());
                 return;
             }
             Err(err) => {
@@ -4234,8 +4231,7 @@ impl App {
         ) {
             Ok(rows) => rows,
             Err(err) => {
-                self.query_state.table_browser.error =
-                    Some(format!("Table list failed: {}", err));
+                self.query_state.table_browser.error = Some(format!("Table list failed: {}", err));
                 return;
             }
         };
@@ -4271,7 +4267,13 @@ impl App {
 
         let mut list: Vec<SavedQueryEntry> = entries
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().extension().map(|e| e == "sql").unwrap_or(false))
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "sql")
+                    .unwrap_or(false)
+            })
             .map(|entry| SavedQueryEntry {
                 name: entry
                     .path()
@@ -4644,31 +4646,33 @@ impl App {
                 }
                 _ => {}
             },
-            WorkspaceSwitcherMode::Creating => match handle_text_input(key, &mut self.workspace_switcher.input) {
-                TextInputResult::Committed => {
-                    let name = self.workspace_switcher.input.trim().to_string();
-                    if name.is_empty() {
-                        self.workspace_switcher.status_message =
-                            Some("Workspace name is required".to_string());
-                        return;
-                    }
-                    match self.create_workspace(&name) {
-                        Ok(workspace) => {
-                            self.apply_active_workspace(workspace);
-                            self.close_workspace_switcher();
+            WorkspaceSwitcherMode::Creating => {
+                match handle_text_input(key, &mut self.workspace_switcher.input) {
+                    TextInputResult::Committed => {
+                        let name = self.workspace_switcher.input.trim().to_string();
+                        if name.is_empty() {
+                            self.workspace_switcher.status_message =
+                                Some("Workspace name is required".to_string());
+                            return;
                         }
-                        Err(err) => {
-                            self.workspace_switcher.status_message = Some(err);
+                        match self.create_workspace(&name) {
+                            Ok(workspace) => {
+                                self.apply_active_workspace(workspace);
+                                self.close_workspace_switcher();
+                            }
+                            Err(err) => {
+                                self.workspace_switcher.status_message = Some(err);
+                            }
                         }
                     }
+                    TextInputResult::Cancelled => {
+                        self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
+                        self.workspace_switcher.input.clear();
+                    }
+                    TextInputResult::Continue => {}
+                    TextInputResult::NotHandled => {}
                 }
-                TextInputResult::Cancelled => {
-                    self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
-                    self.workspace_switcher.input.clear();
-                }
-                TextInputResult::Continue => {}
-                TextInputResult::NotHandled => {}
-            },
+            }
         }
     }
 
@@ -8626,6 +8630,21 @@ impl App {
             TuiMode::Query => self.query_state.view_state == QueryViewState::Editing,
             _ => false,
         }
+    }
+
+    /// Public wrapper for text input mode detection (for state exploration).
+    pub fn is_text_input_mode(&self) -> bool {
+        self.in_text_input_mode()
+    }
+
+    /// Compute a topology-level UI signature for deterministic exploration.
+    pub fn ui_signature(&self) -> UiSignature {
+        UiSignature::from_app(self)
+    }
+
+    /// Stable string key for the current UI signature.
+    pub fn ui_signature_key(&self) -> String {
+        self.ui_signature().key()
     }
 
     fn active_discover_tag_filter(&self) -> DiscoverTagFilter {
@@ -12771,11 +12790,7 @@ impl App {
         // TODO: Persist to config.toml
     }
 
-    fn load_pending_gate_info(
-        &self,
-        session_id: &str,
-        gate_id: &str,
-    ) -> Result<GateInfo, String> {
+    fn load_pending_gate_info(&self, session_id: &str, gate_id: &str) -> Result<GateInfo, String> {
         let session_id: SessionId = session_id
             .parse()
             .map_err(|err| format!("Invalid session id: {}", err))?;
@@ -12905,12 +12920,7 @@ impl App {
         let next_state = match (gate.gate_id.as_str(), &decision) {
             ("G1", Decision::Approve) => IntentState::ProposeTagRules,
             ("G1", Decision::Reject) => IntentState::ProposeSelection,
-            _ => {
-                return Err(format!(
-                    "Decision for {} not supported yet",
-                    gate.gate_id
-                ))
-            }
+            _ => return Err(format!("Decision for {} not supported yet", gate.gate_id)),
         };
 
         let session_id_copy = session_id.clone();
@@ -13118,17 +13128,15 @@ impl App {
                 }
             }
             // Reject gate
-            KeyCode::Char('r') => {
-                match self.apply_gate_decision(Decision::Reject) {
-                    Ok(()) => {
-                        self.sessions_state.pending_gate = None;
-                        self.sessions_state.return_to_previous_state();
-                    }
-                    Err(err) => {
-                        tracing::error!("{}", err);
-                    }
+            KeyCode::Char('r') => match self.apply_gate_decision(Decision::Reject) {
+                Ok(()) => {
+                    self.sessions_state.pending_gate = None;
+                    self.sessions_state.return_to_previous_state();
                 }
-            }
+                Err(err) => {
+                    tracing::error!("{}", err);
+                }
+            },
             // Back to session list without action
             KeyCode::Esc => {
                 self.sessions_state.pending_gate = None;
@@ -13577,9 +13585,7 @@ impl App {
                 Ok(sessions) => {
                     self.sessions_state.sessions = sessions;
                     self.sessions_state.sessions_loaded = true;
-                    if let Some(pending_id) =
-                        self.sessions_state.pending_select_session_id.take()
-                    {
+                    if let Some(pending_id) = self.sessions_state.pending_select_session_id.take() {
                         if let Some(pos) = self
                             .sessions_state
                             .sessions
@@ -14664,10 +14670,10 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use std::sync::Mutex;
     use crate::cli::context;
     use crate::cli::tui::flow_record::RecordRedaction;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

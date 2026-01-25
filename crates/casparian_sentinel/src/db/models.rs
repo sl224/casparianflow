@@ -248,10 +248,7 @@ impl PluginManifest {
         })?;
         let runtime_str: String = row.get_by_name("runtime_kind")?;
         let runtime_kind = runtime_str.parse::<RuntimeKind>().map_err(|e| {
-            BackendError::TypeConversion(format!(
-                "Invalid runtime_kind '{}': {}",
-                runtime_str, e
-            ))
+            BackendError::TypeConversion(format!("Invalid runtime_kind '{}': {}", runtime_str, e))
         })?;
 
         Ok(Self {

@@ -14,8 +14,8 @@ use crate::cli::config::active_db_path;
 use crate::cli::context;
 use crate::cli::tui::app::App;
 use crate::cli::tui::flow::{FlowEnv, FlowStep, TerminalSize, TuiFlow};
-use crate::cli::tui::flow_record::RecordRedaction;
 use crate::cli::tui::flow_assert::{assert_flow, FlowAssertError};
+use crate::cli::tui::flow_record::RecordRedaction;
 use crate::cli::tui::snapshot::{
     buffer_to_bg_mask, buffer_to_plain_text, layout_tree, normalize_for_snapshot,
     render_app_to_buffer, LayoutNode,
@@ -135,14 +135,10 @@ fn run_flow(args: TuiFlowRunArgs) -> Result<()> {
 
     let fixture = prepare_fixture(&flow.env, &casparian_home)?;
 
-    let terminal = flow
-        .env
-        .terminal
-        .clone()
-        .unwrap_or(TerminalSize {
-            width: DEFAULT_WIDTH,
-            height: DEFAULT_HEIGHT,
-        });
+    let terminal = flow.env.terminal.clone().unwrap_or(TerminalSize {
+        width: DEFAULT_WIDTH,
+        height: DEFAULT_HEIGHT,
+    });
 
     let tui_args = TuiArgs {
         database: flow.env.database.clone(),
@@ -202,10 +198,7 @@ fn prepare_fixture(env: &FlowEnv, casparian_home: &Path) -> Result<Option<Fixtur
     let fixture_path = resolve_fixture_path(&fixture.path, casparian_home)?;
     ensure_fixture_tree(&fixture_path)?;
 
-    let db_path = env
-        .database
-        .clone()
-        .unwrap_or_else(active_db_path);
+    let db_path = env.database.clone().unwrap_or_else(active_db_path);
     let db = Database::open(&db_path).context("open scout database")?;
     let workspace = db.ensure_default_workspace().context("ensure workspace")?;
     context::set_active_workspace(&workspace.id).context("set active workspace")?;
@@ -232,8 +225,7 @@ fn prepare_fixture(env: &FlowEnv, casparian_home: &Path) -> Result<Option<Fixtur
         poll_interval_secs: 30,
         enabled: true,
     };
-    db.upsert_source(&source)
-        .context("insert fixture source")?;
+    db.upsert_source(&source).context("insert fixture source")?;
 
     Ok(Some(FixtureInfo {
         name: fixture.name.clone(),
@@ -273,7 +265,12 @@ fn ensure_fixture_tree(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_flow_meta(run_dir: &Path, flow_path: &Path, runner: &FlowRunner, steps: usize) -> Result<()> {
+fn write_flow_meta(
+    run_dir: &Path,
+    flow_path: &Path,
+    runner: &FlowRunner,
+    steps: usize,
+) -> Result<()> {
     let meta = FlowRunMeta {
         flow: flow_path.display().to_string(),
         started_at: Utc::now().to_rfc3339(),
@@ -317,10 +314,7 @@ impl FlowRunner {
                 Ok((capture, None))
             }
             FlowStep::Wait {
-                ticks,
-                ms,
-                until,
-                ..
+                ticks, ms, until, ..
             } => {
                 let wait_ticks = compute_wait_ticks(*ticks, *ms);
                 let mut capture = self.capture_state()?;
@@ -362,7 +356,12 @@ impl FlowRunner {
             }
             FlowStep::Assert { assert, .. } => {
                 let capture = self.capture_state()?;
-                match assert_flow(assert, &capture.plain, &capture.mask, &capture.layout_signature) {
+                match assert_flow(
+                    assert,
+                    &capture.plain,
+                    &capture.mask,
+                    &capture.layout_signature,
+                ) {
                     Ok(_) => Ok((capture, None)),
                     Err(err) => {
                         let failure = build_failure(index, step, &err, "assertion failed");
@@ -422,8 +421,14 @@ impl FlowRunner {
 
     fn resolve_text(&self, input: &str) -> String {
         let mut output = input.to_string();
-        output = output.replace("{{CASPARIAN_HOME}}", &self.casparian_home.display().to_string());
-        output = output.replace("${CASPARIAN_HOME}", &self.casparian_home.display().to_string());
+        output = output.replace(
+            "{{CASPARIAN_HOME}}",
+            &self.casparian_home.display().to_string(),
+        );
+        output = output.replace(
+            "${CASPARIAN_HOME}",
+            &self.casparian_home.display().to_string(),
+        );
         output = output.replace("{{FLOW_DIR}}", &self.flow_dir.display().to_string());
         if let Some(ref fixture) = self.fixture {
             output = output.replace("{{FIXTURE_PATH}}", &fixture.path);

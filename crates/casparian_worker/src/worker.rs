@@ -2457,14 +2457,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = inject_lineage_batches(
-            "output",
-            vec![batch],
-            "src-hash",
-            "job-1",
-            "1.0.0",
-        )
-        .expect_err("expected reserved lineage rejection");
+        let err = inject_lineage_batches("output", vec![batch], "src-hash", "job-1", "1.0.0")
+            .expect_err("expected reserved lineage rejection");
         assert!(
             err.to_string().contains("reserved runtime lineage columns"),
             "unexpected error: {}",

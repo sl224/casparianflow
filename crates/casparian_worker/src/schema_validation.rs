@@ -597,18 +597,15 @@ fn cast_utf8_date(
     );
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
         .ok_or_else(|| anyhow!("schema: invalid epoch date"))?;
-    let (values, has_errors) = cast_from_utf8_values(
-        expected,
-        array,
-        row_errors,
-        &message,
-        |value| {
-            chrono::NaiveDate::parse_from_str(value, format).ok().and_then(|date| {
-                let days = date.signed_duration_since(epoch).num_days();
-                i32::try_from(days).ok()
-            })
-        },
-    )?;
+    let (values, has_errors) =
+        cast_from_utf8_values(expected, array, row_errors, &message, |value| {
+            chrono::NaiveDate::parse_from_str(value, format)
+                .ok()
+                .and_then(|date| {
+                    let days = date.signed_duration_since(epoch).num_days();
+                    i32::try_from(days).ok()
+                })
+        })?;
     let array = Date32Array::from(values);
     Ok((std::sync::Arc::new(array), has_errors))
 }
@@ -626,19 +623,16 @@ fn cast_utf8_time(
         "schema: value does not match format '{}' for '{}'",
         format, expected.name
     );
-    let (values, has_errors) = cast_from_utf8_values(
-        expected,
-        array,
-        row_errors,
-        &message,
-        |value| {
-            chrono::NaiveTime::parse_from_str(value, format).ok().map(|time| {
-                let secs = i64::from(time.num_seconds_from_midnight());
-                let micros = i64::from(time.nanosecond() / 1_000);
-                secs * 1_000_000 + micros
-            })
-        },
-    )?;
+    let (values, has_errors) =
+        cast_from_utf8_values(expected, array, row_errors, &message, |value| {
+            chrono::NaiveTime::parse_from_str(value, format)
+                .ok()
+                .map(|time| {
+                    let secs = i64::from(time.num_seconds_from_midnight());
+                    let micros = i64::from(time.nanosecond() / 1_000);
+                    secs * 1_000_000 + micros
+                })
+        })?;
     let array = Time64MicrosecondArray::from(values);
     Ok((std::sync::Arc::new(array), has_errors))
 }
@@ -656,17 +650,12 @@ fn cast_utf8_timestamp(
         "schema: value does not match format '{}' for '{}'",
         format, expected.name
     );
-    let (values, has_errors) = cast_from_utf8_values(
-        expected,
-        array,
-        row_errors,
-        &message,
-        |value| {
+    let (values, has_errors) =
+        cast_from_utf8_values(expected, array, row_errors, &message, |value| {
             chrono::NaiveDateTime::parse_from_str(value, format)
                 .ok()
                 .map(|dt| dt.and_utc().timestamp_micros())
-        },
-    )?;
+        })?;
     let array = TimestampMicrosecondArray::from(values);
     Ok((std::sync::Arc::new(array), has_errors))
 }
@@ -688,12 +677,8 @@ fn cast_utf8_timestamp_tz(
         SchemaDataType::TimestampTz { tz } => tz.as_str(),
         _ => "",
     };
-    let (values, has_errors) = cast_from_utf8_values(
-        expected,
-        array,
-        row_errors,
-        &message,
-        |value| {
+    let (values, has_errors) =
+        cast_from_utf8_values(expected, array, row_errors, &message, |value| {
             if !expected
                 .data_type
                 .validate_string_with_format(value, Some(format))
@@ -703,8 +688,7 @@ fn cast_utf8_timestamp_tz(
             chrono::DateTime::parse_from_str(value, format)
                 .ok()
                 .map(|dt| dt.with_timezone(&chrono::Utc).timestamp_micros())
-        },
-    )?;
+        })?;
     let array = TimestampMicrosecondArray::from(values).with_timezone(tz);
     Ok((std::sync::Arc::new(array), has_errors))
 }
@@ -716,7 +700,12 @@ fn cast_utf8_decimal(
 ) -> AnyhowResult<(ArrayRef, bool)> {
     let (precision, scale) = match expected.data_type {
         SchemaDataType::Decimal { precision, scale } => (precision, scale),
-        _ => return Err(anyhow!("schema: invalid decimal type for '{}'", expected.name)),
+        _ => {
+            return Err(anyhow!(
+                "schema: invalid decimal type for '{}'",
+                expected.name
+            ))
+        }
     };
     let message = format!(
         "schema: value does not match decimal({}, {}) for '{}'",
@@ -724,12 +713,8 @@ fn cast_utf8_decimal(
     );
     let precision_usize = precision as usize;
     let scale_usize = scale as usize;
-    let (values, has_errors) = cast_from_utf8_values(
-        expected,
-        array,
-        row_errors,
-        &message,
-        |value| {
+    let (values, has_errors) =
+        cast_from_utf8_values(expected, array, row_errors, &message, |value| {
             let (raw, digits, value_scale) = parse_decimal_strict(value)?;
             if digits > precision_usize || value_scale > scale_usize {
                 return None;
@@ -737,10 +722,8 @@ fn cast_utf8_decimal(
             let scale_diff = scale_usize.saturating_sub(value_scale);
             let factor = pow10_i128(scale_diff)?;
             raw.checked_mul(factor)
-        },
-    )?;
-    let array = Decimal128Array::from(values)
-        .with_precision_and_scale(precision, scale as i8)?;
+        })?;
+    let array = Decimal128Array::from(values).with_precision_and_scale(precision, scale as i8)?;
     Ok((std::sync::Arc::new(array), has_errors))
 }
 
@@ -1004,7 +987,9 @@ fn normalize_tz(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Date32Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{
+        Date32Array, Decimal128Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{Field, Schema, TimeUnit};
     use std::sync::Arc;
 
@@ -1395,7 +1380,10 @@ mod tests {
         .unwrap();
 
         let validated = validate_record_batch(&batch, &schema, "output").unwrap();
-        assert_eq!(validated.schema().field(0).data_type(), &ArrowDataType::Date32);
+        assert_eq!(
+            validated.schema().field(0).data_type(),
+            &ArrowDataType::Date32
+        );
         let date_array = validated
             .column(0)
             .as_any()
@@ -1429,12 +1417,8 @@ mod tests {
             nullable: true,
             format: None,
         }]);
-        let values = StringArray::from(vec![
-            Some("12.30"),
-            Some("12.345"),
-            Some("bad"),
-            Some("12"),
-        ]);
+        let values =
+            StringArray::from(vec![Some("12.30"), Some("12.345"), Some("bad"), Some("12")]);
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
                 "amount",

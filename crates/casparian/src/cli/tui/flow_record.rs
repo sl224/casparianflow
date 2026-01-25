@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::cli::config::casparian_home;
 use crate::cli::tui::app::{App, TuiMode};
-use crate::cli::tui::flow::{FlowAssertion, FlowEnv, FlowStep, FlowKey, TerminalSize, TuiFlow};
+use crate::cli::tui::flow::{FlowAssertion, FlowEnv, FlowKey, FlowStep, TerminalSize, TuiFlow};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum RecordRedaction {
@@ -84,9 +84,10 @@ impl FlowRecorder {
         self.flush_text();
 
         if let Some(flow_key) = FlowKey::from_key_event(key) {
-            self.flow
-                .steps
-                .push(FlowStep::Key { key: flow_key, label: None });
+            self.flow.steps.push(FlowStep::Key {
+                key: flow_key,
+                label: None,
+            });
         }
 
         self.maybe_checkpoint(app);
@@ -159,7 +160,10 @@ impl FlowRecorder {
                 let hash = self.pending_hasher.finalize().to_hex().to_string();
                 (
                     self.pending_text.clone(),
-                    Some(format!("redacted=hash len={} blake3={}", self.pending_len, hash)),
+                    Some(format!(
+                        "redacted=hash len={} blake3={}",
+                        self.pending_len, hash
+                    )),
                 )
             }
             RecordRedaction::Omit => (
@@ -168,9 +172,7 @@ impl FlowRecorder {
             ),
         };
 
-        self.flow
-            .steps
-            .push(FlowStep::Text { text, label });
+        self.flow.steps.push(FlowStep::Text { text, label });
         self.pending_text.clear();
         self.pending_len = 0;
         self.pending_hasher = Hasher::new();

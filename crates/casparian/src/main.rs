@@ -469,6 +469,13 @@ enum Commands {
         args: cli::tui::snapshot_export::TuiSnapshotArgs,
     },
 
+    /// Export a deterministic TUI state graph (hidden)
+    #[command(hide = true)]
+    TuiStateGraph {
+        #[command(flatten)]
+        args: cli::tui::state_graph::TuiStateGraphArgs,
+    },
+
     /// Run deterministic TUI flows (headless)
     TuiFlow {
         #[command(subcommand)]
@@ -827,6 +834,7 @@ fn run_command(cli: Cli, telemetry: Option<TelemetryRecorder>) -> Result<()> {
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
         Commands::Tui { args } => cli::tui::run(args, telemetry),
         Commands::TuiSnapshots { args } => cli::tui::snapshot_export::run(args),
+        Commands::TuiStateGraph { args } => cli::tui::state_graph::run(args),
         Commands::TuiFlow { command } => cli::tui::flow_runner::run(command),
         Commands::Mcp { action } => cli::mcp::run(action),
         Commands::SupportBundle(args) => cli::support_bundle::run(args),
@@ -995,6 +1003,7 @@ fn get_command_name(cmd: &Commands) -> String {
         Commands::Config { .. } => "Config".to_string(),
         Commands::Tui { .. } => "Tui".to_string(),
         Commands::TuiSnapshots { .. } => "TuiSnapshots".to_string(),
+        Commands::TuiStateGraph { .. } => "TuiStateGraph".to_string(),
         Commands::TuiFlow { .. } => "TuiFlow".to_string(),
         Commands::Mcp { .. } => "Mcp".to_string(),
         Commands::SupportBundle(_) => "SupportBundle".to_string(),

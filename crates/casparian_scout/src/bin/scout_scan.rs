@@ -1,7 +1,9 @@
 use casparian_scout::file_uid::compute_file_uid;
 use casparian_scout::scanner::ScanConfig;
 use casparian_scout::types::SourceType;
-use casparian_scout::wire::{write_frame, ScanErrorWire, ScanStatsWire, ScannedFileWire, WireMessage};
+use casparian_scout::wire::{
+    write_frame, ScanErrorWire, ScanStatsWire, ScannedFileWire, WireMessage,
+};
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -260,10 +262,8 @@ fn run_scan(args: Args) -> anyhow::Result<()> {
             guard.byte_count += size;
 
             if guard.batch.len() >= guard.batch_size {
-                let batch = std::mem::replace(
-                    &mut guard.batch,
-                    Vec::with_capacity(guard.batch_size),
-                );
+                let batch =
+                    std::mem::replace(&mut guard.batch, Vec::with_capacity(guard.batch_size));
                 let batch_bytes = guard.byte_count;
                 guard.byte_count = 0;
                 let batch_len = batch.len();

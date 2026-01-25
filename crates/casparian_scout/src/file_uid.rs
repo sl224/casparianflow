@@ -16,7 +16,11 @@ pub struct FileUid {
     pub strength: FileUidStrength,
 }
 
-pub fn compute_file_uid(source_type: &SourceType, full_path: &Path, metadata: &Metadata) -> FileUid {
+pub fn compute_file_uid(
+    source_type: &SourceType,
+    full_path: &Path,
+    metadata: &Metadata,
+) -> FileUid {
     match source_type {
         SourceType::Local | SourceType::Smb { .. } => {
             if let Some(value) = strong_uid_from_metadata(metadata) {

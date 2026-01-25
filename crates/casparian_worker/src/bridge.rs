@@ -749,7 +749,10 @@ fn spawn_guest_direct(config: &BridgeConfig, port: u16) -> Result<Child> {
 }
 
 fn venv_root_for_interpreter(interpreter: &Path) -> Option<PathBuf> {
-    interpreter.parent().and_then(|bin_dir| bin_dir.parent()).map(ToOwned::to_owned)
+    interpreter
+        .parent()
+        .and_then(|bin_dir| bin_dir.parent())
+        .map(ToOwned::to_owned)
 }
 
 fn find_uv_path() -> Option<PathBuf> {

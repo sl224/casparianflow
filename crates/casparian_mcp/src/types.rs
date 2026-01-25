@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use casparian_protocol::{
     DataType as ProtocolDataType, RedactionPolicy as ProtocolRedactionPolicy,
-    SchemaColumnSpec as ProtocolSchemaColumnSpec,
-    SchemaDefinition as ProtocolSchemaDefinition, ViolationType as ProtocolViolationType,
+    SchemaColumnSpec as ProtocolSchemaColumnSpec, SchemaDefinition as ProtocolSchemaDefinition,
+    ViolationType as ProtocolViolationType,
 };
 pub use casparian_protocol::{RedactionMode, SchemaMode};
 
@@ -231,11 +231,11 @@ impl TryFrom<ProtocolDataType> for DataType {
                     scale,
                 }))
             }
-            ProtocolDataType::TimestampTz { tz } => Ok(DataType::Complex(
-                ComplexDataType::TimestampTz {
+            ProtocolDataType::TimestampTz { tz } => {
+                Ok(DataType::Complex(ComplexDataType::TimestampTz {
                     timezone: Some(tz),
-                },
-            )),
+                }))
+            }
             other => Err(format!("Unsupported protocol DataType for MCP: {}", other)),
         }
     }
@@ -458,12 +458,12 @@ impl ViolationType {
             ViolationType::TypeMismatch => Ok(ProtocolViolationType::TypeMismatch),
             ViolationType::NullNotAllowed => Ok(ProtocolViolationType::NullNotAllowed),
             ViolationType::FormatMismatch => Ok(ProtocolViolationType::FormatMismatch),
-            ViolationType::ColumnNameMismatch => Err(
-                "ColumnNameMismatch has no direct protocol equivalent".to_string(),
-            ),
-            ViolationType::ColumnCountMismatch => Err(
-                "ColumnCountMismatch has no direct protocol equivalent".to_string(),
-            ),
+            ViolationType::ColumnNameMismatch => {
+                Err("ColumnNameMismatch has no direct protocol equivalent".to_string())
+            }
+            ViolationType::ColumnCountMismatch => {
+                Err("ColumnCountMismatch has no direct protocol equivalent".to_string())
+            }
         }
     }
 }
@@ -758,7 +758,10 @@ mod tests {
         let protocol_schema = schema.to_protocol_schema().unwrap();
         assert_eq!(protocol_schema.columns.len(), 1);
         assert_eq!(protocol_schema.columns[0].name, "id");
-        assert_eq!(protocol_schema.columns[0].data_type, ProtocolDataType::Int64);
+        assert_eq!(
+            protocol_schema.columns[0].data_type,
+            ProtocolDataType::Int64
+        );
     }
 
     #[test]
@@ -773,7 +776,9 @@ mod tests {
         let mapped = ViolationType::TypeMismatch.to_protocol().unwrap();
         assert_eq!(mapped, ProtocolViolationType::TypeMismatch);
 
-        let err = ViolationType::ColumnCountMismatch.to_protocol().unwrap_err();
+        let err = ViolationType::ColumnCountMismatch
+            .to_protocol()
+            .unwrap_err();
         assert!(err.contains("no direct protocol equivalent"));
     }
 

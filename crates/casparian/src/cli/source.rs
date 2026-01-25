@@ -312,11 +312,7 @@ fn list_sources(db: &Database, workspace_id: &WorkspaceId, json: bool) -> anyhow
         rows.push(vec![
             source.name.clone(),
             source.path.clone(),
-            source
-                .exec_path
-                .as_deref()
-                .unwrap_or("-")
-                .to_string(),
+            source.exec_path.as_deref().unwrap_or("-").to_string(),
             format!("{}", stats.file_count),
             format_size(stats.total_size),
         ]);
@@ -528,10 +524,7 @@ fn show_source(
     println!();
     println!("  ID:       {}", source.id);
     println!("  Path:     {}", source.path);
-    println!(
-        "  Exec:     {}",
-        source.exec_path.as_deref().unwrap_or("-")
-    );
+    println!("  Exec:     {}", source.exec_path.as_deref().unwrap_or("-"));
     println!("  Type:     {:?}", source.source_type);
     println!("  Enabled:  {}", if source.enabled { "yes" } else { "no" });
     println!("  Poll:     {}s", source.poll_interval_secs);

@@ -1,7 +1,7 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, with_duckdb};
 use casparian_db::DbValue;
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, with_duckdb};
 use std::fs;
 use tempfile::TempDir;
 
