@@ -2,12 +2,23 @@
 
 **Status:** Validated via Job Postings & Forums
 **Purpose:** Ground product strategy in real-world user workflows
-**Version:** 1.1
-**Date:** January 21, 2026
+**Version:** 1.3
+**Date:** January 25, 2026
 
 ---
 
-## v1 Target: DFIR / Incident Response
+## Vertical Priority Stack
+
+| Priority | Vertical | Primary Persona | Status |
+|----------|----------|-----------------|--------|
+| **P0** | DFIR / Incident Response | DFIR Engineer, Forensic Consultant | **v1 PRIMARY** |
+| **P1** | eDiscovery Preflight | Litigation Support Technologist | Secondary track |
+| **P2** | Defense Flight Test | Flight Test Data Processor | Tertiary (post-PMF) |
+| **P3** | Finance Trade Support | Trade Support Analyst | Consultant-delivered only |
+
+---
+
+## v1 Target: DFIR / Incident Response (P0)
 
 **Primary target personas for v1:**
 
@@ -205,7 +216,9 @@ ORDER BY timestamp;
 
 ---
 
-## 2. Legal: Litigation Support Specialist
+## 2. Legal: Litigation Support Technologist (P1 - eDiscovery Preflight)
+
+> **Status:** P1 secondary track. Focus on Production Preflight (DAT/OPT/LFP validation), not PST parsing. See STRATEGY.md for rationale.
 
 ### Validation Evidence
 
@@ -571,14 +584,138 @@ LIMIT 20;
 
 ---
 
-## Summary: Validated Pain Points by Vertical
+## 5. Defense: Flight Test Data Processor (P2 - Returned Media)
 
-| Vertical | Job Market | Validated Pain | Evidence |
-|----------|------------|----------------|----------|
-| **Finance** | 516+ jobs | "Read and understand FIX log file"; 30-45 min per break | Job postings explicitly mention log analysis |
-| **Legal** | 80K+ firms | "Relativity too expensive for small/mid firms" | $150K+ vs. $5K budgets |
-| **Healthcare** | Active market | Archive analysis gap (Mirth routes, doesn't analyze) | Mirth Community forums; analysts need SQL access to historical HL7 |
-| **Defense** | 4,600+ PCAP jobs | "Closed systems"; DDIL constraints | War on the Rocks; DoD job requirements |
+> **Status:** P2 tertiary track. Focus on returned flight test media (CH10/TF10/DF10/TMATS). See strategies/defense_flight_test_returned_media.md.
+
+### Validation Evidence
+
+**Job Posting Evidence:**
+
+> "Process and validate **telemetry data from flight test instrumentation** including Chapter 10 and PCM data"
+> — Flight Test Data Engineer job descriptions
+
+> "Experience with **IRIG 106 Chapter 10 recording formats**, TMATS, and telemetry processing"
+> — Defense contractor telemetry positions
+
+> "Manage **returned media from flight test sorties**, ensuring chain of custody and data integrity"
+> — Test range data processing requirements
+
+**Market Pain (Returned Media Problem):**
+
+> Flight test programs generate massive volumes of recorded data on removable media (cartridges, SSDs). This media returns from test ranges and must be processed with full chain of custody. Current workflows rely on fragile scripts with no governance.
+
+**Market Size:**
+- Major test ranges: Edwards AFB, Pax River, China Lake, Eglin
+- Defense primes with flight test programs: Lockheed, Boeing, Northrop, Raytheon
+- SBIR/STTR funding available for test data processing tools
+
+**Salary Range:**
+- Entry: **$70,000**
+- Mid: **$90,000-$130,000**
+- Senior: **$140,000-$160,000**
+- With clearance: Premium pay
+
+### Validated Persona
+
+| Attribute | Evidence-Based Reality |
+|-----------|------------------------|
+| **Job Title** | Flight Test Data Processor, Telemetry Data Engineer, Instrumentation Engineer |
+| **Works At** | Test ranges, defense primes, flight test organizations |
+| **Clearance** | Often SECRET or higher |
+| **Education** | EE/CS degree, telemetry experience |
+| **Technical Skills** | IRIG 106, Chapter 10, TMATS, Python/MATLAB |
+| **Key Knowledge** | Telemetry formats, PCM, data reduction |
+| **Salary** | $90K-$160K; clearance premium |
+
+### Validated Workflow
+
+**From job postings and industry knowledge:**
+
+```
+1. MEDIA RETURN:
+   - Removable media (cartridge, SSD) returns from flight test
+   - May contain CH10, TF10, DF10 recordings
+   - TMATS file describes channel configuration
+
+2. INGEST:
+   - Copy media to processing server
+   - Verify integrity (hash inventory)
+   - Log chain of custody
+
+3. EXTRACTION:
+   - Parse CH10 containers
+   - Extract telemetry channels per TMATS
+   - Handle malformed packets (quarantine)
+
+4. VALIDATION:
+   - Verify expected channels present
+   - Check for data gaps
+   - Flag anomalies
+
+5. DELIVERY:
+   - Output to analysis tools
+   - Archive raw + processed data
+   - Maintain audit trail
+```
+
+### Why Current Tools Fall Short
+
+**From practitioner feedback:**
+
+> "We have custom Python scripts for CH10 extraction but they crash on edge cases and have no audit trail. When data goes missing, we can't prove what happened."
+
+**Gaps in current tooling:**
+- No governance on extraction scripts
+- No quarantine for malformed packets
+- No lineage proving what was extracted from what
+- No reproducibility for re-processing
+
+### Casparian Value Proposition (Validated)
+
+**Position:** Governed ingestion for returned media
+
+**Solution:**
+```bash
+# Process returned media with full governance
+casparian scan /mnt/flight_test_media/ --tag ch10_data
+
+# Parse with lineage
+casparian run ch10_parser.py --tag ch10_data
+
+# Query extracted telemetry
+SELECT channel_id, sample_count, first_timestamp, last_timestamp
+FROM ch10_telemetry
+WHERE source_hash = 'abc123...'
+ORDER BY channel_id;
+
+# Audit trail
+SELECT * FROM cf_output_materializations
+WHERE source_hash = 'abc123...';
+```
+
+**Differentiators:**
+- **Chain of custody** - Every output row traces to source media
+- **Quarantine** - Malformed packets captured, not dropped
+- **Reproducibility** - Same media + same parser = identical outputs
+- **Air-gapped** - Works on classified networks
+
+**Go-to-Market:**
+- SBIR/STTR Phase I applications
+- Test range partnerships
+- Defense integrator channel
+
+---
+
+## Summary: Validated Pain Points by Priority
+
+| Priority | Vertical | Validated Pain | Evidence |
+|----------|----------|----------------|----------|
+| **P0** | **DFIR** | "Scripts crash on edge cases"; "No chain of custody"; "Can't reproduce old runs" | Job postings; practitioner forums |
+| **P1** | **eDiscovery Preflight** | "Production validation failures"; "Relativity too expensive for small/mid firms" | $150K+ vs. $5K budgets; ACEDS data |
+| **P2** | **Defense Flight Test** | "No governance on extraction scripts"; "Can't prove what happened to data" | Test range requirements; practitioner feedback |
+| **P3** | **Finance** | "Read and understand FIX log file"; 30-45 min per break | Job postings (deprioritized: don't write parsers) |
+| Deferred | **Healthcare** | Archive analysis gap (Mirth routes, doesn't analyze) | Mirth Community forums |
 
 ---
 
@@ -617,3 +754,4 @@ LIMIT 20;
 | 2026-01-08 | 1.0 | Initial validated personas based on job posting research |
 | 2026-01-08 | 1.1 | **Healthcare positioning fix:** Clarified Casparian is complementary to Mirth, not a replacement |
 | 2026-01-21 | 1.2 | **DFIR-first update:** Added DFIR Forensic Consultant as Section 0 (v1 PRIMARY); Added v1 target persona table; Marked Finance Trade Support as deprioritized to P3 |
+| 2026-01-25 | 1.3 | **Priority stack update:** Added Vertical Priority Stack table; Added Flight Test Data Processor persona (P2); Updated Legal section to Litigation Support Technologist with P1 Production Preflight focus; Updated summary to reflect priority ordering |

@@ -24,6 +24,7 @@ use super::extraction::{
     MatchedFile, NamingScheme, PathArchetype, PatternSeed, ResultFilter, RuleBuilderField,
     RuleBuilderFocus, RuleBuilderState, SuggestionSection, SynonymConfidence, SynonymSuggestion,
 };
+use super::flow_record::RecordRedaction;
 use super::TuiArgs;
 
 pub const DEFAULT_SNAPSHOT_SIZES: &[(u16, u16)] = &[(80, 24), (100, 30), (120, 40), (160, 50)];
@@ -426,6 +427,9 @@ fn case_parser_bench_list() -> App {
 fn base_app() -> App {
     let args = TuiArgs {
         database: Some(PathBuf::from(SNAPSHOT_DB_PATH)),
+        record_flow: None,
+        record_redaction: RecordRedaction::Plaintext,
+        record_checkpoint_every: None,
     };
     let mut app = App::new(args, None);
     app.tick_count = 4;

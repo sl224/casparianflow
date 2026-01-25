@@ -28,14 +28,14 @@ When editing HTML content:
 
 1. Read `../specs/website.md` for page structure and messaging
 2. Read `../STRATEGY.md` for positioning and value props
-3. Read `../strategies/finance.md` for finance vertical specifics (v1 focus)
+3. Read `../strategies/dfir.md` for DFIR vertical specifics (v1 focus)
 
 ## Key Principles
 
 - **Local-first**: Data never leaves the user's machine
-- **Premade parsers**: FIX, HL7, PST, CoT - not generic ETL
+- **Premade parsers**: EVTX, Prefetch, HL7, CoT - not generic ETL
 - **Schema contracts**: Governance and audit trails built-in
-- **v1 = Finance**: Trade Break Workbench for FIX logs
+- **v1 = DFIR**: Evidence-grade artifact parsing with lineage, quarantine, reproducibility
 
 ## Deployment
 

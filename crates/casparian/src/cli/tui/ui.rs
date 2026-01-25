@@ -7812,6 +7812,7 @@ fn draw_catalog_inspector(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::cli::tui::app::{JobInfo, JobType, JobsState};
+    use crate::cli::tui::flow_record::RecordRedaction;
     use crate::cli::tui::TuiArgs;
     use chrono::Local;
     use ratatui::backend::TestBackend;
@@ -7822,6 +7823,9 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("casparian_test_{}.duckdb", uuid::Uuid::new_v4())),
             ),
+            record_flow: None,
+            record_redaction: RecordRedaction::Plaintext,
+            record_checkpoint_every: None,
         }
     }
 

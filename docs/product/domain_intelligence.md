@@ -1,9 +1,9 @@
 # Domain Intelligence: File Format Catalog
 
-**Status:** Draft
+**Status:** Canonical
 **Purpose:** Guide UI/API design based on where and how data files are stored across verticals
-**Version:** 0.2
-**Date:** January 8, 2026
+**Version:** 0.3
+**Date:** January 25, 2026
 
 ---
 
@@ -60,7 +60,66 @@ This document catalogs file formats across all target verticals with specific fo
 
 **Detection Hint:** Path contains `mission`, `tactical`, `classified`, or mounted USB path
 
-### 2.4 The "Cloud Object Store" (Emerging)
+### 2.4 The "SFTP Drop Folder" (eDiscovery/Legal)
+
+| Characteristic | Description |
+|----------------|-------------|
+| **Protocol** | SFTP, UNC share |
+| **Path Pattern** | `sftp://vendor.com/productions/`, `\\server\productions\` |
+| **Who Uses** | Legal (90%), eDiscovery vendors, opposing counsel exchanges |
+| **Challenges** | Incoming data quality unknown, format validation required |
+| **File Counts** | 100s to 100Ks of files per production |
+
+**Detection Hint:** Path contains `production`, `discovery`, `matter_`, or SFTP URI scheme
+
+**Common Drop Folder Patterns:**
+```
+\\ediscovery-share\incoming\
+├── {matter_id}/
+│   └── {production_date}/
+│       ├── DATA/
+│       │   └── *.dat           # Load file
+│       ├── IMAGES/
+│       │   └── *.tif, *.pdf
+│       ├── NATIVES/
+│       │   └── *.docx, *.xlsx
+│       └── TEXT/
+│           └── *.txt
+
+sftp://vendor.law/productions/
+└── {production_number}/
+    └── (same structure)
+```
+
+### 2.5 The "Returned Removable Media" (Flight Test/DFIR)
+
+| Characteristic | Description |
+|----------------|-------------|
+| **Protocol** | USB, cartridge mount, sneakernet |
+| **Path Pattern** | `/media/usb*/`, `/mnt/cartridge/`, `D:\` (Windows) |
+| **Who Uses** | Defense flight test (100%), DFIR evidence collection (80%) |
+| **Challenges** | Chain of custody critical, air-gapped processing required |
+| **File Counts** | 10s to 1000s of large files (GB each) |
+
+**Detection Hint:** Path contains `cartridge`, `rmm`, `/media/`, mounted removable volume
+
+**Common Patterns:**
+```
+# Flight test cartridge
+/mnt/cartridge_{serial}/
+├── manifest.txt
+├── *.ch10
+└── *.tmats
+
+# DFIR evidence drive
+/mnt/evidence_{case_id}/
+├── chain_of_custody.txt
+├── artifacts/
+│   └── *.evtx, *.pf, etc.
+└── hash_inventory.sha256
+```
+
+### 2.6 The "Cloud Object Store" (Emerging)
 
 | Characteristic | Description |
 |----------------|-------------|
@@ -110,6 +169,10 @@ This document catalogs file formats across all target verticals with specific fo
 | **CoT (Cursor on Target)** | `.cot`, `.xml` | ⭐⭐⭐⭐⭐ | `/mnt/mission_data/tracks/` | `patrol_*.cot` | Root element `<event>` with `uid`, `type` attrs |
 | **PCAP (Network Capture)** | `.pcap`, `.pcapng` | ⭐⭐⭐⭐⭐ | `/mnt/mission_data/network/` | `capture_*.pcap` | Magic bytes: `0xd4c3b2a1` (pcap) or `0x0a0d0d0a` (pcapng) |
 | **NITF (Imagery)** | `.ntf`, `.nitf` | ⭐⭐⭐⭐⭐ | `/mnt/mission_data/imagery/` | `img_*.ntf` | Magic bytes: `NITF` or `NSIF` at offset 0 |
+| **IRIG 106 Chapter 10** | `.ch10`, `.c10` | ⭐⭐⭐⭐⭐ | `/mnt/flight_test/` or returned media | `sortie_*.ch10` | Magic bytes: `0x25EB` at packet headers |
+| **TF10 (Chapter 10 variant)** | `.tf10` | ⭐⭐⭐⭐⭐ | `/mnt/flight_test/` | `test_*.tf10` | IRIG 106 packet structure |
+| **DF10 (Chapter 10 variant)** | `.df10` | ⭐⭐⭐⭐⭐ | `/mnt/flight_test/` | `data_*.df10` | IRIG 106 packet structure |
+| **TMATS (Telemetry Attributes)** | `.tmt`, `.tmats`, `.txt` | ⭐⭐⭐⭐⭐ | `/mnt/flight_test/` | `config.tmt`, `*.tmats` | Lines start with `G\`, `R-`, `M-`, `B-`, `P-` |
 | **STANAG 4609 Video** | `.ts`, `.mpg` | ⭐⭐⭐⭐ | `/mnt/mission_data/fmv/` | `mission_*.ts` | KLV metadata in MPEG-TS stream |
 | **KML/KMZ** | `.kml`, `.kmz` | ⭐⭐⭐⭐ | `/mnt/mission_data/exports/` | `route_*.kml` | Root element `<kml>` or ZIP containing .kml |
 | **GeoJSON** | `.geojson`, `.json` | ⭐⭐⭐ | `/mnt/mission_data/exports/` | `tracks_*.geojson` | Contains `"type": "FeatureCollection"` |
@@ -120,7 +183,9 @@ This document catalogs file formats across all target verticals with specific fo
 - Contains network flows, DNS queries, HTTP traffic
 - Wireshark is interactive-only; no good batch pipeline exists
 
-**Folder Structure Pattern:**
+**Folder Structure Patterns:**
+
+**Tactical/Mission Data:**
 ```
 /mnt/mission_data/
 ├── imagery/
@@ -129,11 +194,29 @@ This document catalogs file formats across all target verticals with specific fo
 ├── tracks/
 │   └── patrol_*.cot
 ├── network/
-│   └── capture_*.pcap         # NEW: Network captures
+│   └── capture_*.pcap
 ├── fmv/
 │   └── mission_*.ts
 └── reports/
     └── sitrep_*.txt
+```
+
+**Returned Flight Test Media (P2 Focus):**
+```
+/mnt/flight_test/
+├── sortie_{YYYYMMDD}_{tail}/
+│   ├── *.ch10                 # Chapter 10 recordings
+│   ├── *.tf10, *.df10         # Variant formats
+│   ├── config.tmt             # TMATS configuration
+│   └── manifest.txt           # Media contents list
+└── archive/
+    └── {year}/{month}/
+        └── sortie_*/
+
+# Returned removable media mount points
+/media/cartridge_*/            # USB-mounted cartridges
+/mnt/rmm/                      # Removable media manager
+D:\FlightTest\                 # Windows mount point
 ```
 
 **UI Recommendations:**
@@ -354,7 +437,7 @@ CONTENT_SIGNATURES = {
         "vertical": "healthcare"
     },
 
-    # Defense
+    # Defense - Tactical
     "cot": {
         "pattern": r'<event[^>]+uid="[^"]+"\s+type="[^"]+"',
         "confidence": 0.95,
@@ -379,6 +462,18 @@ CONTENT_SIGNATURES = {
         "pattern": r"<kml\s+xmlns=",
         "confidence": 0.95,
         "vertical": "defense"
+    },
+
+    # Defense - Flight Test (P2)
+    "ch10": {
+        "magic_bytes": [b"\x25\xEB"],  # IRIG 106 sync pattern in packet headers
+        "confidence": 0.95,
+        "vertical": "defense_flight_test"
+    },
+    "tmats": {
+        "pattern": r"^G\\",  # TMATS group code
+        "confidence": 0.99,
+        "vertical": "defense_flight_test"
     },
 
     # Finance
@@ -454,11 +549,17 @@ PATH_HINTS = {
     r"interface.*archive": {"vertical": "healthcare", "formats": ["hl7"]},
     r"(ADT|ORU|ORM)_(In|Out)bound": {"vertical": "healthcare", "formats": ["hl7"]},
 
-    # Defense
+    # Defense - Tactical
     r"mission_data": {"vertical": "defense", "formats": ["cot", "nitf", "pcap"]},
     r"imagery.*pass": {"vertical": "defense", "formats": ["nitf"]},
     r"tracks": {"vertical": "defense", "formats": ["cot", "kml"]},
     r"network|capture": {"vertical": "defense", "formats": ["pcap"]},
+
+    # Defense - Flight Test (P2)
+    r"flight_test|flighttest": {"vertical": "defense_flight_test", "formats": ["ch10", "tmats"]},
+    r"sortie": {"vertical": "defense_flight_test", "formats": ["ch10", "tmats"]},
+    r"telemetry": {"vertical": "defense_flight_test", "formats": ["ch10", "tmats"]},
+    r"cartridge|rmm": {"vertical": "defense_flight_test", "formats": ["ch10", "tmats"]},
 
     # Finance
     r"/var/log/fix": {"vertical": "finance", "formats": ["fix"]},
@@ -475,11 +576,20 @@ PATH_HINTS = {
     r"salesforce|sf_": {"vertical": "midsize_business", "formats": ["salesforce"]},
     r"payroll|adp|gusto": {"vertical": "midsize_business", "formats": ["payroll"]},
 
-    # Legal/eDiscovery
+    # Legal/eDiscovery (P1)
     r"departing_employee|litigation|matter": {"vertical": "legal", "formats": ["pst"]},
     r"production|discovery": {"vertical": "legal", "formats": ["loadfile"]},
     r"slack_export": {"vertical": "legal", "formats": ["slack"]},
     r"teams_export|compliance_export": {"vertical": "legal", "formats": ["teams"]},
+
+    # SFTP Drop Folders (Legal P1)
+    r"incoming.*production": {"vertical": "legal", "formats": ["loadfile"]},
+    r"sftp://": {"vertical": "legal", "formats": ["loadfile"]},
+    r"DATA.*IMAGES.*NATIVES": {"vertical": "legal", "formats": ["loadfile"]},
+
+    # DFIR Evidence (P0)
+    r"evidence|artifacts|case_": {"vertical": "dfir", "formats": ["evtx", "prefetch", "shimcache"]},
+    r"forensic|incident": {"vertical": "dfir", "formats": ["evtx", "prefetch"]},
 }
 ```
 
@@ -487,10 +597,14 @@ PATH_HINTS = {
 
 ```python
 EXTENSION_MAP = {
+    # DFIR (P0)
+    ".evtx": {"vertical": "dfir", "parser": "evtx_parser"},
+    ".pf": {"vertical": "dfir", "parser": "prefetch_parser"},
+
     # Healthcare
     ".hl7": {"vertical": "healthcare", "parser": "hl7_parser"},
 
-    # Defense
+    # Defense - Tactical
     ".cot": {"vertical": "defense", "parser": "cot_parser"},
     ".ntf": {"vertical": "defense", "parser": "nitf_parser"},
     ".nitf": {"vertical": "defense", "parser": "nitf_parser"},
@@ -498,6 +612,14 @@ EXTENSION_MAP = {
     ".pcapng": {"vertical": "defense", "parser": "pcap_parser"},
     ".kml": {"vertical": "defense", "parser": "kml_parser"},
     ".kmz": {"vertical": "defense", "parser": "kml_parser"},  # ZIP containing KML
+
+    # Defense - Flight Test (P2)
+    ".ch10": {"vertical": "defense_flight_test", "parser": "ch10_parser"},
+    ".c10": {"vertical": "defense_flight_test", "parser": "ch10_parser"},
+    ".tf10": {"vertical": "defense_flight_test", "parser": "ch10_parser"},
+    ".df10": {"vertical": "defense_flight_test", "parser": "ch10_parser"},
+    ".tmt": {"vertical": "defense_flight_test", "parser": "tmats_parser"},
+    ".tmats": {"vertical": "defense_flight_test", "parser": "tmats_parser"},
 
     # Finance
     ".fix": {"vertical": "finance", "parser": "fix_parser"},
@@ -661,3 +783,4 @@ class FormatDetection:
 |------|---------|---------|
 | 2026-01-08 | 0.1 | Initial draft aggregating all vertical strategies |
 | 2026-01-08 | 0.2 | Gap analysis integration: Added Legal/eDiscovery vertical (PST, load files, Slack); Added PCAP to Defense; Enhanced KML; Updated value rankings and detection patterns |
+| 2026-01-25 | 0.3 | **DFIR-first alignment:** Added SFTP drop folder archetype (2.4); Added returned removable media archetype (2.5); Added flight test formats (CH10, TF10, DF10, TMATS) to Defense; Added DFIR extensions (.evtx, .pf); Added flight test path hints and detection signatures; Updated priority labels throughout |

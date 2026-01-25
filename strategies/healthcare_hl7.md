@@ -408,7 +408,7 @@ async fn handle_mllp_connection(stream: TcpStream, output_dir: PathBuf) {
 
 #### Pricing
 
-Pricing tiers and unit definitions are centralized in `docs/product/pricing_v2_refined.md`. Use the Healthcare mapping (Clinic → Department → Hospital → Health System) from the system-of-record and keep the compliance and backlog framing from the value analysis above.
+Pricing tiers and unit definitions are centralized in `docs/product/pricing.md`. Use the Healthcare mapping (Clinic → Department → Hospital → Health System) from the system-of-record and keep the compliance and backlog framing from the value analysis above.
 
 **Note:** Healthcare vertical has longer sales cycles. Budget for 12-18 months to close Hospital/Health System deals.
 

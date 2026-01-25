@@ -16,6 +16,27 @@ cargo build --release
 
 ---
 
+## TUI Flow Recording
+
+Record an interactive TUI session into a `TuiFlow` JSON that can be replayed headlessly:
+
+```bash
+cargo run -p casparian -- tui --record-flow specs/tui_flows/my_session.json
+```
+
+**Redaction options:**
+```bash
+cargo run -p casparian -- tui --record-flow specs/tui_flows/my_session.json --record-redaction hash
+```
+
+**Checkpoint assertions:** by default, a checkpoint is inserted every ~2000ms while keys are recorded.  
+Disable with:
+```bash
+cargo run -p casparian -- tui --record-flow specs/tui_flows/my_session.json --record-checkpoint-every 0
+```
+
+---
+
 ## Testing Rust Components
 
 ### TEST: Publish Command (Azure Authentication)

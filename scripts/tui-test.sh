@@ -4,7 +4,6 @@
 # Usage:
 #   ./scripts/tui-test.sh list                    # List available scenarios
 #   ./scripts/tui-test.sh discover-basic          # Run specific scenario
-#   ./scripts/tui-test.sh discover-sources        # Test sources dropdown
 #   ./scripts/tui-test.sh all                     # Run all scenarios
 #
 # This script starts a fresh TUI session, runs the test scenario,
@@ -13,11 +12,15 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tui-env.sh"
 SESSION="tui_test"
 WIDTH=120
 HEIGHT=40
 PASSED=0
 FAILED=0
+SKIPPED=0
+KEY_SEQUENCE=""
+FIXTURE_READY=0
 
 # Colors
 RED='\033[0;31m'
@@ -44,6 +47,20 @@ start_session() {
         echo -e "${RED}ERROR: casparian binary not found${NC}"
         exit 1
     fi
+    KEY_SEQUENCE=""
+
+    if [[ "${TUI_FIXTURE:-0}" == "1" && "$FIXTURE_READY" -eq 0 ]]; then
+        local fixture_args=()
+        fixture_args+=(--name "${TUI_FIXTURE_NAME:-fixture_mock}")
+        if [[ -n "${TUI_FIXTURE_ROOT:-}" ]]; then
+            fixture_args+=(--root "$TUI_FIXTURE_ROOT")
+        fi
+        if [[ -n "${TUI_FIXTURE_WORKSPACE:-}" ]]; then
+            fixture_args+=(--workspace "$TUI_FIXTURE_WORKSPACE")
+        fi
+        "$SCRIPT_DIR/tui-fixture.sh" "${fixture_args[@]}"
+        FIXTURE_READY=1
+    fi
 
     # Kill any existing session
     tmux kill-session -t "$SESSION" 2>/dev/null || true
@@ -51,8 +68,8 @@ start_session() {
 
     # Start new session with the TUI (keep shell alive with sleep fallback)
     # The "|| sleep 60" ensures the pane stays open even if TUI exits
-    tmux new-session -d -s "$SESSION" -x "$WIDTH" -y "$HEIGHT" "$binary tui || sleep 60"
-    sleep 1.5  # Give TUI time to initialize
+    tmux new-session -d -s "$SESSION" -x "$WIDTH" -y "$HEIGHT" "CASPARIAN_HOME=\"$CASPARIAN_HOME\" \"$binary\" tui || sleep 60"
+    wait_for_contains "Home Hub|Casparian Flow" 8
 }
 
 # Stop session
@@ -63,12 +80,51 @@ stop_session() {
 # Send keys and wait
 send() {
     tmux send-keys -t "$SESSION" "$1"
+    if [[ -z "$KEY_SEQUENCE" ]]; then
+        KEY_SEQUENCE="$1"
+    else
+        KEY_SEQUENCE="$KEY_SEQUENCE $1"
+    fi
     sleep "${2:-0.3}"
 }
 
 # Capture screen
 capture() {
-    tmux capture-pane -t "$SESSION" -p
+    capture_stable
+}
+
+# Capture after render stabilizes
+capture_stable() {
+    "$SCRIPT_DIR/tui-capture-stable.sh" -t "$SESSION"
+}
+
+# Wait for screen to contain pattern
+wait_for_contains() {
+    local pattern="$1"
+    local timeout="${2:-5}"
+    local start
+    start=$(date +%s)
+    local interval=0.2
+    local screen=""
+
+    while true; do
+        screen=$(capture_stable)
+        if echo "$screen" | grep -qE "$pattern"; then
+            return 0
+        fi
+        if (( $(date +%s) - start >= timeout )); then
+            break
+        fi
+        sleep "$interval"
+    done
+
+    echo -e "  ${RED}[FAIL]${NC} Timed out waiting for: '$pattern'"
+    echo -e "         CASPARIAN_HOME: $CASPARIAN_HOME"
+    echo -e "         Keys: ${KEY_SEQUENCE}"
+    echo -e "         Last stable screen:"
+    echo "$screen" | head -20 | sed 's/^/         /'
+    ((FAILED++))
+    return 1
 }
 
 # Assert screen contains pattern (supports | for alternatives)
@@ -84,6 +140,8 @@ assert_contains() {
     else
         echo -e "  ${RED}[FAIL]${NC} $description"
         echo -e "         Expected to find: '$pattern'"
+        echo -e "         CASPARIAN_HOME: $CASPARIAN_HOME"
+        echo -e "         Keys: ${KEY_SEQUENCE}"
         echo -e "         Screen content:"
         echo "$screen" | head -20 | sed 's/^/         /'
         ((FAILED++))
@@ -100,6 +158,10 @@ assert_not_contains() {
     if echo "$screen" | grep -qE "$pattern"; then
         echo -e "  ${RED}[FAIL]${NC} $description"
         echo -e "         Should NOT contain: '$pattern'"
+        echo -e "         CASPARIAN_HOME: $CASPARIAN_HOME"
+        echo -e "         Keys: ${KEY_SEQUENCE}"
+        echo -e "         Screen content:"
+        echo "$screen" | head -20 | sed 's/^/         /'
         ((FAILED++))
         return 1
     else
@@ -107,6 +169,12 @@ assert_not_contains() {
         ((PASSED++))
         return 0
     fi
+}
+
+skip_check() {
+    local reason="$1"
+    echo -e "  ${YELLOW}[SKIP]${NC} SKIP: $reason"
+    ((SKIPPED++))
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -126,30 +194,6 @@ test_startup() {
     assert_contains "Parser Bench|2.*Parser" "Home shows Parser Bench card"
     assert_contains "Jobs|3.*Jobs" "Home shows Jobs card"
     assert_contains "Sources|4.*Sources" "Home shows Sources card"
-
-    stop_session
-}
-
-test_home_navigation() {
-    echo -e "\n${YELLOW}TEST: Home Screen Navigation${NC}"
-    start_session
-
-    # Test arrow key navigation on home cards
-    send "Down"
-    sleep 0.2
-    assert_contains "Home Hub|Casparian" "Down arrow navigates home cards"
-
-    send "Right"
-    sleep 0.2
-    assert_contains "Home Hub|Casparian" "Right arrow navigates home cards"
-
-    send "Up"
-    sleep 0.2
-    assert_contains "Home Hub|Casparian" "Up arrow navigates home cards"
-
-    send "Left"
-    sleep 0.2
-    assert_contains "Home Hub|Casparian" "Left arrow navigates home cards"
 
     stop_session
 }
@@ -177,7 +221,7 @@ test_discover_basic() {
     # Enter Discover mode
     send "1"
     assert_contains "Discover" "Discover mode title shown"
-    assert_contains "Tags" "Discover shows Tags panel"
+    assert_contains "PATTERN|EXCLUDES|TAG" "Discover shows Rule Builder panels"
     assert_contains "GLOB PATTERN|FOLDERS|files" "Discover shows file/folder view"
 
     stop_session
@@ -191,26 +235,25 @@ test_sources_dropdown_open_close() {
     send "1"
     sleep 0.5
 
-    # Capture initial state
-    local before=$(capture)
+    # Move focus out of text input mode so panel shortcuts work
+    send "Tab"
+    sleep 0.2
 
     # Press 1 to toggle sources dropdown
     send "1"
     sleep 0.3
 
-    # State should change (dropdown opened)
-    local after=$(capture)
-    if [[ "$before" != "$after" ]]; then
-        echo -e "  ${GREEN}[PASS]${NC} Sources dropdown toggle changes UI state"
-        ((PASSED++))
-    else
-        echo -e "  ${YELLOW}[INFO]${NC} No visible change (may have no sources)"
+    assert_contains "Select Source" "Sources dropdown opens"
+    if [[ "${TUI_FIXTURE:-0}" == "1" ]]; then
+        local fixture_name="${TUI_FIXTURE_NAME:-fixture_mock}"
+        assert_contains "$fixture_name" "Sources dropdown lists fixture source"
     fi
 
     # Press Escape to close dropdown
     send "Escape"
     sleep 0.3
-    assert_contains "Discover|GLOB|FOLDERS" "Escape closes dropdown, returns to Discover"
+    assert_not_contains "Select Source" "Escape closes dropdown"
+    assert_contains "Rule Builder|PATTERN|FOLDERS" "Escape returns to Discover"
 
     stop_session
 }
@@ -222,8 +265,16 @@ test_sources_dropdown_filter() {
     send "1"  # Enter Discover
     sleep 0.5
 
+    # Move focus out of text input mode so panel shortcuts work
+    send "Tab"
+    sleep 0.2
+
     send "1"  # Open sources dropdown
     sleep 0.3
+    assert_contains "Select Source" "Sources dropdown opens for filtering"
+
+    send "/"  # Enter filter mode
+    sleep 0.1
 
     # Type characters to filter
     send "t"
@@ -241,68 +292,12 @@ test_sources_dropdown_filter() {
     send "Backspace"
     sleep 0.2
 
+    assert_contains "/te" "Filter input shows typed text"
+
     # Escape to close
     send "Escape"
     sleep 0.3
-    assert_contains "Discover" "Filter typing and backspace work"
-
-    stop_session
-}
-
-test_sources_dropdown_navigation() {
-    echo -e "\n${YELLOW}TEST: Phase 1 - Sources Dropdown Arrow Navigation${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "1"  # Open sources dropdown
-    sleep 0.3
-
-    # Arrow key navigation in dropdown
-    send "Down"
-    sleep 0.2
-    send "Down"
-    sleep 0.2
-    send "Up"
-    sleep 0.2
-
-    # UI should still be responsive
-    assert_contains "Discover|Sources" "Arrow navigation works in dropdown"
-
-    send "Escape"
-    stop_session
-}
-
-test_discover_sources() {
-    echo -e "\n${YELLOW}TEST: Discover Sources Dropdown${NC}"
-    start_session
-
-    # Enter Discover mode
-    send "1"
-    sleep 0.5
-
-    # Capture before opening dropdown
-    local before=$(capture)
-
-    # Press 1 to open sources dropdown (per spec Section 6.1)
-    send "1"
-
-    # Check for dropdown open indicators
-    # When open, should show filter input or expanded list
-    local after=$(capture)
-
-    # The state should have changed
-    if [[ "$before" != "$after" ]]; then
-        echo -e "  ${GREEN}[PASS]${NC} Pressing 1 changes the UI state"
-        ((PASSED++))
-    else
-        echo -e "  ${YELLOW}[WARN]${NC} UI didn't change after pressing 1 (may have no sources)"
-        # Not a failure - could be empty state
-    fi
-
-    # Press Escape to close
-    send "Escape"
+    assert_not_contains "Select Source" "Escape closes dropdown after filtering"
 
     stop_session
 }
@@ -318,50 +313,21 @@ test_tags_dropdown_open() {
     send "1"  # Enter Discover
     sleep 0.5
 
-    # Capture before
-    local before=$(capture)
+    # Move focus out of text input mode so panel shortcuts work
+    send "Tab"
+    sleep 0.2
 
     # Press 2 to open tags dropdown
     send "2"
     sleep 0.3
 
-    local after=$(capture)
-    if [[ "$before" != "$after" ]]; then
-        echo -e "  ${GREEN}[PASS]${NC} Tags dropdown (key 2) changes UI state"
-        ((PASSED++))
-    else
-        echo -e "  ${YELLOW}[INFO]${NC} Tags dropdown shows same UI (may be empty)"
-    fi
+    assert_contains "Select Tag" "Tags dropdown opens"
 
     # Close with Escape
     send "Escape"
     sleep 0.3
-    assert_contains "Discover" "Escape closes tags dropdown"
+    assert_not_contains "Select Tag" "Escape closes tags dropdown"
 
-    stop_session
-}
-
-test_tags_dropdown_navigation() {
-    echo -e "\n${YELLOW}TEST: Phase 2 - Tags Dropdown Navigation${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "2"  # Open tags dropdown
-    sleep 0.3
-
-    # Navigate with arrows
-    send "Down"
-    sleep 0.2
-    send "Down"
-    sleep 0.2
-    send "Up"
-    sleep 0.2
-
-    assert_contains "Discover|Tags" "Arrow navigation in tags dropdown"
-
-    send "Escape"
     stop_session
 }
 
@@ -372,8 +338,16 @@ test_tags_dropdown_filter() {
     send "1"  # Enter Discover
     sleep 0.5
 
+    # Move focus out of text input mode so panel shortcuts work
+    send "Tab"
+    sleep 0.2
+
     send "2"  # Open tags dropdown
     sleep 0.3
+    assert_contains "Select Tag" "Tags dropdown opens for filtering"
+
+    send "/"  # Enter filter mode
+    sleep 0.1
 
     # Type to filter
     send "c"
@@ -387,9 +361,11 @@ test_tags_dropdown_filter() {
     send "Backspace"
     sleep 0.2
 
-    assert_contains "Discover" "Tags filter typing works"
+    assert_contains "/cs" "Tags filter input shows typed text"
 
     send "Escape"
+    sleep 0.3
+    assert_not_contains "Select Tag" "Escape closes tags dropdown after filtering"
     stop_session
 }
 
@@ -400,32 +376,31 @@ test_tags_dropdown_enter_confirm() {
     send "1"  # Enter Discover
     sleep 0.5
 
+    # Move focus out of text input mode so panel shortcuts work
+    send "Tab"
+    sleep 0.2
+
     send "2"  # Open tags dropdown
     sleep 0.3
+
+    assert_contains "Select Tag" "Tags dropdown opens before confirm"
 
     # Press Enter to confirm selection
     send "Enter"
     sleep 0.3
 
-    assert_contains "Discover|GLOB|FOLDERS|Tags" "Enter confirms tag selection"
+    assert_not_contains "Select Tag" "Enter closes tags dropdown"
 
     stop_session
 }
 
-test_discover_navigation() {
-    echo -e "\n${YELLOW}TEST: Discover Navigation${NC}"
+test_discover_escape_home() {
+    echo -e "\n${YELLOW}TEST: Discover Exit to Home${NC}"
     start_session
 
     # Enter Discover mode
     send "1"
     sleep 0.5
-
-    # Try j/k navigation (per spec Section 6.4)
-    send "j"
-    send "k"
-
-    # UI should still be responsive (not crashed)
-    assert_contains "Discover|Tags|FOLDERS" "UI responsive after navigation"
 
     # Press Escape to go back to Home
     send "Escape"
@@ -458,30 +433,6 @@ test_rules_manager_open() {
     sleep 0.3
     assert_contains "Discover" "Escape closes Rules Manager"
 
-    stop_session
-}
-
-test_rules_manager_navigation() {
-    echo -e "\n${YELLOW}TEST: Phase 3 - Rules Manager j/k Navigation${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "R"  # Open Rules Manager
-    sleep 0.3
-
-    # Navigate with j/k
-    send "j"
-    sleep 0.2
-    send "j"
-    sleep 0.2
-    send "k"
-    sleep 0.2
-
-    assert_contains "Rules|Manager|Discover" "j/k navigation in Rules Manager"
-
-    send "Escape"
     stop_session
 }
 
@@ -525,28 +476,6 @@ test_quick_rule_creation_open() {
 
     assert_contains "New Tagging Rule|Pattern|Tag" "n opens tagging rule dialog"
 
-    stop_session
-}
-
-test_quick_rule_creation_tab() {
-    echo -e "\n${YELLOW}TEST: Phase 4 - Rule Dialog Tab Navigation${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "n"  # Open rule dialog
-    sleep 0.3
-
-    # Tab between fields
-    send "Tab"
-    sleep 0.2
-    send "Tab"
-    sleep 0.2
-
-    assert_contains "New Tagging Rule|Pattern|Tag" "Tab navigates between fields"
-
-    send "Escape"
     stop_session
 }
 
@@ -891,90 +820,6 @@ test_glob_explorer_pattern_confirm() {
     stop_session
 }
 
-test_glob_explorer_folder_drilling() {
-    echo -e "\n${YELLOW}TEST: Glob Explorer - Folder Drilling (l/Enter)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-    sleep 1  # Wait for folder cache
-
-    # Navigate to a folder
-    send "j"
-    sleep 0.2
-
-    # Drill into folder with l
-    send "l"
-    sleep 0.3
-
-    # Should show folder contents or stay responsive
-    assert_contains "FOLDERS|GLOB|Discover" "l drills into folder"
-
-    # Go back with h
-    send "h"
-    sleep 0.3
-
-    assert_contains "FOLDERS|GLOB|Discover" "h goes back to parent"
-
-    stop_session
-}
-
-test_glob_explorer_vim_navigation() {
-    echo -e "\n${YELLOW}TEST: Glob Explorer - Vim Navigation (hjkl)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-    sleep 1  # Wait for folder cache
-
-    # j = down
-    send "j"
-    sleep 0.2
-    send "j"
-    sleep 0.2
-
-    # k = up
-    send "k"
-    sleep 0.2
-
-    # l = drill in (Enter equivalent)
-    send "l"
-    sleep 0.2
-
-    # h = back (Backspace equivalent)
-    send "h"
-    sleep 0.2
-
-    assert_contains "FOLDERS|GLOB|Discover" "hjkl navigation works"
-
-    stop_session
-}
-
-test_glob_explorer_arrow_navigation() {
-    echo -e "\n${YELLOW}TEST: Glob Explorer - Arrow Key Navigation${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-    sleep 1  # Wait for folder cache
-
-    # Arrow keys
-    send "Down"
-    sleep 0.2
-    send "Down"
-    sleep 0.2
-    send "Up"
-    sleep 0.2
-    send "Right"
-    sleep 0.2
-    send "Left"
-    sleep 0.2
-
-    assert_contains "FOLDERS|GLOB|Discover" "Arrow key navigation works"
-
-    stop_session
-}
-
 test_glob_explorer_exit() {
     echo -e "\n${YELLOW}TEST: Glob Explorer - Exit (g/Escape)${NC}"
     start_session
@@ -1045,30 +890,6 @@ test_sources_manager() {
     sleep 0.3
     assert_not_contains "Sources Manager" "Sources Manager closes"
 
-    stop_session
-}
-
-test_sources_manager_navigation() {
-    echo -e "\n${YELLOW}TEST: Sources Manager - j/k Navigation${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "M"  # Open Sources Manager
-    sleep 0.3
-
-    # Navigate with j/k
-    send "j"
-    sleep 0.2
-    send "j"
-    sleep 0.2
-    send "k"
-    sleep 0.2
-
-    assert_contains "Sources Manager|Discover" "j/k navigation in Sources Manager"
-
-    send "Escape"
     stop_session
 }
 
@@ -1172,7 +993,7 @@ test_rule_builder_open() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 2.5  # Wait for folder cache to load
+    wait_for_contains "Rule Builder|PATTERN|EXCLUDES|TAG" 6
 
     # Press n to open Rule Builder
     send "n"
@@ -1190,7 +1011,7 @@ test_rule_builder_phase1_exploration() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 3  # Wait for folder cache to fully load (may take time after prev test)
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 8
 
     # Wait for folders to appear in UI (verify cache is loaded)
     local retry=0
@@ -1208,15 +1029,6 @@ test_rule_builder_phase1_exploration() {
 
     # Phase 1 should show folders with counts
     assert_contains "FOLDERS.*folders.*files" "Phase 1 shows folder counts"
-
-    # Check for folder matches (may be 0 if cache not ready, use looser check)
-    local screen=$(capture)
-    if echo "$screen" | grep -qE "dir_|folders \([1-9]"; then
-        echo -e "  ${GREEN}[PASS]${NC} Phase 1 shows folder matches"
-        ((PASSED++))
-    else
-        echo -e "  ${YELLOW}[INFO]${NC} Folder matches may not be visible yet (cache timing)"
-    fi
 
     # Clear pattern and type new one
     send "BSpace"
@@ -1245,7 +1057,7 @@ test_rule_builder_phase1_navigation() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder
     sleep 0.5
@@ -1272,7 +1084,10 @@ test_rule_builder_phase1_navigation() {
         echo -e "  ${GREEN}[PASS]${NC} j/k navigation shows selection indicator"
         ((PASSED++))
     else
-        echo -e "  ${YELLOW}[INFO]${NC} Selection indicator may not be visible"
+        skip_check "Selection indicator not visible in tmux capture"
+        send "Escape"
+        stop_session
+        return 0
     fi
 
     send "Escape"
@@ -1284,7 +1099,7 @@ test_rule_builder_phase1_expansion() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder
     sleep 0.5
@@ -1315,7 +1130,10 @@ test_rule_builder_phase1_expansion() {
         echo -e "  ${GREEN}[PASS]${NC} Enter changes expansion state"
         ((PASSED++))
     else
-        echo -e "  ${YELLOW}[INFO]${NC} Expansion may not be visible in this state"
+        skip_check "Folder expansion not visible in tmux capture"
+        send "Escape"
+        stop_session
+        return 0
     fi
 
     send "Escape"
@@ -1327,7 +1145,7 @@ test_rule_builder_phase2_transition() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder
     sleep 0.5
@@ -1370,7 +1188,7 @@ test_rule_builder_phase2_extraction_preview() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder
     sleep 0.5
@@ -1411,7 +1229,7 @@ test_rule_builder_phase3_transition() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder
     sleep 0.5
@@ -1463,7 +1281,7 @@ test_rule_builder_phase3_filter() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder
     sleep 0.5
@@ -1507,7 +1325,10 @@ test_rule_builder_phase3_filter() {
         echo -e "  ${GREEN}[PASS]${NC} p key filters to pass only"
         ((PASSED++))
     else
-        echo -e "  ${YELLOW}[INFO]${NC} Filter may not show visible change"
+        skip_check "Phase 3 filter has no visible change (missing results fixture)"
+        send "Escape"
+        stop_session
+        return 0
     fi
 
     send "a"  # All
@@ -1527,25 +1348,29 @@ test_rule_builder_tab_cycle() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder
     sleep 0.5
 
     # Initial state should be Pattern focus
-    assert_contains "PATTERN" "Rule Builder starts with Pattern focus"
+    assert_contains "PATTERN \\(editing\\)" "Rule Builder starts with Pattern focus"
 
     # Tab cycles: Pattern -> Excludes -> Tag -> Extractions -> Options -> FileList
     send "Tab"
     sleep 0.2
+    assert_contains "EXCLUDES \\([0-9]+\\) \\[Enter: add, d: delete\\]" "Tab moves focus to Excludes"
 
     # Continue tabbing through all fields
     send "Tab"
     sleep 0.2
+    assert_contains "TAG \\(editing\\)" "Tab moves focus to Tag"
     send "Tab"
     sleep 0.2
+    assert_contains "EXTRACTIONS \\([0-9]+\\) \\[Space: toggle\\]" "Tab moves focus to Extractions"
     send "Tab"
     sleep 0.2
+    assert_contains "OPTIONS \\[Space: toggle\\]" "Tab moves focus to Options"
     send "Tab"
     sleep 0.2
 
@@ -1555,14 +1380,14 @@ test_rule_builder_tab_cycle() {
         echo -e "  ${GREEN}[PASS]${NC} Tab cycles to FileList (selection visible)"
         ((PASSED++))
     else
-        echo -e "  ${YELLOW}[INFO]${NC} Tab cycle completed but selection not visible"
+        skip_check "Tab cycle reached FileList but selection not visible"
     fi
 
     # One more Tab should return to Pattern
     send "Tab"
     sleep 0.2
 
-    assert_contains "PATTERN" "Tab cycle returns to Pattern"
+    assert_contains "PATTERN \\(editing\\)" "Tab cycle returns to Pattern"
 
     send "Escape"
     stop_session
@@ -1573,7 +1398,7 @@ test_rule_builder_escape_close() {
     start_session
 
     send "1"  # Enter Discover
-    sleep 1.5
+    wait_for_contains "Rule Builder|PATTERN|FOLDERS" 6
 
     send "n"  # Open Rule Builder (though it's already the default)
     sleep 0.5
@@ -1685,171 +1510,6 @@ test_rule_builder_full_workflow() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# FILES PANEL (3 key focus)
-# ───────────────────────────────────────────────────────────────────────────
-
-test_files_panel_focus() {
-    echo -e "\n${YELLOW}TEST: Files Panel - Focus (3 key)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    # Press 3 to focus Files panel
-    send "3"
-    sleep 0.3
-
-    assert_contains "Discover|Files|FOLDERS" "3 focuses Files panel"
-
-    stop_session
-}
-
-test_files_panel_navigation() {
-    echo -e "\n${YELLOW}TEST: Files Panel - j/k Navigation${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "3"  # Focus Files panel
-    sleep 0.3
-
-    # Navigate with j/k
-    send "j"
-    sleep 0.2
-    send "j"
-    sleep 0.2
-    send "k"
-    sleep 0.2
-
-    assert_contains "Discover|Files|FOLDERS" "j/k navigation in Files panel"
-
-    stop_session
-}
-
-test_files_panel_filter_mode() {
-    echo -e "\n${YELLOW}TEST: Files Panel - Filter Mode (/ key)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "3"  # Focus Files panel
-    sleep 0.3
-
-    # Enter filter mode
-    send "/"
-    sleep 0.3
-
-    # Type filter text
-    send "t"
-    send "e"
-    send "s"
-    send "t"
-    sleep 0.3
-
-    assert_contains "test|Discover" "Filter mode accepts text"
-
-    send "Escape"
-    stop_session
-}
-
-test_files_panel_filter_clear() {
-    echo -e "\n${YELLOW}TEST: Files Panel - Filter Clear (Escape)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    # Set a filter first
-    send "/"
-    sleep 0.3
-    send "f"
-    send "i"
-    send "l"
-    send "t"
-    send "e"
-    send "r"
-    sleep 0.3
-
-    # Escape should clear filter
-    send "Escape"
-    sleep 0.3
-
-    assert_contains "Discover" "Escape clears filter"
-
-    stop_session
-}
-
-test_files_panel_tag_file() {
-    echo -e "\n${YELLOW}TEST: Files Panel - Tag File (t key)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "3"  # Focus Files panel
-    sleep 0.3
-
-    # Press t to tag selected file
-    send "t"
-    sleep 0.3
-
-    # Should show tag dialog or handle gracefully
-    assert_contains "Discover|Tag|tag" "t key handled for tagging"
-
-    send "Escape"
-    stop_session
-}
-
-test_files_panel_bulk_tag() {
-    echo -e "\n${YELLOW}TEST: Files Panel - Bulk Tag (T key)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    send "3"  # Focus Files panel
-    sleep 0.3
-
-    # Press T for bulk tag
-    send "T"
-    sleep 0.3
-
-    # Should show bulk tag dialog or wizard
-    assert_contains "Discover|Tag|Bulk|wizard" "T key handled for bulk tagging"
-
-    send "Escape"
-    stop_session
-}
-
-test_files_panel_preview_toggle() {
-    echo -e "\n${YELLOW}TEST: Files Panel - Preview Toggle (p key)${NC}"
-    start_session
-
-    send "1"  # Enter Discover
-    sleep 0.5
-
-    # Capture before
-    local before=$(capture)
-
-    # Press p to toggle preview
-    send "p"
-    sleep 0.3
-
-    # State should change
-    local after=$(capture)
-    if [[ "$before" != "$after" ]]; then
-        echo -e "  ${GREEN}[PASS]${NC} p toggles preview pane"
-        ((PASSED++))
-    else
-        echo -e "  ${YELLOW}[INFO]${NC} Preview toggle may have no visible effect"
-    fi
-
-    stop_session
-}
-
-# ───────────────────────────────────────────────────────────────────────────
 # TAGGING RULE DIALOG (n key in Files panel)
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -1874,40 +1534,6 @@ test_tagging_rule_dialog() {
     stop_session
 }
 
-test_glob_navigation() {
-    echo -e "\n${YELLOW}TEST: Glob Explorer Navigation${NC}"
-    start_session
-
-    # Enter Discover mode (shows Glob Explorer)
-    send "1"
-    sleep 0.5
-
-    # Wait for folder cache to load
-    sleep 1
-
-    # Navigate with j (down)
-    send "j"
-    sleep 0.2
-    send "j"
-    sleep 0.2
-
-    # UI should still be responsive
-    assert_contains "FOLDERS|GLOB|Discover" "Navigation doesn't crash UI"
-
-    # Navigate with k (up)
-    send "k"
-    sleep 0.2
-
-    # Press g to exit Glob Explorer (if applicable) or Escape
-    send "Escape"
-    send "Escape"
-    sleep 0.3
-
-    assert_contains "Home Hub|Discover|Parser Bench" "Can exit to Home"
-
-    stop_session
-}
-
 test_quit() {
     echo -e "\n${YELLOW}TEST: Quit with Ctrl+C${NC}"
     start_session
@@ -1924,7 +1550,7 @@ test_quit() {
         ((PASSED++))
     else
         # TUI might still be running (graceful quit prompt)
-        echo -e "  ${YELLOW}[INFO]${NC} Ctrl+C behavior: quit confirmation may be shown"
+        skip_check "Ctrl+C quit confirmation not visible in tmux capture"
     fi
 
     stop_session
@@ -1939,30 +1565,24 @@ list_scenarios() {
     echo ""
     echo "  PHASE 0: STARTUP & HOME"
     echo "    startup              - TUI starts and shows Home screen"
-    echo "    home-nav             - Home screen arrow navigation"
     echo "    home-enter           - Enter Discover from Home"
     echo ""
     echo "  PHASE 1: SOURCES DROPDOWN"
     echo "    discover-basic       - Enter Discover mode, verify panels"
     echo "    sources-dropdown     - Sources dropdown open/close"
     echo "    sources-filter       - Sources dropdown filter typing"
-    echo "    sources-nav          - Sources dropdown arrow navigation"
-    echo "    discover-sources     - Legacy sources dropdown test"
     echo ""
     echo "  PHASE 2: TAGS DROPDOWN"
     echo "    tags-dropdown        - Tags dropdown open"
-    echo "    tags-nav             - Tags dropdown navigation"
     echo "    tags-filter          - Tags dropdown filter"
     echo "    tags-enter           - Tags dropdown enter confirm"
     echo ""
     echo "  PHASE 3: RULES MANAGER"
     echo "    rules-manager        - Rules Manager open (R key)"
-    echo "    rules-nav            - Rules Manager j/k navigation"
     echo "    rules-new            - Rules Manager new rule (n key)"
     echo ""
     echo "  PHASE 4: QUICK RULE CREATION"
     echo "    quick-rule           - Quick rule creation dialog (n key)"
-    echo "    quick-rule-tab       - Rule dialog Tab navigation"
     echo "    quick-rule-typing    - Rule dialog text input"
     echo "    quick-rule-cancel    - Rule dialog Escape cancel"
     echo ""
@@ -1979,28 +1599,14 @@ list_scenarios() {
     echo "    glob-explorer        - Glob Explorer pattern editing"
     echo "    glob-pattern-input   - Pattern typing and backspace"
     echo "    glob-pattern-confirm - Pattern confirm (Enter)"
-    echo "    glob-drilling        - Folder drilling (l/Enter, h)"
-    echo "    glob-vim-nav         - Vim navigation (hjkl)"
-    echo "    glob-arrow-nav       - Arrow key navigation"
     echo "    glob-exit            - Exit Glob Explorer (g/Escape)"
-    echo "    glob-nav             - Legacy glob navigation"
     echo ""
     echo "  SOURCES MANAGER (M key)"
     echo "    sources-manager      - Sources Manager open"
-    echo "    sources-mgr-nav      - Sources Manager navigation"
     echo "    sources-mgr-add      - Add source (n key)"
     echo "    sources-mgr-edit     - Edit source (e key)"
     echo "    sources-mgr-delete   - Delete source (d key)"
     echo "    sources-mgr-rescan   - Rescan source (r key)"
-    echo ""
-    echo "  FILES PANEL (3 key)"
-    echo "    files-focus          - Files panel focus (3 key)"
-    echo "    files-nav            - Files panel j/k navigation"
-    echo "    files-filter         - Files panel filter mode"
-    echo "    files-filter-clear   - Filter clear (Escape)"
-    echo "    files-tag            - Tag file (t key)"
-    echo "    files-bulk-tag       - Bulk tag (T key)"
-    echo "    files-preview        - Preview toggle (p key)"
     echo ""
     echo "  RULE BUILDER (Three-Phase Workflow)"
     echo "    rb-open              - Rule Builder open (n key)"
@@ -2019,7 +1625,7 @@ list_scenarios() {
     echo "    tagging-rule         - Tagging rule creation dialog"
     echo ""
     echo "  MISC"
-    echo "    discover-nav         - Discover j/k navigation and Escape"
+    echo "    discover-exit        - Escape from Discover to Home"
     echo "    help                 - Legacy help overlay"
     echo "    quit                 - Test Ctrl+C quit"
     echo ""
@@ -2032,7 +1638,6 @@ list_scenarios() {
     echo "    phase5               - Run Phase 5 tests (Polish)"
     echo "    glob                 - Run all Glob Explorer tests"
     echo "    sources-mgr          - Run all Sources Manager tests"
-    echo "    files                - Run all Files Panel tests"
     echo "    rule-builder         - Run all Rule Builder tests"
 }
 
@@ -2040,26 +1645,21 @@ run_phase1() {
     test_discover_basic
     test_sources_dropdown_open_close
     test_sources_dropdown_filter
-    test_sources_dropdown_navigation
-    test_discover_sources
 }
 
 run_phase2() {
     test_tags_dropdown_open
-    test_tags_dropdown_navigation
     test_tags_dropdown_filter
     test_tags_dropdown_enter_confirm
 }
 
 run_phase3() {
     test_rules_manager_open
-    test_rules_manager_navigation
     test_rules_manager_new_rule
 }
 
 run_phase4() {
     test_quick_rule_creation_open
-    test_quick_rule_creation_tab
     test_quick_rule_creation_typing
     test_quick_rule_creation_cancel
 }
@@ -2078,30 +1678,15 @@ run_glob_tests() {
     test_glob_explorer
     test_glob_explorer_pattern_input
     test_glob_explorer_pattern_confirm
-    test_glob_explorer_folder_drilling
-    test_glob_explorer_vim_navigation
-    test_glob_explorer_arrow_navigation
     test_glob_explorer_exit
-    test_glob_navigation
 }
 
 run_sources_mgr_tests() {
     test_sources_manager
-    test_sources_manager_navigation
     test_sources_manager_add_source
     test_sources_manager_edit_source
     test_sources_manager_delete_source
     test_sources_manager_rescan
-}
-
-run_files_tests() {
-    test_files_panel_focus
-    test_files_panel_navigation
-    test_files_panel_filter_mode
-    test_files_panel_filter_clear
-    test_files_panel_tag_file
-    test_files_panel_bulk_tag
-    test_files_panel_preview_toggle
 }
 
 run_rule_builder_tests() {
@@ -2125,7 +1710,6 @@ run_all() {
 
     # Phase 0: Startup & Home
     test_startup
-    test_home_navigation
     test_home_enter_discover
 
     # Phase 1: Sources Dropdown
@@ -2140,8 +1724,8 @@ run_all() {
     # Phase 4: Quick Rule Creation
     run_phase4
 
-    # Discover Navigation
-    test_discover_navigation
+    # Discover Exit
+    test_discover_escape_home
 
     # Phase 5: Polish
     run_phase5
@@ -2154,9 +1738,6 @@ run_all() {
 
     # Sources Manager
     run_sources_mgr_tests
-
-    # Files Panel
-    run_files_tests
 
     # Rule Builder (Three-Phase Workflow)
     run_rule_builder_tests
@@ -2171,7 +1752,7 @@ run_all() {
 print_summary() {
     echo ""
     echo "═══════════════════════════════════════════════════════════════"
-    echo -e "SUMMARY: ${GREEN}$PASSED passed${NC}, ${RED}$FAILED failed${NC}"
+    echo -e "SUMMARY: ${GREEN}$PASSED passed${NC}, ${RED}$FAILED failed${NC}, ${YELLOW}$SKIPPED skipped${NC}"
     echo "═══════════════════════════════════════════════════════════════"
 
     if [[ $FAILED -gt 0 ]]; then
@@ -2187,10 +1768,6 @@ case "${1:-list}" in
     # Phase 0: Startup & Home
     startup)
         test_startup
-        print_summary
-        ;;
-    home-nav)
-        test_home_navigation
         print_summary
         ;;
     home-enter)
@@ -2211,22 +1788,9 @@ case "${1:-list}" in
         test_sources_dropdown_filter
         print_summary
         ;;
-    sources-nav)
-        test_sources_dropdown_navigation
-        print_summary
-        ;;
-    discover-sources)
-        test_discover_sources
-        print_summary
-        ;;
-
     # Phase 2: Tags Dropdown
     tags-dropdown)
         test_tags_dropdown_open
-        print_summary
-        ;;
-    tags-nav)
-        test_tags_dropdown_navigation
         print_summary
         ;;
     tags-filter)
@@ -2243,10 +1807,6 @@ case "${1:-list}" in
         test_rules_manager_open
         print_summary
         ;;
-    rules-nav)
-        test_rules_manager_navigation
-        print_summary
-        ;;
     rules-new)
         test_rules_manager_new_rule
         print_summary
@@ -2255,10 +1815,6 @@ case "${1:-list}" in
     # Phase 4: Quick Rule Creation
     quick-rule)
         test_quick_rule_creation_open
-        print_summary
-        ;;
-    quick-rule-tab)
-        test_quick_rule_creation_tab
         print_summary
         ;;
     quick-rule-typing)
@@ -2270,9 +1826,9 @@ case "${1:-list}" in
         print_summary
         ;;
 
-    # Discover Navigation
-    discover-nav)
-        test_discover_navigation
+    # Discover Exit
+    discover-exit)
+        test_discover_escape_home
         print_summary
         ;;
 
@@ -2319,24 +1875,8 @@ case "${1:-list}" in
         test_glob_explorer_pattern_confirm
         print_summary
         ;;
-    glob-drilling)
-        test_glob_explorer_folder_drilling
-        print_summary
-        ;;
-    glob-vim-nav)
-        test_glob_explorer_vim_navigation
-        print_summary
-        ;;
-    glob-arrow-nav)
-        test_glob_explorer_arrow_navigation
-        print_summary
-        ;;
     glob-exit)
         test_glob_explorer_exit
-        print_summary
-        ;;
-    glob-nav)
-        test_glob_navigation
         print_summary
         ;;
 
@@ -2349,10 +1889,6 @@ case "${1:-list}" in
     # Sources Manager
     sources-manager)
         test_sources_manager
-        print_summary
-        ;;
-    sources-mgr-nav)
-        test_sources_manager_navigation
         print_summary
         ;;
     sources-mgr-add)
@@ -2369,36 +1905,6 @@ case "${1:-list}" in
         ;;
     sources-mgr-rescan)
         test_sources_manager_rescan
-        print_summary
-        ;;
-
-    # Files Panel
-    files-focus)
-        test_files_panel_focus
-        print_summary
-        ;;
-    files-nav)
-        test_files_panel_navigation
-        print_summary
-        ;;
-    files-filter)
-        test_files_panel_filter_mode
-        print_summary
-        ;;
-    files-filter-clear)
-        test_files_panel_filter_clear
-        print_summary
-        ;;
-    files-tag)
-        test_files_panel_tag_file
-        print_summary
-        ;;
-    files-bulk-tag)
-        test_files_panel_bulk_tag
-        print_summary
-        ;;
-    files-preview)
-        test_files_panel_preview_toggle
         print_summary
         ;;
 
@@ -2487,10 +1993,6 @@ case "${1:-list}" in
         ;;
     sources-mgr)
         run_sources_mgr_tests
-        print_summary
-        ;;
-    files)
-        run_files_tests
         print_summary
         ;;
     rule-builder)

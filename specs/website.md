@@ -15,7 +15,7 @@ Multi-page marketing site for Casparian Flow - a local-first data platform that 
 - `/defense` - Air-Gapped Processing (Coming Soon - waitlist)
 - `/legal` - eDiscovery Processing (Coming Soon - waitlist)
 
-**Launch Strategy:** Finance first, expand based on waitlist demand and paying customers.
+**Launch Strategy:** DFIR first, expand based on waitlist demand and paying customers. See STRATEGY.md for vertical priority stack.
 
 **Platform:** Carrd.co Pro (supports multiple pages)
 
@@ -1107,4 +1107,4 @@ Launch
 
 ---
 
-*This document is the system of record for website content and structure. Strategy lives in STRATEGY.md. Pricing lives in docs/product/pricing_v2_refined.md.*
+*This document is the system of record for website content and structure. Strategy lives in STRATEGY.md. Pricing lives in docs/product/pricing.md.*

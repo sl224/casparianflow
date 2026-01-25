@@ -3,6 +3,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tui-env.sh"
+
 OUT_DIR=".test_output/tui_tmux_captures"
 SCENARIO="critical_path"
 SESSION="tui"
@@ -104,4 +107,3 @@ capture_step "jobs_drawer" "J"
 capture_step "jobs" "J"
 
 capture_step "query" "6"
-

@@ -15,6 +15,9 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tui-env.sh"
+
 SESSION="tui"
 WIDTH=120
 HEIGHT=40
@@ -57,7 +60,7 @@ cmd_start() {
     fi
 
     log_info "Starting tmux session '$SESSION' (${WIDTH}x${HEIGHT})"
-    tmux new-session -d -s "$SESSION" -x "$WIDTH" -y "$HEIGHT" "$BINARY tui"
+    tmux new-session -d -s "$SESSION" -x "$WIDTH" -y "$HEIGHT" "CASPARIAN_HOME=\"$CASPARIAN_HOME\" \"$BINARY\" tui"
     sleep 1
     log_success "Session started"
     cmd_capture

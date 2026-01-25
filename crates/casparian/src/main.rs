@@ -469,6 +469,12 @@ enum Commands {
         args: cli::tui::snapshot_export::TuiSnapshotArgs,
     },
 
+    /// Run deterministic TUI flows (headless)
+    TuiFlow {
+        #[command(subcommand)]
+        command: cli::tui::flow_runner::TuiFlowCommand,
+    },
+
     /// MCP (Model Context Protocol) server for AI tool integration
     Mcp {
         #[command(subcommand)]
@@ -821,6 +827,7 @@ fn run_command(cli: Cli, telemetry: Option<TelemetryRecorder>) -> Result<()> {
         Commands::Config { json } => cli::config::run(cli::config::ConfigArgs { json }),
         Commands::Tui { args } => cli::tui::run(args, telemetry),
         Commands::TuiSnapshots { args } => cli::tui::snapshot_export::run(args),
+        Commands::TuiFlow { command } => cli::tui::flow_runner::run(command),
         Commands::Mcp { action } => cli::mcp::run(action),
         Commands::SupportBundle(args) => cli::support_bundle::run(args),
         Commands::Tape { command } => cli::tape::run_tape_command(command),
@@ -988,6 +995,7 @@ fn get_command_name(cmd: &Commands) -> String {
         Commands::Config { .. } => "Config".to_string(),
         Commands::Tui { .. } => "Tui".to_string(),
         Commands::TuiSnapshots { .. } => "TuiSnapshots".to_string(),
+        Commands::TuiFlow { .. } => "TuiFlow".to_string(),
         Commands::Mcp { .. } => "Mcp".to_string(),
         Commands::SupportBundle(_) => "SupportBundle".to_string(),
         Commands::Tape { .. } => "Tape".to_string(),
@@ -1018,6 +1026,11 @@ fn build_command_payload(cmd: &Commands, writer: &TapeWriter) -> serde_json::Val
         }
         Commands::Config { .. } => {
             serde_json::json!({})
+        }
+        Commands::TuiFlow { command } => {
+            serde_json::json!({
+                "command": format!("{:?}", command),
+            })
         }
         Commands::Files { source, topic, .. } => {
             serde_json::json!({

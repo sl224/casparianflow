@@ -14667,6 +14667,7 @@ mod tests {
     use std::time::Duration;
     use std::sync::Mutex;
     use crate::cli::context;
+    use crate::cli::tui::flow_record::RecordRedaction;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -14676,6 +14677,9 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("casparian_test_{}.duckdb", uuid::Uuid::new_v4())),
             ),
+            record_flow: None,
+            record_redaction: RecordRedaction::Plaintext,
+            record_checkpoint_every: None,
         }
     }
 
@@ -14775,6 +14779,9 @@ mod tests {
 
         let args = TuiArgs {
             database: Some(db_path),
+            record_flow: None,
+            record_redaction: RecordRedaction::Plaintext,
+            record_checkpoint_every: None,
         };
         let mut app = App::new(args, None);
         app.ensure_active_workspace();

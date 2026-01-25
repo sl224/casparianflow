@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "env": {
+    "terminal": {
+      "width": 120,
+      "height": 40
+    },
+    "fixture": {
+      "name": "Fixture Source",
+      "path": "fixture_tree"
+    }
+  },
+  "steps": [
+    {
+      "type": "key",
+      "key": "1",
+      "label": "go discover"
+    },
+    {
+      "type": "wait",
+      "ms": 2000,
+      "until": {
+        "plain_contains": "Source: Fixture Source"
+      },
+      "label": "wait for sources"
+    },
+    {
+      "type": "key",
+      "key": "Tab",
+      "label": "exit pattern input"
+    },
+    {
+      "type": "key",
+      "key": "1",
+      "label": "open sources dropdown"
+    },
+    {
+      "type": "wait",
+      "ms": 500,
+      "until": {
+        "plain_contains": "Select Source"
+      },
+      "label": "wait for sources dropdown"
+    },
+    {
+      "type": "text",
+      "text": "/fixture",
+      "label": "filter sources"
+    },
+    {
+      "type": "assert",
+      "plain_contains": "/fixture",
+      "label": "filter text visible"
+    },
+    {
+      "type": "key",
+      "key": "Enter",
+      "label": "exit filter mode"
+    },
+    {
+      "type": "assert",
+      "plain_contains": "Enter:clear",
+      "label": "filter applied"
+    },
+    {
+      "type": "key",
+      "key": "Enter",
+      "label": "select source"
+    },
+    {
+      "type": "assert",
+      "plain_not_contains": "Select Source",
+      "label": "dropdown closed"
+    },
+    {
+      "type": "assert",
+      "plain_contains": "Source: Fixture Source",
+      "label": "source selected"
+    }
+  ]
+}

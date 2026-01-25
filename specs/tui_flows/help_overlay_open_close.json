@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "env": {
+    "terminal": {
+      "width": 120,
+      "height": 40
+    },
+    "fixture": {
+      "name": "Fixture Source",
+      "path": "fixture_tree"
+    }
+  },
+  "steps": [
+    {
+      "type": "key",
+      "key": "1",
+      "label": "go discover"
+    },
+    {
+      "type": "wait",
+      "ms": 1500,
+      "until": {
+        "plain_contains": "Source: Fixture Source"
+      },
+      "label": "wait for sources"
+    },
+    {
+      "type": "key",
+      "key": "Tab",
+      "label": "exit pattern input"
+    },
+    {
+      "type": "key",
+      "key": "?",
+      "label": "open help overlay"
+    },
+    {
+      "type": "assert",
+      "layout_contains": "help_overlay",
+      "label": "help overlay visible"
+    },
+    {
+      "type": "key",
+      "key": "?",
+      "label": "close help overlay"
+    },
+    {
+      "type": "assert",
+      "layout_not_contains": "help_overlay",
+      "label": "help overlay closed"
+    }
+  ]
+}

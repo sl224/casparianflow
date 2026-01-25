@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "env": {
+    "terminal": {
+      "width": 120,
+      "height": 40
+    },
+    "fixture": {
+      "name": "Fixture Source",
+      "path": "fixture_tree"
+    }
+  },
+  "steps": [
+    {
+      "type": "key",
+      "key": "1",
+      "label": "go discover"
+    },
+    {
+      "type": "wait",
+      "ms": 2000,
+      "until": {
+        "plain_contains": "Source: Fixture Source"
+      },
+      "label": "wait for sources"
+    },
+    {
+      "type": "key",
+      "key": "Tab",
+      "label": "exit pattern input"
+    },
+    {
+      "type": "key",
+      "key": "s",
+      "label": "open scan dialog"
+    },
+    {
+      "type": "wait",
+      "ms": 500,
+      "until": {
+        "plain_contains": "Add Source"
+      },
+      "label": "wait for scan dialog"
+    },
+    {
+      "type": "key",
+      "key": "Enter",
+      "label": "start scan"
+    },
+    {
+      "type": "wait",
+      "ms": 1000,
+      "until": {
+        "plain_contains": "Scanning"
+      },
+      "label": "scan started"
+    },
+    {
+      "type": "key",
+      "key": "Esc",
+      "label": "cancel scan"
+    },
+    {
+      "type": "wait",
+      "ms": 500,
+      "until": {
+        "plain_contains": "Scan cancelled"
+      },
+      "label": "scan cancelled"
+    },
+    {
+      "type": "key",
+      "key": "s",
+      "label": "open scan dialog again"
+    },
+    {
+      "type": "wait",
+      "ms": 500,
+      "until": {
+        "plain_contains": "Add Source"
+      },
+      "label": "wait for scan dialog"
+    },
+    {
+      "type": "key",
+      "key": "Enter",
+      "label": "start scan again"
+    },
+    {
+      "type": "wait",
+      "ms": 1000,
+      "until": {
+        "plain_contains": "Scanning"
+      },
+      "label": "scan started again"
+    },
+    {
+      "type": "key",
+      "key": "Esc",
+      "label": "cancel scan again"
+    },
+    {
+      "type": "wait",
+      "ms": 500,
+      "until": {
+        "plain_contains": "Scan cancelled"
+      },
+      "label": "scan cancelled again"
+    }
+  ]
+}

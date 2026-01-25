@@ -42,6 +42,22 @@ cargo run -p casparian -- tui-snapshots --out .test_output/tui_snapshots
 - 120x40
 - 160x50
 
+## Flow Recording (Headless Replay)
+
+Record real TUI sessions into a `TuiFlow` JSON for deterministic replay:
+
+```bash
+cargo run -p casparian -- tui --record-flow specs/tui_flows/my_session.json
+```
+
+**Redaction options:** `plaintext` (default), `hash`, `omit`
+
+**Checkpointing:** By default a checkpoint assertion is inserted every ~2000ms while recording.
+Disable with:
+```bash
+cargo run -p casparian -- tui --record-flow specs/tui_flows/my_session.json --record-checkpoint-every 0
+```
+
 ## Core Principles
 
 ### 1. Test What Users See

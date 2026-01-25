@@ -158,7 +158,7 @@ These competitors appear across multiple verticals:
 
 ## 4. Pricing Philosophy Comparison
 
-Pricing tiers and entry points are centralized in `docs/product/pricing_v2_refined.md`. Use those values for competitive framing and avoid restating tier prices here. Defense remains deployment-based; all other verticals follow the universal ladder.
+Pricing tiers and entry points are centralized in `docs/product/pricing.md`. Use those values for competitive framing and avoid restating tier prices here. Defense remains deployment-based; all other verticals follow the universal ladder.
 
 ---
 
