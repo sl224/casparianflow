@@ -676,7 +676,8 @@ impl JobQueue {
 
         anyhow::bail!(
             "Database schema for '{}' is missing columns: {}. \
-Delete the state store (default: ~/.casparian_flow/state.sqlite) and restart.",
+Manual reset required. Delete the state store (default: ~/.casparian_flow/state.sqlite) \
+or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
             table,
             missing.join(", ")
         );

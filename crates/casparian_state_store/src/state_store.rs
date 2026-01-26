@@ -99,8 +99,42 @@ impl StateStore {
         self.inner.artifacts()
     }
 
+    pub fn session_fast(&self) -> Result<StateStoreQueueSession> {
+        self.inner.session_fast()
+    }
+
+    pub fn session_bulk(&self) -> Result<StateStoreScoutSession> {
+        self.inner.session_bulk()
+    }
+
     pub fn schema_storage(&self) -> Result<SchemaStorage> {
         self.inner.schema_storage()
+    }
+}
+
+/// Thread-affine queue session for fast sentinel operations.
+pub struct StateStoreQueueSession {
+    queue: JobQueue,
+}
+
+impl StateStoreQueueSession {
+    pub fn claim_jobs(&self, limit: usize) -> Result<Vec<ProcessingJob>> {
+        self.queue.claim_jobs(limit)
+    }
+}
+
+/// Thread-affine scout session for bulk scan operations.
+pub struct StateStoreScoutSession {
+    scout: ScoutDatabase,
+}
+
+impl StateStoreScoutSession {
+    pub fn scout(&self) -> &ScoutDatabase {
+        &self.scout
+    }
+
+    pub fn scanner(&self, config: ScanConfig) -> Result<ScoutScanner> {
+        Ok(ScoutScanner::with_config(self.scout.clone(), config))
     }
 }
 
@@ -113,6 +147,8 @@ pub trait StateStoreBackend: Send + Sync {
     fn routing(&self) -> &dyn RoutingStore;
     fn scout(&self) -> &dyn ScoutStore;
     fn artifacts(&self) -> &dyn ArtifactStore;
+    fn session_fast(&self) -> Result<StateStoreQueueSession>;
+    fn session_bulk(&self) -> Result<StateStoreScoutSession>;
     fn schema_storage(&self) -> Result<SchemaStorage>;
 }
 
@@ -1177,14 +1213,14 @@ impl SqliteScoutStore {
     }
 
     fn open_db(&self) -> Result<ScoutDatabase> {
-        ScoutDatabase::open_with_busy_timeout(&self.path, self.busy_timeout_ms)
+        ScoutDatabase::open_existing_with_busy_timeout(&self.path, self.busy_timeout_ms)
             .context("Failed to open scout state store")
     }
 }
 
 impl ScoutStore for SqliteScoutStore {
     fn init_schema(&self) -> Result<()> {
-        let _ = self.open_db()?;
+        let _ = ScoutDatabase::open_with_busy_timeout(&self.path, self.busy_timeout_ms)?;
         Ok(())
     }
 
@@ -1597,6 +1633,21 @@ impl StateStoreBackend for SqliteStateStore {
 
     fn artifacts(&self) -> &dyn ArtifactStore {
         &self.artifacts
+    }
+
+    fn session_fast(&self) -> Result<StateStoreQueueSession> {
+        let conn = self.queue.open_conn()?;
+        Ok(StateStoreQueueSession {
+            queue: JobQueue::new(conn),
+        })
+    }
+
+    fn session_bulk(&self) -> Result<StateStoreScoutSession> {
+        let scout = ScoutDatabase::open_existing_with_busy_timeout(
+            &self.path,
+            self.scout.busy_timeout_ms,
+        )?;
+        Ok(StateStoreScoutSession { scout })
     }
 
     fn schema_storage(&self) -> Result<SchemaStorage> {

@@ -28,5 +28,5 @@ pub use sessions::SessionStorage;
 pub use state_store::{
     ApiStore, ArtifactStore, DispatchData, JobArtifactRecord, PluginDeployRequest, QueueStore,
     RoutingStore, ScoutStore, ScoutTagCount, ScoutTagStats, SessionStore, StateStore,
-    StateStoreBackend, StateStoreUrl,
+    StateStoreBackend, StateStoreQueueSession, StateStoreScoutSession, StateStoreUrl,
 };

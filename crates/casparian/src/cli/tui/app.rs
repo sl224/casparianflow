@@ -6,7 +6,7 @@
 //! They are scaffolding for active development. See specs/views/*.md.
 #![allow(dead_code)]
 
-use casparian_db::{BackendError, DbConnection, DbValue};
+use casparian_db::{dev_allow_destructive_reset, BackendError, DbConnection, DbValue};
 use casparian_intent::IntentState;
 use casparian_mcp::intent::{
     ConfidenceLabel, Decision, DecisionRecord, DecisionTarget, NextAction, ProposalId,
@@ -628,6 +628,8 @@ pub struct JobsState {
     pub pipeline: PipelineState,
     /// Monitoring panel state
     pub monitoring: MonitoringState,
+    /// Log viewer scroll offset (line-based)
+    pub log_viewer_scroll: usize,
     /// Whether jobs have been loaded from DB
     pub jobs_loaded: bool,
     /// Last poll timestamp for incremental updates
@@ -766,6 +768,63 @@ impl JobsState {
     /// Set status filter and clamp selection
     pub fn set_filter(&mut self, filter: Option<JobStatus>) {
         self.status_filter = filter;
+        self.clamp_selection();
+    }
+
+    /// Cycle through status filters (None -> Pending -> Running -> Failed -> Cancelled -> Completed -> Partial -> None)
+    pub fn cycle_status_filter(&mut self) {
+        const ORDER: [JobStatus; 6] = [
+            JobStatus::Pending,
+            JobStatus::Running,
+            JobStatus::Failed,
+            JobStatus::Cancelled,
+            JobStatus::Completed,
+            JobStatus::PartialSuccess,
+        ];
+
+        self.status_filter = match self.status_filter {
+            None => Some(ORDER[0]),
+            Some(current) => {
+                let next = ORDER
+                    .iter()
+                    .position(|status| *status == current)
+                    .and_then(|idx| ORDER.get(idx + 1))
+                    .copied();
+                next
+            }
+        };
+
+        self.clamp_selection();
+    }
+
+    /// Cycle through job type filters (None -> Scan -> Parse -> Backtest -> Schema -> None)
+    pub fn cycle_type_filter(&mut self) {
+        const ORDER: [JobType; 4] = [
+            JobType::Scan,
+            JobType::Parse,
+            JobType::Backtest,
+            JobType::SchemaEval,
+        ];
+
+        self.type_filter = match self.type_filter {
+            None => Some(ORDER[0]),
+            Some(current) => {
+                let next = ORDER
+                    .iter()
+                    .position(|job_type| *job_type == current)
+                    .and_then(|idx| ORDER.get(idx + 1))
+                    .copied();
+                next
+            }
+        };
+
+        self.clamp_selection();
+    }
+
+    /// Clear all job list filters
+    pub fn clear_filters(&mut self) {
+        self.status_filter = None;
+        self.type_filter = None;
         self.clamp_selection();
     }
 
@@ -3394,6 +3453,13 @@ impl App {
             self.discover.status_message = Some((warn, true));
             return false;
         }
+        if !dev_allow_destructive_reset() {
+            let warn = "Destructive reset disabled; set CASPARIAN_DEV_ALLOW_RESET=1 to allow."
+                .to_string();
+            self.db_health_warning = Some(warn.clone());
+            self.discover.status_message = Some((warn, true));
+            return false;
+        }
         let _ = std::fs::remove_file(path);
         match ScoutDatabase::open(path) {
             Ok(_) => {
@@ -3450,6 +3516,28 @@ impl App {
         self.set_mode(TuiMode::Ingest);
         if self.ingest_tab != IngestTab::Sources {
             self.ensure_rule_builder_ready();
+            if let Some(builder) = self.discover.rule_builder.as_mut() {
+                use super::extraction::RuleBuilderFocus;
+                match self.ingest_tab {
+                    IngestTab::Select => {
+                        if !matches!(
+                            builder.focus,
+                            RuleBuilderFocus::Pattern
+                                | RuleBuilderFocus::Excludes
+                                | RuleBuilderFocus::ExcludeInput
+                                | RuleBuilderFocus::FileList
+                        ) {
+                            builder.focus = RuleBuilderFocus::Pattern;
+                        }
+                    }
+                    IngestTab::Validate => {
+                        if !matches!(builder.focus, RuleBuilderFocus::FileList) {
+                            builder.focus = RuleBuilderFocus::FileList;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -3860,8 +3948,21 @@ impl App {
     }
 
     fn set_global_status(&mut self, message: impl Into<String>, is_error: bool) {
+        self.set_global_status_for(
+            message,
+            is_error,
+            std::time::Duration::from_secs(3),
+        );
+    }
+
+    fn set_global_status_for(
+        &mut self,
+        message: impl Into<String>,
+        is_error: bool,
+        duration: std::time::Duration,
+    ) {
         let message = message.into();
-        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let expires_at = std::time::Instant::now() + duration;
         self.global_status = Some(GlobalStatusMessage {
             message,
             is_error,
@@ -6386,10 +6487,14 @@ impl App {
         }
 
         if self.mutations_blocked() {
-            self.discover.status_message = Some((
-                "Sentinel not reachable; cannot start scan".to_string(),
-                true,
-            ));
+            let message = BackendRouter::new(
+                self.control_addr.clone(),
+                self.config.standalone_writer,
+                self.db_read_only,
+            )
+            .blocked_message("start scan");
+            self.discover.status_message = Some((message.clone(), true));
+            self.set_global_status_for(message, true, Duration::from_secs(8));
             return;
         }
 
@@ -9191,25 +9296,36 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             }
         }
 
-        // Jobs/Home: Trigger load on first visit, poll while in Run view
-        if matches!(self.mode, TuiMode::Run | TuiMode::Home) {
-            const JOBS_POLL_INTERVAL_MS: u64 = 2000; // Poll every 2 seconds when in Run view
+        // Jobs: initial load always, then poll fast in Run/Home, slower elsewhere if active
+        const JOBS_POLL_INTERVAL_MS: u64 = 2000;
+        const JOBS_POLL_INTERVAL_IDLE_MS: u64 = 10000;
+        let in_run_or_home = matches!(self.mode, TuiMode::Run | TuiMode::Home);
+        let has_active_jobs = self
+            .jobs_state
+            .jobs
+            .iter()
+            .any(|job| matches!(job.status, JobStatus::Pending | JobStatus::Running));
+        let poll_interval = if in_run_or_home {
+            JOBS_POLL_INTERVAL_MS
+        } else if has_active_jobs {
+            JOBS_POLL_INTERVAL_IDLE_MS
+        } else {
+            0
+        };
 
-            let should_load = if self.mode == TuiMode::Run {
-                if !self.jobs_state.jobs_loaded {
-                    true
-                } else if let Some(last_poll) = self.last_jobs_poll {
-                    last_poll.elapsed().as_millis() as u64 >= JOBS_POLL_INTERVAL_MS
-                } else {
-                    false
-                }
-            } else {
-                !self.jobs_state.jobs_loaded
-            };
-
-            if should_load && self.pending_jobs_load.is_none() {
-                self.start_jobs_load();
+        let should_load = if !self.jobs_state.jobs_loaded {
+            true
+        } else if poll_interval > 0 {
+            match self.last_jobs_poll {
+                Some(last_poll) => last_poll.elapsed().as_millis() as u64 >= poll_interval,
+                None => true,
             }
+        } else {
+            false
+        };
+
+        if should_load && self.pending_jobs_load.is_none() {
+            self.start_jobs_load();
         }
 
         // Poll for pending jobs load results (non-blocking)

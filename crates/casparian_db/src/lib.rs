@@ -18,6 +18,7 @@
 //! ```
 
 pub mod backend;
+pub mod dev;
 mod license;
 pub mod lock;
 pub mod sql_guard;
@@ -26,6 +27,7 @@ pub use backend::{
     AccessMode, BackendError, DbConnection, DbRow as UnifiedDbRow, DbTimestamp, DbTimestampError,
     DbTransaction, DbValue, FromDbValue,
 };
+pub use dev::dev_allow_destructive_reset;
 pub use license::{License, LicenseError, LicenseTier};
 #[cfg(feature = "duckdb")]
 pub use lock::{is_locked, lock_exclusive, try_lock_exclusive, try_lock_shared};

@@ -254,6 +254,7 @@ fn allowed_keys(app: &App, alphabet: &[FlowKey]) -> Vec<FlowKey> {
             key_code(FlowKeyCode::Esc),
             key_code(FlowKeyCode::Up),
             key_code(FlowKeyCode::Down),
+            key_code(FlowKeyCode::Enter),
         ];
     }
     if app.is_text_input_mode() {

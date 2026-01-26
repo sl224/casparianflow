@@ -641,6 +641,84 @@ impl JobQueue {
         Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
 
+    /// Atomically claim up to `limit` jobs from the queue.
+    pub fn claim_jobs(&self, limit: usize) -> Result<Vec<ProcessingJob>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit: i64 = limit
+            .try_into()
+            .context("claim_jobs limit overflow")?;
+        let has_health = self.table_exists("cf_parser_health")?;
+        let now = now_millis();
+
+        let (query, params) = if has_health {
+            (
+                format!(
+                    r#"
+                WITH to_claim AS (
+                    SELECT q.id
+                    FROM cf_processing_queue q
+                    LEFT JOIN cf_parser_health ph ON ph.parser_name = q.plugin_name
+                    WHERE q.status = ?
+                      AND (q.scheduled_at IS NULL OR q.scheduled_at <= ?)
+                      AND (ph.paused_at IS NULL)
+                    ORDER BY q.priority DESC, q.id ASC
+                    LIMIT ?
+                )
+                UPDATE cf_processing_queue
+                SET status = ?, claim_time = ?
+                WHERE id IN (SELECT id FROM to_claim)
+                RETURNING {columns}
+                "#,
+                    columns = column_list(PROCESSING_JOB_COLUMNS)
+                ),
+                vec![
+                    DbValue::from(ProcessingStatus::Queued.as_str()),
+                    DbValue::from(now),
+                    DbValue::from(limit),
+                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(now),
+                ],
+            )
+        } else {
+            (
+                format!(
+                    r#"
+                WITH to_claim AS (
+                    SELECT id
+                    FROM cf_processing_queue
+                    WHERE status = ?
+                      AND (scheduled_at IS NULL OR scheduled_at <= ?)
+                    ORDER BY priority DESC, id ASC
+                    LIMIT ?
+                )
+                UPDATE cf_processing_queue
+                SET status = ?, claim_time = ?
+                WHERE id IN (SELECT id FROM to_claim)
+                RETURNING {columns}
+                "#,
+                    columns = column_list(PROCESSING_JOB_COLUMNS)
+                ),
+                vec![
+                    DbValue::from(ProcessingStatus::Queued.as_str()),
+                    DbValue::from(now),
+                    DbValue::from(limit),
+                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(now),
+                ],
+            )
+        };
+
+        let rows = self.conn.query_all(&query, &params)?;
+        let mut jobs = rows
+            .into_iter()
+            .map(|row| ProcessingJob::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+        jobs.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+        Ok(jobs)
+    }
+
     fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
         Ok(self.conn.column_exists(table, column)?)
     }
@@ -663,7 +741,8 @@ impl JobQueue {
 
         anyhow::bail!(
             "Database schema for '{}' is missing columns: {}. \
-Delete the state store (default: ~/.casparian_flow/state.sqlite) and restart.",
+Manual reset required. Delete the state store (default: ~/.casparian_flow/state.sqlite) \
+or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
             table,
             missing.join(", ")
         );
@@ -1829,6 +1908,15 @@ mod tests {
     }
 
     fn enqueue_test_job(queue: &JobQueue, plugin_name: &str, file_id: i64) -> i64 {
+        enqueue_test_job_with_priority(queue, plugin_name, file_id, 0)
+    }
+
+    fn enqueue_test_job_with_priority(
+        queue: &JobQueue,
+        plugin_name: &str,
+        file_id: i64,
+        priority: i32,
+    ) -> i64 {
         let input_file = format!("/tmp/test_{}.csv", file_id);
         queue
             .conn
@@ -1843,7 +1931,7 @@ mod tests {
                     DbValue::from(input_file.as_str()),
                     DbValue::from(plugin_name),
                     DbValue::from(ProcessingStatus::Queued.as_str()),
-                    DbValue::from(0i32),
+                    DbValue::from(priority),
                     DbValue::from(now_millis()),
                 ],
             )
@@ -1900,6 +1988,33 @@ mod tests {
             .unwrap();
         assert_eq!(completed_jobs.len(), 1);
         assert_eq!(completed_jobs[0].plugin_name, "parser_a");
+    }
+
+    #[test]
+    fn test_claim_jobs_batching_updates_status() {
+        let queue = setup_queue();
+
+        let id_high = enqueue_test_job_with_priority(&queue, "parser_high", 1, 10);
+        let id_mid = enqueue_test_job_with_priority(&queue, "parser_mid", 2, 5);
+        let id_low = enqueue_test_job_with_priority(&queue, "parser_low", 3, 0);
+
+        let claimed = queue.claim_jobs(2).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].id, id_high);
+        assert_eq!(claimed[1].id, id_mid);
+
+        let queued = queue
+            .list_jobs(Some(ProcessingStatus::Queued), 10, 0)
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, id_low);
+
+        let running = queue
+            .list_jobs(Some(ProcessingStatus::Running), 10, 0)
+            .unwrap();
+        let running_ids: Vec<i64> = running.iter().map(|job| job.id).collect();
+        assert!(running_ids.contains(&id_high));
+        assert!(running_ids.contains(&id_mid));
     }
 
     #[test]

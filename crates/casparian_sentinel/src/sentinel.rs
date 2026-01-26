@@ -13,7 +13,7 @@ use casparian_protocol::types::{
 };
 use casparian_protocol::{
     defaults, materialization_key, metrics, output_target_key, schema_hash, table_name_with_schema,
-    ApiJobId, JobId, Message, OpCode, ProcessingStatus, WorkerStatus,
+    safe_output_id, ApiJobId, JobId, Message, OpCode, ProcessingStatus, WorkerStatus,
 };
 use casparian_scout::{
     scan_path, ScanCancelToken, ScanConfig, ScanProgress, Source as ScoutSource, SourceId,
@@ -44,7 +44,7 @@ use crate::db::{
 };
 use crate::metrics::METRICS;
 use casparian_db::DbConnection;
-use casparian_state_store::{DispatchData, StateStore};
+use casparian_state_store::{DispatchData, StateStore, StateStoreQueueSession};
 
 /// Workers are considered stale after this many seconds without heartbeat
 const WORKER_TIMEOUT_SECS: f64 = 60.0;
@@ -218,6 +218,7 @@ pub struct Sentinel {
     control_socket: Option<Socket>,
     workers: HashMap<Vec<u8>, ConnectedWorker>,
     state_store: Arc<StateStore>,
+    queue_session: StateStoreQueueSession,
     schema_storage: SchemaStorage,
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     topic_map_last_refresh: f64,
@@ -245,6 +246,10 @@ impl Sentinel {
         let state_store = StateStore::open(&config.state_store_url)
             .context("Failed to connect to state store")?;
         state_store.init()?;
+
+        let queue_session = state_store
+            .session_fast()
+            .context("Failed to open state store fast session")?;
 
         let state_store = Arc::new(state_store);
 
@@ -322,6 +327,7 @@ impl Sentinel {
             control_socket,
             workers: HashMap::new(),
             state_store,
+            queue_session,
             schema_storage,
             topic_map,
             topic_map_last_refresh: current_time(),
@@ -766,7 +772,8 @@ impl Sentinel {
                 continue;
             };
 
-            let pattern = base_dir.join(format!("{}_*.parquet", output_name));
+            let safe_name = safe_output_id(output_name);
+            let pattern = base_dir.join(format!("{}_*.parquet", safe_name));
             let view_name = if is_quarantine {
                 has_quarantine = true;
                 format!("quarantine.{}", quote_ident(output_name))
@@ -1918,7 +1925,18 @@ impl Sentinel {
         let state_store_for_thread = self.state_store.clone();
         let cancel_token_for_thread = cancel_token.clone();
         std::thread::spawn(move || {
-            let scout = state_store_for_thread.scout();
+            let session = match state_store_for_thread.session_bulk() {
+                Ok(session) => session,
+                Err(e) => {
+                    let mut jobs = scan_jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                        job.state = ScanState::Failed;
+                        job.error = Some(format!("Failed to open scout session: {}", e));
+                    }
+                    return;
+                }
+            };
+            let scout = session.scout();
 
             let source = match scout
                 .get_source_by_path(&workspace_id_for_thread, &path_display_for_thread)
@@ -2010,7 +2028,7 @@ impl Sentinel {
             });
 
             let scan_config = ScanConfig::default();
-            let scanner = match scout.scanner(scan_config) {
+            let scanner = match session.scanner(scan_config) {
                 Ok(scanner) => scanner,
                 Err(e) => {
                     let mut jobs = scan_jobs.lock().unwrap();
@@ -2448,16 +2466,16 @@ impl Sentinel {
             return Ok(());
         }
 
+        let claimed_jobs = self.queue_session.claim_jobs(idle_identities.len())?;
+        if claimed_jobs.is_empty() {
+            self.schedule_dispatch_backoff();
+            return Ok(());
+        }
+
         let mut dispatched_any = false;
 
         // Dispatch jobs to ALL idle workers (batch dispatch)
-        for identity in idle_identities {
-            let job = self.state_store.queue().pop_job()?;
-
-            let Some(job) = job else {
-                continue;
-            };
-
+        for (identity, job) in idle_identities.into_iter().zip(claimed_jobs) {
             if self.assign_job(identity, job)? {
                 dispatched_any = true;
             }

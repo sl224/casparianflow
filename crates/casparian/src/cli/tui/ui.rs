@@ -743,9 +743,27 @@ pub fn draw(frame: &mut Frame, app: &App) {
         TuiMode::Settings => draw_settings_screen(frame, app, main_area),
     }
 
+    // Draw Jobs Drawer Overlay (toggle with J key)
+    if app.jobs_drawer_open {
+        draw_jobs_drawer(frame, app, &shell);
+    }
+
+    // Draw Sources Drawer Overlay (toggle with S key)
+    if app.sources_drawer_open {
+        draw_sources_drawer(frame, app, &shell);
+    }
+
+    let jobs_modal_active = app.mode == TuiMode::Run
+        && app.run_tab == RunTab::Jobs
+        && matches!(
+            app.jobs_state.view_state,
+            JobsViewState::FilterDialog | JobsViewState::LogViewer
+        );
+
     let global_modal_active = app.show_help
         || app.command_palette.visible
         || app.workspace_switcher.visible
+        || jobs_modal_active
         || app
             .discover
             .rule_builder
@@ -755,6 +773,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if global_modal_active {
         draw_modal_scrim(frame, area, shell.top);
+    }
+
+    if jobs_modal_active {
+        match app.jobs_state.view_state {
+            JobsViewState::FilterDialog => draw_jobs_filter_dialog(frame, app, area),
+            JobsViewState::LogViewer => draw_jobs_log_viewer(frame, app, area),
+            _ => {}
+        }
     }
 
     if let Some(builder) = &app.discover.rule_builder {
@@ -769,16 +795,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Draw Help Overlay (on top of everything)
     if app.show_help {
         draw_help_overlay(frame, area, app);
-    }
-
-    // Draw Jobs Drawer Overlay (toggle with J key)
-    if app.jobs_drawer_open {
-        draw_jobs_drawer(frame, app, &shell);
-    }
-
-    // Draw Sources Drawer Overlay (toggle with S key)
-    if app.sources_drawer_open {
-        draw_sources_drawer(frame, app, &shell);
     }
 
     // Draw Workspace Switcher Overlay
@@ -3073,7 +3089,7 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut header_text = format!(
-        " [Scope] [Pattern] [Extract] [Validate]  |  Source: {}  |  Matches: {}  |  {}",
+        " [Select] [Rules] [Validate]  |  Source: {}  |  Matches: {}  |  {}",
         source_name, match_count, file_range
     );
     if let Some(msg) = error_hint {
@@ -3094,16 +3110,25 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(content_area);
 
-    // Left panel: Rule config sections
-    draw_rule_builder_left_panel(frame, builder, h_chunks[0]);
+    // Left panel: Tab-specific rule config
+    match app.ingest_tab {
+        IngestTab::Select => draw_rule_builder_left_panel_select(frame, builder, h_chunks[0]),
+        IngestTab::Rules | IngestTab::Sources => {
+            draw_rule_builder_left_panel(frame, builder, h_chunks[0])
+        }
+        IngestTab::Validate => draw_rule_builder_left_panel_validate(frame, builder, h_chunks[0]),
+    }
 
-    // Right panel: File results
-    draw_rule_builder_right_panel(
-        frame,
-        builder,
-        h_chunks[1],
-        app.discover.scan_error.as_deref(),
-    );
+    // Right panel: Tab-specific context
+    match app.ingest_tab {
+        IngestTab::Rules => draw_rule_builder_right_panel_rules(frame, builder, h_chunks[1]),
+        _ => draw_rule_builder_right_panel(
+            frame,
+            builder,
+            h_chunks[1],
+            app.discover.scan_error.as_deref(),
+        ),
+    }
 
 }
 
@@ -3480,6 +3505,261 @@ fn draw_rule_builder_left_panel(
     draw_schema_suggestions(frame, builder, left_chunks[5]);
 }
 
+/// Simplified left panel for Select tab (pattern + excludes + selection summary)
+fn draw_rule_builder_left_panel_select(
+    frame: &mut Frame,
+    builder: &super::extraction::RuleBuilderState,
+    area: Rect,
+) {
+    use super::extraction::RuleBuilderFocus;
+
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Pattern
+            Constraint::Length(4), // Excludes
+            Constraint::Min(6),    // Selection summary
+        ])
+        .split(area);
+
+    // --- PATTERN field ---
+    let pattern_focused = matches!(builder.focus, RuleBuilderFocus::Pattern);
+    let pattern_style = if pattern_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let pattern_title = if let Some(ref err) = builder.pattern_error {
+        format!(" PATTERN [!] {} ", err)
+    } else if pattern_focused {
+        " PATTERN (editing) ".to_string()
+    } else {
+        " PATTERN ".to_string()
+    };
+
+    let pattern_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if pattern_focused {
+            BorderType::Double
+        } else {
+            BorderType::Plain
+        })
+        .border_style(if builder.pattern_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else if pattern_focused {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            pattern_style
+        })
+        .title(Span::styled(
+            pattern_title,
+            if pattern_focused {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                pattern_style
+            },
+        ));
+
+    let pattern_text = if pattern_focused {
+        format!("{}█", builder.pattern)
+    } else {
+        builder.pattern.clone()
+    };
+    let pattern_para = Paragraph::new(pattern_text)
+        .style(Style::default().fg(Color::White))
+        .block(pattern_block);
+    frame.render_widget(pattern_para, left_chunks[0]);
+
+    // --- EXCLUDES field ---
+    let excludes_focused = matches!(
+        builder.focus,
+        RuleBuilderFocus::Excludes | RuleBuilderFocus::ExcludeInput
+    );
+    let excludes_style = if excludes_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let excludes_title = if excludes_focused {
+        format!(
+            " EXCLUDES ({}) [Enter: add, d: delete] ",
+            builder.excludes.len()
+        )
+    } else {
+        format!(" EXCLUDES ({}) ", builder.excludes.len())
+    };
+    let excludes_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if excludes_focused {
+            BorderType::Double
+        } else {
+            BorderType::Plain
+        })
+        .border_style(if excludes_focused {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            excludes_style
+        })
+        .title(Span::styled(
+            excludes_title,
+            if excludes_focused {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                excludes_style
+            },
+        ));
+
+    let excludes_content = if matches!(builder.focus, RuleBuilderFocus::ExcludeInput) {
+        format!("{}█", builder.exclude_input)
+    } else if builder.excludes.is_empty() {
+        "Press [Enter] to add exclude pattern".to_string()
+    } else {
+        builder
+            .excludes
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                if i == builder.selected_exclude && excludes_focused {
+                    format!("► {}", e)
+                } else {
+                    format!("  {}", e)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let excludes_para = Paragraph::new(excludes_content)
+        .style(Style::default().fg(Color::Gray))
+        .block(excludes_block);
+    frame.render_widget(excludes_para, left_chunks[1]);
+
+    // --- SELECTION summary ---
+    let summary_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " SELECTION ",
+            Style::default().fg(Color::DarkGray),
+        ));
+    let summary_inner = summary_block.inner(left_chunks[2]);
+    frame.render_widget(summary_block, left_chunks[2]);
+
+    let lines = vec![
+        Line::from(format!(" Matches: {}", builder.match_count)),
+        Line::from(" Focus: pattern + excludes"),
+        Line::from(" [s] scan source  [Enter] drill-down"),
+    ];
+    let para = Paragraph::new(lines)
+        .style(Style::default().fg(Color::Gray))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(para, summary_inner);
+}
+
+/// Simplified left panel for Validate tab (pattern + validation summary)
+fn draw_rule_builder_left_panel_validate(
+    frame: &mut Frame,
+    builder: &super::extraction::RuleBuilderState,
+    area: Rect,
+) {
+    use super::extraction::{FileResultsState, RuleBuilderFocus};
+
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Pattern
+            Constraint::Min(6),    // Validation summary
+        ])
+        .split(area);
+
+    // --- PATTERN field ---
+    let pattern_focused = matches!(builder.focus, RuleBuilderFocus::Pattern);
+    let pattern_style = if pattern_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let pattern_title = if let Some(ref err) = builder.pattern_error {
+        format!(" PATTERN [!] {} ", err)
+    } else if pattern_focused {
+        " PATTERN (editing) ".to_string()
+    } else {
+        " PATTERN ".to_string()
+    };
+
+    let pattern_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(if pattern_focused {
+            BorderType::Double
+        } else {
+            BorderType::Plain
+        })
+        .border_style(if builder.pattern_error.is_some() {
+            Style::default().fg(Color::Red)
+        } else if pattern_focused {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            pattern_style
+        })
+        .title(Span::styled(
+            pattern_title,
+            if pattern_focused {
+                Style::default().fg(Color::Cyan).bold()
+            } else {
+                pattern_style
+            },
+        ));
+
+    let pattern_text = if pattern_focused {
+        format!("{}█", builder.pattern)
+    } else {
+        builder.pattern.clone()
+    };
+    let pattern_para = Paragraph::new(pattern_text)
+        .style(Style::default().fg(Color::White))
+        .block(pattern_block);
+    frame.render_widget(pattern_para, left_chunks[0]);
+
+    // --- VALIDATION summary ---
+    let summary_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " VALIDATION ",
+            Style::default().fg(Color::DarkGray),
+        ));
+    let summary_inner = summary_block.inner(left_chunks[1]);
+    frame.render_widget(summary_block, left_chunks[1]);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(format!(" Matches: {}", builder.match_count)));
+    match &builder.file_results {
+        FileResultsState::Exploration { folder_matches, .. } => {
+            let folder_count = folder_matches.len();
+            lines.push(Line::from(format!(" Folders: {}", folder_count)));
+            lines.push(Line::from(" Run a scan to preview results"));
+        }
+        FileResultsState::ExtractionPreview { preview_files } => {
+            let warning_count: usize = preview_files.iter().map(|f| f.warnings.len()).sum();
+            lines.push(Line::from(format!(" Preview files: {}", preview_files.len())));
+            lines.push(Line::from(format!(" Warnings: {}", warning_count)));
+        }
+        FileResultsState::BacktestResults { backtest, .. } => {
+            lines.push(Line::from(format!(" Pass: {}", backtest.pass_count)));
+            lines.push(Line::from(format!(" Fail: {}", backtest.fail_count)));
+            lines.push(Line::from(format!(" Skip: {}", backtest.excluded_count)));
+        }
+    }
+    lines.push(Line::from(" Review results in the right panel"));
+
+    let para = Paragraph::new(lines)
+        .style(Style::default().fg(Color::Gray))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(para, summary_inner);
+}
+
 /// Draw schema suggestions panel (RULE_BUILDER_UI_PLAN.md)
 /// Shows pattern seeds, path archetypes, naming schemes, and synonym suggestions.
 fn draw_schema_suggestions(
@@ -3706,6 +3986,72 @@ fn draw_schema_suggestions(
 
     let para = Paragraph::new(lines).style(Style::default());
     frame.render_widget(para, inner);
+}
+
+/// Draw the right panel for Rules tab (summary view)
+fn draw_rule_builder_right_panel_rules(
+    frame: &mut Frame,
+    builder: &super::extraction::RuleBuilderState,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" RULES SUMMARY ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let tag_display = if builder.tag.is_empty() {
+        "-".to_string()
+    } else {
+        builder.tag.clone()
+    };
+    lines.push(Line::from(format!(
+        " Excludes: {}  Tag: {}",
+        builder.excludes.len(),
+        tag_display
+    )));
+    lines.push(Line::from(format!(
+        " Extractions: {}  Enabled: {}",
+        builder.extractions.len(),
+        if builder.enabled { "yes" } else { "no" }
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(" Fields:"));
+
+    if builder.extractions.is_empty() {
+        lines.push(Line::from("  No extraction fields yet"));
+    } else {
+        for field in &builder.extractions {
+            let enabled = if field.enabled { "[x]" } else { "[ ]" };
+            let line = format!(
+                "  {} {}: {}",
+                enabled,
+                field.name,
+                field.field_type.display_name()
+            );
+            lines.push(Line::from(truncate_end(&line, inner.width as usize)));
+            if let Some(pattern) = &field.pattern {
+                let pattern_line = format!("     pattern: {}", pattern);
+                lines.push(Line::from(Span::styled(
+                    truncate_end(&pattern_line, inner.width as usize),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Preview results in Select/Validate tabs",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().fg(Color::Gray))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, inner);
 }
 
 /// Draw the right panel of Rule Builder (file results list)
@@ -4925,9 +5271,16 @@ fn draw_pipeline_summary(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the jobs list (per spec Section 4)
 fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::White));
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+
     let mut lines: Vec<Line> = Vec::new();
-    let ready_jobs = app.jobs_state.ready_jobs();
+    let mut selected_line: Option<usize> = None;
     let actionable_jobs = app.jobs_state.actionable_jobs();
+    let ready_jobs = app.jobs_state.ready_jobs();
 
     if actionable_jobs.is_empty() && ready_jobs.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -4942,17 +5295,38 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
             )));
         }
     } else {
-        let ready_style = if app.jobs_state.section_focus == JobsListSection::Ready {
-            Style::default().fg(Color::Green).bold()
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
         let actionable_style = if app.jobs_state.section_focus == JobsListSection::Actionable {
             Style::default().fg(Color::Cyan).bold()
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let ready_style = if app.jobs_state.section_focus == JobsListSection::Ready {
+            Style::default().fg(Color::Green).bold()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
 
+        lines.push(Line::from(Span::styled(
+            " ACTIONABLE (running, queued, or failed)",
+            actionable_style,
+        )));
+        if actionable_jobs.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No actionable jobs.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (i, job) in actionable_jobs.iter().enumerate() {
+                let is_selected = app.jobs_state.section_focus == JobsListSection::Actionable
+                    && i == app.jobs_state.selected_index;
+                if is_selected {
+                    selected_line = Some(lines.len());
+                }
+                render_actionable_job_line(&mut lines, job, is_selected, width);
+            }
+        }
+
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(" READY OUTPUTS", ready_style)));
 
         if ready_jobs.is_empty() {
@@ -4964,36 +5338,160 @@ fn draw_jobs_list(frame: &mut Frame, app: &App, area: Rect) {
             for (i, job) in ready_jobs.iter().enumerate() {
                 let is_selected = app.jobs_state.section_focus == JobsListSection::Ready
                     && i == app.jobs_state.selected_index;
-                render_ready_job_line(&mut lines, job, is_selected, area.width as usize);
-            }
-        }
-
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            " ACTIONABLE (running, queued, or failed)",
-            actionable_style,
-        )));
-
-        if actionable_jobs.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "  No actionable jobs.",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for (i, job) in actionable_jobs.iter().enumerate() {
-                let is_selected = app.jobs_state.section_focus == JobsListSection::Actionable
-                    && i == app.jobs_state.selected_index;
-                render_actionable_job_line(&mut lines, job, is_selected, area.width as usize);
+                if is_selected {
+                    selected_line = Some(lines.len());
+                }
+                render_ready_job_line(&mut lines, job, is_selected, width);
             }
         }
     }
 
+    let visible_lines = inner.height as usize;
+    let total_lines = lines.len().max(1);
+    let scroll = selected_line
+        .map(|line| centered_scroll_offset(line, visible_lines, total_lines))
+        .unwrap_or(0);
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_jobs_filter_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let dialog_area = render_centered_dialog(frame, area, 52, 9);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::White));
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Jobs Filter ");
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
 
-    let paragraph = Paragraph::new(lines).block(block);
-    frame.render_widget(paragraph, area);
+    let status_label = app
+        .jobs_state
+        .status_filter
+        .map(|status| status.as_str())
+        .unwrap_or("Any");
+    let status_style = if app.jobs_state.status_filter.is_some() {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let type_label = app
+        .jobs_state
+        .type_filter
+        .map(|job_type| job_type.as_str())
+        .unwrap_or("Any");
+    let type_style = if app.jobs_state.type_filter.is_some() {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        " Filters",
+        Style::default().fg(Color::Cyan).bold(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(status_label, status_style),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" Type:   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(type_label, type_style),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " [s] status  [t] type  [x] clear",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        " [Enter/Esc] close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
+    frame.render_widget(paragraph, inner);
+}
+
+fn draw_jobs_log_viewer(frame: &mut Frame, app: &App, area: Rect) {
+    let max_width = area.width.saturating_sub(4).min(90).max(50);
+    let max_height = area.height.saturating_sub(4).min(22).max(10);
+    let dialog_area = render_centered_dialog(frame, area, max_width, max_height);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Logs ");
+    let inner = block.inner(dialog_area);
+    frame.render_widget(block, dialog_area);
+
+    let max_line_width = inner.width.saturating_sub(1) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(job) = app.jobs_state.selected_job() {
+        let job_name = truncate_end(&job.name, max_line_width.saturating_sub(12));
+        lines.push(Line::from(vec![
+            Span::styled(" Job: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(job_name, Style::default().fg(Color::White).bold()),
+            Span::styled(
+                format!(" ({})", job.job_type.as_str()),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(job.status.as_str(), Style::default().fg(Color::White)),
+        ]));
+        let output_path = job.output_path.as_deref().unwrap_or("-");
+        let output_display =
+            truncate_path_start(output_path, max_line_width.saturating_sub(10));
+        lines.push(Line::from(vec![
+            Span::styled(" Output: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(output_display, Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " Failures",
+            Style::default().fg(Color::Cyan).bold(),
+        )));
+        if job.failures.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  No failure details recorded.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for failure in &job.failures {
+                let location = failure
+                    .line
+                    .map(|line| format!(":{}", line))
+                    .unwrap_or_default();
+                let path_display =
+                    truncate_path_start(&failure.file_path, max_line_width.saturating_sub(6));
+                let line_text = format!("  {}{} - {}", path_display, location, failure.error);
+                lines.push(Line::from(Span::styled(
+                    truncate_end(&line_text, max_line_width),
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            " No job selected.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let visible_lines = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_lines);
+    let scroll = app.jobs_state.log_viewer_scroll.min(max_scroll);
+
+    let paragraph = Paragraph::new(lines)
+        .scroll((scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, inner);
 }
 
 fn render_ready_job_line(lines: &mut Vec<Line>, job: &JobInfo, is_selected: bool, width: usize) {

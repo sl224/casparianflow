@@ -63,7 +63,10 @@ impl BackendRouter {
         if self.db_read_only {
             format!("Database is read-only; cannot {}", action)
         } else {
-            format!("Sentinel not reachable; cannot {}", action)
+            format!(
+                "Sentinel not reachable; cannot {}. Start `casparian_sentinel` (control tcp://127.0.0.1:5556) or run TUI with --standalone-writer (dev-only).",
+                action
+            )
         }
     }
 

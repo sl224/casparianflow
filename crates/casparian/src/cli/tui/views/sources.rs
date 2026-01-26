@@ -1,9 +1,20 @@
 use super::{App, DiscoverViewState, SourceId, TuiMode};
+use crate::cli::tui::backend::BackendRouter;
 use crossterm::event::{KeyCode, KeyEvent};
 
 impl App {
     /// Start a scan job for the given source (called from Home)
     pub(super) fn start_scan_for_source(&mut self, source_id: SourceId) {
+        if self.mutations_blocked() {
+            let message = BackendRouter::new(
+                self.control_addr.clone(),
+                self.config.standalone_writer,
+                self.db_read_only,
+            )
+            .blocked_message("start scan");
+            self.set_global_status_for(message, true, std::time::Duration::from_secs(8));
+            return;
+        }
         let path = self
             .discover
             .sources

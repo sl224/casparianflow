@@ -80,8 +80,21 @@ fn jobs_actions(app: &App) -> Vec<ActionHint> {
         JobsViewState::MonitoringPanel => ordered_hints(&[
             ("Esc", "Back"),
             ("p", "Pause updates"),
-            ("r", "Reset stats"),
+            ("x", "Reset stats"),
             ("I", "Inspector"),
+        ]),
+        JobsViewState::LogViewer => ordered_hints(&[
+            ("Esc", "Back"),
+            ("Up/Down", "Scroll"),
+            ("y", "Copy path"),
+            ("?", "Help"),
+        ]),
+        JobsViewState::FilterDialog => ordered_hints(&[
+            ("s", "Status"),
+            ("t", "Type"),
+            ("x", "Clear"),
+            ("Enter", "Apply"),
+            ("Esc", "Back"),
         ]),
         JobsViewState::ViolationDetail => ordered_hints(&[
             ("Up/Down", "Select"),
@@ -101,7 +114,7 @@ fn jobs_actions(app: &App) -> Vec<ActionHint> {
             ("v", "Violations"),
             ("L", "Logs"),
             ("O", "Open"),
-            ("y", "Copy"),
+            ("y", "Copy path"),
             ("I", "Inspector"),
             ("?", "Help"),
         ]),

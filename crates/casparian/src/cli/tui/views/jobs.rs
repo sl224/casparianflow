@@ -88,12 +88,7 @@ impl App {
             }
             // Clear filters when active
             KeyCode::Backspace | KeyCode::Delete => {
-                if self.jobs_state.status_filter.is_some() || self.jobs_state.type_filter.is_some()
-                {
-                    self.jobs_state.status_filter = None;
-                    self.jobs_state.type_filter = None;
-                    self.jobs_state.clamp_selection();
-                }
+                self.jobs_state.clear_filters();
             }
             // Go to first job
             KeyCode::Char('g') => {
@@ -135,6 +130,7 @@ impl App {
             // Open log viewer
             KeyCode::Char('L') => {
                 if !self.jobs_state.focused_jobs().is_empty() {
+                    self.jobs_state.log_viewer_scroll = 0;
                     self.jobs_state.transition_state(JobsViewState::LogViewer);
                 }
             }
@@ -143,8 +139,19 @@ impl App {
                 let jobs = self.jobs_state.focused_jobs();
                 if let Some(job) = jobs.get(self.jobs_state.selected_index) {
                     if let Some(ref path) = job.output_path {
-                        // TODO: Copy to clipboard (requires clipboard crate or platform-specific impl)
-                        let _ = path; // Silence warning for now
+                        match copy_to_clipboard(path) {
+                            Ok(()) => {
+                                self.set_global_status("Copied output path", false);
+                            }
+                            Err(err) => {
+                                self.set_global_status(
+                                    format!("Clipboard unavailable: {}", err),
+                                    true,
+                                );
+                            }
+                        }
+                    } else {
+                        self.set_global_status("No output path to copy", true);
                     }
                 }
             }
@@ -180,11 +187,30 @@ impl App {
             }
             // View logs (placeholder)
             KeyCode::Char('L') => {
-                // TODO: Open log viewer
+                if self.jobs_state.selected_job().is_some() {
+                    self.jobs_state.log_viewer_scroll = 0;
+                    self.jobs_state.transition_state(JobsViewState::LogViewer);
+                }
             }
             // Copy output path to clipboard (placeholder)
             KeyCode::Char('y') => {
-                // TODO: Copy to clipboard
+                if let Some(job) = self.jobs_state.selected_job() {
+                    if let Some(ref path) = job.output_path {
+                        match copy_to_clipboard(path) {
+                            Ok(()) => {
+                                self.set_global_status("Copied output path", false);
+                            }
+                            Err(err) => {
+                                self.set_global_status(
+                                    format!("Clipboard unavailable: {}", err),
+                                    true,
+                                );
+                            }
+                        }
+                    } else {
+                        self.set_global_status("No output path to copy", true);
+                    }
+                }
             }
             _ => {}
         }
@@ -202,7 +228,7 @@ impl App {
                 self.jobs_state.monitoring.paused = !self.jobs_state.monitoring.paused;
             }
             // Reset metrics
-            KeyCode::Char('r') => {
+            KeyCode::Char('x') => {
                 self.jobs_state.monitoring = MonitoringState::default();
             }
             _ => {}
@@ -216,12 +242,32 @@ impl App {
             KeyCode::Esc => {
                 self.jobs_state.return_to_previous_state();
             }
-            // TODO: Scroll logs up/down
             KeyCode::Down => {
-                // Scroll down
+                self.jobs_state.log_viewer_scroll =
+                    self.jobs_state.log_viewer_scroll.saturating_add(1);
             }
             KeyCode::Up => {
-                // Scroll up
+                self.jobs_state.log_viewer_scroll =
+                    self.jobs_state.log_viewer_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('y') => {
+                if let Some(job) = self.jobs_state.selected_job() {
+                    if let Some(ref path) = job.output_path {
+                        match copy_to_clipboard(path) {
+                            Ok(()) => {
+                                self.set_global_status("Copied output path", false);
+                            }
+                            Err(err) => {
+                                self.set_global_status(
+                                    format!("Clipboard unavailable: {}", err),
+                                    true,
+                                );
+                            }
+                        }
+                    } else {
+                        self.set_global_status("No output path to copy", true);
+                    }
+                }
             }
             _ => {}
         }
@@ -234,9 +280,17 @@ impl App {
             KeyCode::Esc => {
                 self.jobs_state.return_to_previous_state();
             }
-            // TODO: Apply filter selections
             KeyCode::Enter => {
                 self.jobs_state.return_to_previous_state();
+            }
+            KeyCode::Char('s') => {
+                self.jobs_state.cycle_status_filter();
+            }
+            KeyCode::Char('t') => {
+                self.jobs_state.cycle_type_filter();
+            }
+            KeyCode::Char('x') => {
+                self.jobs_state.clear_filters();
             }
             _ => {}
         }
@@ -303,5 +357,52 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return run_clipboard_command("pbcopy", &[], text);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return run_clipboard_command("clip", &[], text);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if run_clipboard_command("wl-copy", &[], text).is_ok() {
+            return Ok(());
+        }
+        return run_clipboard_command("xclip", &["-selection", "clipboard"], text);
+    }
+
+    #[allow(unreachable_code)]
+    Err("unsupported platform".to_string())
+}
+
+fn run_clipboard_command(cmd: &str, args: &[&str], text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("{}: {}", cmd, err))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("{}: {}", cmd, err))?;
+    }
+    let status = child
+        .wait()
+        .map_err(|err| format!("{}: {}", cmd, err))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{} failed", cmd))
     }
 }

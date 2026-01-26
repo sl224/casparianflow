@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use casparian_db::{DbConnection, DbValue};
+use casparian_db::{dev_allow_destructive_reset, DbConnection, DbValue};
 use tracing::warn;
 
 /// Current schema version. Increment when schema changes.
@@ -75,6 +75,15 @@ pub fn ensure_schema_version(conn: &DbConnection, expected_version: i32) -> Resu
             Ok(false)
         }
         Some(v) => {
+            if !dev_allow_destructive_reset() {
+                anyhow::bail!(
+                    "State store schema version mismatch (current {}, expected {}). \
+Automatic reset is disabled. Delete the state store file manually or set \
+CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
+                    v,
+                    expected_version
+                );
+            }
             // Version mismatch - reset
             warn!(
                 "Database schema reset (dev mode): version {} -> {}",
@@ -86,6 +95,13 @@ pub fn ensure_schema_version(conn: &DbConnection, expected_version: i32) -> Resu
         None => {
             // cf_meta doesn't exist - check if other tables exist
             if has_any_known_tables(conn)? {
+                if !dev_allow_destructive_reset() {
+                    anyhow::bail!(
+                        "State store schema version missing but tables exist. \
+Automatic reset is disabled. Delete the state store file manually or set \
+CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only)."
+                    );
+                }
                 // Old schema without versioning - reset
                 warn!(
                     "Database schema reset (dev mode): unversioned -> {}",
@@ -192,6 +208,28 @@ fn create_meta_table(conn: &DbConnection, version: i32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
+    struct ResetGuard {
+        prev: Option<String>,
+    }
+
+    impl ResetGuard {
+        fn enable() -> Self {
+            let prev = env::var("CASPARIAN_DEV_ALLOW_RESET").ok();
+            env::set_var("CASPARIAN_DEV_ALLOW_RESET", "1");
+            Self { prev }
+        }
+    }
+
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            match self.prev.as_ref() {
+                Some(value) => env::set_var("CASPARIAN_DEV_ALLOW_RESET", value),
+                None => env::remove_var("CASPARIAN_DEV_ALLOW_RESET"),
+            }
+        }
+    }
 
     #[test]
     fn test_fresh_database_creates_meta() {
@@ -235,6 +273,7 @@ mod tests {
     #[test]
     fn test_version_mismatch_triggers_reset() {
         let conn = DbConnection::open_duckdb_memory().unwrap();
+        let _guard = ResetGuard::enable();
 
         // Initialize with version 1
         ensure_schema_version(&conn, 1).unwrap();
@@ -265,6 +304,7 @@ mod tests {
     #[test]
     fn test_unversioned_schema_triggers_reset() {
         let conn = DbConnection::open_duckdb_memory().unwrap();
+        let _guard = ResetGuard::enable();
 
         // Create tables without cf_meta (simulating old schema)
         conn.execute_batch("CREATE TABLE cf_processing_queue (id INTEGER PRIMARY KEY)")
@@ -294,6 +334,7 @@ mod tests {
     #[test]
     fn test_schema_reset_then_init_tables() {
         let conn = DbConnection::open_duckdb_memory().unwrap();
+        let _guard = ResetGuard::enable();
 
         // Simulate old version
         create_meta_table(&conn, 1).unwrap();
@@ -333,5 +374,18 @@ mod tests {
             .unwrap()
             .is_some();
         assert!(has_new_col);
+    }
+
+    #[test]
+    fn test_version_mismatch_blocks_without_dev_flag() {
+        let conn = DbConnection::open_duckdb_memory().unwrap();
+
+        ensure_schema_version(&conn, 1).unwrap();
+        conn.execute_batch("CREATE TABLE cf_processing_queue (id INTEGER PRIMARY KEY)")
+            .unwrap();
+
+        let err = ensure_schema_version(&conn, 2).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CASPARIAN_DEV_ALLOW_RESET"));
     }
 }

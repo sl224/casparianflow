@@ -16,7 +16,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use casparian_protocol::SinkMode;
+use casparian_protocol::{safe_output_id, SinkMode};
 #[cfg(feature = "sink-duckdb")]
 pub use casparian_sinks_duckdb::DuckDbSink;
 
@@ -29,7 +29,8 @@ fn job_prefix(job_id: &str) -> String {
 }
 
 pub fn output_filename(output_name: &str, job_id: &str, extension: &str) -> String {
-    format!("{}_{}.{}", output_name, job_prefix(job_id), extension)
+    let safe_name = safe_output_id(output_name);
+    format!("{}_{}.{}", safe_name, job_prefix(job_id), extension)
 }
 
 /// Errors returned by sink planning and writing.
@@ -330,7 +331,7 @@ pub fn write_output_plan(
 
 /// Parquet sink writer
 ///
-/// Partitions output by job_id: {output_name}_{job_id}.parquet
+/// Partitions output by job_id: {safe_output_id}_{job_id}.parquet
 pub struct ParquetSink {
     output_dir: PathBuf,
     output_name: String,
@@ -493,7 +494,7 @@ impl Drop for ParquetSink {
 
 /// CSV sink writer
 ///
-/// Partitions output by job_id: {output_name}_{job_id}.csv
+/// Partitions output by job_id: {safe_output_id}_{job_id}.csv
 pub struct CsvSink {
     output_dir: PathBuf,
     output_name: String,

@@ -22,6 +22,7 @@ pub mod error;
 pub mod http_types;
 pub mod idempotency;
 pub mod metrics;
+pub mod naming;
 pub mod paths;
 pub mod telemetry;
 pub mod types;
@@ -81,6 +82,7 @@ pub use types::{
 pub use idempotency::{
     materialization_key, output_target_key, schema_hash, table_name_with_schema,
 };
+pub use naming::{is_safe_output_id, safe_output_id};
 
 // Re-export HTTP API types
 pub use http_types::{

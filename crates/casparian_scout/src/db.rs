@@ -567,13 +567,12 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open or create a database at the given path.
-    pub fn open(path: &Path) -> Result<Self> {
-        let conn = DbConnection::open_sqlite(path)?;
-
-        let schema_sql = schema_sql(false);
-        conn.execute_batch(&schema_sql)?;
-        Self::validate_schema(&conn)?;
+    fn from_conn_with_init(conn: DbConnection, init_schema: bool) -> Result<Self> {
+        if init_schema {
+            let schema_sql = schema_sql(false);
+            conn.execute_batch(&schema_sql)?;
+            Self::validate_schema(&conn)?;
+        }
 
         Ok(Self {
             conn,
@@ -581,18 +580,35 @@ impl Database {
         })
     }
 
+    /// Open or create a database at the given path.
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = DbConnection::open_sqlite(path)?;
+        Self::from_conn_with_init(conn, true)
+    }
+
+    /// Open an existing database without schema initialization/validation.
+    ///
+    /// Call `open` or `open_with_busy_timeout` once at startup to initialize.
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        let conn = DbConnection::open_sqlite(path)?;
+        Self::from_conn_with_init(conn, false)
+    }
+
     /// Open or create a database with a custom busy timeout (milliseconds).
     pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
         let conn = DbConnection::open_sqlite_with_busy_timeout(path, busy_timeout_ms)?;
+        Self::from_conn_with_init(conn, true)
+    }
 
-        let schema_sql = schema_sql(false);
-        conn.execute_batch(&schema_sql)?;
-        Self::validate_schema(&conn)?;
+    /// Open an existing database with a busy timeout, skipping schema work.
+    pub fn open_existing_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
+        let conn = DbConnection::open_sqlite_with_busy_timeout(path, busy_timeout_ms)?;
+        Self::from_conn_with_init(conn, false)
+    }
 
-        Ok(Self {
-            conn,
-            _temp_dir: None,
-        })
+    /// Wrap an existing connection without schema initialization/validation.
+    pub fn from_conn(conn: DbConnection) -> Result<Self> {
+        Self::from_conn_with_init(conn, false)
     }
 
     /// Validate schema columns and fail loud if the DB is outdated (pre-v1 policy).
@@ -623,7 +639,8 @@ impl Database {
         } else {
             return Err(ScoutError::Config(format!(
                 "Database schema for 'scout_files' is missing columns: {}. \
-Delete the database (default: ~/.casparian_flow/state.sqlite) and restart.",
+Manual reset required. Delete the state store (default: ~/.casparian_flow/state.sqlite) \
+or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
                 missing.join(", ")
             )));
         }
@@ -642,7 +659,8 @@ Delete the database (default: ~/.casparian_flow/state.sqlite) and restart.",
 
         Err(ScoutError::Config(format!(
             "Database schema for 'scout_sources' is missing columns: {}. \
-Delete the database (default: ~/.casparian_flow/state.sqlite) and restart.",
+Manual reset required. Delete the state store (default: ~/.casparian_flow/state.sqlite) \
+or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
             source_missing.join(", ")
         )))
     }
@@ -652,13 +670,9 @@ Delete the database (default: ~/.casparian_flow/state.sqlite) and restart.",
         let temp_dir = Arc::new(TempDir::new()?);
         let db_path = temp_dir.path().join("scout.sqlite");
         let conn = DbConnection::open_sqlite(&db_path)?;
-        let schema_sql = schema_sql(false);
-        conn.execute_batch(&schema_sql)?;
-        Self::validate_schema(&conn)?;
-        Ok(Self {
-            conn,
-            _temp_dir: Some(temp_dir),
-        })
+        let mut db = Self::from_conn_with_init(conn, true)?;
+        db._temp_dir = Some(temp_dir);
+        Ok(db)
     }
 
     /// Get the underlying connection (for sharing with other code).
