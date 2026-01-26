@@ -2,7 +2,7 @@
 plan: scan_persist_line_rate
 last_updated: 2026-01-26
 milestone: M3
-step: M3.1
+step: M3.2
 status: completed
 baseline:
   scanner_walk_only: "walk_parallel: 10.480 ms (thrpt ~477.11 Kelem/s)"
@@ -39,6 +39,7 @@ notes:
   - "2026-01-26: Non-scan work: state store split to SQLite + query catalog plumbing + sentinel epoch millis. Did not run cargo test -p casparian or scanner_perf bench for this milestone."
   - "2026-01-26: Control-plane TUI backend + sentinel control API updates. Ran cargo check -p casparian_sentinel and cargo check -p casparian. Did not run cargo test -p casparian or scanner_perf bench."
   - "2026-01-26: Fixed SQLite scan rename detection by updating paths for matching file_uid before upsert; adjusted TUI tests for task nav + Esc behavior. Ran cargo test -p casparian (pass). ./scripts/tui-qa.sh timed out on tui-state-graph; ran tui-state-graph with --max-nodes 200 --max-depth 8 (pass) and ran tui-flow specs (pass). Ran cargo bench -p casparian --bench scanner_perf; db_write batch_size=4096/10000 regressed, rescan improved (see benchmark log)."
+  - "2026-01-26: Reduced default scan batch_size to 1000 and added adaptive batch sizing with dynamic walker batch targets. Ran cargo test -p casparian (pass). Ran cargo bench -p casparian --bench scanner_perf; walk_parallel 10.011-10.400 ms; full_scan batch_size=512 123.27-125.88 ms, batch_size=2048 115.39-120.21 ms, batch_size=10000 117.08-121.08 ms; rescan batch_size=512 128.86-133.90 ms, batch_size=2048 119.11-124.40 ms, batch_size=10000 124.06-126.59 ms; db_write batch_size=256 129.52-134.61 ms, batch_size=1024 95.104-96.195 ms, batch_size=4096 86.795-90.273 ms, batch_size=10000 83.624-88.947 ms."
 ---
 
 # Goal

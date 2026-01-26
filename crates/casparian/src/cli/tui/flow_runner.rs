@@ -144,6 +144,7 @@ fn run_flow(args: TuiFlowRunArgs) -> Result<()> {
 
     let tui_args = TuiArgs {
         database: flow.env.database.clone(),
+        standalone_writer: false,
         record_flow: None,
         record_redaction: RecordRedaction::Plaintext,
         record_checkpoint_every: None,

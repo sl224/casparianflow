@@ -581,6 +581,20 @@ impl Database {
         })
     }
 
+    /// Open or create a database with a custom busy timeout (milliseconds).
+    pub fn open_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
+        let conn = DbConnection::open_sqlite_with_busy_timeout(path, busy_timeout_ms)?;
+
+        let schema_sql = schema_sql(false);
+        conn.execute_batch(&schema_sql)?;
+        Self::validate_schema(&conn)?;
+
+        Ok(Self {
+            conn,
+            _temp_dir: None,
+        })
+    }
+
     /// Validate schema columns and fail loud if the DB is outdated (pre-v1 policy).
     fn validate_schema(conn: &DbConnection) -> Result<()> {
         let required_columns = [

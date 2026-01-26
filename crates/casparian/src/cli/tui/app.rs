@@ -24,13 +24,14 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::info_span;
 
-use super::{nav, ui_signature::UiSignature, TuiArgs};
+use super::{backend::BackendRouter, nav, ui_signature::UiSignature, TuiArgs};
 use crate::cli::config::{
     casparian_home, default_db_backend, query_catalog_path, state_store_path, DbBackend,
 };
+use crate::cli::scan::classify_scan_error;
 use crate::cli::context;
 use casparian::scout::{
     match_rules_to_files, patterns, scan_path, Database as ScoutDatabase, RuleApplyFile,
@@ -40,6 +41,27 @@ use casparian::scout::{
 use casparian::telemetry::{scan_config_telemetry, TelemetryRecorder};
 use casparian_protocol::telemetry as protocol_telemetry;
 use uuid::Uuid;
+
+#[path = "views/approvals.rs"]
+mod approvals;
+#[path = "views/discover.rs"]
+mod discover;
+#[path = "views/jobs.rs"]
+mod jobs;
+#[path = "views/home.rs"]
+mod home;
+#[path = "views/catalog.rs"]
+mod catalog;
+#[path = "views/query.rs"]
+mod query;
+#[path = "views/sessions.rs"]
+mod sessions;
+#[path = "views/settings.rs"]
+mod settings;
+#[path = "views/sources.rs"]
+mod sources;
+#[path = "views/triage.rs"]
+mod triage;
 
 /// Current TUI mode/screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -802,6 +824,62 @@ impl JobsState {
         self.trim_completed_jobs();
     }
 
+    pub fn merge_loaded_jobs(&mut self, loaded: Vec<JobInfo>) {
+        // Keep ephemeral/local jobs regardless of what DB/control returned.
+        // Treat loaded jobs as authoritative snapshot for persistent records.
+        let mut existing_by_id: HashMap<i64, JobInfo> =
+            self.jobs.iter().cloned().map(|job| (job.id, job)).collect();
+
+        let mut next: Vec<JobInfo> = self
+            .jobs
+            .iter()
+            .cloned()
+            .filter(|job| job.origin == JobOrigin::Ephemeral)
+            .collect();
+
+        for mut new_job in loaded {
+            if let Some(old) = existing_by_id.remove(&new_job.id) {
+                // Preserve UI-only/detail fields that DB/control does not (or should not) own.
+                new_job.violations = old.violations;
+                new_job.top_violations_loaded = old.top_violations_loaded;
+                new_job.selected_violation_index = old.selected_violation_index;
+                if new_job.backtest.is_none() && old.backtest.is_some() {
+                    new_job.backtest = old.backtest.clone();
+                }
+                if new_job.failures.is_empty()
+                    && !old.failures.is_empty()
+                    && new_job.status == old.status
+                {
+                    new_job.failures = old.failures.clone();
+                }
+
+                // Preserve stable started_at when the loader used Local::now() fallback.
+                if matches!(new_job.status, JobStatus::Pending)
+                    && old.started_at < new_job.started_at
+                {
+                    new_job.started_at = old.started_at;
+                }
+
+                // Preserve completed_at if we had it but refresh doesn't.
+                if new_job.completed_at.is_none() && old.completed_at.is_some() {
+                    new_job.completed_at = old.completed_at;
+                }
+            }
+
+            next.push(new_job);
+        }
+
+        self.jobs = next;
+        self.trim_completed_jobs();
+
+        if let Some(pinned) = self.pinned_job_id {
+            if !self.jobs.iter().any(|job| job.id == pinned) {
+                self.pinned_job_id = None;
+            }
+        }
+        self.clamp_selection();
+    }
+
     /// Trim old completed/failed jobs to prevent unbounded memory growth
     /// Keeps running/pending jobs and removes oldest completed jobs first
     fn trim_completed_jobs(&mut self) {
@@ -864,6 +942,14 @@ impl JobType {
     }
 }
 
+/// Where a job record comes from (persistent store vs local UI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JobOrigin {
+    #[default]
+    Persistent,
+    Ephemeral,
+}
+
 /// Mode for schema evaluation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaEvalMode {
@@ -879,6 +965,7 @@ pub struct JobInfo {
     pub id: i64,
     pub file_id: Option<i64>,
     pub job_type: JobType,
+    pub origin: JobOrigin,
     pub name: String, // parser/exporter/source name
     pub version: Option<String>,
     pub status: JobStatus,
@@ -918,6 +1005,7 @@ impl Default for JobInfo {
             id: 0,
             file_id: None,
             job_type: JobType::Parse,
+            origin: JobOrigin::Persistent,
             name: String::new(),
             version: None,
             status: JobStatus::Pending,
@@ -3055,6 +3143,8 @@ pub struct App {
     control_addr: Option<String>,
     /// Whether Control API is connected (sentinel is writer)
     control_connected: bool,
+    /// Last time we probed the control plane (for reconnect)
+    last_control_probe: Option<Instant>,
     /// Optional telemetry recorder (Tape domain events)
     pub telemetry: Option<TelemetryRecorder>,
     /// Last error message
@@ -3212,6 +3302,7 @@ struct RuleBuilderSearchResult {
 struct ControlWriteResult {
     sources_changed: bool,
     error: Option<String>,
+    control_connected: Option<bool>,
 }
 
 impl App {
@@ -3292,6 +3383,13 @@ impl App {
     fn reset_db_file(&mut self, path: &std::path::Path, reason: &str) -> bool {
         if self.control_connected {
             let warn = "Control API active; refusing to reset state store.".to_string();
+            self.db_health_warning = Some(warn.clone());
+            self.discover.status_message = Some((warn, true));
+            return false;
+        }
+        if !self.config.standalone_writer {
+            let warn = "Sentinel not reachable; run with --standalone-writer to reset the state store."
+                .to_string();
             self.db_health_warning = Some(warn.clone());
             self.discover.status_message = Some((warn, true));
             return false;
@@ -3469,6 +3567,7 @@ impl App {
             config: args,
             control_addr,
             control_connected,
+            last_control_probe: None,
             telemetry,
             error: None,
             pending_scan: None,
@@ -3498,7 +3597,7 @@ impl App {
             last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250), // 250ms frame budget
-            db_read_only: control_connected,
+            db_read_only: false,
             db_health_checked: false,
             db_health_warning: None,
         }
@@ -3518,7 +3617,7 @@ impl App {
         // Stay in RuleBuilder view; dropdowns open only on explicit user action.
     }
 
-    fn resolve_db_target(&self) -> (DbBackend, std::path::PathBuf) {
+    pub(super) fn resolve_db_target(&self) -> (DbBackend, std::path::PathBuf) {
         if let Some(ref path) = self.config.database {
             (DbBackend::Sqlite, path.clone())
         } else {
@@ -3546,13 +3645,33 @@ impl App {
         }
     }
 
-    fn open_db_readonly(&self) -> Result<Option<DbConnection>, BackendError> {
-        let (backend, path) = self.resolve_db_target();
-        Self::open_db_readonly_with(backend, &path)
+    fn maybe_probe_control_connection(&mut self) {
+        let Some(addr) = self.control_addr.as_deref() else {
+            return;
+        };
+        let now = Instant::now();
+        let should_probe = self
+            .last_control_probe
+            .map(|last| now.duration_since(last) >= Duration::from_secs(2))
+            .unwrap_or(true);
+        if !should_probe {
+            return;
+        }
+        self.last_control_probe = Some(now);
+
+        let connected = Self::probe_control_addr(addr);
+        if connected != self.control_connected {
+            self.control_connected = connected;
+            if connected {
+                self.set_global_status("Sentinel connected", false);
+            } else {
+                self.set_global_status("Sentinel not reachable", true);
+            }
+        }
     }
 
     fn open_db_write(&self) -> Result<Option<DbConnection>, BackendError> {
-        if self.db_read_only {
+        if self.db_read_only || self.control_connected || !self.config.standalone_writer {
             return Ok(None);
         }
         let (backend, path) = self.resolve_db_target();
@@ -3560,7 +3679,7 @@ impl App {
     }
 
     fn open_scout_db_for_writes(&mut self) -> Option<ScoutDatabase> {
-        if self.db_read_only {
+        if self.db_read_only || self.control_connected || !self.config.standalone_writer {
             return None;
         }
         let (_backend, path) = self.resolve_db_target();
@@ -3673,75 +3792,6 @@ impl App {
         }
     }
 
-    fn query_first_workspace(&self) -> Result<Option<Workspace>, String> {
-        let workspaces = self.query_workspaces()?;
-        Ok(workspaces.into_iter().next())
-    }
-
-    fn query_workspace_by_id(&self, id: &WorkspaceId) -> Result<Option<Workspace>, String> {
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => return Ok(None),
-            Err(err) => {
-                return Err(format!("Database open failed: {}", err));
-            }
-        };
-        let has_table = App::table_exists(&conn, "cf_workspaces")
-            .map_err(|err| format!("Workspace schema check failed: {}", err))?;
-        if !has_table {
-            return Ok(None);
-        }
-        let row = conn
-            .query_optional(
-                "SELECT id, name, created_at FROM cf_workspaces WHERE id = ?",
-                &[DbValue::Text(id.to_string())],
-            )
-            .map_err(|err| format!("Workspace query failed: {}", err))?;
-        match row {
-            Some(row) => Ok(Some(Self::row_to_workspace(&row)?)),
-            None => Ok(None),
-        }
-    }
-
-    fn query_workspaces(&self) -> Result<Vec<Workspace>, String> {
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => return Err("Database not found".to_string()),
-            Err(err) => {
-                return Err(format!("Database open failed: {}", err));
-            }
-        };
-        let has_table = App::table_exists(&conn, "cf_workspaces")
-            .map_err(|err| format!("Workspace schema check failed: {}", err))?;
-        if !has_table {
-            return Err("Workspace registry not initialized".to_string());
-        }
-        let rows = conn
-            .query_all(
-                "SELECT id, name, created_at FROM cf_workspaces ORDER BY created_at ASC",
-                &[],
-            )
-            .map_err(|err| format!("Workspace query failed: {}", err))?;
-        let mut workspaces = Vec::with_capacity(rows.len());
-        for row in rows {
-            workspaces.push(Self::row_to_workspace(&row)?);
-        }
-        Ok(workspaces)
-    }
-
-    fn row_to_workspace(row: &casparian_db::UnifiedDbRow) -> Result<Workspace, String> {
-        let id_raw: String = row.get(0).map_err(|err| err.to_string())?;
-        let id = WorkspaceId::parse(&id_raw).map_err(|err| err.to_string())?;
-        let name: String = row.get(1).map_err(|err| err.to_string())?;
-        let created_at_ms: i64 = row.get(2).unwrap_or_default();
-        let created_at =
-            chrono::DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now);
-        Ok(Workspace {
-            id,
-            name,
-            created_at,
-        })
-    }
 
     fn job_from_control(job: ControlJobInfo) -> JobInfo {
         let status = JobStatus::from_db_status(job.status.as_str(), None);
@@ -3786,6 +3836,7 @@ impl App {
                 Some(job.file_id)
             },
             job_type: JobType::Parse,
+            origin: JobOrigin::Persistent,
             name: job.plugin_name,
             version: job.parser_version,
             status,
@@ -3818,18 +3869,13 @@ impl App {
         });
     }
 
-    fn open_db_readonly_with(
-        backend: DbBackend,
-        path: &std::path::Path,
-    ) -> Result<Option<DbConnection>, BackendError> {
-        if !path.exists() {
-            return Ok(None);
-        }
-
-        match backend {
-            DbBackend::Sqlite => DbConnection::open_sqlite_readonly(path).map(Some),
-            DbBackend::DuckDb => DbConnection::open_duckdb_readonly(path).map(Some),
-        }
+    fn mutations_blocked(&self) -> bool {
+        BackendRouter::new(
+            self.control_addr.clone(),
+            self.config.standalone_writer,
+            self.db_read_only,
+        )
+        .mutations_blocked(self.control_connected)
     }
 
     fn open_db_write_with(
@@ -3844,14 +3890,6 @@ impl App {
             DbBackend::Sqlite => DbConnection::open_sqlite(path).map(Some),
             DbBackend::DuckDb => DbConnection::open_duckdb(path).map(Some),
         }
-    }
-
-    fn table_exists(conn: &DbConnection, table: &str) -> Result<bool, BackendError> {
-        conn.table_exists(table)
-    }
-
-    fn column_exists(conn: &DbConnection, table: &str, column: &str) -> Result<bool, BackendError> {
-        conn.column_exists(table, column)
     }
 
     fn report_db_error(&mut self, context: &str, err: impl std::fmt::Display) {
@@ -4223,471 +4261,6 @@ impl App {
         }
     }
 
-    // ======== Query Mode Key Handler ========
-
-    /// Handle Query mode key events
-    fn handle_query_key(&mut self, key: KeyEvent) {
-        match self.query_state.view_state {
-            QueryViewState::Editing => self.handle_query_editing_key(key),
-            QueryViewState::Executing => {
-                // Esc detaches (query keeps running in background)
-                if key.code == KeyCode::Esc {
-                    self.query_state.view_state = QueryViewState::Editing;
-                }
-            }
-            QueryViewState::ViewingResults => self.handle_query_results_key(key),
-            QueryViewState::TableBrowser => self.handle_query_table_browser_key(key),
-            QueryViewState::SavedQueries => self.handle_query_saved_queries_key(key),
-        }
-    }
-
-    /// Handle keys when in query editing mode
-    fn handle_query_editing_key(&mut self, key: KeyEvent) {
-        if self.query_state.status_message.is_some() {
-            self.query_state.status_message = None;
-        }
-        match key.code {
-            // Ctrl+Enter = execute query
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.execute_query();
-            }
-            // Ctrl+T = open table browser
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.load_table_browser();
-                self.query_state.view_state = QueryViewState::TableBrowser;
-            }
-            // Ctrl+S = save query
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.save_query_to_disk();
-            }
-            // Ctrl+O = open saved query list
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.load_saved_queries();
-                self.query_state.view_state = QueryViewState::SavedQueries;
-            }
-            // Ctrl+L = clear input
-            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.query_state.sql_input.clear();
-                self.query_state.cursor_position = 0;
-                self.query_state.history_index = None;
-                self.query_state.draft_input = None;
-            }
-            // Up arrow = history navigation (when not in middle of text)
-            KeyCode::Up
-                if self.query_state.cursor_position == 0
-                    || self.query_state.sql_input.is_empty() =>
-            {
-                self.query_state.history_prev();
-            }
-            // Down arrow = history navigation (when browsing history)
-            KeyCode::Down if self.query_state.history_index.is_some() => {
-                self.query_state.history_next();
-            }
-            // Tab = toggle focus to results (if results exist)
-            KeyCode::Tab if self.query_state.results.is_some() => {
-                self.query_state.view_state = QueryViewState::ViewingResults;
-            }
-            // Esc = clear results/error or do nothing
-            KeyCode::Esc => {
-                if self.query_state.error.is_some() {
-                    self.query_state.error = None;
-                } else if self.query_state.results.is_some() {
-                    self.query_state.results = None;
-                }
-            }
-            // Regular text input
-            KeyCode::Char(c) => {
-                self.query_state
-                    .sql_input
-                    .insert(self.query_state.cursor_position, c);
-                self.query_state.cursor_position += 1;
-                self.query_state.history_index = None;
-            }
-            KeyCode::Backspace if self.query_state.cursor_position > 0 => {
-                self.query_state.cursor_position -= 1;
-                self.query_state
-                    .sql_input
-                    .remove(self.query_state.cursor_position);
-                self.query_state.history_index = None;
-            }
-            KeyCode::Delete
-                if self.query_state.cursor_position < self.query_state.sql_input.len() =>
-            {
-                self.query_state
-                    .sql_input
-                    .remove(self.query_state.cursor_position);
-                self.query_state.history_index = None;
-            }
-            KeyCode::Left if self.query_state.cursor_position > 0 => {
-                self.query_state.cursor_position -= 1;
-            }
-            KeyCode::Right
-                if self.query_state.cursor_position < self.query_state.sql_input.len() =>
-            {
-                self.query_state.cursor_position += 1;
-            }
-            KeyCode::Home => {
-                self.query_state.cursor_position = 0;
-            }
-            KeyCode::End => {
-                self.query_state.cursor_position = self.query_state.sql_input.len();
-            }
-            KeyCode::Enter => {
-                // Regular Enter adds newline for multi-line queries
-                self.query_state
-                    .sql_input
-                    .insert(self.query_state.cursor_position, '\n');
-                self.query_state.cursor_position += 1;
-                self.query_state.history_index = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when viewing query results
-    fn handle_query_results_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Tab = toggle focus back to editor
-            KeyCode::Tab | KeyCode::Esc => {
-                self.query_state.view_state = QueryViewState::Editing;
-            }
-            // Up/Down = navigate result rows
-            KeyCode::Up => {
-                if let Some(ref mut results) = self.query_state.results {
-                    if results.selected_row > 0 {
-                        results.selected_row -= 1;
-                    }
-                }
-            }
-            KeyCode::Down => {
-                if let Some(ref mut results) = self.query_state.results {
-                    if results.selected_row + 1 < results.rows.len() {
-                        results.selected_row += 1;
-                    }
-                }
-            }
-            // Left/Right = horizontal scroll for wide tables
-            KeyCode::Left => {
-                if let Some(ref mut results) = self.query_state.results {
-                    if results.scroll_x > 0 {
-                        results.scroll_x -= 1;
-                    }
-                }
-            }
-            KeyCode::Right => {
-                if let Some(ref mut results) = self.query_state.results {
-                    if results.scroll_x + 1 < results.columns.len() {
-                        results.scroll_x += 1;
-                    }
-                }
-            }
-            // Page navigation
-            KeyCode::PageUp => {
-                if let Some(ref mut results) = self.query_state.results {
-                    results.selected_row = results.selected_row.saturating_sub(10);
-                }
-            }
-            KeyCode::PageDown => {
-                if let Some(ref mut results) = self.query_state.results {
-                    let max = results.rows.len().saturating_sub(1);
-                    results.selected_row = (results.selected_row + 10).min(max);
-                }
-            }
-            KeyCode::Home => {
-                if let Some(ref mut results) = self.query_state.results {
-                    results.selected_row = 0;
-                }
-            }
-            KeyCode::End => {
-                if let Some(ref mut results) = self.query_state.results {
-                    results.selected_row = results.rows.len().saturating_sub(1);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_query_table_browser_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.query_state.view_state = QueryViewState::Editing;
-            }
-            KeyCode::Up => {
-                if self.query_state.table_browser.selected_index > 0 {
-                    self.query_state.table_browser.selected_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if self.query_state.table_browser.selected_index + 1
-                    < self.query_state.table_browser.tables.len()
-                {
-                    self.query_state.table_browser.selected_index += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(table) = self
-                    .query_state
-                    .table_browser
-                    .tables
-                    .get(self.query_state.table_browser.selected_index)
-                {
-                    self.query_state
-                        .sql_input
-                        .insert_str(self.query_state.cursor_position, table.as_str());
-                    self.query_state.cursor_position += table.len();
-                }
-                self.query_state.view_state = QueryViewState::Editing;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_query_saved_queries_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.query_state.view_state = QueryViewState::Editing;
-            }
-            KeyCode::Up => {
-                if self.query_state.saved_queries.selected_index > 0 {
-                    self.query_state.saved_queries.selected_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if self.query_state.saved_queries.selected_index + 1
-                    < self.query_state.saved_queries.entries.len()
-                {
-                    self.query_state.saved_queries.selected_index += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(entry) = self
-                    .query_state
-                    .saved_queries
-                    .entries
-                    .get(self.query_state.saved_queries.selected_index)
-                {
-                    match std::fs::read_to_string(&entry.path) {
-                        Ok(sql) => {
-                            self.query_state.sql_input = sql;
-                            self.query_state.cursor_position = self.query_state.sql_input.len();
-                            self.query_state.error = None;
-                            self.query_state.results = None;
-                            self.query_state.view_state = QueryViewState::Editing;
-                        }
-                        Err(err) => {
-                            self.query_state.status_message = Some(format!("Load failed: {}", err));
-                        }
-                    }
-                } else {
-                    self.query_state.view_state = QueryViewState::Editing;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn load_table_browser(&mut self) {
-        self.query_state.table_browser.tables.clear();
-        self.query_state.table_browser.selected_index = 0;
-        self.query_state.table_browser.error = None;
-
-        let db_path = query_catalog_path();
-        if !db_path.exists() {
-            self.query_state.table_browser.error = Some("Query catalog not found".to_string());
-            return;
-        }
-
-        let conn = match DbConnection::open_duckdb_readonly(&db_path) {
-            Ok(conn) => conn,
-            Err(err) => {
-                self.query_state.table_browser.error =
-                    Some(format!("Query catalog open failed: {}", err));
-                return;
-            }
-        };
-
-        let rows = match conn.query_all(
-            "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-             ORDER BY table_name",
-            &[],
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                self.query_state.table_browser.error = Some(format!("Table list failed: {}", err));
-                return;
-            }
-        };
-
-        for row in rows {
-            if let Ok(name) = row.get::<String>(0) {
-                self.query_state.table_browser.tables.push(name);
-            }
-        }
-        self.query_state.table_browser.loaded = true;
-    }
-
-    fn load_saved_queries(&mut self) {
-        self.query_state.saved_queries.entries.clear();
-        self.query_state.saved_queries.selected_index = 0;
-        self.query_state.saved_queries.error = None;
-
-        let dir = casparian_home().join("queries");
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            self.query_state.saved_queries.error =
-                Some(format!("Create queries dir failed: {}", err));
-            return;
-        }
-
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                self.query_state.saved_queries.error =
-                    Some(format!("Read queries dir failed: {}", err));
-                return;
-            }
-        };
-
-        let mut list: Vec<SavedQueryEntry> = entries
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .path()
-                    .extension()
-                    .map(|e| e == "sql")
-                    .unwrap_or(false)
-            })
-            .map(|entry| SavedQueryEntry {
-                name: entry
-                    .path()
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("query.sql")
-                    .to_string(),
-                path: entry.path(),
-            })
-            .collect();
-
-        list.sort_by(|a, b| a.name.cmp(&b.name));
-        self.query_state.saved_queries.entries = list;
-        self.query_state.saved_queries.loaded = true;
-    }
-
-    fn save_query_to_disk(&mut self) {
-        let sql = self.query_state.sql_input.trim();
-        if sql.is_empty() {
-            self.query_state.status_message = Some("Nothing to save".to_string());
-            return;
-        }
-
-        let dir = casparian_home().join("queries");
-        if let Err(err) = std::fs::create_dir_all(&dir) {
-            self.query_state.status_message = Some(format!("Save failed: {}", err));
-            return;
-        }
-
-        let filename = format!("query_{}.sql", Local::now().format("%Y%m%d_%H%M%S"));
-        let path = dir.join(&filename);
-        if let Err(err) = std::fs::write(&path, sql) {
-            self.query_state.status_message = Some(format!("Save failed: {}", err));
-            return;
-        }
-
-        self.query_state.status_message = Some(format!("Saved {}", filename));
-        self.query_state.saved_queries.loaded = false;
-    }
-
-    /// Execute the current SQL query
-    fn execute_query(&mut self) {
-        // Clone the SQL to avoid borrow issues
-        let sql = self.query_state.sql_input.trim().to_string();
-        if sql.is_empty() {
-            return;
-        }
-
-        if self.query_state.executing {
-            self.query_state.error =
-                Some("Query already running. Press Esc to detach.".to_string());
-            return;
-        }
-
-        self.query_state.clear_for_new_query();
-        self.query_state.view_state = QueryViewState::Executing;
-        self.query_state.executing = true;
-
-        let db_path = query_catalog_path();
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.pending_query = Some(rx);
-
-        std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            let result = match DbConnection::open_duckdb_readonly(&db_path) {
-                Ok(conn) => App::run_query_with_conn(&conn, &sql),
-                Err(err) => Err(format!("Query catalog open failed: {}", err)),
-            };
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            let _ = tx.send(QueryExecutionResult {
-                sql,
-                result,
-                elapsed_ms,
-            });
-        });
-    }
-
-    /// Run a SQL query and return results
-    fn run_query_with_conn(conn: &DbConnection, sql: &str) -> Result<QueryResults, String> {
-        use casparian_db::DbValue;
-
-        let rows_result = conn.query_all(sql, &[]);
-
-        match rows_result {
-            Ok(rows) => {
-                // Extract column names from first row if available
-                let columns: Vec<String> = if rows.is_empty() {
-                    vec![]
-                } else {
-                    rows[0].column_names().to_vec()
-                };
-
-                const MAX_ROWS: usize = 1000;
-                let truncated = rows.len() > MAX_ROWS;
-                let row_count = rows.len();
-
-                let result_rows: Vec<Vec<String>> = rows
-                    .into_iter()
-                    .take(MAX_ROWS)
-                    .map(|row| {
-                        (0..row.len())
-                            .map(|i| {
-                                // Convert DbValue to display string
-                                match row.get_raw(i) {
-                                    Some(DbValue::Null) => "NULL".to_string(),
-                                    Some(DbValue::Integer(v)) => v.to_string(),
-                                    Some(DbValue::Real(v)) => v.to_string(),
-                                    Some(DbValue::Text(v)) => v.clone(),
-                                    Some(DbValue::Boolean(v)) => v.to_string(),
-                                    Some(DbValue::Blob(v)) => format!("<blob {} bytes>", v.len()),
-                                    Some(DbValue::Timestamp(t)) => t.to_rfc3339(),
-                                    None => "NULL".to_string(),
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
-
-                Ok(QueryResults {
-                    columns,
-                    rows: result_rows,
-                    row_count,
-                    truncated,
-                    selected_row: 0,
-                    scroll_x: 0,
-                })
-            }
-            Err(e) => Err(format!("Query error: {}", e)),
-        }
-    }
-
     // ======== Discover State Machine Helpers ========
 
     /// Transition to a new Discover view state, saving current as previous
@@ -4723,2803 +4296,9 @@ impl App {
         }
     }
 
-    /// Handle command palette key events
-    fn handle_command_palette_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.command_palette.close();
-            }
-            KeyCode::Enter => {
-                // Execute the selected action
-                if let Some(action) = self.command_palette.selected_action().cloned() {
-                    match action {
-                        CommandAction::Navigate(mode) => {
-                            self.command_palette.close();
-                            self.navigate_to_mode(mode);
-                        }
-                        CommandAction::StartIntent(intent) => {
-                            // Add to history before closing
-                            self.command_palette.add_to_history(intent.clone());
-                            self.command_palette.close();
-                            match self.create_intent_session(&intent) {
-                                Ok(session_id) => {
-                                    self.sessions_state.pending_select_session_id =
-                                        Some(session_id);
-                                    self.sessions_state.sessions_loaded = false;
-                                    self.sessions_state.view_state = SessionsViewState::SessionList;
-                                    self.sessions_state.active_session = None;
-                                    self.set_review_tab(ReviewTab::Sessions);
-                                }
-                                Err(err) => {
-                                    tracing::error!("{}", err);
-                                }
-                            }
-                        }
-                        CommandAction::RunCommand(cmd) => {
-                            self.command_palette.close();
-                            // Handle slash commands
-                            match cmd.as_str() {
-                                "/jobs" => self.set_run_tab(RunTab::Jobs),
-                                "/approve" => self.set_review_tab(ReviewTab::Approvals),
-                                "/query" => self.navigate_to_mode(TuiMode::Query),
-                                "/workspace" => self.open_workspace_switcher(),
-                                "/quarantine" => self.open_triage(None),
-                                "/catalog" | "/pipelines" => self.open_catalog(None),
-                                "/scan" => {
-                                    self.navigate_to_mode(TuiMode::Ingest);
-                                    self.set_ingest_tab(IngestTab::Select);
-                                    self.transition_discover_state(DiscoverViewState::EnteringPath);
-                                }
-                                "/help" => {
-                                    self.show_help = true;
-                                }
-                                _ => {
-                                    // Unknown command - show in status
-                                    self.discover.status_message =
-                                        Some((format!("Unknown command: {}", cmd), true));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            KeyCode::Tab => {
-                // Cycle through modes
-                self.command_palette.cycle_mode();
-            }
-            KeyCode::Up => {
-                self.command_palette.select_prev();
-            }
-            KeyCode::Down => {
-                self.command_palette.select_next();
-            }
-            KeyCode::Left => {
-                self.command_palette.cursor_left();
-            }
-            KeyCode::Right => {
-                self.command_palette.cursor_right();
-            }
-            KeyCode::Home => {
-                self.command_palette.cursor_home();
-            }
-            KeyCode::End => {
-                self.command_palette.cursor_end();
-            }
-            KeyCode::Backspace => {
-                self.command_palette.backspace();
-            }
-            KeyCode::Delete => {
-                self.command_palette.delete();
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+U clears input
-                self.command_palette.clear_input();
-            }
-            KeyCode::Char(c) => {
-                self.command_palette.insert_char(c);
-            }
-            _ => {}
-        }
-    }
 
-    fn open_workspace_switcher(&mut self) {
-        self.ensure_active_workspace();
-        self.workspace_switcher.visible = true;
-        self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
-        self.workspace_switcher.input.clear();
-        self.workspace_switcher.status_message = None;
-        self.load_workspace_switcher_list();
-    }
-
-    fn close_workspace_switcher(&mut self) {
-        self.workspace_switcher.visible = false;
-        self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
-        self.workspace_switcher.input.clear();
-        self.workspace_switcher.status_message = None;
-    }
-
-    fn load_workspace_switcher_list(&mut self) {
-        self.workspace_switcher.workspaces.clear();
-        self.workspace_switcher.loaded = false;
-        match self.query_workspaces() {
-            Ok(workspaces) => {
-                self.workspace_switcher.workspaces = workspaces;
-                self.workspace_switcher.loaded = true;
-                if let Some(active_id) = self.active_workspace_id() {
-                    if let Some(idx) = self
-                        .workspace_switcher
-                        .workspaces
-                        .iter()
-                        .position(|ws| ws.id == active_id)
-                    {
-                        self.workspace_switcher.selected_index = idx;
-                    } else {
-                        self.workspace_switcher.selected_index = 0;
-                    }
-                } else {
-                    self.workspace_switcher.selected_index = 0;
-                }
-            }
-            Err(err) => {
-                self.workspace_switcher.status_message = Some(err);
-            }
-        }
-    }
-
-    fn handle_workspace_switcher_key(&mut self, key: KeyEvent) {
-        match self.workspace_switcher.mode {
-            WorkspaceSwitcherMode::List => match key.code {
-                KeyCode::Esc => {
-                    self.close_workspace_switcher();
-                }
-                KeyCode::Up => {
-                    if self.workspace_switcher.selected_index > 0 {
-                        self.workspace_switcher.selected_index -= 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if self.workspace_switcher.selected_index + 1
-                        < self.workspace_switcher.workspaces.len()
-                    {
-                        self.workspace_switcher.selected_index += 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    if let Some(workspace) = self
-                        .workspace_switcher
-                        .workspaces
-                        .get(self.workspace_switcher.selected_index)
-                        .cloned()
-                    {
-                        self.apply_active_workspace(workspace);
-                        self.close_workspace_switcher();
-                    }
-                }
-                KeyCode::Char('n') => {
-                    if self.db_read_only {
-                        self.workspace_switcher.status_message =
-                            Some("Database is read-only; cannot create workspace".to_string());
-                    } else {
-                        self.workspace_switcher.mode = WorkspaceSwitcherMode::Creating;
-                        self.workspace_switcher.input.clear();
-                        self.workspace_switcher.status_message = None;
-                    }
-                }
-                KeyCode::Char('r') => {
-                    self.load_workspace_switcher_list();
-                }
-                _ => {}
-            },
-            WorkspaceSwitcherMode::Creating => {
-                match handle_text_input(key, &mut self.workspace_switcher.input) {
-                    TextInputResult::Committed => {
-                        let name = self.workspace_switcher.input.trim().to_string();
-                        if name.is_empty() {
-                            self.workspace_switcher.status_message =
-                                Some("Workspace name is required".to_string());
-                            return;
-                        }
-                        match self.create_workspace(&name) {
-                            Ok(workspace) => {
-                                self.apply_active_workspace(workspace);
-                                self.close_workspace_switcher();
-                            }
-                            Err(err) => {
-                                self.workspace_switcher.status_message = Some(err);
-                            }
-                        }
-                    }
-                    TextInputResult::Cancelled => {
-                        self.workspace_switcher.mode = WorkspaceSwitcherMode::List;
-                        self.workspace_switcher.input.clear();
-                    }
-                    TextInputResult::Continue => {}
-                    TextInputResult::NotHandled => {}
-                }
-            }
-        }
-    }
-
-    fn create_workspace(&mut self, name: &str) -> Result<Workspace, String> {
-        let db = self
-            .open_scout_db_for_writes()
-            .ok_or_else(|| "Database unavailable for writes".to_string())?;
-        if let Ok(Some(existing)) = db.get_workspace_by_name(name) {
-            return Err(format!("Workspace '{}' already exists", existing.name));
-        }
-        db.create_workspace(name)
-            .map_err(|err| format!("Create workspace failed: {}", err))
-    }
-
-    fn apply_active_workspace(&mut self, workspace: Workspace) {
-        let name = workspace.name.clone();
-        let id = workspace.id;
-        let was_ingest = self.mode == TuiMode::Ingest && self.ingest_tab != IngestTab::Sources;
-        self.reset_workspace_scoped_state();
-        self.active_workspace = Some(workspace);
-        if let Err(err) = context::set_active_workspace(&id) {
-            self.workspace_switcher
-                .status_message
-                .replace(format!("Failed to persist workspace context: {}", err));
-        } else {
-            self.set_global_status(format!("Switched workspace to {}", name), false);
-        }
-        if was_ingest {
-            self.enter_discover_mode();
-        }
-    }
-
-    fn reset_workspace_scoped_state(&mut self) {
-        // Discover caches and selections
-        self.discover = DiscoverState {
-            page_size: DISCOVER_PAGE_SIZE,
-            ..Default::default()
-        };
-
-        // Cancel any pending workspace-scoped async work.
-        self.pending_cache_load = None;
-        self.pending_folder_query = None;
-        self.pending_glob_search = None;
-        self.pending_rule_builder_search = None;
-        self.cache_load_progress = None;
-        self.last_cache_load_timing = None;
-        self.glob_search_cancelled = None;
-
-        // Sources view state
-        self.sources_state = SourcesState::default();
-
-        // Home stats should reload for the new workspace
-        self.home.stats_loaded = false;
-        self.home.stats = HomeStats::default();
-        self.home.recent_jobs.clear();
-        self.home.selected_source_index = 0;
-        self.home.filter.clear();
-        self.home.filtering = false;
-
-        // Jobs may be workspace-scoped; reload and clear filters.
-        self.jobs_state.jobs.clear();
-        self.jobs_state.jobs_loaded = false;
-        self.jobs_state.status_filter = None;
-        self.jobs_state.type_filter = None;
-        self.jobs_state.selected_index = 0;
-        self.jobs_state.pinned_job_id = None;
-
-        // Invalidate cached loads.
-        self.pending_sources_load = None;
-        self.pending_stats_load = None;
-        self.pending_jobs_load = None;
-    }
-
-    fn create_intent_session(&self, intent: &str) -> Result<String, String> {
-        let store = SessionStore::with_root(casparian_home().join("sessions"));
-        match store.create_session(intent, Some("tui"), Some("tui")) {
-            Ok(bundle) => Ok(bundle.session_id.to_string()),
-            Err(err) => Err(format!("Session create failed: {}", err)),
-        }
-    }
-
-    /// Handle Discover mode keys - using unified state machine
-    fn handle_discover_key(&mut self, key: KeyEvent) {
-        // Clear status message on any key press
-        if self.discover.status_message.is_some() && key.code != KeyCode::Esc {
-            self.discover.status_message = None;
-        }
-
-        // Global keybindings that work from most states (per spec Section 6.1)
-        // R (Rules Manager), M (Sources Manager), S/T (Sources/Tags dropdowns)
-        // work from Files, dropdowns, etc.
-        // but NOT from dialogs or text input modes
-        if !self.in_text_input_mode()
-            && !matches!(
-                self.discover.view_state,
-                DiscoverViewState::RulesManager
-                    | DiscoverViewState::RuleCreation
-                    | DiscoverViewState::SourcesManager
-                    | DiscoverViewState::SourceEdit
-                    | DiscoverViewState::SourceDeleteConfirm
-            )
-        {
-            match key.code {
-                KeyCode::Char('R') => {
-                    self.transition_discover_state(DiscoverViewState::RulesManager);
-                    self.discover.selected_rule = 0;
-                    return;
-                }
-                KeyCode::Char('M') => {
-                    self.transition_discover_state(DiscoverViewState::SourcesManager);
-                    self.discover.sources_manager_selected = self.discover.selected_source_index();
-                    return;
-                }
-                KeyCode::Char('S') => {
-                    self.handle_discover_panel_shortcut(KeyCode::Char('S'));
-                    return;
-                }
-                KeyCode::Char('T') => {
-                    self.handle_discover_panel_shortcut(KeyCode::Char('T'));
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        // Route to handler based on current view state
-        match self.discover.view_state {
-            // === Modal text input states (using shared handler) ===
-            DiscoverViewState::EnteringPath => {
-                // Handle autocomplete navigation first
-                match key.code {
-                    KeyCode::Tab if !self.discover.path_suggestions.is_empty() => {
-                        // Apply selected suggestion
-                        self.apply_path_suggestion();
-                        return;
-                    }
-                    KeyCode::Down if !self.discover.path_suggestions.is_empty() => {
-                        // Navigate down in suggestions
-                        let max_idx = self.discover.path_suggestions.len().saturating_sub(1);
-                        self.discover.path_suggestion_idx =
-                            (self.discover.path_suggestion_idx + 1).min(max_idx);
-                        return;
-                    }
-                    KeyCode::Up if !self.discover.path_suggestions.is_empty() => {
-                        // Navigate up in suggestions
-                        self.discover.path_suggestion_idx =
-                            self.discover.path_suggestion_idx.saturating_sub(1);
-                        return;
-                    }
-                    _ => {}
-                }
-
-                // Handle regular text input
-                match handle_text_input(key, &mut self.discover.scan_path_input) {
-                    TextInputResult::Committed => {
-                        let path = self.discover.scan_path_input.clone();
-                        self.discover.path_suggestions.clear();
-                        if path.is_empty() {
-                            self.discover.view_state = DiscoverViewState::Files;
-                            return;
-                        }
-                        if self.is_risky_scan_path(&path) {
-                            self.discover.scan_confirm_path = Some(path);
-                            self.discover.view_state = DiscoverViewState::ScanConfirm;
-                            self.discover.status_message = Some((
-                                "Confirm scan of a risky path (Enter to proceed, Esc to cancel)"
-                                    .to_string(),
-                                true,
-                            ));
-                        } else {
-                            self.discover.view_state = DiscoverViewState::Files;
-                            self.scan_directory(&path);
-                        }
-                    }
-                    TextInputResult::Cancelled => {
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.scan_path_input.clear();
-                        self.discover.path_suggestions.clear();
-                        self.discover.scan_error = None;
-                    }
-                    TextInputResult::Continue => {
-                        // Update suggestions after any character change
-                        self.update_path_suggestions();
-                    }
-                    TextInputResult::NotHandled => {}
-                }
-            }
-
-            DiscoverViewState::ScanConfirm => match key.code {
-                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(path) = self.discover.scan_confirm_path.take() {
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.status_message = None;
-                        self.scan_directory(&path);
-                    } else {
-                        self.discover.view_state = DiscoverViewState::Files;
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.discover.scan_confirm_path = None;
-                    self.discover.view_state = DiscoverViewState::Files;
-                    self.discover
-                        .status_message
-                        .replace(("Scan cancelled".to_string(), true));
-                }
-                _ => {}
-            },
-
-            DiscoverViewState::CreatingSource => {
-                match handle_text_input(key, &mut self.discover.source_name_input) {
-                    TextInputResult::Committed => {
-                        let name = self.discover.source_name_input.trim().to_string();
-                        if !name.is_empty() {
-                            if let Some(path) = self.discover.pending_source_path.take() {
-                                self.create_source(&path, &name);
-                            }
-                        }
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.source_name_input.clear();
-                    }
-                    TextInputResult::Cancelled => {
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.source_name_input.clear();
-                        self.discover.pending_source_path = None;
-                    }
-                    TextInputResult::Continue | TextInputResult::NotHandled => {}
-                }
-            }
-
-            DiscoverViewState::BulkTagging => {
-                // Special handling: Space toggles option
-                if key.code == KeyCode::Char(' ') {
-                    self.discover.bulk_tag_save_as_rule = !self.discover.bulk_tag_save_as_rule;
-                    return;
-                }
-                match handle_text_input(key, &mut self.discover.bulk_tag_input) {
-                    TextInputResult::Committed => {
-                        let tag = self.discover.bulk_tag_input.trim().to_string();
-                        if !tag.is_empty() {
-                            let file_ids: Vec<i64> =
-                                self.filtered_files().iter().map(|f| f.file_id).collect();
-                            let count = file_ids.len();
-                            for file_id in file_ids {
-                                self.queue_tag_for_file(
-                                    file_id,
-                                    &tag,
-                                    TagSource::Manual,
-                                    None,
-                                    false,
-                                );
-                            }
-                            let rule_msg = if self.discover.bulk_tag_save_as_rule {
-                                " (rule saved)"
-                            } else {
-                                ""
-                            };
-                            self.discover.status_message = Some((
-                                format!("Tagged {} files with '{}'{}", count, tag, rule_msg),
-                                false,
-                            ));
-                        }
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.bulk_tag_input.clear();
-                        self.discover.bulk_tag_save_as_rule = false;
-                    }
-                    TextInputResult::Cancelled => {
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.bulk_tag_input.clear();
-                        self.discover.bulk_tag_save_as_rule = false;
-                    }
-                    TextInputResult::Continue | TextInputResult::NotHandled => {}
-                }
-            }
-
-            DiscoverViewState::Tagging => {
-                // Special handling: Tab for autocomplete
-                if key.code == KeyCode::Tab {
-                    if !self.discover.tag_input.is_empty() {
-                        let input_lower = self.discover.tag_input.to_lowercase();
-                        if let Some(matching_tag) = self
-                            .discover
-                            .available_tags
-                            .iter()
-                            .find(|t| t.to_lowercase().starts_with(&input_lower))
-                        {
-                            self.discover.tag_input = matching_tag.clone();
-                        }
-                    }
-                    return;
-                }
-                match handle_text_input(key, &mut self.discover.tag_input) {
-                    TextInputResult::Committed => {
-                        let tag = self.discover.tag_input.trim().to_string();
-                        if !tag.is_empty() {
-                            if let Some(file) = self.filtered_files().get(self.discover.selected) {
-                                self.queue_tag_for_file(
-                                    file.file_id,
-                                    &tag,
-                                    TagSource::Manual,
-                                    None,
-                                    true,
-                                );
-                            }
-                        }
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.tag_input.clear();
-                    }
-                    TextInputResult::Cancelled => {
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.tag_input.clear();
-                    }
-                    TextInputResult::Continue | TextInputResult::NotHandled => {}
-                }
-            }
-
-            DiscoverViewState::Filtering => {
-                match handle_text_input(key, &mut self.discover.filter) {
-                    TextInputResult::Committed => {
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.page_offset = 0;
-                        self.discover.data_loaded = false;
-                        self.discover.db_filtered = false;
-                    }
-                    TextInputResult::Cancelled => {
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.filter.clear();
-                        self.discover.page_offset = 0;
-                        self.discover.data_loaded = false;
-                        self.discover.db_filtered = false;
-                    }
-                    TextInputResult::Continue | TextInputResult::NotHandled => {
-                        self.discover.db_filtered = false;
-                    }
-                }
-            }
-
-            // === Dialog states ===
-            DiscoverViewState::RuleCreation => match key.code {
-                KeyCode::Enter => {
-                    let tag = self.discover.rule_tag_input.trim().to_string();
-                    let pattern = self.discover.rule_pattern_input.trim().to_string();
-                    if !tag.is_empty() && !pattern.is_empty() {
-                        let tagged_count = self.apply_rule_to_files(&pattern, &tag);
-                        self.discover.rules.push(RuleInfo {
-                            id: RuleId::unsaved(),
-                            pattern: pattern.clone(),
-                            tag: tag.clone(),
-                            priority: 100,
-                            enabled: true,
-                        });
-                        self.refresh_tags_list();
-                        self.discover.status_message = Some((
-                            format!(
-                                "Created rule: {} → {} ({} files tagged)",
-                                pattern, tag, tagged_count
-                            ),
-                            false,
-                        ));
-                    } else if tag.is_empty() && !pattern.is_empty() {
-                        self.discover.status_message =
-                            Some(("Please enter a tag name".to_string(), true));
-                        return;
-                    } else if pattern.is_empty() {
-                        self.discover.status_message =
-                            Some(("Please enter a pattern".to_string(), true));
-                        return;
-                    }
-                    self.close_rule_creation_dialog();
-                }
-                KeyCode::Esc => self.close_rule_creation_dialog(),
-                KeyCode::Tab | KeyCode::BackTab => {
-                    self.discover.rule_dialog_focus = match self.discover.rule_dialog_focus {
-                        RuleDialogFocus::Pattern => RuleDialogFocus::Tag,
-                        RuleDialogFocus::Tag => RuleDialogFocus::Pattern,
-                    };
-                }
-                KeyCode::Char(c) => match self.discover.rule_dialog_focus {
-                    RuleDialogFocus::Pattern => {
-                        self.discover.rule_pattern_input.push(c);
-                        self.update_rule_preview();
-                    }
-                    RuleDialogFocus::Tag => self.discover.rule_tag_input.push(c),
-                },
-                KeyCode::Backspace => match self.discover.rule_dialog_focus {
-                    RuleDialogFocus::Pattern => {
-                        self.discover.rule_pattern_input.pop();
-                        self.update_rule_preview();
-                    }
-                    RuleDialogFocus::Tag => {
-                        self.discover.rule_tag_input.pop();
-                    }
-                },
-                _ => {}
-            },
-
-            DiscoverViewState::RulesManager => self.handle_rules_manager_key(key),
-            DiscoverViewState::SourcesDropdown => self.handle_sources_dropdown_key(key),
-            DiscoverViewState::TagsDropdown => self.handle_tags_dropdown_key(key),
-
-            // === Sources Manager states (spec v1.7) ===
-            DiscoverViewState::SourcesManager => self.handle_sources_manager_key(key),
-            DiscoverViewState::SourceEdit => self.handle_source_edit_key(key),
-            DiscoverViewState::SourceDeleteConfirm => self.handle_source_delete_confirm_key(key),
-
-            // === Rule Builder (specs/rule_builder.md) ===
-            DiscoverViewState::RuleBuilder => self.handle_rule_builder_key(key),
-
-            // === Background scanning state ===
-            DiscoverViewState::Scanning => {
-                match key.code {
-                    // Esc cancels the scan
-                    KeyCode::Esc => {
-                        // Update job status to Cancelled
-                        if let Some(job_id) = self.current_scan_job_id {
-                            self.update_scan_job_status(
-                                job_id,
-                                JobStatus::Cancelled,
-                                None,
-                                None,
-                                None,
-                            );
-                        }
-
-                        if self.control_connected {
-                            if let (Some(scan_id), Some(control_addr)) =
-                                (self.current_scan_id.clone(), self.control_addr.clone())
-                            {
-                                std::thread::spawn(move || {
-                                    if let Ok(client) = ControlClient::connect_with_timeout(
-                                        &control_addr,
-                                        Duration::from_millis(200),
-                                    ) {
-                                        let _ = client.cancel_scan(scan_id);
-                                    }
-                                });
-                            }
-                        } else if let Some(token) = self.scan_cancel_token.take() {
-                            token.cancel();
-                        }
-
-                        self.pending_scan = None;
-                        self.current_scan_job_id = None;
-                        self.current_scan_id = None;
-                        self.discover.scanning_path = None;
-                        self.discover.scan_progress = None;
-                        self.discover.scan_start_time = None;
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.discover.status_message = Some(("Scan cancelled".to_string(), true));
-                    }
-                    // Navigate to Home while scan continues in background
-                    KeyCode::Char('0') => {
-                        // Don't cancel - scan continues, just switch view
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.set_mode(TuiMode::Home);
-                        self.discover.status_message =
-                            Some(("Scan running in background...".to_string(), false));
-                    }
-                    // Navigate to Run (Jobs) while scan continues in background
-                    KeyCode::Char('2') => {
-                        // Don't cancel - scan continues, just switch view
-                        self.discover.view_state = DiscoverViewState::Files;
-                        self.set_run_tab(RunTab::Jobs);
-                        self.discover.status_message =
-                            Some(("Scan running in background...".to_string(), false));
-                    }
-                    // All other keys are ignored during scanning
-                    _ => {}
-                }
-            }
-
-            // === Default file browsing state ===
-            DiscoverViewState::Files => {
-                // IMPORTANT: If in text input mode (glob pattern editing, filtering, etc.),
-                // dispatch to the appropriate handler first - don't intercept shortcuts
-                if self.in_text_input_mode() {
-                    match self.discover.focus {
-                        DiscoverFocus::Files => self.handle_discover_files_key(key),
-                        DiscoverFocus::Sources => self.handle_discover_sources_key(key),
-                        DiscoverFocus::Tags => self.handle_discover_tags_key(key),
-                    }
-                    return;
-                }
-
-                // Not in text input mode - handle shortcuts
-                // NOTE: Keys 1-4 are now handled globally for view navigation.
-                // Use Tab/arrow keys for panel focus cycling within Discover.
-                match key.code {
-                    KeyCode::Char('n') => self.open_rule_creation_dialog(),
-                    // Tab: Toggle preview panel or cycle focus
-                    KeyCode::Tab if self.discover.focus == DiscoverFocus::Files => {
-                        // If in glob explorer EditRule phase, let it handle Tab for section cycling
-                        if let Some(ref explorer) = self.discover.glob_explorer {
-                            if matches!(explorer.phase, GlobExplorerPhase::EditRule { .. }) {
-                                self.handle_discover_files_key(key);
-                                return;
-                            }
-                        }
-                        self.discover.preview_open = !self.discover.preview_open;
-                    }
-                    KeyCode::Esc if !self.discover.filter.is_empty() => {
-                        // If in glob explorer non-Browse phase, let it handle Escape
-                        let in_glob_editor_phase = self
-                            .discover
-                            .glob_explorer
-                            .as_ref()
-                            .map(|e| {
-                                !matches!(
-                                    e.phase,
-                                    GlobExplorerPhase::Browse | GlobExplorerPhase::Filtering
-                                )
-                            })
-                            .unwrap_or(false);
-                        if in_glob_editor_phase {
-                            self.handle_discover_files_key(key);
-                            return;
-                        }
-                        self.discover.filter.clear();
-                        self.discover.selected = 0;
-                        self.discover.page_offset = 0;
-                        self.discover.data_loaded = false;
-                        self.discover.db_filtered = false;
-                    }
-                    KeyCode::Esc => {
-                        self.set_mode(TuiMode::Home);
-                    }
-                    _ => match self.discover.focus {
-                        DiscoverFocus::Files => self.handle_discover_files_key(key),
-                        DiscoverFocus::Sources => self.handle_discover_sources_key(key),
-                        DiscoverFocus::Tags => self.handle_discover_tags_key(key),
-                    },
-                }
-            }
-        }
-    }
-
-    /// Handle keys when Files panel is focused
-    fn handle_discover_files_key(&mut self, key: KeyEvent) {
-        // === Glob Explorer mode ===
-        // When glob_explorer is active, handle folder navigation
-        if self.discover.glob_explorer.is_some() {
-            self.handle_glob_explorer_key(key);
-            return;
-        }
-
-        // === Normal file list mode ===
-        match key.code {
-            KeyCode::Char('g') => {
-                // Toggle Glob Explorer on
-                self.discover.glob_explorer = Some(GlobExplorerState::default());
-                self.discover.data_loaded = false; // Trigger reload
-                self.discover.db_filtered = false;
-            }
-            KeyCode::Down => {
-                if self.discover.selected < self.filtered_files().len().saturating_sub(1) {
-                    self.discover.selected += 1;
-                }
-            }
-            KeyCode::Up => {
-                if self.discover.selected > 0 {
-                    self.discover.selected -= 1;
-                }
-            }
-            KeyCode::PageDown => {
-                self.discover_next_page();
-            }
-            KeyCode::PageUp => {
-                self.discover_prev_page();
-            }
-            KeyCode::Home => {
-                self.discover_first_page();
-            }
-            KeyCode::End => {
-                self.discover_last_page();
-            }
-            KeyCode::Char('/') => {
-                self.transition_discover_state(DiscoverViewState::Filtering);
-            }
-            KeyCode::Char('p') => {
-                self.discover.preview_open = !self.discover.preview_open;
-            }
-            KeyCode::Char('s') => {
-                // Open scan path input - auto-populate with selected source path
-                self.transition_discover_state(DiscoverViewState::EnteringPath);
-                // Pre-fill with selected source path if available
-                self.discover.scan_path_input = self
-                    .discover
-                    .selected_source()
-                    .map(|s| s.path.display().to_string())
-                    .unwrap_or_default();
-                self.discover.scan_error = None;
-            }
-            KeyCode::Char('r') => {
-                // Reload from Scout DB
-                self.discover.data_loaded = false;
-                self.discover.db_filtered = false;
-                self.discover.sources_loaded = false;
-            }
-            KeyCode::Char('t') => {
-                // Open tag dialog for selected file (or bulk tag if filter active)
-                if !self.discover.filter.is_empty() {
-                    // With filter active, 't' tags all filtered files
-                    let count = self.filtered_files().len();
-                    if count > 0 {
-                        self.transition_discover_state(DiscoverViewState::BulkTagging);
-                        self.discover.bulk_tag_input.clear();
-                        self.discover.bulk_tag_save_as_rule = false;
-                    }
-                } else if !self.filtered_files().is_empty() {
-                    self.transition_discover_state(DiscoverViewState::Tagging);
-                    self.discover.tag_input.clear();
-                }
-            }
-            KeyCode::Char('R') => {
-                // Create rule from current filter
-                if !self.discover.filter.is_empty() {
-                    // Prefill pattern with current filter
-                    self.discover.rule_pattern_input = self.discover.filter.clone();
-                    self.discover.rule_tag_input.clear();
-                    self.transition_discover_state(DiscoverViewState::RuleCreation);
-                } else {
-                    self.discover.status_message =
-                        Some(("Enter a filter pattern first (press /)".to_string(), true));
-                }
-            }
-            KeyCode::Char('c') => {
-                // Create source from selected directory
-                let file_info = self
-                    .filtered_files()
-                    .get(self.discover.selected)
-                    .map(|f| (f.is_dir, f.path.clone()));
-
-                if let Some((is_dir, path)) = file_info {
-                    if is_dir {
-                        self.transition_discover_state(DiscoverViewState::CreatingSource);
-                        self.discover.source_name_input.clear();
-                        self.discover.pending_source_path = Some(path);
-                    } else {
-                        self.discover.status_message =
-                            Some(("Select a directory to create a source".to_string(), true));
-                    }
-                }
-            }
-            KeyCode::Char('B') => {
-                // Bulk tag all filtered/visible files (explicit B)
-                let count = self.filtered_files().len();
-                if count > 0 {
-                    self.transition_discover_state(DiscoverViewState::BulkTagging);
-                    self.discover.bulk_tag_input.clear();
-                    self.discover.bulk_tag_save_as_rule = false;
-                } else {
-                    self.discover.status_message = Some(("No files to tag".to_string(), true));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when Glob Explorer is active (hierarchical folder navigation)
-    fn handle_glob_explorer_key(&mut self, key: KeyEvent) {
-        // Check current phase to determine behavior
-        let phase = self
-            .discover
-            .glob_explorer
-            .as_ref()
-            .map(|e| e.phase.clone());
-
-        // Pattern editing mode (Filtering phase) - uses in-memory cache filtering
-        if matches!(phase, Some(GlobExplorerPhase::Filtering)) {
-            match key.code {
-                KeyCode::Enter | KeyCode::Esc | KeyCode::Down => {
-                    // Exit pattern editing, move focus to folder list (Browse phase)
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        explorer.phase = GlobExplorerPhase::Browse;
-                    }
-                    self.update_folders_from_cache();
-                }
-                KeyCode::Left => {
-                    // Move cursor left
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if explorer.pattern_cursor > 0 {
-                            explorer.pattern_cursor -= 1;
-                        }
-                    }
-                }
-                KeyCode::Right => {
-                    // Move cursor right
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        let len = explorer.pattern.chars().count();
-                        if explorer.pattern_cursor < len {
-                            explorer.pattern_cursor += 1;
-                        }
-                    }
-                }
-                KeyCode::Home => {
-                    // Move cursor to start
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        explorer.pattern_cursor = 0;
-                    }
-                }
-                KeyCode::End => {
-                    // Move cursor to end
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        explorer.pattern_cursor = explorer.pattern.chars().count();
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if explorer.pattern_cursor > 0 && !explorer.pattern.is_empty() {
-                            // Delete character before cursor
-                            let mut chars: Vec<char> = explorer.pattern.chars().collect();
-                            chars.remove(explorer.pattern_cursor - 1);
-                            explorer.pattern = chars.into_iter().collect();
-                            explorer.pattern_cursor -= 1;
-                            explorer.pattern_changed_at = Some(std::time::Instant::now());
-                        } else if explorer.pattern.is_empty() && !explorer.current_prefix.is_empty()
-                        {
-                            // Pattern is empty, go up a directory
-                            let prefix = explorer.current_prefix.trim_end_matches('/');
-                            if let Some(last_slash) = prefix.rfind('/') {
-                                explorer.current_prefix = format!("{}/", &prefix[..last_slash]);
-                            } else {
-                                explorer.current_prefix.clear();
-                            }
-                            explorer.pattern = "*".to_string();
-                            explorer.pattern_cursor = 1;
-                            explorer.nav_history.clear();
-                            explorer.pattern_changed_at = Some(std::time::Instant::now());
-                        }
-                    }
-                }
-                KeyCode::Delete => {
-                    // Delete character at cursor
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        let len = explorer.pattern.chars().count();
-                        if explorer.pattern_cursor < len {
-                            let mut chars: Vec<char> = explorer.pattern.chars().collect();
-                            chars.remove(explorer.pattern_cursor);
-                            explorer.pattern = chars.into_iter().collect();
-                            explorer.pattern_changed_at = Some(std::time::Instant::now());
-                        }
-                    }
-                }
-                KeyCode::Char(c) => {
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        // Insert character at cursor position
-                        let mut chars: Vec<char> = explorer.pattern.chars().collect();
-                        chars.insert(explorer.pattern_cursor, c);
-                        explorer.pattern = chars.into_iter().collect();
-                        explorer.pattern_cursor += 1;
-                        explorer.pattern_changed_at = Some(std::time::Instant::now());
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // EditRule phase - editing extraction rule
-        if let Some(GlobExplorerPhase::EditRule {
-            focus,
-            selected_index,
-            editing_field,
-        }) = phase.clone()
-        {
-            self.handle_edit_rule_key(key, focus, selected_index, editing_field);
-            return;
-        }
-
-        // Testing phase - viewing test results
-        if matches!(phase, Some(GlobExplorerPhase::Testing)) {
-            self.handle_testing_key(key);
-            return;
-        }
-
-        // Publishing phase - confirming publish
-        if matches!(phase, Some(GlobExplorerPhase::Publishing)) {
-            self.handle_publishing_key(key);
-            return;
-        }
-
-        // Published phase - success screen
-        if matches!(phase, Some(GlobExplorerPhase::Published { .. })) {
-            self.handle_published_key(key);
-            return;
-        }
-
-        // Navigation mode (Browse phase)
-        match key.code {
-            KeyCode::Down => {
-                // Navigate down in folder list
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if explorer.selected_folder < explorer.folders.len().saturating_sub(1) {
-                        explorer.selected_folder += 1;
-                    }
-                }
-            }
-            KeyCode::Up => {
-                // Navigate up in folder list, or move to pattern input at top
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if explorer.selected_folder > 0 {
-                        explorer.selected_folder -= 1;
-                    } else {
-                        // At top of list, move focus to pattern input (Filtering phase)
-                        explorer.phase = GlobExplorerPhase::Filtering;
-                        explorer.pattern_cursor = explorer.pattern.chars().count();
-                    }
-                }
-            }
-            KeyCode::Enter | KeyCode::Right => {
-                // Drill into selected folder - O(1) using cache
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(folder) = explorer.folders.get(explorer.selected_folder).cloned() {
-                        // Don't drill into files or the loading placeholder
-                        let folder_name = folder.name().to_string();
-                        if !folder.is_file()
-                            && !folder_name.contains("Loading folder hierarchy")
-                            && !folder_name.contains("Searching")
-                        {
-                            // Save current (prefix, pattern) to history for back navigation
-                            explorer
-                                .nav_history
-                                .push((explorer.current_prefix.clone(), explorer.pattern.clone()));
-
-                            // Determine new prefix based on whether this is a ** result or normal folder
-                            if let Some(full_path) = folder.path() {
-                                // ** result: path is the full folder path, use it directly
-                                explorer.current_prefix = format!("{}/", full_path);
-                                // Clear ** from pattern when drilling into a ** result
-                                if explorer.pattern.contains("**") {
-                                    explorer.pattern = explorer.pattern.replace("**/", "");
-                                }
-                            } else {
-                                // Normal folder: append folder name to current prefix
-                                explorer.current_prefix =
-                                    format!("{}{}/", explorer.current_prefix, folder_name);
-                            }
-
-                            // Stay in Browse phase (navigation) - phase doesn't change based on folder depth
-                            explorer.selected_folder = 0;
-                        }
-                    }
-                }
-                // Update from cache - O(1) hashmap lookup, no SQL
-                self.update_folders_from_cache();
-            }
-            KeyCode::Left => {
-                // Go back to parent folder - O(1) using cache
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some((prev_prefix, prev_pattern)) = explorer.nav_history.pop() {
-                        explorer.current_prefix = prev_prefix;
-                        explorer.pattern = prev_pattern;
-                        // Stay in Browse phase
-                        self.update_folders_from_cache();
-                    } else if key.code == KeyCode::Left {
-                        // At root level, Left/h moves focus to sidebar
-                        self.discover.focus = DiscoverFocus::Sources;
-                    }
-                }
-            }
-            KeyCode::Char('/') => {
-                // Enter pattern editing mode (Filtering phase)
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.phase = GlobExplorerPhase::Filtering;
-                    // Position cursor at end of pattern
-                    explorer.pattern_cursor = explorer.pattern.chars().count();
-                }
-            }
-            KeyCode::Char('e') => {
-                // Enter rule editing mode (if matches > 0)
-                // Get source_id before mutable borrow
-                let source_id = self.discover.selected_source().map(|s| s.id);
-
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    let match_count = explorer.total_count.value();
-                    if match_count > 0 {
-                        // Create a new rule draft from current pattern
-                        let pattern = if explorer.current_prefix.is_empty() {
-                            explorer.pattern.clone()
-                        } else {
-                            format!("{}{}", explorer.current_prefix, explorer.pattern)
-                        };
-                        explorer.rule_draft = Some(super::extraction::RuleDraft::from_pattern(
-                            &pattern, source_id,
-                        ));
-                        explorer.phase = GlobExplorerPhase::EditRule {
-                            focus: super::extraction::RuleEditorFocus::GlobPattern,
-                            selected_index: 0,
-                            editing_field: None,
-                        };
-                    }
-                    // If no matches, do nothing (could show hint)
-                }
-            }
-            KeyCode::Char('g') | KeyCode::Esc => {
-                // Exit Glob Explorer
-                self.discover.glob_explorer = None;
-                self.discover.data_loaded = false; // Trigger reload of normal file list
-                self.discover.db_filtered = false;
-            }
-            KeyCode::Char('s') => {
-                // Open scan path input (same as normal mode)
-                self.transition_discover_state(DiscoverViewState::EnteringPath);
-                // Pre-fill with selected source path if available
-                self.discover.scan_path_input = self
-                    .discover
-                    .selected_source()
-                    .map(|s| s.path.display().to_string())
-                    .unwrap_or_default();
-                self.discover.scan_error = None;
-            }
-            // --- Rule Builder: Result Filtering (a/p/f keys) ---
-            KeyCode::Char('a') => {
-                // Show all results
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.result_filter = super::extraction::ResultFilter::All;
-                }
-            }
-            KeyCode::Char('p') => {
-                // Show only passing results
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.result_filter = super::extraction::ResultFilter::PassOnly;
-                }
-            }
-            KeyCode::Char('f') => {
-                // Show only failing results
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.result_filter = super::extraction::ResultFilter::FailOnly;
-                }
-            }
-            // --- Rule Builder: Exclusion System (x/i keys) ---
-            KeyCode::Char('x') => {
-                // Exclude selected file/folder from rule
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(folder) = explorer.folders.get(explorer.selected_folder) {
-                        // Build exclusion pattern from current item
-                        let exclude_pattern =
-                            if folder.is_file() {
-                                // Exclude specific file
-                                if let Some(path) = folder.path() {
-                                    path.to_string()
-                                } else {
-                                    format!("{}{}", explorer.current_prefix, folder.name())
-                                }
-                            } else {
-                                // Exclude folder and all contents
-                                let path =
-                                    folder.path().map(|value| value.to_string()).unwrap_or_else(
-                                        || format!("{}{}", explorer.current_prefix, folder.name()),
-                                    );
-                                format!("{}/**", path)
-                            };
-                        // Add to excludes if not already present
-                        if !explorer.excludes.contains(&exclude_pattern) {
-                            explorer.excludes.push(exclude_pattern);
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('i') => {
-                // Ignore current folder (add to excludes)
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if !explorer.current_prefix.is_empty() {
-                        // Remove trailing slash for the exclusion pattern
-                        let folder_path = explorer.current_prefix.trim_end_matches('/').to_string();
-                        let exclude_pattern = format!("{}/**", folder_path);
-                        if !explorer.excludes.contains(&exclude_pattern) {
-                            explorer.excludes.push(exclude_pattern);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys in EditRule phase (editing extraction rule)
-    fn handle_edit_rule_key(
-        &mut self,
-        key: KeyEvent,
-        focus: super::extraction::RuleEditorFocus,
-        selected_index: usize,
-        _editing_field: Option<super::extraction::FieldEditFocus>,
-    ) {
-        use super::extraction::RuleEditorFocus;
-
-        match key.code {
-            KeyCode::Tab => {
-                // Cycle through sections: GlobPattern -> FieldList -> BaseTag -> Conditions -> GlobPattern
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    let new_focus = match focus {
-                        RuleEditorFocus::GlobPattern => RuleEditorFocus::FieldList,
-                        RuleEditorFocus::FieldList => RuleEditorFocus::BaseTag,
-                        RuleEditorFocus::BaseTag => RuleEditorFocus::Conditions,
-                        RuleEditorFocus::Conditions => RuleEditorFocus::GlobPattern,
-                    };
-                    explorer.phase = GlobExplorerPhase::EditRule {
-                        focus: new_focus,
-                        selected_index: 0,
-                        editing_field: None,
-                    };
-                }
-            }
-            KeyCode::BackTab => {
-                // Reverse cycle
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    let new_focus = match focus {
-                        RuleEditorFocus::GlobPattern => RuleEditorFocus::Conditions,
-                        RuleEditorFocus::FieldList => RuleEditorFocus::GlobPattern,
-                        RuleEditorFocus::BaseTag => RuleEditorFocus::FieldList,
-                        RuleEditorFocus::Conditions => RuleEditorFocus::BaseTag,
-                    };
-                    explorer.phase = GlobExplorerPhase::EditRule {
-                        focus: new_focus,
-                        selected_index: 0,
-                        editing_field: None,
-                    };
-                }
-            }
-            KeyCode::Char('t') => {
-                // In text fields, 't' is just a character
-                if matches!(
-                    focus,
-                    RuleEditorFocus::GlobPattern | RuleEditorFocus::BaseTag
-                ) {
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if let Some(ref mut draft) = explorer.rule_draft {
-                            match focus {
-                                RuleEditorFocus::GlobPattern => draft.glob_pattern.push('t'),
-                                RuleEditorFocus::BaseTag => draft.base_tag.push('t'),
-                                _ => {}
-                            }
-                        }
-                    }
-                } else {
-                    // Transition to Testing phase (if rule is valid)
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if let Some(ref draft) = explorer.rule_draft {
-                            if draft.is_valid_for_test() {
-                                // Initialize test state with rule draft and file count
-                                let files_total = explorer.total_count.value();
-                                explorer.test_state = Some(super::extraction::TestState::new(
-                                    draft.clone(),
-                                    files_total,
-                                ));
-                                explorer.phase = GlobExplorerPhase::Testing;
-                                // TODO: Start async test execution (non-blocking)
-                            }
-                        }
-                    }
-                }
-            }
-            KeyCode::Esc => {
-                // Return to Browse, preserve prefix
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.phase = GlobExplorerPhase::Browse;
-                    explorer.rule_draft = None;
-                }
-            }
-            // Section-specific key handling
-            KeyCode::Down => {
-                if matches!(
-                    focus,
-                    RuleEditorFocus::FieldList | RuleEditorFocus::Conditions
-                ) {
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        explorer.phase = GlobExplorerPhase::EditRule {
-                            focus: focus.clone(),
-                            selected_index: selected_index.saturating_add(1),
-                            editing_field: None,
-                        };
-                    }
-                }
-            }
-            KeyCode::Up => {
-                if matches!(
-                    focus,
-                    RuleEditorFocus::FieldList | RuleEditorFocus::Conditions
-                ) {
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        explorer.phase = GlobExplorerPhase::EditRule {
-                            focus: focus.clone(),
-                            selected_index: selected_index.saturating_sub(1),
-                            editing_field: None,
-                        };
-                    }
-                }
-            }
-            KeyCode::Char('a') => {
-                // In text fields, 'a' is just a character
-                if matches!(
-                    focus,
-                    RuleEditorFocus::GlobPattern | RuleEditorFocus::BaseTag
-                ) {
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if let Some(ref mut draft) = explorer.rule_draft {
-                            match focus {
-                                RuleEditorFocus::GlobPattern => draft.glob_pattern.push('a'),
-                                RuleEditorFocus::BaseTag => draft.base_tag.push('a'),
-                                _ => {}
-                            }
-                        }
-                    }
-                } else {
-                    // Add field or condition
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if let Some(ref mut draft) = explorer.rule_draft {
-                            match focus {
-                                RuleEditorFocus::FieldList => {
-                                    draft.fields.push(super::extraction::FieldDraft::default());
-                                }
-                                RuleEditorFocus::Conditions => {
-                                    draft
-                                        .tag_conditions
-                                        .push(super::extraction::TagConditionDraft::default());
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('d') => {
-                // In text fields, 'd' is just a character
-                if matches!(
-                    focus,
-                    RuleEditorFocus::GlobPattern | RuleEditorFocus::BaseTag
-                ) {
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if let Some(ref mut draft) = explorer.rule_draft {
-                            match focus {
-                                RuleEditorFocus::GlobPattern => draft.glob_pattern.push('d'),
-                                RuleEditorFocus::BaseTag => draft.base_tag.push('d'),
-                                _ => {}
-                            }
-                        }
-                    }
-                } else {
-                    // Delete selected field or condition
-                    if let Some(ref mut explorer) = self.discover.glob_explorer {
-                        if let Some(ref mut draft) = explorer.rule_draft {
-                            match focus {
-                                RuleEditorFocus::FieldList => {
-                                    if selected_index < draft.fields.len() {
-                                        draft.fields.remove(selected_index);
-                                    }
-                                }
-                                RuleEditorFocus::Conditions => {
-                                    if selected_index < draft.tag_conditions.len() {
-                                        draft.tag_conditions.remove(selected_index);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('i') if matches!(focus, RuleEditorFocus::FieldList) => {
-                // Infer fields from pattern
-                // TODO: Implement field inference from glob pattern
-            }
-            KeyCode::Char(c) => {
-                // Text input for GlobPattern and BaseTag
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(ref mut draft) = explorer.rule_draft {
-                        match focus {
-                            RuleEditorFocus::GlobPattern => {
-                                draft.glob_pattern.push(c);
-                            }
-                            RuleEditorFocus::BaseTag => {
-                                draft.base_tag.push(c);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            KeyCode::Backspace => {
-                // Delete char for GlobPattern and BaseTag
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(ref mut draft) = explorer.rule_draft {
-                        match focus {
-                            RuleEditorFocus::GlobPattern => {
-                                draft.glob_pattern.pop();
-                            }
-                            RuleEditorFocus::BaseTag => {
-                                draft.base_tag.pop();
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys in Testing phase (viewing test results)
-    fn handle_testing_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('p') => {
-                // Transition to Publishing (only if test is complete)
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(ref test_state) = explorer.test_state {
-                        if matches!(
-                            test_state.phase,
-                            super::extraction::TestPhase::Complete { .. }
-                        ) {
-                            let matching_files = explorer.total_count.value();
-                            explorer.publish_state = Some(super::extraction::PublishState::new(
-                                test_state.rule.clone(),
-                                matching_files,
-                            ));
-                            explorer.phase = GlobExplorerPhase::Publishing;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('e') | KeyCode::Esc => {
-                // Return to EditRule, preserve draft
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.phase = GlobExplorerPhase::EditRule {
-                        focus: super::extraction::RuleEditorFocus::GlobPattern,
-                        selected_index: 0,
-                        editing_field: None,
-                    };
-                    explorer.test_state = None;
-                }
-            }
-            KeyCode::Down => {
-                // Scroll test results down
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(ref mut test_state) = explorer.test_state {
-                        test_state.scroll_offset = test_state.scroll_offset.saturating_add(1);
-                    }
-                }
-            }
-            KeyCode::Up => {
-                // Scroll test results up
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(ref mut test_state) = explorer.test_state {
-                        test_state.scroll_offset = test_state.scroll_offset.saturating_sub(1);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys in Publishing phase (confirming publish)
-    fn handle_publishing_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Enter => {
-                // Confirm publish - save to DB and start job
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    if let Some(ref mut publish_state) = explorer.publish_state {
-                        use super::extraction::PublishPhase;
-                        match publish_state.phase {
-                            PublishPhase::Confirming => {
-                                publish_state.phase = PublishPhase::Saving;
-                                // TODO: Actually save to DB (async, non-blocking)
-                                // For now, transition directly to Published
-                                let job_id = format!(
-                                    "cf_extract_{}",
-                                    &uuid::Uuid::new_v4().to_string()[..8]
-                                );
-                                explorer.phase = GlobExplorerPhase::Published { job_id };
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            KeyCode::Esc => {
-                // Return to EditRule, preserve draft
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.phase = GlobExplorerPhase::EditRule {
-                        focus: super::extraction::RuleEditorFocus::GlobPattern,
-                        selected_index: 0,
-                        editing_field: None,
-                    };
-                    explorer.publish_state = None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys in Published phase (success screen)
-    fn handle_published_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Enter | KeyCode::Esc => {
-                // Return to Browse at root (clean slate)
-                if let Some(ref mut explorer) = self.discover.glob_explorer {
-                    explorer.phase = GlobExplorerPhase::Browse;
-                    explorer.current_prefix.clear();
-                    explorer.pattern = "*".to_string();
-                    explorer.rule_draft = None;
-                    explorer.test_state = None;
-                    explorer.publish_state = None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Get filtered sources based on dropdown filter
-    fn filtered_sources(&self) -> Vec<(usize, &SourceInfo)> {
-        let filter = self.discover.sources_filter.to_lowercase();
-        self.discover
-            .sources
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| filter.is_empty() || s.name.to_lowercase().contains(&filter))
-            .collect()
-    }
-
-    /// Get filtered tags based on dropdown filter
-    fn filtered_tags(&self) -> Vec<(usize, &TagInfo)> {
-        let filter = self.discover.tags_filter.to_lowercase();
-        self.discover
-            .tags
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| filter.is_empty() || t.name.to_lowercase().contains(&filter))
-            .collect()
-    }
-
-    /// Get parser indices filtered by the current Parser Bench filter
-    pub fn filtered_parser_indices(&self) -> Vec<usize> {
-        let filter = self.parser_bench.filter.to_lowercase();
-        self.parser_bench
-            .parsers
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                filter.is_empty()
-                    || p.name.to_lowercase().contains(&filter)
-                    || p.path
-                        .display()
-                        .to_string()
-                        .to_lowercase()
-                        .contains(&filter)
-            })
-            .map(|(idx, _)| idx)
-            .collect()
-    }
-
-    /// Handle keys when Sources dropdown is open
-    /// Vim-style modal: navigation mode by default, '/' enters filter mode
-    fn handle_sources_dropdown_key(&mut self, key: KeyEvent) {
-        // Filter mode: text input goes to filter
-        if self.discover.sources_filtering {
-            match key.code {
-                KeyCode::Enter => {
-                    // Confirm filter, stay in dropdown but exit filter mode
-                    self.discover.sources_filtering = false;
-                }
-                KeyCode::Esc => {
-                    // Clear filter and close dropdown
-                    self.discover.sources_filter.clear();
-                    self.discover.sources_filtering = false;
-                    self.discover.preview_source = None;
-                    self.discover.view_state = DiscoverViewState::RuleBuilder;
-                }
-                KeyCode::Backspace => {
-                    self.discover.sources_filter.pop();
-                    self.update_sources_preview_after_filter();
-                }
-                KeyCode::Char(c) => {
-                    self.discover.sources_filter.push(c);
-                    self.update_sources_preview_after_filter();
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Navigation mode: keybindings work
-        let filtered = self.filtered_sources();
-
-        match key.code {
-            KeyCode::Down => {
-                // Navigate down in dropdown - DON'T reload files here (perf fix)
-                // Files only reload on Enter (confirm selection)
-                if let Some(preview_idx) = self.discover.preview_source {
-                    if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
-                        if pos + 1 < filtered.len() {
-                            self.discover.preview_source = Some(filtered[pos + 1].0);
-                        }
-                    }
-                } else if !filtered.is_empty() {
-                    self.discover.preview_source = Some(filtered[0].0);
-                }
-            }
-            KeyCode::Up => {
-                // Navigate up in dropdown - DON'T reload files here (perf fix)
-                if let Some(preview_idx) = self.discover.preview_source {
-                    if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
-                        if pos > 0 {
-                            self.discover.preview_source = Some(filtered[pos - 1].0);
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('/') => {
-                // Enter filter mode
-                self.discover.sources_filtering = true;
-            }
-            KeyCode::Char('s') => {
-                // Open scan dialog to add new source
-                self.discover.view_state = DiscoverViewState::Files;
-                self.discover.sources_filter.clear();
-                self.discover.sources_filtering = false;
-                self.discover.preview_source = None;
-                self.transition_discover_state(DiscoverViewState::EnteringPath);
-                self.discover.scan_path_input.clear();
-                self.discover.scan_error = None;
-            }
-            KeyCode::Enter => {
-                // Confirm selection, close dropdown
-                if let Some(preview_idx) = self.discover.preview_source {
-                    self.discover.select_source_by_index(preview_idx);
-                    // Schedule source touch for MRU ordering (processed in tick)
-                    if let Some(source_id) = &self.discover.selected_source_id {
-                        self.discover.pending_source_touch = Some(source_id.clone());
-                    }
-                    self.discover.data_loaded = false;
-                    self.discover.db_filtered = false;
-                    self.discover.page_offset = 0;
-                    self.discover.total_files = 0;
-                    self.discover.selected_tag = None;
-                    self.discover.filter.clear();
-                    // Reset glob_explorer completely so it reloads for new source
-                    // Setting to None triggers fresh creation in tick()
-                    self.discover.glob_explorer = None;
-                    // Reset rule_builder so it reinitializes with new source
-                    self.discover.rule_builder = None;
-                    // Cancel any pending cache load for old source
-                    self.pending_cache_load = None;
-                    self.cache_load_progress = None;
-                }
-                // Return to RuleBuilder (the default Discover view)
-                self.discover.view_state = DiscoverViewState::RuleBuilder;
-                self.discover.sources_filter.clear();
-                self.discover.sources_filtering = false;
-                self.discover.preview_source = None;
-            }
-            KeyCode::Esc => {
-                // Close dropdown without changing selection, return to Rule Builder
-                self.discover.view_state = DiscoverViewState::RuleBuilder;
-                self.discover.sources_filter.clear();
-                self.discover.sources_filtering = false;
-                self.discover.preview_source = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// Helper to update preview after filter changes
-    /// Note: Does NOT reload files - that only happens on Enter (perf fix)
-    fn update_sources_preview_after_filter(&mut self) {
-        let filtered = self.filtered_sources();
-        if let Some(preview_idx) = self.discover.preview_source {
-            if !filtered.iter().any(|(i, _)| *i == preview_idx) {
-                self.discover.preview_source = filtered.first().map(|(i, _)| *i);
-            }
-        }
-    }
-
-    /// Handle keys when Sources panel is focused (dropdown closed)
-    fn handle_discover_sources_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('s') => {
-                // Create new source (open scan dialog)
-                self.transition_discover_state(DiscoverViewState::EnteringPath);
-                self.discover.scan_path_input.clear();
-                self.discover.scan_error = None;
-            }
-            KeyCode::Right => {
-                // Move focus to Files/Folder area
-                self.discover.focus = DiscoverFocus::Files;
-            }
-            KeyCode::Down => {
-                // Move focus to Tags
-                self.discover.focus = DiscoverFocus::Tags;
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when Tags dropdown is open
-    /// Vim-style modal: navigation mode by default, '/' enters filter mode
-    fn handle_tags_dropdown_key(&mut self, key: KeyEvent) {
-        // Filter mode: text input goes to filter
-        if self.discover.tags_filtering {
-            match key.code {
-                KeyCode::Enter => {
-                    // Confirm filter, stay in dropdown but exit filter mode
-                    self.discover.tags_filtering = false;
-                }
-                KeyCode::Esc => {
-                    // Clear filter and close dropdown
-                    self.discover.tags_filter.clear();
-                    self.discover.tags_filtering = false;
-                    self.discover.preview_tag = None;
-                    self.discover.view_state = DiscoverViewState::RuleBuilder;
-                }
-                KeyCode::Backspace => {
-                    self.discover.tags_filter.pop();
-                    self.update_tags_preview_after_filter();
-                }
-                KeyCode::Char(c) => {
-                    self.discover.tags_filter.push(c);
-                    self.update_tags_preview_after_filter();
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Navigation mode: keybindings work
-        let filtered = self.filtered_tags();
-
-        match key.code {
-            KeyCode::Down => {
-                if let Some(preview_idx) = self.discover.preview_tag {
-                    if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
-                        if pos + 1 < filtered.len() {
-                            let new_idx = filtered[pos + 1].0;
-                            self.discover.preview_tag = Some(new_idx);
-                            self.discover.selected = 0;
-                        }
-                    }
-                } else if !filtered.is_empty() {
-                    let new_idx = filtered[0].0;
-                    self.discover.preview_tag = Some(new_idx);
-                    self.discover.selected = 0;
-                }
-            }
-            KeyCode::Up => {
-                if let Some(preview_idx) = self.discover.preview_tag {
-                    if let Some(pos) = filtered.iter().position(|(i, _)| *i == preview_idx) {
-                        if pos > 0 {
-                            let new_idx = filtered[pos - 1].0;
-                            self.discover.preview_tag = Some(new_idx);
-                            self.discover.selected = 0;
-                        } else {
-                            // At top of list, select "All files" (None)
-                            self.discover.preview_tag = None;
-                            self.discover.selected = 0;
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('/') => {
-                // Enter filter mode
-                self.discover.tags_filtering = true;
-            }
-            KeyCode::Enter => {
-                // Confirm selection, close dropdown, return to Rule Builder
-                self.discover.selected_tag = self.discover.preview_tag;
-                self.discover.view_state = DiscoverViewState::RuleBuilder;
-                self.discover.tags_filter.clear();
-                self.discover.tags_filtering = false;
-                self.discover.preview_tag = None;
-                self.discover.selected = 0;
-                self.discover.page_offset = 0;
-                self.discover.data_loaded = false;
-                self.discover.db_filtered = false;
-            }
-            KeyCode::Esc => {
-                // Close dropdown without changing selection, return to Rule Builder
-                self.discover.view_state = DiscoverViewState::RuleBuilder;
-                self.discover.tags_filter.clear();
-                self.discover.tags_filtering = false;
-                self.discover.preview_tag = None;
-                self.discover.selected = 0;
-            }
-            _ => {}
-        }
-    }
-
-    /// Helper to update preview after tags filter changes
-    fn update_tags_preview_after_filter(&mut self) {
-        let filtered = self.filtered_tags();
-        if let Some(preview_idx) = self.discover.preview_tag {
-            if !filtered.iter().any(|(i, _)| *i == preview_idx) {
-                self.discover.preview_tag = filtered.first().map(|(i, _)| *i);
-                self.discover.selected = 0;
-            }
-        }
-    }
-
-    /// Handle keys when Tags panel is focused (dropdown closed)
-    fn handle_discover_tags_key(&mut self, key: KeyEvent) {
-        // Tags panel doesn't have specific keybindings when dropdown is closed
-        // Press 2 to open dropdown, R to manage rules
-        match key.code {
-            KeyCode::Right => {
-                // Move focus to Files/Folder area
-                self.discover.focus = DiscoverFocus::Files;
-            }
-            KeyCode::Up => {
-                // Move focus to Sources
-                self.discover.focus = DiscoverFocus::Sources;
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when Rules Manager dialog is open
-    fn handle_rules_manager_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Down => {
-                if self.discover.selected_rule < self.discover.rules.len().saturating_sub(1) {
-                    self.discover.selected_rule += 1;
-                }
-            }
-            KeyCode::Up => {
-                if self.discover.selected_rule > 0 {
-                    self.discover.selected_rule -= 1;
-                }
-            }
-            KeyCode::Char('n') => {
-                // Create new rule
-                self.transition_discover_state(DiscoverViewState::RuleCreation);
-                self.discover.rule_tag_input.clear();
-                self.discover.rule_pattern_input.clear();
-                self.discover.editing_rule_id = None;
-            }
-            KeyCode::Char('e') => {
-                // Edit selected rule
-                if let Some(rule) = self
-                    .discover
-                    .rules
-                    .get(self.discover.selected_rule)
-                    .cloned()
-                {
-                    self.transition_discover_state(DiscoverViewState::RuleCreation);
-                    self.discover.rule_pattern_input = rule.pattern;
-                    self.discover.rule_tag_input = rule.tag;
-                    self.discover.editing_rule_id = Some(rule.id);
-                }
-            }
-            KeyCode::Char('d') => {
-                // Delete selected rule (TODO: add confirmation)
-                if !self.discover.rules.is_empty() {
-                    if self.db_read_only && !self.control_connected {
-                        self.discover.status_message = Some((
-                            "Database is read-only; cannot delete rules".to_string(),
-                            true,
-                        ));
-                        return;
-                    }
-                    let workspace_id = match self.active_workspace_id() {
-                        Some(id) => id,
-                        None => {
-                            self.discover.status_message = Some((
-                                "No workspace selected; cannot delete rule".to_string(),
-                                true,
-                            ));
-                            return;
-                        }
-                    };
-                    if let Some(rule) = self.discover.rules.get(self.discover.selected_rule) {
-                        if let Some(id) = rule.id.0 {
-                            self.discover
-                                .pending_rule_deletes
-                                .push(PendingRuleDelete { id, workspace_id });
-                        }
-                    }
-                    self.discover.rules.remove(self.discover.selected_rule);
-                    if self.discover.selected_rule >= self.discover.rules.len()
-                        && self.discover.selected_rule > 0
-                    {
-                        self.discover.selected_rule -= 1;
-                    }
-                }
-            }
-            KeyCode::Enter => {
-                // Toggle rule enabled/disabled
-                let workspace_id = match self.active_workspace_id() {
-                    Some(id) => id,
-                    None => {
-                        self.discover.status_message = Some((
-                            "No workspace selected; cannot update rule".to_string(),
-                            true,
-                        ));
-                        return;
-                    }
-                };
-                if let Some(rule) = self.discover.rules.get_mut(self.discover.selected_rule) {
-                    if self.db_read_only && !self.control_connected {
-                        self.discover.status_message = Some((
-                            "Database is read-only; cannot update rules".to_string(),
-                            true,
-                        ));
-                        return;
-                    }
-                    rule.enabled = !rule.enabled;
-                    if let Some(id) = rule.id.0 {
-                        self.discover.pending_rule_updates.push(PendingRuleUpdate {
-                            id,
-                            enabled: rule.enabled,
-                            workspace_id,
-                        });
-                    }
-                }
-            }
-            KeyCode::Esc => {
-                // Close Rules Manager
-                self.return_to_previous_discover_state();
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when Sources Manager dialog is open (spec v1.7)
-    fn handle_sources_manager_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Down => {
-                if self.discover.sources_manager_selected
-                    < self.discover.sources.len().saturating_sub(1)
-                {
-                    self.discover.sources_manager_selected += 1;
-                }
-            }
-            KeyCode::Up => {
-                if self.discover.sources_manager_selected > 0 {
-                    self.discover.sources_manager_selected -= 1;
-                }
-            }
-            KeyCode::Char('n') => {
-                // Add new source (open scan dialog)
-                self.transition_discover_state(DiscoverViewState::EnteringPath);
-                self.discover.scan_path_input.clear();
-                self.discover.scan_error = None;
-            }
-            KeyCode::Char('e') => {
-                // Edit selected source name
-                if let Some(source) = self
-                    .discover
-                    .sources
-                    .get(self.discover.sources_manager_selected)
-                {
-                    self.discover.editing_source = Some(source.id.clone());
-                    self.discover.source_edit_input = source.name.clone();
-                    self.transition_discover_state(DiscoverViewState::SourceEdit);
-                }
-            }
-            KeyCode::Char('d') => {
-                // Delete source (with confirmation)
-                if let Some(source) = self
-                    .discover
-                    .sources
-                    .get(self.discover.sources_manager_selected)
-                {
-                    self.discover.source_to_delete = Some(source.id.clone());
-                    self.transition_discover_state(DiscoverViewState::SourceDeleteConfirm);
-                }
-            }
-            KeyCode::Char('r') => {
-                // Rescan selected source
-                let source_info = self
-                    .discover
-                    .sources
-                    .get(self.discover.sources_manager_selected)
-                    .map(|s| (s.path.to_string_lossy().to_string(), s.name.clone()));
-
-                if let Some((path, name)) = source_info {
-                    self.scan_directory(&path);
-                    self.discover.status_message =
-                        Some((format!("Rescanning '{}'...", name), false));
-                }
-            }
-            KeyCode::Esc => {
-                self.return_to_previous_discover_state();
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when Source Edit dialog is open (spec v1.7)
-    fn handle_source_edit_key(&mut self, key: KeyEvent) {
-        match handle_text_input(key, &mut self.discover.source_edit_input) {
-            TextInputResult::Committed => {
-                let new_name = self.discover.source_edit_input.trim().to_string();
-                if !new_name.is_empty() {
-                    if let Some(source_id) = self.discover.editing_source.clone() {
-                        self.update_source_name(&source_id, &new_name);
-                    }
-                }
-                self.discover.editing_source = None;
-                self.discover.source_edit_input.clear();
-                self.transition_discover_state(DiscoverViewState::SourcesManager);
-            }
-            TextInputResult::Cancelled => {
-                self.discover.editing_source = None;
-                self.discover.source_edit_input.clear();
-                self.transition_discover_state(DiscoverViewState::SourcesManager);
-            }
-            TextInputResult::Continue | TextInputResult::NotHandled => {}
-        }
-    }
-
-    /// Handle keys when Source Delete Confirmation dialog is open (spec v1.7)
-    fn handle_source_delete_confirm_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('y') => {
-                if let Some(source_id) = self.discover.source_to_delete.take() {
-                    // Find and remove the source
-                    let source_name = self
-                        .discover
-                        .sources
-                        .iter()
-                        .find(|s| s.id == source_id)
-                        .map(|s| s.name.clone());
-
-                    self.delete_source(&source_id);
-
-                    if let Some(name) = source_name {
-                        self.discover.status_message =
-                            Some((format!("Deleted source '{}'", name), false));
-                    }
-                }
-                self.transition_discover_state(DiscoverViewState::SourcesManager);
-            }
-            KeyCode::Esc | KeyCode::Char('n') => {
-                self.discover.source_to_delete = None;
-                self.transition_discover_state(DiscoverViewState::SourcesManager);
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys in Rule Builder mode (specs/rule_builder.md)
-    ///
-    /// Focus cycles: Pattern → Excludes → Tag → Extractions → Options → Suggestions → FileList
-    fn handle_rule_builder_key(&mut self, key: KeyEvent) {
-        use super::extraction::RuleBuilderFocus;
-        use super::extraction::SuggestionSection;
-
-        // Capture the current pattern before handling the key
-        let pattern_before = self
-            .discover
-            .rule_builder
-            .as_ref()
-            .map(|b| b.pattern.clone())
-            .unwrap_or_default();
-        let active_workspace_id = self.active_workspace_id();
-
-        let builder = match self.discover.rule_builder.as_mut() {
-            Some(b) => b,
-            None => {
-                // No builder state - should not happen, return to Files
-                self.transition_discover_state(DiscoverViewState::Files);
-                return;
-            }
-        };
-        let mut refresh_needed = false;
-
-        if builder.suggestions_help_open || builder.suggestions_detail_open {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
-                    builder.suggestions_help_open = false;
-                    builder.suggestions_detail_open = false;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if builder.confirm_exit_open {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    builder.confirm_exit_open = false;
-                    builder.dirty = false;
-                    self.set_mode(TuiMode::Home);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    builder.confirm_exit_open = false;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if builder.manual_tag_confirm_open {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let (tag, paths) = {
-                        builder.manual_tag_confirm_open = false;
-                        (
-                            builder.tag.clone(),
-                            Self::rule_builder_preview_paths_from(builder, false),
-                        )
-                    };
-                    if !tag.is_empty() && !paths.is_empty() {
-                        let tagged = self.apply_manual_tag_to_paths(&paths, &tag);
-                        self.discover.status_message =
-                            Some((format!("Tagged {} files with '{}'", tagged, tag), false));
-                        if let Some(builder) = self.discover.rule_builder.as_mut() {
-                            builder.selected_preview_files.clear();
-                        }
-                    }
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    builder.manual_tag_confirm_open = false;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if builder.source_id.is_none() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.set_mode(TuiMode::Home);
-                }
-                KeyCode::Char('S') => {
-                    self.transition_discover_state(DiscoverViewState::SourcesDropdown);
-                    self.discover.sources_filter.clear();
-                    self.discover.sources_filtering = false;
-                    self.discover.preview_source = Some(self.discover.selected_source_index());
-                }
-                KeyCode::Char('s') => {
-                    self.transition_discover_state(DiscoverViewState::EnteringPath);
-                    self.discover.scan_path_input.clear();
-                    self.discover.scan_error = None;
-                }
-                _ => {
-                    self.discover.status_message =
-                        Some(("Select a source before building rules".to_string(), true));
-                }
-            }
-            return;
-        }
-
-        match key.code {
-            // Tab cycles focus (per spec Section 8)
-            KeyCode::Tab => {
-                builder.focus = match builder.focus {
-                    RuleBuilderFocus::Pattern => RuleBuilderFocus::Excludes,
-                    RuleBuilderFocus::Excludes => RuleBuilderFocus::Tag,
-                    RuleBuilderFocus::ExcludeInput => RuleBuilderFocus::Tag,
-                    RuleBuilderFocus::Tag => RuleBuilderFocus::Extractions,
-                    RuleBuilderFocus::Extractions => RuleBuilderFocus::Options,
-                    RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Options,
-                    RuleBuilderFocus::Options => RuleBuilderFocus::Suggestions,
-                    RuleBuilderFocus::Suggestions => RuleBuilderFocus::FileList,
-                    RuleBuilderFocus::FileList => RuleBuilderFocus::Pattern,
-                    RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
-                };
-            }
-
-            // BackTab (Shift+Tab) cycles focus in reverse
-            KeyCode::BackTab => {
-                builder.focus = match builder.focus {
-                    RuleBuilderFocus::Pattern => RuleBuilderFocus::FileList,
-                    RuleBuilderFocus::Excludes => RuleBuilderFocus::Pattern,
-                    RuleBuilderFocus::ExcludeInput => RuleBuilderFocus::Excludes,
-                    RuleBuilderFocus::Tag => RuleBuilderFocus::Excludes,
-                    RuleBuilderFocus::Extractions => RuleBuilderFocus::Tag,
-                    RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Extractions,
-                    RuleBuilderFocus::Options => RuleBuilderFocus::Extractions,
-                    RuleBuilderFocus::Suggestions => RuleBuilderFocus::Options,
-                    RuleBuilderFocus::FileList => RuleBuilderFocus::Suggestions,
-                    RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
-                };
-            }
-
-            // Escape cancels nested state or exits Rule Builder from FileList
-            KeyCode::Esc => {
-                match builder.focus {
-                    RuleBuilderFocus::FileList => {
-                        if builder.dirty {
-                            builder.confirm_exit_open = true;
-                        } else {
-                            self.set_mode(TuiMode::Home);
-                        }
-                        return;
-                    }
-                    RuleBuilderFocus::ExcludeInput => {
-                        builder.exclude_input.clear();
-                        builder.focus = RuleBuilderFocus::Excludes;
-                    }
-                    RuleBuilderFocus::ExtractionEdit(_) => {
-                        builder.focus = RuleBuilderFocus::Extractions;
-                    }
-                    RuleBuilderFocus::IgnorePicker => {
-                        builder.ignore_options.clear();
-                        builder.focus = RuleBuilderFocus::FileList;
-                    }
-                    RuleBuilderFocus::Suggestions => {
-                        builder.focus = RuleBuilderFocus::FileList;
-                    }
-                    RuleBuilderFocus::Pattern | RuleBuilderFocus::Tag => {
-                        // Escape from text input fields moves focus to FileList
-                        // This provides a quick way to exit text entry mode
-                        builder.focus = RuleBuilderFocus::FileList;
-                    }
-                    _ => {
-                        // First Escape moves to FileList
-                        builder.focus = RuleBuilderFocus::FileList;
-                    }
-                }
-            }
-
-            // Enter: confirm action based on focus (phase-aware for FileList)
-            KeyCode::Enter => {
-                match builder.focus {
-                    RuleBuilderFocus::FileList => {
-                        // Phase-aware Enter behavior
-                        match &mut builder.file_results {
-                            super::extraction::FileResultsState::Exploration {
-                                expanded_folder_indices,
-                                ..
-                            } => {
-                                // Toggle folder expansion
-                                let idx = builder.selected_file;
-                                if expanded_folder_indices.contains(&idx) {
-                                    expanded_folder_indices.remove(&idx);
-                                } else {
-                                    expanded_folder_indices.insert(idx);
-                                }
-                            }
-                            super::extraction::FileResultsState::ExtractionPreview { .. } => {
-                                // Could show file details or do nothing
-                            }
-                            super::extraction::FileResultsState::BacktestResults { .. } => {
-                                // Could show error details for failed files
-                            }
-                        }
-                    }
-                    RuleBuilderFocus::ExcludeInput => {
-                        // Add exclude pattern
-                        let pattern = builder.exclude_input.trim().to_string();
-                        if !pattern.is_empty() {
-                            builder.add_exclude(pattern);
-                            builder.dirty = true;
-                            refresh_needed = true;
-                        }
-                        builder.exclude_input.clear();
-                        builder.focus = RuleBuilderFocus::Excludes;
-                    }
-                    RuleBuilderFocus::Excludes => {
-                        // Start editing new exclude
-                        builder.focus = RuleBuilderFocus::ExcludeInput;
-                    }
-                    RuleBuilderFocus::IgnorePicker => {
-                        // Apply selected ignore option
-                        if let Some(option) = builder.ignore_options.get(builder.ignore_selected) {
-                            builder.add_exclude(option.pattern.clone());
-                            builder.dirty = true;
-                            refresh_needed = true;
-                        }
-                        builder.ignore_options.clear();
-                        builder.focus = RuleBuilderFocus::FileList;
-                    }
-                    RuleBuilderFocus::Suggestions => {
-                        builder.suggestions_detail_open = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Ctrl+S: Save rule
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.db_read_only && !self.control_connected {
-                    self.discover.status_message =
-                        Some(("Database is read-only; cannot save rules".to_string(), true));
-                    return;
-                }
-                let workspace_id = match active_workspace_id {
-                    Some(id) => id,
-                    None => {
-                        self.discover.status_message =
-                            Some(("No workspace selected; cannot save rule".to_string(), true));
-                        return;
-                    }
-                };
-                if builder.can_save() {
-                    let _draft = builder.to_draft();
-                    if builder.source_id.is_some() {
-                        let rule_id = TaggingRuleId::new();
-                        self.discover.pending_rule_writes.push(PendingRuleWrite {
-                            id: rule_id,
-                            workspace_id,
-                            pattern: builder.pattern.clone(),
-                            tag: builder.tag.clone(),
-                        });
-                        self.discover.status_message =
-                            Some((format!("Rule '{}' saved", builder.tag), false));
-                        builder.dirty = false;
-                        // Stay in Rule Builder (it's the default view) - clear for next rule
-                        builder.pattern = "**/*".to_string();
-                        builder.tag.clear();
-                        builder.excludes.clear();
-                        builder.focus = RuleBuilderFocus::Pattern;
-                    } else {
-                        self.discover.status_message =
-                            Some(("Cannot save: no source selected".to_string(), true));
-                    }
-                } else {
-                    self.discover.status_message = Some((
-                        "Cannot save: pattern and tag are required".to_string(),
-                        true,
-                    ));
-                }
-            }
-
-            // Ctrl+N: Clear form (new rule)
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                builder.pattern = "**/*".to_string();
-                builder.pattern_error = None;
-                builder.excludes.clear();
-                builder.exclude_input.clear();
-                builder.tag.clear();
-                builder.extractions.clear();
-                builder.editing_rule_id = None;
-                builder.selected_preview_files.clear();
-                builder.manual_tag_confirm_open = false;
-                builder.manual_tag_confirm_count = 0;
-                builder.dirty = false;
-                builder.focus = RuleBuilderFocus::Pattern;
-                refresh_needed = true;
-                self.discover.status_message = Some(("Cleared rule builder".to_string(), false));
-            }
-
-            // Down arrow: navigate lists OR move to next field from text input
-            KeyCode::Down => {
-                match builder.focus {
-                    // In text input fields, Down moves to next field
-                    RuleBuilderFocus::Pattern => {
-                        builder.focus = RuleBuilderFocus::Excludes;
-                    }
-                    RuleBuilderFocus::Tag => {
-                        builder.focus = RuleBuilderFocus::Extractions;
-                    }
-                    RuleBuilderFocus::ExcludeInput => {
-                        builder.focus = RuleBuilderFocus::Tag;
-                    }
-                    // In lists, navigate within the list
-                    RuleBuilderFocus::FileList => {
-                        let max_index = match &builder.file_results {
-                            super::extraction::FileResultsState::Exploration {
-                                folder_matches,
-                                ..
-                            } => folder_matches.len().saturating_sub(1),
-                            super::extraction::FileResultsState::ExtractionPreview {
-                                preview_files,
-                            } => preview_files.len().saturating_sub(1),
-                            super::extraction::FileResultsState::BacktestResults {
-                                visible_indices,
-                                ..
-                            } => visible_indices.len().saturating_sub(1),
-                        };
-                        if max_index > 0 {
-                            builder.selected_file = (builder.selected_file + 1).min(max_index);
-                        }
-                    }
-                    RuleBuilderFocus::Excludes => {
-                        if builder.excludes.is_empty() {
-                            builder.focus = RuleBuilderFocus::Tag;
-                        } else if builder.selected_exclude + 1 >= builder.excludes.len() {
-                            builder.focus = RuleBuilderFocus::Tag;
-                        } else {
-                            builder.selected_exclude = (builder.selected_exclude + 1)
-                                .min(builder.excludes.len().saturating_sub(1));
-                        }
-                    }
-                    RuleBuilderFocus::Extractions => {
-                        if builder.extractions.is_empty() {
-                            builder.focus = RuleBuilderFocus::Options;
-                        } else if builder.selected_extraction + 1 >= builder.extractions.len() {
-                            builder.focus = RuleBuilderFocus::Options;
-                        } else {
-                            builder.selected_extraction = (builder.selected_extraction + 1)
-                                .min(builder.extractions.len().saturating_sub(1));
-                        }
-                    }
-                    RuleBuilderFocus::IgnorePicker => {
-                        if !builder.ignore_options.is_empty() {
-                            builder.ignore_selected = (builder.ignore_selected + 1)
-                                .min(builder.ignore_options.len().saturating_sub(1));
-                        }
-                    }
-                    RuleBuilderFocus::Options => {
-                        builder.focus = RuleBuilderFocus::Suggestions;
-                    }
-                    RuleBuilderFocus::Suggestions => {
-                        builder.suggestions_section = match builder.suggestions_section {
-                            SuggestionSection::Patterns => SuggestionSection::Structures,
-                            SuggestionSection::Structures => SuggestionSection::Filenames,
-                            SuggestionSection::Filenames => SuggestionSection::Synonyms,
-                            SuggestionSection::Synonyms => SuggestionSection::Patterns,
-                        };
-                    }
-                    _ => {}
-                }
-            }
-
-            // Up arrow: navigate lists OR move to previous field from text input
-            KeyCode::Up => {
-                match builder.focus {
-                    // In text input fields, Up moves to previous field
-                    RuleBuilderFocus::Tag => {
-                        builder.focus = RuleBuilderFocus::Excludes;
-                    }
-                    RuleBuilderFocus::ExcludeInput => {
-                        builder.focus = RuleBuilderFocus::Excludes;
-                    }
-                    // In lists, navigate within the list
-                    RuleBuilderFocus::FileList => {
-                        builder.selected_file = builder.selected_file.saturating_sub(1);
-                    }
-                    RuleBuilderFocus::Excludes => {
-                        if builder.selected_exclude == 0 {
-                            // At top of excludes, move to Pattern
-                            builder.focus = RuleBuilderFocus::Pattern;
-                        } else {
-                            builder.selected_exclude = builder.selected_exclude.saturating_sub(1);
-                        }
-                    }
-                    RuleBuilderFocus::Extractions => {
-                        if builder.selected_extraction == 0 {
-                            // At top of extractions, move to Tag
-                            builder.focus = RuleBuilderFocus::Tag;
-                        } else {
-                            builder.selected_extraction =
-                                builder.selected_extraction.saturating_sub(1);
-                        }
-                    }
-                    RuleBuilderFocus::Options => {
-                        builder.focus = RuleBuilderFocus::Extractions;
-                    }
-                    RuleBuilderFocus::Suggestions => {
-                        builder.suggestions_section = match builder.suggestions_section {
-                            SuggestionSection::Patterns => SuggestionSection::Synonyms,
-                            SuggestionSection::Structures => SuggestionSection::Patterns,
-                            SuggestionSection::Filenames => SuggestionSection::Structures,
-                            SuggestionSection::Synonyms => SuggestionSection::Filenames,
-                        };
-                    }
-                    RuleBuilderFocus::IgnorePicker => {
-                        builder.ignore_selected = builder.ignore_selected.saturating_sub(1);
-                    }
-                    _ => {}
-                }
-            }
-
-            // Delete exclude with 'd' or 'x'
-            KeyCode::Char('d') | KeyCode::Char('x')
-                if builder.focus == RuleBuilderFocus::Excludes =>
-            {
-                builder.remove_exclude(builder.selected_exclude);
-                builder.dirty = true;
-                refresh_needed = true;
-            }
-
-            // Filter toggle in FileList (only in BacktestResults phase)
-            KeyCode::Char('a') if builder.focus == RuleBuilderFocus::FileList => {
-                if let super::extraction::FileResultsState::BacktestResults {
-                    result_filter, ..
-                } = &mut builder.file_results
-                {
-                    *result_filter = super::extraction::ResultFilter::All;
-                    builder.update_visible();
-                }
-            }
-            KeyCode::Char('p') if builder.focus == RuleBuilderFocus::FileList => {
-                if let super::extraction::FileResultsState::BacktestResults {
-                    result_filter, ..
-                } = &mut builder.file_results
-                {
-                    *result_filter = super::extraction::ResultFilter::PassOnly;
-                    builder.update_visible();
-                }
-            }
-            KeyCode::Char('f') if builder.focus == RuleBuilderFocus::FileList => {
-                if let super::extraction::FileResultsState::BacktestResults {
-                    result_filter, ..
-                } = &mut builder.file_results
-                {
-                    *result_filter = super::extraction::ResultFilter::FailOnly;
-                    builder.update_visible();
-                }
-            }
-
-            // Suggestions list navigation
-            KeyCode::Char('j') if builder.focus == RuleBuilderFocus::Suggestions => {
-                match builder.suggestions_section {
-                    SuggestionSection::Patterns => {
-                        if !builder.pattern_seeds.is_empty() {
-                            builder.selected_pattern_seed = (builder.selected_pattern_seed + 1)
-                                .min(builder.pattern_seeds.len().saturating_sub(1));
-                        }
-                    }
-                    SuggestionSection::Structures => {
-                        if !builder.path_archetypes.is_empty() {
-                            builder.selected_archetype = (builder.selected_archetype + 1)
-                                .min(builder.path_archetypes.len().saturating_sub(1));
-                        }
-                    }
-                    SuggestionSection::Filenames => {
-                        if !builder.naming_schemes.is_empty() {
-                            builder.selected_naming_scheme = (builder.selected_naming_scheme + 1)
-                                .min(builder.naming_schemes.len().saturating_sub(1));
-                        }
-                    }
-                    SuggestionSection::Synonyms => {
-                        if !builder.synonym_suggestions.is_empty() {
-                            builder.selected_synonym = (builder.selected_synonym + 1)
-                                .min(builder.synonym_suggestions.len().saturating_sub(1));
-                        }
-                    }
-                }
-            }
-            KeyCode::Char('k') if builder.focus == RuleBuilderFocus::Suggestions => {
-                match builder.suggestions_section {
-                    SuggestionSection::Patterns => {
-                        builder.selected_pattern_seed =
-                            builder.selected_pattern_seed.saturating_sub(1);
-                    }
-                    SuggestionSection::Structures => {
-                        builder.selected_archetype = builder.selected_archetype.saturating_sub(1);
-                    }
-                    SuggestionSection::Filenames => {
-                        builder.selected_naming_scheme =
-                            builder.selected_naming_scheme.saturating_sub(1);
-                    }
-                    SuggestionSection::Synonyms => {
-                        builder.selected_synonym = builder.selected_synonym.saturating_sub(1);
-                    }
-                }
-            }
-
-            // 'b' backtest stub removed (no-op with guidance)
-            KeyCode::Char('b')
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                        | RuleBuilderFocus::ExtractionEdit(_)
-                ) =>
-            {
-                self.discover.status_message =
-                    Some(("Backtest is not available yet".to_string(), true));
-            }
-
-            // Space toggles selection in preview/results list
-            KeyCode::Char(' ') if builder.focus == RuleBuilderFocus::FileList => {
-                if let Some(path) = Self::rule_builder_selected_rel_path_from(builder) {
-                    if builder.selected_preview_files.contains(&path) {
-                        builder.selected_preview_files.remove(&path);
-                    } else {
-                        builder.selected_preview_files.insert(path);
-                    }
-                }
-            }
-
-            // Left/Right arrows for panel navigation (move between left panel and FileList)
-            // When not in text input mode, arrows provide quick panel switching
-            KeyCode::Left
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                ) =>
-            {
-                if matches!(builder.focus, RuleBuilderFocus::FileList) {
-                    // Move from FileList to Pattern (left panel)
-                    builder.focus = RuleBuilderFocus::Pattern;
-                }
-            }
-            KeyCode::Right
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                ) =>
-            {
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::FileList | RuleBuilderFocus::IgnorePicker
-                ) {
-                    // Move from left panel to FileList (right panel)
-                    builder.focus = RuleBuilderFocus::FileList;
-                }
-            }
-            // Quick pane jump with [ and ]
-            KeyCode::Char('[')
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                        | RuleBuilderFocus::ExtractionEdit(_)
-                ) =>
-            {
-                builder.focus = RuleBuilderFocus::Pattern;
-            }
-            KeyCode::Char(']')
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                        | RuleBuilderFocus::ExtractionEdit(_)
-                ) =>
-            {
-                builder.focus = RuleBuilderFocus::FileList;
-            }
-
-            // Contextual help for suggestions section
-            KeyCode::Char('?') if builder.focus == RuleBuilderFocus::Suggestions => {
-                builder.suggestions_help_open = true;
-            }
-
-            // 't' applies manual tag to preview (selection-aware)
-            KeyCode::Char('t') if builder.focus == RuleBuilderFocus::FileList => {
-                if self.db_read_only && !self.control_connected {
-                    self.discover.status_message =
-                        Some(("Database is read-only; cannot apply tags".to_string(), true));
-                    return;
-                }
-                if builder.tag.trim().is_empty() {
-                    self.discover.status_message =
-                        Some(("Enter a tag before applying".to_string(), true));
-                    return;
-                }
-                let selected = Self::rule_builder_preview_paths_from(builder, true);
-                let total = if selected.is_empty() {
-                    Self::rule_builder_preview_paths_from(builder, false).len()
-                } else {
-                    0
-                };
-                let tag = builder.tag.clone();
-                if selected.is_empty() {
-                    if total == 0 {
-                        self.discover.status_message =
-                            Some(("No preview results to tag".to_string(), true));
-                        return;
-                    }
-                    if let Some(builder) = self.discover.rule_builder.as_mut() {
-                        builder.manual_tag_confirm_open = true;
-                        builder.manual_tag_confirm_count = total;
-                    }
-                    return;
-                }
-                let tagged = self.apply_manual_tag_to_paths(&selected, tag.as_str());
-                self.discover.status_message =
-                    Some((format!("Tagged {} files with '{}'", tagged, tag), false));
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.selected_preview_files.clear();
-                }
-            }
-
-            // 's' opens scan dialog (when not in text input)
-            KeyCode::Char('s')
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                ) && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.transition_discover_state(DiscoverViewState::EnteringPath);
-                // Pre-fill with selected source path if available
-                self.discover.scan_path_input = self
-                    .discover
-                    .selected_source()
-                    .map(|s| s.path.display().to_string())
-                    .unwrap_or_default();
-                self.discover.scan_error = None;
-                return; // Exit early
-            }
-
-            // 'e' runs quick sample schema evaluation (RULE_BUILDER_UI_PLAN.md)
-            // Structure-aware sampling: buckets by prefix, N per bucket, capped at 200
-            KeyCode::Char('e')
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                ) =>
-            {
-                self.run_sample_schema_eval();
-            }
-
-            // 'E' (shift+e) triggers full evaluation as background job (RULE_BUILDER_UI_PLAN.md)
-            // Runs complete schema analysis on ALL matched files with progress tracking
-            KeyCode::Char('E')
-                if !matches!(
-                    builder.focus,
-                    RuleBuilderFocus::Pattern
-                        | RuleBuilderFocus::Tag
-                        | RuleBuilderFocus::ExcludeInput
-                ) =>
-            {
-                self.start_full_schema_eval();
-            }
-
-            // Text input for Pattern, Tag, and ExcludeInput
-            KeyCode::Char(c) => {
-                match builder.focus {
-                    RuleBuilderFocus::Pattern => {
-                        builder.pattern.push(c);
-                        builder.dirty = true;
-                        builder.pattern_changed_at = Some(std::time::Instant::now());
-                        // Validate pattern
-                        match super::extraction::parse_custom_glob(&builder.pattern) {
-                            Ok(_) => builder.pattern_error = None,
-                            Err(e) => builder.pattern_error = Some(e.message),
-                        }
-                    }
-                    RuleBuilderFocus::Tag => {
-                        builder.tag.push(c);
-                        builder.dirty = true;
-                    }
-                    RuleBuilderFocus::ExcludeInput => {
-                        builder.exclude_input.push(c);
-                        builder.dirty = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Backspace for text input
-            KeyCode::Backspace => {
-                match builder.focus {
-                    RuleBuilderFocus::Pattern => {
-                        builder.pattern.pop();
-                        builder.dirty = true;
-                        builder.pattern_changed_at = Some(std::time::Instant::now());
-                        // Re-validate pattern
-                        if builder.pattern.is_empty() {
-                            builder.pattern_error = None;
-                        } else {
-                            match super::extraction::parse_custom_glob(&builder.pattern) {
-                                Ok(_) => builder.pattern_error = None,
-                                Err(e) => builder.pattern_error = Some(e.message),
-                            }
-                        }
-                    }
-                    RuleBuilderFocus::Tag => {
-                        builder.tag.pop();
-                        builder.dirty = true;
-                    }
-                    RuleBuilderFocus::ExcludeInput => {
-                        builder.exclude_input.pop();
-                        builder.dirty = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            _ => {}
-        }
-
-        // If pattern changed, update matched files
-        let mut needs_refresh = refresh_needed;
-        if let Some(builder) = &self.discover.rule_builder {
-            if builder.pattern != pattern_before {
-                needs_refresh = true;
-            }
-        }
-        if needs_refresh {
-            if let Some(builder) = &self.discover.rule_builder {
-                let pattern = builder.pattern.clone();
-                self.update_rule_builder_files(&pattern);
-            }
-        }
-    }
-
-    /// Create a source from a directory path
     fn create_source(&mut self, path: &str, name: &str) {
-        if self.db_read_only && !self.control_connected {
+        if self.mutations_blocked() {
             self.discover.status_message = Some((
                 "Database is read-only; cannot create sources".to_string(),
                 true,
@@ -7600,7 +4379,7 @@ impl App {
     }
 
     fn update_source_name(&mut self, source_id: &SourceId, new_name: &str) {
-        if self.db_read_only && !self.control_connected {
+        if self.mutations_blocked() {
             self.discover.status_message = Some((
                 "Database is read-only; cannot rename sources".to_string(),
                 true,
@@ -7645,7 +4424,7 @@ impl App {
     }
 
     fn update_source_path(&mut self, source_id: &SourceId, new_path: &str) {
-        if self.db_read_only && !self.control_connected {
+        if self.mutations_blocked() {
             self.discover.status_message = Some((
                 "Database is read-only; cannot edit sources".to_string(),
                 true,
@@ -7694,7 +4473,7 @@ impl App {
     }
 
     fn delete_source(&mut self, source_id: &SourceId) {
-        if self.db_read_only && !self.control_connected {
+        if self.mutations_blocked() {
             self.discover.status_message = Some((
                 "Database is read-only; cannot delete sources".to_string(),
                 true,
@@ -7721,8 +4500,6 @@ impl App {
             self.discover.sources_manager_selected = self.discover.sources.len().saturating_sub(1);
         }
     }
-
-    /// Queue a tag write and update local state (DB persistence happens on tick)
     fn queue_tag_for_file(
         &mut self,
         file_id: i64,
@@ -7731,7 +4508,7 @@ impl App {
         rule_id: Option<TaggingRuleId>,
         show_message: bool,
     ) -> bool {
-        if self.db_read_only && !self.control_connected {
+        if self.mutations_blocked() {
             self.discover.status_message =
                 Some(("Database is read-only; cannot apply tags".to_string(), true));
             return false;
@@ -7793,8 +4570,6 @@ impl App {
 
         true
     }
-
-    /// Get the currently selected preview file relative path (if any)
     fn rule_builder_selected_rel_path_from(
         builder: &super::extraction::RuleBuilderState,
     ) -> Option<String> {
@@ -7815,8 +4590,6 @@ impl App {
             _ => None,
         }
     }
-
-    /// Get preview relative paths, optionally only selected
     fn rule_builder_preview_paths_from(
         builder: &super::extraction::RuleBuilderState,
         only_selected: bool,
@@ -7850,8 +4623,6 @@ impl App {
 
         paths
     }
-
-    /// Apply a manual tag to preview paths (returns count tagged)
     fn apply_manual_tag_to_paths(&mut self, paths: &[String], tag: &str) -> usize {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
@@ -7937,11 +4708,6 @@ impl App {
 
         tagged
     }
-
-    /// Open the rule creation dialog with context-aware prefilling
-    ///
-    /// v3.0 Consolidation: Opens GlobExplorer in EditRule phase (Rule Builder)
-    /// instead of the old RuleCreation dialog.
     fn open_rule_creation_dialog(&mut self) {
         // Determine initial pattern from context
         let initial_pattern = if !self.discover.filter.is_empty() {
@@ -7993,10 +4759,6 @@ impl App {
         // Trigger cache load for pattern matching
         self.start_cache_load();
     }
-
-    /// Update the Rule Builder's matched files based on the current pattern
-    /// Update the Rule Builder's file results based on the current pattern.
-    /// Detects phase based on whether pattern contains <field> placeholders.
     fn update_rule_builder_files(&mut self, pattern: &str) {
         let builder = match self.discover.rule_builder.as_mut() {
             Some(b) => b,
@@ -8027,8 +4789,6 @@ impl App {
             self.update_rule_builder_exploration(pattern);
         }
     }
-
-    /// Phase 1: Exploration - Update folder matches with counts
     fn update_rule_builder_exploration(&mut self, pattern: &str) {
         use super::extraction::FolderMatch;
         use super::pattern_query::PatternQuery;
@@ -8226,8 +4986,6 @@ impl App {
             });
         });
     }
-
-    /// Phase 2: Extraction Preview - Show files with extracted values
     fn update_rule_builder_extraction_preview(&mut self, pattern: &str) {
         use super::extraction::{extract_field_values, parse_custom_glob, ExtractionPreviewFile};
         use super::pattern_query::PatternQuery;
@@ -8396,8 +5154,6 @@ impl App {
             builder.selected_file = 0;
         }
     }
-
-    /// Close the rule creation dialog and reset state
     fn close_rule_creation_dialog(&mut self) {
         self.return_to_previous_discover_state();
         self.discover.rule_pattern_input.clear();
@@ -8407,8 +5163,6 @@ impl App {
         self.discover.rule_dialog_focus = RuleDialogFocus::Pattern;
         self.discover.editing_rule_id = None;
     }
-
-    /// Update the live preview of files matching the current pattern
     fn update_rule_preview(&mut self) {
         let pattern = &self.discover.rule_pattern_input;
 
@@ -8450,12 +5204,8 @@ impl App {
             }
         }
     }
-
-    /// Apply a rule (pattern → tag) to all matching files
-    /// Returns the number of files tagged
-    /// Also queues DB writes for persistence
     fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> usize {
-        if self.db_read_only && !self.control_connected {
+        if self.mutations_blocked() {
             self.discover.status_message = Some((
                 "Database is read-only; cannot apply rules".to_string(),
                 true,
@@ -8632,8 +5382,6 @@ impl App {
 
         tagged_count
     }
-
-    /// Refresh the tags dropdown list based on current file tags
     fn refresh_tags_list(&mut self) {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
@@ -8873,8 +5621,6 @@ impl App {
             }
         }
     }
-
-    /// Refresh the current view's data (per spec Section 3.3)
     fn refresh_current_view(&mut self) {
         match self.mode {
             TuiMode::Home => {
@@ -8920,8 +5666,6 @@ impl App {
             TuiMode::Settings => {}
         }
     }
-
-    /// Check if the app is in a text input mode where global keys should not be intercepted
     fn in_text_input_mode(&self) -> bool {
         // Command palette is always a text input mode when visible
         if self.command_palette.visible {
@@ -8984,31 +5728,137 @@ impl App {
         }
     }
 
-    /// Public wrapper for text input mode detection (for state exploration).
     pub fn is_text_input_mode(&self) -> bool {
         self.in_text_input_mode()
     }
 
-    /// Human-readable label for the current task/tab.
+    pub fn filtered_files(&self) -> Vec<&FileInfo> {
+        if self.discover.files.is_empty() {
+            return Vec::new();
+        }
+
+        let tag_filter = self.active_discover_tag_filter();
+        let filter_raw = self.discover.filter.trim();
+        let has_text_filter = !filter_raw.is_empty();
+        let has_tag_filter = !matches!(tag_filter, DiscoverTagFilter::All);
+
+        if !has_text_filter && !has_tag_filter {
+            return self.discover.files.iter().collect();
+        }
+
+        let use_glob = has_text_filter
+            && (filter_raw.contains('*') || filter_raw.contains('?') || filter_raw.contains('['));
+        let matcher = if use_glob {
+            let glob_pattern = patterns::normalize_glob_pattern(filter_raw);
+            patterns::build_matcher(&glob_pattern).ok()
+        } else {
+            None
+        };
+        let filter_lower = if has_text_filter && matcher.is_none() {
+            Some(filter_raw.to_lowercase())
+        } else {
+            None
+        };
+
+        self.discover
+            .files
+            .iter()
+            .filter(|file| match &tag_filter {
+                DiscoverTagFilter::All => true,
+                DiscoverTagFilter::Untagged => file.tags.is_empty(),
+                DiscoverTagFilter::Tag(tag) => file.tags.iter().any(|t| t == tag),
+            })
+            .filter(|file| {
+                if !has_text_filter {
+                    return true;
+                }
+                if let Some(matcher) = matcher.as_ref() {
+                    let rel = file.rel_path.trim_start_matches('/');
+                    let abs = file.path.trim_start_matches('/');
+                    matcher.is_match(rel) || matcher.is_match(abs)
+                } else if let Some(filter) = filter_lower.as_ref() {
+                    let rel = file.rel_path.to_lowercase();
+                    let abs = file.path.to_lowercase();
+                    rel.contains(filter) || abs.contains(filter)
+                } else {
+                    true
+                }
+            })
+            .collect()
+    }
+
+    pub fn discover_page_bounds(&self) -> (usize, usize, usize) {
+        let total = if self.discover.db_filtered {
+            self.discover.total_files
+        } else {
+            self.filtered_files().len()
+        };
+
+        if total == 0 {
+            return (0, 0, 0);
+        }
+
+        if self.discover.db_filtered {
+            let start = self.discover.page_offset + 1;
+            let end = (self.discover.page_offset + self.discover.files.len()).min(total);
+            (start, end, total)
+        } else {
+            (1, total, total)
+        }
+    }
+
     pub fn view_label(&self) -> String {
         match self.mode {
             TuiMode::Home => "Home".to_string(),
-            TuiMode::Ingest => format!("Ingest / {}", self.ingest_tab.label()),
-            TuiMode::Run => format!("Run / {}", self.run_tab.label()),
-            TuiMode::Review => format!("Review / {}", self.review_tab.label()),
+            TuiMode::Ingest => format!("Ingest/{}", self.ingest_tab.label()),
+            TuiMode::Run => format!("Run/{}", self.run_tab.label()),
+            TuiMode::Review => format!("Review/{}", self.review_tab.label()),
             TuiMode::Query => "Query".to_string(),
             TuiMode::Settings => "Settings".to_string(),
         }
     }
 
-    /// Compute a topology-level UI signature for deterministic exploration.
     pub fn ui_signature(&self) -> UiSignature {
         UiSignature::from_app(self)
     }
 
-    /// Stable string key for the current UI signature.
     pub fn ui_signature_key(&self) -> String {
         self.ui_signature().key()
+    }
+
+    #[cfg(feature = "profiling")]
+    pub fn check_profiler_dump(&self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static DUMPED: AtomicBool = AtomicBool::new(false);
+        let Ok(spec) = std::env::var("CASPARIAN_TUI_PROFILE_DUMP") else {
+            return;
+        };
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return;
+        }
+        if DUMPED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        let path = if spec == "1" || spec.eq_ignore_ascii_case("true") {
+            casparian_home().join("tui_profile_dump.txt")
+        } else {
+            std::path::PathBuf::from(spec)
+        };
+
+        let mut output = String::new();
+        output.push_str(&self.profiler.export_summary());
+        output.push('\n');
+        output.push_str("frames_tsv:\n");
+        output.push_str(&self.profiler.export_frames_tsv(120));
+        output.push_str("\nzones:\n");
+        output.push_str(&self.profiler.export_zones());
+
+        if let Err(err) = std::fs::write(&path, output) {
+            tracing::warn!(error = %err, path = %path.display(), "Profiler dump failed");
+        }
     }
 
     fn active_discover_tag_filter(&self) -> DiscoverTagFilter {
@@ -9052,93 +5902,6 @@ impl App {
         };
 
         Some(("f.rel_path ILIKE ?".to_string(), DbValue::Text(like)))
-    }
-
-    /// Get files filtered by current tag and text filter
-    ///
-    /// Tag filtering:
-    /// - Uses preview_tag when tags dropdown is open (live preview)
-    /// - Uses selected_tag when dropdown is closed
-    /// - "All files" (index 0) or None = no tag filter
-    /// - "untagged" = files with no tags
-    /// - Other tags = files with that specific tag
-    ///
-    /// Text filter supports gitignore-style patterns:
-    /// - `foo` matches any path containing "foo"
-    /// - `*foo*` matches paths with "foo" anywhere (wildcard)
-    /// - `*.py` matches files ending in .py
-    pub fn filtered_files(&self) -> Vec<&FileInfo> {
-        if self.discover.db_filtered {
-            return self.discover.files.iter().collect();
-        }
-        // Step 1: Get the active tag for filtering
-        let tag_filter = self.active_discover_tag_filter();
-
-        // Step 3: Apply tag filter first
-        let tag_filtered: Vec<&FileInfo> = match tag_filter {
-            DiscoverTagFilter::All => self.discover.files.iter().collect(),
-            DiscoverTagFilter::Untagged => {
-                // "untagged" - files with no tags
-                self.discover
-                    .files
-                    .iter()
-                    .filter(|f| f.tags.is_empty())
-                    .collect()
-            }
-            DiscoverTagFilter::Tag(tag_name) => {
-                // Specific tag
-                self.discover
-                    .files
-                    .iter()
-                    .filter(|f| f.tags.contains(&tag_name))
-                    .collect()
-            }
-        };
-
-        // Step 4: Apply text filter on top of tag filter
-        if self.discover.filter.is_empty() {
-            tag_filtered
-        } else {
-            let has_wildcards =
-                self.discover.filter.contains('*') || self.discover.filter.contains('?');
-
-            if has_wildcards {
-                let pattern = patterns::normalize_glob_pattern(&self.discover.filter);
-
-                match patterns::build_matcher(&pattern) {
-                    Ok(matcher) => tag_filtered
-                        .into_iter()
-                        .filter(|f| {
-                            let path = f.path.strip_prefix('/').unwrap_or(&f.path);
-                            matcher.is_match(path)
-                        })
-                        .collect(),
-                    Err(_) => {
-                        let filter_lower = self.discover.filter.to_lowercase();
-                        tag_filtered
-                            .into_iter()
-                            .filter(|f| f.path.to_lowercase().contains(&filter_lower))
-                            .collect()
-                    }
-                }
-            } else {
-                let filter_lower = self.discover.filter.to_lowercase();
-                tag_filtered
-                    .into_iter()
-                    .filter(|f| f.path.to_lowercase().contains(&filter_lower))
-                    .collect()
-            }
-        }
-    }
-
-    pub(crate) fn discover_page_bounds(&self) -> (usize, usize, usize) {
-        let total = self.discover.total_files;
-        if total == 0 {
-            return (0, 0, 0);
-        }
-        let start = self.discover.page_offset.saturating_add(1);
-        let end = (self.discover.page_offset + self.discover.page_size).min(total);
-        (start, end, total)
     }
 
     fn set_discover_page_offset(&mut self, offset: usize) {
@@ -9186,29 +5949,6 @@ impl App {
             self.set_discover_page_offset(max_offset);
         }
     }
-
-    /// Scan a directory recursively and add files to the discover list (non-blocking)
-    ///
-    /// Path validation happens synchronously (fast). The actual directory walk
-    /// happens in a background task to avoid freezing the TUI. Results are
-    /// polled in tick() and applied when ready.
-    ///
-    /// ## Parallelism Design (fixing common pitfalls)
-    ///
-    /// 1. **Per-thread local batches**: Each thread accumulates files locally,
-    ///    only locking to flush full batches. This avoids the "global mutex on
-    ///    every file" anti-pattern that serializes parallel work.
-    ///
-    /// 2. **Atomic compare-exchange for progress**: Prevents duplicate progress
-    ///    messages from racing threads.
-
-    // =========================================================================
-    // Job Management for Scans
-    // =========================================================================
-
-    /// Create a new scan job and add it to the jobs list.
-    ///
-    /// Returns the job ID for tracking status updates.
     fn add_scan_job(&mut self, directory_path: &str) -> i64 {
         // Generate unique job ID from timestamp
         let job_id = chrono::Local::now().timestamp_millis();
@@ -9217,6 +5957,7 @@ impl App {
             id: job_id,
             file_id: None,
             job_type: JobType::Scan,
+            origin: JobOrigin::Ephemeral,
             name: "scan".to_string(),
             version: None,
             status: JobStatus::Running,
@@ -9243,10 +5984,6 @@ impl App {
 
         job_id
     }
-
-    /// Update the status of a scan job.
-    ///
-    /// Finds the job by ID and updates its status and error message.
     fn update_scan_job_status(
         &mut self,
         job_id: i64,
@@ -9281,10 +6018,6 @@ impl App {
             }
         }
     }
-
-    /// Create a new schema eval job and add it to the jobs list.
-    ///
-    /// Returns the job ID for tracking status updates.
     fn add_schema_eval_job(&mut self, mode: SchemaEvalMode, paths_total: usize) -> i64 {
         let job_id = chrono::Local::now().timestamp_millis();
 
@@ -9292,6 +6025,7 @@ impl App {
             id: job_id,
             file_id: None,
             job_type: JobType::SchemaEval,
+            origin: JobOrigin::Ephemeral,
             name: match mode {
                 SchemaEvalMode::Sample => "schema-sample".to_string(),
                 SchemaEvalMode::Full => "schema-full".to_string(),
@@ -9319,8 +6053,6 @@ impl App {
         self.jobs_state.push_job(job);
         job_id
     }
-
-    /// Update the status of a schema eval job.
     fn update_schema_eval_job(
         &mut self,
         job_id: i64,
@@ -9357,10 +6089,6 @@ impl App {
             }
         }
     }
-
-    /// Run sample schema evaluation (quick, async).
-    ///
-    /// Uses structure-aware sampling: buckets paths by prefix and takes N per bucket.
     fn run_sample_schema_eval(&mut self) {
         let (source_id_raw, pattern, eval_running) = match self.discover.rule_builder.as_ref() {
             Some(builder) => (
@@ -9463,8 +6191,6 @@ impl App {
             });
         });
     }
-
-    /// Start full schema evaluation as a background job.
     fn start_full_schema_eval(&mut self) {
         let (pattern, source_id_raw, full_eval_running) = match self.discover.rule_builder.as_ref()
         {
@@ -9634,11 +6360,6 @@ impl App {
 
         self.discover.status_message = Some(("Full eval started...".to_string(), false));
     }
-
-    /// Scan a directory using the unified parallel scanner.
-    ///
-    /// Uses `scout::Scanner` for parallel walking and DB persistence.
-    /// Progress updates are forwarded to the TUI via channel.
     fn is_risky_scan_path(&self, path: &str) -> bool {
         use std::path::Path;
 
@@ -9664,9 +6385,9 @@ impl App {
             return;
         }
 
-        if self.db_read_only {
+        if self.mutations_blocked() {
             self.discover.status_message = Some((
-                "Database is read-only due to schema health check".to_string(),
+                "Sentinel not reachable; cannot start scan".to_string(),
                 true,
             ));
             return;
@@ -10139,14 +6860,6 @@ impl App {
             }
         });
     }
-
-    /// List directories matching a partial path for autocomplete
-    ///
-    /// Given a partial path like "/Users/shan/Do", returns directories that match:
-    /// - If path ends with '/', lists directories in that path
-    /// - Otherwise, lists directories in parent matching the prefix
-    ///
-    /// Returns up to 8 suggestions, excludes hidden directories (starting with '.').
     fn list_directories(partial_path: &str) -> Vec<String> {
         use std::path::Path;
 
@@ -10204,14 +6917,10 @@ impl App {
         suggestions.truncate(8);
         suggestions
     }
-
-    /// Update path suggestions based on current input
     fn update_path_suggestions(&mut self) {
         self.discover.path_suggestions = Self::list_directories(&self.discover.scan_path_input);
         self.discover.path_suggestion_idx = 0;
     }
-
-    /// Apply the selected suggestion to the path input
     fn apply_path_suggestion(&mut self) {
         if let Some(suggestion) = self
             .discover
@@ -10234,16 +6943,6 @@ impl App {
             self.update_path_suggestions();
         }
     }
-
-    /// Load files from Scout database for the selected source (async using sqlx)
-    ///
-    /// Uses the scout_files + scout_file_tags schema from scout/db.rs:
-    /// - scout_files: path, rel_path, size, mtime, is_dir
-    /// - scout_file_tags: multi-tag assignments per file
-    ///
-    /// Files are filtered by the currently selected source. If no source is
-    /// selected, the file list will be empty with a helpful message.
-    /// When sources dropdown is open, uses preview_source for live preview.
     fn load_scout_files(&mut self) {
         self.discover.db_filtered = false;
         // First check if we have a directly-set source ID (e.g., after scan completion)
@@ -10510,16 +7209,6 @@ impl App {
         self.discover.scan_error = None;
         self.refresh_tags_list();
     }
-
-    /// Load folder tree for Glob Explorer (hierarchical file browsing).
-    ///
-    /// This replaces load_scout_files() when glob_explorer is active.
-    /// Queries are batched: folders + preview files + total count in one function call.
-    /// State is updated atomically at the end.
-    ///
-    /// NOTE: Currently unused - replaced by preload_folder_cache() for O(1) navigation.
-    /// Start non-blocking cache load for glob explorer.
-    /// Checks preloaded caches first (instant), then loads from disk cache or scout_folders.
     fn start_cache_load(&mut self) {
         // Must have a source selected
         let source_id = match &self.discover.selected_source_id {
@@ -10725,7 +7414,6 @@ impl App {
             });
         });
     }
-}
 
 fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Option<String>) {
     use casparian::scout::error::ScoutError;
@@ -10755,47 +7443,6 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
         ScoutError::SourceIsParentOfExisting { .. } => ("source_overlap".to_string(), None),
     }
 }
-
-impl App {
-    /// Check for profiler dump trigger file and export data.
-    /// Used for testing integration - touch /tmp/casparian_profile_dump to trigger.
-    #[cfg(feature = "profiling")]
-    pub fn check_profiler_dump(&self) {
-        const DUMP_TRIGGER: &str = "/tmp/casparian_profile_dump";
-        const DUMP_OUTPUT: &str = "/tmp/casparian_profile_data.txt";
-
-        if std::path::Path::new(DUMP_TRIGGER).exists() {
-            let _ = std::fs::remove_file(DUMP_TRIGGER);
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            // Format cache load timing if available
-            let cache_load_section = if let Some(ref timing) = self.last_cache_load_timing {
-                format!(
-                    "\n=== CACHE LOAD ===\nsource_id={}\nfiles_loaded={}\nload_duration_ms={:.1}\n",
-                    timing.source_id, timing.files_loaded, timing.duration_ms
-                )
-            } else {
-                String::new()
-            };
-
-            let data = format!(
-                "=== PROFILER DUMP ===\ntimestamp={}\n{}{}\n=== ZONES ===\n{}\n=== FRAMES ===\n{}\n",
-                timestamp,
-                self.profiler.export_summary(),
-                cache_load_section,
-                self.profiler.export_zones(),
-                self.profiler.export_frames_tsv(30)
-            );
-            let _ = std::fs::write(DUMP_OUTPUT, data);
-        }
-    }
-
-    /// Update folders from cache based on current prefix (O(1) lookup).
-    /// Used for navigation instead of SQL queries.
-    /// If a pattern is set, filters entries in-memory using simple matching.
     fn update_folders_from_cache(&mut self) {
         // Note: profiling zone removed here to avoid borrow conflict with start_folder_query
 
@@ -10959,8 +7606,6 @@ impl App {
             }
         }
     }
-
-    /// Start an async database query for a folder prefix
     fn start_folder_query(
         &mut self,
         workspace_id: WorkspaceId,
@@ -11031,8 +7676,6 @@ impl App {
             });
         });
     }
-
-    /// Simple glob pattern matching for file names
     fn glob_match_name(name: &str, pattern: &str) -> bool {
         if pattern.starts_with("*.") {
             // *.ext -> ends with .ext
@@ -11247,8 +7890,6 @@ impl App {
 
         Ok(results)
     }
-
-    /// Start non-blocking sources load from Scout database
     fn start_sources_load(&mut self) {
         // Skip if already loading
         if self.pending_sources_load.is_some() {
@@ -11358,8 +7999,6 @@ impl App {
             let _ = tx.send(result);
         });
     }
-
-    /// Start non-blocking jobs load from processing queue database
     fn start_jobs_load(&mut self) {
         // Skip if already loading
         if self.pending_jobs_load.is_some() {
@@ -11602,6 +8241,7 @@ impl App {
                         id,
                         file_id,
                         job_type: JobType::Parse,
+                        origin: JobOrigin::Persistent,
                         name: plugin_name,
                         version: None,
                         status,
@@ -11656,8 +8296,6 @@ impl App {
 
         self.home.recent_jobs = summaries;
     }
-
-    /// Start non-blocking home stats load from database
     fn start_stats_load(&mut self) {
         // Skip if already loading
         if self.pending_stats_load.is_some() {
@@ -11751,8 +8389,6 @@ impl App {
             let _ = tx.send(result);
         });
     }
-
-    /// Start non-blocking approvals load from database
     fn start_approvals_load(&mut self) {
         // Skip if already loading
         if self.pending_approvals_load.is_some() {
@@ -11915,8 +8551,6 @@ impl App {
             let _ = tx.send(result);
         });
     }
-
-    /// Start non-blocking sessions load from file system
     fn start_sessions_load(&mut self) {
         // Skip if already loading
         if self.pending_sessions_load.is_some() {
@@ -11970,284 +8604,11 @@ impl App {
         });
     }
 
-    fn start_triage_load(&mut self) {
-        if self.pending_triage_load.is_some() {
-            return;
-        }
 
-        let (backend, db_path) = self.resolve_db_target();
-        if !db_path.exists() {
-            self.triage_state.loaded = true;
-            return;
-        }
 
-        let job_filter = self.triage_state.job_filter;
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.pending_triage_load = Some(rx);
-
-        std::thread::spawn(move || {
-            let result: Result<TriageData, String> = (|| {
-                let conn = match App::open_db_readonly_with(backend, &db_path) {
-                    Ok(Some(conn)) => conn,
-                    Ok(None) => return Err("Database not available".to_string()),
-                    Err(err) => return Err(format!("Database open failed: {}", err)),
-                };
-
-                let quarantine_rows = if App::table_exists(&conn, "cf_quarantine")
-                    .map_err(|err| format!("Triage schema check failed: {}", err))?
-                {
-                    let mut rows = Vec::new();
-                    let (query, params) = if let Some(job_id) = job_filter {
-                        (
-                            "SELECT id, job_id, row_index, error_reason, raw_data, created_at \
-                             FROM cf_quarantine WHERE job_id = ? ORDER BY created_at DESC LIMIT 500",
-                            vec![DbValue::from(job_id)],
-                        )
-                    } else {
-                        (
-                            "SELECT id, job_id, row_index, error_reason, raw_data, created_at \
-                             FROM cf_quarantine ORDER BY created_at DESC LIMIT 500",
-                            Vec::new(),
-                        )
-                    };
-                    let result_rows = conn
-                        .query_all(query, &params)
-                        .map_err(|err| format!("Quarantine query failed: {}", err))?;
-                    for row in result_rows {
-                        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                        let job_id: i64 = row.get(1).map_err(|e| e.to_string())?;
-                        let row_index: i64 = row.get(2).map_err(|e| e.to_string())?;
-                        let error_reason: String = row.get(3).map_err(|e| e.to_string())?;
-                        let raw_data: Option<Vec<u8>> = row.get(4).ok().flatten();
-                        let created_at: Option<String> = row.get(5).ok().flatten();
-                        rows.push(QuarantineRow {
-                            id,
-                            job_id,
-                            row_index,
-                            error_reason,
-                            raw_data,
-                            created_at: created_at.unwrap_or_else(|| "-".to_string()),
-                        });
-                    }
-                    Some(rows)
-                } else {
-                    None
-                };
-
-                let schema_mismatches = if App::table_exists(&conn, "cf_job_schema_mismatch")
-                    .map_err(|err| format!("Triage schema check failed: {}", err))?
-                {
-                    let mut rows = Vec::new();
-                    let (query, params) = if let Some(job_id) = job_filter {
-                        (
-                            "SELECT id, job_id, output_name, mismatch_kind, expected_name, actual_name, \
-                             expected_type, actual_type, expected_index, actual_index, created_at \
-                             FROM cf_job_schema_mismatch WHERE job_id = ? ORDER BY created_at DESC LIMIT 500",
-                            vec![DbValue::from(job_id)],
-                        )
-                    } else {
-                        (
-                            "SELECT id, job_id, output_name, mismatch_kind, expected_name, actual_name, \
-                             expected_type, actual_type, expected_index, actual_index, created_at \
-                             FROM cf_job_schema_mismatch ORDER BY created_at DESC LIMIT 500",
-                            Vec::new(),
-                        )
-                    };
-                    let result_rows = conn
-                        .query_all(query, &params)
-                        .map_err(|err| format!("Schema mismatch query failed: {}", err))?;
-                    for row in result_rows {
-                        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                        let job_id: i64 = row.get(1).map_err(|e| e.to_string())?;
-                        let output_name: String = row.get(2).map_err(|e| e.to_string())?;
-                        let mismatch_kind: String = row.get(3).map_err(|e| e.to_string())?;
-                        let expected_name: Option<String> = row.get(4).ok().flatten();
-                        let actual_name: Option<String> = row.get(5).ok().flatten();
-                        let expected_type: Option<String> = row.get(6).ok().flatten();
-                        let actual_type: Option<String> = row.get(7).ok().flatten();
-                        let expected_index: Option<i64> = row.get(8).ok().flatten();
-                        let actual_index: Option<i64> = row.get(9).ok().flatten();
-                        let created_at: Option<String> = row.get(10).ok().flatten();
-                        rows.push(SchemaMismatchRow {
-                            id,
-                            job_id,
-                            output_name,
-                            mismatch_kind,
-                            expected_name,
-                            actual_name,
-                            expected_type,
-                            actual_type,
-                            expected_index,
-                            actual_index,
-                            created_at: created_at.unwrap_or_else(|| "-".to_string()),
-                        });
-                    }
-                    Some(rows)
-                } else {
-                    None
-                };
-
-                let dead_letters = if App::table_exists(&conn, "cf_dead_letter")
-                    .map_err(|err| format!("Triage schema check failed: {}", err))?
-                {
-                    let mut rows = Vec::new();
-                    let (query, params) = if let Some(job_id) = job_filter {
-                        (
-                            "SELECT id, original_job_id, file_id, plugin_name, error_message, retry_count, moved_at, reason \
-                             FROM cf_dead_letter WHERE original_job_id = ? ORDER BY moved_at DESC LIMIT 500",
-                            vec![DbValue::from(job_id)],
-                        )
-                    } else {
-                        (
-                            "SELECT id, original_job_id, file_id, plugin_name, error_message, retry_count, moved_at, reason \
-                             FROM cf_dead_letter ORDER BY moved_at DESC LIMIT 500",
-                            Vec::new(),
-                        )
-                    };
-                    let result_rows = conn
-                        .query_all(query, &params)
-                        .map_err(|err| format!("Dead letter query failed: {}", err))?;
-                    for row in result_rows {
-                        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                        let original_job_id: i64 = row.get(1).map_err(|e| e.to_string())?;
-                        let file_id: Option<i64> = row.get(2).ok().flatten();
-                        let plugin_name: String = row.get(3).map_err(|e| e.to_string())?;
-                        let error_message: Option<String> = row.get(4).ok().flatten();
-                        let retry_count: i64 = row.get(5).map_err(|e| e.to_string())?;
-                        let moved_at: Option<String> = row.get(6).ok().flatten();
-                        let reason: Option<String> = row.get(7).ok().flatten();
-                        rows.push(DeadLetterRow {
-                            id,
-                            original_job_id,
-                            file_id,
-                            plugin_name,
-                            error_message,
-                            retry_count,
-                            moved_at: moved_at.unwrap_or_else(|| "-".to_string()),
-                            reason,
-                        });
-                    }
-                    Some(rows)
-                } else {
-                    None
-                };
-
-                Ok(TriageData {
-                    quarantine_rows,
-                    schema_mismatches,
-                    dead_letters,
-                })
-            })();
-
-            let _ = tx.send(result);
-        });
-    }
-
-    fn start_catalog_load(&mut self) {
-        if self.pending_catalog_load.is_some() {
-            return;
-        }
-
-        let (backend, db_path) = self.resolve_db_target();
-        if !db_path.exists() {
-            self.catalog_state.loaded = true;
-            return;
-        }
-
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.pending_catalog_load = Some(rx);
-
-        std::thread::spawn(move || {
-            let result: Result<CatalogData, String> = (|| {
-                let conn = match App::open_db_readonly_with(backend, &db_path) {
-                    Ok(Some(conn)) => conn,
-                    Ok(None) => return Err("Database not available".to_string()),
-                    Err(err) => return Err(format!("Database open failed: {}", err)),
-                };
-
-                let pipelines = if App::table_exists(&conn, "cf_pipelines")
-                    .map_err(|err| format!("Catalog schema check failed: {}", err))?
-                {
-                    let mut rows_out = Vec::new();
-                    let rows = conn
-                        .query_all(
-                            "SELECT id, name, version, created_at FROM cf_pipelines \
-                             ORDER BY created_at DESC LIMIT 200",
-                            &[],
-                        )
-                        .map_err(|err| format!("Pipelines query failed: {}", err))?;
-                    for row in rows {
-                        let id: String = row.get(0).map_err(|e| e.to_string())?;
-                        let name: String = row.get(1).map_err(|e| e.to_string())?;
-                        let version: i64 = row.get(2).map_err(|e| e.to_string())?;
-                        let created_at: Option<String> = row.get(3).ok().flatten();
-                        rows_out.push(PipelineInfo {
-                            id,
-                            name,
-                            version,
-                            created_at: created_at.unwrap_or_else(|| "-".to_string()),
-                        });
-                    }
-                    Some(rows_out)
-                } else {
-                    None
-                };
-
-                let runs = if App::table_exists(&conn, "cf_pipeline_runs")
-                    .map_err(|err| format!("Catalog schema check failed: {}", err))?
-                {
-                    let mut rows_out = Vec::new();
-                    let rows = conn
-                        .query_all(
-                            "SELECT pr.id, pr.pipeline_id, p.name, p.version, pr.logical_date, \
-                             pr.status, pr.selection_snapshot_hash, pr.started_at, pr.completed_at \
-                             FROM cf_pipeline_runs pr \
-                             LEFT JOIN cf_pipelines p ON p.id = pr.pipeline_id \
-                             ORDER BY pr.created_at DESC LIMIT 200",
-                            &[],
-                        )
-                        .map_err(|err| format!("Pipeline runs query failed: {}", err))?;
-                    for row in rows {
-                        let id: String = row.get(0).map_err(|e| e.to_string())?;
-                        let pipeline_id: String = row.get(1).map_err(|e| e.to_string())?;
-                        let pipeline_name: Option<String> = row.get(2).ok().flatten();
-                        let pipeline_version: Option<i64> = row.get(3).ok().flatten();
-                        let logical_date: String = row.get(4).map_err(|e| e.to_string())?;
-                        let status: String = row.get(5).map_err(|e| e.to_string())?;
-                        let selection_snapshot_hash: Option<String> = row.get(6).ok().flatten();
-                        let started_at: Option<String> = row.get(7).ok().flatten();
-                        let completed_at: Option<String> = row.get(8).ok().flatten();
-                        rows_out.push(PipelineRunInfo {
-                            id,
-                            pipeline_id,
-                            pipeline_name,
-                            pipeline_version,
-                            logical_date,
-                            status,
-                            selection_snapshot_hash,
-                            started_at,
-                            completed_at,
-                        });
-                    }
-                    Some(rows_out)
-                } else {
-                    None
-                };
-
-                Ok(CatalogData { pipelines, runs })
-            })();
-
-            let _ = tx.send(result);
-        });
-    }
-
-    /// Persist pending writes to the database
     fn persist_pending_writes(&mut self) {
         if self.control_connected {
             self.persist_pending_writes_control();
-            return;
-        }
-        if self.db_read_only {
             return;
         }
         // Skip if nothing to persist
@@ -12260,6 +8621,13 @@ impl App {
             && self.discover.pending_source_deletes.is_empty()
             && self.discover.pending_source_touch.is_none()
         {
+            return;
+        }
+        if self.mutations_blocked() {
+            self.set_global_status(
+                "Sentinel not reachable; changes are not saved (use --standalone-writer to allow local writes)",
+                true,
+            );
             return;
         }
 
@@ -12466,6 +8834,7 @@ impl App {
                     let _ = tx.send(ControlWriteResult {
                         sources_changed,
                         error: Some(format!("Control API unavailable: {}", err)),
+                        control_connected: Some(false),
                     });
                     return;
                 }
@@ -12559,11 +8928,10 @@ impl App {
             let _ = tx.send(ControlWriteResult {
                 sources_changed,
                 error,
+                control_connected: Some(true),
             });
         });
     }
-
-    /// Load tagging rules for the Rules Manager dialog
     fn load_rules_for_manager(&mut self) {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
@@ -12679,1512 +9047,12 @@ impl App {
             self.discover.selected_rule = 0;
         }
     }
-
-    /// Handle home hub keys
-    /// Handle Home view keys (Quick Start + Status dashboard)
-    /// Navigation: ↑↓ to select source, Enter to start scan
-    fn handle_home_key(&mut self, key: KeyEvent) {
-        if self.home.filtering {
-            match handle_text_input(key, &mut self.home.filter) {
-                TextInputResult::Committed => {
-                    self.home.filtering = false;
-                    return;
-                }
-                TextInputResult::Cancelled => {
-                    self.home.filtering = false;
-                    self.home.filter.clear();
-                    return;
-                }
-                TextInputResult::Continue => {
-                    return;
-                }
-                TextInputResult::NotHandled => {}
-            }
-        }
-
-        let filter_lower = self.home.filter.to_lowercase();
-        let filtered_indices: Vec<usize> = self
-            .discover
-            .sources
-            .iter()
-            .enumerate()
-            .filter(|(_, source)| {
-                filter_lower.is_empty()
-                    || source.name.to_lowercase().contains(&filter_lower)
-                    || source
-                        .path
-                        .display()
-                        .to_string()
-                        .to_lowercase()
-                        .contains(&filter_lower)
-            })
-            .map(|(idx, _)| idx)
-            .collect();
-
-        if let Some(first_idx) = filtered_indices.first().copied() {
-            if !filtered_indices.contains(&self.home.selected_source_index) {
-                self.home.selected_source_index = first_idx;
-            }
-        } else {
-            self.home.selected_source_index = 0;
-        }
-
-        let source_count = filtered_indices.len();
-        match key.code {
-            // Navigate up in source list
-            KeyCode::Up => {
-                if let Some(pos) = filtered_indices
-                    .iter()
-                    .position(|idx| *idx == self.home.selected_source_index)
-                {
-                    if pos > 0 {
-                        self.home.selected_source_index = filtered_indices[pos - 1];
-                    }
-                }
-            }
-            // Navigate down in source list
-            KeyCode::Down => {
-                if let Some(pos) = filtered_indices
-                    .iter()
-                    .position(|idx| *idx == self.home.selected_source_index)
-                {
-                    if pos + 1 < source_count {
-                        self.home.selected_source_index = filtered_indices[pos + 1];
-                    }
-                }
-            }
-            // Enter: Start scan job for selected source
-            KeyCode::Enter => {
-                if source_count > 0 && self.home.selected_source_index < self.discover.sources.len()
-                {
-                    // Clone the source_id to avoid borrow conflict
-                    let source_id = self.discover.sources[self.home.selected_source_index].id;
-                    self.start_scan_for_source(source_id);
-                }
-            }
-            // /: Filter sources
-            KeyCode::Char('/') => {
-                self.home.filtering = true;
-            }
-            // s: Scan a new folder (via Discover)
-            KeyCode::Char('s') => {
-                self.enter_discover_mode();
-                self.transition_discover_state(DiscoverViewState::EnteringPath);
-                self.discover.scan_path_input.clear();
-                self.discover.scan_error = None;
-                self.discover.path_suggestions.clear();
-            }
-            // Global keys 1-4, J, P, etc. are handled by global key handler
-            _ => {}
-        }
-    }
-
-    /// Start a scan job for the given source (called from Home)
-    fn start_scan_for_source(&mut self, source_id: SourceId) {
-        let path = self
-            .discover
-            .sources
-            .iter()
-            .find(|s| s.id == source_id)
-            .map(|s| s.path.display().to_string());
-
-        if let Some(path) = path {
-            self.enter_discover_mode();
-            self.scan_directory(&path);
-        } else {
-            self.discover.status_message = Some((
-                "Selected source no longer exists. Refresh sources and try again.".to_string(),
-                true,
-            ));
-        }
-    }
-
-    pub fn sources_drawer_sources(&self) -> Vec<usize> {
-        let count = self.discover.sources.len().min(5);
-        (0..count).collect()
-    }
-
-    pub fn sources_drawer_selected_source(&self) -> Option<usize> {
-        self.sources_drawer_sources()
-            .get(self.sources_drawer_selected)
-            .copied()
-    }
-
-    /// Handle Sources view keys (key 4)
-    /// Per keybinding matrix: n=new, e=edit, r=rescan, d=delete
-    fn handle_sources_key(&mut self, key: KeyEvent) {
-        let source_count = self.discover.sources.len();
-
-        // Handle delete confirmation first
-        if self.sources_state.confirm_delete {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    if let Some(source_id) = self
-                        .discover
-                        .sources
-                        .get(self.sources_state.selected_index)
-                        .map(|s| s.id.clone())
-                    {
-                        self.delete_source(&source_id);
-                    }
-                    self.sources_state.confirm_delete = false;
-                }
-                KeyCode::Char('n') | KeyCode::Esc => {
-                    self.sources_state.confirm_delete = false;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Handle editing mode
-        if self.sources_state.editing {
-            match key.code {
-                KeyCode::Esc => {
-                    self.sources_state.editing = false;
-                    self.sources_state.creating = false;
-                    self.sources_state.edit_value.clear();
-                }
-                KeyCode::Enter => {
-                    let value = self.sources_state.edit_value.trim().to_string();
-                    if !value.is_empty() {
-                        if self.sources_state.creating {
-                            self.create_source(&value, "");
-                        } else if let Some(source_id) = self
-                            .discover
-                            .sources
-                            .get(self.sources_state.selected_index)
-                            .map(|s| s.id.clone())
-                        {
-                            self.update_source_path(&source_id, &value);
-                        }
-                    }
-                    self.sources_state.editing = false;
-                    self.sources_state.creating = false;
-                    self.sources_state.edit_value.clear();
-                }
-                KeyCode::Char(c) => {
-                    self.sources_state.edit_value.push(c);
-                }
-                KeyCode::Backspace => {
-                    self.sources_state.edit_value.pop();
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Normal mode
-        match key.code {
-            // Navigate up/down in source list
-            KeyCode::Up => {
-                if self.sources_state.selected_index > 0 {
-                    self.sources_state.selected_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if source_count > 0
-                    && self.sources_state.selected_index < source_count.saturating_sub(1)
-                {
-                    self.sources_state.selected_index += 1;
-                }
-            }
-            // n: New source
-            KeyCode::Char('n') => {
-                self.sources_state.editing = true;
-                self.sources_state.creating = true;
-                self.sources_state.edit_value.clear();
-            }
-            // e: Edit source
-            KeyCode::Char('e') => {
-                if source_count > 0 && self.sources_state.selected_index < source_count {
-                    self.sources_state.editing = true;
-                    self.sources_state.creating = false;
-                    let source = &self.discover.sources[self.sources_state.selected_index];
-                    self.sources_state.edit_value = source.path.display().to_string();
-                }
-            }
-            // r: Rescan source
-            KeyCode::Char('r') => {
-                if source_count > 0 && self.sources_state.selected_index < source_count {
-                    // Clone the source_id to avoid borrow conflict
-                    let source_id = self.discover.sources[self.sources_state.selected_index].id;
-                    self.start_scan_for_source(source_id);
-                }
-            }
-            // d: Delete source (with confirmation)
-            KeyCode::Char('d') => {
-                if source_count > 0 && self.sources_state.selected_index < source_count {
-                    self.sources_state.confirm_delete = true;
-                }
-            }
-            KeyCode::Esc => {
-                if let Some(prev_mode) = self.sources_state.previous_mode.take() {
-                    self.set_mode(prev_mode);
-                } else {
-                    self.set_mode(TuiMode::Home);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle Approvals view keys (key 5)
-    /// Per keybinding matrix: a=approve, r=reject, Enter=details, f=filter
-    fn handle_approvals_key(&mut self, key: KeyEvent) {
-        let filtered_count = self.approvals_state.filtered_approvals().len();
-
-        // Handle confirm dialogs first
-        match self.approvals_state.view_state {
-            ApprovalsViewState::ConfirmApprove => {
-                match key.code {
-                    KeyCode::Char('y') | KeyCode::Enter => {
-                        // Approve the selected approval
-                        if let Some(approval) = self.approvals_state.selected_approval() {
-                            let approval_id = approval.id.clone();
-                            self.approve_approval(&approval_id);
-                        }
-                        self.approvals_state.view_state = ApprovalsViewState::List;
-                        self.approvals_state.confirm_action = None;
-                    }
-                    KeyCode::Char('n') | KeyCode::Esc => {
-                        self.approvals_state.view_state = ApprovalsViewState::List;
-                        self.approvals_state.confirm_action = None;
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            ApprovalsViewState::ConfirmReject => {
-                match key.code {
-                    KeyCode::Enter => {
-                        // Reject with reason
-                        if let Some(approval) = self.approvals_state.selected_approval() {
-                            let approval_id = approval.id.clone();
-                            let reason = if self.approvals_state.rejection_reason.is_empty() {
-                                None
-                            } else {
-                                Some(self.approvals_state.rejection_reason.clone())
-                            };
-                            self.reject_approval(&approval_id, reason);
-                        }
-                        self.approvals_state.view_state = ApprovalsViewState::List;
-                        self.approvals_state.confirm_action = None;
-                        self.approvals_state.rejection_reason.clear();
-                    }
-                    KeyCode::Esc => {
-                        self.approvals_state.view_state = ApprovalsViewState::List;
-                        self.approvals_state.confirm_action = None;
-                        self.approvals_state.rejection_reason.clear();
-                    }
-                    KeyCode::Char(c) => {
-                        self.approvals_state.rejection_reason.push(c);
-                    }
-                    KeyCode::Backspace => {
-                        self.approvals_state.rejection_reason.pop();
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            ApprovalsViewState::Detail => {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Enter => {
-                        self.approvals_state.view_state = ApprovalsViewState::List;
-                    }
-                    KeyCode::Char('a') => {
-                        if let Some(approval) = self.approvals_state.selected_approval() {
-                            if approval.is_pending() {
-                                self.approvals_state.view_state =
-                                    ApprovalsViewState::ConfirmApprove;
-                                self.approvals_state.confirm_action = Some(ApprovalAction::Approve);
-                            }
-                        }
-                    }
-                    KeyCode::Char('r') => {
-                        if let Some(approval) = self.approvals_state.selected_approval() {
-                            if approval.is_pending() {
-                                self.approvals_state.view_state = ApprovalsViewState::ConfirmReject;
-                                self.approvals_state.confirm_action = Some(ApprovalAction::Reject);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            ApprovalsViewState::List => {}
-        }
-
-        // Normal list mode
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.approvals_state.selected_index > 0 {
-                    self.approvals_state.selected_index -= 1;
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if filtered_count > 0
-                    && self.approvals_state.selected_index < filtered_count.saturating_sub(1)
-                {
-                    self.approvals_state.selected_index += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(approval) = self
-                    .approvals_state
-                    .filtered_approvals()
-                    .get(self.approvals_state.selected_index)
-                {
-                    let approval_id = approval.id.clone();
-                    if self.approvals_state.pinned_approval_id == Some(approval_id.clone()) {
-                        self.approvals_state.pinned_approval_id = None;
-                    } else {
-                        self.approvals_state.pinned_approval_id = Some(approval_id);
-                    }
-                }
-            }
-            KeyCode::Char('a') => {
-                if let Some(approval) = self
-                    .approvals_state
-                    .filtered_approvals()
-                    .get(self.approvals_state.selected_index)
-                {
-                    if approval.is_pending() {
-                        self.approvals_state.view_state = ApprovalsViewState::ConfirmApprove;
-                        self.approvals_state.confirm_action = Some(ApprovalAction::Approve);
-                    }
-                }
-            }
-            KeyCode::Char('r') => {
-                if let Some(approval) = self
-                    .approvals_state
-                    .filtered_approvals()
-                    .get(self.approvals_state.selected_index)
-                {
-                    if approval.is_pending() {
-                        self.approvals_state.view_state = ApprovalsViewState::ConfirmReject;
-                        self.approvals_state.confirm_action = Some(ApprovalAction::Reject);
-                        self.approvals_state.rejection_reason.clear();
-                    }
-                }
-            }
-            KeyCode::Char('f') => {
-                self.approvals_state.filter = self.approvals_state.filter.next();
-                self.approvals_state.clamp_selection();
-            }
-            KeyCode::Char('d') => {
-                if filtered_count > 0 {
-                    self.approvals_state.view_state = ApprovalsViewState::Detail;
-                }
-            }
-            KeyCode::Char('R') => {
-                self.approvals_state.approvals_loaded = false;
-            }
-            KeyCode::Esc => {
-                if let Some(prev_mode) = self.approvals_state.previous_mode.take() {
-                    self.set_mode(prev_mode);
-                } else {
-                    self.set_mode(TuiMode::Home);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Approve an approval request (stub - actual implementation connects to MCP)
-    fn approve_approval(&mut self, approval_id: &str) {
-        // Update in-memory state immediately for UI feedback
-        if let Some(approval) = self
-            .approvals_state
-            .approvals
-            .iter_mut()
-            .find(|a| a.id == approval_id)
-        {
-            approval.status = ApprovalDisplayStatus::Approved;
-        }
-
-        // Call backend to persist the approval
-        let approval_id_owned = approval_id.to_string();
-        if self.control_connected {
-            if let Some(control_addr) = self.control_addr.clone() {
-                std::thread::spawn(move || {
-                    if let Ok(client) =
-                        ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(500))
-                    {
-                        let _ = client.approve(&approval_id_owned);
-                    }
-                });
-            }
-        } else {
-            let (backend, db_path) = self.resolve_db_target();
-            std::thread::spawn(move || {
-                if let Ok(Some(conn)) = App::open_db_write_with(backend, &db_path) {
-                    let storage = ApiStorage::new(conn);
-                    if let Err(e) = storage.init_schema() {
-                        tracing::error!("Failed to init schema for approval: {}", e);
-                        return;
-                    }
-                    if let Err(e) = storage.approve(&approval_id_owned, None) {
-                        tracing::error!("Failed to approve {}: {}", approval_id_owned, e);
-                    }
-                }
-            });
-        }
-
-        // Mark approvals as needing refresh to pick up any job_id changes
-        self.approvals_state.approvals_loaded = false;
-    }
-
-    /// Reject an approval request
-    fn reject_approval(&mut self, approval_id: &str, reason: Option<String>) {
-        // Update in-memory state immediately for UI feedback
-        if let Some(approval) = self
-            .approvals_state
-            .approvals
-            .iter_mut()
-            .find(|a| a.id == approval_id)
-        {
-            approval.status = ApprovalDisplayStatus::Rejected;
-        }
-
-        // Call backend to persist the rejection
-        let approval_id_owned = approval_id.to_string();
-        let reason_owned = reason.clone();
-        if self.control_connected {
-            if let Some(control_addr) = self.control_addr.clone() {
-                std::thread::spawn(move || {
-                    if let Ok(client) =
-                        ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(500))
-                    {
-                        let reason = reason_owned.as_deref().unwrap_or("");
-                        let _ = client.reject(&approval_id_owned, reason);
-                    }
-                });
-            }
-        } else {
-            let (backend, db_path) = self.resolve_db_target();
-            std::thread::spawn(move || {
-                if let Ok(Some(conn)) = App::open_db_write_with(backend, &db_path) {
-                    let storage = ApiStorage::new(conn);
-                    if let Err(e) = storage.init_schema() {
-                        tracing::error!("Failed to init schema for rejection: {}", e);
-                        return;
-                    }
-                    if let Err(e) = storage.reject(&approval_id_owned, None, reason_owned.as_deref()) {
-                        tracing::error!("Failed to reject {}: {}", approval_id_owned, e);
-                    }
-                }
-            });
-        }
-
-        // Mark approvals as needing refresh
-        self.approvals_state.approvals_loaded = false;
-    }
-    /// Handle jobs mode keys
-    fn handle_jobs_key(&mut self, key: KeyEvent) {
-        // Handle keys based on current view state
-        match self.jobs_state.view_state {
-            JobsViewState::JobList => self.handle_jobs_list_key(key),
-            JobsViewState::DetailPanel => self.handle_jobs_detail_key(key),
-            JobsViewState::MonitoringPanel => self.handle_jobs_monitoring_key(key),
-            JobsViewState::LogViewer => self.handle_jobs_log_viewer_key(key),
-            JobsViewState::FilterDialog => self.handle_jobs_filter_dialog_key(key),
-            JobsViewState::ViolationDetail => self.handle_jobs_violation_detail_key(key),
-        }
-    }
-
-    /// Handle keys when in job list view
-    fn handle_jobs_list_key(&mut self, key: KeyEvent) {
-        let focused_count = self.jobs_state.focused_jobs().len();
-
-        let sync_focus_index = |state: &mut JobsState| match state.section_focus {
-            JobsListSection::Actionable => state.actionable_index = state.selected_index,
-            JobsListSection::Ready => state.ready_index = state.selected_index,
-        };
-
-        match key.code {
-            // Job navigation (within filtered list)
-            KeyCode::Down => {
-                if self.jobs_state.selected_index < focused_count.saturating_sub(1) {
-                    self.jobs_state.selected_index += 1;
-                    sync_focus_index(&mut self.jobs_state);
-                }
-            }
-            KeyCode::Up => {
-                if self.jobs_state.selected_index > 0 {
-                    self.jobs_state.selected_index -= 1;
-                    sync_focus_index(&mut self.jobs_state);
-                }
-            }
-            // Pin details panel to selected job
-            KeyCode::Enter => {
-                let jobs = self.jobs_state.focused_jobs();
-                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
-                    if self.jobs_state.pinned_job_id == Some(job.id) {
-                        self.jobs_state.pinned_job_id = None;
-                    } else {
-                        self.jobs_state.pinned_job_id = Some(job.id);
-                    }
-                }
-            }
-            // Switch list focus
-            KeyCode::Tab => {
-                sync_focus_index(&mut self.jobs_state);
-                self.jobs_state.section_focus = match self.jobs_state.section_focus {
-                    JobsListSection::Actionable => JobsListSection::Ready,
-                    JobsListSection::Ready => JobsListSection::Actionable,
-                };
-                self.jobs_state.clamp_selection();
-            }
-            // Toggle pipeline summary
-            KeyCode::Char('p') => {
-                self.jobs_state.show_pipeline = !self.jobs_state.show_pipeline;
-            }
-            // Open quarantine/triage view for selected job
-            KeyCode::Char('Q') => {
-                let jobs = self.jobs_state.focused_jobs();
-                let job_id = jobs.get(self.jobs_state.selected_index).map(|job| job.id);
-                self.open_triage(job_id);
-            }
-            // Open monitoring panel
-            KeyCode::Char('m') => {
-                self.jobs_state
-                    .transition_state(JobsViewState::MonitoringPanel);
-            }
-            // Open pipeline catalog for selected run
-            KeyCode::Char('C') => {
-                let jobs = self.jobs_state.focused_jobs();
-                let run_id = jobs
-                    .get(self.jobs_state.selected_index)
-                    .and_then(|job| job.pipeline_run_id.clone());
-                self.open_catalog(run_id);
-            }
-            // f: Open filter dialog (per keybinding matrix - keys 1-4 are reserved for navigation)
-            KeyCode::Char('f') => {
-                self.jobs_state
-                    .transition_state(JobsViewState::FilterDialog);
-            }
-            // Clear filters when active
-            KeyCode::Backspace | KeyCode::Delete => {
-                if self.jobs_state.status_filter.is_some() || self.jobs_state.type_filter.is_some()
-                {
-                    self.jobs_state.status_filter = None;
-                    self.jobs_state.type_filter = None;
-                    self.jobs_state.clamp_selection();
-                }
-            }
-            // Go to first job
-            KeyCode::Char('g') => {
-                self.jobs_state.selected_index = 0;
-                sync_focus_index(&mut self.jobs_state);
-            }
-            // Go to last job
-            KeyCode::Char('G') => {
-                self.jobs_state.selected_index = focused_count.saturating_sub(1);
-                sync_focus_index(&mut self.jobs_state);
-            }
-            // Open output folder for completed jobs
-            KeyCode::Char('o') | KeyCode::Char('O') => {
-                let jobs = self.jobs_state.focused_jobs();
-                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
-                    if let Some(ref path) = job.output_path {
-                        // Try to open the folder in system file manager
-                        #[cfg(target_os = "macos")]
-                        let _ = std::process::Command::new("open").arg(path).spawn();
-                        #[cfg(target_os = "linux")]
-                        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-                        #[cfg(target_os = "windows")]
-                        let _ = std::process::Command::new("explorer").arg(path).spawn();
-                    }
-                }
-            }
-            // Clear completed jobs from the list
-            KeyCode::Char('x') => {
-                self.jobs_state.jobs.retain(|j| {
-                    !matches!(j.status, JobStatus::Completed | JobStatus::PartialSuccess)
-                });
-                // Clamp selection to valid range
-                self.jobs_state.clamp_selection();
-            }
-            // Show help overlay
-            KeyCode::Char('?') => {
-                self.show_help = true;
-            }
-            // Open log viewer
-            KeyCode::Char('L') => {
-                if !self.jobs_state.focused_jobs().is_empty() {
-                    self.jobs_state.transition_state(JobsViewState::LogViewer);
-                }
-            }
-            // Copy output path to clipboard
-            KeyCode::Char('y') => {
-                let jobs = self.jobs_state.focused_jobs();
-                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
-                    if let Some(ref path) = job.output_path {
-                        // TODO: Copy to clipboard (requires clipboard crate or platform-specific impl)
-                        let _ = path; // Silence warning for now
-                    }
-                }
-            }
-            // Toggle violation detail view (for backtest jobs)
-            KeyCode::Char('v') => {
-                let jobs = self.jobs_state.focused_jobs();
-                if let Some(job) = jobs.get(self.jobs_state.selected_index) {
-                    if job.job_type == JobType::Backtest && !job.violations.is_empty() {
-                        self.jobs_state
-                            .transition_state(JobsViewState::ViolationDetail);
-                    }
-                }
-            }
-            KeyCode::Esc => {}
-            _ => {}
-        }
-    }
-
-    /// Handle keys when in job detail panel
-    fn handle_jobs_detail_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Close detail panel, return to list
-            KeyCode::Esc => {
-                self.jobs_state.return_to_previous_state();
-            }
-            // Retry failed job from detail view
-            KeyCode::Char('R') => {
-                if let Some(job) = self.jobs_state.selected_job() {
-                    if job.status == JobStatus::Failed {
-                        // TODO: Actually retry the job
-                    }
-                }
-            }
-            // View logs (placeholder)
-            KeyCode::Char('L') => {
-                // TODO: Open log viewer
-            }
-            // Copy output path to clipboard (placeholder)
-            KeyCode::Char('y') => {
-                // TODO: Copy to clipboard
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when in monitoring panel
-    fn handle_jobs_monitoring_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Close monitoring panel, return to list
-            KeyCode::Esc => {
-                self.jobs_state.return_to_previous_state();
-            }
-            // Pause/resume monitoring refresh
-            KeyCode::Char('p') => {
-                self.jobs_state.monitoring.paused = !self.jobs_state.monitoring.paused;
-            }
-            // Reset metrics
-            KeyCode::Char('r') => {
-                self.jobs_state.monitoring = MonitoringState::default();
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when in log viewer
-    fn handle_jobs_log_viewer_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Close log viewer, return to previous state
-            KeyCode::Esc => {
-                self.jobs_state.return_to_previous_state();
-            }
-            // TODO: Scroll logs up/down
-            KeyCode::Down => {
-                // Scroll down
-            }
-            KeyCode::Up => {
-                // Scroll up
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when in filter dialog
-    fn handle_jobs_filter_dialog_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Close filter dialog
-            KeyCode::Esc => {
-                self.jobs_state.return_to_previous_state();
-            }
-            // TODO: Apply filter selections
-            KeyCode::Enter => {
-                self.jobs_state.return_to_previous_state();
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when in violation detail view
-    fn handle_jobs_violation_detail_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Close violation detail view, return to job list
-            KeyCode::Esc | KeyCode::Char('v') => {
-                self.jobs_state.return_to_previous_state();
-            }
-            // Navigate violations
-            KeyCode::Down => {
-                if let Some(job_id) = self.jobs_state.selected_job().map(|j| j.id) {
-                    if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
-                        if job.selected_violation_index < job.violations.len().saturating_sub(1) {
-                            job.selected_violation_index += 1;
-                        }
-                    }
-                }
-            }
-            KeyCode::Up => {
-                if let Some(job_id) = self.jobs_state.selected_job().map(|j| j.id) {
-                    if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
-                        if job.selected_violation_index > 0 {
-                            job.selected_violation_index -= 1;
-                        }
-                    }
-                }
-            }
-            // Apply suggested fix (creates approval request)
-            KeyCode::Char('a') => {
-                if let Some(job) = self.jobs_state.selected_job() {
-                    if let Some(violation) = job.violations.get(job.selected_violation_index) {
-                        if violation.suggested_fix.is_some() {
-                            // TODO: Create approval request for the suggested fix
-                            // This would integrate with the approval workflow
-                            // For now, just log that we want to apply the fix
-                            let _ = (job.id, job.selected_violation_index);
-                        }
-                    }
-                }
-            }
-            // Go to first violation
-            KeyCode::Char('g') => {
-                if let Some(job_id) = self.jobs_state.selected_job().map(|j| j.id) {
-                    if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
-                        job.selected_violation_index = 0;
-                    }
-                }
-            }
-            // Go to last violation
-            KeyCode::Char('G') => {
-                if let Some(job_id) = self.jobs_state.selected_job().map(|j| j.id) {
-                    if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
-                        job.selected_violation_index = job.violations.len().saturating_sub(1);
-                    }
-                }
-            }
-            // Show help
-            KeyCode::Char('?') => {
-                self.show_help = true;
-            }
-            _ => {}
-        }
-    }
-
-    // ======== Settings Key Handlers ========
-
-    /// Handle key events in Settings mode (per specs/views/settings.md)
-    fn handle_settings_key(&mut self, key: KeyEvent) {
-        if self.settings.editing {
-            // In editing mode, handle text input
-            match key.code {
-                KeyCode::Esc => {
-                    // Cancel edit, discard changes
-                    self.settings.editing = false;
-                    self.settings.edit_value.clear();
-                }
-                KeyCode::Enter => {
-                    // Save the edit
-                    self.apply_settings_edit();
-                    self.settings.editing = false;
-                    self.settings.edit_value.clear();
-                }
-                KeyCode::Backspace => {
-                    self.settings.edit_value.pop();
-                }
-                KeyCode::Char(c) => {
-                    self.settings.edit_value.push(c);
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Normal navigation mode
-        match key.code {
-            // Navigate categories
-            KeyCode::Tab => {
-                self.settings.category = match self.settings.category {
-                    SettingsCategory::General => SettingsCategory::Display,
-                    SettingsCategory::Display => SettingsCategory::About,
-                    SettingsCategory::About => SettingsCategory::General,
-                };
-                self.settings.selected_index = 0;
-            }
-            KeyCode::BackTab => {
-                self.settings.category = match self.settings.category {
-                    SettingsCategory::General => SettingsCategory::About,
-                    SettingsCategory::Display => SettingsCategory::General,
-                    SettingsCategory::About => SettingsCategory::Display,
-                };
-                self.settings.selected_index = 0;
-            }
-            // Navigate within category
-            KeyCode::Down => {
-                let max = self.settings.category_item_count().saturating_sub(1);
-                if self.settings.selected_index < max {
-                    self.settings.selected_index += 1;
-                }
-            }
-            KeyCode::Up => {
-                if self.settings.selected_index > 0 {
-                    self.settings.selected_index -= 1;
-                }
-            }
-            // Edit/Toggle selected setting
-            KeyCode::Enter => {
-                self.toggle_or_edit_setting();
-            }
-            _ => {}
-        }
-    }
-
-    /// Toggle boolean setting or start editing text setting
-    fn toggle_or_edit_setting(&mut self) {
-        match self.settings.category {
-            SettingsCategory::General => match self.settings.selected_index {
-                0 => {
-                    // default_source_path - enter edit mode
-                    self.settings.editing = true;
-                    self.settings.edit_value = self.settings.default_source_path.clone();
-                }
-                1 => {
-                    // auto_scan_on_startup - toggle
-                    self.settings.auto_scan_on_startup = !self.settings.auto_scan_on_startup;
-                }
-                2 => {
-                    // confirm_destructive - toggle
-                    self.settings.confirm_destructive = !self.settings.confirm_destructive;
-                }
-                _ => {}
-            },
-            SettingsCategory::Display => match self.settings.selected_index {
-                0 => {
-                    // theme - cycle
-                    self.settings.theme = match self.settings.theme.as_str() {
-                        "dark" => "light".to_string(),
-                        "light" => "system".to_string(),
-                        _ => "dark".to_string(),
-                    };
-                }
-                1 => {
-                    // unicode_symbols - toggle
-                    self.settings.unicode_symbols = !self.settings.unicode_symbols;
-                }
-                2 => {
-                    // show_hidden_files - toggle
-                    self.settings.show_hidden_files = !self.settings.show_hidden_files;
-                }
-                _ => {}
-            },
-            SettingsCategory::About => {
-                // Read-only, no action
-            }
-        }
-    }
-
-    /// Apply the current edit value to the appropriate setting
-    fn apply_settings_edit(&mut self) {
-        match self.settings.category {
-            SettingsCategory::General => {
-                if self.settings.selected_index == 0 {
-                    self.settings.default_source_path = self.settings.edit_value.clone();
-                }
-            }
-            _ => {}
-        }
-        // TODO: Persist to config.toml
-    }
-
-    fn load_pending_gate_info(&self, session_id: &str, gate_id: &str) -> Result<GateInfo, String> {
-        let session_id: SessionId = session_id
-            .parse()
-            .map_err(|err| format!("Invalid session id: {}", err))?;
-        let store = SessionStore::with_root(casparian_home().join("sessions"));
-        let bundle = store
-            .get_session(session_id)
-            .map_err(|err| format!("Failed to load session: {}", err))?;
-        let manifest = bundle
-            .read_manifest()
-            .map_err(|err| format!("Failed to read manifest: {}", err))?;
-
-        match gate_id {
-            "G1" => self.build_selection_gate_info(&bundle, &manifest),
-            _ => Err(format!("Gate {} not supported yet", gate_id)),
-        }
-    }
-
-    fn build_selection_gate_info(
-        &self,
-        bundle: &SessionBundle,
-        manifest: &SessionManifest,
-    ) -> Result<GateInfo, String> {
-        let artifact = manifest
-            .artifacts
-            .iter()
-            .rev()
-            .find(|artifact| artifact.kind == "selection")
-            .ok_or_else(|| "No selection proposal found".to_string())?;
-        let path = bundle.session_dir().join(&artifact.reference);
-        let content =
-            std::fs::read_to_string(&path).map_err(|err| format!("Read proposal: {}", err))?;
-        let proposal: SelectionProposal =
-            serde_json::from_str(&content).map_err(|err| format!("Parse proposal: {}", err))?;
-
-        let selected_examples = proposal.preview.selected_examples.clone();
-        let near_miss_examples = proposal.preview.near_miss_examples.clone();
-        let proposal_summary = format!(
-            "Selected {} examples, {} near misses",
-            selected_examples.len(),
-            near_miss_examples.len()
-        );
-        let evidence = self.selection_evidence_lines(&proposal);
-        let confidence = Self::confidence_label_string(proposal.confidence.label);
-        let next_actions = proposal
-            .next_actions
-            .iter()
-            .map(|action| Self::next_action_label(action.clone()))
-            .collect();
-
-        Ok(GateInfo {
-            gate_id: "G1".to_string(),
-            gate_name: "File Selection".to_string(),
-            proposal_summary,
-            evidence,
-            confidence,
-            selected_examples,
-            near_miss_examples,
-            next_actions,
-            proposal_id: proposal.proposal_id,
-            approval_target_hash: proposal.proposal_hash,
-        })
-    }
-
-    fn selection_evidence_lines(&self, proposal: &SelectionProposal) -> Vec<String> {
-        let mut evidence = Vec::new();
-
-        for item in proposal.evidence.top_dir_prefixes.iter().take(3) {
-            evidence.push(format!("Dir {} ({})", item.prefix, item.count));
-        }
-        for item in proposal.evidence.extensions.iter().take(3) {
-            evidence.push(format!("Ext {} ({})", item.ext, item.count));
-        }
-        for item in proposal.evidence.semantic_tokens.iter().take(3) {
-            evidence.push(format!("Token {} ({})", item.token, item.count));
-        }
-        for item in proposal
-            .evidence
-            .collision_with_existing_tags
-            .iter()
-            .take(3)
-        {
-            evidence.push(format!("Tag collision {} ({})", item.tag, item.count));
-        }
-        for reason in proposal.confidence.reasons.iter().take(3) {
-            evidence.push(format!("Reason: {}", reason));
-        }
-
-        if evidence.is_empty() {
-            evidence.push("No evidence recorded".to_string());
-        }
-
-        evidence
-    }
-
-    fn confidence_label_string(label: ConfidenceLabel) -> String {
-        match label {
-            ConfidenceLabel::High => "HIGH".to_string(),
-            ConfidenceLabel::Med => "MEDIUM".to_string(),
-            ConfidenceLabel::Low => "LOW".to_string(),
-        }
-    }
-
-    fn next_action_label(action: NextAction) -> String {
-        let raw = format!("{:?}", action);
-        let mut out = String::new();
-        for (idx, ch) in raw.chars().enumerate() {
-            if idx > 0 && ch.is_uppercase() {
-                out.push(' ');
-            }
-            out.push(ch);
-        }
-        out
-    }
-
-    fn apply_gate_decision(&mut self, decision: Decision) -> Result<(), String> {
-        let session_id = self
-            .sessions_state
-            .active_session
-            .clone()
-            .ok_or_else(|| "No active session selected".to_string())?;
-        let gate = self
-            .sessions_state
-            .pending_gate
-            .clone()
-            .ok_or_else(|| "No pending gate loaded".to_string())?;
-
-        let next_state = match (gate.gate_id.as_str(), &decision) {
-            ("G1", Decision::Approve) => IntentState::ProposeTagRules,
-            ("G1", Decision::Reject) => IntentState::ProposeSelection,
-            _ => return Err(format!("Decision for {} not supported yet", gate.gate_id)),
-        };
-
-        let session_id_copy = session_id.clone();
-        self.record_gate_decision(&session_id, &gate, decision, next_state)?;
-        self.sessions_state.pending_select_session_id = Some(session_id_copy);
-        self.sessions_state.sessions_loaded = false;
-        Ok(())
-    }
-
-    fn record_gate_decision(
-        &self,
-        session_id: &str,
-        gate: &GateInfo,
-        decision: Decision,
-        next_state: IntentState,
-    ) -> Result<(), String> {
-        let session_id: SessionId = session_id
-            .parse()
-            .map_err(|err| format!("Invalid session id: {}", err))?;
-        let store = SessionStore::with_root(casparian_home().join("sessions"));
-        let bundle = store
-            .get_session(session_id)
-            .map_err(|err| format!("Failed to load session: {}", err))?;
-
-        let notes = format!("{} {:?} via TUI", gate.gate_id, decision);
-        let decision_record = DecisionRecord {
-            timestamp: Utc::now(),
-            actor: "tui".to_string(),
-            decision: decision.clone(),
-            target: DecisionTarget {
-                proposal_id: gate.proposal_id,
-                approval_target_hash: gate.approval_target_hash.clone(),
-            },
-            choice_payload: serde_json::json!({}),
-            notes: Some(notes),
-        };
-        bundle
-            .append_decision(&decision_record)
-            .map_err(|err| format!("Append decision failed: {}", err))?;
-        bundle
-            .update_state(next_state)
-            .map_err(|err| format!("Update state failed: {}", err))?;
-
-        Ok(())
-    }
-
-    // ======== Sessions Key Handlers (Intent Pipeline Workflow) ========
-
-    /// Handle key events in Sessions mode
-    fn handle_sessions_key(&mut self, key: KeyEvent) {
-        match self.sessions_state.view_state {
-            SessionsViewState::SessionList => self.handle_sessions_list_key(key),
-            SessionsViewState::SessionDetail => self.handle_session_detail_key(key),
-            SessionsViewState::WorkflowProgress => self.handle_workflow_progress_key(key),
-            SessionsViewState::ProposalReview => self.handle_proposal_review_key(key),
-            SessionsViewState::GateApproval => self.handle_gate_approval_key(key),
-        }
-    }
-
-    /// Handle keys when in session list view
-    fn handle_sessions_list_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Navigate list
-            KeyCode::Down => {
-                if self.sessions_state.selected_index
-                    < self.sessions_state.sessions.len().saturating_sub(1)
-                {
-                    self.sessions_state.selected_index += 1;
-                }
-            }
-            KeyCode::Up => {
-                if self.sessions_state.selected_index > 0 {
-                    self.sessions_state.selected_index -= 1;
-                }
-            }
-            // View session details
-            KeyCode::Enter => {
-                // Extract needed values first to avoid borrow conflicts
-                let session_info = self
-                    .sessions_state
-                    .selected_session()
-                    .map(|s| (s.id.clone(), s.pending_gate.clone()));
-                if let Some((session_id, pending_gate)) = session_info {
-                    self.sessions_state.active_session = Some(session_id.clone());
-                    // If there's a pending gate, go to gate approval, otherwise session detail
-                    if let Some(gate_id) = pending_gate {
-                        match self.load_pending_gate_info(&session_id, &gate_id) {
-                            Ok(gate) => {
-                                self.sessions_state.pending_gate = Some(gate);
-                                self.sessions_state
-                                    .transition_state(SessionsViewState::GateApproval);
-                            }
-                            Err(err) => {
-                                tracing::error!("{}", err);
-                                self.sessions_state.pending_gate = None;
-                                self.sessions_state
-                                    .transition_state(SessionsViewState::SessionDetail);
-                            }
-                        }
-                    } else {
-                        self.sessions_state.pending_gate = None;
-                        self.sessions_state
-                            .transition_state(SessionsViewState::SessionDetail);
-                    }
-                }
-            }
-            // New session (would open command palette in full implementation)
-            KeyCode::Char('n') => {
-                self.command_palette.open(CommandPaletteMode::Intent);
-            }
-            // Escape returns to previous mode
-            KeyCode::Esc => {
-                if let Some(prev_mode) = self.sessions_state.previous_mode {
-                    self.set_mode(prev_mode);
-                    self.sessions_state.previous_mode = None;
-                } else {
-                    self.set_mode(TuiMode::Home);
-                }
-            }
-            // Refresh sessions list
-            KeyCode::Char('r') => {
-                self.sessions_state.sessions_loaded = false;
-                // TODO: Trigger sessions reload
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when viewing session details
-    fn handle_session_detail_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // View workflow progress
-            KeyCode::Char('w') => {
-                self.sessions_state
-                    .transition_state(SessionsViewState::WorkflowProgress);
-            }
-            // Jump to Jobs view
-            KeyCode::Char('j') => {
-                self.set_run_tab(RunTab::Jobs);
-            }
-            // Jump to Query view with a template
-            KeyCode::Char('q') => {
-                if let Some(session) = self.sessions_state.selected_session() {
-                    let template = format!(
-                        "-- Session {}\nSELECT * FROM cf_pipeline_runs ORDER BY started_at DESC LIMIT 50;",
-                        session.id
-                    );
-                    self.query_state.sql_input = template;
-                    self.query_state.cursor_position = self.query_state.sql_input.len();
-                    self.query_state.view_state = QueryViewState::Editing;
-                    self.query_state.error = None;
-                    self.query_state.results = None;
-                }
-                self.navigate_to_mode(TuiMode::Query);
-            }
-            // Jump to Discover view
-            KeyCode::Char('d') => {
-                self.set_ingest_tab(IngestTab::Select);
-            }
-            // Back to session list
-            KeyCode::Esc => {
-                self.sessions_state.return_to_previous_state();
-                self.sessions_state.active_session = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when viewing workflow progress
-    fn handle_workflow_progress_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Back to session detail
-            KeyCode::Esc => {
-                self.sessions_state.return_to_previous_state();
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when reviewing a proposal
-    fn handle_proposal_review_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Back to previous view
-            KeyCode::Esc => {
-                self.sessions_state.return_to_previous_state();
-                self.sessions_state.current_proposal = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle keys when at a gate approval
-    fn handle_gate_approval_key(&mut self, key: KeyEvent) {
-        match key.code {
-            // Approve gate
-            KeyCode::Char('a') | KeyCode::Enter => {
-                match self.apply_gate_decision(Decision::Approve) {
-                    Ok(()) => {
-                        self.sessions_state.pending_gate = None;
-                        self.sessions_state.return_to_previous_state();
-                    }
-                    Err(err) => {
-                        tracing::error!("{}", err);
-                    }
-                }
-            }
-            // Reject gate
-            KeyCode::Char('r') => match self.apply_gate_decision(Decision::Reject) {
-                Ok(()) => {
-                    self.sessions_state.pending_gate = None;
-                    self.sessions_state.return_to_previous_state();
-                }
-                Err(err) => {
-                    tracing::error!("{}", err);
-                }
-            },
-            // Back to session list without action
-            KeyCode::Esc => {
-                self.sessions_state.pending_gate = None;
-                self.sessions_state.return_to_previous_state();
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_triage_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                if let Some(prev_mode) = self.triage_state.previous_mode.take() {
-                    self.set_mode(prev_mode);
-                } else {
-                    self.set_mode(TuiMode::Home);
-                }
-            }
-            KeyCode::Tab => {
-                self.triage_state.tab = self.triage_state.tab.next();
-                self.triage_state.selected_index = 0;
-                self.triage_state.clamp_selection();
-            }
-            KeyCode::Down => {
-                let len = self.triage_state.active_len();
-                if len > 0 && self.triage_state.selected_index + 1 < len {
-                    self.triage_state.selected_index += 1;
-                }
-            }
-            KeyCode::Up => {
-                if self.triage_state.selected_index > 0 {
-                    self.triage_state.selected_index -= 1;
-                }
-            }
-            KeyCode::Char('r') => {
-                self.triage_state.loaded = false;
-            }
-            KeyCode::Char('j') => {
-                if let Some(job_id) = self.triage_selected_job_id() {
-                    self.select_job_by_id(job_id);
-                    self.set_run_tab(RunTab::Jobs);
-                }
-            }
-            KeyCode::Char('y') => {
-                if let Some(detail) = self.triage_selected_detail() {
-                    self.triage_state.copied_buffer = Some(detail);
-                    self.triage_state.status_message =
-                        Some("Copied diagnostics to buffer".to_string());
-                }
-            }
-            KeyCode::Backspace | KeyCode::Delete => {
-                if self.triage_state.job_filter.is_some() {
-                    self.triage_state.job_filter = None;
-                    self.triage_state.loaded = false;
-                    self.triage_state.selected_index = 0;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn triage_selected_job_id(&self) -> Option<i64> {
-        match self.triage_state.tab {
-            TriageTab::Quarantine => self
-                .triage_state
-                .quarantine_rows
-                .as_ref()
-                .and_then(|rows| rows.get(self.triage_state.selected_index))
-                .map(|row| row.job_id),
-            TriageTab::SchemaMismatch => self
-                .triage_state
-                .schema_mismatches
-                .as_ref()
-                .and_then(|rows| rows.get(self.triage_state.selected_index))
-                .map(|row| row.job_id),
-            TriageTab::DeadLetter => self
-                .triage_state
-                .dead_letters
-                .as_ref()
-                .and_then(|rows| rows.get(self.triage_state.selected_index))
-                .map(|row| row.original_job_id),
-        }
-    }
-
-    fn triage_selected_detail(&self) -> Option<String> {
-        match self.triage_state.tab {
-            TriageTab::Quarantine => self
-                .triage_state
-                .quarantine_rows
-                .as_ref()
-                .and_then(|rows| rows.get(self.triage_state.selected_index))
-                .map(|row| {
-                    format!(
-                        "Quarantine Row {}\nJob: {}\nRow: {}\nReason: {}\nCreated: {}\n",
-                        row.id, row.job_id, row.row_index, row.error_reason, row.created_at
-                    )
-                }),
-            TriageTab::SchemaMismatch => self
-                .triage_state
-                .schema_mismatches
-                .as_ref()
-                .and_then(|rows| rows.get(self.triage_state.selected_index))
-                .map(|row| {
-                    format!(
-                        "Schema Mismatch {}\nJob: {}\nOutput: {}\nKind: {}\nExpected: {:?} ({:?}) idx {:?}\nActual: {:?} ({:?}) idx {:?}\nCreated: {}\n",
-                        row.id,
-                        row.job_id,
-                        row.output_name,
-                        row.mismatch_kind,
-                        row.expected_name,
-                        row.expected_type,
-                        row.expected_index,
-                        row.actual_name,
-                        row.actual_type,
-                        row.actual_index,
-                        row.created_at
-                    )
-                }),
-            TriageTab::DeadLetter => self
-                .triage_state
-                .dead_letters
-                .as_ref()
-                .and_then(|rows| rows.get(self.triage_state.selected_index))
-                .map(|row| {
-                    format!(
-                        "Dead Letter {}\nOriginal Job: {}\nFile: {:?}\nPlugin: {}\nError: {:?}\nRetry: {}\nMoved: {}\nReason: {:?}\n",
-                        row.id,
-                        row.original_job_id,
-                        row.file_id,
-                        row.plugin_name,
-                        row.error_message,
-                        row.retry_count,
-                        row.moved_at,
-                        row.reason
-                    )
-                }),
-        }
-    }
-
-    fn select_job_by_id(&mut self, job_id: i64) {
-        if self.jobs_state.jobs.is_empty() {
-            return;
-        }
-
-        if let Some(job) = self.jobs_state.jobs.iter().find(|job| job.id == job_id) {
-            self.jobs_state.section_focus = match job.status {
-                JobStatus::Completed | JobStatus::PartialSuccess => JobsListSection::Ready,
-                JobStatus::Pending
-                | JobStatus::Running
-                | JobStatus::Failed
-                | JobStatus::Cancelled => JobsListSection::Actionable,
-            };
-
-            let list = match self.jobs_state.section_focus {
-                JobsListSection::Actionable => self.jobs_state.actionable_jobs(),
-                JobsListSection::Ready => self.jobs_state.ready_jobs(),
-            };
-            if let Some(pos) = list.iter().position(|job| job.id == job_id) {
-                self.jobs_state.selected_index = pos;
-                self.jobs_state.clamp_selection();
-            }
-        }
-    }
-
-    fn open_triage(&mut self, job_filter: Option<i64>) {
-        self.triage_state.job_filter = job_filter;
-        self.triage_state.tab = TriageTab::Quarantine;
-        self.triage_state.selected_index = 0;
-        self.triage_state.loaded = false;
-        self.triage_state.status_message = None;
-        self.set_review_tab(ReviewTab::Triage);
-    }
-
-    fn handle_catalog_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                if let Some(prev_mode) = self.catalog_state.previous_mode.take() {
-                    self.set_mode(prev_mode);
-                } else {
-                    self.set_mode(TuiMode::Home);
-                }
-            }
-            KeyCode::Tab => {
-                self.catalog_state.tab = self.catalog_state.tab.next();
-                self.catalog_state.selected_index = 0;
-                self.catalog_state.clamp_selection();
-            }
-            KeyCode::Down => {
-                let len = self.catalog_state.active_len();
-                if len > 0 && self.catalog_state.selected_index + 1 < len {
-                    self.catalog_state.selected_index += 1;
-                }
-            }
-            KeyCode::Up => {
-                if self.catalog_state.selected_index > 0 {
-                    self.catalog_state.selected_index -= 1;
-                }
-            }
-            KeyCode::Char('r') => {
-                self.catalog_state.loaded = false;
-            }
-            KeyCode::Enter => {
-                if self.catalog_state.tab == CatalogTab::Pipelines {
-                    self.catalog_state.tab = CatalogTab::Runs;
-                    self.catalog_state.selected_index = 0;
-                    self.catalog_state.clamp_selection();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn open_catalog(&mut self, run_id: Option<String>) {
-        self.catalog_state.pending_select_run_id = run_id;
-        self.catalog_state.tab = CatalogTab::Pipelines;
-        if self.catalog_state.pending_select_run_id.is_some() {
-            self.catalog_state.tab = CatalogTab::Runs;
-        }
-        self.catalog_state.selected_index = 0;
-        self.catalog_state.loaded = false;
-        self.catalog_state.status_message = None;
-        self.set_run_tab(RunTab::Outputs);
-    }
-
     /// Periodic tick for updates
     pub fn tick(&mut self) {
         // Increment tick counter for animated UI elements
         self.tick_count = self.tick_count.wrapping_add(1);
 
+        self.maybe_probe_control_connection();
         self.check_db_health_once();
         self.ensure_active_workspace();
 
@@ -14204,6 +9072,16 @@ impl App {
                         self.discover
                             .status_message
                             .replace((err, true));
+                    }
+                    if let Some(connected) = result.control_connected {
+                        if connected != self.control_connected {
+                            self.control_connected = connected;
+                            if connected {
+                                self.set_global_status("Sentinel connected", false);
+                            } else {
+                                self.set_global_status("Sentinel not reachable", true);
+                            }
+                        }
                     }
                     if result.sources_changed {
                         self.discover.sources_loaded = false;
@@ -14344,7 +9222,7 @@ impl App {
 
             match recv_result {
                 Ok(Ok(jobs)) => {
-                    self.jobs_state.jobs = jobs;
+                    self.jobs_state.merge_loaded_jobs(jobs);
                     self.jobs_state.jobs_loaded = true;
                     self.last_jobs_poll = Some(std::time::Instant::now());
                     self.update_home_recent_jobs();
@@ -15540,6 +10418,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("casparian_test_{}.duckdb", uuid::Uuid::new_v4())),
             ),
+            standalone_writer: false,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,
@@ -15646,6 +10525,7 @@ mod tests {
 
         let args = TuiArgs {
             database: Some(db_path),
+            standalone_writer: false,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,
@@ -15684,6 +10564,7 @@ mod tests {
                 id: 1,
                 file_id: Some(101),
                 job_type: JobType::Parse,
+                origin: JobOrigin::Persistent,
                 name: "parser_a".into(),
                 version: Some("1.0.0".into()),
                 status: JobStatus::Pending,
@@ -15708,6 +10589,7 @@ mod tests {
                 id: 2,
                 file_id: Some(102),
                 job_type: JobType::Parse,
+                origin: JobOrigin::Persistent,
                 name: "parser_b".into(),
                 version: Some("1.0.0".into()),
                 status: JobStatus::Running,
@@ -15732,6 +10614,7 @@ mod tests {
                 id: 3,
                 file_id: Some(103),
                 job_type: JobType::Parse,
+                origin: JobOrigin::Persistent,
                 name: "parser_c".into(),
                 version: Some("1.0.0".into()),
                 status: JobStatus::Failed,
@@ -15760,6 +10643,7 @@ mod tests {
                 id: 4,
                 file_id: Some(104),
                 job_type: JobType::Parse,
+                origin: JobOrigin::Persistent,
                 name: "parser_d".into(),
                 version: Some("1.0.0".into()),
                 status: JobStatus::Completed,
@@ -15976,6 +10860,7 @@ mod tests {
                 id: i,
                 file_id: Some(i * 100),
                 job_type: JobType::Parse,
+                origin: JobOrigin::Persistent,
                 name: format!("test_parser_{}", i),
                 version: Some("1.0.0".into()),
                 status: if i % 4 == 0 {

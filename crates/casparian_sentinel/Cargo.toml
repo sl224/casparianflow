@@ -24,6 +24,7 @@ serde_json.workspace = true
 
 # Database
 casparian_db = { path = "../casparian_db" }
+casparian_state_store = { path = "../casparian_state_store" }
 casparian_schema = { path = "../casparian_schema" }
 casparian_security = { path = "../casparian_security" }
 casparian_scout = { path = "../casparian_scout", default-features = false }

@@ -914,6 +914,31 @@ fn load_file_generation(conn: &DbConnection, file_ids: &[i64]) -> Result<HashMap
     Ok(result)
 }
 
+fn load_file_paths(conn: &DbConnection, file_ids: &[i64]) -> Result<HashMap<i64, String>> {
+    if file_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut result = HashMap::new();
+    const CHUNK_SIZE: usize = 200;
+    for chunk in file_ids.chunks(CHUNK_SIZE) {
+        let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT id, path FROM scout_files WHERE id IN ({})",
+            placeholders
+        );
+        let params: Vec<DbValue> = chunk.iter().map(|id| DbValue::from(*id)).collect();
+        let rows = conn.query_all(&sql, &params)?;
+        for row in rows {
+            let id: i64 = row.get_by_name("id")?;
+            let path: String = row.get_by_name("path")?;
+            result.insert(id, path);
+        }
+    }
+
+    Ok(result)
+}
+
 fn load_existing_materialization_keys(
     conn: &DbConnection,
     keys: &[String],
@@ -1038,6 +1063,7 @@ fn enqueue_jobs(
     let output_targets = output_target_keys_for_sinks(conn, &sinks, parser, &manifest.version)?;
 
     let file_meta = load_file_generation(conn, file_ids)?;
+    let file_paths = load_file_paths(conn, file_ids)?;
     let mut keys_by_file: HashMap<i64, Vec<String>> = HashMap::new();
     let mut all_keys = Vec::new();
 
@@ -1070,10 +1096,17 @@ fn enqueue_jobs(
         };
 
         if should_enqueue {
+            let input_file = file_paths.get(file_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing input path for file_id {}. Rescan sources and retry.",
+                    file_id
+                )
+            })?;
             conn.execute(
-                "INSERT INTO cf_processing_queue (file_id, pipeline_run_id, plugin_name, status, priority) VALUES (?, ?, ?, ?, 0)",
+                "INSERT INTO cf_processing_queue (file_id, input_file, pipeline_run_id, plugin_name, status, priority) VALUES (?, ?, ?, ?, ?, 0)",
                 &[
                     DbValue::from(*file_id),
+                    DbValue::from(input_file.as_str()),
                     DbValue::from(run_id),
                     DbValue::from(parser),
                     DbValue::from(ProcessingStatus::Queued.as_str()),

@@ -110,9 +110,7 @@ impl AppState {
     }
 }
 
-// Ensure AppState is Send + Sync (only contains a String)
-unsafe impl Send for AppState {}
-unsafe impl Sync for AppState {}
+static_assertions::assert_impl_all!(AppState: Send, Sync);
 
 /// Error type for Tauri commands.
 #[derive(Debug, thiserror::Error)]

@@ -28,6 +28,7 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use zmq::{Context, Socket};
 
+use crate::bridge;
 use crate::bridge::BridgeError;
 use crate::cancel::CancellationToken;
 use crate::native_runtime::NativeSubprocessRuntime;
@@ -879,12 +880,7 @@ fn allow_unsigned_python() -> WorkerResult<bool> {
 }
 
 fn casparian_home() -> WorkerResult<PathBuf> {
-    if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
-        return Ok(PathBuf::from(override_path));
-    }
-    dirs::home_dir()
-        .map(|home| home.join(".casparian_flow"))
-        .ok_or_else(|| WorkerError::internal("Could not determine home directory"))
+    Ok(casparian_protocol::paths::casparian_home())
 }
 
 const LINEAGE_COLUMNS: [&str; 4] = [
@@ -981,6 +977,18 @@ fn aggregate_job_status(outputs: &[OutputMetrics]) -> JobStatus {
     } else {
         JobStatus::Success
     }
+}
+
+fn log_artifact_for_job(job_id: JobId) -> Option<ArtifactV1> {
+    let uri = bridge::job_log_uri(job_id).ok()?;
+    let path = uri.strip_prefix("file://")?;
+    if !Path::new(path).exists() {
+        return None;
+    }
+    Some(ArtifactV1::Log {
+        name: "bridge".to_string(),
+        uri,
+    })
 }
 
 struct OutputMetrics {
@@ -1228,10 +1236,11 @@ fn execute_job(
 
     // Check cancellation before starting
     if cancel_token.is_cancelled() {
+        let artifacts = log_artifact_for_job(job_id).into_iter().collect();
         let receipt = types::JobReceipt {
             status: JobStatus::Aborted,
             metrics: HashMap::new(),
-            artifacts: vec![],
+            artifacts,
             error_message: Some("Job cancelled before execution".to_string()),
             diagnostics: None,
             source_hash: None,
@@ -1251,7 +1260,7 @@ fn execute_job(
     ) {
         Ok(ExecutionOutcome::Success {
             metrics: exec_metrics,
-            artifacts,
+            mut artifacts,
             source_hash,
         }) => {
             let mut metrics = HashMap::new();
@@ -1259,6 +1268,10 @@ fn execute_job(
 
             // Use per-output status aggregation for multi-output jobs
             let aggregated_status = aggregate_job_status(&exec_metrics.outputs);
+
+            if let Some(log_artifact) = log_artifact_for_job(job_id) {
+                artifacts.push(log_artifact);
+            }
 
             let receipt = types::JobReceipt {
                 status: aggregated_status,
@@ -1281,11 +1294,15 @@ fn execute_job(
             insert_execution_metrics(&mut metrics, &exec_metrics);
             metrics.insert(metrics::IS_TRANSIENT.to_string(), 0);
             metrics.insert(metrics::QUARANTINE_REJECTED.to_string(), 1);
+            let mut artifacts = Vec::new();
+            if let Some(log_artifact) = log_artifact_for_job(job_id) {
+                artifacts.push(log_artifact);
+            }
 
             let receipt = types::JobReceipt {
                 status: JobStatus::Failed,
                 metrics,
-                artifacts: vec![],
+                artifacts,
                 error_message: Some(reason),
                 diagnostics: None,
                 source_hash: Some(source_hash),
@@ -1295,10 +1312,11 @@ fn execute_job(
             receipt
         }
         Ok(ExecutionOutcome::Cancelled { source_hash }) => {
+            let artifacts = log_artifact_for_job(job_id).into_iter().collect();
             let receipt = types::JobReceipt {
                 status: JobStatus::Aborted,
                 metrics: HashMap::new(),
-                artifacts: vec![],
+                artifacts,
                 error_message: Some("Job cancelled during execution".to_string()),
                 diagnostics: None,
                 source_hash,
@@ -1311,6 +1329,7 @@ fn execute_job(
             let is_transient = worker_err.is_transient();
             let error_message = worker_err.to_string();
             let diagnostics = worker_err.diagnostics().cloned();
+            let artifacts = log_artifact_for_job(job_id).into_iter().collect();
 
             if is_transient {
                 warn!(
@@ -1334,7 +1353,7 @@ fn execute_job(
             let receipt = types::JobReceipt {
                 status: JobStatus::Failed,
                 metrics,
-                artifacts: vec![],
+                artifacts,
                 error_message: Some(error_message),
                 diagnostics,
                 // Hash unavailable on early failure (e.g., file not found, venv setup failure)
@@ -1474,7 +1493,7 @@ fn execute_job_inner(
 
     let output_batches = run_outputs.output_batches;
 
-    // Log the captured logs for debugging (will be stored in DB in Phase 3)
+    // Log the captured snippet for debugging (full log is persisted to disk)
     if !run_outputs.logs.is_empty() {
         debug!(
             "Job {} logs ({} bytes):\n{}",

@@ -15,7 +15,7 @@ use super::app::{
     ApprovalsViewState, BacktestInfo, CatalogTab,
     CommandPaletteMode, CommandPaletteState, DeadLetterRow, DiscoverFocus, DiscoverViewState,
     FileInfo, GateInfo, HomeStats, IngestTab, JobInfo, JobStatus, JobSummary, JobType,
-    JobsListSection, JobsViewState, MonitoringState, PipelineInfo, PipelineRunInfo,
+    JobOrigin, JobsListSection, JobsViewState, MonitoringState, PipelineInfo, PipelineRunInfo,
     PipelineStage, PipelineState, ProposalInfo, QuarantineRow, QueryResults, QueryState,
     QueryViewState, QueueStats, ReviewTab, RuleDialogFocus, RuleId, RuleInfo, RunTab,
     SavedQueriesState, SavedQueryEntry, SchemaMismatchRow, SessionInfo, SessionsViewState,
@@ -1534,6 +1534,7 @@ fn case_sources_delete_confirm() -> App {
 fn base_app() -> App {
     let args = TuiArgs {
         database: Some(PathBuf::from(SNAPSHOT_DB_PATH)),
+        standalone_writer: false,
         record_flow: None,
         record_redaction: RecordRedaction::Plaintext,
         record_checkpoint_every: None,
@@ -1891,6 +1892,10 @@ fn job_info(
         id,
         file_id: Some(id * 10),
         job_type,
+        origin: match job_type {
+            JobType::Scan | JobType::SchemaEval => JobOrigin::Ephemeral,
+            _ => JobOrigin::Persistent,
+        },
         name: name.to_string(),
         version: Some("1.2.3".to_string()),
         status,

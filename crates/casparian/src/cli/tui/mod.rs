@@ -3,6 +3,8 @@
 //! Provides an interactive TUI to scan sources, manage jobs, and build rules.
 
 pub mod app;
+pub mod db_read;
+pub mod backend;
 pub mod components;
 pub mod event;
 pub mod extraction;
@@ -47,6 +49,9 @@ pub struct TuiArgs {
     /// State store path override (defaults to ~/.casparian_flow/state.sqlite)
     #[arg(long = "state-store")]
     pub database: Option<PathBuf>,
+    /// Allow direct DB writes when control plane is unavailable (dev-only)
+    #[arg(long = "standalone-writer")]
+    pub standalone_writer: bool,
     /// Record a TUI flow to the given path (JSON)
     #[arg(long)]
     pub record_flow: Option<PathBuf>,
@@ -174,6 +179,9 @@ fn run_app<B: Backend>(
 }
 
 #[cfg(test)]
+mod jobs_merge_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -183,6 +191,7 @@ mod tests {
     fn test_app_starts_in_home_mode() {
         let args = TuiArgs {
             database: None,
+            standalone_writer: false,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,
@@ -196,6 +205,7 @@ mod tests {
     fn test_app_quit_flow() {
         let args = TuiArgs {
             database: None,
+            standalone_writer: false,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,
@@ -213,6 +223,7 @@ mod tests {
 
         let args = TuiArgs {
             database: None,
+            standalone_writer: false,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,

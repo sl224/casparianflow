@@ -77,6 +77,8 @@ const MAX_METRICS_MESSAGE_SIZE: u32 = 1024 * 1024;
 
 /// Maximum log file size (10 MB) - prevents disk exhaustion
 const MAX_LOG_FILE_SIZE: usize = 10 * 1024 * 1024;
+/// Maximum log snippet size for in-memory error display (64 KB)
+const LOG_SNIPPET_BYTES: usize = 64 * 1024;
 
 /// Timeout for Python guest to connect to Unix socket
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -110,7 +112,36 @@ impl From<anyhow::Error> for BridgeError {
     }
 }
 
-/// Streaming log writer that writes to a temp file with size cap.
+fn job_log_path(job_id: JobId) -> Result<PathBuf> {
+    let log_dir = casparian_protocol::paths::default_logs_dir();
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
+    Ok(log_dir.join(format!("{}_{}.log", job_id, std::process::id())))
+}
+
+pub(crate) fn job_log_uri(job_id: JobId) -> Result<String> {
+    let path = job_log_path(job_id)?;
+    Ok(format!("file://{}", path.display()))
+}
+
+fn read_log_snippet(path: &Path) -> Result<String> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("Failed to read log metadata: {}", path.display()))?;
+    let truncated = metadata.len() > LOG_SNIPPET_BYTES as u64;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open log file: {}", path.display()))?;
+    let mut buffer = Vec::with_capacity(LOG_SNIPPET_BYTES.min(metadata.len() as usize));
+    file.take(LOG_SNIPPET_BYTES as u64)
+        .read_to_end(&mut buffer)
+        .with_context(|| format!("Failed to read log file: {}", path.display()))?;
+    let mut content = String::from_utf8_lossy(&buffer).to_string();
+    if truncated {
+        content.push_str("\n[SYSTEM] Log snippet truncated; see full log file.\n");
+    }
+    Ok(content)
+}
+
+/// Streaming log writer that writes to a durable file with size cap.
 /// Memory usage is O(1) regardless of log volume - key for preventing OOM.
 struct JobLogWriter {
     writer: std::io::BufWriter<std::fs::File>,
@@ -124,13 +155,8 @@ impl JobLogWriter {
     /// Creates the log directory if needed.
     /// Uses both job_id and process ID to ensure uniqueness when running tests in parallel.
     fn new(job_id: JobId) -> Result<Self> {
-        let mut log_dir = std::env::temp_dir();
-        log_dir.push("casparian_logs");
-        std::fs::create_dir_all(&log_dir)
-            .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
-
         // Include process ID to avoid collisions when tests run in parallel with same job_id
-        let path = log_dir.join(format!("{}_{}.log", job_id, std::process::id()));
+        let path = job_log_path(job_id)?;
         let file = std::fs::File::create(&path)
             .with_context(|| format!("Failed to create log file: {}", path.display()))?;
 
@@ -192,17 +218,10 @@ impl JobLogWriter {
         Ok(self.path)
     }
 
-    /// Read the log file contents and delete the file.
-    /// Returns the log text (capped at 10MB).
-    fn read_and_cleanup(self) -> Result<String> {
+    /// Read a capped snippet of the log file contents.
+    fn read_snippet(self) -> Result<String> {
         let path = self.finish()?;
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read log file: {}", path.display()))?;
-
-        // Delete temp file
-        let _ = std::fs::remove_file(&path);
-
-        Ok(content)
+        read_log_snippet(&path)
     }
 }
 
@@ -234,7 +253,7 @@ pub struct BridgeResult {
     /// Arrow record batches grouped by output (per publish call)
     pub output_batches: Vec<Vec<OutputBatch>>,
     /// Captured logs from the plugin (stdout, stderr, logging)
-    /// This is O(1) memory during execution but loaded at end (capped at 10MB)
+    /// This is O(1) memory during execution; snippet loaded at end (capped at 64KB)
     pub logs: String,
     /// Output metadata from the parser
     pub output_info: Vec<OutputInfo>,
@@ -302,7 +321,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
                 log_writer.write_log(log_level::STDERR, &stderr_output);
             }
             // Still return the logs even on failure
-            let logs = log_writer.read_and_cleanup().unwrap_or_default();
+            let logs = log_writer.read_snippet().unwrap_or_default();
             return Err(e.context(format!("Logs:\n{}", logs)));
         }
     };
@@ -337,7 +356,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
                     );
                     log_writer.write_log(log_level::STDERR, &stderr_output);
                 }
-                let logs = log_writer.read_and_cleanup().unwrap_or_default();
+                let logs = log_writer.read_snippet().unwrap_or_default();
                 return Err(e.context(format!("Logs:\n{}", logs)));
             }
         };
@@ -356,7 +375,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
             error!("[Job {}] Guest stderr:\n{}", job_id, stderr_output);
             log_writer.write_log(log_level::STDERR, &stderr_output);
         }
-        let logs = log_writer.read_and_cleanup().unwrap_or_default();
+        let logs = log_writer.read_snippet().unwrap_or_default();
         anyhow::bail!(
             "[Job {}] Guest process (pid={}) exited with {}: {}\n\nLogs:\n{}",
             job_id,
@@ -392,7 +411,7 @@ fn execute_bridge_sync(config: BridgeConfig) -> Result<BridgeResult> {
 
     // Read and cleanup log file
     let logs = log_writer
-        .read_and_cleanup()
+        .read_snippet()
         .with_context(|| format!("[Job {}] Failed to read logs", job_id))?;
 
     if !output_info.is_empty() && output_info.len() != output_batches.len() {
@@ -1381,6 +1400,10 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
 
+        let prev_home = std::env::var("CASPARIAN_HOME").ok();
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("CASPARIAN_HOME", temp_home.path());
+
         let mut log_writer = JobLogWriter::new(JobId::new(1)).unwrap();
         let cancel_token = CancellationToken::new();
         let result = read_arrow_batches(&mut stream, JobId::new(1), &mut log_writer, &cancel_token);
@@ -1394,6 +1417,12 @@ mod tests {
         );
 
         writer.join().unwrap();
+
+        if let Some(prev) = prev_home {
+            std::env::set_var("CASPARIAN_HOME", prev);
+        } else {
+            std::env::remove_var("CASPARIAN_HOME");
+        }
     }
 
     fn write_ipc_batch(stream: &mut TcpStream, batch: &RecordBatch) {

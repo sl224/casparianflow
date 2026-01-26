@@ -264,8 +264,8 @@ fn test_job_queue_operations() {
     // Insert test job
     conn.execute(
         r#"
-        INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
-        VALUES (1, 1, 'test_plugin', ?, 10)
+        INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status, priority)
+        VALUES (1, 1, '/data/test.csv', 'test_plugin', ?, 10)
         "#,
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
@@ -303,22 +303,16 @@ fn test_job_queue_operations() {
     );
 }
 
-/// Test job details lookup via scout_files
+/// Test job details lookup via input_file
 #[test]
-fn test_job_details_uses_scout_files() {
+fn test_job_details_uses_input_file() {
     use casparian_sentinel::db::queue::JobQueue;
 
     let conn = setup_queue_db();
     let queue = JobQueue::new(conn.clone());
 
     conn.execute(
-        "INSERT INTO scout_files (id, path) VALUES (1, '/data/demo/sample.csv')",
-        &[],
-    )
-    .unwrap();
-
-    conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'demo', ?)",
+        "INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status) VALUES (1, 1, '/data/demo/sample.csv', 'demo', ?)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
 
@@ -354,8 +348,8 @@ fn test_pipeline_run_status_updates() {
 
     conn.execute(
         r#"
-        INSERT INTO cf_processing_queue (id, file_id, pipeline_run_id, plugin_name, status, priority)
-        VALUES (1, 1, 'run-1', 'demo', ?, 0)
+        INSERT INTO cf_processing_queue (id, file_id, input_file, pipeline_run_id, plugin_name, status, priority)
+        VALUES (1, 1, '/data/demo/sample.csv', 'run-1', 'demo', ?, 0)
         "#,
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
@@ -443,11 +437,11 @@ fn test_job_priority_ordering() {
     conn.execute(
         &format!(
             r#"
-        INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, priority)
+        INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status, priority)
         VALUES
-            (1, 1, 'low', '{queued}', 0),
-            (2, 2, 'high', '{queued}', 100),
-            (3, 3, 'medium', '{queued}', 50)
+            (1, 1, '/data/low.csv', 'low', '{queued}', 0),
+            (2, 2, '/data/high.csv', 'high', '{queued}', 100),
+            (3, 3, '/data/medium.csv', 'medium', '{queued}', 50)
         "#,
             queued = queued
         ),
@@ -487,7 +481,7 @@ fn test_job_failure_marks_status_and_error() {
 
     // Insert a job
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'test', ?)",
+        "INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status) VALUES (1, 1, '/data/test.csv', 'test', ?)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
 
@@ -533,7 +527,7 @@ fn test_job_requeue_increments_retry_count() {
     let conn = setup_queue_db();
 
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', ?, 0)",
+        "INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status, retry_count) VALUES (1, 1, '/data/test.csv', 'test', ?, 0)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
 
@@ -571,7 +565,7 @@ fn test_job_exceeds_max_retries_marked_failed() {
 
     // Insert job that's already at max retries (3 = MAX_RETRY_COUNT)
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, retry_count) VALUES (1, 1, 'test', ?, 3)",
+        "INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status, retry_count) VALUES (1, 1, '/data/test.csv', 'test', ?, 3)",
         &[DbValue::from(ProcessingStatus::Running.as_str())],
     )
 
@@ -611,7 +605,7 @@ fn test_concurrent_job_claim_only_one_wins() {
 
     // Insert exactly ONE job
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (1, 1, 'contested_job', ?)",
+        "INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status) VALUES (1, 1, '/data/contested.csv', 'contested_job', ?)",
         &[DbValue::from(ProcessingStatus::Queued.as_str())],
     )
 
@@ -641,11 +635,13 @@ fn test_multiple_jobs_claimed_sequentially() {
 
     // Insert 10 jobs
     for i in 1..=10 {
+        let input_file = format!("/data/job_{}.csv", i);
         conn.execute(
-            "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES (?, ?, 'job', ?)",
+            "INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status) VALUES (?, ?, ?, 'job', ?)",
             &[
                 DbValue::from(i),
                 DbValue::from(i),
+                DbValue::from(input_file.as_str()),
                 DbValue::from(ProcessingStatus::Queued.as_str()),
             ],
         )
@@ -692,7 +688,7 @@ fn test_stale_running_jobs_can_be_recovered() {
     // claim_time is 1 hour ago
     let stale_time = chrono::Utc::now() - chrono::Duration::hours(1);
     conn.execute(
-        "INSERT INTO cf_processing_queue (id, file_id, plugin_name, status, claim_time, worker_host) VALUES (1, 1, 'stale_job', ?, ?, 'dead-worker')",
+        "INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status, claim_time, worker_host) VALUES (1, 1, '/data/stale.csv', 'stale_job', ?, ?, 'dead-worker')",
         &[
             DbValue::from(ProcessingStatus::Running.as_str()),
             DbValue::from(stale_time.to_rfc3339()),
@@ -783,12 +779,12 @@ fn test_only_queued_jobs_are_dispatched() {
     conn.execute(
         &format!(
             r#"
-        INSERT INTO cf_processing_queue (id, file_id, plugin_name, status) VALUES
-            (1, 1, 'pending_job', '{pending}'),
-            (2, 2, 'running_job', '{running}'),
-            (3, 3, 'completed_job', '{completed}'),
-            (4, 4, 'failed_job', '{failed}'),
-            (5, 5, 'queued_job', '{queued}')
+        INSERT INTO cf_processing_queue (id, file_id, input_file, plugin_name, status) VALUES
+            (1, 1, '/data/pending.csv', 'pending_job', '{pending}'),
+            (2, 2, '/data/running.csv', 'running_job', '{running}'),
+            (3, 3, '/data/completed.csv', 'completed_job', '{completed}'),
+            (4, 4, '/data/failed.csv', 'failed_job', '{failed}'),
+            (5, 5, '/data/queued.csv', 'queued_job', '{queued}')
         "#,
             pending = ProcessingStatus::Pending.as_str(),
             running = ProcessingStatus::Running.as_str(),

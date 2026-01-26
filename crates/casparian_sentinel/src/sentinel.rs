@@ -13,13 +13,11 @@ use casparian_protocol::types::{
 };
 use casparian_protocol::{
     defaults, materialization_key, metrics, output_target_key, schema_hash, table_name_with_schema,
-    ApiJobId, JobId, Message, OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
-    WorkerStatus,
+    ApiJobId, JobId, Message, OpCode, ProcessingStatus, WorkerStatus,
 };
 use casparian_scout::{
-    scan_path, Database as ScoutDatabase, ScanCancelToken, ScanConfig, ScanProgress,
-    Scanner as ScoutScanner, Source as ScoutSource, SourceId, SourceType, TagSource, TaggingRuleId,
-    WorkspaceId,
+    scan_path, ScanCancelToken, ScanConfig, ScanProgress, Source as ScoutSource, SourceId,
+    SourceType, TagSource, TaggingRuleId, WorkspaceId,
 };
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{
@@ -42,11 +40,11 @@ use crate::control::{
 };
 use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
 use crate::db::{
-    ensure_schema_version, models::*, ApiStorage, ExpectedOutputs, IntentState, JobQueue,
-    SessionId, SessionStorage, SCHEMA_VERSION,
+    models::*, IntentState, SessionId,
 };
 use crate::metrics::METRICS;
-use casparian_db::{DbConnection, DbValue, UnifiedDbRow};
+use casparian_db::DbConnection;
+use casparian_state_store::{DispatchData, StateStore};
 
 /// Workers are considered stale after this many seconds without heartbeat
 const WORKER_TIMEOUT_SECS: f64 = 60.0;
@@ -79,57 +77,6 @@ const TOPIC_CACHE_TTL_SECS: f64 = 30.0;
 const DEFAULT_MAX_WORKERS: usize = 4;
 /// Hard worker cap.
 const HARD_MAX_WORKERS: usize = 8;
-
-/// Result of the combined dispatch query (file path + manifest data)
-#[derive(Debug)]
-struct DispatchQueryResult {
-    rel_path: String,
-    scan_root: String,
-    exec_root: Option<String>,
-    source_code: String,
-    parser_version: String,
-    env_hash: String,
-    artifact_hash: String,
-    runtime_kind: RuntimeKind,
-    entrypoint: String,
-    platform_os: Option<String>,
-    platform_arch: Option<String>,
-    signature_verified: bool,
-    signer_id: Option<String>,
-}
-
-impl DispatchQueryResult {
-    fn from_row(row: &UnifiedDbRow) -> Result<Self> {
-        let runtime_str: String = row.get_by_name("runtime_kind")?;
-        let runtime_kind = runtime_str
-            .parse::<RuntimeKind>()
-            .map_err(|err| anyhow::anyhow!(err))?;
-        let exec_root: Option<String> = row.get_by_name("exec_root")?;
-        let exec_root = exec_root.and_then(|value| {
-            if value.trim().is_empty() {
-                None
-            } else {
-                Some(value)
-            }
-        });
-
-        Ok(Self {
-            rel_path: row.get_by_name("rel_path")?,
-            scan_root: row.get_by_name("scan_root")?,
-            exec_root,
-            source_code: row.get_by_name("source_code")?,
-            parser_version: row.get_by_name("parser_version")?,
-            env_hash: row.get_by_name("env_hash")?,
-            artifact_hash: row.get_by_name("artifact_hash")?,
-            runtime_kind,
-            entrypoint: row.get_by_name("entrypoint")?,
-            platform_os: row.get_by_name("platform_os")?,
-            platform_arch: row.get_by_name("platform_arch")?,
-            signature_verified: row.get_by_name("signature_verified")?,
-            signer_id: row.get_by_name("signer_id")?,
-        })
-    }
-}
 
 // ============================================================================
 // Scout scan tracking (control API)
@@ -270,10 +217,7 @@ pub struct Sentinel {
     /// Optional control API socket (REP pattern)
     control_socket: Option<Socket>,
     workers: HashMap<Vec<u8>, ConnectedWorker>,
-    queue: JobQueue,
-    conn: DbConnection, // Database connection for queries
-    api_storage: ApiStorage,
-    session_storage: SessionStorage,
+    state_store: Arc<StateStore>,
     schema_storage: SchemaStorage,
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     topic_map_last_refresh: f64,
@@ -298,31 +242,17 @@ impl Sentinel {
             config.max_workers.min(HARD_MAX_WORKERS)
         };
 
-        let conn = DbConnection::open_from_url(&config.state_store_url)
+        let state_store = StateStore::open(&config.state_store_url)
             .context("Failed to connect to state store")?;
-        if ensure_schema_version(&conn, SCHEMA_VERSION)? {
-            warn!(
-                "State store schema reset (pre-v1). Delete ~/.casparian_flow/state.sqlite if this was unexpected."
-            );
-        }
+        state_store.init()?;
 
-        let api_storage = ApiStorage::new(conn.clone());
-        api_storage.init_schema()?;
-
-        let session_storage = SessionStorage::new(conn.clone());
-        session_storage.init_schema()?;
-
-        // Clone connection only once for the queue
-        let queue = JobQueue::new(conn.clone());
-        queue.init_queue_schema()?;
-        queue.init_registry_schema()?;
-        queue.init_error_handling_schema()?;
+        let state_store = Arc::new(state_store);
 
         let schema_storage =
-            SchemaStorage::new(conn.clone()).context("Failed to initialize schema storage")?;
+            state_store.schema_storage().context("Failed to initialize schema storage")?;
 
         // Load topic configs into memory after schema is present.
-        let topic_map = Self::load_topic_configs(&conn)?;
+        let topic_map = Self::load_topic_configs(state_store.routing())?;
         info!("Loaded {} plugin topic configs", topic_map.len());
 
         // Destructive Initialization for IPC sockets (Unix only)
@@ -391,10 +321,7 @@ impl Sentinel {
             socket,
             control_socket,
             workers: HashMap::new(),
-            queue,
-            conn,
-            api_storage,
-            session_storage,
+            state_store,
             schema_storage,
             topic_map,
             topic_map_last_refresh: current_time(),
@@ -411,18 +338,10 @@ impl Sentinel {
     }
 
     /// Load topic configurations from database into memory (non-blocking cache)
-    fn load_topic_configs(conn: &DbConnection) -> Result<HashMap<String, Vec<SinkConfig>>> {
-        let rows = conn.query_all(
-            &format!(
-                "SELECT {} FROM cf_topic_config ORDER BY id ASC",
-                TOPIC_CONFIG_COLUMNS.join(", ")
-            ),
-            &[],
-        )?;
-        let mut configs = Vec::with_capacity(rows.len());
-        for row in rows {
-            configs.push(TopicConfig::from_row(&row)?);
-        }
+    fn load_topic_configs(
+        routing: &dyn casparian_state_store::RoutingStore,
+    ) -> Result<HashMap<String, Vec<SinkConfig>>> {
+        let configs = routing.list_topic_configs()?;
 
         let mut map: HashMap<String, Vec<SinkConfig>> = HashMap::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -450,17 +369,6 @@ impl Sentinel {
         Ok(map)
     }
 
-    fn sqlite_state_store_path(&self) -> Result<&std::path::Path> {
-        self.state_store_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Scout operations require sqlite state store"))
-    }
-
-    fn scout_db(&self) -> Result<ScoutDatabase> {
-        let path = self.sqlite_state_store_path()?;
-        ScoutDatabase::open(path).context("Failed to open scout state store")
-    }
-
     fn resolve_sinks_for_plugin(
         topic_map: &HashMap<String, Vec<SinkConfig>>,
         plugin_name: &str,
@@ -484,7 +392,7 @@ impl Sentinel {
             return;
         }
 
-        match Self::load_topic_configs(&self.conn) {
+        match Self::load_topic_configs(self.state_store.routing()) {
             Ok(new_map) => {
                 self.topic_map = new_map;
                 self.topic_map_last_refresh = now;
@@ -520,7 +428,7 @@ impl Sentinel {
     }
 
     fn apply_contract_overrides_with_storage(
-        conn: &DbConnection,
+        routing: &dyn casparian_state_store::RoutingStore,
         schema_storage: &SchemaStorage,
         plugin_name: &str,
         parser_version: &str,
@@ -546,8 +454,7 @@ impl Sentinel {
         }
 
         let default_sink = default_sinks.remove(0);
-        let expected_outputs = ExpectedOutputs::list_for_plugin(
-            conn,
+        let expected_outputs = routing.expected_outputs_for_plugin(
             plugin_name,
             if parser_version.trim().is_empty() {
                 None
@@ -610,7 +517,7 @@ impl Sentinel {
         sinks: Vec<SinkConfig>,
     ) -> Result<Vec<SinkConfig>> {
         Self::apply_contract_overrides_with_storage(
-            &self.conn,
+            self.state_store.routing(),
             &self.schema_storage,
             plugin_name,
             parser_version,
@@ -639,20 +546,11 @@ impl Sentinel {
     }
 
     fn load_file_generation(&self, file_id: i64) -> Result<Option<(i64, i64)>> {
-        let row = self.conn.query_optional(
-            "SELECT mtime, size FROM scout_files WHERE id = ?",
-            &[DbValue::from(file_id)],
-        )?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let mtime: i64 = row.get_by_name("mtime")?;
-        let size: i64 = row.get_by_name("size")?;
-        Ok(Some((mtime, size)))
+        self.state_store.queue().load_file_generation(file_id)
     }
 
     fn record_materializations_for_job(&self, job_id: i64, receipt: &JobReceipt) -> Result<()> {
-        let Some(dispatch) = self.queue.get_dispatch_metadata(job_id)? else {
+        let Some(dispatch) = self.state_store.queue().get_dispatch_metadata(job_id)? else {
             return Ok(());
         };
 
@@ -769,7 +667,7 @@ impl Sentinel {
                 rows: *rows,
                 job_id,
             };
-            self.queue.insert_output_materialization(&record)?;
+            self.state_store.queue().insert_output_materialization(&record)?;
         }
 
         for sink in sinks
@@ -813,22 +711,72 @@ impl Sentinel {
                 rows: 0,
                 job_id,
             };
-            self.queue.insert_output_materialization(&record)?;
+            self.state_store.queue().insert_output_materialization(&record)?;
         }
 
-        if let Err(err) = self.update_query_catalog_for_outputs(&sinks, &output_rows) {
+        if let Err(err) = self.update_query_catalog_for_artifacts(&receipt.artifacts) {
             warn!("Failed to update query catalog: {}", err);
         }
 
         Ok(())
     }
 
-    fn update_query_catalog_for_outputs(
-        &self,
-        sinks: &[SinkConfig],
-        output_rows: &HashMap<String, i64>,
-    ) -> Result<()> {
-        if output_rows.is_empty() {
+    fn update_query_catalog_for_artifacts(&self, artifacts: &[ArtifactV1]) -> Result<()> {
+        let mut views: HashMap<String, std::path::PathBuf> = HashMap::new();
+        let mut has_quarantine = false;
+
+        for artifact in artifacts {
+            let (output_name, sink_uri, is_quarantine) = match artifact {
+                ArtifactV1::Output {
+                    output_name,
+                    sink_uri,
+                    ..
+                } => (output_name.as_str(), sink_uri.as_str(), false),
+                ArtifactV1::Quarantine {
+                    output_name,
+                    sink_uri,
+                    ..
+                } => (output_name.as_str(), sink_uri.as_str(), true),
+                _ => continue,
+            };
+
+            let parsed = ParsedSinkUri::parse(sink_uri).map_err(|err| {
+                anyhow::anyhow!("Failed to parse artifact URI '{}': {}", sink_uri, err)
+            })?;
+
+            let base_dir = match parsed.scheme {
+                SinkScheme::Parquet => Some(parsed.path.clone()),
+                SinkScheme::File => {
+                    if parsed
+                        .path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("parquet"))
+                        .unwrap_or(false)
+                    {
+                        parsed.path.parent().map(|p| p.to_path_buf())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            let Some(base_dir) = base_dir else {
+                continue;
+            };
+
+            let pattern = base_dir.join(format!("{}_*.parquet", output_name));
+            let view_name = if is_quarantine {
+                has_quarantine = true;
+                format!("quarantine.{}", quote_ident(output_name))
+            } else {
+                format!("outputs.{}", quote_ident(output_name))
+            };
+            views.entry(view_name).or_insert(pattern);
+        }
+
+        if views.is_empty() {
             return Ok(());
         }
 
@@ -839,21 +787,11 @@ impl Sentinel {
         let catalog_conn = DbConnection::open_duckdb(&self.query_catalog_path)
             .context("Failed to open query catalog")?;
         catalog_conn.execute("CREATE SCHEMA IF NOT EXISTS outputs", &[])?;
+        if has_quarantine {
+            catalog_conn.execute("CREATE SCHEMA IF NOT EXISTS quarantine", &[])?;
+        }
 
-        for output_name in output_rows.keys() {
-            let Some(sink) = Self::select_sink_for_output(sinks, output_name) else {
-                continue;
-            };
-            let parsed = ParsedSinkUri::parse(&sink.uri)
-                .map_err(|err| anyhow::anyhow!("Failed to parse sink URI '{}': {}", sink.uri, err))?;
-            if parsed.scheme != SinkScheme::Parquet {
-                continue;
-            }
-
-            let pattern = parsed
-                .path
-                .join(format!("{}_*.parquet", output_name));
-            let view_name = format!("outputs.{}", quote_ident(output_name));
+        for (view_name, pattern) in views {
             let path_literal = escape_sql_literal(&pattern.to_string_lossy());
             let sql = format!(
                 "CREATE OR REPLACE VIEW {} AS SELECT * FROM parquet_scan('{}')",
@@ -933,7 +871,7 @@ impl Sentinel {
                             continue;
                         }
                     };
-                    if let Err(e) = self.queue.fail_job(
+                    if let Err(e) = self.state_store.queue().fail_job(
                         job_id_db,
                         JobStatus::Failed.as_str(),
                         "Worker became unresponsive (stale heartbeat)",
@@ -1198,9 +1136,9 @@ impl Sentinel {
         limit: i64,
         offset: i64,
     ) -> ControlResponse {
-        let limit = limit.max(0) as usize;
-        let offset = offset.max(0) as usize;
-        match self.queue.list_jobs(status, limit, offset) {
+        let limit = limit.max(0);
+        let offset = offset.max(0);
+        match self.state_store.queue().list_jobs(status, limit, offset) {
             Ok(jobs) => {
                 let job_infos: Vec<JobInfo> = jobs.into_iter().map(Self::job_to_info).collect();
                 ControlResponse::Jobs(job_infos)
@@ -1211,7 +1149,7 @@ impl Sentinel {
 
     /// Handle GetJob request
     fn handle_get_job(&self, job_id: JobId) -> ControlResponse {
-        match self.queue.get_job(job_id) {
+        match self.state_store.queue().get_job(job_id) {
             Ok(Some(job)) => ControlResponse::Job(Some(Self::job_to_info(job))),
             Ok(None) => ControlResponse::Job(None),
             Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get job: {}", e)),
@@ -1221,7 +1159,7 @@ impl Sentinel {
     /// Handle CancelJob request
     fn handle_cancel_job(&mut self, job_id: JobId) -> ControlResponse {
         // First, try to cancel in the database (for queued jobs)
-        match self.queue.cancel_job(job_id) {
+        match self.state_store.queue().cancel_job(job_id) {
             Ok(true) => {
                 info!("Job {} cancelled via control API", job_id);
                 return ControlResponse::CancelResult {
@@ -1265,7 +1203,7 @@ impl Sentinel {
 
     /// Handle GetQueueStats request
     fn handle_get_queue_stats(&self) -> ControlResponse {
-        match self.queue.count_jobs_by_status() {
+        match self.state_store.queue().count_jobs_by_status() {
             Ok(counts) => {
                 let queued = *counts.get(&ProcessingStatus::Queued).unwrap_or(&0);
                 let running = *counts.get(&ProcessingStatus::Running).unwrap_or(&0);
@@ -1298,7 +1236,7 @@ impl Sentinel {
         approval_id: Option<&str>,
         spec_json: Option<&str>,
     ) -> ControlResponse {
-        match self.api_storage.create_job(
+        match self.state_store.api().create_job(
             job_type,
             plugin_name,
             plugin_version,
@@ -1316,7 +1254,7 @@ impl Sentinel {
 
     /// Handle GetApiJob request
     fn handle_get_api_job(&self, job_id: ApiJobId) -> ControlResponse {
-        match self.api_storage.get_job(job_id) {
+        match self.state_store.api().get_job(job_id) {
             Ok(job) => ControlResponse::ApiJob(job),
             Err(e) => ControlResponse::error(
                 "DB_ERROR",
@@ -1335,7 +1273,8 @@ impl Sentinel {
         let limit = limit.unwrap_or(100).max(0) as usize;
         let offset = offset.unwrap_or(0).max(0) as usize;
         match self
-            .api_storage
+            .state_store
+            .api()
             .list_jobs(status, limit.saturating_add(offset))
         {
             Ok(jobs) => {
@@ -1356,7 +1295,7 @@ impl Sentinel {
         job_id: ApiJobId,
         status: casparian_protocol::HttpJobStatus,
     ) -> ControlResponse {
-        match self.api_storage.update_job_status(job_id, status) {
+        match self.state_store.api().update_job_status(job_id, status) {
             Ok(()) => ControlResponse::ApiJobResult {
                 success: true,
                 message: "Status updated".to_string(),
@@ -1374,7 +1313,7 @@ impl Sentinel {
         job_id: ApiJobId,
         progress: ApiJobProgress,
     ) -> ControlResponse {
-        match self.api_storage.update_job_progress(
+        match self.state_store.api().update_job_progress(
             job_id,
             &progress.phase,
             progress.items_done,
@@ -1398,7 +1337,7 @@ impl Sentinel {
         job_id: ApiJobId,
         result: ApiJobResult,
     ) -> ControlResponse {
-        match self.api_storage.update_job_result(job_id, &result) {
+        match self.state_store.api().update_job_result(job_id, &result) {
             Ok(()) => ControlResponse::ApiJobResult {
                 success: true,
                 message: "Result updated".to_string(),
@@ -1412,7 +1351,7 @@ impl Sentinel {
 
     /// Handle UpdateApiJobError request
     fn handle_update_api_job_error(&self, job_id: ApiJobId, error: &str) -> ControlResponse {
-        match self.api_storage.update_job_error(job_id, error) {
+        match self.state_store.api().update_job_error(job_id, error) {
             Ok(()) => ControlResponse::ApiJobResult {
                 success: true,
                 message: "Error updated".to_string(),
@@ -1426,7 +1365,7 @@ impl Sentinel {
 
     /// Handle CancelApiJob request
     fn handle_cancel_api_job(&self, job_id: ApiJobId) -> ControlResponse {
-        match self.api_storage.cancel_job(job_id) {
+        match self.state_store.api().cancel_job(job_id) {
             Ok(success) => ControlResponse::ApiJobResult {
                 success,
                 message: if success {
@@ -1451,7 +1390,7 @@ impl Sentinel {
     ) -> ControlResponse {
         let limit = limit.unwrap_or(100).max(0) as usize;
         let offset = offset.unwrap_or(0).max(0) as usize;
-        match self.api_storage.list_approvals(status) {
+        match self.state_store.api().list_approvals(status) {
             Ok(approvals) => {
                 let approvals = approvals
                     .into_iter()
@@ -1476,7 +1415,8 @@ impl Sentinel {
     ) -> ControlResponse {
         let expires_in = ChronoDuration::seconds(expires_in_seconds.max(0));
         match self
-            .api_storage
+            .state_store
+            .api()
             .create_approval(approval_id, &operation, summary, expires_in)
         {
             Ok(()) => ControlResponse::ApprovalResult {
@@ -1492,7 +1432,7 @@ impl Sentinel {
 
     /// Handle GetApproval request
     fn handle_get_approval(&self, approval_id: &str) -> ControlResponse {
-        match self.api_storage.get_approval(approval_id) {
+        match self.state_store.api().get_approval(approval_id) {
             Ok(approval) => ControlResponse::Approval(approval),
             Err(e) => ControlResponse::error(
                 "DB_ERROR",
@@ -1503,7 +1443,7 @@ impl Sentinel {
 
     /// Handle Approve request
     fn handle_approve(&self, approval_id: &str) -> ControlResponse {
-        match self.api_storage.approve(approval_id, None) {
+        match self.state_store.api().approve(approval_id, None) {
             Ok(true) => ControlResponse::ApprovalResult {
                 success: true,
                 message: "Approval accepted".to_string(),
@@ -1521,7 +1461,7 @@ impl Sentinel {
 
     /// Handle Reject request
     fn handle_reject(&self, approval_id: &str, reason: &str) -> ControlResponse {
-        match self.api_storage.reject(approval_id, None, Some(reason)) {
+        match self.state_store.api().reject(approval_id, None, Some(reason)) {
             Ok(true) => ControlResponse::ApprovalResult {
                 success: true,
                 message: "Approval rejected".to_string(),
@@ -1539,7 +1479,7 @@ impl Sentinel {
 
     /// Handle SetApprovalJobId request
     fn handle_set_approval_job_id(&self, approval_id: &str, job_id: ApiJobId) -> ControlResponse {
-        match self.api_storage.link_approval_to_job(approval_id, job_id) {
+        match self.state_store.api().link_approval_to_job(approval_id, job_id) {
             Ok(()) => ControlResponse::ApprovalResult {
                 success: true,
                 message: "Approval linked to job".to_string(),
@@ -1556,7 +1496,7 @@ impl Sentinel {
 
     /// Handle ExpireApprovals request
     fn handle_expire_approvals(&self) -> ControlResponse {
-        match self.api_storage.expire_approvals() {
+        match self.state_store.api().expire_approvals() {
             Ok(count) => ControlResponse::ApprovalResult {
                 success: true,
                 message: format!("Expired {} approvals", count),
@@ -1569,7 +1509,7 @@ impl Sentinel {
 
     /// Handle CreateSession request
     fn handle_create_session(&self, intent_text: &str, input_dir: Option<&str>) -> ControlResponse {
-        match self.session_storage.create_session(intent_text, input_dir) {
+        match self.state_store.sessions().create_session(intent_text, input_dir) {
             Ok(session_id) => ControlResponse::SessionCreated { session_id },
             Err(e) => {
                 ControlResponse::error("DB_ERROR", format!("Failed to create session: {}", e))
@@ -1579,7 +1519,7 @@ impl Sentinel {
 
     /// Handle GetSession request
     fn handle_get_session(&self, session_id: SessionId) -> ControlResponse {
-        match self.session_storage.get_session(session_id) {
+        match self.state_store.sessions().get_session(session_id) {
             Ok(session) => ControlResponse::Session(session),
             Err(e) => ControlResponse::error(
                 "DB_ERROR",
@@ -1595,7 +1535,7 @@ impl Sentinel {
         limit: Option<i64>,
     ) -> ControlResponse {
         let limit = limit.unwrap_or(100).max(0) as usize;
-        match self.session_storage.list_sessions(state, limit) {
+        match self.state_store.sessions().list_sessions(state, limit) {
             Ok(sessions) => ControlResponse::Sessions(sessions),
             Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list sessions: {}", e)),
         }
@@ -1604,7 +1544,7 @@ impl Sentinel {
     /// Handle ListSessionsNeedingInput request
     fn handle_list_sessions_needing_input(&self, limit: Option<i64>) -> ControlResponse {
         let limit = limit.unwrap_or(100).max(0) as usize;
-        match self.session_storage.list_sessions_needing_input(limit) {
+        match self.state_store.sessions().list_sessions_needing_input(limit) {
             Ok(sessions) => ControlResponse::Sessions(sessions),
             Err(e) => ControlResponse::error(
                 "DB_ERROR",
@@ -1620,7 +1560,8 @@ impl Sentinel {
         target_state: IntentState,
     ) -> ControlResponse {
         match self
-            .session_storage
+            .state_store
+            .sessions()
             .update_session_state(session_id, target_state)
         {
             Ok(true) => ControlResponse::SessionResult {
@@ -1640,7 +1581,7 @@ impl Sentinel {
 
     /// Handle CancelSession request
     fn handle_cancel_session(&self, session_id: SessionId) -> ControlResponse {
-        match self.session_storage.cancel_session(session_id) {
+        match self.state_store.sessions().cancel_session(session_id) {
             Ok(true) => ControlResponse::SessionResult {
                 success: true,
                 message: "Session cancelled".to_string(),
@@ -1661,89 +1602,33 @@ impl Sentinel {
     // =====================================================================
 
     fn handle_list_sources(&self, workspace_id: WorkspaceId) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
+        let records = match self.state_store.scout().list_sources_with_counts(workspace_id) {
+            Ok(records) => records,
             Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
         };
 
-        let rows = match db.conn().query_all(
-            "SELECT id, name, source_type, path, exec_path, poll_interval_secs, enabled, file_count \
-             FROM scout_sources WHERE workspace_id = ? AND enabled = 1 ORDER BY updated_at DESC",
-            &[DbValue::from(workspace_id.to_string())],
-        ) {
-            Ok(rows) => rows,
-            Err(e) => {
-                return ControlResponse::error("DB_ERROR", format!("Sources query failed: {}", e))
-            }
-        };
-
-        let mut sources = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id_i64: i64 = match row.get(0) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let id = match SourceId::try_from(id_i64) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let name: String = match row.get(1) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let source_type_raw: String = match row.get(2) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let source_type: SourceType = match serde_json::from_str(&source_type_raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    return ControlResponse::error(
-                        "DB_ERROR",
-                        format!("Invalid source_type JSON: {}", e),
-                    )
+        let sources = records
+            .into_iter()
+            .map(|record| {
+                let source = record.source;
+                ScoutSourceInfo {
+                    id: source.id,
+                    workspace_id: source.workspace_id,
+                    name: source.name,
+                    source_type: source.source_type,
+                    path: source.path,
+                    exec_path: source.exec_path,
+                    enabled: source.enabled,
+                    poll_interval_secs: source.poll_interval_secs,
+                    file_count: record.file_count,
                 }
-            };
-            let path: String = match row.get(3) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let exec_path: Option<String> = row.get(4).ok().flatten();
-            let poll_interval_secs: i64 = match row.get(5) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let enabled_raw: i64 = match row.get(6) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let file_count: i64 = match row.get(7) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-
-            sources.push(ScoutSourceInfo {
-                id,
-                workspace_id,
-                name,
-                source_type,
-                path,
-                exec_path,
-                enabled: enabled_raw != 0,
-                poll_interval_secs: poll_interval_secs.max(0) as u64,
-                file_count,
-            });
-        }
+            })
+            .collect();
 
         ControlResponse::Sources(sources)
     }
 
     fn handle_upsert_source(&self, source: &ScoutSourceInfo) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
         let source_row = ScoutSource {
             workspace_id: source.workspace_id,
             id: source.id,
@@ -1755,7 +1640,7 @@ impl Sentinel {
             enabled: source.enabled,
         };
 
-        match db.upsert_source(&source_row) {
+        match self.state_store.scout().upsert_source(&source_row) {
             Ok(()) => ControlResponse::SourceResult {
                 success: true,
                 message: "Source upserted".to_string(),
@@ -1770,12 +1655,7 @@ impl Sentinel {
         name: Option<&str>,
         path: Option<&str>,
     ) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
-        let mut source = match db.get_source(&source_id) {
+        let mut source = match self.state_store.scout().get_source(&source_id) {
             Ok(Some(source)) => source,
             Ok(None) => {
                 return ControlResponse::SourceResult {
@@ -1795,7 +1675,7 @@ impl Sentinel {
             source.path = path.to_string();
         }
 
-        match db.upsert_source(&source) {
+        match self.state_store.scout().upsert_source(&source) {
             Ok(()) => ControlResponse::SourceResult {
                 success: true,
                 message: "Source updated".to_string(),
@@ -1805,12 +1685,7 @@ impl Sentinel {
     }
 
     fn handle_delete_source(&self, source_id: SourceId) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
-        match db.delete_source(&source_id) {
+        match self.state_store.scout().delete_source(&source_id) {
             Ok(true) => ControlResponse::SourceResult {
                 success: true,
                 message: "Source deleted".to_string(),
@@ -1824,12 +1699,7 @@ impl Sentinel {
     }
 
     fn handle_touch_source(&self, source_id: SourceId) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
-        match db.touch_source(&source_id) {
+        match self.state_store.scout().touch_source(&source_id) {
             Ok(()) => ControlResponse::SourceResult {
                 success: true,
                 message: "Source touched".to_string(),
@@ -1839,12 +1709,7 @@ impl Sentinel {
     }
 
     fn handle_list_rules(&self, workspace_id: WorkspaceId) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
-        match db.list_tagging_rules(&workspace_id) {
+        match self.state_store.scout().list_tagging_rules(&workspace_id) {
             Ok(rules) => {
                 let mapped = rules
                     .into_iter()
@@ -1870,11 +1735,6 @@ impl Sentinel {
         pattern: &str,
         tag: &str,
     ) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
         let name = format!("{} → {}", pattern, tag);
         let rule = casparian_scout::types::TaggingRule {
             id: rule_id,
@@ -1886,7 +1746,7 @@ impl Sentinel {
             enabled: true,
         };
 
-        match db.upsert_tagging_rule(&rule) {
+        match self.state_store.scout().upsert_tagging_rule(&rule) {
             Ok(()) => ControlResponse::RuleResult {
                 success: true,
                 message: "Rule created".to_string(),
@@ -1901,12 +1761,7 @@ impl Sentinel {
         _workspace_id: WorkspaceId,
         enabled: bool,
     ) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
-        let mut rule = match db.get_tagging_rule(&rule_id) {
+        let mut rule = match self.state_store.scout().get_tagging_rule(&rule_id) {
             Ok(Some(rule)) => rule,
             Ok(None) => {
                 return ControlResponse::RuleResult {
@@ -1921,7 +1776,7 @@ impl Sentinel {
 
         rule.enabled = enabled;
 
-        match db.upsert_tagging_rule(&rule) {
+        match self.state_store.scout().upsert_tagging_rule(&rule) {
             Ok(()) => ControlResponse::RuleResult {
                 success: true,
                 message: "Rule updated".to_string(),
@@ -1935,12 +1790,7 @@ impl Sentinel {
         rule_id: TaggingRuleId,
         _workspace_id: WorkspaceId,
     ) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
-        match db.delete_tagging_rule(&rule_id) {
+        match self.state_store.scout().delete_tagging_rule(&rule_id) {
             Ok(true) => ControlResponse::RuleResult {
                 success: true,
                 message: "Rule deleted".to_string(),
@@ -1954,78 +1804,22 @@ impl Sentinel {
     }
 
     fn handle_list_tags(&self, workspace_id: WorkspaceId, source_id: SourceId) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
+        let stats = match self.state_store.scout().tag_stats(workspace_id, source_id) {
+            Ok(stats) => stats,
             Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
         };
 
-        let total_files = match db.conn().query_scalar::<i64>(
-            "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ?",
-            &[
-                DbValue::from(workspace_id.to_string()),
-                DbValue::from(source_id.as_i64()),
-            ],
-        ) {
-            Ok(count) => count,
-            Err(e) => {
-                return ControlResponse::error("DB_ERROR", format!("Tags query failed: {}", e))
-            }
-        };
-
-        let rows = match db.conn().query_all(
-            "SELECT t.tag, COUNT(*) AS count \
-             FROM scout_file_tags t \
-             JOIN scout_files f ON f.id = t.file_id AND f.workspace_id = t.workspace_id \
-             WHERE f.workspace_id = ? AND f.source_id = ? \
-             GROUP BY t.tag \
-             ORDER BY count DESC, t.tag",
-            &[
-                DbValue::from(workspace_id.to_string()),
-                DbValue::from(source_id.as_i64()),
-            ],
-        ) {
-            Ok(rows) => rows,
-            Err(e) => {
-                return ControlResponse::error("DB_ERROR", format!("Tags query failed: {}", e))
-            }
-        };
-
-        let mut tags = Vec::with_capacity(rows.len());
-        for row in rows {
-            let tag: String = match row.get(0) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            let count: i64 = match row.get(1) {
-                Ok(v) => v,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            };
-            if count > 0 {
-                tags.push(ScoutTagCount { tag, count });
-            }
-        }
-
-        let untagged_files = match db.conn().query_scalar::<i64>(
-            "SELECT COUNT(*) \
-             FROM scout_files f \
-             LEFT JOIN scout_file_tags t \
-                ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
-             WHERE f.workspace_id = ? AND f.source_id = ? AND t.file_id IS NULL",
-            &[
-                DbValue::from(workspace_id.to_string()),
-                DbValue::from(source_id.as_i64()),
-            ],
-        ) {
-            Ok(count) => count,
-            Err(e) => {
-                return ControlResponse::error("DB_ERROR", format!("Tags query failed: {}", e))
-            }
-        };
-
         ControlResponse::TagStats(ScoutTagStats {
-            total_files,
-            untagged_files,
-            tags,
+            total_files: stats.total_files,
+            untagged_files: stats.untagged_files,
+            tags: stats
+                .tags
+                .into_iter()
+                .map(|tag| ScoutTagCount {
+                    tag: tag.tag,
+                    count: tag.count,
+                })
+                .collect(),
         })
     }
 
@@ -2036,13 +1830,8 @@ impl Sentinel {
         tag_source: TagSource,
         rule_id: Option<&TaggingRuleId>,
     ) -> ControlResponse {
-        let db = match self.scout_db() {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
         let result = match tag_source {
-            TagSource::Manual => db.tag_file(file_id, tag),
+            TagSource::Manual => self.state_store.scout().tag_file(file_id, tag),
             TagSource::Rule => {
                 let Some(rule_id) = rule_id else {
                     return ControlResponse::TagResult {
@@ -2050,7 +1839,7 @@ impl Sentinel {
                         message: "Rule-based tag missing rule_id".to_string(),
                     };
                 };
-                db.tag_file_by_rule(file_id, tag, rule_id)
+                self.state_store.scout().tag_file_by_rule(file_id, tag, rule_id)
             }
         };
 
@@ -2068,15 +1857,12 @@ impl Sentinel {
         workspace_id: Option<WorkspaceId>,
         path: &str,
     ) -> ControlResponse {
-        let state_store_path = match self.state_store_path.clone() {
-            Some(path) => path,
-            None => {
-                return ControlResponse::error(
-                    "DB_ERROR",
-                    "Scan requires sqlite state store".to_string(),
-                )
-            }
-        };
+        if self.state_store_path.is_none() {
+            return ControlResponse::error(
+                "DB_ERROR",
+                "Scan requires sqlite state store".to_string(),
+            );
+        }
 
         let input_path = std::path::Path::new(path);
         let expanded_path = scan_path::expand_scan_path(input_path);
@@ -2086,13 +1872,9 @@ impl Sentinel {
         let canonical_path = scan_path::canonicalize_scan_path(&expanded_path);
         let path_display = canonical_path.display().to_string();
 
-        let db = match ScoutDatabase::open(&state_store_path) {
-            Ok(db) => db,
-            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-        };
-
+        let scout = self.state_store.scout();
         let workspace_id = match workspace_id {
-            Some(id) => match db.get_workspace(&id) {
+            Some(id) => match scout.get_workspace(&id) {
                 Ok(Some(_)) => id,
                 Ok(None) => {
                     return ControlResponse::error(
@@ -2102,7 +1884,7 @@ impl Sentinel {
                 }
                 Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
             },
-            None => match db.ensure_default_workspace() {
+            None => match scout.ensure_default_workspace() {
                 Ok(ws) => ws.id,
                 Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
             },
@@ -2133,22 +1915,14 @@ impl Sentinel {
         let scan_id_for_thread = scan_id.clone();
         let workspace_id_for_thread = workspace_id;
         let path_display_for_thread = path_display.clone();
-        let state_store_path_for_thread = state_store_path.clone();
+        let state_store_for_thread = self.state_store.clone();
         let cancel_token_for_thread = cancel_token.clone();
         std::thread::spawn(move || {
-            let db = match ScoutDatabase::open(&state_store_path_for_thread) {
-                Ok(db) => db,
-                Err(e) => {
-                    let mut jobs = scan_jobs.lock().unwrap();
-                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                        job.state = ScanState::Failed;
-                        job.error = Some(format!("Failed to open state store: {}", e));
-                    }
-                    return;
-                }
-            };
+            let scout = state_store_for_thread.scout();
 
-            let source = match db.get_source_by_path(&workspace_id_for_thread, &path_display_for_thread) {
+            let source = match scout
+                .get_source_by_path(&workspace_id_for_thread, &path_display_for_thread)
+            {
                 Ok(Some(existing)) => existing,
                 Ok(None) => {
                     let source_name = std::path::Path::new(&path_display_for_thread)
@@ -2157,7 +1931,7 @@ impl Sentinel {
                         .unwrap_or_else(|| path_display_for_thread.clone());
 
                     if let Ok(Some(name_conflict)) =
-                        db.get_source_by_name(&workspace_id_for_thread, &source_name)
+                        scout.get_source_by_name(&workspace_id_for_thread, &source_name)
                     {
                         let mut jobs = scan_jobs.lock().unwrap();
                         if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
@@ -2170,8 +1944,10 @@ impl Sentinel {
                         return;
                     }
 
-                    if let Err(err) =
-                        db.check_source_overlap(&workspace_id_for_thread, std::path::Path::new(&path_display_for_thread))
+                    if let Err(err) = scout.check_source_overlap(
+                        &workspace_id_for_thread,
+                        std::path::Path::new(&path_display_for_thread),
+                    )
                     {
                         let mut jobs = scan_jobs.lock().unwrap();
                         if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
@@ -2193,7 +1969,7 @@ impl Sentinel {
                         enabled: true,
                     };
 
-                    if let Err(e) = db.upsert_source(&new_source) {
+                    if let Err(e) = scout.upsert_source(&new_source) {
                         let mut jobs = scan_jobs.lock().unwrap();
                         if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
                             job.state = ScanState::Failed;
@@ -2234,9 +2010,23 @@ impl Sentinel {
             });
 
             let scan_config = ScanConfig::default();
-            let scanner = ScoutScanner::with_config(db, scan_config);
-            let scan_result =
-                scanner.scan_with_cancel(&source, Some(progress_tx), None, Some(cancel_token_for_thread));
+            let scanner = match scout.scanner(scan_config) {
+                Ok(scanner) => scanner,
+                Err(e) => {
+                    let mut jobs = scan_jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                        job.state = ScanState::Failed;
+                        job.error = Some(format!("Failed to start scanner: {}", e));
+                    }
+                    return;
+                }
+            };
+            let scan_result = scanner.scan_with_cancel(
+                &source,
+                Some(progress_tx),
+                None,
+                Some(cancel_token_for_thread),
+            );
             drop(scanner);
             let _ = progress_handle.join();
 
@@ -2489,13 +2279,21 @@ impl Sentinel {
 
         if let Some(diagnostics) = receipt.diagnostics.as_ref() {
             if let Some(mismatch) = diagnostics.schema_mismatch.as_ref() {
-                if let Err(err) = self.queue.record_schema_mismatch(job_id, mismatch) {
+                if let Err(err) = self.state_store.queue().record_schema_mismatch(job_id, mismatch) {
                     warn!(
                         "Failed to persist schema mismatch for job {}: {}",
                         job_id, err
                     );
                 }
             }
+        }
+
+        if let Err(err) = self
+            .state_store
+            .artifacts()
+            .insert_job_artifacts(job_id, &receipt.artifacts)
+        {
+            warn!("Failed to persist artifacts for job {}: {}", job_id, err);
         }
 
         // Get plugin_name for health tracking (need to look up from job)
@@ -2522,7 +2320,7 @@ impl Sentinel {
                     other => unreachable!("Non-success status in success branch: {:?}", other),
                 };
                 let quarantine_rows = receipt.metrics.get(metrics::QUARANTINE_ROWS).copied();
-                self.queue
+                self.state_store.queue()
                     .complete_job(job_id, completion_status, summary, quarantine_rows)?;
                 METRICS.inc_jobs_completed();
 
@@ -2572,7 +2370,7 @@ impl Sentinel {
                 METRICS.inc_jobs_rejected();
                 // Use defer_job (not requeue_job) to avoid incrementing retry_count
                 let scheduled_at = now_millis();
-                self.queue
+                self.state_store.queue()
                     .defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
             }
             JobStatus::Aborted => {
@@ -2580,7 +2378,7 @@ impl Sentinel {
                     .error_message
                     .unwrap_or_else(|| "Aborted".to_string());
                 warn!("Job {} aborted: {}", job_id, error);
-                self.queue.abort_job(job_id, &error)?;
+                self.state_store.queue().abort_job(job_id, &error)?;
                 METRICS.inc_jobs_aborted();
             }
         }
@@ -2619,7 +2417,7 @@ impl Sentinel {
             anyhow::anyhow!("Job ID {} is not representable in storage: {}", job_id, err)
         })?;
 
-        self.queue
+        self.state_store.queue()
             .fail_job(job_id, JobStatus::Failed.as_str(), &err.message)?;
         if let Err(err) = self.update_pipeline_run_status_for_job(job_id) {
             warn!(
@@ -2654,7 +2452,7 @@ impl Sentinel {
 
         // Dispatch jobs to ALL idle workers (batch dispatch)
         for identity in idle_identities {
-            let job = self.queue.pop_job()?;
+            let job = self.state_store.queue().pop_job()?;
 
             let Some(job) = job else {
                 continue;
@@ -2692,108 +2490,17 @@ impl Sentinel {
     }
 
     fn update_pipeline_run_status_for_job(&self, job_id: i64) -> Result<()> {
-        let run_id = self
-            .conn
-            .query_optional(
-                "SELECT pipeline_run_id FROM cf_processing_queue WHERE id = ?",
-                &[DbValue::from(job_id)],
-            )?
-            .and_then(|row| row.get_by_name::<String>("pipeline_run_id").ok());
-        let Some(run_id) = run_id else {
-            return Ok(());
-        };
-        self.update_pipeline_run_status(&run_id)
+        self.state_store
+            .queue()
+            .update_pipeline_run_status_for_job(job_id)
     }
 
     fn set_pipeline_run_running(&self, run_id: &str) -> Result<()> {
-        if !self.table_exists("cf_pipeline_runs")? {
-            return Ok(());
-        }
-        self.conn.execute(
-            r#"
-                UPDATE cf_pipeline_runs
-                SET status = ?,
-                    started_at = COALESCE(started_at, ?)
-                WHERE id = ?
-                "#,
-            &[
-                DbValue::from(PipelineRunStatus::Running.as_str()),
-                DbValue::from(now_millis()),
-                DbValue::from(run_id),
-            ],
-        )?;
-        Ok(())
+        self.state_store.queue().set_pipeline_run_running(run_id)
     }
 
     fn update_pipeline_run_status(&self, run_id: &str) -> Result<()> {
-        if !self.table_exists("cf_pipeline_runs")? {
-            return Ok(());
-        }
-
-        let row = self.conn.query_optional(
-            &format!(
-                r#"
-                SELECT
-                    SUM(CASE WHEN status IN ('{failed}', '{aborted}') THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN status IN ('{queued}', '{running}') THEN 1 ELSE 0 END) AS active,
-                    SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END) AS completed
-                FROM cf_processing_queue
-                WHERE pipeline_run_id = ?
-                "#,
-                failed = ProcessingStatus::Failed.as_str(),
-                aborted = ProcessingStatus::Aborted.as_str(),
-                queued = ProcessingStatus::Queued.as_str(),
-                running = ProcessingStatus::Running.as_str(),
-                completed = ProcessingStatus::Completed.as_str(),
-            ),
-            &[DbValue::from(run_id)],
-        )?;
-
-        let Some(row) = row else {
-            return Ok(());
-        };
-
-        let failed: i64 = row.get_by_name("failed").unwrap_or(0);
-        let active: i64 = row.get_by_name("active").unwrap_or(0);
-        let completed: i64 = row.get_by_name("completed").unwrap_or(0);
-
-        if failed > 0 {
-            self.conn
-                .execute(
-                    "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = ?",
-                    &[
-                        DbValue::from(PipelineRunStatus::Failed.as_str()),
-                        DbValue::from(now_millis()),
-                        DbValue::from(run_id),
-                    ],
-                )
-                ?;
-            return Ok(());
-        }
-
-        if active > 0 {
-            self.set_pipeline_run_running(run_id)?;
-            return Ok(());
-        }
-
-        if completed > 0 {
-            self.conn
-                .execute(
-                    "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = ?",
-                    &[
-                        DbValue::from(PipelineRunStatus::Completed.as_str()),
-                        DbValue::from(now_millis()),
-                        DbValue::from(run_id),
-                    ],
-                )
-                ?;
-        }
-
-        Ok(())
-    }
-
-    fn table_exists(&self, table: &str) -> Result<bool> {
-        Ok(self.conn.table_exists(table)?)
+        self.state_store.queue().update_pipeline_run_status(run_id)
     }
 
     /// Assign a job to a worker.
@@ -2840,43 +2547,12 @@ impl Sentinel {
         }
 
         // Load file path and manifest in single query (was 4 queries, now 1)
-        let dispatch_row = self
-            .conn
-            .query_optional(
-                r#"
-                SELECT
-                    sf.rel_path as rel_path,
-                    ss.path as scan_root,
-                    ss.exec_path as exec_root,
-                    pm.source_code,
-                    pm.version as parser_version,
-                    pm.env_hash,
-                    pm.artifact_hash,
-                    pm.runtime_kind,
-                    pm.entrypoint,
-                    pm.platform_os,
-                    pm.platform_arch,
-                    pm.signature_verified,
-                    pm.signer_id
-                FROM scout_files sf
-                JOIN scout_sources ss ON ss.id = sf.source_id
-                JOIN cf_plugin_manifest pm ON pm.plugin_name = ? AND pm.status IN (?, ?)
-                WHERE sf.id = ?
-                ORDER BY pm.created_at DESC
-                LIMIT 1
-                "#,
-                &[
-                    DbValue::from(job.plugin_name.as_str()),
-                    DbValue::from(PluginStatus::Active.as_str()),
-                    DbValue::from(PluginStatus::Deployed.as_str()),
-                    DbValue::from(job.file_id),
-                ],
-            )
+        let dispatch_data = self
+            .state_store
+            .queue()
+            .load_dispatch_data(&job.plugin_name, job.file_id)
             .context("Failed to load dispatch data")?;
-
-        let dispatch_row = dispatch_row.ok_or_else(|| anyhow::anyhow!("Dispatch data missing"))?;
-        let dispatch_data = DispatchQueryResult::from_row(&dispatch_row)?;
-        let DispatchQueryResult {
+        let DispatchData {
             rel_path,
             scan_root,
             exec_root,
@@ -2939,7 +2615,7 @@ impl Sentinel {
         let sinks = self.apply_contract_overrides(&job.plugin_name, &parser_version, sinks)?;
 
         let sink_config_json = serde_json::to_string(&sinks)?;
-        if let Err(err) = self.queue.record_dispatch_metadata(
+        if let Err(err) = self.state_store.queue().record_dispatch_metadata(
             job.id,
             &parser_version,
             &artifact_hash,
@@ -3128,165 +2804,43 @@ impl Sentinel {
         // 2. Compute source_hash (SHA256, not MD5)
         let source_hash = compute_sha256(&cmd.source_code);
 
-        // 3. Execute all DB operations in a transaction
-        self.conn.execute("BEGIN TRANSACTION", &[])?;
         let now = now_millis();
-
-        // 3a. Upsert the plugin environment (lockfile)
-        if !cmd.lockfile_content.is_empty() {
-            if let Err(e) = self
-                .conn
-                .execute(
-                    r#"
-                    INSERT INTO cf_plugin_environment (hash, lockfile_content, size_mb, last_used, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(hash) DO UPDATE SET last_used = ?
-                    "#,
-                    &[
-                        DbValue::from(cmd.env_hash.as_str()),
-                        DbValue::from(cmd.lockfile_content.as_str()),
-                        DbValue::from(cmd.lockfile_content.len() as f64 / 1_000_000.0),
-                        DbValue::from(now),
-                        DbValue::from(now),
-                        DbValue::from(now),
-                    ],
-                )
-
-            {
-                let _ = self.conn.execute("ROLLBACK", &[]);
-                return Err(e.into());
-            }
-        }
-
-        // 3b. Insert the plugin manifest
-        let publisher_email = cmd
-            .publisher_email
-            .as_deref()
-            .map(DbValue::from)
-            .unwrap_or(DbValue::Null);
-        let azure_oid = cmd
-            .azure_oid
-            .as_deref()
-            .map(DbValue::from)
-            .unwrap_or(DbValue::Null);
-        let system_requirements = cmd
+        let system_requirements_json = cmd
             .system_requirements
             .as_ref()
-            .map(|reqs| serde_json::to_string(reqs).unwrap_or_default())
-            .map(DbValue::from)
-            .unwrap_or(DbValue::Null);
+            .map(|reqs| serde_json::to_string(reqs).unwrap_or_default());
+        let request = casparian_state_store::PluginDeployRequest {
+            plugin_name: cmd.plugin_name.clone(),
+            version: cmd.version.clone(),
+            runtime_kind: manifest.runtime_kind,
+            entrypoint: manifest.entrypoint.clone(),
+            platform_os: manifest.platform_os.clone(),
+            platform_arch: manifest.platform_arch.clone(),
+            source_code: cmd.source_code.clone(),
+            source_hash: source_hash.clone(),
+            env_hash: cmd.env_hash.clone(),
+            artifact_hash: cmd.artifact_hash.clone(),
+            manifest_json: cmd.manifest_json.clone(),
+            protocol_version: cmd.protocol_version.clone(),
+            schema_artifacts_json: cmd.schema_artifacts_json.clone(),
+            outputs_json: outputs_json.clone(),
+            signature_verified: false,
+            signer_id: None,
+            created_at: now,
+            deployed_at: now,
+            publisher_name: cmd.publisher_name.clone(),
+            publisher_email: cmd.publisher_email.clone(),
+            azure_oid: cmd.azure_oid.clone(),
+            system_requirements_json,
+            lockfile_content: if cmd.lockfile_content.is_empty() {
+                None
+            } else {
+                Some(cmd.lockfile_content.clone())
+            },
+            contracts: contracts.clone(),
+        };
 
-        if let Err(e) = self.conn.execute(
-            r#"
-                INSERT INTO cf_plugin_manifest
-                (plugin_name, version, runtime_kind, entrypoint, platform_os, platform_arch,
-                 source_code, source_hash, status,
-                 env_hash, artifact_hash, manifest_json, protocol_version, schema_artifacts_json,
-                 outputs_json, signature_verified, signer_id,
-                 created_at, deployed_at,
-                 publisher_name, publisher_email, azure_oid, system_requirements)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            &[
-                DbValue::from(cmd.plugin_name.as_str()),
-                DbValue::from(cmd.version.as_str()),
-                DbValue::from(manifest.runtime_kind.as_str()),
-                DbValue::from(manifest.entrypoint.as_str()),
-                manifest
-                    .platform_os
-                    .as_deref()
-                    .map(DbValue::from)
-                    .unwrap_or(DbValue::Null),
-                manifest
-                    .platform_arch
-                    .as_deref()
-                    .map(DbValue::from)
-                    .unwrap_or(DbValue::Null),
-                DbValue::from(cmd.source_code.as_str()),
-                DbValue::from(source_hash.as_str()),
-                DbValue::from(PluginStatus::Active.as_str()),
-                DbValue::from(cmd.env_hash.as_str()),
-                DbValue::from(cmd.artifact_hash.as_str()),
-                DbValue::from(cmd.manifest_json.as_str()),
-                DbValue::from(cmd.protocol_version.as_str()),
-                DbValue::from(cmd.schema_artifacts_json.as_str()),
-                DbValue::from(outputs_json.as_str()),
-                DbValue::from(false),
-                DbValue::Null,
-                DbValue::from(now),
-                DbValue::from(now),
-                DbValue::from(cmd.publisher_name.as_str()),
-                publisher_email,
-                azure_oid,
-                system_requirements,
-            ],
-        ) {
-            let _ = self.conn.execute("ROLLBACK", &[]);
-            return Err(e.into());
-        }
-
-        // 3c. Insert schema contracts (fail if schema changed without version bump)
-        for (scope_id, locked_schema) in &contracts {
-            if let Some(existing) = self
-                .schema_storage
-                .get_contract_for_scope(scope_id)
-                .context("Failed to load existing schema contract")?
-            {
-                let existing_hash = existing
-                    .schemas
-                    .get(0)
-                    .map(|schema| schema.content_hash.as_str())
-                    .unwrap_or("");
-                if existing_hash != locked_schema.content_hash {
-                    let _ = self.conn.execute("ROLLBACK", &[]);
-                    anyhow::bail!(
-                        "Schema changed for output '{}' without version bump. \
-Update version '{}' or delete the database.",
-                        locked_schema.name,
-                        cmd.version
-                    );
-                }
-                let _ = self.conn.execute("ROLLBACK", &[]);
-                anyhow::bail!(
-                    "Schema contract already exists for output '{}' at version '{}'. \
-Delete the database to republish.",
-                    locked_schema.name,
-                    cmd.version
-                );
-            }
-
-            let contract =
-                SchemaContract::new(scope_id, locked_schema.clone(), &cmd.publisher_name)
-                    .with_logic_hash(Some(source_hash.clone()));
-            if let Err(e) = self.schema_storage.save_contract(&contract) {
-                let _ = self.conn.execute("ROLLBACK", &[]);
-                return Err(anyhow::anyhow!(e));
-            }
-        }
-
-        // 3d. Deactivate previous versions
-        if let Err(e) = self.conn.execute(
-            r#"
-                UPDATE cf_plugin_manifest
-                SET status = ?
-                WHERE plugin_name = ? AND version != ? AND status = ?
-                "#,
-            &[
-                DbValue::from(PluginStatus::Superseded.as_str()),
-                DbValue::from(cmd.plugin_name.as_str()),
-                DbValue::from(cmd.version.as_str()),
-                DbValue::from(PluginStatus::Active.as_str()),
-            ],
-        ) {
-            let _ = self.conn.execute("ROLLBACK", &[]);
-            return Err(e.into());
-        }
-
-        // 4. Commit transaction
-        if let Err(e) = self.conn.execute("COMMIT", &[]) {
-            let _ = self.conn.execute("ROLLBACK", &[]);
-            return Err(e.into());
-        }
+        self.state_store.routing().deploy_plugin(request)?;
 
         info!(
             "Deployed {} v{} (env: {}, artifact: {})",
@@ -3298,7 +2852,7 @@ Delete the database to republish.",
 
         // 5. Refresh topic_map cache (new plugins may have topic configs)
         // This ensures newly deployed plugins get their sink configs immediately
-        match Self::load_topic_configs(&self.conn) {
+        match Self::load_topic_configs(self.state_store.routing()) {
             Ok(new_map) => {
                 let old_count = self.topic_map.len();
                 self.topic_map = new_map;
@@ -3392,7 +2946,7 @@ Delete the database to republish.",
 
             let now = now_millis();
             let scheduled_at = now + (backoff_secs as i64 * 1_000);
-            self.queue
+            self.state_store.queue()
                 .schedule_retry(job_id, retry_count + 1, error, scheduled_at)?;
 
             METRICS.inc_jobs_retried();
@@ -3412,7 +2966,7 @@ Delete the database to republish.",
                 MAX_RETRY_COUNT
             );
 
-            self.queue.move_to_dead_letter(job_id, error, reason)?;
+            self.state_store.queue().move_to_dead_letter(job_id, error, reason)?;
             METRICS.inc_jobs_failed();
         }
 
@@ -3423,15 +2977,7 @@ Delete the database to republish.",
     ///
     /// Returns true if parser can accept jobs, false if paused.
     pub fn check_circuit_breaker(&self, parser_name: &str) -> Result<bool> {
-        let health = self.conn.query_optional(
-            &format!(
-                "SELECT {} FROM cf_parser_health WHERE parser_name = ?",
-                PARSER_HEALTH_COLUMNS.join(", ")
-            ),
-            &[DbValue::from(parser_name)],
-        )?;
-        let health = health.map(|row| ParserHealth::from_row(&row)).transpose()?;
-
+        let health = self.state_store.queue().get_parser_health(parser_name)?;
         if let Some(h) = health {
             // Already paused
             if h.is_paused() {
@@ -3442,17 +2988,7 @@ Delete the database to republish.",
             // Check threshold
             if h.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
                 // Trip the circuit breaker
-                let now = now_millis();
-                self.conn
-                    .execute(
-                        "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
-                        &[
-                            DbValue::from(now),
-                            DbValue::from(now),
-                            DbValue::from(parser_name),
-                        ],
-                    )
-                    ?;
+                self.state_store.queue().pause_parser(parser_name)?;
 
                 warn!(
                     parser = parser_name,
@@ -3468,26 +3004,7 @@ Delete the database to republish.",
 
     /// Record successful execution (resets consecutive failures).
     fn record_success(&self, parser_name: &str) -> Result<()> {
-        let now = now_millis();
-        self.conn
-            .execute(
-                r#"
-                INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, created_at, updated_at)
-                VALUES (?, 1, 1, 0, ?, ?)
-                ON CONFLICT(parser_name) DO UPDATE SET
-                    total_executions = total_executions + 1,
-                    successful_executions = successful_executions + 1,
-                    consecutive_failures = 0,
-                    updated_at = ?
-                "#,
-                &[
-                    DbValue::from(parser_name),
-                    DbValue::from(now),
-                    DbValue::from(now),
-                    DbValue::from(now),
-                ],
-            )
-            ?;
+        self.state_store.queue().record_parser_success(parser_name)?;
 
         debug!(
             parser = parser_name,
@@ -3498,28 +3015,7 @@ Delete the database to republish.",
 
     /// Record failed execution (increments consecutive failures).
     fn record_failure(&self, parser_name: &str, reason: &str) -> Result<()> {
-        let now = now_millis();
-        self.conn
-            .execute(
-                r#"
-                INSERT INTO cf_parser_health (parser_name, total_executions, successful_executions, consecutive_failures, last_failure_reason, created_at, updated_at)
-                VALUES (?, 1, 0, 1, ?, ?, ?)
-                ON CONFLICT(parser_name) DO UPDATE SET
-                    total_executions = total_executions + 1,
-                    consecutive_failures = consecutive_failures + 1,
-                    last_failure_reason = ?,
-                    updated_at = ?
-                "#,
-                &[
-                    DbValue::from(parser_name),
-                    DbValue::from(reason),
-                    DbValue::from(now),
-                    DbValue::from(now),
-                    DbValue::from(reason),
-                    DbValue::from(now),
-                ],
-            )
-            ?;
+        self.state_store.queue().record_parser_failure(parser_name, reason)?;
 
         debug!(parser = parser_name, reason = reason, "Recorded failure");
         self.check_circuit_breaker(parser_name)?;
@@ -3528,30 +3024,24 @@ Delete the database to republish.",
 
     /// Get plugin name for a job (for health tracking).
     fn get_job_plugin_name(&self, job_id: i64) -> Option<String> {
-        let result = self
-            .conn
-            .query_optional(
-                "SELECT plugin_name FROM cf_processing_queue WHERE id = ?",
-                &[DbValue::from(job_id)],
-            )
+        let job_id = JobId::try_from(job_id).ok()?;
+        self.state_store
+            .queue()
+            .get_job(job_id)
             .ok()
-            .flatten();
-
-        result.and_then(|row| row.get_by_name("plugin_name").ok())
+            .flatten()
+            .map(|job| job.plugin_name)
     }
 
     /// Get retry count for a job.
     fn get_job_retry_count(&self, job_id: i64) -> Option<i32> {
-        let result = self
-            .conn
-            .query_optional(
-                "SELECT retry_count FROM cf_processing_queue WHERE id = ?",
-                &[DbValue::from(job_id)],
-            )
+        let job_id = JobId::try_from(job_id).ok()?;
+        self.state_store
+            .queue()
+            .get_job(job_id)
             .ok()
-            .flatten();
-
-        result.and_then(|row| row.get_by_name("retry_count").ok())
+            .flatten()
+            .map(|job| job.retry_count)
     }
 }
 
@@ -3601,6 +3091,29 @@ fn escape_sql_literal(value: &str) -> String {
 mod tests {
     use super::*;
     use casparian_db::{DbConnection, DbValue};
+    use casparian_state_store::{ExpectedOutputs, OutputSpec, PluginDeployRequest, RoutingStore};
+
+    struct TestRoutingStore {
+        conn: DbConnection,
+    }
+
+    impl RoutingStore for TestRoutingStore {
+        fn list_topic_configs(&self) -> Result<Vec<TopicConfig>> {
+            Ok(Vec::new())
+        }
+
+        fn expected_outputs_for_plugin(
+            &self,
+            plugin_name: &str,
+            parser_version: Option<&str>,
+        ) -> Result<Vec<OutputSpec>> {
+            ExpectedOutputs::list_for_plugin(&self.conn, plugin_name, parser_version)
+        }
+
+        fn deploy_plugin(&self, _request: PluginDeployRequest) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_join_root_and_rel_posix() {
@@ -3748,6 +3261,7 @@ mod tests {
         insert_test_plugin(&conn, "parser_a", "1.0.0", outputs_json);
         save_contract(&schema_storage, "parser_a", "1.0.0", "alpha");
         save_contract(&schema_storage, "parser_a", "1.0.0", "beta");
+        let routing = TestRoutingStore { conn: conn.clone() };
 
         let sinks = vec![SinkConfig {
             topic: defaults::DEFAULT_SINK_TOPIC.to_string(),
@@ -3758,7 +3272,7 @@ mod tests {
         }];
 
         let resolved = Sentinel::apply_contract_overrides_with_storage(
-            &conn,
+            &routing,
             &schema_storage,
             "parser_a",
             "1.0.0",
@@ -3780,6 +3294,7 @@ mod tests {
         insert_test_plugin(&conn, "parser_b", "1.2.3", outputs_json);
         save_contract(&schema_storage, "parser_b", "1.2.3", "alpha");
         save_contract(&schema_storage, "parser_b", "1.2.3", "beta");
+        let routing = TestRoutingStore { conn: conn.clone() };
 
         let sinks = vec![SinkConfig {
             topic: "*".to_string(),
@@ -3790,7 +3305,7 @@ mod tests {
         }];
 
         let resolved = Sentinel::apply_contract_overrides_with_storage(
-            &conn,
+            &routing,
             &schema_storage,
             "parser_b",
             "1.2.3",
@@ -3807,7 +3322,9 @@ mod tests {
 
     #[test]
     fn test_load_topic_configs_without_schema() {
-        let conn = DbConnection::open_duckdb_memory().unwrap();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = temp.path().to_path_buf();
+        let conn = DbConnection::open_sqlite(&db_path).unwrap();
         conn.execute(
             r#"
             CREATE TABLE cf_topic_config (
@@ -3846,7 +3363,8 @@ mod tests {
         )
         .unwrap();
 
-        let configs = Sentinel::load_topic_configs(&conn).unwrap();
+        let store = StateStore::open(&format!("sqlite:{}", db_path.display())).unwrap();
+        let configs = Sentinel::load_topic_configs(store.routing()).unwrap();
         let sinks = configs.get("test_plugin").unwrap();
         assert_eq!(sinks.len(), 1);
         assert!(sinks[0].schema.is_none());
@@ -3854,7 +3372,9 @@ mod tests {
 
     #[test]
     fn test_load_topic_configs_rejects_duplicates() {
-        let conn = DbConnection::open_duckdb_memory().unwrap();
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = temp.path().to_path_buf();
+        let conn = DbConnection::open_sqlite(&db_path).unwrap();
         conn.execute(
             r#"
             CREATE TABLE cf_topic_config (
@@ -3884,7 +3404,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = Sentinel::load_topic_configs(&conn).unwrap_err();
+        let store = StateStore::open(&format!("sqlite:{}", db_path.display())).unwrap();
+        let err = Sentinel::load_topic_configs(store.routing()).unwrap_err();
         assert!(err.to_string().contains("Duplicate sink config"));
     }
 

@@ -506,8 +506,35 @@ impl DbConnection {
         } else {
             rusqlite::Connection::open(path)?
         };
+        ensure_sqlite_returning(&conn)?;
         configure_sqlite_rw(&conn)?;
         info!("Opened SQLite database: {}", path.display());
+
+        Ok(Self {
+            inner: Inner::Sqlite {
+                conn: Rc::new(conn),
+            },
+            access_mode: AccessMode::ReadWrite,
+        })
+    }
+
+    /// Open a SQLite database with a custom busy timeout (milliseconds).
+    pub fn open_sqlite_with_busy_timeout(
+        path: &Path,
+        busy_timeout_ms: u64,
+    ) -> Result<Self, BackendError> {
+        let conn = if path.to_string_lossy() == ":memory:" {
+            rusqlite::Connection::open_in_memory()?
+        } else {
+            rusqlite::Connection::open(path)?
+        };
+        ensure_sqlite_returning(&conn)?;
+        configure_sqlite_rw_with_timeout(&conn, Duration::from_millis(busy_timeout_ms))?;
+        info!(
+            "Opened SQLite database: {} (busy_timeout={}ms)",
+            path.display(),
+            busy_timeout_ms
+        );
 
         Ok(Self {
             inner: Inner::Sqlite {
@@ -526,6 +553,7 @@ impl DbConnection {
         } else {
             rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
         };
+        ensure_sqlite_returning(&conn)?;
         configure_sqlite_ro(&conn)?;
         info!("Opened SQLite database (read-only): {}", path.display());
 
@@ -625,13 +653,28 @@ impl DbConnection {
     }
 
     /// Query and return the first row, if any.
+    pub fn query_first_row(
+        &self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, BackendError> {
+        match &self.inner {
+            Inner::DuckDb { conn, .. } => {
+                Self::query_duckdb_first_row_on_conn(conn.as_ref(), sql, params)
+            }
+            Inner::Sqlite { conn } => {
+                Self::query_sqlite_first_row_on_conn(conn.as_ref(), sql, params)
+            }
+        }
+    }
+
+    /// Query and return the first row, if any.
     pub fn query_optional(
         &self,
         sql: &str,
         params: &[DbValue],
     ) -> Result<Option<DbRow>, BackendError> {
-        let rows = self.query_all(sql, params)?;
-        Ok(rows.into_iter().next())
+        self.query_first_row(sql, params)
     }
 
     /// Query and return exactly one row.
@@ -846,6 +889,61 @@ impl DbConnection {
         Ok(result)
     }
 
+    fn query_duckdb_first_row_on_conn(
+        conn: &duckdb::Connection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, BackendError> {
+        let op = sql_op_name(sql);
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.query_first",
+            op = op,
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
+
+        let mut stmt = conn.prepare(sql)?;
+        let duckdb_params = Self::to_duckdb_params(params);
+        let param_refs: Vec<&dyn duckdb::ToSql> = duckdb_params
+            .iter()
+            .map(|v| v as &dyn duckdb::ToSql)
+            .collect();
+
+        let mut rows_iter = stmt.query(param_refs.as_slice())?;
+        let (column_count, columns) = if let Some(stmt_ref) = rows_iter.as_ref() {
+            let count = stmt_ref.column_count();
+            let cols: Vec<String> = (0..count)
+                .map(|i| {
+                    stmt_ref
+                        .column_name(i)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| format!("col{}", i))
+                })
+                .collect();
+            (count, cols)
+        } else {
+            return Ok(None);
+        };
+
+        let row = if let Some(row) = rows_iter.next()? {
+            let mut values = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let value = Self::duckdb_value_to_db_value(row, i)?;
+                values.push(value);
+            }
+            Some(DbRow::new(columns, values))
+        } else {
+            None
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", duration_ms);
+        Ok(row)
+    }
+
     fn to_duckdb_params(params: &[DbValue]) -> Vec<duckdb::types::Value> {
         params
             .iter()
@@ -1037,6 +1135,57 @@ impl DbConnection {
         Ok(result)
     }
 
+    fn query_sqlite_first_row_on_conn(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, BackendError> {
+        let op = sql_op_name(sql);
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.query_first",
+            op = op,
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
+
+        let mut stmt = conn.prepare(sql)?;
+        let column_count = stmt.column_count();
+        let mut columns = Vec::with_capacity(column_count);
+        for i in 0..column_count {
+            let name = stmt
+                .column_name(i)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| format!("col{}", i));
+            columns.push(name);
+        }
+
+        let sqlite_params = Self::to_sqlite_params(params);
+        let param_refs: Vec<&dyn rusqlite::ToSql> = sqlite_params
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
+
+        let mut rows_iter = stmt.query(param_refs.as_slice())?;
+
+        let row = if let Some(row) = rows_iter.next()? {
+            let mut values = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let value = Self::sqlite_value_to_db_value(row, i)?;
+                values.push(value);
+            }
+            Some(DbRow::new(columns, values))
+        } else {
+            None
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", duration_ms);
+        Ok(row)
+    }
+
     fn to_sqlite_params(params: &[DbValue]) -> Vec<rusqlite::types::Value> {
         params
             .iter()
@@ -1118,13 +1267,27 @@ impl<'a> DbTransaction<'a> {
         }
     }
 
+    pub fn query_first_row(
+        &mut self,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, BackendError> {
+        match self.inner {
+            TransactionInner::DuckDb { conn } => {
+                DbConnection::query_duckdb_first_row_on_conn(conn, sql, params)
+            }
+            TransactionInner::Sqlite { conn } => {
+                DbConnection::query_sqlite_first_row_on_conn(conn, sql, params)
+            }
+        }
+    }
+
     pub fn query_optional(
         &mut self,
         sql: &str,
         params: &[DbValue],
     ) -> Result<Option<DbRow>, BackendError> {
-        let rows = self.query_all(sql, params)?;
-        Ok(rows.into_iter().next())
+        self.query_first_row(sql, params)
     }
 
     pub fn query_one(&mut self, sql: &str, params: &[DbValue]) -> Result<DbRow, BackendError> {
@@ -1366,18 +1529,92 @@ fn hash_sql(sql: &str) -> String {
 }
 
 fn configure_sqlite_rw(conn: &rusqlite::Connection) -> Result<(), BackendError> {
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;\
-         PRAGMA synchronous=NORMAL;\
-         PRAGMA foreign_keys=ON;",
-    )?;
-    conn.busy_timeout(Duration::from_millis(5000))?;
-    Ok(())
+    configure_sqlite_rw_with_timeout(conn, Duration::from_millis(5000))
 }
 
 fn configure_sqlite_ro(conn: &rusqlite::Connection) -> Result<(), BackendError> {
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     conn.busy_timeout(Duration::from_millis(5000))?;
+    Ok(())
+}
+
+fn configure_sqlite_rw_with_timeout(
+    conn: &rusqlite::Connection,
+    timeout: Duration,
+) -> Result<(), BackendError> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA foreign_keys=ON;",
+    )?;
+    conn.busy_timeout(timeout)?;
+    Ok(())
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SqliteVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl std::fmt::Display for SqliteVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl SqliteVersion {
+    fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.split('.');
+        let major = parts.next().and_then(parse_version_part)?;
+        let minor = parts.next().and_then(parse_version_part).unwrap_or(0);
+        let patch = parts.next().and_then(parse_version_part).unwrap_or(0);
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+fn parse_version_part(part: &str) -> Option<u32> {
+    let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+fn sqlite_version(conn: &rusqlite::Connection) -> Result<SqliteVersion, BackendError> {
+    let mut stmt = conn.prepare("SELECT sqlite_version()")?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let raw: String = row.get(0)?;
+        SqliteVersion::parse(&raw).ok_or_else(|| {
+            BackendError::NotAvailable(format!("Unable to parse SQLite version '{}'", raw))
+        })
+    } else {
+        Err(BackendError::NotAvailable(
+            "Unable to read SQLite version".to_string(),
+        ))
+    }
+}
+
+fn ensure_sqlite_returning(conn: &rusqlite::Connection) -> Result<(), BackendError> {
+    let version = sqlite_version(conn)?;
+    let min = SqliteVersion {
+        major: 3,
+        minor: 35,
+        patch: 0,
+    };
+    if version < min {
+        return Err(BackendError::NotAvailable(format!(
+            "SQLite {} is too old for RETURNING (requires >= {}). Rebuild with bundled SQLite or upgrade your system SQLite.",
+            version, min
+        )));
+    }
     Ok(())
 }
 

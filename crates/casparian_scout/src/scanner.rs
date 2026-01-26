@@ -124,7 +124,7 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             threads: 0,             // Auto-detect CPU count
-            batch_size: 10_000,     // Flush to DB every 10k files
+            batch_size: 1_000,      // Flush to DB every 1k files
             progress_interval: 100, // Progress update every 100 files for responsive TUI
             progress_interval_time: Duration::from_secs(1),
             stall_threshold: Duration::from_secs(30),
@@ -204,6 +204,76 @@ impl FolderCacheAggregator {
                 }
             }
         }
+    }
+}
+
+struct AdaptiveBatchSizer {
+    target: usize,
+    min: usize,
+    max: usize,
+    ema_ms_per_file: f64,
+    slow_streak: u8,
+    fast_streak: u8,
+}
+
+impl AdaptiveBatchSizer {
+    fn new(initial: usize, min: usize, max: usize) -> Self {
+        let min = min.max(1);
+        let max = max.max(min);
+        let target = initial.clamp(min, max);
+        Self {
+            target,
+            min,
+            max,
+            ema_ms_per_file: 0.0,
+            slow_streak: 0,
+            fast_streak: 0,
+        }
+    }
+
+    fn target(&self) -> usize {
+        self.target
+    }
+
+    fn observe(&mut self, batch_len: usize, duration_ms: u64) -> Option<usize> {
+        if batch_len == 0 {
+            return None;
+        }
+        let per_file_ms = duration_ms as f64 / batch_len as f64;
+        if self.ema_ms_per_file == 0.0 {
+            self.ema_ms_per_file = per_file_ms;
+        } else {
+            self.ema_ms_per_file = (self.ema_ms_per_file * 0.8) + (per_file_ms * 0.2);
+        }
+
+        let slow = self.ema_ms_per_file > 2.0;
+        let fast = self.ema_ms_per_file < 0.25;
+
+        if slow {
+            self.slow_streak = self.slow_streak.saturating_add(1);
+            self.fast_streak = 0;
+        } else if fast {
+            self.fast_streak = self.fast_streak.saturating_add(1);
+            self.slow_streak = 0;
+        } else {
+            self.slow_streak = 0;
+            self.fast_streak = 0;
+        }
+
+        if self.slow_streak >= 2 && self.target > self.min {
+            self.slow_streak = 0;
+            self.target = (self.target / 2).max(self.min);
+            return Some(self.target);
+        }
+
+        if self.fast_streak >= 4 && self.target < self.max {
+            self.fast_streak = 0;
+            let increased = (self.target as f64 * 1.25).ceil() as usize;
+            self.target = increased.min(self.max);
+            return Some(self.target);
+        }
+
+        None
     }
 }
 
@@ -483,7 +553,7 @@ impl Scanner {
         let scan_start = Utc::now();
 
         // Create bounded channel for backpressure (GAP-006)
-        // 10 batches in flight = batch_size * 10 files max in memory
+        // 10 batches in flight = current batch_size * 10 files max in memory
         let (batch_tx, batch_rx) = mpsc::sync_channel::<Vec<ScannedFile>>(10);
 
         // Shared counter for files_persisted (updated by persist task, read by walker for progress)
@@ -497,14 +567,14 @@ impl Scanner {
         // Spawn the walk task; persistence happens on the calling thread
         let db = self.db.clone();
         let tag_owned = tag.map(|t| t.to_string());
-        let batch_size = self.config.batch_size;
+        let batch_size_target = Arc::new(AtomicUsize::new(self.config.batch_size));
 
         // Run the parallel walk in a blocking task, sending batches to channel
         let walk_source_path = source_path.to_path_buf();
         let walk_source_id = source.id.clone();
         let walk_workspace_id = source.workspace_id;
         let walk_source_type = source.source_type.clone();
-        let walk_config_batch_size = self.config.batch_size;
+        let walk_config_batch_size = batch_size_target.clone();
         let walk_config_threads = self.config.threads;
         let walk_config_include_hidden = self.config.include_hidden;
         let walk_config_follow_symlinks = self.config.follow_symlinks;
@@ -563,55 +633,75 @@ impl Scanner {
         let mut folder_cache = FolderCacheAggregator::default();
         let mut persist_batches: u64 = 0;
         let mut persist_time_ms: u64 = 0;
+        let mut batch_sizer = AdaptiveBatchSizer::new(self.config.batch_size, 200, 5_000);
+        batch_size_target.store(batch_sizer.target(), Ordering::Relaxed);
         while let Ok(batch) = batch_rx.recv() {
             let batch_len = batch.len();
-            let persist_span = debug_span!(
-                "scout.persist_batch",
-                batch_files = batch_len,
-                duration_ms = tracing::field::Empty
-            );
-            let _persist_guard = persist_span.enter();
-            let persist_start = Instant::now();
-
             // GAP-SCAN-005: Track files_discovered as total files received (including failed)
             // This represents what the walker found, regardless of persist success
             persist_stats.files_discovered += batch_len as u64;
 
-            // GAP-002: Transactional batch persist
-            match Self::persist_batch_streaming(
-                &db,
-                &batch,
-                tag_owned.as_deref(),
-                self.config.compute_stats,
-            ) {
-                Ok(batch_stats) => {
-                    persist_stats.files_new += batch_stats.files_new;
-                    persist_stats.files_changed += batch_stats.files_changed;
-                    persist_stats.files_unchanged += batch_stats.files_unchanged;
-                    // GAP-SCAN-005: Track files_persisted separately from files_discovered
-                    persist_stats.files_persisted += batch_len as u64;
+            let mut offset = 0;
+            while offset < batch_len {
+                let target_batch = batch_sizer.target().max(1);
+                let end = (offset + target_batch).min(batch_len);
+                let chunk = &batch[offset..end];
+                let chunk_len = chunk.len();
 
-                    // Update shared counter for progress reporting
-                    files_persisted_for_persist.fetch_add(batch_len, Ordering::Relaxed);
+                let persist_span = debug_span!(
+                    "scout.persist_batch",
+                    batch_files = chunk_len,
+                    duration_ms = tracing::field::Empty
+                );
+                let _persist_guard = persist_span.enter();
+                let persist_start = Instant::now();
 
-                    folder_cache.update_batch(&batch);
+                // GAP-002: Transactional batch persist
+                match Self::persist_batch_streaming(
+                    &db,
+                    chunk,
+                    tag_owned.as_deref(),
+                    self.config.compute_stats,
+                ) {
+                    Ok(batch_stats) => {
+                        persist_stats.files_new += batch_stats.files_new;
+                        persist_stats.files_changed += batch_stats.files_changed;
+                        persist_stats.files_unchanged += batch_stats.files_unchanged;
+                        // GAP-SCAN-005: Track files_persisted separately from files_discovered
+                        persist_stats.files_persisted += chunk_len as u64;
+
+                        // Update shared counter for progress reporting
+                        files_persisted_for_persist.fetch_add(chunk_len, Ordering::Relaxed);
+
+                        folder_cache.update_batch(chunk);
+                    }
+                    Err(e) => {
+                        persist_stats.errors += chunk_len as u64;
+                        // GAP-SCAN-001: Mark scan as failed so we don't incorrectly mark files as deleted
+                        scan_ok_for_persist.store(false, Ordering::Relaxed);
+                        tracing::warn!(
+                            error = %e,
+                            "Batch persist failed - will skip mark_deleted_files"
+                        );
+                    }
                 }
-                Err(e) => {
-                    persist_stats.errors += batch_len as u64;
-                    // GAP-SCAN-001: Mark scan as failed so we don't incorrectly mark files as deleted
-                    scan_ok_for_persist.store(false, Ordering::Relaxed);
-                    tracing::warn!(error = %e, "Batch persist failed - will skip mark_deleted_files");
+                persist_batches += 1;
+                let batch_duration_ms = persist_start.elapsed().as_millis() as u64;
+                persist_span.record("duration_ms", &batch_duration_ms);
+                persist_time_ms = persist_time_ms.saturating_add(batch_duration_ms);
+                tracing::debug!(
+                    batch_files = chunk_len,
+                    duration_ms = batch_duration_ms,
+                    "Persist batch complete"
+                );
+
+                if let Some(new_target) = batch_sizer.observe(chunk_len, batch_duration_ms) {
+                    batch_size_target.store(new_target, Ordering::Relaxed);
+                    tracing::debug!(new_batch_size = new_target, "Adjusted scan batch size");
                 }
+
+                offset = end;
             }
-            persist_batches += 1;
-            let batch_duration_ms = persist_start.elapsed().as_millis() as u64;
-            persist_span.record("duration_ms", &batch_duration_ms);
-            persist_time_ms = persist_time_ms.saturating_add(batch_duration_ms);
-            tracing::debug!(
-                batch_files = batch_len,
-                duration_ms = batch_duration_ms,
-                "Persist batch complete"
-            );
         }
 
         let walk_result = walk_handle
@@ -747,7 +837,7 @@ impl Scanner {
             deleted = final_stats.files_deleted,
             errors = final_stats.errors,
             duration_ms = final_stats.duration_ms,
-            batches = batch_size,
+            batches = batch_sizer.target(),
             persist_batches = persist_batches,
             persist_time_ms = persist_time_ms,
             "Streaming scan complete"
@@ -779,7 +869,7 @@ impl Scanner {
         source_id: &SourceId,
         source_type: SourceType,
         batch_tx: mpsc::SyncSender<Vec<ScannedFile>>,
-        batch_size: usize,
+        batch_size: Arc<AtomicUsize>,
         threads: usize,
         include_hidden: bool,
         follow_symlinks: bool,
@@ -868,6 +958,7 @@ impl Scanner {
             let progress_state = progress_state.clone();
             let progress_counters = progress_counters.clone();
             let batch_tx = batch_tx.clone();
+            let batch_size = batch_size.clone();
             let thread_now = Utc::now();
             let cancel_flag = cancel_flag.clone();
 
@@ -876,7 +967,7 @@ impl Scanner {
             // GAP-SCAN-006: dir_count removed - directories counted immediately via atomic
             struct StreamingFlushGuard {
                 batch: Vec<ScannedFile>,
-                batch_size: usize,
+                batch_size: Arc<AtomicUsize>,
                 byte_count: u64,
                 batch_tx: mpsc::SyncSender<Vec<ScannedFile>>,
                 total_files: Arc<AtomicUsize>,
@@ -902,7 +993,7 @@ impl Scanner {
             }
 
             let mut guard = StreamingFlushGuard {
-                batch: Vec::with_capacity(batch_size),
+                batch: Vec::with_capacity(batch_size.load(Ordering::Relaxed).max(1)),
                 batch_size,
                 byte_count: 0,
                 batch_tx: batch_tx.clone(),
@@ -1004,9 +1095,10 @@ impl Scanner {
                 }
 
                 // Send batch to channel when full
-                if guard.batch.len() >= guard.batch_size {
+                let target_batch_size = guard.batch_size.load(Ordering::Relaxed).max(1);
+                if guard.batch.len() >= target_batch_size {
                     let batch =
-                        std::mem::replace(&mut guard.batch, Vec::with_capacity(guard.batch_size));
+                        std::mem::replace(&mut guard.batch, Vec::with_capacity(target_batch_size));
                     let batch_len = batch.len();
 
                     // send provides backpressure with sync_channel (waits if channel full)

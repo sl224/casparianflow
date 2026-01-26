@@ -4,9 +4,10 @@
 //! All paths are under ~/.casparian_flow/
 
 use std::path::PathBuf;
-use std::sync::Once;
 
-static CREATE_DIR_WARNED: Once = Once::new();
+pub use casparian_protocol::paths::{
+    casparian_home, default_logs_dir, default_query_catalog_path, default_state_store_path,
+};
 
 /// State store backend type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,54 +27,11 @@ impl DbBackend {
     }
 }
 
-/// Get the Casparian home directory: ~/.casparian_flow
-pub fn casparian_home() -> PathBuf {
-    if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
-        return PathBuf::from(override_path);
-    }
-    dirs::home_dir()
-        .expect(
-            "Could not determine home directory (HOME not set). \
-Set CASPARIAN_HOME or pass --state-store, or export HOME.",
-        )
-        .join(".casparian_flow")
-}
-
 /// Ensure the Casparian home directory exists
 pub fn ensure_casparian_home() -> std::io::Result<PathBuf> {
     let home = casparian_home();
     std::fs::create_dir_all(&home)?;
     Ok(home)
-}
-
-/// Get the state store path: ~/.casparian_flow/state.sqlite
-pub fn default_state_store_path() -> PathBuf {
-    let home = casparian_home();
-    if let Err(err) = std::fs::create_dir_all(&home) {
-        CREATE_DIR_WARNED.call_once(|| {
-            eprintln!(
-                "Warning: failed to create Casparian home directory {}: {}. Set CASPARIAN_HOME or use --state-store.",
-                home.display(),
-                err
-            );
-        });
-    }
-    home.join("state.sqlite")
-}
-
-/// Get the query catalog path: ~/.casparian_flow/query.duckdb
-pub fn default_query_catalog_path() -> PathBuf {
-    let home = casparian_home();
-    if let Err(err) = std::fs::create_dir_all(&home) {
-        CREATE_DIR_WARNED.call_once(|| {
-            eprintln!(
-                "Warning: failed to create Casparian home directory {}: {}. Set CASPARIAN_HOME or use --query-catalog.",
-                home.display(),
-                err
-            );
-        });
-    }
-    home.join("query.duckdb")
 }
 
 /// Determine the state store backend.
@@ -118,7 +76,7 @@ pub fn parsers_dir() -> PathBuf {
 
 /// Get logs directory: ~/.casparian_flow/logs
 pub fn logs_dir() -> PathBuf {
-    casparian_home().join("logs")
+    default_logs_dir()
 }
 
 /// Ensure the logs directory exists

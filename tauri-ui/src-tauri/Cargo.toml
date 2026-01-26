@@ -37,6 +37,9 @@ tracing-appender = "0.2"
 # UUID for IDs
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Compile-time trait assertions
+static_assertions = "1"
+
 # Base64 for blob encoding
 base64 = "0.22"
 

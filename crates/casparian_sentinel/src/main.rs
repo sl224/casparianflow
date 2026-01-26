@@ -103,7 +103,7 @@ fn main() -> anyhow::Result<()> {
         control_addr,
         query_catalog_path: args
             .query_catalog
-            .unwrap_or_else(default_query_catalog_path),
+            .unwrap_or_else(casparian_protocol::paths::default_query_catalog_path),
     };
 
     // Bind and run
@@ -115,8 +115,10 @@ fn main() -> anyhow::Result<()> {
 
 fn resolve_state_store_url(state_store: &str) -> String {
     if state_store == casparian_protocol::defaults::DEFAULT_STATE_STORE_URL {
-        let home = casparian_home();
-        format!("sqlite:{}", home.join("state.sqlite").display())
+        format!(
+            "sqlite:{}",
+            casparian_protocol::paths::default_state_store_path().display()
+        )
     } else {
         normalize_state_store_url(state_store)
     }
@@ -139,21 +141,8 @@ fn looks_like_url(raw: &str) -> bool {
         || raw.starts_with("sqlserver:")
 }
 
-fn default_query_catalog_path() -> std::path::PathBuf {
-    casparian_home().join("query.duckdb")
-}
-
-fn casparian_home() -> std::path::PathBuf {
-    if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
-        return std::path::PathBuf::from(override_path);
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".casparian_flow"))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-}
-
 fn ensure_logs_dir() -> std::io::Result<std::path::PathBuf> {
-    let dir = casparian_home().join("logs");
+    let dir = casparian_protocol::paths::default_logs_dir();
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

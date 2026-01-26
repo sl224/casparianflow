@@ -22,8 +22,13 @@ pub mod error;
 pub mod http_types;
 pub mod idempotency;
 pub mod metrics;
+pub mod paths;
 pub mod telemetry;
 pub mod types;
+
+pub use paths::{
+    casparian_home, default_logs_dir, default_query_catalog_path, default_state_store_path,
+};
 
 // Re-export types for convenience
 pub use types::{

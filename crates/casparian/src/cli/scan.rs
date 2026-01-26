@@ -372,7 +372,9 @@ fn scanned_to_discovered(file: &ScannedFile) -> DiscoveredFile {
     }
 }
 
-fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Option<String>) {
+pub(crate) fn classify_scan_error(
+    err: &casparian::scout::error::ScoutError,
+) -> (String, Option<String>) {
     use casparian::scout::error::ScoutError;
     match err {
         ScoutError::Io(io_err) => ("io_error".to_string(), Some(format!("{:?}", io_err.kind()))),

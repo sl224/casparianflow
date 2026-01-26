@@ -1,0 +1,36 @@
+[package]
+name = "casparian_state_store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Semantic state store for Casparian Flow"
+
+[dependencies]
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Time
+chrono.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Casparian crates
+casparian_db = { path = "../casparian_db" }
+casparian_protocol = { path = "../casparian_protocol" }
+casparian_intent = { path = "../casparian_intent" }
+casparian_schema = { path = "../casparian_schema" }
+casparian_scout = { path = "../casparian_scout", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

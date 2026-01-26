@@ -126,13 +126,11 @@ impl TapeState {
     }
 }
 
-// TapeState needs to be Send + Sync for Tauri state management
-// TapeWriter uses Mutex internally, so this is safe
-unsafe impl Send for TapeState {}
-unsafe impl Sync for TapeState {}
-
 /// Thread-safe wrapper for TapeState.
 pub type SharedTapeState = Arc<RwLock<TapeState>>;
+
+static_assertions::assert_impl_all!(TapeState: Send, Sync);
+static_assertions::assert_impl_all!(SharedTapeState: Send, Sync);
 
 /// Create a shared tape state that is disabled (no recording).
 pub fn create_disabled_tape() -> SharedTapeState {

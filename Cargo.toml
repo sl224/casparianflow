@@ -17,6 +17,7 @@ members = [
     "crates/casparian_backtest",
     "crates/casparian_profiler",
     "crates/casparian_db",
+    "crates/casparian_state_store",
     "crates/casparian_mcp",
     "tauri-ui/src-tauri",
 ]

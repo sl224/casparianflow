@@ -123,18 +123,8 @@ fn main() {
         .expect("error while running tauri application");
 }
 
-fn casparian_home() -> Option<std::path::PathBuf> {
-    if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
-        return Some(std::path::PathBuf::from(override_path));
-    }
-    dirs::home_dir().map(|h| h.join(".casparian_flow"))
-}
-
 fn ensure_logs_dir() -> std::io::Result<std::path::PathBuf> {
-    let home = casparian_home().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "home directory not found")
-    })?;
-    let dir = home.join("logs");
+    let dir = casparian_protocol::paths::default_logs_dir();
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

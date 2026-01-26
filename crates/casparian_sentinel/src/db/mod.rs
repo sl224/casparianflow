@@ -1,20 +1,21 @@
-//! Database layer for Sentinel
-//!
-//! Ported from Python SQLAlchemy to Rust with casparian_db.
+//! Database layer for Sentinel (re-exported from state store).
 
-pub mod api_storage;
-pub mod expected_outputs;
-pub mod legacy_models;
-pub mod models;
-pub mod queue;
-pub mod schema_version;
-pub mod sessions;
+pub use casparian_state_store::api_storage;
+pub use casparian_state_store::expected_outputs;
+pub use casparian_state_store::legacy_models;
+pub use casparian_state_store::models;
+pub use casparian_state_store::queue;
+pub use casparian_state_store::schema_version;
+pub use casparian_state_store::sessions;
 
-pub use api_storage::ApiStorage;
+pub use casparian_state_store::ApiStorage;
+pub use casparian_state_store::ExpectedOutputs;
+pub use casparian_state_store::JobQueue;
+pub use casparian_state_store::OutputSpec;
+pub use casparian_state_store::QueueStats;
+pub use casparian_state_store::SessionStorage;
+pub use casparian_state_store::{ensure_schema_version, SCHEMA_VERSION};
+
 pub use casparian_intent::{
     IntentState, QuestionKind, QuestionOption, Session, SessionId, SessionQuestion,
 };
-pub use expected_outputs::{ExpectedOutputs, OutputSpec};
-pub use queue::{Job, JobQueue, QueueStats};
-pub use schema_version::{ensure_schema_version, SCHEMA_VERSION};
-pub use sessions::SessionStorage;

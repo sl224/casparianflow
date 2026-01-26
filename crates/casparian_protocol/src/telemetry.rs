@@ -174,17 +174,7 @@ impl TelemetryHasher {
 }
 
 fn telemetry_salt_path() -> PathBuf {
-    casparian_home().join("telemetry").join("salt")
-}
-
-fn casparian_home() -> PathBuf {
-    if let Ok(override_path) = std::env::var("CASPARIAN_HOME") {
-        return PathBuf::from(override_path);
-    }
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
-        return PathBuf::from(home).join(".casparian_flow");
-    }
-    PathBuf::from(".").join(".casparian_flow")
+    crate::paths::casparian_home().join("telemetry").join("salt")
 }
 
 fn generate_salt() -> [u8; 32] {

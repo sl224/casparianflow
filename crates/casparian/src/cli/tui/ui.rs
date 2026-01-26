@@ -2754,117 +2754,35 @@ fn draw_scan_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, inner_area);
 }
 
-/// Draw the Scanning progress dialog as an overlay
-fn draw_scanning_dialog(frame: &mut Frame, app: &App, area: Rect) {
-    let dialog_area = render_centered_dialog(frame, area, 60, 9);
-
-    // Animated spinner for title
-    let spinner = spinner_ascii(app.tick_count);
+/// Draw the scan started dialog as an overlay
+fn draw_scanning_dialog(frame: &mut Frame, _app: &App, area: Rect) {
+    let dialog_area = render_centered_dialog(frame, area, 60, 7);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(Color::Green))
         .title(Span::styled(
-            format!(" [{}] Scanning ", spinner),
-            Style::default().fg(Color::Yellow).bold(),
+            " Scan Started ",
+            Style::default().fg(Color::Green).bold(),
         ));
 
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
 
-    // Get progress - IMPORTANT: scan_progress contains the REAL values
-    let progress = app.discover.scan_progress.as_ref();
-    let files_found = progress.map(|p| p.files_found).unwrap_or(0);
-    let files_persisted = progress.map(|p| p.files_persisted).unwrap_or(0);
-    let dirs = progress.map(|p| p.dirs_scanned).unwrap_or(0);
-    let current = progress.and_then(|p| p.current_dir.clone());
-    let files_per_sec = progress.map(|p| p.files_per_sec).unwrap_or(0.0);
-    let stalled = progress.map(|p| p.stalled).unwrap_or(false);
-
-    // Elapsed time from scan_start_time
-    let elapsed_ms = progress
-        .map(|p| p.elapsed_ms)
-        .or_else(|| {
-            app.discover
-                .scan_start_time
-                .map(|t| t.elapsed().as_millis() as u64)
-        })
-        .unwrap_or(0);
-    let secs = elapsed_ms / 1_000;
-    let time_str = if secs >= 60 {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}s", secs)
-    };
-
-    // Path being scanned
-    let path = app.discover.scanning_path.as_deref().unwrap_or("...");
-    let w = inner.width as usize;
-    let path_display = if path.len() > w.saturating_sub(10) {
-        let take = w.saturating_sub(13);
-        format!("...{}", &path[path.len().saturating_sub(take)..])
-    } else {
-        path.to_string()
-    };
-
-    // Current directory hint
-    let hint = match &current {
-        Some(d) if d != "Initializing..." => {
-            if d.len() > w.saturating_sub(6) {
-                let take = w.saturating_sub(9);
-                format!("...{}", &d[d.len().saturating_sub(take)..])
-            } else {
-                d.clone()
-            }
-        }
-        _ => {
-            let dots = ["   ", ".  ", ".. ", "..."][(app.tick_count / 4) as usize % 4];
-            format!("scanning{}", dots)
-        }
-    };
-
-    // Render each line explicitly - using raw strings to fill width
-    let pad = |s: &str| format!("{:<width$}", s, width = w);
-
-    // Line 0: Path
-    let line0 = format!("  Path: {}", path_display);
-    // Line 1: empty
-    // Line 2: Stats (THE MAIN PROGRESS LINE)
-    // Show crawled/persisted to diagnose bottlenecks
-    let rate_str = format!("{:.1} files/s", files_per_sec);
-    let stall_str = if stalled { " | STALLED" } else { "" };
-    let line2 = format!(
-        "  {}/{} files | {} dirs | {} | {}{}",
-        files_found, files_persisted, dirs, time_str, rate_str, stall_str
-    );
-    // Line 3: empty
-    // Line 4: Current directory hint
-    let line4 = format!("  {}", hint);
-    // Line 5: empty
-    // Line 6: Navigation
-    let line6 = "  [Esc] Cancel  [0] Home  [3] Jobs";
-
-    let progress_style = if stalled {
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(ratatui::style::Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(ratatui::style::Modifier::BOLD)
-    };
-
-    let text = vec![
-        Line::styled(pad(&line0), Style::default().fg(Color::White)),
-        Line::raw(pad("")),
-        Line::styled(pad(&line2), progress_style),
-        Line::raw(pad("")),
-        Line::styled(pad(&line4), Style::default().fg(Color::DarkGray)),
-        Line::raw(pad("")),
-        Line::styled(pad(line6), Style::default().fg(Color::DarkGray)),
+    let content = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Scan started.",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  View progress in Jobs: press [2]",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(Paragraph::new(content), inner);
 }
 
 fn tag_suggestions<'a>(input: &str, tags: &'a [String], limit: usize) -> Vec<&'a str> {
@@ -5160,12 +5078,16 @@ fn render_actionable_job_line(
     };
 
     let trailing = if job.status == JobStatus::Running {
-        let pct = if job.items_total > 0 {
-            (job.items_processed as f64 / job.items_total as f64 * 100.0) as u8
+        if job.job_type == JobType::Scan {
+            "scanning".to_string()
         } else {
-            0
-        };
-        format!("{} {}%", render_progress_bar(pct, 10), pct)
+            let pct = if job.items_total > 0 {
+                (job.items_processed as f64 / job.items_total as f64 * 100.0) as u8
+            } else {
+                0
+            };
+            format!("{} {}%", render_progress_bar(pct, 10), pct)
+        }
     } else if job.status == JobStatus::Pending {
         "queued".to_string()
     } else {
@@ -5187,11 +5109,17 @@ fn render_actionable_job_line(
 
     let detail = match job.status {
         JobStatus::Running => {
-            let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
-            format!(
-                "    {}/{} files • ETA {}",
-                job.items_processed, job.items_total, eta
-            )
+            if job.job_type == JobType::Scan {
+                let processed = format_number(job.items_processed as u64);
+                let discovered = format_number(job.items_total as u64);
+                format!("    Indexed {} • Found {}", processed, discovered)
+            } else {
+                let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
+                format!(
+                    "    {}/{} files • ETA {}",
+                    job.items_processed, job.items_total, eta
+                )
+            }
         }
         JobStatus::Failed => {
             let err = job
@@ -5246,11 +5174,19 @@ fn draw_job_detail(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         if job.status == JobStatus::Running {
-            let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
-            detail.push_str(&format!(
-                "\nProgress: {}/{} files • ETA {}\n",
-                job.items_processed, job.items_total, eta
-            ));
+            if job.job_type == JobType::Scan {
+                detail.push_str(&format!(
+                    "\nProgress: Indexed {} • Found {}\n",
+                    format_number(job.items_processed as u64),
+                    format_number(job.items_total as u64)
+                ));
+            } else {
+                let eta = calculate_eta(job.items_processed, job.items_total, job.started_at);
+                detail.push_str(&format!(
+                    "\nProgress: {}/{} files • ETA {}\n",
+                    job.items_processed, job.items_total, eta
+                ));
+            }
         } else if job.status == JobStatus::Pending {
             detail.push_str("\nQueued\n");
         }
@@ -7982,7 +7918,7 @@ fn draw_catalog_inspector(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::tui::app::{JobInfo, JobType, JobsState};
+    use crate::cli::tui::app::{JobInfo, JobOrigin, JobType, JobsState};
     use crate::cli::tui::flow_record::RecordRedaction;
     use crate::cli::tui::TuiArgs;
     use chrono::Local;
@@ -7994,6 +7930,7 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("casparian_test_{}.duckdb", uuid::Uuid::new_v4())),
             ),
+            standalone_writer: false,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,
@@ -8005,6 +7942,7 @@ mod tests {
             id,
             file_id: Some(id * 100),
             job_type: JobType::Parse,
+            origin: JobOrigin::Persistent,
             name: name.to_string(),
             version: Some("1.0.0".to_string()),
             status,
