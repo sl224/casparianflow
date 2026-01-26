@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn test_executor_handle_enqueue() {
         let temp = tempfile::TempDir::new().unwrap();
-        let db_path = temp.path().join("test.duckdb");
+        let db_path = temp.path().join("test.sqlite");
 
         // Spawn Core (owns JobManager)
         let (core, _events, _thread) = spawn_core(db_path).unwrap();
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn test_executor_handle_cancel_no_job() {
         let temp = tempfile::TempDir::new().unwrap();
-        let db_path = temp.path().join("test.duckdb");
+        let db_path = temp.path().join("test.sqlite");
 
         // Spawn Core (owns JobManager)
         let (core, _events, _thread) = spawn_core(db_path).unwrap();

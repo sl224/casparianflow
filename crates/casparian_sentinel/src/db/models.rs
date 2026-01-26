@@ -2,12 +2,11 @@
 //!
 //! These models are backend-agnostic and map from casparian_db rows.
 
-use casparian_db::{BackendError, DbTimestamp, UnifiedDbRow};
+use casparian_db::{BackendError, UnifiedDbRow};
 use casparian_protocol::{
     JobStatus as ProtocolJobStatus, PluginStatus, ProcessingStatus, QuarantineConfig, RuntimeKind,
     SinkMode,
 };
-
 // Re-export canonical enums from protocol for convenience
 pub use casparian_protocol::{PluginStatus as PluginStatusEnum, ProcessingStatus as StatusEnum};
 
@@ -158,8 +157,8 @@ pub struct ProcessingJob {
     pub priority: i32,
     pub worker_host: Option<String>,
     pub worker_pid: Option<i32>,
-    pub claim_time: Option<DbTimestamp>,
-    pub end_time: Option<DbTimestamp>,
+    pub claim_time: Option<i64>,
+    pub end_time: Option<i64>,
     pub result_summary: Option<String>,
     pub error_message: Option<String>,
     pub retry_count: i32,
@@ -222,8 +221,8 @@ pub struct PluginManifest {
     pub source_hash: String,
     pub status: PluginStatus,
     pub validation_error: Option<String>,
-    pub created_at: DbTimestamp,
-    pub deployed_at: Option<DbTimestamp>,
+    pub created_at: i64,
+    pub deployed_at: Option<i64>,
     pub env_hash: String,
     pub artifact_hash: String,
     pub manifest_json: String,
@@ -293,7 +292,7 @@ pub struct DeadLetterJob {
     pub plugin_name: String,
     pub error_message: Option<String>,
     pub retry_count: i32,
-    pub moved_at: DbTimestamp,
+    pub moved_at: i64,
     pub reason: Option<String>,
 }
 
@@ -334,9 +333,9 @@ pub struct ParserHealth {
     pub successful_executions: i64,
     pub consecutive_failures: i32,
     pub last_failure_reason: Option<String>,
-    pub paused_at: Option<DbTimestamp>,
-    pub created_at: DbTimestamp,
-    pub updated_at: DbTimestamp,
+    pub paused_at: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 impl ParserHealth {
@@ -373,7 +372,7 @@ pub struct QuarantinedRow {
     pub row_index: i64,
     pub error_reason: String,
     pub raw_data: Option<Vec<u8>>,
-    pub created_at: DbTimestamp,
+    pub created_at: i64,
 }
 
 impl QuarantinedRow {
@@ -395,7 +394,7 @@ pub struct QuarantinedRowSummary {
     pub job_id: i64,
     pub row_index: i64,
     pub error_reason: String,
-    pub created_at: DbTimestamp,
+    pub created_at: i64,
 }
 
 impl QuarantinedRowSummary {
@@ -504,8 +503,8 @@ mod tests {
             consecutive_failures: 0,
             last_failure_reason: None,
             paused_at: None,
-            created_at: DbTimestamp::now(),
-            updated_at: DbTimestamp::now(),
+            created_at: Utc::now().timestamp_millis(),
+            updated_at: Utc::now().timestamp_millis(),
         };
         assert_eq!(health.success_rate(), 100.0);
     }

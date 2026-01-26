@@ -4,8 +4,8 @@ use serde::Serialize;
 
 use super::app::{
     App, ApprovalStatusFilter, ApprovalsViewState, CatalogTab, CommandPaletteMode, DiscoverFocus,
-    DiscoverViewState, JobsListSection, JobsViewState, ParserBenchView, QueryViewState,
-    SessionsViewState, SettingsCategory, ShellFocus, SourcesState, TriageTab, TuiMode,
+    DiscoverViewState, IngestTab, JobsListSection, JobsViewState, QueryViewState, ReviewTab,
+    RunTab, SessionsViewState, SettingsCategory, ShellFocus, SourcesState, TriageTab, TuiMode,
     WorkspaceSwitcherMode,
 };
 use super::extraction::{FileResultsState, RuleBuilderFocus};
@@ -15,13 +15,15 @@ pub struct UiSignature {
     pub mode: UiMode,
     pub shell_focus: UiShellFocus,
     pub nav_selected: Option<usize>,
+    pub ingest_tab: UiIngestTab,
+    pub run_tab: UiRunTab,
+    pub review_tab: UiReviewTab,
     pub overlays: UiOverlays,
     pub home: Option<HomeSignature>,
     pub discover: Option<DiscoverSignature>,
     pub jobs: Option<JobsSignature>,
     pub sources: Option<SourcesSignature>,
     pub approvals: Option<ApprovalsSignature>,
-    pub parser_bench: Option<ParserBenchSignature>,
     pub query: Option<QuerySignature>,
     pub settings: Option<SettingsSignature>,
     pub sessions: Option<SessionsSignature>,
@@ -37,6 +39,9 @@ impl UiSignature {
             ShellFocus::Rail => Some(app.nav_selected),
             ShellFocus::Main => None,
         };
+        let ingest_tab = UiIngestTab::from(app.ingest_tab);
+        let run_tab = UiRunTab::from(app.run_tab);
+        let review_tab = UiReviewTab::from(app.review_tab);
 
         let overlays = UiOverlays {
             show_help: app.show_help,
@@ -65,7 +70,7 @@ impl UiSignature {
         };
 
         let discover = match app.mode {
-            TuiMode::Discover => {
+            TuiMode::Ingest if app.ingest_tab != IngestTab::Sources => {
                 let rule_builder = if app.discover.view_state == DiscoverViewState::RuleBuilder {
                     app.discover
                         .rule_builder
@@ -93,7 +98,7 @@ impl UiSignature {
         };
 
         let jobs = match app.mode {
-            TuiMode::Jobs => Some(JobsSignature {
+            TuiMode::Run if app.run_tab == RunTab::Jobs => Some(JobsSignature {
                 view_state: JobsViewStateKey::from(app.jobs_state.view_state),
                 section_focus: JobsListSectionKey::from(app.jobs_state.section_focus),
                 show_pipeline: app.jobs_state.show_pipeline,
@@ -102,25 +107,16 @@ impl UiSignature {
         };
 
         let sources = match app.mode {
-            TuiMode::Sources => Some(SourcesSignature::from_state(&app.sources_state)),
+            TuiMode::Ingest if app.ingest_tab == IngestTab::Sources => {
+                Some(SourcesSignature::from_state(&app.sources_state))
+            }
             _ => None,
         };
 
         let approvals = match app.mode {
-            TuiMode::Approvals => Some(ApprovalsSignature {
+            TuiMode::Review if app.review_tab == ReviewTab::Approvals => Some(ApprovalsSignature {
                 view_state: ApprovalsViewStateKey::from(app.approvals_state.view_state),
                 filter: ApprovalStatusFilterKey::from(app.approvals_state.filter),
-            }),
-            _ => None,
-        };
-
-        let parser_bench = match app.mode {
-            TuiMode::ParserBench => Some(ParserBenchSignature {
-                view: ParserBenchViewKey::from(app.parser_bench.view),
-                focus_mode: app.parser_bench.focus_mode,
-                filtering: app.parser_bench.is_filtering,
-                test_running: app.parser_bench.test_running,
-                has_test_result: app.parser_bench.test_result.is_some(),
             }),
             _ => None,
         };
@@ -141,21 +137,21 @@ impl UiSignature {
         };
 
         let sessions = match app.mode {
-            TuiMode::Sessions => Some(SessionsSignature {
+            TuiMode::Review if app.review_tab == ReviewTab::Sessions => Some(SessionsSignature {
                 view_state: SessionsViewStateKey::from(app.sessions_state.view_state),
             }),
             _ => None,
         };
 
         let triage = match app.mode {
-            TuiMode::Triage => Some(TriageSignature {
+            TuiMode::Review if app.review_tab == ReviewTab::Triage => Some(TriageSignature {
                 tab: TriageTabKey::from(app.triage_state.tab),
             }),
             _ => None,
         };
 
         let catalog = match app.mode {
-            TuiMode::Catalog => Some(CatalogSignature {
+            TuiMode::Run if app.run_tab == RunTab::Outputs => Some(CatalogSignature {
                 tab: CatalogTabKey::from(app.catalog_state.tab),
             }),
             _ => None,
@@ -165,13 +161,15 @@ impl UiSignature {
             mode,
             shell_focus,
             nav_selected,
+            ingest_tab,
+            run_tab,
+            review_tab,
             overlays,
             home,
             discover,
             jobs,
             sources,
             approvals,
-            parser_bench,
             query,
             settings,
             sessions,
@@ -188,6 +186,9 @@ impl UiSignature {
             Some(idx) => parts.push(format!("nav={}", idx)),
             None => parts.push("nav=none".to_string()),
         }
+        parts.push(format!("ingest.tab={}", self.ingest_tab.as_str()));
+        parts.push(format!("run.tab={}", self.run_tab.as_str()));
+        parts.push(format!("review.tab={}", self.review_tab.as_str()));
         parts.push(format!("help={}", bool_key(self.overlays.show_help)));
         parts.push(format!(
             "inspector={}",
@@ -261,26 +262,6 @@ impl UiSignature {
         if let Some(ref approvals) = self.approvals {
             parts.push(format!("approvals.view={}", approvals.view_state.as_str()));
             parts.push(format!("approvals.filter={}", approvals.filter.as_str()));
-        }
-
-        if let Some(ref bench) = self.parser_bench {
-            parts.push(format!("parser_bench.view={}", bench.view.as_str()));
-            parts.push(format!(
-                "parser_bench.focus_mode={}",
-                bool_key(bench.focus_mode)
-            ));
-            parts.push(format!(
-                "parser_bench.filtering={}",
-                bool_key(bench.filtering)
-            ));
-            parts.push(format!(
-                "parser_bench.test_running={}",
-                bool_key(bench.test_running)
-            ));
-            parts.push(format!(
-                "parser_bench.has_result={}",
-                bool_key(bench.has_test_result)
-            ));
         }
 
         if let Some(ref query) = self.query {
@@ -396,15 +377,6 @@ pub struct ApprovalsSignature {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub struct ParserBenchSignature {
-    pub view: ParserBenchViewKey,
-    pub focus_mode: bool,
-    pub filtering: bool,
-    pub test_running: bool,
-    pub has_test_result: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct QuerySignature {
     pub view_state: QueryViewStateKey,
 }
@@ -434,32 +406,22 @@ pub struct CatalogSignature {
 #[serde(rename_all = "snake_case")]
 pub enum UiMode {
     Home,
-    Discover,
-    Jobs,
-    Sources,
-    Approvals,
-    ParserBench,
+    Ingest,
+    Run,
+    Review,
     Query,
     Settings,
-    Sessions,
-    Triage,
-    Catalog,
 }
 
 impl UiMode {
     pub fn as_str(self) -> &'static str {
         match self {
             UiMode::Home => "home",
-            UiMode::Discover => "discover",
-            UiMode::Jobs => "jobs",
-            UiMode::Sources => "sources",
-            UiMode::Approvals => "approvals",
-            UiMode::ParserBench => "parser_bench",
+            UiMode::Ingest => "ingest",
+            UiMode::Run => "run",
+            UiMode::Review => "review",
             UiMode::Query => "query",
             UiMode::Settings => "settings",
-            UiMode::Sessions => "sessions",
-            UiMode::Triage => "triage",
-            UiMode::Catalog => "catalog",
         }
     }
 }
@@ -468,16 +430,95 @@ impl From<TuiMode> for UiMode {
     fn from(value: TuiMode) -> Self {
         match value {
             TuiMode::Home => UiMode::Home,
-            TuiMode::Discover => UiMode::Discover,
-            TuiMode::Jobs => UiMode::Jobs,
-            TuiMode::Sources => UiMode::Sources,
-            TuiMode::Approvals => UiMode::Approvals,
-            TuiMode::ParserBench => UiMode::ParserBench,
+            TuiMode::Ingest => UiMode::Ingest,
+            TuiMode::Run => UiMode::Run,
+            TuiMode::Review => UiMode::Review,
             TuiMode::Query => UiMode::Query,
             TuiMode::Settings => UiMode::Settings,
-            TuiMode::Sessions => UiMode::Sessions,
-            TuiMode::Triage => UiMode::Triage,
-            TuiMode::Catalog => UiMode::Catalog,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiIngestTab {
+    Sources,
+    Select,
+    Rules,
+    Validate,
+}
+
+impl UiIngestTab {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiIngestTab::Sources => "sources",
+            UiIngestTab::Select => "select",
+            UiIngestTab::Rules => "rules",
+            UiIngestTab::Validate => "validate",
+        }
+    }
+}
+
+impl From<IngestTab> for UiIngestTab {
+    fn from(value: IngestTab) -> Self {
+        match value {
+            IngestTab::Sources => UiIngestTab::Sources,
+            IngestTab::Select => UiIngestTab::Select,
+            IngestTab::Rules => UiIngestTab::Rules,
+            IngestTab::Validate => UiIngestTab::Validate,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiRunTab {
+    Jobs,
+    Outputs,
+}
+
+impl UiRunTab {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiRunTab::Jobs => "jobs",
+            UiRunTab::Outputs => "outputs",
+        }
+    }
+}
+
+impl From<RunTab> for UiRunTab {
+    fn from(value: RunTab) -> Self {
+        match value {
+            RunTab::Jobs => UiRunTab::Jobs,
+            RunTab::Outputs => UiRunTab::Outputs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiReviewTab {
+    Triage,
+    Approvals,
+    Sessions,
+}
+
+impl UiReviewTab {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiReviewTab::Triage => "triage",
+            UiReviewTab::Approvals => "approvals",
+            UiReviewTab::Sessions => "sessions",
+        }
+    }
+}
+
+impl From<ReviewTab> for UiReviewTab {
+    fn from(value: ReviewTab) -> Self {
+        match value {
+            ReviewTab::Triage => UiReviewTab::Triage,
+            ReviewTab::Approvals => UiReviewTab::Approvals,
+            ReviewTab::Sessions => UiReviewTab::Sessions,
         }
     }
 }
@@ -855,28 +896,6 @@ impl From<ApprovalStatusFilter> for ApprovalStatusFilterKey {
             ApprovalStatusFilter::Rejected => ApprovalStatusFilterKey::Rejected,
             ApprovalStatusFilter::Expired => ApprovalStatusFilterKey::Expired,
             ApprovalStatusFilter::All => ApprovalStatusFilterKey::All,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ParserBenchViewKey {
-    ParserList,
-}
-
-impl ParserBenchViewKey {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ParserBenchViewKey::ParserList => "parser_list",
-        }
-    }
-}
-
-impl From<ParserBenchView> for ParserBenchViewKey {
-    fn from(value: ParserBenchView) -> Self {
-        match value {
-            ParserBenchView::ParserList => ParserBenchViewKey::ParserList,
         }
     }
 }

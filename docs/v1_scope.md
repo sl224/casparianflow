@@ -89,7 +89,7 @@ MCP makes Casparian a **force multiplier** rather than just another CLI tool.
 | `casparian_schema_propose` | Propose schema changes (ephemeral) | None (ephemeral) |
 | `casparian_schema_promote` | Generate schema-as-code for publish | **Requires approval** |
 | `casparian_quarantine_summary` | Get violation summary with samples | None (read-only) |
-| `casparian_query` | Run SQL on DuckDB outputs | None (read-only) |
+| `casparian_query` | Run SQL on DuckDB query catalog (views over Parquet) | None (read-only) |
 
 ### MCP Architecture
 
@@ -114,7 +114,7 @@ MCP makes Casparian a **force multiplier** rather than just another CLI tool.
 │                    Casparian Core                                │
 │  • Parser execution (Python bridge / native runtime)            │
 │  • Schema validation (Rust)                                     │
-│  • Output sinks (Parquet / DuckDB)                              │
+│  • Output sinks (Parquet / SQL sinks)                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

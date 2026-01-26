@@ -1,14 +1,14 @@
-//! DuckDB-backed pipeline storage.
+//! State-store pipeline storage.
 //!
-//! Uses DbConnection to keep the actor boundary intact and reuse DuckDB
-//! query paths already in casparian_db.
+//! Uses DbConnection to keep the actor boundary intact and reuse shared query
+//! paths across state-store backends.
 
 use crate::scout::FileStatus;
 use anyhow::{Context, Result};
 use casparian_protocol::{JobId, PipelineRunStatus};
 use std::path::Path;
 
-use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow as DbRow};
+use casparian_db::{DbConnection, DbValue, UnifiedDbRow as DbRow};
 
 use super::types::{
     Pipeline, PipelineRun, SelectionFilters, SelectionResolution, SelectionSnapshot, WatermarkField,
@@ -95,23 +95,38 @@ fn row_to_pipeline(row: DbRow) -> Result<Pipeline> {
 }
 
 fn timestamp_to_string(row: &DbRow, name: &str) -> Result<String> {
-    let ts: DbTimestamp = row.get_by_name(name)?;
-    Ok(ts.to_rfc3339())
+    let ts: i64 = row.get_by_name(name)?;
+    Ok(millis_to_rfc3339(ts))
 }
 
 fn timestamp_to_string_opt(row: &DbRow, name: &str) -> Result<Option<String>> {
-    let ts: Option<DbTimestamp> = row.get_by_name(name)?;
-    Ok(ts.map(|value| value.to_rfc3339()))
+    let ts: Option<i64> = row.get_by_name(name)?;
+    Ok(ts.map(millis_to_rfc3339))
 }
 
-pub struct DuckDbPipelineStore {
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH - check system clock")
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn millis_to_rfc3339(millis: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .unwrap_or_else(|| chrono::Utc::now())
+        .to_rfc3339()
+}
+
+pub struct PipelineStore {
     conn: DbConnection,
 }
 
-impl DuckDbPipelineStore {
+impl PipelineStore {
     pub fn open(db_path: &Path) -> Result<Self> {
-        let db_url = format!("duckdb:{}", db_path.display());
-        let conn = DbConnection::open_from_url(&db_url).context("Failed to connect to DuckDB")?;
+        let db_url = format!("sqlite:{}", db_path.display());
+        let conn = DbConnection::open_from_url(&db_url).context("Failed to connect to SQLite")?;
         let store = Self { conn };
         store.initialize_tables()?;
         Ok(store)
@@ -244,7 +259,7 @@ impl DuckDbPipelineStore {
                 CREATE TABLE IF NOT EXISTS cf_selection_specs (
                     id TEXT PRIMARY KEY,
                     spec_json TEXT NOT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cf_selection_snapshots (
@@ -253,7 +268,7 @@ impl DuckDbPipelineStore {
                     snapshot_hash TEXT NOT NULL,
                     logical_date TEXT NOT NULL,
                     watermark_value TEXT,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cf_selection_snapshot_files (
@@ -273,7 +288,7 @@ impl DuckDbPipelineStore {
                     name TEXT NOT NULL,
                     version BIGINT NOT NULL,
                     config_json TEXT NOT NULL,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at INTEGER NOT NULL
                 );
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_pipelines_name_version
@@ -288,9 +303,9 @@ impl DuckDbPipelineStore {
                     logical_date TEXT NOT NULL,
                     status TEXT NOT NULL
                         CHECK (status IN ({pipeline_status_values})),
-                    started_at TIMESTAMP,
-                    completed_at TIMESTAMP,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    started_at INTEGER,
+                    completed_at INTEGER,
+                    created_at INTEGER NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pipeline
@@ -306,13 +321,17 @@ impl DuckDbPipelineStore {
     }
 }
 
-impl DuckDbPipelineStore {
+impl PipelineStore {
     pub fn create_selection_spec(&self, spec_json: &str) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         self.conn
             .execute(
-                "INSERT INTO cf_selection_specs (id, spec_json) VALUES (?, ?)",
-                &[DbValue::from(id.as_str()), DbValue::from(spec_json)],
+                "INSERT INTO cf_selection_specs (id, spec_json, created_at) VALUES (?, ?, ?)",
+                &[
+                    DbValue::from(id.as_str()),
+                    DbValue::from(spec_json),
+                    DbValue::from(now_millis()),
+                ],
             )
             .context("Failed to insert selection spec")?;
         Ok(id)
@@ -330,9 +349,9 @@ impl DuckDbPipelineStore {
             .execute(
                 r#"
                 INSERT INTO cf_selection_snapshots (
-                    id, spec_id, snapshot_hash, logical_date, watermark_value
+                    id, spec_id, snapshot_hash, logical_date, watermark_value, created_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?)
                 "#,
                 &[
                     DbValue::from(id.as_str()),
@@ -340,6 +359,7 @@ impl DuckDbPipelineStore {
                     DbValue::from(snapshot_hash),
                     DbValue::from(logical_date),
                     DbValue::from(watermark_value),
+                    DbValue::from(now_millis()),
                 ],
             )
             .context("Failed to insert selection snapshot")?;
@@ -362,12 +382,13 @@ impl DuckDbPipelineStore {
         let id = Uuid::new_v4().to_string();
         self.conn
             .execute(
-                "INSERT INTO cf_pipelines (id, name, version, config_json) VALUES (?, ?, ?, ?)",
+                "INSERT INTO cf_pipelines (id, name, version, config_json, created_at) VALUES (?, ?, ?, ?, ?)",
                 &[
                     DbValue::from(id.as_str()),
                     DbValue::from(name),
                     DbValue::from(version),
                     DbValue::from(config_json),
+                    DbValue::from(now_millis()),
                 ],
             )
             .context("Failed to insert pipeline")?;
@@ -412,9 +433,10 @@ impl DuckDbPipelineStore {
                     selection_snapshot_hash,
                     context_snapshot_hash,
                     logical_date,
-                    status
+                    status,
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 &[
                     DbValue::from(id.as_str()),
@@ -424,6 +446,7 @@ impl DuckDbPipelineStore {
                     DbValue::from(context_snapshot_hash),
                     DbValue::from(logical_date),
                     DbValue::from(status.as_str()),
+                    DbValue::from(now_millis()),
                 ],
             )
             .context("Failed to insert pipeline run")?;
@@ -440,19 +463,26 @@ impl DuckDbPipelineStore {
         };
 
         let mut query = String::from("UPDATE cf_pipeline_runs SET status = ?");
+        let now = now_millis();
         if set_started {
-            query.push_str(", started_at = CURRENT_TIMESTAMP");
+            query.push_str(", started_at = ?");
         }
         if set_completed {
-            query.push_str(", completed_at = CURRENT_TIMESTAMP");
+            query.push_str(", completed_at = ?");
         }
         query.push_str(" WHERE id = ?");
 
+        let mut params = vec![DbValue::from(status.as_str())];
+        if set_started {
+            params.push(DbValue::from(now));
+        }
+        if set_completed {
+            params.push(DbValue::from(now));
+        }
+        params.push(DbValue::from(run_id));
+
         self.conn
-            .execute(
-                &query,
-                &[DbValue::from(status.as_str()), DbValue::from(run_id)],
-            )
+            .execute(&query, &params)
             .context("Failed to update pipeline run status")?;
         Ok(())
     }

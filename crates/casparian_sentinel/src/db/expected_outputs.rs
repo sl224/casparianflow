@@ -179,7 +179,7 @@ impl ExpectedOutputs {
 mod tests {
     use super::*;
     use crate::db::queue::JobQueue;
-    use casparian_db::DbTimestamp;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn setup_db() -> DbConnection {
         let conn = DbConnection::open_duckdb_memory().unwrap();
@@ -194,7 +194,7 @@ mod tests {
         version: &str,
         outputs_json: &str,
     ) {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         // Generate unique source_hash using plugin_name and version
         let source_hash = format!("hash_{}_{}", plugin_name, version);
         conn.execute(
@@ -212,11 +212,20 @@ mod tests {
                 DbValue::from(version),
                 DbValue::from(source_hash.as_str()),
                 DbValue::from(outputs_json),
-                DbValue::from(now.clone()),
+                DbValue::from(now),
                 DbValue::from(now),
             ],
         )
         .unwrap();
+    }
+
+    fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("SystemTime before UNIX_EPOCH - check system clock")
+            .as_millis()
+            .try_into()
+            .unwrap_or(i64::MAX)
     }
 
     #[test]

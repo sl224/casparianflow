@@ -146,27 +146,7 @@ impl SchemaStorage {
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool, StorageError> {
-        let (query, params) = match self.conn.backend_name() {
-            "DuckDB" => (
-                "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?"
-                    .to_string(),
-                vec![DbValue::from(table), DbValue::from(column)],
-            ),
-            "SQLite" => (
-                format!(
-                    "SELECT 1 FROM pragma_table_info('{}') WHERE name = ?",
-                    table.replace('\'', "''")
-                ),
-                vec![DbValue::from(column)],
-            ),
-            _ => (
-                "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?"
-                    .to_string(),
-                vec![DbValue::from(table), DbValue::from(column)],
-            ),
-        };
-
-        Ok(self.conn.query_optional(&query, &params)?.is_some())
+        Ok(self.conn.column_exists(table, column)?)
     }
 
     /// Save a schema contract to the database.

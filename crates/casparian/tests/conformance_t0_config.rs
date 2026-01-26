@@ -19,56 +19,62 @@ fn conf_t0_config_json_paths() {
         .expect("config.home present");
     assert_eq!(Path::new(home), home_dir.path());
 
-    let database = config
-        .get("database")
+    let state_store = config
+        .get("state_store")
         .and_then(|value| value.as_object())
-        .expect("config.database present");
-    let backend = database
+        .expect("config.state_store present");
+    let backend = state_store
         .get("backend")
         .and_then(|value| value.as_str())
-        .expect("database.backend present");
-    assert_eq!(backend, "duckdb");
+        .expect("state_store.backend present");
+    assert_eq!(backend, "sqlite");
 
-    let active_path = database
-        .get("active_path")
+    let state_path = state_store
+        .get("path")
         .and_then(|value| value.as_str())
-        .expect("database.active_path present");
-    let duckdb_path = database
-        .get("duckdb_path")
-        .and_then(|value| value.as_str())
-        .expect("database.duckdb_path present");
-    let expected_db_path = home_dir.path().join("casparian_flow.duckdb");
-    assert_eq!(Path::new(active_path), expected_db_path);
-    assert_eq!(Path::new(duckdb_path), expected_db_path);
+        .expect("state_store.path present");
+    let expected_db_path = home_dir.path().join("state.sqlite");
+    assert_eq!(Path::new(state_path), expected_db_path);
 
-    let duckdb_exists = database
-        .get("duckdb_exists")
+    let state_exists = state_store
+        .get("exists")
         .and_then(|value| value.as_bool())
-        .expect("database.duckdb_exists present");
-    assert!(!duckdb_exists, "duckdb should not exist yet");
+        .expect("state_store.exists present");
+    assert!(!state_exists, "state store should not exist yet");
+
+    let query_catalog = config
+        .get("query_catalog")
+        .and_then(|value| value.as_object())
+        .expect("config.query_catalog present");
+    let query_path = query_catalog
+        .get("path")
+        .and_then(|value| value.as_str())
+        .expect("query_catalog.path present");
+    let query_exists = query_catalog
+        .get("exists")
+        .and_then(|value| value.as_bool())
+        .expect("query_catalog.exists present");
+    assert!(!query_exists, "query catalog should not exist yet");
+    let expected_query_path = home_dir.path().join("query.duckdb");
+    assert_eq!(Path::new(query_path), expected_query_path);
 
     init_scout_schema(&expected_db_path);
-    assert!(expected_db_path.exists(), "duckdb file created");
+    assert!(expected_db_path.exists(), "state store file created");
 
     let config_after = run_cli_json_value(&config_args, &envs);
-    let database_after = config_after
-        .get("database")
+    let state_store_after = config_after
+        .get("state_store")
         .and_then(|value| value.as_object())
-        .expect("config.database present");
-    let duckdb_exists_after = database_after
-        .get("duckdb_exists")
+        .expect("config.state_store present");
+    let state_exists_after = state_store_after
+        .get("exists")
         .and_then(|value| value.as_bool())
-        .expect("database.duckdb_exists present");
-    assert!(duckdb_exists_after, "duckdb should exist after init");
+        .expect("state_store.exists present");
+    assert!(state_exists_after, "state store should exist after init");
 
-    let active_path_after = database_after
-        .get("active_path")
+    let state_path_after = state_store_after
+        .get("path")
         .and_then(|value| value.as_str())
-        .expect("database.active_path present");
-    let duckdb_path_after = database_after
-        .get("duckdb_path")
-        .and_then(|value| value.as_str())
-        .expect("database.duckdb_path present");
-    assert_eq!(Path::new(active_path_after), expected_db_path);
-    assert_eq!(Path::new(duckdb_path_after), expected_db_path);
+        .expect("state_store.path present");
+    assert_eq!(Path::new(state_path_after), expected_db_path);
 }

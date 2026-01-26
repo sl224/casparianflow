@@ -57,6 +57,9 @@ pub struct McpServerConfig {
     /// Database path
     pub db_path: PathBuf,
 
+    /// Query catalog path (DuckDB)
+    pub query_catalog_path: PathBuf,
+
     /// Control API address (preferred backend for mutations)
     pub control_addr: Option<String>,
 
@@ -76,7 +79,8 @@ impl Default for McpServerConfig {
             max_response_bytes: 1024 * 1024, // 1MB
             max_rows: 10_000,
             audit_log_path: Some(casparian_dir.join("mcp_audit.ndjson")),
-            db_path: casparian_dir.join("casparian_flow.duckdb"),
+            db_path: casparian_dir.join("state.sqlite"),
+            query_catalog_path: casparian_dir.join("query.duckdb"),
             control_addr: Some(casparian_sentinel::DEFAULT_CONTROL_ADDR.to_string()),
             standalone_db_writer: false,
         }

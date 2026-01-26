@@ -14,7 +14,6 @@ use anyhow::{anyhow, Result};
 use casparian_db::{apply_row_limit, validate_read_only, DbConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
 use std::time::Instant;
 
 pub struct QueryTool;
@@ -99,8 +98,8 @@ impl McpTool for QueryTool {
 
         let start = Instant::now();
 
-        // Open DuckDB in read-only mode
-        let conn = DbConnection::open_duckdb_readonly(Path::new(&config.db_path))
+        // Open query catalog in read-only mode
+        let conn = DbConnection::open_duckdb_readonly(config.query_catalog_path.as_path())
             .map_err(|e| anyhow!("Failed to open database: {}", e))?;
 
         // Add LIMIT to query if not present

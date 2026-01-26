@@ -25,9 +25,9 @@ pub struct JobManager {
 }
 
 impl JobManager {
-    /// Create a new job manager backed by DuckDB at the given path.
+    /// Create a new job manager backed by the state store at the given path.
     pub fn new(db_path: PathBuf) -> Result<Self> {
-        let conn = DbConnection::open_duckdb(&db_path)
+        let conn = DbConnection::open_sqlite(&db_path)
             .with_context(|| format!("Failed to open DB at {}", db_path.display()))?;
         let storage = ApiStorage::new(conn);
         storage.init_schema().context("Failed to init schema")?;
@@ -53,7 +53,7 @@ impl JobManager {
     fn storage(&self) -> Result<ApiStorage> {
         match &self.backend {
             JobBackend::Db { db_path } => {
-                let conn = DbConnection::open_duckdb(db_path)
+                let conn = DbConnection::open_sqlite(db_path)
                     .with_context(|| format!("Failed to open DB at {}", db_path.display()))?;
                 let storage = ApiStorage::new(conn);
                 storage.init_schema().context("Failed to init schema")?;
@@ -557,7 +557,7 @@ mod tests {
 
     fn create_test_manager() -> (JobManager, TempDir) {
         let temp = TempDir::new().unwrap();
-        let db_path = temp.path().join("test.duckdb");
+        let db_path = temp.path().join("test.sqlite");
         let manager = JobManager::new(db_path).unwrap();
         (manager, temp)
     }

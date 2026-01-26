@@ -4,11 +4,12 @@
 //! drop all known tables and let init_*_schema recreate them.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use casparian_db::{DbConnection, DbValue};
 use tracing::warn;
 
 /// Current schema version. Increment when schema changes.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// Known tables that will be dropped on schema mismatch.
 ///
@@ -103,12 +104,7 @@ pub fn ensure_schema_version(conn: &DbConnection, expected_version: i32) -> Resu
 /// Get the current schema version from cf_meta, if it exists.
 fn get_current_version(conn: &DbConnection) -> Result<Option<i32>> {
     // Check if cf_meta table exists
-    let table_exists = conn
-        .query_optional(
-            "SELECT 1 FROM information_schema.tables WHERE table_name = 'cf_meta'",
-            &[],
-        )?
-        .is_some();
+    let table_exists = conn.table_exists("cf_meta")?;
 
     if !table_exists {
         return Ok(None);
@@ -132,12 +128,7 @@ fn get_current_version(conn: &DbConnection) -> Result<Option<i32>> {
 /// Check if any known tables exist (besides cf_meta).
 fn has_any_known_tables(conn: &DbConnection) -> Result<bool> {
     for table in KNOWN_TABLES.iter().filter(|t| **t != "cf_meta") {
-        let exists = conn
-            .query_optional(
-                "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
-                &[DbValue::from(*table)],
-            )?
-            .is_some();
+        let exists = conn.table_exists(table)?;
         if exists {
             return Ok(true);
         }
@@ -154,11 +145,13 @@ fn reset_schema(conn: &DbConnection, version: i32) -> Result<()> {
             .with_context(|| format!("Failed to drop table {}", table))?;
     }
 
-    // Drop sequences
-    for seq in KNOWN_SEQUENCES {
-        let drop_sql = format!("DROP SEQUENCE IF EXISTS {}", seq);
-        conn.execute(&drop_sql, &[])
-            .with_context(|| format!("Failed to drop sequence {}", seq))?;
+    // Drop sequences (DuckDB only)
+    if conn.backend_name() != "SQLite" {
+        for seq in KNOWN_SEQUENCES {
+            let drop_sql = format!("DROP SEQUENCE IF EXISTS {}", seq);
+            conn.execute(&drop_sql, &[])
+                .with_context(|| format!("Failed to drop sequence {}", seq))?;
+        }
     }
 
     // Create fresh cf_meta
@@ -174,14 +167,14 @@ fn create_meta_table(conn: &DbConnection, version: i32) -> Result<()> {
         CREATE TABLE IF NOT EXISTS cf_meta (
             key TEXT PRIMARY KEY,
             schema_version INTEGER NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at INTEGER NOT NULL
         );
         "#,
     )
     .context("Failed to create cf_meta table")?;
 
     // Use explicit timestamp in ON CONFLICT - DuckDB doesn't support CURRENT_TIMESTAMP there
-    let now = casparian_db::DbTimestamp::now();
+    let now = Utc::now().timestamp_millis();
     conn.execute(
         r#"
         INSERT INTO cf_meta (key, schema_version, updated_at)

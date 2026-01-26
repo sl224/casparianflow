@@ -141,7 +141,7 @@ fn resolve_workspace_ref(db: &Database, raw: &str) -> anyhow::Result<Workspace> 
 }
 
 fn open_db() -> anyhow::Result<Database> {
-    let db_path = config::active_db_path();
+    let db_path = config::state_store_path();
     Database::open(&db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.to_string_lossy()))
 }

@@ -3,12 +3,15 @@
 //! Provides an interactive TUI to scan sources, manage jobs, and build rules.
 
 pub mod app;
+pub mod components;
 pub mod event;
 pub mod extraction;
 pub mod flow;
 pub mod flow_assert;
 pub mod flow_record;
 pub mod flow_runner;
+pub mod keymap;
+pub mod layout;
 pub mod nav;
 pub mod pattern_query;
 pub mod snapshot;
@@ -41,8 +44,8 @@ use casparian::telemetry::TelemetryRecorder;
 /// TUI command arguments
 #[derive(Debug, Args)]
 pub struct TuiArgs {
-    /// Database path override (defaults to active backend path)
-    #[arg(long)]
+    /// State store path override (defaults to ~/.casparian_flow/state.sqlite)
+    #[arg(long = "state-store")]
     pub database: Option<PathBuf>,
     /// Record a TUI flow to the given path (JSON)
     #[arg(long)]

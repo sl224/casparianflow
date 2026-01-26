@@ -1,14 +1,14 @@
 mod cli_support;
 
 use casparian_db::DbValue;
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, with_duckdb};
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, with_state_store};
 use std::fs;
 use tempfile::TempDir;
 
 #[test]
 fn conf_t1_rename_preserves_file_id_and_tags() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.duckdb");
+    let db_path = home_dir.path().join("state.sqlite");
     init_scout_schema(&db_path);
 
     let data_dir = TempDir::new().expect("create data dir");
@@ -42,7 +42,7 @@ fn conf_t1_rename_preserves_file_id_and_tags() {
     ];
     assert_cli_success(&run_cli(&tag_args, &envs), &tag_args);
 
-    let file_id: i64 = with_duckdb(&db_path, |conn| {
+    let file_id: i64 = with_state_store(&db_path, |conn| {
         conn.query_scalar(
             "SELECT id FROM scout_files WHERE path = ?",
             &[DbValue::from(a_canon.to_string_lossy().as_ref())],
@@ -56,7 +56,7 @@ fn conf_t1_rename_preserves_file_id_and_tags() {
 
     assert_cli_success(&run_cli(&sync_args, &envs), &sync_args);
 
-    let renamed_id: i64 = with_duckdb(&db_path, |conn| {
+    let renamed_id: i64 = with_state_store(&db_path, |conn| {
         conn.query_scalar(
             "SELECT id FROM scout_files WHERE path = ?",
             &[DbValue::from(b_canon.to_string_lossy().as_ref())],
@@ -65,7 +65,7 @@ fn conf_t1_rename_preserves_file_id_and_tags() {
     });
     assert_eq!(renamed_id, file_id);
 
-    let old_count: i64 = with_duckdb(&db_path, |conn| {
+    let old_count: i64 = with_state_store(&db_path, |conn| {
         conn.query_scalar::<i64>(
             "SELECT COUNT(*) FROM scout_files WHERE path = ?",
             &[DbValue::from(a_canon.to_string_lossy().as_ref())],
@@ -74,7 +74,7 @@ fn conf_t1_rename_preserves_file_id_and_tags() {
     });
     assert_eq!(old_count, 0);
 
-    let tag_count: i64 = with_duckdb(&db_path, |conn| {
+    let tag_count: i64 = with_state_store(&db_path, |conn| {
         conn.query_scalar::<i64>(
             "SELECT COUNT(*) FROM scout_file_tags WHERE file_id = ? AND tag = ?",
             &[DbValue::from(file_id), DbValue::from("topic1")],

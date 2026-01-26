@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use clap::Args;
 use serde::Serialize;
 
-use super::app::TuiMode;
 use super::snapshot::{
     buffer_to_bg_mask, buffer_to_plain_text, layout_tree, normalize_for_snapshot,
     render_app_to_buffer,
@@ -60,7 +59,7 @@ pub fn run(args: TuiSnapshotArgs) -> Result<()> {
         let app_for_meta = (case.build)();
         let meta = SnapshotCaseMeta {
             name: case.name.to_string(),
-            mode: mode_label(app_for_meta.mode).to_string(),
+            mode: app_for_meta.view_label(),
             notes: case.notes.to_string(),
             focus_hint: case.focus_hint.to_string(),
             coverage: case.coverage.as_str().to_string(),
@@ -78,7 +77,7 @@ pub fn run(args: TuiSnapshotArgs) -> Result<()> {
             bundle.push_str(&format!("Focus: {}\n\n", case.focus_hint));
         }
         bundle.push_str(&format!("Coverage: {}\n\n", case.coverage.as_str()));
-        bundle.push_str(&format!("Mode: {}\n\n", mode_label(app_for_meta.mode)));
+        bundle.push_str(&format!("Mode: {}\n\n", app_for_meta.view_label()));
 
         for (width, height) in &sizes {
             let app = (case.build)();
@@ -143,21 +142,5 @@ fn parse_sizes(input: &str) -> Result<Vec<(u16, u16)>> {
         Ok(DEFAULT_SNAPSHOT_SIZES.to_vec())
     } else {
         Ok(sizes)
-    }
-}
-
-fn mode_label(mode: TuiMode) -> &'static str {
-    match mode {
-        TuiMode::Home => "Home",
-        TuiMode::Discover => "Discover",
-        TuiMode::Jobs => "Jobs",
-        TuiMode::Sources => "Sources",
-        TuiMode::Approvals => "Approvals",
-        TuiMode::ParserBench => "Parser Bench",
-        TuiMode::Query => "Query",
-        TuiMode::Settings => "Settings",
-        TuiMode::Sessions => "Sessions",
-        TuiMode::Triage => "Triage",
-        TuiMode::Catalog => "Catalog",
     }
 }

@@ -373,7 +373,7 @@ fn run_cancel_via_api(client: &ControlClient, job_id: JobId) -> anyhow::Result<(
 
 /// Connect to the database
 fn db_url_for_path(db_path: &PathBuf) -> String {
-    format!("duckdb:{}", db_path.display())
+    format!("sqlite:{}", db_path.display())
 }
 
 fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
@@ -387,7 +387,8 @@ fn connect_db(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
 }
 
 fn connect_db_readonly(db_path: &PathBuf) -> anyhow::Result<DbConnection> {
-    DbConnection::open_duckdb_readonly(db_path).map_err(|e| {
+    let db_url = db_url_for_path(db_path);
+    DbConnection::open_from_url_readonly(&db_url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(format!("Database: {}", db_path.display()))
             .with_suggestion(format!("Error: {}", e))

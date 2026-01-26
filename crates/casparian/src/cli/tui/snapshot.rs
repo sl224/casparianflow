@@ -5,7 +5,8 @@ use std::io;
 use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, Terminal};
 use serde::Serialize;
 
-use super::app::{App, ShellFocus, TuiMode};
+use super::app::{App, ShellFocus};
+use super::layout::{viewport_class, ViewportClass};
 use super::ui;
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,22 +49,6 @@ impl LayoutNode {
     }
 }
 
-fn mode_label(mode: TuiMode) -> &'static str {
-    match mode {
-        TuiMode::Home => "Home",
-        TuiMode::Discover => "Discover",
-        TuiMode::Jobs => "Jobs",
-        TuiMode::Sources => "Sources",
-        TuiMode::Approvals => "Approvals",
-        TuiMode::ParserBench => "Parser Bench",
-        TuiMode::Query => "Query",
-        TuiMode::Settings => "Settings",
-        TuiMode::Sessions => "Sessions",
-        TuiMode::Triage => "Triage",
-        TuiMode::Catalog => "Catalog",
-    }
-}
-
 /// Build a lightweight layout tree for LLM/UX inspection.
 pub fn layout_tree(app: &App, width: u16, height: u16) -> Vec<LayoutNode> {
     let area = Rect::new(0, 0, width, height);
@@ -71,13 +56,14 @@ pub fn layout_tree(app: &App, width: u16, height: u16) -> Vec<LayoutNode> {
 
     nodes.push(LayoutNode::new(
         "screen",
-        &format!("Screen ({})", mode_label(app.mode)),
+        &format!("Screen ({})", app.view_label()),
         "root",
         area,
         false,
     ));
 
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = !matches!(viewport_class(area), ViewportClass::Narrow)
+        && !app.inspector_collapsed;
     let shell = ui::shell_layout(area, inspector_visible);
 
     let rail_focused = app.shell_focus == ShellFocus::Rail;
@@ -122,7 +108,7 @@ pub fn layout_tree(app: &App, width: u16, height: u16) -> Vec<LayoutNode> {
     ));
 
     if app.jobs_drawer_open {
-        let rect = ui::right_drawer_area(area);
+        let rect = ui::right_drawer_area(&shell);
         nodes.push(LayoutNode::new(
             "jobs_drawer",
             "Jobs Drawer",
@@ -133,7 +119,7 @@ pub fn layout_tree(app: &App, width: u16, height: u16) -> Vec<LayoutNode> {
     }
 
     if app.sources_drawer_open {
-        let rect = ui::right_drawer_area(area);
+        let rect = ui::right_drawer_area(&shell);
         nodes.push(LayoutNode::new(
             "sources_drawer",
             "Sources Drawer",

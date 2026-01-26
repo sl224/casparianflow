@@ -3,7 +3,7 @@
 //! Control plane for job orchestration and worker management.
 //!
 //! Usage:
-//!     casparian-sentinel --bind tcp://127.0.0.1:5555 --database duckdb:/path/to/db.duckdb
+//!     casparian-sentinel --bind tcp://127.0.0.1:5555 --state-store sqlite:/path/to/state.sqlite
 
 use casparian_sentinel::{Sentinel, SentinelConfig};
 use clap::Parser;
@@ -23,9 +23,13 @@ struct Args {
     )]
     bind: String,
 
-    /// Database connection string
-    #[arg(long)]
-    database: Option<String>,
+    /// State store URL (sqlite:/... | postgres://... | sqlserver://...)
+    #[arg(long = "state-store")]
+    state_store: Option<String>,
+
+    /// Query catalog path (DuckDB file over Parquet)
+    #[arg(long = "query-catalog")]
+    query_catalog: Option<std::path::PathBuf>,
 
     /// Maximum number of workers (default 4, hard cap 8)
     #[arg(long, default_value_t = 4)]
@@ -74,11 +78,11 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Casparian Rust Sentinel");
     tracing::info!("  Bind: {}", args.bind);
-    let database_arg = args
-        .database
-        .unwrap_or_else(|| casparian_protocol::defaults::DEFAULT_DB_URL.to_string());
-    let database = resolve_db_url(&database_arg);
-    tracing::info!("  Database: {}", database);
+    let state_store_arg = args
+        .state_store
+        .unwrap_or_else(|| casparian_protocol::defaults::DEFAULT_STATE_STORE_URL.to_string());
+    let state_store_url = resolve_state_store_url(&state_store_arg);
+    tracing::info!("  State Store: {}", state_store_url);
     tracing::info!("  Max workers: {}", args.max_workers);
     let control_addr = if args.no_control_api {
         None
@@ -94,9 +98,12 @@ fn main() -> anyhow::Result<()> {
 
     let config = SentinelConfig {
         bind_addr: args.bind,
-        database_url: database,
+        state_store_url,
         max_workers: args.max_workers,
         control_addr,
+        query_catalog_path: args
+            .query_catalog
+            .unwrap_or_else(default_query_catalog_path),
     };
 
     // Bind and run
@@ -106,13 +113,34 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_db_url(database: &str) -> String {
-    if database == casparian_protocol::defaults::DEFAULT_DB_URL {
+fn resolve_state_store_url(state_store: &str) -> String {
+    if state_store == casparian_protocol::defaults::DEFAULT_STATE_STORE_URL {
         let home = casparian_home();
-        format!("duckdb:{}", home.join("casparian_flow.duckdb").display())
+        format!("sqlite:{}", home.join("state.sqlite").display())
     } else {
-        database.to_string()
+        normalize_state_store_url(state_store)
     }
+}
+
+fn normalize_state_store_url(raw: &str) -> String {
+    if looks_like_url(raw) {
+        raw.to_string()
+    } else {
+        format!("sqlite:{}", raw)
+    }
+}
+
+fn looks_like_url(raw: &str) -> bool {
+    raw.contains("://")
+        || raw.starts_with("sqlite:")
+        || raw.starts_with("duckdb:")
+        || raw.starts_with("postgres:")
+        || raw.starts_with("postgresql:")
+        || raw.starts_with("sqlserver:")
+}
+
+fn default_query_catalog_path() -> std::path::PathBuf {
+    casparian_home().join("query.duckdb")
 }
 
 fn casparian_home() -> std::path::PathBuf {

@@ -373,8 +373,8 @@ mod tests {
 
     fn setup() -> (AuditLogger, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("audit.duckdb");
-        let conn = DbConnection::open_duckdb(&db_path).unwrap();
+        let db_path = temp_dir.path().join("audit.sqlite");
+        let conn = DbConnection::open_sqlite(&db_path).unwrap();
 
         // Create the audit table
         conn.execute_batch(

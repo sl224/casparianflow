@@ -20,6 +20,7 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+rusqlite = { version = "0.31" }
 
 # DuckDB support (columnar OLAP database)
 # Note: No "bundled" feature by default - uses system libduckdb for fast dev builds

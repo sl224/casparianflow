@@ -37,6 +37,22 @@ cargo run -p casparian -- tui --record-flow specs/tui_flows/my_session.json --re
 
 ---
 
+## TUI QA Loop
+
+Run the deterministic TUI QA loop (snapshots, UX lint, state graph, headless flows):
+
+```bash
+./scripts/tui-qa.sh
+```
+
+Artifacts land under `.test_output/`:
+- `tui_snapshots/`
+- `tui_ux_lint/ux_report.json`
+- `tui_state_graph/graph.json` + `frames/` + `ux_report.json`
+- `tui_flows/<flow>/...`
+
+---
+
 ## Testing Rust Components
 
 ### TEST: Publish Command (Azure Authentication)

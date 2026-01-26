@@ -33,12 +33,14 @@ pub use lock::{lock_path_for, DbLockGuard, LockError};
 pub use sql_guard::{apply_row_limit, validate_read_only, SqlGuardError};
 /// Database backend type.
 ///
-/// DuckDB is the only supported backend in v1.
+/// Pre-v1 defaults to SQLite for state store, with DuckDB for local SQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum DatabaseType {
     /// DuckDB - columnar OLAP database (open source)
     DuckDb,
+    /// SQLite - embedded transactional database
+    Sqlite,
 }
 
 impl DatabaseType {
@@ -46,6 +48,7 @@ impl DatabaseType {
     pub fn requires_license(&self) -> bool {
         match self {
             Self::DuckDb => false,
+            Self::Sqlite => false,
         }
     }
 
@@ -53,6 +56,7 @@ impl DatabaseType {
     pub fn name(&self) -> &'static str {
         match self {
             Self::DuckDb => "DuckDB",
+            Self::Sqlite => "SQLite",
         }
     }
 
@@ -60,6 +64,9 @@ impl DatabaseType {
     pub fn from_url(url: &str) -> Option<Self> {
         if url.starts_with("duckdb:") {
             return Some(Self::DuckDb);
+        }
+        if url.starts_with("sqlite:") {
+            return Some(Self::Sqlite);
         }
 
         None

@@ -3,7 +3,8 @@
 //! Ported from tauri-ui session storage to keep schema and semantics aligned.
 
 use anyhow::{Context, Result};
-use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
+use casparian_db::{DbConnection, DbValue, UnifiedDbRow};
+use chrono::{DateTime, Utc};
 use casparian_intent::{IntentState, Session, SessionId, StateParseError};
 
 /// Storage for Intent Pipeline sessions.
@@ -45,8 +46,8 @@ impl SessionStorage {
                 intent_text TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT '{default_state}' CHECK (state IN ({state_values})),
                 files_selected BIGINT NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
                 input_dir TEXT,
                 error_message TEXT
             );
@@ -71,10 +72,11 @@ impl SessionStorage {
     pub fn create_session(&self, intent_text: &str, input_dir: Option<&str>) -> Result<SessionId> {
         let session_id = SessionId::new();
         let state = IntentState::InterpretIntent;
+        let now = now_millis();
 
         let sql = r#"
-            INSERT INTO cf_sessions (session_id, intent_text, state, input_dir)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO cf_sessions (session_id, intent_text, state, files_selected, created_at, updated_at, input_dir)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         "#;
 
         self.conn.execute(
@@ -83,6 +85,9 @@ impl SessionStorage {
                 DbValue::from(session_id.to_string()),
                 DbValue::from(intent_text),
                 DbValue::from(state.as_str()),
+                DbValue::from(0_i64),
+                DbValue::from(now),
+                DbValue::from(now),
                 DbValue::from(input_dir),
             ],
         )?;
@@ -184,9 +189,10 @@ impl SessionStorage {
             );
         }
 
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_sessions
-            SET state = ?, updated_at = CURRENT_TIMESTAMP
+            SET state = ?, updated_at = ?
             WHERE session_id = ?
         "#;
 
@@ -194,6 +200,7 @@ impl SessionStorage {
             sql,
             &[
                 DbValue::from(new_state.as_str()),
+                DbValue::from(now),
                 DbValue::from(session_id.to_string()),
             ],
         )?;
@@ -207,9 +214,10 @@ impl SessionStorage {
         session_id: SessionId,
         files_selected: u64,
     ) -> Result<bool> {
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_sessions
-            SET files_selected = ?, updated_at = CURRENT_TIMESTAMP
+            SET files_selected = ?, updated_at = ?
             WHERE session_id = ?
         "#;
 
@@ -217,6 +225,7 @@ impl SessionStorage {
             sql,
             &[
                 DbValue::from(files_selected as i64),
+                DbValue::from(now),
                 DbValue::from(session_id.to_string()),
             ],
         )?;
@@ -233,9 +242,10 @@ impl SessionStorage {
             anyhow::bail!("Cannot fail session in state {}", session.state);
         }
 
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_sessions
-            SET state = 'FAILED', error_message = ?, updated_at = CURRENT_TIMESTAMP
+            SET state = 'FAILED', error_message = ?, updated_at = ?
             WHERE session_id = ?
         "#;
 
@@ -243,6 +253,7 @@ impl SessionStorage {
             sql,
             &[
                 DbValue::from(error_message),
+                DbValue::from(now),
                 DbValue::from(session_id.to_string()),
             ],
         )?;
@@ -259,15 +270,17 @@ impl SessionStorage {
             anyhow::bail!("Cannot cancel session in state {}", session.state);
         }
 
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_sessions
-            SET state = 'CANCELLED', updated_at = CURRENT_TIMESTAMP
+            SET state = 'CANCELLED', updated_at = ?
             WHERE session_id = ?
         "#;
 
-        let affected = self
-            .conn
-            .execute(sql, &[DbValue::from(session_id.to_string())])?;
+        let affected = self.conn.execute(
+            sql,
+            &[DbValue::from(now), DbValue::from(session_id.to_string())],
+        )?;
 
         Ok(affected > 0)
     }
@@ -281,15 +294,17 @@ impl SessionStorage {
             anyhow::bail!("Cannot complete session in state {}", session.state);
         }
 
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_sessions
-            SET state = 'COMPLETED', updated_at = CURRENT_TIMESTAMP
+            SET state = 'COMPLETED', updated_at = ?
             WHERE session_id = ?
         "#;
 
-        let affected = self
-            .conn
-            .execute(sql, &[DbValue::from(session_id.to_string())])?;
+        let affected = self.conn.execute(
+            sql,
+            &[DbValue::from(now), DbValue::from(session_id.to_string())],
+        )?;
 
         Ok(affected > 0)
     }
@@ -323,12 +338,12 @@ impl SessionStorage {
         let files_selected: i64 = row.get(3).unwrap_or(0);
 
         // Column 4: created_at - convert to RFC3339 string
-        let created_at_ts: DbTimestamp = row.get(4)?;
-        let created_at = created_at_ts.to_rfc3339();
+        let created_at_ts: i64 = row.get(4)?;
+        let created_at = millis_to_rfc3339(created_at_ts);
 
         // Column 5: updated_at - convert to RFC3339 string
-        let updated_at_ts: DbTimestamp = row.get(5)?;
-        let updated_at = updated_at_ts.to_rfc3339();
+        let updated_at_ts: i64 = row.get(5)?;
+        let updated_at = millis_to_rfc3339(updated_at_ts);
 
         // Column 6: input_dir (optional)
         let input_dir: Option<String> = row.get(6).ok();
@@ -347,4 +362,14 @@ impl SessionStorage {
             error_message,
         })
     }
+}
+
+fn now_millis() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn millis_to_rfc3339(millis: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .unwrap_or_else(|| Utc::now())
+        .to_rfc3339()
 }

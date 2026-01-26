@@ -5,12 +5,12 @@
 
 use super::schema_version::{ensure_schema_version, SCHEMA_VERSION};
 use anyhow::{Context, Result};
-use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
+use casparian_db::{DbConnection, DbValue, UnifiedDbRow};
 use casparian_protocol::{
     ApiJobId, Approval, ApprovalOperation, ApprovalStatus, Event, EventId, EventType,
     HttpJobStatus, HttpJobType, Job, JobProgress, JobResult, OutputInfo,
 };
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -48,8 +48,72 @@ impl ApiStorage {
         let approval_status_values = "'pending','approved','rejected','expired'";
         let event_type_values = "'job_started','phase','progress','violation','output','job_finished','approval_required'";
 
-        let create_sql = format!(
-            r#"
+        let create_sql = if self.conn.backend_name() == "SQLite" {
+            format!(
+                r#"
+            -- API Jobs table
+            CREATE TABLE IF NOT EXISTS cf_api_jobs (
+                job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL CHECK (job_type IN ({job_type_values})),
+                status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ({job_status_values})),
+                plugin_name TEXT NOT NULL,
+                plugin_version TEXT,
+                input_dir TEXT NOT NULL,
+                output_sink TEXT,
+                approval_id TEXT,
+                job_spec_json TEXT,
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                finished_at INTEGER,
+                error_message TEXT,
+                progress_phase TEXT,
+                progress_items_done BIGINT DEFAULT 0,
+                progress_items_total BIGINT,
+                progress_message TEXT,
+                result_rows_processed BIGINT,
+                result_bytes_written BIGINT,
+                result_outputs_json TEXT,
+                result_metrics_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_api_jobs_status ON cf_api_jobs(status);
+            CREATE INDEX IF NOT EXISTS ix_api_jobs_created ON cf_api_jobs(created_at DESC);
+            CREATE INDEX IF NOT EXISTS ix_api_jobs_approval ON cf_api_jobs(approval_id);
+
+            -- API Events table
+            CREATE TABLE IF NOT EXISTS cf_api_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id BIGINT NOT NULL,
+                event_type TEXT NOT NULL CHECK (event_type IN ({event_type_values})),
+                timestamp INTEGER NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_api_events_job ON cf_api_events(job_id, event_id);
+
+            -- API Approvals table
+            CREATE TABLE IF NOT EXISTS cf_api_approvals (
+                approval_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ({approval_status_values})),
+                operation_type TEXT NOT NULL,
+                operation_json TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                decided_at INTEGER,
+                decided_by TEXT,
+                rejection_reason TEXT,
+                job_id BIGINT
+            );
+            CREATE INDEX IF NOT EXISTS ix_api_approvals_status ON cf_api_approvals(status);
+            CREATE INDEX IF NOT EXISTS ix_api_approvals_expires ON cf_api_approvals(expires_at);
+            "#,
+                job_type_values = job_type_values,
+                job_status_values = job_status_values,
+                approval_status_values = approval_status_values,
+                event_type_values = event_type_values,
+            )
+        } else {
+            format!(
+                r#"
             -- API Jobs table
             CREATE SEQUENCE IF NOT EXISTS seq_cf_api_jobs;
             CREATE TABLE IF NOT EXISTS cf_api_jobs (
@@ -62,9 +126,9 @@ impl ApiStorage {
                 output_sink TEXT,
                 approval_id TEXT,
                 job_spec_json TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                started_at TIMESTAMP,
-                finished_at TIMESTAMP,
+                created_at BIGINT NOT NULL,
+                started_at BIGINT,
+                finished_at BIGINT,
                 error_message TEXT,
                 progress_phase TEXT,
                 progress_items_done BIGINT DEFAULT 0,
@@ -85,7 +149,7 @@ impl ApiStorage {
                 event_id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_api_events'),
                 job_id BIGINT NOT NULL,
                 event_type TEXT NOT NULL CHECK (event_type IN ({event_type_values})),
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                timestamp BIGINT NOT NULL,
                 payload_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_api_events_job ON cf_api_events(job_id, event_id);
@@ -97,9 +161,9 @@ impl ApiStorage {
                 operation_type TEXT NOT NULL,
                 operation_json TEXT NOT NULL,
                 summary TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP NOT NULL,
-                decided_at TIMESTAMP,
+                created_at BIGINT NOT NULL,
+                expires_at BIGINT NOT NULL,
+                decided_at BIGINT,
                 decided_by TEXT,
                 rejection_reason TEXT,
                 job_id BIGINT
@@ -107,11 +171,12 @@ impl ApiStorage {
             CREATE INDEX IF NOT EXISTS ix_api_approvals_status ON cf_api_approvals(status);
             CREATE INDEX IF NOT EXISTS ix_api_approvals_expires ON cf_api_approvals(expires_at);
             "#,
-            job_type_values = job_type_values,
-            job_status_values = job_status_values,
-            approval_status_values = approval_status_values,
-            event_type_values = event_type_values,
-        );
+                job_type_values = job_type_values,
+                job_status_values = job_status_values,
+                approval_status_values = approval_status_values,
+                event_type_values = event_type_values,
+            )
+        };
 
         self.conn
             .execute_batch(&create_sql)
@@ -142,11 +207,12 @@ impl ApiStorage {
         };
 
         let sql = r#"
-            INSERT INTO cf_api_jobs (job_type, plugin_name, plugin_version, input_dir, output_sink, approval_id, job_spec_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO cf_api_jobs (job_type, plugin_name, plugin_version, input_dir, output_sink, approval_id, job_spec_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING job_id
         "#;
 
+        let now = now_millis();
         let job_id_raw: i64 = self.conn.query_scalar(
             sql,
             &[
@@ -157,6 +223,7 @@ impl ApiStorage {
                 DbValue::from(output_sink),
                 DbValue::from(approval_id),
                 DbValue::from(job_spec_json),
+                DbValue::from(now),
             ],
         )?;
         let job_id = ApiJobId::try_from(job_id_raw).context("job_id must be non-negative")?;
@@ -228,7 +295,7 @@ impl ApiStorage {
     /// Update job status.
     pub fn update_job_status(&self, job_id: ApiJobId, status: HttpJobStatus) -> Result<()> {
         let status_str = job_status_to_str(status);
-        let now = DbTimestamp::now();
+        let now = now_millis();
         let job_id_i64 = job_id.to_i64().context("job_id exceeds i64::MAX")?;
 
         let (sql, params) = match status {
@@ -236,7 +303,7 @@ impl ApiStorage {
                 r#"UPDATE cf_api_jobs SET status = ?, started_at = ? WHERE job_id = ?"#,
                 vec![
                     DbValue::from(status_str),
-                    DbValue::Timestamp(now),
+                    DbValue::from(now),
                     DbValue::from(job_id_i64),
                 ],
             ),
@@ -244,7 +311,7 @@ impl ApiStorage {
                 r#"UPDATE cf_api_jobs SET status = ?, finished_at = ? WHERE job_id = ?"#,
                 vec![
                     DbValue::from(status_str),
-                    DbValue::Timestamp(now),
+                    DbValue::from(now),
                     DbValue::from(job_id_i64),
                 ],
             ),
@@ -372,9 +439,9 @@ impl ApiStorage {
         let output: Option<String> = row.get(6)?;
         let approval_id: Option<String> = row.get(7)?;
         let job_spec_json: Option<String> = row.get(8)?;
-        let created_at: DbTimestamp = row.get(9)?;
-        let started_at: Option<DbTimestamp> = row.get(10)?;
-        let finished_at: Option<DbTimestamp> = row.get(11)?;
+        let created_at: i64 = row.get(9)?;
+        let started_at: Option<i64> = row.get(10)?;
+        let finished_at: Option<i64> = row.get(11)?;
         let error_message: Option<String> = row.get(12)?;
         let progress_phase: Option<String> = row.get(13)?;
         let progress_items_done: Option<i64> = row.get(14)?;
@@ -452,9 +519,9 @@ impl ApiStorage {
             plugin_version,
             input_dir,
             output,
-            created_at: created_at.to_rfc3339(),
-            started_at: started_at.map(|t| t.to_rfc3339()),
-            finished_at: finished_at.map(|t| t.to_rfc3339()),
+            created_at: millis_to_rfc3339(created_at),
+            started_at: started_at.map(millis_to_rfc3339),
+            finished_at: finished_at.map(millis_to_rfc3339),
             error_message,
             approval_id,
             progress,
@@ -473,16 +540,18 @@ impl ApiStorage {
         let payload_json = serde_json::to_string(event_type)?;
 
         let sql = r#"
-            INSERT INTO cf_api_events (job_id, event_type, payload_json)
-            VALUES (?, ?, ?)
+            INSERT INTO cf_api_events (job_id, event_type, timestamp, payload_json)
+            VALUES (?, ?, ?, ?)
             RETURNING event_id
         "#;
 
+        let now = now_millis();
         let event_id_raw: i64 = self.conn.query_scalar(
             sql,
             &[
                 DbValue::from(job_id.to_i64().context("job_id exceeds i64::MAX")?),
                 DbValue::from(event_type_str),
+                DbValue::from(now),
                 DbValue::from(payload_json.as_str()),
             ],
         )?;
@@ -535,7 +604,7 @@ impl ApiStorage {
     fn row_to_event(&self, row: &UnifiedDbRow) -> Result<Event> {
         let event_id_raw: i64 = row.get(0)?;
         let job_id_raw: i64 = row.get(1)?;
-        let timestamp: DbTimestamp = row.get(2)?;
+        let timestamp: i64 = row.get(2)?;
         let payload_json: String = row.get(3)?;
 
         let event_type: EventType = serde_json::from_str(&payload_json)?;
@@ -548,7 +617,7 @@ impl ApiStorage {
         Ok(Event {
             event_id,
             job_id,
-            timestamp: timestamp.to_rfc3339(),
+            timestamp: millis_to_rfc3339(timestamp),
             event_type,
         })
     }
@@ -576,13 +645,14 @@ impl ApiStorage {
         };
         let operation_json = serde_json::to_string(operation)?;
         let expires_at = chrono::Utc::now() + expires_in;
-        let expires_ts = DbTimestamp::from_unix_millis(expires_at.timestamp_millis())?;
+        let expires_ts = expires_at.timestamp_millis();
 
         let sql = r#"
-            INSERT INTO cf_api_approvals (approval_id, operation_type, operation_json, summary, expires_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO cf_api_approvals (approval_id, operation_type, operation_json, summary, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
         "#;
 
+        let now = now_millis();
         self.conn.execute(
             sql,
             &[
@@ -590,7 +660,8 @@ impl ApiStorage {
                 DbValue::from(operation_type),
                 DbValue::from(operation_json.as_str()),
                 DbValue::from(summary),
-                DbValue::Timestamp(expires_ts),
+                DbValue::from(now),
+                DbValue::from(expires_ts),
             ],
         )?;
 
@@ -651,7 +722,7 @@ impl ApiStorage {
 
     /// Approve an approval request.
     pub fn approve(&self, approval_id: &str, decided_by: Option<&str>) -> Result<bool> {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_api_approvals
             SET status = 'approved', decided_at = ?, decided_by = ?
@@ -661,7 +732,7 @@ impl ApiStorage {
         let rows = self.conn.execute(
             sql,
             &[
-                DbValue::Timestamp(now),
+                DbValue::from(now),
                 DbValue::from(decided_by),
                 DbValue::from(approval_id),
             ],
@@ -677,7 +748,7 @@ impl ApiStorage {
         decided_by: Option<&str>,
         reason: Option<&str>,
     ) -> Result<bool> {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_api_approvals
             SET status = 'rejected', decided_at = ?, decided_by = ?, rejection_reason = ?
@@ -687,7 +758,7 @@ impl ApiStorage {
         let rows = self.conn.execute(
             sql,
             &[
-                DbValue::Timestamp(now),
+                DbValue::from(now),
                 DbValue::from(decided_by),
                 DbValue::from(reason),
                 DbValue::from(approval_id),
@@ -699,14 +770,14 @@ impl ApiStorage {
 
     /// Mark expired approvals.
     pub fn expire_approvals(&self) -> Result<usize> {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         let sql = r#"
             UPDATE cf_api_approvals
             SET status = 'expired'
             WHERE status = 'pending' AND expires_at < ?
         "#;
 
-        let count = self.conn.execute(sql, &[DbValue::Timestamp(now)])?;
+        let count = self.conn.execute(sql, &[DbValue::from(now)])?;
         Ok(count as usize)
     }
 
@@ -729,9 +800,9 @@ impl ApiStorage {
         let _operation_type: String = row.get(2)?;
         let operation_json: String = row.get(3)?;
         let summary: String = row.get(4)?;
-        let created_at: DbTimestamp = row.get(5)?;
-        let expires_at: DbTimestamp = row.get(6)?;
-        let decided_at: Option<DbTimestamp> = row.get(7)?;
+        let created_at: i64 = row.get(5)?;
+        let expires_at: i64 = row.get(6)?;
+        let decided_at: Option<i64> = row.get(7)?;
         let decided_by: Option<String> = row.get(8)?;
         let rejection_reason: Option<String> = row.get(9)?;
         let job_id_raw: Option<i64> = row.get(10)?;
@@ -744,9 +815,9 @@ impl ApiStorage {
             status,
             operation,
             summary,
-            created_at: created_at.to_rfc3339(),
-            expires_at: expires_at.to_rfc3339(),
-            decided_at: decided_at.map(|t| t.to_rfc3339()),
+            created_at: millis_to_rfc3339(created_at),
+            expires_at: millis_to_rfc3339(expires_at),
+            decided_at: decided_at.map(millis_to_rfc3339),
             decided_by,
             rejection_reason,
             job_id: match job_id_raw {
@@ -771,23 +842,33 @@ impl ApiStorage {
         let job_cutoff = chrono::Utc::now() - Duration::hours(job_ttl_hours);
         let event_cutoff = chrono::Utc::now() - Duration::hours(event_ttl_hours);
 
-        let job_cutoff_ts = DbTimestamp::from_unix_millis(job_cutoff.timestamp_millis())?;
-        let event_cutoff_ts = DbTimestamp::from_unix_millis(event_cutoff.timestamp_millis())?;
+        let job_cutoff_ts = job_cutoff.timestamp_millis();
+        let event_cutoff_ts = event_cutoff.timestamp_millis();
 
         // Delete old events first (foreign key consideration)
         let events_deleted = self.conn.execute(
             r#"DELETE FROM cf_api_events WHERE timestamp < ?"#,
-            &[DbValue::Timestamp(event_cutoff_ts)],
+            &[DbValue::from(event_cutoff_ts)],
         )?;
 
         // Delete old jobs with terminal status
         let jobs_deleted = self.conn.execute(
             r#"DELETE FROM cf_api_jobs WHERE created_at < ? AND status IN ('completed', 'failed', 'cancelled')"#,
-            &[DbValue::Timestamp(job_cutoff_ts)],
+            &[DbValue::from(job_cutoff_ts)],
         )?;
 
         Ok((jobs_deleted as usize, events_deleted as usize))
     }
+}
+
+fn now_millis() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn millis_to_rfc3339(millis: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .unwrap_or_else(|| Utc::now())
+        .to_rfc3339()
 }
 
 // Helper functions for status conversion

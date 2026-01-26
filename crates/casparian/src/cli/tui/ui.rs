@@ -7,12 +7,14 @@ use ratatui::{
 
 use super::app::{
     App, ApprovalsViewState, CommandPaletteMode, CommandPaletteState, DiscoverFocus,
-    DiscoverViewState, JobInfo, JobStatus, JobType, JobsListSection, JobsViewState, ParserHealth,
-    ShellFocus, SuggestedFix, ThroughputSample, TriageTab, TuiMode, ViolationSummary,
-    ViolationType,
+    DiscoverViewState, IngestTab, JobInfo, JobStatus, JobType, JobsListSection, JobsViewState,
+    ParserHealth, ReviewTab, RunTab, ShellFocus, SuggestedFix, ThroughputSample, TriageTab,
+    TuiMode, ViolationSummary, ViolationType,
 };
+use super::components::{action_bar, modal};
+use super::layout::{viewport_class, ViewportClass};
 use super::nav;
-use crate::cli::config::active_db_path;
+use crate::cli::config::state_store_path;
 use crate::cli::output::format_number;
 use casparian_intent::IntentState;
 use chrono::{DateTime, Local};
@@ -59,6 +61,23 @@ pub fn render_centered_dialog(
     dialog_area
 }
 
+fn format_optional_i64(value: Option<i64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_schema_detail(
+    name: &Option<String>,
+    dtype: &Option<String>,
+    index: Option<i64>,
+) -> String {
+    let name = name.as_deref().unwrap_or("—");
+    let dtype = dtype.as_deref().unwrap_or("—");
+    let index = format_optional_i64(index);
+    format!("{} ({}) idx {}", name, dtype, index)
+}
+
 pub(super) fn help_overlay_area(area: Rect) -> Rect {
     let help_width = 76.min(area.width.saturating_sub(4));
     let help_height = 36.min(area.height.saturating_sub(2));
@@ -83,13 +102,7 @@ pub(super) fn command_palette_area(palette: &CommandPaletteState, area: Rect) ->
 
 /// Clear the content area beneath the top bar for modal overlays.
 fn draw_modal_scrim(frame: &mut Frame, area: Rect, top_bar: Rect) {
-    let scrim_area = Rect::new(
-        area.x,
-        top_bar.y + top_bar.height,
-        area.width,
-        area.height.saturating_sub(top_bar.height),
-    );
-    frame.render_widget(Clear, scrim_area);
+    modal::render_scrim(frame, area, top_bar);
 }
 
 /// Calculate scroll offset to keep selected item centered in view.
@@ -190,13 +203,21 @@ pub(super) fn shell_layout(area: Rect, inspector_visible: bool) -> ShellAreas {
     }
 }
 
-pub(super) fn right_drawer_area(area: Rect) -> Rect {
-    let drawer_width = (area.width * 40 / 100).max(50).min(area.width);
+fn inspector_visible_for(app: &App, area: Rect) -> bool {
+    if matches!(viewport_class(area), ViewportClass::Narrow) {
+        return false;
+    }
+    !app.inspector_collapsed
+}
+
+pub(super) fn right_drawer_area(shell: &ShellAreas) -> Rect {
+    let total_width = shell.top.width;
+    let drawer_width = (total_width * 40 / 100).max(50).min(total_width);
     Rect::new(
-        area.width.saturating_sub(drawer_width),
-        0,
+        shell.top.x + total_width.saturating_sub(drawer_width),
+        shell.main.y,
         drawer_width,
-        area.height,
+        shell.main.height,
     )
 }
 
@@ -208,13 +229,14 @@ fn workspace_switcher_area(area: Rect) -> Rect {
     Rect::new(x, y, width, height)
 }
 
-fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect) {
+fn draw_shell_top_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let view_label = app.view_label();
     if area.height == 0 {
         return;
     }
 
-    let _db_path = app.config.database.clone().unwrap_or_else(active_db_path);
-    let backend_label = "duckdb";
+    let _db_path = app.config.database.clone().unwrap_or_else(state_store_path);
+    let backend_label = "sqlite";
 
     let running = app
         .jobs_state
@@ -259,16 +281,17 @@ fn draw_shell_top_bar(frame: &mut Frame, app: &App, view_label: &str, area: Rect
     frame.render_widget(bar, area);
 }
 
-fn draw_shell_action_bar(frame: &mut Frame, text: &str, style: Style, area: Rect) {
-    if area.height == 0 {
-        return;
-    }
-    let line = truncate_end(text, area.width as usize);
-    let footer = Paragraph::new(line)
-        .style(style)
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, area);
+fn draw_shell_action_bar(
+    frame: &mut Frame,
+    hints: &[action_bar::ActionHint],
+    style: Style,
+    area: Rect,
+) {
+    action_bar::render_action_bar(frame, area, hints, style);
+}
+
+fn draw_shell_action_message(frame: &mut Frame, message: &str, style: Style, area: Rect) {
+    action_bar::render_action_bar_message(frame, area, message, style);
 }
 
 fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
@@ -293,7 +316,7 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        " Views",
+        " Tasks",
         if is_focused {
             Style::default().fg(Color::Cyan)
         } else {
@@ -339,11 +362,30 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
     )));
 
     match app.mode {
-        TuiMode::Discover => {
-            if let Some(source) = app.discover.selected_source() {
+        TuiMode::Ingest => {
+            if app.ingest_tab == IngestTab::Sources {
+                if let Some(source) = app.discover.sources.get(app.sources_state.selected_index) {
+                    let line = format!(" Source: {}", source.name);
+                    lines.push(Line::from(Span::styled(
+                        truncate_end(&line, inner.width as usize),
+                        Style::default().fg(Color::Gray),
+                    )));
+                }
+            } else if let Some(source) = app.discover.selected_source() {
                 let line = format!(" Source: {}", source.name);
                 lines.push(Line::from(Span::styled(
                     truncate_end(&line, inner.width as usize),
+                    Style::default().fg(Color::Gray),
+                )));
+                let tag_label = app
+                    .discover
+                    .selected_tag
+                    .and_then(|idx| app.discover.tags.get(idx))
+                    .map(|t| t.name.as_str())
+                    .unwrap_or("All");
+                let tag_line = format!(" Tag: {}", tag_label);
+                lines.push(Line::from(Span::styled(
+                    truncate_end(&tag_line, inner.width as usize),
                     Style::default().fg(Color::Gray),
                 )));
             } else {
@@ -352,59 +394,55 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 )));
             }
-            let tag_label = app
-                .discover
-                .selected_tag
-                .and_then(|idx| app.discover.tags.get(idx))
-                .map(|t| t.name.as_str())
-                .unwrap_or("All");
-            let tag_line = format!(" Tag: {}", tag_label);
-            lines.push(Line::from(Span::styled(
-                truncate_end(&tag_line, inner.width as usize),
-                Style::default().fg(Color::Gray),
-            )));
         }
-        TuiMode::ParserBench => {
-            let filter = if app.parser_bench.filter.is_empty() {
-                "(none)"
-            } else {
-                app.parser_bench.filter.as_str()
-            };
-            let line = format!(" Filter: {}", filter);
-            lines.push(Line::from(Span::styled(
-                truncate_end(&line, inner.width as usize),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-        TuiMode::Jobs => {
-            let status = app
-                .jobs_state
-                .status_filter
-                .map(|s| s.as_str())
-                .unwrap_or("All");
-            let job_type = app
-                .jobs_state
-                .type_filter
-                .map(|t| t.as_str())
-                .unwrap_or("All");
-            lines.push(Line::from(Span::styled(
-                truncate_end(&format!(" Status: {}", status), inner.width as usize),
-                Style::default().fg(Color::Gray),
-            )));
-            lines.push(Line::from(Span::styled(
-                truncate_end(&format!(" Type: {}", job_type), inner.width as usize),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-        TuiMode::Sources => {
-            if let Some(source) = app.discover.sources.get(app.sources_state.selected_index) {
-                let line = format!(" Source: {}", source.name);
+        TuiMode::Run => {
+            if app.run_tab == RunTab::Jobs {
+                let status = app
+                    .jobs_state
+                    .status_filter
+                    .map(|s| s.as_str())
+                    .unwrap_or("All");
+                let job_type = app
+                    .jobs_state
+                    .type_filter
+                    .map(|t| t.as_str())
+                    .unwrap_or("All");
                 lines.push(Line::from(Span::styled(
-                    truncate_end(&line, inner.width as usize),
+                    truncate_end(&format!(" Status: {}", status), inner.width as usize),
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    truncate_end(&format!(" Type: {}", job_type), inner.width as usize),
+                    Style::default().fg(Color::Gray),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!(" Tab: {}", app.catalog_state.tab.label()),
                     Style::default().fg(Color::Gray),
                 )));
             }
         }
+        TuiMode::Review => match app.review_tab {
+            ReviewTab::Approvals => {
+                lines.push(Line::from(Span::styled(
+                    " MCP Approvals",
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            ReviewTab::Sessions => {
+                let session_count = app.sessions_state.sessions.len();
+                lines.push(Line::from(Span::styled(
+                    format!(" Sessions: {}", session_count),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            ReviewTab::Triage => {
+                lines.push(Line::from(Span::styled(
+                    format!(" Tab: {}", app.triage_state.tab.label()),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+        },
         TuiMode::Settings => {
             lines.push(Line::from(Span::styled(
                 truncate_end(
@@ -421,34 +459,9 @@ fn draw_shell_rail(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Gray),
             )));
         }
-        TuiMode::Approvals => {
-            lines.push(Line::from(Span::styled(
-                " MCP Approvals",
-                Style::default().fg(Color::Gray),
-            )));
-        }
         TuiMode::Query => {
             lines.push(Line::from(Span::styled(
                 " SQL Query Console",
-                Style::default().fg(Color::Gray),
-            )));
-        }
-        TuiMode::Sessions => {
-            let session_count = app.sessions_state.sessions.len();
-            lines.push(Line::from(Span::styled(
-                format!(" Sessions: {}", session_count),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-        TuiMode::Triage => {
-            lines.push(Line::from(Span::styled(
-                format!(" Tab: {}", app.triage_state.tab.label()),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-        TuiMode::Catalog => {
-            lines.push(Line::from(Span::styled(
-                format!(" Tab: {}", app.catalog_state.tab.label()),
                 Style::default().fg(Color::Gray),
             )));
         }
@@ -705,22 +718,29 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let _zone = app.profiler.zone("tui.draw");
 
     let area = frame.area();
+    let inspector_visible = inspector_visible_for(app, area);
+    let shell = shell_layout(area, inspector_visible);
 
     let main_area = area;
 
     // Draw Main Content
     match app.mode {
         TuiMode::Home => draw_home_screen(frame, app, main_area),
-        TuiMode::Discover => draw_discover_screen(frame, app, main_area),
-        TuiMode::Jobs => draw_jobs_screen(frame, app, main_area),
-        TuiMode::Sources => draw_sources_screen(frame, app, main_area),
-        TuiMode::Approvals => draw_approvals_screen(frame, app, main_area),
-        TuiMode::ParserBench => draw_parser_bench_screen(frame, app, main_area),
+        TuiMode::Ingest => match app.ingest_tab {
+            IngestTab::Sources => draw_sources_screen(frame, app, main_area),
+            _ => draw_discover_screen(frame, app, main_area),
+        },
+        TuiMode::Run => match app.run_tab {
+            RunTab::Jobs => draw_jobs_screen(frame, app, main_area),
+            RunTab::Outputs => draw_catalog_screen(frame, app, main_area),
+        },
+        TuiMode::Review => match app.review_tab {
+            ReviewTab::Approvals => draw_approvals_screen(frame, app, main_area),
+            ReviewTab::Sessions => draw_sessions_screen(frame, app, main_area),
+            ReviewTab::Triage => draw_triage_screen(frame, app, main_area),
+        },
         TuiMode::Query => draw_query_screen(frame, app, main_area),
         TuiMode::Settings => draw_settings_screen(frame, app, main_area),
-        TuiMode::Sessions => draw_sessions_screen(frame, app, main_area),
-        TuiMode::Triage => draw_triage_screen(frame, app, main_area),
-        TuiMode::Catalog => draw_catalog_screen(frame, app, main_area),
     }
 
     let global_modal_active = app.show_help
@@ -734,7 +754,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .unwrap_or(false);
 
     if global_modal_active {
-        let shell = shell_layout(area, !app.inspector_collapsed);
         draw_modal_scrim(frame, area, shell.top);
     }
 
@@ -754,12 +773,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     // Draw Jobs Drawer Overlay (toggle with J key)
     if app.jobs_drawer_open {
-        draw_jobs_drawer(frame, app, area);
+        draw_jobs_drawer(frame, app, &shell);
     }
 
     // Draw Sources Drawer Overlay (toggle with S key)
     if app.sources_drawer_open {
-        draw_sources_drawer(frame, app, area);
+        draw_sources_drawer(frame, app, &shell);
     }
 
     // Draw Workspace Switcher Overlay
@@ -774,8 +793,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 /// Draw the Jobs drawer overlay (global, toggles with J)
-fn draw_jobs_drawer(frame: &mut Frame, app: &App, area: Rect) {
-    let drawer_area = right_drawer_area(area);
+fn draw_jobs_drawer(frame: &mut Frame, app: &App, shell: &ShellAreas) {
+    let drawer_area = right_drawer_area(shell);
 
     // Clear background
     frame.render_widget(Clear, drawer_area);
@@ -943,8 +962,8 @@ fn draw_jobs_drawer(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Draw the Sources drawer overlay (global, toggles with S key)
-fn draw_sources_drawer(frame: &mut Frame, app: &App, area: Rect) {
-    let drawer_area = right_drawer_area(area);
+fn draw_sources_drawer(frame: &mut Frame, app: &App, shell: &ShellAreas) {
+    let drawer_area = right_drawer_area(shell);
 
     // Clear background
     frame.render_widget(Clear, drawer_area);
@@ -1141,10 +1160,10 @@ fn draw_workspace_switcher_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the home hub screen (Quick Start + Status dashboard)
 fn draw_home_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Home", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     let main_chunks = Layout::default()
@@ -1160,10 +1179,9 @@ fn draw_home_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_home_inspector(frame, app, inner);
     }
 
-    let footer_text = " [Enter] Open  [s] Scan  [/] Filter  [r] Refresh  [I] Inspector  [?] Help ";
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -1409,10 +1427,10 @@ fn draw_home_inspector(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Sources view screen (key 4)
 fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Sources", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     let block = Block::default()
@@ -1508,11 +1526,9 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
     if modal_active {
         frame.render_widget(Clear, shell.bottom);
     } else {
-        let footer =
-            " [↑/↓] Navigate  [n] New  [e] Edit  [r] Rescan  [d] Delete  [I] Inspector  [?] Help ";
         draw_shell_action_bar(
             frame,
-            footer,
+            &app.effective_actions(),
             Style::default().fg(Color::DarkGray),
             shell.bottom,
         );
@@ -1521,10 +1537,10 @@ fn draw_sources_screen(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Approvals view screen (key 5)
 fn draw_approvals_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Approvals", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     // Calculate aggregate stats
@@ -1615,10 +1631,9 @@ fn draw_approvals_screen(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     if app.approvals_state.view_state == ApprovalsViewState::List {
-        let footer = " [j/k] Navigate  [a] Approve  [r] Reject  [f] Filter  [Enter] Pin  [d] Details  [R] Refresh  [I] Inspector ";
         draw_shell_action_bar(
             frame,
-            footer,
+            &app.effective_actions(),
             Style::default().fg(Color::DarkGray),
             shell.bottom,
         );
@@ -1902,10 +1917,10 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
     #[cfg(feature = "profiling")]
     let _zone = app.profiler.zone("tui.discover");
 
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Discover", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     // Rule Builder is the ONLY view in Discover mode (replaces old GlobExplorer)
@@ -1941,9 +1956,15 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
 
     if modal_active {
         frame.render_widget(Clear, shell.bottom);
+    } else if let Some((message, style)) = discover_action_message(app) {
+        draw_shell_action_message(frame, &message, style, shell.bottom);
     } else {
-        let (footer_text, footer_style) = discover_action_bar(app);
-        draw_shell_action_bar(frame, &footer_text, footer_style, shell.bottom);
+        draw_shell_action_bar(
+            frame,
+            &app.effective_actions(),
+            Style::default().fg(Color::DarkGray),
+            shell.bottom,
+        );
     }
     if modal_active {
         draw_modal_scrim(frame, area, shell.top);
@@ -1985,48 +2006,25 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn discover_action_bar(app: &App) -> (String, Style) {
+fn discover_action_message(app: &App) -> Option<(String, Style)> {
     if let Some((ref msg, is_error)) = app.discover.status_message {
-        return (
-            format!(" {} ", msg),
-            if is_error {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default().fg(Color::Green)
-            },
-        );
+        let style = if is_error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        return Some((format!(" {} ", msg), style));
     }
 
     if let Some(ref progress) = app.cache_load_progress {
         let spinner = spinner_char(app.tick_count);
-        return (
+        return Some((
             format!(" {} {} ", spinner, progress.status_line()),
             Style::default().fg(Color::Yellow),
-        );
+        ));
     }
 
-    let scan_hint = if let Some(builder) = &app.discover.rule_builder {
-        use super::extraction::RuleBuilderFocus;
-        if matches!(
-            builder.focus,
-            RuleBuilderFocus::Pattern
-                | RuleBuilderFocus::Tag
-                | RuleBuilderFocus::ExcludeInput
-                | RuleBuilderFocus::ExtractionEdit(_)
-        ) {
-            "[Esc] Exit input then [s] Scan"
-        } else {
-            "[s] Scan"
-        }
-    } else {
-        "[s] Scan"
-    };
-
-    let text = format!(
-        " [e] Sample  [E] Full  [t] Apply Tag  [b] Backtest  {}  [Ctrl+S] Save  [Ctrl+N] Clear  [I] Inspector  [?] Help ",
-        scan_hint
-    );
-    (text, Style::default().fg(Color::DarkGray))
+    None
 }
 
 /// Draw the Sources dropdown as a proper overlay dialog
@@ -4438,10 +4436,10 @@ fn draw_rule_creation_dialog(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the Parser Bench screen - parser development workbench
 fn draw_parser_bench_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Parser Bench", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     let content_chunks = Layout::default()
@@ -4460,11 +4458,9 @@ fn draw_parser_bench_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_parser_bench_inspector(frame, app, inner);
     }
 
-    let footer_text =
-        " [↑/↓] Navigate  [t] Test  [n] Quick test  [/] Filter  [I] Inspector  [?] Help ";
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -4852,10 +4848,10 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Jobs", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     // Calculate layout based on whether pipeline is shown
@@ -4954,15 +4950,9 @@ fn draw_jobs_screen(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    // Show different footer based on view state
-    let footer_text = if app.jobs_state.view_state == JobsViewState::ViolationDetail {
-        " [↑/↓] Select violation  [a] Apply fix  [v/Esc] Back to details  [?] Help "
-    } else {
-        " [↑/↓] Select  [Tab] Section  [Enter] Pin  [p] Pipeline  [f] Filter  [Del] Clear  [Q] Quarantine  [C] Catalog  [v] Violations  [L] Logs  [O] Open  [y] Copy  [I] Inspector  [?] Help "
-    };
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -5488,10 +5478,10 @@ fn draw_violations_summary(job: &JobInfo, detail: &mut String) {
 
 /// Draw monitoring panel (per spec Section 5)
 fn draw_monitoring_panel(frame: &mut Frame, app: &App, area: Rect) {
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Jobs Monitor", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     let content_chunks = Layout::default()
@@ -5598,18 +5588,9 @@ fn draw_monitoring_panel(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(para, inner);
     }
 
-    let paused_indicator = if app.jobs_state.monitoring.paused {
-        " (PAUSED)"
-    } else {
-        ""
-    };
-    let footer = format!(
-        " [Esc] Back  [p] Pause updates  [r] Reset stats{}  [I] Inspector ",
-        paused_indicator
-    );
     draw_shell_action_bar(
         frame,
-        &footer,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -5901,125 +5882,23 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     // Clear the background
     frame.render_widget(Clear, help_area);
 
-    // Context-aware help content based on current mode
-    let help_text = match app.mode {
-        TuiMode::Discover => {
-            if app.discover.view_state == super::app::DiscoverViewState::RuleBuilder {
-                vec![
-                    "",
-                    "  RULE BUILDER KEYS                      NAVIGATION",
-                    "  ─────────────────                      ──────────",
-                    "  Tab/Shift+Tab  Cycle between fields    1-4       Go to view",
-                    "  ↑/↓ arrows     Move between fields     0 / H     Home",
-                    "  ←/→ arrows     Switch panels           Esc       Back / Close",
-                    "  ↑/↓            Navigate lists",
-                    "  Enter          Expand folder / Save    PATTERN SYNTAX",
-                    "                                         ──────────────",
-                    "  ACTIONS                                **/*      All files",
-                    "  ───────                                *.rs      Rust files",
-                    "  S              Sources dropdown        **/*.csv  CSV files (recursive)",
-                    "  T              Tags dropdown           <name>    Extract field",
-                    "  s              Scan new directory",
-                    "  Ctrl+S         Save rule               FOCUS INDICATOR",
-                    "  t              Apply tag               ──────────────",
-                    "                                         █ cursor   = text input active",
-                    "                                         ► pointer  = list navigation",
-                    "  IN DROPDOWNS",
-                    "  ────────────                           GLOBAL",
-                    "  /              Filter list             ──────",
-                    "  ↑/↓           Navigate                 ?         This help",
-                    "  Enter          Select item             r         Refresh view",
-                    "  I              Toggle inspector        q         Quit",
-                    "  Esc            Close dropdown          q         Quit",
-                    "",
-                    "  Press ? or Esc to close",
-                ]
-            } else {
-                vec![
-                    "",
-                    "  DISCOVER MODE                          NAVIGATION",
-                    "  ─────────────                          ──────────",
-                    "  s              Scan new directory      1-4       Go to view",
-                    "  n              Create new rule         0 / H     Home",
-                    "  Enter          Open Rule Builder       Esc       Back / Close",
-                    "  t              Tag selected file",
-                    "  c              Create source from folder",
-                    "  B              Bulk tag filtered files",
-                    "  S              Sources dropdown",
-                    "  T              Tags dropdown",
-                    "  /              Filter files            GLOBAL",
-                    "                                         ──────",
-                    "  IN SOURCES/TAGS DROPDOWN               ?         This help",
-                    "  ────────────────────────               r         Refresh view",
-                    "  /              Filter list             q         Quit",
-                    "  s              Scan (in Sources)",
-                    "  ↑/↓           Navigate",
-                    "  Enter          Select",
-                    "  Esc            Close",
-                    "  I              Toggle inspector",
-                    "",
-                    "  Press ? or Esc to close",
-                ]
-            }
-        }
-        TuiMode::ParserBench => vec![
-            "",
-            "  PARSER BENCH                           NAVIGATION",
-            "  ────────────                           ──────────",
-            "  n              Quick test any .py      1-4       Go to view",
-            "  t              Test selected parser    0 / H     Home",
-            "  ↑/↓           Navigate parsers        Esc       Back / Close",
-            "  /              Filter parsers",
-            "  Enter          View details            GLOBAL",
-            "                                         ──────",
-            "                                         ?         This help",
-            "                                         r         Refresh view",
-            "                                         I         Toggle inspector",
-            "                                         q         Quit",
-            "",
-            "  Press ? or Esc to close",
-        ],
-        TuiMode::Jobs => vec![
-            "",
-            "  JOBS VIEW                              NAVIGATION",
-            "  ─────────                              ──────────",
-            "  ↑/↓           Navigate jobs           1-4       Go to view",
-            "  Tab            Switch Actionable/Ready 0 / H     Home",
-            "  Enter          Pin details             Esc       Back / Close",
-            "  p              Toggle pipeline         GLOBAL",
-            "  o              Open output             GLOBAL",
-            "  f              Filter jobs             GLOBAL",
-            "  Backspace      Clear filters           GLOBAL",
-            "  Q              Quarantine explorer     GLOBAL",
-            "  C              Pipeline catalog        GLOBAL",
-            "                                         ──────",
-            "                                         ?         This help",
-            "                                         r         Refresh view",
-            "                                         I         Toggle inspector",
-            "                                         q         Quit",
-            "",
-            "  Press ? or Esc to close",
-        ],
-        _ => vec![
-            "",
-            "  NAVIGATION                             GLOBAL ACTIONS",
-            "  ──────────                             ──────────────",
-            "  1              Discover view           ?         This help",
-            "  2              Parser Bench view       r         Refresh view",
-            "  3              Jobs view               q         Quit",
-            "  4              Sources view            P         Parser Bench",
-            "  0 / H          Home                    S         Sources drawer",
-            "  Ctrl+W         Workspaces",
-            "  I              Toggle inspector",
-            "  Esc            Back / Close",
-            "  ↑/↓/←/→       Navigate",
-            "  Enter          Select",
-            "",
-            "  Press ? or Esc to close",
-        ],
-    };
+    let mode_label = app.view_label();
 
-    let help_paragraph = Paragraph::new(help_text.join("\n"))
+    let mut help_lines = Vec::new();
+    help_lines.push(String::new());
+    help_lines.push(format!("  Mode: {}", mode_label));
+    help_lines.push(String::new());
+    help_lines.push("  ACTIONS".to_string());
+    help_lines.push("  -------".to_string());
+    help_lines.extend(action_bar::format_help_lines(&app.effective_actions()));
+    help_lines.push(String::new());
+    help_lines.push("  GLOBAL".to_string());
+    help_lines.push("  ------".to_string());
+    help_lines.extend(action_bar::format_help_lines(&app.global_actions()));
+    help_lines.push(String::new());
+    help_lines.push("  Press ? or Esc to close".to_string());
+
+    let help_paragraph = Paragraph::new(help_lines.join("\n"))
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
@@ -6198,10 +6077,10 @@ fn draw_suggestions_detail_overlay(
 fn draw_settings_screen(frame: &mut Frame, app: &App, area: Rect) {
     use crate::cli::tui::app::SettingsCategory;
 
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Settings", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     let content_chunks = Layout::default()
@@ -6290,8 +6169,8 @@ fn draw_settings_screen(frame: &mut Frame, app: &App, area: Rect) {
             }),
         );
 
-    let db_path = app.config.database.clone().unwrap_or_else(active_db_path);
-    let backend_label = "duckdb";
+    let db_path = app.config.database.clone().unwrap_or_else(state_store_path);
+    let backend_label = "sqlite";
 
     let about_lines = vec![
         Line::from(format!("  Version:    {}", env!("CARGO_PKG_VERSION"))),
@@ -6310,14 +6189,9 @@ fn draw_settings_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_settings_inspector(frame, app, inner);
     }
 
-    let footer_text = if app.settings.editing {
-        " [Enter] Save  [Esc] Cancel  [I] Inspector "
-    } else {
-        " [↑/↓] Navigate  [Tab] Category  [Enter] Edit/Toggle  [I] Inspector "
-    };
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -6381,8 +6255,8 @@ fn draw_settings_category(
 }
 
 fn draw_settings_inspector(frame: &mut Frame, app: &App, area: Rect) {
-    let db_path = app.config.database.clone().unwrap_or_else(active_db_path);
-    let backend_label = "duckdb";
+    let db_path = app.config.database.clone().unwrap_or_else(state_store_path);
+    let backend_label = "sqlite";
 
     let lines = vec![
         Line::from(Span::styled(
@@ -6408,10 +6282,10 @@ fn draw_settings_inspector(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_query_screen(frame: &mut Frame, app: &App, area: Rect) {
     use crate::cli::tui::app::QueryViewState;
 
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Query Console", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     // Main content: SQL Editor (top 30%) + Results (bottom 70%)
@@ -6449,25 +6323,9 @@ fn draw_query_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_query_saved_queries_overlay(frame, area, app);
     }
 
-    // Draw Action Bar
-    let footer_text = match app.query_state.view_state {
-        QueryViewState::Editing => {
-            if app.query_state.executing {
-                " Query running in background...  [Tab] Results "
-            } else {
-                " [Ctrl+Enter] Execute  [Ctrl+L] Clear  [Ctrl+T] Tables  [Ctrl+S] Save  [Ctrl+O] Open  [Tab] Results "
-            }
-        }
-        QueryViewState::Executing => " Executing query...  [Esc] Detach ",
-        QueryViewState::ViewingResults => {
-            " [Tab/Esc] Editor  [Up/Down] Navigate  [Left/Right] Scroll  [PgUp/PgDn] Page "
-        }
-        QueryViewState::TableBrowser => " [Enter] Insert  [Esc] Close ",
-        QueryViewState::SavedQueries => " [Enter] Load  [Esc] Close ",
-    };
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -7043,10 +6901,10 @@ fn draw_query_saved_queries_overlay(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_sessions_screen(frame: &mut Frame, app: &App, area: Rect) {
     use crate::cli::tui::app::SessionsViewState;
 
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Sessions", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     // Three-panel layout: Session list | Workflow progress | Proposal/Gate details
@@ -7069,20 +6927,9 @@ fn draw_sessions_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_sessions_inspector(frame, app, inner);
     }
 
-    // Context-aware action bar
-    let footer_text = match app.sessions_state.view_state {
-        SessionsViewState::GateApproval => " [a] Approve  [r] Reject  [Esc] Back  [I] Inspector ",
-        SessionsViewState::SessionList => {
-            " [Enter] View  [n] New Session  [r] Refresh  [Esc] Back  [I] Inspector "
-        }
-        SessionsViewState::SessionDetail => {
-            " [w] Workflow  [j] Jobs  [q] Query  [d] Discover  [Esc] Back  [I] Inspector "
-        }
-        _ => " [Esc] Back  [I] Inspector ",
-    };
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -7502,10 +7349,10 @@ fn draw_sessions_inspector(frame: &mut Frame, app: &App, area: Rect) {
 // ======== Triage Screen (Quarantine + Schema + Dead Letter) ========
 
 fn draw_triage_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Triage", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     let chunks = Layout::default()
@@ -7528,14 +7375,9 @@ fn draw_triage_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_triage_inspector(frame, app, inner);
     }
 
-    let footer_text = if app.triage_state.job_filter.is_some() {
-        " [Tab] Next Tab  [↑/↓] Select  [j] Jobs  [y] Copy  [Del] Clear filter  [r] Refresh  [Esc] Back "
-    } else {
-        " [Tab] Next Tab  [↑/↓] Select  [j] Jobs  [y] Copy  [r] Refresh  [Esc] Back "
-    };
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -7755,18 +7597,19 @@ fn draw_triage_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
             }
             Some(rows) => {
                 let row = &rows[app.triage_state.selected_index];
+                let expected = format_schema_detail(
+                    &row.expected_name,
+                    &row.expected_type,
+                    row.expected_index,
+                );
+                let actual =
+                    format_schema_detail(&row.actual_name, &row.actual_type, row.actual_index);
                 lines.push(Line::from(format!("Row ID: {}", row.id)));
                 lines.push(Line::from(format!("Job ID: {}", row.job_id)));
                 lines.push(Line::from(format!("Output: {}", row.output_name)));
                 lines.push(Line::from(format!("Kind: {}", row.mismatch_kind)));
-                lines.push(Line::from(format!(
-                    "Expected: {:?} ({:?}) idx {:?}",
-                    row.expected_name, row.expected_type, row.expected_index
-                )));
-                lines.push(Line::from(format!(
-                    "Actual:   {:?} ({:?}) idx {:?}",
-                    row.actual_name, row.actual_type, row.actual_index
-                )));
+                lines.push(Line::from(format!("Expected: {}", expected)));
+                lines.push(Line::from(format!("Actual:   {}", actual)));
                 lines.push(Line::from(format!("Created: {}", row.created_at)));
             }
         },
@@ -7789,7 +7632,10 @@ fn draw_triage_detail_panel(frame: &mut Frame, app: &App, area: Rect) {
                 let row = &rows[app.triage_state.selected_index];
                 lines.push(Line::from(format!("Row ID: {}", row.id)));
                 lines.push(Line::from(format!("Original Job: {}", row.original_job_id)));
-                lines.push(Line::from(format!("File ID: {:?}", row.file_id)));
+                lines.push(Line::from(format!(
+                    "File ID: {}",
+                    format_optional_i64(row.file_id)
+                )));
                 lines.push(Line::from(format!("Plugin: {}", row.plugin_name)));
                 lines.push(Line::from(format!("Retry: {}", row.retry_count)));
                 lines.push(Line::from(format!("Moved: {}", row.moved_at)));
@@ -7883,10 +7729,10 @@ fn raw_data_preview(raw: &Option<Vec<u8>>) -> Vec<String> {
 // ======== Catalog Screen (Pipelines + Runs) ========
 
 fn draw_catalog_screen(frame: &mut Frame, app: &App, area: Rect) {
-    let inspector_visible = !app.inspector_collapsed;
+    let inspector_visible = inspector_visible_for(app, area);
     let shell = shell_layout(area, inspector_visible);
 
-    draw_shell_top_bar(frame, app, "Catalog", shell.top);
+    draw_shell_top_bar(frame, app, shell.top);
     draw_shell_rail(frame, app, shell.rail);
 
     let chunks = Layout::default()
@@ -7909,10 +7755,9 @@ fn draw_catalog_screen(frame: &mut Frame, app: &App, area: Rect) {
         draw_catalog_inspector(frame, app, inner);
     }
 
-    let footer_text = " [Tab] Next Tab  [↑/↓] Select  [Enter] Runs  [r] Refresh  [Esc] Back ";
     draw_shell_action_bar(
         frame,
-        footer_text,
+        &app.effective_actions(),
         Style::default().fg(Color::DarkGray),
         shell.bottom,
     );
@@ -8189,7 +8034,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Jobs;
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
 
         // Create a job with a UTF-8 name containing multi-byte characters
         let jobs_state = JobsState {
@@ -8214,7 +8060,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Jobs;
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
 
         // Emoji are 4-byte UTF-8 sequences
         let jobs_state = JobsState {
@@ -8285,24 +8132,4 @@ mod tests {
         assert!(content.contains("Scope"));
     }
 
-    #[test]
-    fn test_draw_parser_bench_mode() {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        // Test Parser Bench mode
-        let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::ParserBench;
-        terminal.draw(|f| draw(f, &app)).unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let content: String = buffer
-            .content
-            .iter()
-            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
-            .collect();
-
-        assert!(content.contains("Parser"));
-        assert!(content.contains("Bench"));
-    }
 }

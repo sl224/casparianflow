@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug_span, info};
 
@@ -39,6 +39,9 @@ pub enum BackendError {
 
     #[error("DuckDB error: {0}")]
     DuckDb(#[from] duckdb::Error),
+
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 /// Database access mode.
@@ -370,20 +373,30 @@ impl FromDbValue for Vec<u8> {
     }
 }
 
+#[derive(Clone)]
+enum Inner {
+    DuckDb {
+        conn: Rc<duckdb::Connection>,
+        /// Holds the exclusive file lock via RAII - not read, but dropping it releases the lock.
+        #[allow(dead_code)]
+        lock: Option<Rc<crate::lock::DbLockGuard>>,
+    },
+    Sqlite {
+        conn: Rc<rusqlite::Connection>,
+    },
+}
+
 /// Unified database connection.
 #[derive(Clone)]
 pub struct DbConnection {
-    conn: Rc<duckdb::Connection>,
+    inner: Inner,
     access_mode: AccessMode,
-    /// Holds the exclusive file lock via RAII - not read, but dropping it releases the lock.
-    #[allow(dead_code)]
-    lock_guard: Option<Rc<crate::lock::DbLockGuard>>,
 }
 
 impl std::fmt::Debug for DbConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DbConnection")
-            .field("backend", &"DuckDB")
+            .field("backend", &self.backend_name())
             .field("access_mode", &self.access_mode)
             .finish()
     }
@@ -392,10 +405,13 @@ impl std::fmt::Debug for DbConnection {
 impl DbConnection {
     /// Open a database from a URL.
     ///
-    /// Supported scheme: duckdb:
+    /// Supported schemes: duckdb:, sqlite:
     pub fn open_from_url(url: &str) -> Result<Self, BackendError> {
         if let Some(path) = strip_url_prefix(url, "duckdb:") {
             return Self::open_duckdb(Path::new(&path));
+        }
+        if let Some(path) = strip_url_prefix(url, "sqlite:") {
+            return Self::open_sqlite(Path::new(&path));
         }
 
         Err(BackendError::NotAvailable(format!(
@@ -406,10 +422,13 @@ impl DbConnection {
 
     /// Open a database from a URL in read-only mode.
     ///
-    /// Supported scheme: duckdb:
+    /// Supported schemes: duckdb:, sqlite:
     pub fn open_from_url_readonly(url: &str) -> Result<Self, BackendError> {
         if let Some(path) = strip_url_prefix(url, "duckdb:") {
             return Self::open_duckdb_readonly(Path::new(&path));
+        }
+        if let Some(path) = strip_url_prefix(url, "sqlite:") {
+            return Self::open_sqlite_readonly(Path::new(&path));
         }
 
         Err(BackendError::NotAvailable(format!(
@@ -442,9 +461,11 @@ impl DbConnection {
         );
 
         Ok(Self {
-            conn,
+            inner: Inner::DuckDb {
+                conn,
+                lock: Some(Rc::new(lock_guard)),
+            },
             access_mode: AccessMode::ReadWrite,
-            lock_guard: Some(Rc::new(lock_guard)),
         })
     }
 
@@ -459,9 +480,11 @@ impl DbConnection {
         info!("Opened DuckDB database (read-only): {}", path.display());
 
         Ok(Self {
-            conn,
+            inner: Inner::DuckDb {
+                conn,
+                lock: None,
+            },
             access_mode: AccessMode::ReadOnly,
-            lock_guard: None,
         })
     }
 
@@ -471,9 +494,46 @@ impl DbConnection {
         info!("Opened in-memory DuckDB database");
 
         Ok(Self {
-            conn,
+            inner: Inner::DuckDb { conn, lock: None },
             access_mode: AccessMode::ReadWrite,
-            lock_guard: None,
+        })
+    }
+
+    /// Open a SQLite database.
+    pub fn open_sqlite(path: &Path) -> Result<Self, BackendError> {
+        let conn = if path.to_string_lossy() == ":memory:" {
+            rusqlite::Connection::open_in_memory()?
+        } else {
+            rusqlite::Connection::open(path)?
+        };
+        configure_sqlite_rw(&conn)?;
+        info!("Opened SQLite database: {}", path.display());
+
+        Ok(Self {
+            inner: Inner::Sqlite {
+                conn: Rc::new(conn),
+            },
+            access_mode: AccessMode::ReadWrite,
+        })
+    }
+
+    /// Open a SQLite database in read-only mode.
+    pub fn open_sqlite_readonly(path: &Path) -> Result<Self, BackendError> {
+        use rusqlite::OpenFlags;
+
+        let conn = if path.to_string_lossy() == ":memory:" {
+            rusqlite::Connection::open_in_memory()?
+        } else {
+            rusqlite::Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
+        };
+        configure_sqlite_ro(&conn)?;
+        info!("Opened SQLite database (read-only): {}", path.display());
+
+        Ok(Self {
+            inner: Inner::Sqlite {
+                conn: Rc::new(conn),
+            },
+            access_mode: AccessMode::ReadOnly,
         })
     }
 
@@ -489,7 +549,10 @@ impl DbConnection {
 
     /// Get the backend name.
     pub fn backend_name(&self) -> &'static str {
-        "DuckDB"
+        match self.inner {
+            Inner::DuckDb { .. } => "DuckDB",
+            Inner::Sqlite { .. } => "SQLite",
+        }
     }
 
     /// Execute a SQL statement (no results).
@@ -498,7 +561,10 @@ impl DbConnection {
             return Err(BackendError::ReadOnly);
         }
 
-        Self::execute_duckdb_on_conn(self.conn.as_ref(), sql, params)
+        match &self.inner {
+            Inner::DuckDb { conn, .. } => Self::execute_duckdb_on_conn(conn.as_ref(), sql, params),
+            Inner::Sqlite { conn } => Self::execute_sqlite_on_conn(conn.as_ref(), sql, params),
+        }
     }
 
     /// Execute a batch of SQL statements.
@@ -507,7 +573,10 @@ impl DbConnection {
             return Err(BackendError::ReadOnly);
         }
 
-        Self::execute_duckdb_batch_on_conn(self.conn.as_ref(), sql)
+        match &self.inner {
+            Inner::DuckDb { conn, .. } => Self::execute_duckdb_batch_on_conn(conn.as_ref(), sql),
+            Inner::Sqlite { conn } => Self::execute_sqlite_batch_on_conn(conn.as_ref(), sql),
+        }
     }
 
     /// Bulk insert rows into a table.
@@ -523,19 +592,36 @@ impl DbConnection {
             return Err(BackendError::ReadOnly);
         }
 
-        let conn = self.conn.as_ref();
-        bulk_insert_rows_internal(
-            conn,
-            |sql, params| Self::execute_duckdb_on_conn(conn, sql, params),
-            table,
-            columns,
-            rows,
-        )
+        match &self.inner {
+            Inner::DuckDb { conn, .. } => {
+                let conn = conn.as_ref();
+                bulk_insert_rows_internal(
+                    conn,
+                    |sql, params| Self::execute_duckdb_on_conn(conn, sql, params),
+                    table,
+                    columns,
+                    rows,
+                )
+            }
+            Inner::Sqlite { conn } => {
+                let conn = conn.as_ref();
+                bulk_insert_rows_generic(
+                    &mut |sql, params| Self::execute_sqlite_on_conn(conn, sql, params),
+                    table,
+                    columns,
+                    rows,
+                    DEFAULT_MAX_PARAMS,
+                )
+            }
+        }
     }
 
     /// Query and return all rows.
     pub fn query_all(&self, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
-        Self::query_duckdb_on_conn(self.conn.as_ref(), sql, params)
+        match &self.inner {
+            Inner::DuckDb { conn, .. } => Self::query_duckdb_on_conn(conn.as_ref(), sql, params),
+            Inner::Sqlite { conn } => Self::query_sqlite_on_conn(conn.as_ref(), sql, params),
+        }
     }
 
     /// Query and return the first row, if any.
@@ -564,27 +650,96 @@ impl DbConnection {
         row.get(0)
     }
 
+    /// Check if a table exists in the current database.
+    pub fn table_exists(&self, table: &str) -> Result<bool, BackendError> {
+        match &self.inner {
+            Inner::DuckDb { .. } => {
+                let row = self.query_optional(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = ? LIMIT 1",
+                    &[DbValue::from(table)],
+                )?;
+                Ok(row.is_some())
+            }
+            Inner::Sqlite { .. } => {
+                let row = self.query_optional(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+                    &[DbValue::from(table)],
+                )?;
+                Ok(row.is_some())
+            }
+        }
+    }
+
+    /// Check if a column exists in the given table.
+    pub fn column_exists(&self, table: &str, column: &str) -> Result<bool, BackendError> {
+        match &self.inner {
+            Inner::DuckDb { .. } => {
+                let row = self.query_optional(
+                    "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ? LIMIT 1",
+                    &[DbValue::from(table), DbValue::from(column)],
+                )?;
+                Ok(row.is_some())
+            }
+            Inner::Sqlite { .. } => {
+                let escaped = table.replace('\'', "''");
+                let sql = format!("PRAGMA table_info('{}')", escaped);
+                let rows = self.query_all(&sql, &[])?;
+                for row in rows {
+                    if let Ok(name) = row.get_by_name::<String>("name") {
+                        if name == column {
+                            return Ok(true);
+                        }
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
     /// Execute a transaction using DuckDB.
     pub fn transaction<T, F>(&self, op: F) -> Result<T, BackendError>
     where
         F: for<'a> FnOnce(&'a mut DbTransaction<'a>) -> Result<T, BackendError>,
     {
-        self.conn.execute_batch("BEGIN")?;
-        let mut tx = DbTransaction::duckdb(self.conn.as_ref());
-        let result = op(&mut tx);
+        match &self.inner {
+            Inner::DuckDb { conn, .. } => {
+                conn.execute_batch("BEGIN")?;
+                let mut tx = DbTransaction::duckdb(conn.as_ref());
+                let result = op(&mut tx);
 
-        match result {
-            Ok(value) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(value)
+                match result {
+                    Ok(value) => {
+                        conn.execute_batch("COMMIT")?;
+                        Ok(value)
+                    }
+                    Err(err) => match conn.execute_batch("ROLLBACK") {
+                        Ok(()) => Err(err),
+                        Err(rollback_err) => Err(BackendError::Transaction(format!(
+                            "Transaction failed: {}; rollback failed: {}",
+                            err, rollback_err
+                        ))),
+                    },
+                }
             }
-            Err(err) => match self.conn.execute_batch("ROLLBACK") {
-                Ok(()) => Err(err),
-                Err(rollback_err) => Err(BackendError::Transaction(format!(
-                    "Transaction failed: {}; rollback failed: {}",
-                    err, rollback_err
-                ))),
-            },
+            Inner::Sqlite { conn } => {
+                conn.execute_batch("BEGIN")?;
+                let mut tx = DbTransaction::sqlite(conn.as_ref());
+                let result = op(&mut tx);
+
+                match result {
+                    Ok(value) => {
+                        conn.execute_batch("COMMIT")?;
+                        Ok(value)
+                    }
+                    Err(err) => match conn.execute_batch("ROLLBACK") {
+                        Ok(()) => Err(err),
+                        Err(rollback_err) => Err(BackendError::Transaction(format!(
+                            "Transaction failed: {}; rollback failed: {}",
+                            err, rollback_err
+                        ))),
+                    },
+                }
+            }
         }
     }
 
@@ -784,28 +939,183 @@ impl DbConnection {
             }
         }
     }
+
+    fn execute_sqlite_on_conn(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<u64, BackendError> {
+        let op = sql_op_name(sql);
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.exec",
+            op = op,
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
+
+        let mut stmt = conn.prepare(sql)?;
+        let sqlite_params = Self::to_sqlite_params(params);
+        let param_refs: Vec<&dyn rusqlite::ToSql> = sqlite_params
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = stmt.execute(param_refs.as_slice())?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", duration_ms);
+        Ok(rows as u64)
+    }
+
+    fn execute_sqlite_batch_on_conn(
+        conn: &rusqlite::Connection,
+        sql: &str,
+    ) -> Result<(), BackendError> {
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.exec_batch",
+            op = "BATCH",
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
+        conn.execute_batch(sql)?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", duration_ms);
+        Ok(())
+    }
+
+    fn query_sqlite_on_conn(
+        conn: &rusqlite::Connection,
+        sql: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<DbRow>, BackendError> {
+        let op = sql_op_name(sql);
+        let sql_hash = hash_sql(sql);
+        let span = debug_span!(
+            "db.query",
+            op = op,
+            sql_hash = %sql_hash,
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let start = Instant::now();
+
+        let mut stmt = conn.prepare(sql)?;
+        let column_count = stmt.column_count();
+        let mut columns = Vec::with_capacity(column_count);
+        for i in 0..column_count {
+            let name = stmt
+                .column_name(i)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| format!("col{}", i));
+            columns.push(name);
+        }
+
+        let sqlite_params = Self::to_sqlite_params(params);
+        let param_refs: Vec<&dyn rusqlite::ToSql> = sqlite_params
+            .iter()
+            .map(|v| v as &dyn rusqlite::ToSql)
+            .collect();
+
+        let mut rows_iter = stmt.query(param_refs.as_slice())?;
+
+        let mut result = Vec::new();
+        while let Some(row) = rows_iter.next()? {
+            let mut values = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let value = Self::sqlite_value_to_db_value(row, i)?;
+                values.push(value);
+            }
+            result.push(DbRow::new(columns.clone(), values));
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        span.record("duration_ms", duration_ms);
+        Ok(result)
+    }
+
+    fn to_sqlite_params(params: &[DbValue]) -> Vec<rusqlite::types::Value> {
+        params
+            .iter()
+            .map(|p| match p {
+                DbValue::Null => rusqlite::types::Value::Null,
+                DbValue::Integer(v) => rusqlite::types::Value::Integer(*v),
+                DbValue::Real(v) => rusqlite::types::Value::Real(*v),
+                DbValue::Text(v) => rusqlite::types::Value::Text(v.clone()),
+                DbValue::Blob(v) => rusqlite::types::Value::Blob(v.clone()),
+                DbValue::Boolean(v) => rusqlite::types::Value::Integer(i64::from(*v)),
+                DbValue::Timestamp(v) => {
+                    rusqlite::types::Value::Text(v.to_rfc3339())
+                }
+            })
+            .collect()
+    }
+
+    fn sqlite_value_to_db_value(
+        row: &rusqlite::Row,
+        index: usize,
+    ) -> Result<DbValue, rusqlite::Error> {
+        use rusqlite::types::ValueRef;
+
+        match row.get_ref(index)? {
+            ValueRef::Null => Ok(DbValue::Null),
+            ValueRef::Integer(v) => Ok(DbValue::Integer(v)),
+            ValueRef::Real(v) => Ok(DbValue::Real(v)),
+            ValueRef::Text(v) => Ok(DbValue::Text(String::from_utf8_lossy(v).to_string())),
+            ValueRef::Blob(v) => Ok(DbValue::Blob(v.to_vec())),
+        }
+    }
 }
 
-/// Transaction wrapper for DuckDB.
+/// Transaction wrapper for supported backends.
 pub struct DbTransaction<'a> {
-    conn: &'a duckdb::Connection,
+    inner: TransactionInner<'a>,
+}
+
+enum TransactionInner<'a> {
+    DuckDb { conn: &'a duckdb::Connection },
+    Sqlite { conn: &'a rusqlite::Connection },
 }
 
 impl<'a> DbTransaction<'a> {
     fn duckdb(conn: &'a duckdb::Connection) -> Self {
-        Self { conn }
+        Self {
+            inner: TransactionInner::DuckDb { conn },
+        }
+    }
+
+    fn sqlite(conn: &'a rusqlite::Connection) -> Self {
+        Self {
+            inner: TransactionInner::Sqlite { conn },
+        }
     }
 
     pub fn execute(&mut self, sql: &str, params: &[DbValue]) -> Result<u64, BackendError> {
-        DbConnection::execute_duckdb_on_conn(self.conn, sql, params)
+        match self.inner {
+            TransactionInner::DuckDb { conn } => {
+                DbConnection::execute_duckdb_on_conn(conn, sql, params)
+            }
+            TransactionInner::Sqlite { conn } => {
+                DbConnection::execute_sqlite_on_conn(conn, sql, params)
+            }
+        }
     }
 
     pub fn execute_batch(&mut self, sql: &str) -> Result<(), BackendError> {
-        DbConnection::execute_duckdb_batch_on_conn(self.conn, sql)
+        match self.inner {
+            TransactionInner::DuckDb { conn } => DbConnection::execute_duckdb_batch_on_conn(conn, sql),
+            TransactionInner::Sqlite { conn } => DbConnection::execute_sqlite_batch_on_conn(conn, sql),
+        }
     }
 
     pub fn query_all(&mut self, sql: &str, params: &[DbValue]) -> Result<Vec<DbRow>, BackendError> {
-        DbConnection::query_duckdb_on_conn(self.conn, sql, params)
+        match self.inner {
+            TransactionInner::DuckDb { conn } => DbConnection::query_duckdb_on_conn(conn, sql, params),
+            TransactionInner::Sqlite { conn } => DbConnection::query_sqlite_on_conn(conn, sql, params),
+        }
     }
 
     pub fn query_optional(
@@ -840,14 +1150,22 @@ impl<'a> DbTransaction<'a> {
         columns: &[&str],
         rows: &[Vec<DbValue>],
     ) -> Result<u64, BackendError> {
-        let conn = self.conn;
-        bulk_insert_rows_internal(
-            conn,
-            |sql, params| DbConnection::execute_duckdb_on_conn(conn, sql, params),
-            table,
-            columns,
-            rows,
-        )
+        match self.inner {
+            TransactionInner::DuckDb { conn } => bulk_insert_rows_internal(
+                conn,
+                |sql, params| DbConnection::execute_duckdb_on_conn(conn, sql, params),
+                table,
+                columns,
+                rows,
+            ),
+            TransactionInner::Sqlite { conn } => bulk_insert_rows_generic(
+                &mut |sql, params| DbConnection::execute_sqlite_on_conn(conn, sql, params),
+                table,
+                columns,
+                rows,
+                DEFAULT_MAX_PARAMS,
+            ),
+        }
     }
 }
 
@@ -1047,6 +1365,22 @@ fn hash_sql(sql: &str) -> String {
     format!("{:016x}", hash)
 }
 
+fn configure_sqlite_rw(conn: &rusqlite::Connection) -> Result<(), BackendError> {
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA foreign_keys=ON;",
+    )?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    Ok(())
+}
+
+fn configure_sqlite_ro(conn: &rusqlite::Connection) -> Result<(), BackendError> {
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,5 +1462,56 @@ mod tests {
         assert_eq!(inserted, 600);
         let count: i64 = conn.query_scalar("SELECT COUNT(*) FROM t", &[]).unwrap();
         assert_eq!(count, 600);
+    }
+
+    #[test]
+    fn sqlite_execute_and_query_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let url = format!("sqlite:{}", path.display());
+        let conn = DbConnection::open_from_url(&url).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t (id, name) VALUES (?, ?)",
+            &[DbValue::from(1_i64), DbValue::from("alpha")],
+        )
+        .unwrap();
+
+        let name: String = conn
+            .query_scalar("SELECT name FROM t WHERE id = ?", &[DbValue::from(1_i64)])
+            .unwrap();
+        assert_eq!(name, "alpha");
+    }
+
+    #[test]
+    fn sqlite_readonly_rejects_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let url = format!("sqlite:{}", path.display());
+        let conn = DbConnection::open_from_url(&url).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER)")
+            .unwrap();
+
+        let ro = DbConnection::open_from_url_readonly(&url).unwrap();
+        let err = ro
+            .execute("INSERT INTO t (id) VALUES (1)", &[])
+            .unwrap_err();
+        assert!(matches!(err, BackendError::ReadOnly));
+    }
+
+    #[test]
+    fn sqlite_table_and_column_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let url = format!("sqlite:{}", path.display());
+        let conn = DbConnection::open_from_url(&url).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER, name TEXT)")
+            .unwrap();
+
+        assert!(conn.table_exists("t").unwrap());
+        assert!(!conn.table_exists("missing").unwrap());
+        assert!(conn.column_exists("t", "id").unwrap());
+        assert!(!conn.column_exists("t", "nope").unwrap());
     }
 }

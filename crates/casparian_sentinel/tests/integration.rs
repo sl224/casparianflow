@@ -26,9 +26,9 @@ fn setup_queue_db() -> DbConnection {
             context_snapshot_hash TEXT,
             logical_date TEXT NOT NULL,
             status TEXT NOT NULL,
-            started_at TIMESTAMP,
-            completed_at TIMESTAMP,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            started_at INTEGER,
+            completed_at INTEGER,
+            created_at INTEGER NOT NULL
         )
         "#,
         &[],
@@ -45,6 +45,15 @@ fn setup_queue_db() -> DbConnection {
     )
     .unwrap();
     conn
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH - check system clock")
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 #[cfg(not(unix))]
@@ -110,8 +119,9 @@ fn test_conclude_message() {
 #[test]
 fn test_control_api_smoke() {
     let temp_dir = TempDir::new().expect("temp dir");
-    let db_path = temp_dir.path().join("casparian_flow.duckdb");
-    let db_url = format!("duckdb:{}", db_path.display());
+    let db_path = temp_dir.path().join("state.sqlite");
+    let db_url = format!("sqlite:{}", db_path.display());
+    let query_catalog = temp_dir.path().join("query.duckdb");
 
     #[cfg(unix)]
     let bind_addr = format!("ipc://{}", temp_dir.path().join("sentinel.sock").display());
@@ -129,9 +139,10 @@ fn test_control_api_smoke() {
     let handle = thread::spawn(move || {
         let config = SentinelConfig {
             bind_addr,
-            database_url: db_url,
+            state_store_url: db_url,
             max_workers: 1,
             control_addr: Some(control_addr_clone),
+            query_catalog_path: query_catalog,
         };
         let mut sentinel = Sentinel::bind(config).expect("bind sentinel");
         sentinel.run_with_shutdown(stop_rx).expect("run sentinel");
@@ -327,10 +338,12 @@ fn test_pipeline_run_status_updates() {
     let queue = JobQueue::new(conn.clone());
 
     conn.execute(
-        "INSERT INTO cf_pipeline_runs (id, pipeline_id, selection_spec_id, selection_snapshot_hash, logical_date, status) VALUES ('run-1', 'pipe-1', 'spec-1', 'hash-1', '2025-01-01', ?)",
-        &[DbValue::from(PipelineRunStatus::Queued.as_str())],
+        "INSERT INTO cf_pipeline_runs (id, pipeline_id, selection_spec_id, selection_snapshot_hash, logical_date, status, created_at) VALUES ('run-1', 'pipe-1', 'spec-1', 'hash-1', '2025-01-01', ?, ?)",
+        &[
+            DbValue::from(PipelineRunStatus::Queued.as_str()),
+            DbValue::from(now_millis()),
+        ],
     )
-
     .unwrap();
 
     conn.execute(
@@ -353,8 +366,11 @@ fn test_pipeline_run_status_updates() {
     assert_eq!(job.pipeline_run_id.as_deref(), Some("run-1"));
 
     conn.execute(
-        "UPDATE cf_pipeline_runs SET status = ?, started_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
-        &[DbValue::from(PipelineRunStatus::Running.as_str())],
+        "UPDATE cf_pipeline_runs SET status = ?, started_at = ? WHERE id = 'run-1'",
+        &[
+            DbValue::from(PipelineRunStatus::Running.as_str()),
+            DbValue::from(now_millis()),
+        ],
     )
     .unwrap();
 
@@ -382,10 +398,12 @@ fn test_pipeline_run_status_updates() {
 
     if failed > 0 {
         conn.execute(
-            "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
-            &[DbValue::from(PipelineRunStatus::Failed.as_str())],
+            "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = 'run-1'",
+            &[
+                DbValue::from(PipelineRunStatus::Failed.as_str()),
+                DbValue::from(now_millis()),
+            ],
         )
-
         .unwrap();
     } else if active > 0 {
         conn.execute(
@@ -395,10 +413,12 @@ fn test_pipeline_run_status_updates() {
         .unwrap();
     } else if completed > 0 {
         conn.execute(
-            "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = 'run-1'",
-            &[DbValue::from(PipelineRunStatus::Completed.as_str())],
+            "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = 'run-1'",
+            &[
+                DbValue::from(PipelineRunStatus::Completed.as_str()),
+                DbValue::from(now_millis()),
+            ],
         )
-
         .unwrap();
     }
 

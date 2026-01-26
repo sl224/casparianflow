@@ -16,6 +16,7 @@
 //! - JOB_ID (u64): Job ID (Q = unsigned long long, 8 bytes)
 //! - LEN (u32): Payload length in bytes (I = unsigned int, 4 bytes)
 
+pub mod config;
 pub mod defaults;
 pub mod error;
 pub mod http_types;

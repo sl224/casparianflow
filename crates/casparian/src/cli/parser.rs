@@ -11,7 +11,7 @@ use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{print_table, print_table_colored};
 use anyhow::Context;
-use casparian_db::{DbConnection, DbTimestamp, DbValue};
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::PluginStatus;
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
@@ -195,7 +195,7 @@ fn run_with_action(action: ParserAction) -> anyhow::Result<()> {
 
 /// Get database path using config module
 fn get_db_path() -> PathBuf {
-    config::active_db_path()
+    config::state_store_path()
 }
 
 /// Connect to the database
@@ -212,7 +212,7 @@ fn connect_db() -> anyhow::Result<DbConnection> {
             .into());
     }
 
-    let url = format!("duckdb:{}", db_path.display());
+    let url = config::state_store_url();
     let conn = DbConnection::open_from_url(&url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(e.to_string())
@@ -235,7 +235,8 @@ fn connect_db_readonly() -> anyhow::Result<DbConnection> {
             .into());
     }
 
-    Ok(DbConnection::open_duckdb_readonly(&db_path).map_err(|e| {
+    let url = config::state_store_url();
+    Ok(DbConnection::open_from_url_readonly(&url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(e.to_string())
             .with_suggestion("TRY: Ensure the database file is not corrupted")
@@ -243,11 +244,7 @@ fn connect_db_readonly() -> anyhow::Result<DbConnection> {
 }
 
 fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
-    let row = conn.query_optional(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
-        &[DbValue::from(table)],
-    )?;
-    Ok(row.is_some())
+    Ok(conn.table_exists(table)?)
 }
 
 // ============================================================================
@@ -303,10 +300,10 @@ fn cmd_list(json_output: bool) -> anyhow::Result<()> {
             source_hash: source_hash_value,
             env_hash: env_hash_value,
             artifact_hash: artifact_hash_value,
-            created_at: row
-                .get_by_name::<DbTimestamp>("created_at")?
-                .as_chrono()
-                .clone(),
+            created_at: DateTime::<Utc>::from_timestamp_millis(
+                row.get_by_name::<i64>("created_at")?,
+            )
+            .unwrap_or_else(Utc::now),
         };
         parsers.push(parser);
     }
@@ -419,10 +416,10 @@ fn cmd_show(name: &str, json_output: bool) -> anyhow::Result<()> {
         source_hash: source_hash_value,
         env_hash: env_hash_value,
         artifact_hash: artifact_hash_value,
-        created_at: row
-            .get_by_name::<DbTimestamp>("created_at")?
-            .as_chrono()
-            .clone(),
+        created_at: DateTime::<Utc>::from_timestamp_millis(
+            row.get_by_name::<i64>("created_at")?,
+        )
+        .unwrap_or_else(Utc::now),
     };
 
     if json_output {
@@ -654,7 +651,7 @@ fn cmd_resume(name: &str) -> anyhow::Result<()> {
             let failures: i64 = row
                 .get_by_name("consecutive_failures")
                 .context("Failed to read 'consecutive_failures' from cf_parser_health")?;
-            let paused_at: Option<String> = row.get_by_name("paused_at").ok();
+            let paused_at: Option<i64> = row.get_by_name("paused_at").ok();
             if paused_at.is_none() && failures == 0 {
                 println!("Parser '{}' is already healthy (not paused)", name);
                 return Ok(());
@@ -662,8 +659,8 @@ fn cmd_resume(name: &str) -> anyhow::Result<()> {
 
             // Reset the circuit breaker
             conn.execute(
-                "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0, updated_at = CURRENT_TIMESTAMP WHERE parser_name = ?",
-                &[DbValue::from(name)],
+                "UPDATE cf_parser_health SET paused_at = NULL, consecutive_failures = 0, updated_at = ? WHERE parser_name = ?",
+                &[DbValue::from(now_millis()), DbValue::from(name)],
             )
             ?;
 
@@ -727,7 +724,7 @@ fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
                 .get_by_name("consecutive_failures")
                 .context("Failed to read 'consecutive_failures' from cf_parser_health")?;
             let last_error: Option<String> = row.get_by_name("last_failure_reason").ok();
-            let paused_at: Option<String> = row.get_by_name("paused_at").ok();
+            let paused_at: Option<i64> = row.get_by_name("paused_at").ok();
             let success_rate = if total > 0 {
                 (success as f64 / total as f64) * 100.0
             } else {
@@ -735,6 +732,7 @@ fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
             };
 
             if json_output {
+                let paused_at_rfc3339 = paused_at.map(millis_to_rfc3339);
                 let result = serde_json::json!({
                     "parser_name": parser_name,
                     "total_executions": total,
@@ -743,7 +741,7 @@ fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
                     "success_rate": success_rate,
                     "last_failure_reason": last_error,
                     "paused": paused_at.is_some(),
-                    "paused_at": paused_at,
+                    "paused_at": paused_at_rfc3339,
                 });
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
@@ -761,7 +759,10 @@ fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
             println!("Circuit Breaker:");
             println!("  Consecutive Failures: {}", failures);
             if let Some(paused) = paused_at {
-                println!("  Status:               PAUSED (tripped at {})", paused);
+                println!(
+                    "  Status:               PAUSED (tripped at {})",
+                    millis_to_rfc3339(paused)
+                );
                 println!();
                 println!("To resume this parser:");
                 println!("  casparian parser resume {}", parser_name);
@@ -802,6 +803,21 @@ fn cmd_health(name: &str, json_output: bool) -> anyhow::Result<()> {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH - check system clock")
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn millis_to_rfc3339(millis: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .unwrap_or_else(|| chrono::Utc::now())
+        .to_rfc3339()
+}
 
 /// Run a parser test against an input file
 /// Returns: (success, rows, schema, preview_rows, headers, errors)

@@ -22,7 +22,7 @@ All Phase 0 components have been implemented in `crates/casparian_mcp/`:
 | **Security Subsystem** | DONE | Path allowlist, output budget, audit logging |
 | **Job Subsystem** | DONE | `JobManager`, `JobStore`, states: Queued/Running/Completed/Failed/Cancelled/Stalled |
 | **Approval Subsystem** | DONE | `ApprovalManager`, `ApprovalStore`, file-based persistence |
-| **Core Tools** | DONE | plugins, scan, preview, query (with SQL allowlist + read-only DuckDB) |
+| **Core Tools** | DONE | plugins, scan, preview, query (SQL allowlist + read-only DuckDB query catalog) |
 | **Job Tools** | DONE | backtest_start, run_request, job_status/cancel/list |
 | **Approval Tools** | DONE | approval_status, approval_list, approval_decide |
 
@@ -33,10 +33,10 @@ MCP now integrates with `casparian_sentinel`'s `ApiStorage` for persistent job/e
 | Component | Status | Implementation Notes |
 |-----------|--------|---------------------|
 | **Protocol HTTP Types** | DONE | `casparian_protocol/src/http_types.rs` - Job, Event, Approval, Query types |
-| **ApiStorage** | DONE | `casparian_sentinel/src/db/api_storage.rs` - DuckDB-backed storage |
+| **ApiStorage** | DONE | `casparian_sentinel/src/db/api_storage.rs` - state-store-backed storage (SQLite default) |
 | **Bridge Layer** | DONE | `casparian_mcp/src/db_store.rs` - DbJobStore, DbApprovalStore |
 | **Redaction Module** | DONE | `casparian_mcp/src/redaction.rs` - hash/truncate/none modes |
-| **Query Hardening** | DONE | Read-only DuckDB, SQL allowlist, redaction applied |
+| **Query Hardening** | DONE | Read-only DuckDB query catalog, SQL allowlist, redaction applied |
 
 **Architecture Decision:** MCP calls Rust crates directly (no HTTP server). See `docs/local_control_plane_api_plan.md`.
 
@@ -46,7 +46,7 @@ MCP now integrates with `casparian_sentinel`'s `ApiStorage` for persistent job/e
 
 2. **Direct Crate Calls (No HTTP)**: MCP server calls `casparian_sentinel::ApiStorage` directly for job/event/approval management. No separate HTTP server.
 
-3. **DuckDB Storage**: Jobs, events, and approvals are stored in DuckDB tables (`cf_api_jobs`, `cf_api_events`, `cf_api_approvals`) for persistence and queryability.
+3. **State Store Storage**: Jobs, events, and approvals are stored in state store tables (`cf_api_jobs`, `cf_api_events`, `cf_api_approvals`) for persistence and queryability. SQLite is default; Postgres/SQLServer are optional.
 
 4. **Monotonic Event IDs**: Events use per-job monotonic IDs for strict ordering and efficient polling.
 
@@ -84,7 +84,7 @@ crates/casparian_mcp/
 │       ├── plugins.rs            # casparian_plugins
 │       ├── scan.rs               # casparian_scan
 │       ├── preview.rs            # casparian_preview
-│       ├── query.rs              # casparian_query (SQL allowlist + read-only DuckDB + redaction)
+│       ├── query.rs              # casparian_query (SQL allowlist + read-only DuckDB query catalog + redaction)
 │       ├── backtest.rs           # casparian_backtest_start
 │       ├── run.rs                # casparian_run_request
 │       ├── job.rs                # job_status, job_cancel, job_list
@@ -94,7 +94,7 @@ crates/casparian_sentinel/
 ├── CLAUDE.md                     # Crate-specific Claude Code instructions
 ├── src/
 │   └── db/
-│       └── api_storage.rs        # ApiStorage - DuckDB storage for Control Plane API
+│       └── api_storage.rs        # ApiStorage - state store for Control Plane API
 
 crates/casparian_protocol/
 ├── CLAUDE.md                     # Crate-specific Claude Code instructions
@@ -169,7 +169,7 @@ as MCP tools, with appropriate human approval gates for write operations.
 
 1. **Job-first architecture:** Long-running operations return immediately with a `job_id`; progress is polled via separate tools.
 2. **Non-blocking approvals:** Write operations create approval requests; humans approve out-of-band.
-3. **Read-only by default:** Query tool uses read-only DuckDB connection; samples are redacted by default.
+3. **Read-only by default:** Query tool uses a read-only DuckDB query catalog; samples are redacted by default.
 4. **Security from day one:** Path allowlists, output budgets, and audit logging are P0, not afterthoughts.
 5. **Per-output schemas:** Multi-output parsers are first-class; schemas are always keyed by output name.
 
@@ -1163,7 +1163,7 @@ Per ADR-021, ephemeral contracts are for iteration, not system-of-record.
 **Human Gate:** None
 
 **Security:**
-- Opens DuckDB in **read-only mode**
+- Opens the DuckDB query catalog in **read-only mode**
 - SQL allowlist: `SELECT`, `WITH`, `EXPLAIN` only
 - Forbids: `INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `COPY`, `INSTALL`, `LOAD`
 - Query timeout enforced
@@ -1388,7 +1388,7 @@ Phase 2 (Polish) - P2
 |----------|----------|-----------|
 | Progress streaming | Job-based polling | stderr unreliable in MCP clients |
 | Human gate mechanism | Non-blocking file-based approvals | Prevents deadlocks in agent loops |
-| Query sandboxing | Read-only DuckDB + SQL allowlist | Prevents accidental destructive commands |
+| Query sandboxing | Read-only DuckDB query catalog + SQL allowlist | Prevents accidental destructive commands |
 | Security timing | P0 (day one) | Filesystem access + SQL in agentic env is high risk |
 | Sample redaction | Hash by default | DFIR data contains sensitive content |
 | Parser identity | PluginRef (plugin@version or path) | Future-proof for native plugins |

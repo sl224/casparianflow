@@ -389,9 +389,13 @@ enum Commands {
         #[arg(long)]
         addr: Option<String>,
 
-        /// Database path (default: ~/.casparian_flow/casparian_flow.duckdb)
-        #[arg(long)]
-        database: Option<std::path::PathBuf>,
+        /// State store URL (default: sqlite:~/.casparian_flow/state.sqlite)
+        #[arg(long = "state-store")]
+        state_store: Option<String>,
+
+        /// Query catalog path (default: ~/.casparian_flow/query.duckdb)
+        #[arg(long = "query-catalog")]
+        query_catalog: Option<std::path::PathBuf>,
 
         /// Parquet output directory (default: ~/.casparian_flow/output)
         #[arg(long)]
@@ -806,7 +810,8 @@ fn run_command(cli: Cli, telemetry: Option<TelemetryRecorder>) -> Result<()> {
         // === Existing Server Commands ===
         Commands::Start {
             addr,
-            database,
+            state_store,
+            query_catalog,
             output,
             data_threads,
             venvs_dir,
@@ -814,12 +819,15 @@ fn run_command(cli: Cli, telemetry: Option<TelemetryRecorder>) -> Result<()> {
             no_control_api,
         } => {
             // Use config module for defaults
-            let db_path = database.unwrap_or_else(cli::config::active_db_path);
+            let state_store_url = resolve_state_store_url(state_store);
             let output_dir = output.unwrap_or_else(cli::config::output_dir);
+            let query_catalog_path =
+                query_catalog.unwrap_or_else(cli::config::query_catalog_path);
             run_unified(
                 addr,
-                db_path,
+                state_store_url,
                 output_dir,
+                query_catalog_path,
                 data_threads,
                 venvs_dir,
                 control_addr,
@@ -1085,8 +1093,9 @@ fn build_command_payload(cmd: &Commands, writer: &TapeWriter) -> serde_json::Val
 /// Run unified Sentinel + Worker with Split-Runtime Architecture
 fn run_unified(
     addr: Option<String>,
-    db_path: std::path::PathBuf,
+    state_store_url: String,
     output: std::path::PathBuf,
+    query_catalog_path: std::path::PathBuf,
     data_threads: Option<usize>,
     venvs_dir: Option<std::path::PathBuf>,
     control_addr: Option<String>,
@@ -1108,8 +1117,9 @@ fn run_unified(
         "Control API: {}",
         control_addr.as_deref().unwrap_or("disabled")
     );
-    info!("Database: {}", db_path.display());
+    info!("State Store: {}", state_store_url);
     info!("Output: {}", output.display());
+    info!("Query Catalog: {}", query_catalog_path.display());
 
     // Setup signal handling
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -1149,13 +1159,14 @@ fn run_unified(
 
     // Start Sentinel (in its own thread)
     let sentinel_addr = addr.clone();
-    let sentinel_db = format!("duckdb:{}", db_path.display());
+    let sentinel_state_store = state_store_url.clone();
     let sentinel_thread = std::thread::spawn(move || {
         let config = SentinelConfig {
             bind_addr: sentinel_addr,
-            database_url: sentinel_db,
+            state_store_url: sentinel_state_store,
             max_workers: 1,
             control_addr,
+            query_catalog_path,
         };
 
         let mut sentinel = Sentinel::bind(config)?;
@@ -1250,6 +1261,38 @@ fn run_unified(
     Ok(())
 }
 
+fn resolve_state_store_url(state_store: Option<String>) -> String {
+    match state_store {
+        None => default_state_store_url(),
+        Some(raw) if raw == casparian_protocol::defaults::DEFAULT_STATE_STORE_URL => {
+            default_state_store_url()
+        }
+        Some(raw) => normalize_state_store_url(&raw),
+    }
+}
+
+fn default_state_store_url() -> String {
+    let path = cli::config::state_store_path();
+    format!("sqlite:{}", path.display())
+}
+
+fn normalize_state_store_url(raw: &str) -> String {
+    if looks_like_url(raw) {
+        raw.to_string()
+    } else {
+        format!("sqlite:{}", raw)
+    }
+}
+
+fn looks_like_url(raw: &str) -> bool {
+    raw.contains("://")
+        || raw.starts_with("sqlite:")
+        || raw.starts_with("duckdb:")
+        || raw.starts_with("postgres:")
+        || raw.starts_with("postgresql:")
+        || raw.starts_with("sqlserver:")
+}
+
 /// Run Sentinel standalone (for distributed deployment)
 fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -1269,13 +1312,8 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
         });
     }
 
-    // Resolve database URL: if it's the default, use config module resolution
-    let database_url = if args.database == casparian_protocol::defaults::DEFAULT_DB_URL {
-        let db_path = cli::config::active_db_path();
-        format!("duckdb:{}", db_path.display())
-    } else {
-        args.database
-    };
+    // Resolve state store URL: if it's the default, use config module resolution
+    let state_store_url = resolve_state_store_url(Some(args.state_store));
 
     let control_addr = if args.no_control_api {
         None
@@ -1288,9 +1326,12 @@ fn run_sentinel_standalone(args: SentinelArgs) -> Result<()> {
 
     let config = SentinelConfig {
         bind_addr: args.bind,
-        database_url,
+        state_store_url,
         max_workers: args.max_workers,
         control_addr,
+        query_catalog_path: args
+            .query_catalog
+            .unwrap_or_else(cli::config::query_catalog_path),
     };
     let mut sentinel = Sentinel::bind(config)?;
 

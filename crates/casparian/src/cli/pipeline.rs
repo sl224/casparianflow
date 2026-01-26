@@ -6,7 +6,7 @@ use crate::cli::error::HelpfulError;
 use anyhow::{Context, Result};
 use casparian::scout::{SourceId, WorkspaceId};
 use casparian::storage::{
-    DuckDbPipelineStore, Pipeline, SelectionFilters, SelectionResolution, WatermarkField,
+    PipelineStore, Pipeline, SelectionFilters, SelectionResolution, WatermarkField,
 };
 use casparian::telemetry::TelemetryRecorder;
 use casparian_db::{DbConnection, DbValue};
@@ -167,7 +167,7 @@ struct ExportConfig {
 }
 
 struct PipelineStoreHandle {
-    store: DuckDbPipelineStore,
+    store: PipelineStore,
 }
 
 #[derive(Debug, Default)]
@@ -178,8 +178,8 @@ struct EnqueueSummary {
 
 impl PipelineStoreHandle {
     fn open() -> Result<Self> {
-        let db_path = config::active_db_path();
-        let store = DuckDbPipelineStore::open(&db_path)?;
+        let db_path = config::state_store_path();
+        let store = PipelineStore::open(&db_path)?;
         Ok(Self { store })
     }
 
@@ -703,11 +703,7 @@ fn is_default_sink(topic: &str) -> bool {
 }
 
 fn table_exists(conn: &DbConnection, table: &str) -> Result<bool> {
-    let row = conn.query_optional(
-        "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
-        &[DbValue::from(table)],
-    )?;
-    Ok(row.is_some())
+    Ok(conn.table_exists(table)?)
 }
 
 struct ParserManifest {
@@ -1103,10 +1099,10 @@ fn ensure_queue_schema(conn: &DbConnection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian_db::DbTimestamp;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn setup_db() -> DbConnection {
-        let conn = DbConnection::open_duckdb_memory().unwrap();
+        let conn = DbConnection::open_sqlite(std::path::Path::new(":memory:")).unwrap();
         // Initialize registry schema for ExpectedOutputs
         let queue = casparian_sentinel::JobQueue::new(conn.clone());
         queue.init_registry_schema().unwrap();
@@ -1114,7 +1110,7 @@ mod tests {
     }
 
     fn insert_plugin(conn: &DbConnection, plugin_name: &str, version: &str, outputs_json: &str) {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         let source_hash = format!("hash_{}_{}", plugin_name, version);
         conn.execute(
             r#"
@@ -1131,11 +1127,20 @@ mod tests {
                 DbValue::from(version),
                 DbValue::from(source_hash.as_str()),
                 DbValue::from(outputs_json),
-                DbValue::from(now.clone()),
+                DbValue::from(now),
                 DbValue::from(now),
             ],
         )
         .unwrap();
+    }
+
+    fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("SystemTime before UNIX_EPOCH - check system clock")
+            .as_millis()
+            .try_into()
+            .unwrap_or(i64::MAX)
     }
 
     #[test]

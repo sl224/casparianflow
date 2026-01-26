@@ -12,16 +12,16 @@ use uuid::Uuid;
 
 use super::app::{
     App, ApprovalDisplayStatus, ApprovalInfo, ApprovalOperationType, ApprovalStatusFilter,
-    ApprovalsViewState, BacktestInfo, BoundFileInfo, BoundFileStatus, CatalogTab,
+    ApprovalsViewState, BacktestInfo, CatalogTab,
     CommandPaletteMode, CommandPaletteState, DeadLetterRow, DiscoverFocus, DiscoverViewState,
-    FileInfo, GateInfo, HomeStats, JobInfo, JobStatus, JobSummary, JobType, JobsListSection,
-    JobsViewState, MonitoringState, ParserBenchState, ParserHealth, ParserInfo, ParserTestResult,
-    PipelineInfo, PipelineRunInfo, PipelineStage, PipelineState, ProposalInfo, QuarantineRow,
-    QueryResults, QueryState, QueryViewState, QueueStats, RuleDialogFocus, RuleId, RuleInfo,
-    SavedQueriesState, SavedQueryEntry, SchemaColumn, SchemaMismatchRow, SessionInfo,
-    SessionsViewState, SettingsCategory, SettingsState, SinkOutput, SinkStats, SourceInfo,
-    SuggestedFix, TableBrowserState, TagInfo, ThroughputSample, TriageTab, TuiMode,
-    ViolationSummary, ViolationType, WorkspaceSwitcherMode,
+    FileInfo, GateInfo, HomeStats, IngestTab, JobInfo, JobStatus, JobSummary, JobType,
+    JobsListSection, JobsViewState, MonitoringState, PipelineInfo, PipelineRunInfo,
+    PipelineStage, PipelineState, ProposalInfo, QuarantineRow, QueryResults, QueryState,
+    QueryViewState, QueueStats, ReviewTab, RuleDialogFocus, RuleId, RuleInfo, RunTab,
+    SavedQueriesState, SavedQueryEntry, SchemaMismatchRow, SessionInfo, SessionsViewState,
+    SettingsCategory, SettingsState, SinkOutput, SinkStats, SourceInfo, SuggestedFix,
+    TableBrowserState, TagInfo, ThroughputSample, TriageTab, TuiMode, ViolationSummary,
+    ViolationType, WorkspaceSwitcherMode,
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
@@ -74,9 +74,6 @@ pub enum SnapshotCoverage {
     ApprovalsConfirmApprove,
     ApprovalsConfirmReject,
     ApprovalsDetail,
-    ParserBenchList,
-    ParserBenchFiltering,
-    ParserBenchTestResult,
     QueryEditing,
     QueryExecuting,
     QueryResults,
@@ -103,7 +100,6 @@ pub enum SnapshotCoverage {
     CommandPaletteNavigation,
     HelpOverlayDiscover,
     HelpOverlayJobs,
-    HelpOverlayParserBench,
     HelpOverlayDefault,
 }
 
@@ -146,9 +142,6 @@ impl SnapshotCoverage {
         SnapshotCoverage::ApprovalsConfirmApprove,
         SnapshotCoverage::ApprovalsConfirmReject,
         SnapshotCoverage::ApprovalsDetail,
-        SnapshotCoverage::ParserBenchList,
-        SnapshotCoverage::ParserBenchFiltering,
-        SnapshotCoverage::ParserBenchTestResult,
         SnapshotCoverage::QueryEditing,
         SnapshotCoverage::QueryExecuting,
         SnapshotCoverage::QueryResults,
@@ -175,7 +168,6 @@ impl SnapshotCoverage {
         SnapshotCoverage::CommandPaletteNavigation,
         SnapshotCoverage::HelpOverlayDiscover,
         SnapshotCoverage::HelpOverlayJobs,
-        SnapshotCoverage::HelpOverlayParserBench,
         SnapshotCoverage::HelpOverlayDefault,
     ];
 
@@ -224,9 +216,6 @@ impl SnapshotCoverage {
             SnapshotCoverage::ApprovalsConfirmApprove => "approvals_confirm_approve",
             SnapshotCoverage::ApprovalsConfirmReject => "approvals_confirm_reject",
             SnapshotCoverage::ApprovalsDetail => "approvals_detail",
-            SnapshotCoverage::ParserBenchList => "parser_bench_list",
-            SnapshotCoverage::ParserBenchFiltering => "parser_bench_filtering",
-            SnapshotCoverage::ParserBenchTestResult => "parser_bench_test_result",
             SnapshotCoverage::QueryEditing => "query_editor_focused",
             SnapshotCoverage::QueryExecuting => "query_executing",
             SnapshotCoverage::QueryResults => "query_results_table",
@@ -253,7 +242,6 @@ impl SnapshotCoverage {
             SnapshotCoverage::CommandPaletteNavigation => "command_palette_navigation",
             SnapshotCoverage::HelpOverlayDiscover => "help_overlay_open",
             SnapshotCoverage::HelpOverlayJobs => "help_overlay_jobs",
-            SnapshotCoverage::HelpOverlayParserBench => "help_overlay_parser_bench",
             SnapshotCoverage::HelpOverlayDefault => "help_overlay_default",
         }
     }
@@ -532,27 +520,6 @@ static SNAPSHOT_CASES: &[SnapshotCase] = &[
         build: case_approvals_detail,
     },
     SnapshotCase {
-        name: "parser_bench_list",
-        notes: "Parser Bench with parser list and details.",
-        focus_hint: "Parser list",
-        coverage: SnapshotCoverage::ParserBenchList,
-        build: case_parser_bench_list,
-    },
-    SnapshotCase {
-        name: "parser_bench_filtering",
-        notes: "Parser Bench filter input active.",
-        focus_hint: "Filter input",
-        coverage: SnapshotCoverage::ParserBenchFiltering,
-        build: case_parser_bench_filtering,
-    },
-    SnapshotCase {
-        name: "parser_bench_test_result",
-        notes: "Parser test result view.",
-        focus_hint: "Test result",
-        coverage: SnapshotCoverage::ParserBenchTestResult,
-        build: case_parser_bench_test_result,
-    },
-    SnapshotCase {
         name: "query_editor_focused",
         notes: "Query console with editor focused and history.",
         focus_hint: "SQL editor",
@@ -722,24 +689,17 @@ static SNAPSHOT_CASES: &[SnapshotCase] = &[
     },
     SnapshotCase {
         name: "help_overlay_open",
-        notes: "Help overlay open on Discover mode.",
+        notes: "Help overlay open on Ingest.",
         focus_hint: "Help overlay",
         coverage: SnapshotCoverage::HelpOverlayDiscover,
         build: case_help_overlay_open,
     },
     SnapshotCase {
         name: "help_overlay_jobs",
-        notes: "Help overlay open on Jobs mode.",
+        notes: "Help overlay open on Run (Jobs).",
         focus_hint: "Help overlay",
         coverage: SnapshotCoverage::HelpOverlayJobs,
         build: case_help_overlay_jobs,
-    },
-    SnapshotCase {
-        name: "help_overlay_parser_bench",
-        notes: "Help overlay open on Parser Bench.",
-        focus_hint: "Help overlay",
-        coverage: SnapshotCoverage::HelpOverlayParserBench,
-        build: case_help_overlay_parser_bench,
     },
     SnapshotCase {
         name: "help_overlay_default",
@@ -774,7 +734,8 @@ fn case_home_filtering() -> App {
 
 fn case_discover_empty_no_sources() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.sources.clear();
     app.discover.tags.clear();
     app.discover.selected_source_id = None;
@@ -785,7 +746,8 @@ fn case_discover_empty_no_sources() -> App {
 
 fn case_discover_scanning_progress() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::Scanning;
     app.discover.rule_builder = Some(sample_rule_builder_basic());
     app.discover.scanning_path = Some("/data/alpha".to_string());
@@ -805,7 +767,8 @@ fn case_discover_scanning_progress() -> App {
 
 fn case_discover_files_list_with_filters_and_tags() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     app.discover.selected_tag = Some(2);
     app.discover.rule_builder = Some(sample_rule_builder_backtest());
@@ -814,7 +777,8 @@ fn case_discover_files_list_with_filters_and_tags() -> App {
 
 fn case_discover_rule_builder() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     app.discover.rule_builder = Some(sample_rule_builder_with_suggestions());
     app
@@ -822,7 +786,8 @@ fn case_discover_rule_builder() -> App {
 
 fn case_discover_sources_dropdown() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::SourcesDropdown;
     app.discover.sources_filtering = true;
     app.discover.sources_filter = "alpha".to_string();
@@ -833,7 +798,8 @@ fn case_discover_sources_dropdown() -> App {
 
 fn case_discover_tags_dropdown() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::TagsDropdown;
     app.discover.focus = DiscoverFocus::Tags;
     app.discover.tags_filtering = true;
@@ -845,7 +811,8 @@ fn case_discover_tags_dropdown() -> App {
 
 fn case_discover_rules_manager_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RulesManager;
     app.discover.rule_builder = Some(sample_rule_builder_basic());
     app.discover.rules = sample_rules();
@@ -855,7 +822,8 @@ fn case_discover_rules_manager_dialog() -> App {
 
 fn case_discover_rule_creation_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleCreation;
     app.discover.rule_dialog_focus = RuleDialogFocus::Pattern;
     app.discover.rule_pattern_input = "**/reports/**/*.csv".to_string();
@@ -871,7 +839,8 @@ fn case_discover_rule_creation_dialog() -> App {
 
 fn case_discover_sources_manager_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::SourcesManager;
     app.discover.sources_manager_selected = 1;
     app.discover.rule_builder = Some(sample_rule_builder_basic());
@@ -880,7 +849,8 @@ fn case_discover_sources_manager_dialog() -> App {
 
 fn case_discover_source_edit_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::SourceEdit;
     app.discover.editing_source = app.discover.sources.get(1).map(|s| s.id.clone());
     app.discover.source_edit_input = "bravo-share".to_string();
@@ -890,7 +860,8 @@ fn case_discover_source_edit_dialog() -> App {
 
 fn case_discover_source_delete_confirm_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::SourceDeleteConfirm;
     app.discover.source_to_delete = app.discover.sources.get(2).map(|s| s.id.clone());
     app.discover.rule_builder = Some(sample_rule_builder_basic());
@@ -899,7 +870,8 @@ fn case_discover_source_delete_confirm_dialog() -> App {
 
 fn case_discover_entering_path_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::EnteringPath;
     app.discover.scan_path_input = "/data/alpha/2024".to_string();
     app.discover.path_suggestions = vec![
@@ -914,7 +886,8 @@ fn case_discover_entering_path_dialog() -> App {
 
 fn case_discover_scan_confirm_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::ScanConfirm;
     app.discover.scan_confirm_path = Some("/".to_string());
     app.discover.rule_builder = Some(sample_rule_builder_basic());
@@ -923,7 +896,8 @@ fn case_discover_scan_confirm_dialog() -> App {
 
 fn case_discover_filtering_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::Filtering;
     app.discover.filter = "reports/**/*.csv".to_string();
     app.discover.rule_builder = Some(sample_rule_builder_basic());
@@ -932,7 +906,8 @@ fn case_discover_filtering_dialog() -> App {
 
 fn case_discover_tagging_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::Tagging;
     app.discover.files = sample_discover_files();
     app.discover.selected = 1;
@@ -944,7 +919,8 @@ fn case_discover_tagging_dialog() -> App {
 
 fn case_discover_bulk_tag_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::BulkTagging;
     app.discover.files = sample_discover_files();
     app.discover.filter = "2024".to_string();
@@ -957,7 +933,8 @@ fn case_discover_bulk_tag_dialog() -> App {
 
 fn case_discover_create_source_dialog() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::CreatingSource;
     app.discover.pending_source_path = Some("/data/alpha/2024".to_string());
     app.discover.source_name_input = "alpha-2024".to_string();
@@ -967,7 +944,8 @@ fn case_discover_create_source_dialog() -> App {
 
 fn case_discover_suggestions_help_overlay() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     let mut builder = sample_rule_builder_with_suggestions();
     builder.suggestions_help_open = true;
@@ -977,7 +955,8 @@ fn case_discover_suggestions_help_overlay() -> App {
 
 fn case_discover_suggestions_detail_overlay() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     let mut builder = sample_rule_builder_with_suggestions();
     builder.suggestions_section = SuggestionSection::Synonyms;
@@ -989,7 +968,8 @@ fn case_discover_suggestions_detail_overlay() -> App {
 
 fn case_discover_manual_tag_confirm_overlay() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     let mut builder = sample_rule_builder_backtest();
     builder.manual_tag_confirm_open = true;
@@ -1000,7 +980,8 @@ fn case_discover_manual_tag_confirm_overlay() -> App {
 
 fn case_discover_confirm_exit_overlay() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     let mut builder = sample_rule_builder_basic();
     builder.confirm_exit_open = true;
@@ -1011,7 +992,8 @@ fn case_discover_confirm_exit_overlay() -> App {
 
 fn case_jobs_list_mixed_status() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Jobs;
+    app.mode = TuiMode::Run;
+    app.run_tab = RunTab::Jobs;
     app.jobs_state.view_state = JobsViewState::JobList;
     app.jobs_state.section_focus = JobsListSection::Actionable;
     app.jobs_state.selected_index = 1;
@@ -1022,7 +1004,8 @@ fn case_jobs_list_mixed_status() -> App {
 
 fn case_jobs_list_no_pipeline() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Jobs;
+    app.mode = TuiMode::Run;
+    app.run_tab = RunTab::Jobs;
     app.jobs_state.view_state = JobsViewState::JobList;
     app.jobs_state.section_focus = JobsListSection::Actionable;
     app.jobs_state.selected_index = 1;
@@ -1032,7 +1015,8 @@ fn case_jobs_list_no_pipeline() -> App {
 
 fn case_jobs_monitoring_panel() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Jobs;
+    app.mode = TuiMode::Run;
+    app.run_tab = RunTab::Jobs;
     app.jobs_state.view_state = JobsViewState::MonitoringPanel;
     app.jobs_state.monitoring = sample_monitoring_state();
     app
@@ -1040,7 +1024,8 @@ fn case_jobs_monitoring_panel() -> App {
 
 fn case_jobs_violation_detail() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Jobs;
+    app.mode = TuiMode::Run;
+    app.run_tab = RunTab::Jobs;
     app.jobs_state.view_state = JobsViewState::ViolationDetail;
     let mut jobs = sample_jobs();
     if let Some(job) = jobs.get_mut(2) {
@@ -1071,7 +1056,8 @@ fn case_sources_drawer_open() -> App {
 
 fn case_approvals_list_mixed() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Approvals;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Approvals;
     app.approvals_state.view_state = ApprovalsViewState::List;
     app.approvals_state.filter = ApprovalStatusFilter::All;
     app.approvals_state.approvals = sample_approvals();
@@ -1082,7 +1068,8 @@ fn case_approvals_list_mixed() -> App {
 
 fn case_approvals_confirm_approve() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Approvals;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Approvals;
     app.approvals_state.view_state = ApprovalsViewState::ConfirmApprove;
     app.approvals_state.approvals = sample_approvals();
     app.approvals_state.approvals_loaded = true;
@@ -1092,7 +1079,8 @@ fn case_approvals_confirm_approve() -> App {
 
 fn case_approvals_confirm_reject() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Approvals;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Approvals;
     app.approvals_state.view_state = ApprovalsViewState::ConfirmReject;
     app.approvals_state.approvals = sample_approvals();
     app.approvals_state.approvals_loaded = true;
@@ -1103,7 +1091,8 @@ fn case_approvals_confirm_reject() -> App {
 
 fn case_approvals_detail() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Approvals;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Approvals;
     app.approvals_state.view_state = ApprovalsViewState::Detail;
     app.approvals_state.approvals = sample_approvals();
     app.approvals_state.approvals_loaded = true;
@@ -1113,7 +1102,8 @@ fn case_approvals_detail() -> App {
 
 fn case_sessions_list() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sessions;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Sessions;
     app.sessions_state.view_state = SessionsViewState::SessionList;
     app.sessions_state.sessions = sample_sessions();
     app.sessions_state.sessions_loaded = true;
@@ -1123,7 +1113,8 @@ fn case_sessions_list() -> App {
 
 fn case_sessions_detail() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sessions;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Sessions;
     app.sessions_state.view_state = SessionsViewState::SessionDetail;
     app.sessions_state.sessions = sample_sessions();
     app.sessions_state.sessions_loaded = true;
@@ -1133,7 +1124,8 @@ fn case_sessions_detail() -> App {
 
 fn case_sessions_workflow_progress() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sessions;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Sessions;
     app.sessions_state.view_state = SessionsViewState::WorkflowProgress;
     app.sessions_state.sessions = sample_sessions();
     app.sessions_state.sessions_loaded = true;
@@ -1143,7 +1135,8 @@ fn case_sessions_workflow_progress() -> App {
 
 fn case_sessions_proposal_review() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sessions;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Sessions;
     app.sessions_state.view_state = SessionsViewState::ProposalReview;
     app.sessions_state.sessions = sample_sessions();
     app.sessions_state.sessions_loaded = true;
@@ -1154,7 +1147,8 @@ fn case_sessions_proposal_review() -> App {
 
 fn case_sessions_gate_approval() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sessions;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Sessions;
     app.sessions_state.view_state = SessionsViewState::GateApproval;
     app.sessions_state.sessions = sample_sessions();
     app.sessions_state.sessions_loaded = true;
@@ -1165,7 +1159,8 @@ fn case_sessions_gate_approval() -> App {
 
 fn case_triage_quarantine_list() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Triage;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Triage;
     app.triage_state.tab = TriageTab::Quarantine;
     app.triage_state.quarantine_rows = Some(sample_quarantine_rows());
     app.triage_state.schema_mismatches = Some(sample_schema_mismatches());
@@ -1177,7 +1172,8 @@ fn case_triage_quarantine_list() -> App {
 
 fn case_triage_schema_mismatch_list() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Triage;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Triage;
     app.triage_state.tab = TriageTab::SchemaMismatch;
     app.triage_state.quarantine_rows = Some(sample_quarantine_rows());
     app.triage_state.schema_mismatches = Some(sample_schema_mismatches());
@@ -1189,7 +1185,8 @@ fn case_triage_schema_mismatch_list() -> App {
 
 fn case_triage_dead_letter_list() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Triage;
+    app.mode = TuiMode::Review;
+    app.review_tab = ReviewTab::Triage;
     app.triage_state.tab = TriageTab::DeadLetter;
     app.triage_state.quarantine_rows = Some(sample_quarantine_rows());
     app.triage_state.schema_mismatches = Some(sample_schema_mismatches());
@@ -1201,7 +1198,8 @@ fn case_triage_dead_letter_list() -> App {
 
 fn case_catalog_runs_list() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Catalog;
+    app.mode = TuiMode::Run;
+    app.run_tab = RunTab::Outputs;
     app.catalog_state.tab = CatalogTab::Runs;
     app.catalog_state.pipelines = Some(sample_pipelines());
     app.catalog_state.runs = Some(sample_pipeline_runs());
@@ -1212,7 +1210,8 @@ fn case_catalog_runs_list() -> App {
 
 fn case_catalog_pipelines_list() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Catalog;
+    app.mode = TuiMode::Run;
+    app.run_tab = RunTab::Outputs;
     app.catalog_state.tab = CatalogTab::Pipelines;
     app.catalog_state.pipelines = Some(sample_pipelines());
     app.catalog_state.runs = Some(sample_pipeline_runs());
@@ -1459,7 +1458,7 @@ fn case_command_palette_navigation() -> App {
     let mut palette = CommandPaletteState::new();
     palette.visible = true;
     palette.mode = CommandPaletteMode::Navigation;
-    palette.input = "jobs".to_string();
+    palette.input = "run".to_string();
     palette.cursor = palette.input.len();
     palette.update_suggestions();
     app.command_palette = palette;
@@ -1468,7 +1467,8 @@ fn case_command_palette_navigation() -> App {
 
 fn case_help_overlay_open() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Discover;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     app.discover.rule_builder = Some(sample_rule_builder_basic());
     app.show_help = true;
@@ -1477,23 +1477,10 @@ fn case_help_overlay_open() -> App {
 
 fn case_help_overlay_jobs() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Jobs;
+    app.mode = TuiMode::Run;
+    app.run_tab = RunTab::Jobs;
     app.jobs_state.view_state = JobsViewState::JobList;
     app.jobs_state.section_focus = JobsListSection::Actionable;
-    app.show_help = true;
-    app
-}
-
-fn case_help_overlay_parser_bench() -> App {
-    let mut app = base_app();
-    app.mode = TuiMode::ParserBench;
-    app.parser_bench = ParserBenchState {
-        parsers: sample_parsers(),
-        selected_parser: 1,
-        parsers_loaded: true,
-        bound_files: sample_bound_files(),
-        ..ParserBenchState::default()
-    };
     app.show_help = true;
     app
 }
@@ -1507,14 +1494,16 @@ fn case_help_overlay_default() -> App {
 
 fn case_sources_screen() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sources;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Sources;
     app.sources_state.selected_index = 1;
     app
 }
 
 fn case_sources_edit_overlay() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sources;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Sources;
     app.sources_state.selected_index = 0;
     app.sources_state.editing = true;
     app.sources_state.creating = false;
@@ -1524,7 +1513,8 @@ fn case_sources_edit_overlay() -> App {
 
 fn case_sources_create_overlay() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sources;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Sources;
     app.sources_state.selected_index = 0;
     app.sources_state.editing = true;
     app.sources_state.creating = true;
@@ -1534,51 +1524,10 @@ fn case_sources_create_overlay() -> App {
 
 fn case_sources_delete_confirm() -> App {
     let mut app = base_app();
-    app.mode = TuiMode::Sources;
+    app.mode = TuiMode::Ingest;
+    app.ingest_tab = IngestTab::Sources;
     app.sources_state.selected_index = 1;
     app.sources_state.confirm_delete = true;
-    app
-}
-
-fn case_parser_bench_list() -> App {
-    let mut app = base_app();
-    app.mode = TuiMode::ParserBench;
-    app.parser_bench = ParserBenchState {
-        parsers: sample_parsers(),
-        selected_parser: 1,
-        parsers_loaded: true,
-        bound_files: sample_bound_files(),
-        ..ParserBenchState::default()
-    };
-    app
-}
-
-fn case_parser_bench_filtering() -> App {
-    let mut app = base_app();
-    app.mode = TuiMode::ParserBench;
-    app.parser_bench = ParserBenchState {
-        parsers: sample_parsers(),
-        selected_parser: 0,
-        parsers_loaded: true,
-        bound_files: sample_bound_files(),
-        filter: "report".to_string(),
-        is_filtering: true,
-        ..ParserBenchState::default()
-    };
-    app
-}
-
-fn case_parser_bench_test_result() -> App {
-    let mut app = base_app();
-    app.mode = TuiMode::ParserBench;
-    app.parser_bench = ParserBenchState {
-        parsers: sample_parsers(),
-        selected_parser: 0,
-        parsers_loaded: true,
-        bound_files: sample_bound_files(),
-        test_result: Some(sample_parser_test_result()),
-        ..ParserBenchState::default()
-    };
     app
 }
 
@@ -2566,111 +2515,6 @@ fn sample_saved_queries() -> Vec<SavedQueryEntry> {
         SavedQueryEntry {
             name: "recent_runs".to_string(),
             path: PathBuf::from("/Users/demo/.casparian_flow/queries/recent_runs.sql"),
-        },
-    ]
-}
-
-fn sample_parsers() -> Vec<ParserInfo> {
-    vec![
-        ParserInfo {
-            path: PathBuf::from("/Users/demo/.casparian_flow/parsers/trades_parser.py"),
-            name: "trades_parser".to_string(),
-            version: Some("1.4.2".to_string()),
-            topics: vec!["trade".to_string(), "audit".to_string()],
-            modified: local_at(-180),
-            health: ParserHealth::Healthy {
-                success_rate: 0.98,
-                total_runs: 128,
-            },
-            is_symlink: false,
-            symlink_broken: false,
-        },
-        ParserInfo {
-            path: PathBuf::from("/Users/demo/.casparian_flow/parsers/report_parser.py"),
-            name: "report_parser".to_string(),
-            version: Some("0.9.1".to_string()),
-            topics: vec!["report".to_string()],
-            modified: local_at(-240),
-            health: ParserHealth::Warning {
-                consecutive_failures: 3,
-            },
-            is_symlink: false,
-            symlink_broken: false,
-        },
-        ParserInfo {
-            path: PathBuf::from("/Users/demo/.casparian_flow/parsers/legacy_parser.py"),
-            name: "legacy_parser".to_string(),
-            version: None,
-            topics: vec!["legacy".to_string()],
-            modified: local_at(-360),
-            health: ParserHealth::Paused {
-                reason: "Circuit breaker".to_string(),
-            },
-            is_symlink: true,
-            symlink_broken: true,
-        },
-    ]
-}
-
-fn sample_parser_test_result() -> ParserTestResult {
-    ParserTestResult {
-        success: true,
-        rows_processed: 120,
-        execution_time_ms: 284,
-        schema: Some(vec![
-            SchemaColumn {
-                name: "trade_id".to_string(),
-                dtype: "VARCHAR".to_string(),
-            },
-            SchemaColumn {
-                name: "amount".to_string(),
-                dtype: "DECIMAL(10,2)".to_string(),
-            },
-            SchemaColumn {
-                name: "trade_date".to_string(),
-                dtype: "DATE".to_string(),
-            },
-        ]),
-        preview_rows: vec![
-            vec![
-                "T-1001".to_string(),
-                "120.50".to_string(),
-                "2024-10-01".to_string(),
-            ],
-            vec![
-                "T-1002".to_string(),
-                "98.10".to_string(),
-                "2024-10-01".to_string(),
-            ],
-        ],
-        headers: vec![
-            "trade_id".to_string(),
-            "amount".to_string(),
-            "trade_date".to_string(),
-        ],
-        errors: vec![],
-        suggestions: vec!["Consider indexing trade_id".to_string()],
-        error_type: None,
-        truncated: false,
-    }
-}
-
-fn sample_bound_files() -> Vec<BoundFileInfo> {
-    vec![
-        BoundFileInfo {
-            path: PathBuf::from("/data/alpha/trades/2024/09/report_2024-09-30.csv"),
-            size: 2_400_000,
-            status: BoundFileStatus::Processed,
-        },
-        BoundFileInfo {
-            path: PathBuf::from("/data/alpha/trades/2024/10/report_2024-10-01.csv"),
-            size: 2_100_000,
-            status: BoundFileStatus::Pending,
-        },
-        BoundFileInfo {
-            path: PathBuf::from("/data/alpha/trades/2024/10/report_2024-10-02.csv"),
-            size: 2_200_000,
-            status: BoundFileStatus::Failed,
         },
     ]
 }

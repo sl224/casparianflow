@@ -63,11 +63,11 @@ pub fn init_scout_schema(db_path: &Path) {
     let _db = Database::open(db_path).expect("initialize scout schema");
 }
 
-pub fn with_duckdb<F, T>(db_path: &Path, f: F) -> T
+pub fn with_state_store<F, T>(db_path: &Path, f: F) -> T
 where
     F: FnOnce(DbConnection) -> T,
 {
-    let url = format!("duckdb:{}", db_path.display());
-    let conn = DbConnection::open_from_url(&url).expect("open duckdb connection");
+    let url = format!("sqlite:{}", db_path.display());
+    let conn = DbConnection::open_from_url(&url).expect("open sqlite connection");
     f(conn)
 }

@@ -17,7 +17,7 @@
 //!
 //! # Storage
 //!
-//! Approvals are stored in DuckDB via Sentinel's control plane (`cf_api_approvals`).
+//! Approvals are stored in the state store via Sentinel's control plane (`cf_api_approvals`).
 //! In standalone mode, MCP can write directly to the DB (pre-v1 only).
 
 mod manager;

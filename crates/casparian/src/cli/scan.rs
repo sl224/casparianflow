@@ -99,7 +99,7 @@ mod system_time_serde {
 
 /// Get the active database path
 fn get_db_path() -> PathBuf {
-    crate::cli::config::active_db_path()
+    crate::cli::config::state_store_path()
 }
 
 /// Build a GlobSet from pattern strings

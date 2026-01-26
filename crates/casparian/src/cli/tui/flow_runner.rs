@@ -10,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Serialize;
 use tempfile::TempDir;
 
-use crate::cli::config::active_db_path;
+use crate::cli::config::state_store_path;
 use crate::cli::context;
 use crate::cli::tui::app::App;
 use crate::cli::tui::flow::{FlowEnv, FlowStep, TerminalSize, TuiFlow};
@@ -200,7 +200,7 @@ fn prepare_fixture(env: &FlowEnv, casparian_home: &Path) -> Result<Option<Fixtur
     let fixture_path = resolve_fixture_path(&fixture.path, casparian_home)?;
     ensure_fixture_tree(&fixture_path)?;
 
-    let db_path = env.database.clone().unwrap_or_else(active_db_path);
+    let db_path = env.database.clone().unwrap_or_else(state_store_path);
     let db = Database::open(&db_path).context("open scout database")?;
     let workspace = db.ensure_default_workspace().context("ensure workspace")?;
     context::set_active_workspace(&workspace.id).context("set active workspace")?;

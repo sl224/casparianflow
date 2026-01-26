@@ -1,6 +1,6 @@
 ---
 plan: scan_persist_line_rate
-last_updated: 2026-01-25
+last_updated: 2026-01-26
 milestone: M3
 step: M3.1
 status: completed
@@ -34,6 +34,11 @@ notes:
   - "2026-01-25: Sentinel dispatch exec_path join + tests. Ran cargo test -p casparian_sentinel (pass). Ran cargo test -p casparian (pass). Ran cargo bench -p casparian --bench scanner_perf; walk_parallel 10.236-10.353 ms, full_scan batch_size=10000 126.05-128.04 ms, rescan batch_size=10000 182.36-187.08 ms, db_write batch_size=10000 120.87-299.39 ms (noisy)."
   - "2026-01-25: Split scout into casparian_scout + ai types crate. Ran cargo test -p casparian_scout (pass). Ran cargo test -p casparian (pass). Ran cargo bench -p casparian --bench scanner_perf; walk_parallel 10.087-10.308 ms, full_scan batch_size=10000 134.78-148.29 ms, rescan batch_size=10000 193.36-208.65 ms, db_write batch_size=10000 62.813-65.507 ms."
   - "2026-01-25: Scout subprocess engine + perf scans. Ran cargo test -p casparian (pass). Ran cargo bench -p casparian --bench scanner_perf; walk_parallel 11.566-11.914 ms, full_scan batch_size=10000 142.72-148.63 ms, rescan batch_size=10000 208.62-222.09 ms, db_write batch_size=10000 71.612-80.904 ms (db_write batch_size=4096 regressed)."
+  - "2026-01-25: TUI QA loop script + help modal gating + home key guard + drawer layout fix + triage formatting cleanup. Updated sources/tags flows to use S/T shortcuts. Ran cargo test -p casparian (pass) and ./scripts/tui-qa.sh (pass)."
+  - "2026-01-26: Added action bar/keymap/modal/layout primitives, action bar now drops by priority, help overlay draws from effective/global actions, inspector auto-collapses on narrow viewports. Ran cargo test -p casparian (pass) and ./scripts/tui-qa.sh (pass)."
+  - "2026-01-26: Non-scan work: state store split to SQLite + query catalog plumbing + sentinel epoch millis. Did not run cargo test -p casparian or scanner_perf bench for this milestone."
+  - "2026-01-26: Control-plane TUI backend + sentinel control API updates. Ran cargo check -p casparian_sentinel and cargo check -p casparian. Did not run cargo test -p casparian or scanner_perf bench."
+  - "2026-01-26: Fixed SQLite scan rename detection by updating paths for matching file_uid before upsert; adjusted TUI tests for task nav + Esc behavior. Ran cargo test -p casparian (pass). ./scripts/tui-qa.sh timed out on tui-state-graph; ran tui-state-graph with --max-nodes 200 --max-depth 8 (pass) and ran tui-flow specs (pass). Ran cargo bench -p casparian --bench scanner_perf; db_write batch_size=4096/10000 regressed, rescan improved (see benchmark log)."
 ---
 
 # Goal
@@ -58,6 +63,7 @@ Get scanning + persistence as close to filesystem walk ("line rate") as possible
 - 2026-01-24: cargo bench -p casparian --bench scanner_perf timed out after 300s during build; no criterion output.
 - 2026-01-24: cargo bench -p casparian --bench scanner_perf timed out after 600s; partial results for full_scan/rescan (see notes).
 - 2026-01-24: Bench run (criterion): walk_parallel 10.056-10.265 ms (thrpt 487.07-497.24 Kelem/s); full_scan batch_size=512 143.42-155.24 ms (32.208-34.862 Kelem/s), batch_size=2048 117.21-125.08 ms (39.973-42.659 Kelem/s), batch_size=10000 111.62-122.27 ms (40.895-44.796 Kelem/s); rescan batch_size=512 183.74-186.91 ms (26.751-27.212 Kelem/s), batch_size=2048 158.69-160.23 ms (31.204-31.508 Kelem/s), batch_size=10000 159.61-162.31 ms (30.806-31.326 Kelem/s); db_write batch_size=256 136.78-140.54 ms, batch_size=1024 73.888-75.702 ms, batch_size=4096 58.573-60.501 ms, batch_size=10000 52.683-54.360 ms.
+- 2026-01-26: Bench run (criterion): walk_parallel 10.070-10.247 ms (thrpt 487.95-496.54 Kelem/s); full_scan batch_size=512 160.65-174.66 ms (28.627-31.123 Kelem/s), batch_size=2048 140.03-146.00 ms (34.245-35.708 Kelem/s), batch_size=10000 137.70-149.45 ms (33.457-36.310 Kelem/s); rescan batch_size=512 164.83-178.36 ms (28.033-30.335 Kelem/s), batch_size=2048 147.69-152.14 ms (32.864-33.854 Kelem/s), batch_size=10000 144.95-163.63 ms (30.557-34.495 Kelem/s); db_write batch_size=256 171.92-175.38 ms (28.510-29.084 Kelem/s), batch_size=1024 104.77-109.19 ms (45.792-47.723 Kelem/s), batch_size=4096 124.29-160.62 ms (31.130-40.229 Kelem/s), batch_size=10000 114.75-164.12 ms (30.465-43.575 Kelem/s).
 
 # Decisions / gotchas
 - (append as discovered)

@@ -9,7 +9,7 @@ use clap::ValueEnum;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::cli::config::casparian_home;
-use crate::cli::tui::app::{App, TuiMode};
+use crate::cli::tui::app::App;
 use crate::cli::tui::flow::{FlowAssertion, FlowEnv, FlowKey, FlowStep, TerminalSize, TuiFlow};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -191,7 +191,7 @@ impl FlowRecorder {
     }
 
     fn push_checkpoint(&mut self, app: &App, label: &str) {
-        let view = mode_label(app.mode);
+        let view = app.view_label();
         let assert = FlowAssertion {
             plain_contains: vec![format!("View: {}", view)],
             ..FlowAssertion::default()
@@ -200,21 +200,5 @@ impl FlowRecorder {
             assert,
             label: Some(label.to_string()),
         });
-    }
-}
-
-fn mode_label(mode: TuiMode) -> &'static str {
-    match mode {
-        TuiMode::Home => "Home",
-        TuiMode::Discover => "Discover",
-        TuiMode::Jobs => "Jobs",
-        TuiMode::Sources => "Sources",
-        TuiMode::Approvals => "Approvals",
-        TuiMode::ParserBench => "Parser Bench",
-        TuiMode::Query => "Query",
-        TuiMode::Settings => "Settings",
-        TuiMode::Sessions => "Sessions",
-        TuiMode::Triage => "Triage",
-        TuiMode::Catalog => "Catalog",
     }
 }

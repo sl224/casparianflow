@@ -371,7 +371,7 @@ impl SupportBundle {
         let home = casparian_home();
         let config = RedactedConfig {
             database_backend: super::config::default_db_backend().as_str().to_string(),
-            database_exists: super::config::active_db_path().exists(),
+            database_exists: super::config::state_store_path().exists(),
             output_dir_exists: super::config::output_dir().exists(),
             venvs_dir_exists: super::config::venvs_dir().exists(),
             parsers_dir_exists: super::config::parsers_dir().exists(),

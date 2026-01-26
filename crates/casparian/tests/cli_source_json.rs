@@ -1,6 +1,6 @@
 mod cli_support;
 
-use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_duckdb};
+use cli_support::{assert_cli_success, init_scout_schema, run_cli, run_cli_json, with_state_store};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
@@ -33,7 +33,7 @@ struct SourceFile {
 #[test]
 fn conf_t0_source_json_and_sync() {
     let home_dir = TempDir::new().expect("create temp home");
-    let db_path = home_dir.path().join("casparian_flow.duckdb");
+    let db_path = home_dir.path().join("state.sqlite");
     init_scout_schema(&db_path);
 
     let data_dir = TempDir::new().expect("create data dir");
@@ -122,7 +122,7 @@ fn conf_t0_source_json_and_sync() {
 }
 
 fn source_count(db_path: &Path) -> i64 {
-    with_duckdb(db_path, |conn| {
+    with_state_store(db_path, |conn| {
         conn.query_scalar::<i64>("SELECT COUNT(*) FROM scout_sources", &[])
             .expect("count sources")
     })

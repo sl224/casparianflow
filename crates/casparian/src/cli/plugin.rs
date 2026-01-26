@@ -13,7 +13,7 @@ use base64::{engine::general_purpose, Engine as _};
 use casparian::trust::{
     load_default_trust_config, PublicKeyBase64, SignerId, TrustConfig, TrustMode,
 };
-use casparian_db::{DbConnection, DbTimestamp, DbValue};
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::{PluginStatus, RuntimeKind, SchemaDefinition};
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{
@@ -97,7 +97,7 @@ struct PluginInfo {
     signature_verified: bool,
     signer_id: Option<String>,
     status: String,
-    created_at: DbTimestamp,
+    created_at: String,
 }
 
 fn cmd_import(bundle_root: PathBuf) -> Result<()> {
@@ -204,7 +204,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
     let mut plugins = Vec::with_capacity(rows.len());
     for row in rows {
         let status: String = row.get_by_name("status")?;
-        let created_at: DbTimestamp = row.get_by_name("created_at")?;
+        let created_at: i64 = row.get_by_name("created_at")?;
         plugins.push(PluginInfo {
             plugin_name: row.get_by_name("plugin_name")?,
             version: row.get_by_name("version")?,
@@ -214,7 +214,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
             signature_verified: row.get_by_name("signature_verified")?,
             signer_id: row.get_by_name("signer_id")?,
             status,
-            created_at,
+            created_at: millis_to_rfc3339(created_at),
         });
     }
 
@@ -241,7 +241,7 @@ fn cmd_list(json_output: bool) -> Result<()> {
                 if p.signature_verified { "yes" } else { "no" }.to_string(),
                 p.signer_id.unwrap_or_else(|| "-".to_string()),
                 p.status,
-                p.created_at.to_rfc3339(),
+                p.created_at,
             ]
         })
         .collect::<Vec<_>>();
@@ -608,7 +608,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn connect_db() -> Result<DbConnection> {
-    let db_path = config::active_db_path();
+    let db_path = config::state_store_path();
     if !db_path.exists() {
         return Err(HelpfulError::new("Database not found")
             .with_context(format!("Expected database at: {}", db_path.display()))
@@ -618,7 +618,7 @@ fn connect_db() -> Result<DbConnection> {
             ])
             .into());
     }
-    let url = format!("duckdb:{}", db_path.display());
+    let url = config::state_store_url();
     DbConnection::open_from_url(&url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(e.to_string())
@@ -628,7 +628,7 @@ fn connect_db() -> Result<DbConnection> {
 }
 
 fn connect_db_readonly() -> Result<DbConnection> {
-    let db_path = config::active_db_path();
+    let db_path = config::state_store_path();
     if !db_path.exists() {
         return Err(HelpfulError::new("Database not found")
             .with_context(format!("Expected database at: {}", db_path.display()))
@@ -638,7 +638,8 @@ fn connect_db_readonly() -> Result<DbConnection> {
             ])
             .into());
     }
-    DbConnection::open_duckdb_readonly(&db_path).map_err(|e| {
+    let url = config::state_store_url();
+    DbConnection::open_from_url_readonly(&url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(e.to_string())
             .with_suggestion("TRY: Ensure the database file is not corrupted")
@@ -699,7 +700,7 @@ fn insert_manifest(
     signature_verified: bool,
     signer_id: Option<&SignerId>,
 ) -> Result<()> {
-    let now = DbTimestamp::now();
+    let now = now_millis();
     let signer_value = signer_id
         .map(|id| DbValue::from(id.as_str()))
         .unwrap_or(DbValue::Null);
@@ -740,8 +741,8 @@ fn insert_manifest(
             DbValue::from(outputs_json),
             DbValue::from(signature_verified),
             signer_value,
-            DbValue::from(now.clone()),
-            DbValue::from(now.clone()),
+            DbValue::from(now),
+            DbValue::from(now),
             DbValue::from(
                 signer_id
                     .map(|id| id.as_str().to_string())
@@ -815,6 +816,21 @@ fn parse_target(target: &str) -> Result<(String, String)> {
     Ok((name.to_string(), version.to_string()))
 }
 
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH - check system clock")
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn millis_to_rfc3339(millis: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .unwrap_or_else(|| chrono::Utc::now())
+        .to_rfc3339()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,9 +865,9 @@ mod tests {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("CASPARIAN_HOME", temp_home.path());
 
-        let db_path = temp_home.path().join("casparian_flow.duckdb");
+        let db_path = temp_home.path().join("state.sqlite");
         {
-            let conn = DbConnection::open_duckdb(&db_path).unwrap();
+            let conn = DbConnection::open_sqlite(&db_path).unwrap();
             let queue = JobQueue::new(conn);
             queue.init_registry_schema().unwrap();
         }
@@ -947,7 +963,7 @@ test_signer = "{pub_key}"
 
         cmd_import(bundle_dir.path().to_path_buf()).unwrap();
 
-        let conn = DbConnection::open_duckdb_readonly(&db_path).unwrap();
+        let conn = DbConnection::open_sqlite_readonly(&db_path).unwrap();
         let row = conn
             .query_optional(
                 "SELECT 1 FROM cf_plugin_manifest WHERE plugin_name = ? AND version = ?",

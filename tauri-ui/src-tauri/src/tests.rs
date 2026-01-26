@@ -1,7 +1,7 @@
 //! Integration tests for Tauri commands.
 //!
 //! These tests verify that the Tauri commands work correctly
-//! against a real DuckDB database.
+//! against a real SQLite database.
 
 #[cfg(test)]
 mod app_state_tests {
@@ -11,7 +11,7 @@ mod app_state_tests {
     fn setup_test_state() -> (AppState, tempfile::TempDir) {
         // Create a temp directory for the test database
         let temp_dir = tempdir().expect("Failed to create temp dir");
-        let db_path = temp_dir.path().join("test.duckdb");
+        let db_path = temp_dir.path().join("test.sqlite");
 
         let mut state = AppState::new().expect("Failed to create AppState");
         state.db_path = db_path.to_string_lossy().to_string();
@@ -23,7 +23,7 @@ mod app_state_tests {
     #[test]
     fn test_app_state_creation() {
         let (state, _temp_dir) = setup_test_state();
-        assert!(state.db_path.contains("test.duckdb"));
+        assert!(state.db_path.contains("test.sqlite"));
     }
 
     #[test]

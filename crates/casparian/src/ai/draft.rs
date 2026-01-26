@@ -379,9 +379,9 @@ mod tests {
 
     fn setup() -> (DraftManager, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.duckdb");
+        let db_path = temp_dir.path().join("test.sqlite");
 
-        let conn = DbConnection::open_duckdb(&db_path).unwrap();
+        let conn = DbConnection::open_sqlite(&db_path).unwrap();
 
         // Create the drafts table
         let schema = format!(

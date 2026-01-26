@@ -16,15 +16,21 @@ use casparian_protocol::{
     Approval as ProtoApproval, ApprovalOperation, ApprovalStatus as ProtoApprovalStatus,
     JobStatus as ProtocolJobStatus, ProcessingStatus,
 };
-use casparian_sentinel::ApiStorage;
+use casparian_sentinel::{
+    ApiStorage, ControlClient, JobInfo as ControlJobInfo, ScoutRuleInfo, ScoutSourceInfo,
+    DEFAULT_CONTROL_ADDR,
+};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
+use std::time::Duration;
 use tracing::info_span;
 
 use super::{nav, ui_signature::UiSignature, TuiArgs};
-use crate::cli::config::{active_db_path, casparian_home, default_db_backend, DbBackend};
+use crate::cli::config::{
+    casparian_home, default_db_backend, query_catalog_path, state_store_path, DbBackend,
+};
 use crate::cli::context;
 use casparian::scout::{
     match_rules_to_files, patterns, scan_path, Database as ScoutDatabase, RuleApplyFile,
@@ -40,16 +46,110 @@ use uuid::Uuid;
 pub enum TuiMode {
     #[default]
     Home, // Home hub: quick start + status dashboard
-    Discover,    // File discovery and tagging
-    Jobs,        // Job queue management
-    Sources,     // Sources management
-    Approvals,   // MCP approval management
-    ParserBench, // Parser development workbench (accessed via P key)
-    Query,       // SQL query console
-    Settings,    // Application settings
-    Sessions,    // Intent pipeline workflows
-    Triage,      // Quarantine + schema mismatch + dead-letter triage
-    Catalog,     // Pipelines + runs catalog
+    Ingest,   // Sources + selection + rules + validation
+    Run,      // Jobs + outputs
+    Review,   // Triage + approvals + sessions
+    Query,    // SQL query console
+    Settings, // Application settings
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IngestTab {
+    Sources,
+    #[default]
+    Select,
+    Rules,
+    Validate,
+}
+
+impl IngestTab {
+    pub fn next(self) -> Self {
+        match self {
+            IngestTab::Sources => IngestTab::Select,
+            IngestTab::Select => IngestTab::Rules,
+            IngestTab::Rules => IngestTab::Validate,
+            IngestTab::Validate => IngestTab::Sources,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            IngestTab::Sources => IngestTab::Validate,
+            IngestTab::Select => IngestTab::Sources,
+            IngestTab::Rules => IngestTab::Select,
+            IngestTab::Validate => IngestTab::Rules,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IngestTab::Sources => "Sources",
+            IngestTab::Select => "Select",
+            IngestTab::Rules => "Rules",
+            IngestTab::Validate => "Validate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunTab {
+    #[default]
+    Jobs,
+    Outputs,
+}
+
+impl RunTab {
+    pub fn next(self) -> Self {
+        match self {
+            RunTab::Jobs => RunTab::Outputs,
+            RunTab::Outputs => RunTab::Jobs,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        self.next()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RunTab::Jobs => "Jobs",
+            RunTab::Outputs => "Outputs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewTab {
+    #[default]
+    Triage,
+    Approvals,
+    Sessions,
+}
+
+impl ReviewTab {
+    pub fn next(self) -> Self {
+        match self {
+            ReviewTab::Triage => ReviewTab::Approvals,
+            ReviewTab::Approvals => ReviewTab::Sessions,
+            ReviewTab::Sessions => ReviewTab::Triage,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            ReviewTab::Triage => ReviewTab::Sessions,
+            ReviewTab::Approvals => ReviewTab::Triage,
+            ReviewTab::Sessions => ReviewTab::Approvals,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReviewTab::Triage => "Triage",
+            ReviewTab::Approvals => "Approvals",
+            ReviewTab::Sessions => "Sessions",
+        }
+    }
 }
 
 /// Focus area for global shell navigation
@@ -1407,6 +1507,55 @@ impl ApprovalInfo {
             "-".to_string()
         }
     }
+
+    fn from_control(approval: ProtoApproval) -> Self {
+        let status = match approval.status {
+            ProtoApprovalStatus::Pending => ApprovalDisplayStatus::Pending,
+            ProtoApprovalStatus::Approved => ApprovalDisplayStatus::Approved,
+            ProtoApprovalStatus::Rejected => ApprovalDisplayStatus::Rejected,
+            ProtoApprovalStatus::Expired => ApprovalDisplayStatus::Expired,
+        };
+
+        let (operation_type, plugin_ref, input_dir, file_count) = match approval.operation {
+            ApprovalOperation::Run {
+                plugin_name,
+                input_dir,
+                file_count,
+                ..
+            } => (
+                ApprovalOperationType::Run,
+                plugin_name,
+                Some(input_dir),
+                Some(file_count as u32),
+            ),
+            ApprovalOperation::SchemaPromote { plugin_name, .. } => (
+                ApprovalOperationType::SchemaPromote,
+                plugin_name,
+                None,
+                None,
+            ),
+        };
+
+        let created_at = chrono::DateTime::parse_from_rfc3339(&approval.created_at)
+            .map(|dt| dt.with_timezone(&Local))
+            .unwrap_or_else(|_| Local::now());
+        let expires_at = chrono::DateTime::parse_from_rfc3339(&approval.expires_at)
+            .map(|dt| dt.with_timezone(&Local))
+            .unwrap_or_else(|_| Local::now());
+
+        Self {
+            id: approval.approval_id,
+            operation_type,
+            plugin_ref,
+            summary: approval.summary,
+            status,
+            created_at,
+            expires_at,
+            file_count,
+            input_dir,
+            job_id: approval.job_id.map(|id| id.to_string()),
+        }
+    }
 }
 
 /// State for Approvals view (key 5)
@@ -1731,14 +1880,14 @@ impl CommandPaletteState {
             }
             CommandPaletteMode::Command => {
                 let commands = [
-                    ("/scan", "Scan a directory for files", "/scan"),
+                    ("/scan", "Scan a directory for files (Ingest)", "/scan"),
                     ("/query", "Query processed data", "/query"),
-                    ("/approve", "Review and approve schemas", "/approve"),
+                    ("/approve", "Review approvals", "/approve"),
                     ("/workspace", "Switch workspace", "/workspace"),
-                    ("/quarantine", "Open quarantine explorer", "/quarantine"),
-                    ("/catalog", "Open pipelines catalog", "/catalog"),
-                    ("/pipelines", "Open pipelines catalog", "/pipelines"),
-                    ("/jobs", "View job queue", "/jobs"),
+                    ("/quarantine", "Open quarantine (Review)", "/quarantine"),
+                    ("/catalog", "Open outputs catalog (Run)", "/catalog"),
+                    ("/pipelines", "Open outputs catalog (Run)", "/pipelines"),
+                    ("/jobs", "View jobs (Run)", "/jobs"),
                     ("/help", "Show help", "/help"),
                 ];
 
@@ -2209,6 +2358,17 @@ pub struct SourceInfo {
     pub file_count: usize,
 }
 
+impl SourceInfo {
+    fn from_control(source: ScoutSourceInfo) -> Self {
+        Self {
+            id: source.id,
+            name: source.name,
+            path: std::path::PathBuf::from(source.path),
+            file_count: source.file_count.max(0) as usize,
+        }
+    }
+}
+
 /// Tag with file count (for Tags dropdown in sidebar)
 /// Tags are derived from files, showing what categories exist
 #[derive(Debug, Clone)]
@@ -2228,6 +2388,18 @@ pub struct RuleInfo {
     #[allow(dead_code)] // Used in Rules Manager sorting
     pub priority: i32,
     pub enabled: bool,
+}
+
+impl RuleInfo {
+    fn from_control(rule: ScoutRuleInfo) -> Self {
+        Self {
+            id: RuleId::new(rule.id),
+            pattern: rule.pattern,
+            tag: rule.tag,
+            priority: rule.priority,
+            enabled: rule.enabled,
+        }
+    }
 }
 
 /// Pending tag write for persistence
@@ -2258,7 +2430,10 @@ pub struct PendingSourceDelete {
 #[derive(Debug)]
 pub enum TuiScanResult {
     /// Validation passed, scan is starting
-    Started { job_id: i64 },
+    Started {
+        job_id: i64,
+        scan_id: Option<String>,
+    },
     /// Progress update during scan
     Progress(ScoutProgress),
     /// Scanning completed successfully
@@ -2821,6 +2996,12 @@ pub struct App {
     pub running: bool,
     /// Current TUI mode/screen
     pub mode: TuiMode,
+    /// Active tab within Ingest
+    pub ingest_tab: IngestTab,
+    /// Active tab within Run
+    pub run_tab: RunTab,
+    /// Active tab within Review
+    pub review_tab: ReviewTab,
     /// Whether the help overlay is visible (per spec Section 3.1)
     pub show_help: bool,
     /// Whether the right-side inspector panel is collapsed
@@ -2870,6 +3051,10 @@ pub struct App {
     /// Configuration
     #[allow(dead_code)]
     pub config: TuiArgs,
+    /// Control API address (when connected)
+    control_addr: Option<String>,
+    /// Whether Control API is connected (sentinel is writer)
+    control_connected: bool,
     /// Optional telemetry recorder (Tape domain events)
     pub telemetry: Option<TelemetryRecorder>,
     /// Last error message
@@ -2881,6 +3066,8 @@ pub struct App {
     scan_cancel_token: Option<ScanCancelToken>,
     /// Job ID for the currently running scan (for status updates)
     current_scan_job_id: Option<i64>,
+    /// Control-plane scan ID (when connected)
+    current_scan_id: Option<String>,
     /// Job ID for the currently running schema eval (for status updates)
     current_schema_eval_job_id: Option<i64>,
     /// Pending schema eval result from background analysis
@@ -2919,6 +3106,8 @@ pub struct App {
     pending_triage_load: Option<mpsc::Receiver<Result<TriageData, String>>>,
     /// Pending catalog load (non-blocking DB query)
     pending_catalog_load: Option<mpsc::Receiver<Result<CatalogData, String>>>,
+    /// Pending control write flush (non-blocking Control API calls)
+    pending_control_writes: Option<mpsc::Receiver<ControlWriteResult>>,
     /// Last time jobs were polled (for incremental updates)
     last_jobs_poll: Option<std::time::Instant>,
     /// Profiler for frame timing and zone breakdown (F12 toggle)
@@ -3020,6 +3209,11 @@ struct RuleBuilderSearchResult {
     error: Option<String>,
 }
 
+struct ControlWriteResult {
+    sources_changed: bool,
+    error: Option<String>,
+}
+
 impl App {
     fn check_db_health_once(&mut self) {
         if self.db_health_checked {
@@ -3057,38 +3251,31 @@ impl App {
             "schema_migrations",
         ];
 
-        let rows = match conn.query_all(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'",
-            &[],
-        ) {
-            Err(err) => {
-                self.report_db_error("Database health check failed", err);
-                return;
-            }
-            Ok(rows) => rows,
-        };
-
-        let mut existing_tables = std::collections::HashSet::new();
-        for row in rows {
-            let table: String = match row.get(0) {
-                Ok(value) => value,
+        let mut missing = Vec::new();
+        for table in required_tables {
+            match conn.table_exists(table) {
+                Ok(true) => {}
+                Ok(false) => missing.push(table.to_string()),
                 Err(err) => {
                     self.report_db_error("Database health check failed", err);
                     return;
                 }
-            };
-            existing_tables.insert(table.to_lowercase());
+            }
         }
-
-        let missing: Vec<String> = required_tables
-            .iter()
-            .filter(|t| !existing_tables.contains(&t.to_lowercase()))
-            .map(|t| t.to_string())
-            .collect();
 
         if !missing.is_empty() {
             drop(conn);
             let msg = format!("Missing tables: {}", missing.join(", "));
+            if self.control_connected {
+                let warn = format!(
+                    "Database missing tables: {}. Control API active; not resetting.",
+                    missing.join(", ")
+                );
+                self.db_health_warning = Some(warn.clone());
+                self.discover.status_message = Some((warn, true));
+                self.db_read_only = true;
+                return;
+            }
             if self.reset_db_file(&path, &msg) {
                 return;
             }
@@ -3103,6 +3290,12 @@ impl App {
     }
 
     fn reset_db_file(&mut self, path: &std::path::Path, reason: &str) -> bool {
+        if self.control_connected {
+            let warn = "Control API active; refusing to reset state store.".to_string();
+            self.db_health_warning = Some(warn.clone());
+            self.discover.status_message = Some((warn, true));
+            return false;
+        }
         let _ = std::fs::remove_file(path);
         match ScoutDatabase::open(path) {
             Ok(_) => {
@@ -3145,61 +3338,80 @@ impl App {
         self.nav_selected = Self::nav_index_for_mode(mode);
     }
 
+    fn ensure_rule_builder_ready(&mut self) {
+        if self.discover.rule_builder.is_none() {
+            let source_id = self.discover.selected_source_id;
+            let mut builder = super::extraction::RuleBuilderState::new(source_id);
+            builder.pattern = "**/*".to_string();
+            self.discover.rule_builder = Some(builder);
+        }
+    }
+
+    fn set_ingest_tab(&mut self, tab: IngestTab) {
+        self.ingest_tab = tab;
+        self.set_mode(TuiMode::Ingest);
+        if self.ingest_tab != IngestTab::Sources {
+            self.ensure_rule_builder_ready();
+        }
+    }
+
+    fn set_run_tab(&mut self, tab: RunTab) {
+        self.run_tab = tab;
+        self.set_mode(TuiMode::Run);
+    }
+
+    fn set_review_tab(&mut self, tab: ReviewTab) {
+        self.review_tab = tab;
+        self.set_mode(TuiMode::Review);
+    }
+
+    fn next_task_tab(&mut self) {
+        match self.mode {
+            TuiMode::Ingest => {
+                self.set_ingest_tab(self.ingest_tab.next());
+            }
+            TuiMode::Run => {
+                self.set_run_tab(self.run_tab.next());
+            }
+            TuiMode::Review => {
+                self.set_review_tab(self.review_tab.next());
+            }
+            _ => {}
+        }
+    }
+
+    fn prev_task_tab(&mut self) {
+        match self.mode {
+            TuiMode::Ingest => {
+                self.set_ingest_tab(self.ingest_tab.prev());
+            }
+            TuiMode::Run => {
+                self.set_run_tab(self.run_tab.prev());
+            }
+            TuiMode::Review => {
+                self.set_review_tab(self.review_tab.prev());
+            }
+            _ => {}
+        }
+    }
+
     fn navigate_to_mode(&mut self, mode: TuiMode) {
         match mode {
-            TuiMode::Discover => self.enter_discover_mode(),
-            TuiMode::ParserBench => {
-                self.set_mode(TuiMode::ParserBench);
-                self.parser_bench.parsers_loaded = false;
-                self.load_parsers();
-            }
-            TuiMode::Jobs => {
-                if self.mode != TuiMode::Jobs {
-                    self.jobs_state.previous_mode = Some(self.mode);
+            TuiMode::Home => self.set_mode(TuiMode::Home),
+            TuiMode::Ingest => {
+                self.set_mode(TuiMode::Ingest);
+                if self.ingest_tab != IngestTab::Sources {
+                    self.ensure_rule_builder_ready();
                 }
-                self.set_mode(TuiMode::Jobs);
             }
-            TuiMode::Sources => {
-                if self.mode != TuiMode::Sources {
-                    self.sources_state.previous_mode = Some(self.mode);
-                }
-                self.set_mode(TuiMode::Sources);
-            }
-            TuiMode::Approvals => {
-                if self.mode != TuiMode::Approvals {
-                    self.approvals_state.previous_mode = Some(self.mode);
-                }
-                self.set_mode(TuiMode::Approvals);
-            }
-            TuiMode::Query => {
-                self.set_mode(TuiMode::Query);
-            }
+            TuiMode::Run => self.set_mode(TuiMode::Run),
+            TuiMode::Review => self.set_mode(TuiMode::Review),
+            TuiMode::Query => self.set_mode(TuiMode::Query),
             TuiMode::Settings => {
                 if self.mode != TuiMode::Settings {
                     self.settings.previous_mode = Some(self.mode);
                 }
                 self.set_mode(TuiMode::Settings);
-            }
-            TuiMode::Sessions => {
-                if self.mode != TuiMode::Sessions {
-                    self.sessions_state.previous_mode = Some(self.mode);
-                }
-                self.set_mode(TuiMode::Sessions);
-            }
-            TuiMode::Triage => {
-                if self.mode != TuiMode::Triage {
-                    self.triage_state.previous_mode = Some(self.mode);
-                }
-                self.set_mode(TuiMode::Triage);
-            }
-            TuiMode::Catalog => {
-                if self.mode != TuiMode::Catalog {
-                    self.catalog_state.previous_mode = Some(self.mode);
-                }
-                self.set_mode(TuiMode::Catalog);
-            }
-            TuiMode::Home => {
-                self.set_mode(TuiMode::Home);
             }
         }
 
@@ -3212,9 +3424,17 @@ impl App {
             page_size: DISCOVER_PAGE_SIZE,
             ..Default::default()
         };
+        let control_addr = Self::resolve_control_addr();
+        let control_connected = control_addr
+            .as_deref()
+            .map(Self::probe_control_addr)
+            .unwrap_or(false);
         Self {
             running: true,
             mode: TuiMode::Home,
+            ingest_tab: IngestTab::Select,
+            run_tab: RunTab::Jobs,
+            review_tab: ReviewTab::Triage,
             show_help: false,
             inspector_collapsed: false,
             shell_focus: ShellFocus::Main,
@@ -3247,11 +3467,14 @@ impl App {
             command_palette: CommandPaletteState::new(),
             workspace_switcher: WorkspaceSwitcherState::default(),
             config: args,
+            control_addr,
+            control_connected,
             telemetry,
             error: None,
             pending_scan: None,
             scan_cancel_token: None,
             current_scan_job_id: None,
+            current_scan_id: None,
             current_schema_eval_job_id: None,
             pending_schema_eval: None,
             pending_sample_eval: None,
@@ -3271,10 +3494,11 @@ impl App {
             pending_sessions_load: None,
             pending_triage_load: None,
             pending_catalog_load: None,
+            pending_control_writes: None,
             last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250), // 250ms frame budget
-            db_read_only: false,
+            db_read_only: control_connected,
             db_health_checked: false,
             db_health_warning: None,
         }
@@ -3284,15 +3508,9 @@ impl App {
     /// This ensures the Rule Builder UI appears instantly (no loading delay).
     /// Files will populate asynchronously as the cache loads.
     pub fn enter_discover_mode(&mut self) {
-        self.set_mode(TuiMode::Discover);
+        self.set_ingest_tab(IngestTab::Select);
 
-        // Initialize Rule Builder immediately if not already present
-        if self.discover.rule_builder.is_none() {
-            let source_id = self.discover.selected_source_id;
-            let mut builder = super::extraction::RuleBuilderState::new(source_id);
-            builder.pattern = "**/*".to_string();
-            self.discover.rule_builder = Some(builder);
-        }
+        self.ensure_rule_builder_ready();
 
         // Set view state to Rule Builder immediately
         self.discover.view_state = DiscoverViewState::RuleBuilder;
@@ -3302,9 +3520,29 @@ impl App {
 
     fn resolve_db_target(&self) -> (DbBackend, std::path::PathBuf) {
         if let Some(ref path) = self.config.database {
-            (DbBackend::DuckDb, path.clone())
+            (DbBackend::Sqlite, path.clone())
         } else {
-            (default_db_backend(), active_db_path())
+            (default_db_backend(), state_store_path())
+        }
+    }
+
+    fn resolve_control_addr() -> Option<String> {
+        if cfg!(test) {
+            return None;
+        }
+        if std::env::var("CASPARIAN_CONTROL_DISABLED").is_ok() {
+            return None;
+        }
+        Some(
+            std::env::var("CASPARIAN_CONTROL_ADDR")
+                .unwrap_or_else(|_| DEFAULT_CONTROL_ADDR.to_string()),
+        )
+    }
+
+    fn probe_control_addr(addr: &str) -> bool {
+        match ControlClient::connect_with_timeout(addr, Duration::from_millis(200)) {
+            Ok(client) => client.ping().unwrap_or(false),
+            Err(_) => false,
         }
     }
 
@@ -3401,22 +3639,24 @@ impl App {
             }
         }
 
-        if let Some(db) = self.open_scout_db_for_writes() {
-            match db.ensure_default_workspace() {
-                Ok(workspace) => {
-                    let id = workspace.id;
-                    self.active_workspace = Some(workspace);
-                    if let Err(err) = context::set_active_workspace(&id) {
-                        self.discover.status_message = Some((
-                            format!("Failed to persist workspace context: {}", err),
-                            true,
-                        ));
+        if !self.control_connected {
+            if let Some(db) = self.open_scout_db_for_writes() {
+                match db.ensure_default_workspace() {
+                    Ok(workspace) => {
+                        let id = workspace.id;
+                        self.active_workspace = Some(workspace);
+                        if let Err(err) = context::set_active_workspace(&id) {
+                            self.discover.status_message = Some((
+                                format!("Failed to persist workspace context: {}", err),
+                                true,
+                            ));
+                        }
+                        return;
                     }
-                    return;
-                }
-                Err(err) => {
-                    self.discover.status_message =
-                        Some((format!("Workspace init failed: {}", err), true));
+                    Err(err) => {
+                        self.discover.status_message =
+                            Some((format!("Workspace init failed: {}", err), true));
+                    }
                 }
             }
         }
@@ -3503,6 +3743,71 @@ impl App {
         })
     }
 
+    fn job_from_control(job: ControlJobInfo) -> JobInfo {
+        let status = JobStatus::from_db_status(job.status.as_str(), None);
+        let started_at = job
+            .created_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local))
+            .unwrap_or_else(Local::now);
+        let mut completed_at = job
+            .updated_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Local));
+        if !matches!(
+            status,
+            JobStatus::Completed
+                | JobStatus::PartialSuccess
+                | JobStatus::Failed
+                | JobStatus::Cancelled
+        ) {
+            completed_at = None;
+        }
+
+        let failures = job
+            .error_message
+            .map(|err| {
+                vec![JobFailure {
+                    file_path: String::new(),
+                    error: err,
+                    line: None,
+                }]
+            })
+            .unwrap_or_default();
+
+        let id = i64::try_from(job.id).expect("job id out of range for i64");
+        JobInfo {
+            id,
+            file_id: if job.file_id == 0 {
+                None
+            } else {
+                Some(job.file_id)
+            },
+            job_type: JobType::Parse,
+            name: job.plugin_name,
+            version: job.parser_version,
+            status,
+            started_at,
+            completed_at,
+            pipeline_run_id: job.pipeline_run_id,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: Some(job.quarantine_rows),
+            items_total: 0,
+            items_processed: 0,
+            items_failed: 0,
+            output_path: None,
+            output_size_bytes: None,
+            backtest: None,
+            failures,
+            violations: vec![],
+            top_violations_loaded: false,
+            selected_violation_index: 0,
+        }
+    }
+
     fn set_global_status(&mut self, message: impl Into<String>, is_error: bool) {
         let message = message.into();
         let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -3521,14 +3826,9 @@ impl App {
             return Ok(None);
         }
 
-        let _ = backend;
-        #[cfg(feature = "duckdb")]
-        {
-            DbConnection::open_duckdb_readonly(path).map(Some)
-        }
-        #[cfg(not(feature = "duckdb"))]
-        {
-            Ok(None)
+        match backend {
+            DbBackend::Sqlite => DbConnection::open_sqlite_readonly(path).map(Some),
+            DbBackend::DuckDb => DbConnection::open_duckdb_readonly(path).map(Some),
         }
     }
 
@@ -3540,34 +3840,18 @@ impl App {
             return Ok(None);
         }
 
-        let _ = backend;
-        #[cfg(feature = "duckdb")]
-        {
-            DbConnection::open_duckdb(path).map(Some)
-        }
-        #[cfg(not(feature = "duckdb"))]
-        {
-            Ok(None)
+        match backend {
+            DbBackend::Sqlite => DbConnection::open_sqlite(path).map(Some),
+            DbBackend::DuckDb => DbConnection::open_duckdb(path).map(Some),
         }
     }
 
     fn table_exists(conn: &DbConnection, table: &str) -> Result<bool, BackendError> {
-        let query =
-            "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?"
-                .to_string();
-        let params = vec![DbValue::from(table)];
-
-        conn.query_optional(&query, &params)
-            .map(|row| row.is_some())
+        conn.table_exists(table)
     }
 
     fn column_exists(conn: &DbConnection, table: &str, column: &str) -> Result<bool, BackendError> {
-        let query = "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?"
-            .to_string();
-        let params = vec![DbValue::from(table), DbValue::from(column)];
-
-        conn.query_optional(&query, &params)
-            .map(|row| row.is_some())
+        conn.column_exists(table, column)
     }
 
     fn report_db_error(&mut self, context: &str, err: impl std::fmt::Display) {
@@ -3587,6 +3871,16 @@ impl App {
         // Handle command palette input when visible (highest priority)
         if self.command_palette.visible {
             self.handle_command_palette_key(key);
+            return;
+        }
+
+        if self.show_help {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.show_help = false;
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -3634,44 +3928,38 @@ impl App {
             // Keys 1-4 are RESERVED for view navigation and work from ANY view.
             // Don't intercept when in text input.
 
-            // 1: Discover
+            // 1: Ingest
             KeyCode::Char('1') if !self.in_text_input_mode() => {
-                self.navigate_to_mode(TuiMode::Discover);
+                self.navigate_to_mode(TuiMode::Ingest);
                 return;
             }
-            // 2: Parser Bench
+            // 2: Run
             KeyCode::Char('2') if !self.in_text_input_mode() => {
-                self.navigate_to_mode(TuiMode::ParserBench);
+                self.navigate_to_mode(TuiMode::Run);
                 return;
             }
-            // 3: Jobs
+            // 3: Review
             KeyCode::Char('3') if !self.in_text_input_mode() => {
-                self.navigate_to_mode(TuiMode::Jobs);
+                self.navigate_to_mode(TuiMode::Review);
                 return;
             }
-            // 4: Sources
+            // 4: Query Console
             KeyCode::Char('4') if !self.in_text_input_mode() => {
-                self.navigate_to_mode(TuiMode::Sources);
-                return;
-            }
-            // 5: Approvals
-            KeyCode::Char('5') if !self.in_text_input_mode() => {
-                self.navigate_to_mode(TuiMode::Approvals);
-                return;
-            }
-            // 6: Query Console
-            KeyCode::Char('6') if !self.in_text_input_mode() => {
                 self.navigate_to_mode(TuiMode::Query);
                 return;
             }
-            // 7: Sessions (Intent Pipeline Workflows)
-            KeyCode::Char('7') if !self.in_text_input_mode() => {
-                self.navigate_to_mode(TuiMode::Sessions);
+            // 5: Settings
+            KeyCode::Char('5') if !self.in_text_input_mode() => {
+                self.navigate_to_mode(TuiMode::Settings);
                 return;
             }
-            // P: Parser Bench (separate from 1-4 navigation)
-            KeyCode::Char('P') if !self.in_text_input_mode() => {
-                self.navigate_to_mode(TuiMode::ParserBench);
+            // Tab cycling within tasks
+            KeyCode::Char('[') if !self.in_text_input_mode() => {
+                self.prev_task_tab();
+                return;
+            }
+            KeyCode::Char(']') if !self.in_text_input_mode() => {
+                self.next_task_tab();
                 return;
             }
             // I: Toggle Inspector panel
@@ -3689,7 +3977,7 @@ impl App {
                 return;
             }
             // S: Toggle Sources Drawer (global overlay, except Discover)
-            KeyCode::Char('S') if !self.in_text_input_mode() && self.mode != TuiMode::Discover => {
+            KeyCode::Char('S') if !self.in_text_input_mode() && self.mode != TuiMode::Ingest => {
                 self.sources_drawer_open = !self.sources_drawer_open;
                 if self.sources_drawer_open {
                     self.jobs_drawer_open = false;
@@ -3718,7 +4006,7 @@ impl App {
             KeyCode::Enter if self.jobs_drawer_open => {
                 // Jump to Jobs view with selected job
                 if !self.jobs_state.jobs.is_empty() {
-                    if self.mode != TuiMode::Jobs {
+                    if self.mode != TuiMode::Run {
                         self.jobs_state.previous_mode = Some(self.mode);
                     }
                     if let Some(job) = self.jobs_state.jobs.get(self.jobs_drawer_selected) {
@@ -3744,7 +4032,7 @@ impl App {
                         }
                         self.jobs_state.clamp_selection();
                     }
-                    self.set_mode(TuiMode::Jobs);
+                    self.set_run_tab(RunTab::Jobs);
                     self.jobs_drawer_open = false;
                 }
                 return;
@@ -3770,7 +4058,10 @@ impl App {
             KeyCode::Enter if self.sources_drawer_open => {
                 if let Some(source) = self.sources_drawer_selected_source() {
                     self.sources_state.selected_index = source;
-                    self.set_mode(TuiMode::Sources);
+                    if self.mode != TuiMode::Ingest {
+                        self.sources_state.previous_mode = Some(self.mode);
+                    }
+                    self.set_ingest_tab(IngestTab::Sources);
                     self.sources_drawer_open = false;
                 }
                 return;
@@ -3790,7 +4081,10 @@ impl App {
                     self.sources_state.selected_index = source_idx;
                     self.sources_state.editing = true;
                     self.sources_state.edit_value = source.path.display().to_string();
-                    self.set_mode(TuiMode::Sources);
+                    if self.mode != TuiMode::Ingest {
+                        self.sources_state.previous_mode = Some(self.mode);
+                    }
+                    self.set_ingest_tab(IngestTab::Sources);
                     self.sources_drawer_open = false;
                 }
                 return;
@@ -3799,7 +4093,10 @@ impl App {
                 if let Some(source_idx) = self.sources_drawer_selected_source() {
                     self.sources_state.selected_index = source_idx;
                     self.sources_state.confirm_delete = true;
-                    self.set_mode(TuiMode::Sources);
+                    if self.mode != TuiMode::Ingest {
+                        self.sources_state.previous_mode = Some(self.mode);
+                    }
+                    self.set_ingest_tab(IngestTab::Sources);
                     self.sources_drawer_open = false;
                 }
                 return;
@@ -3818,11 +4115,11 @@ impl App {
                 return;
             }
             // 0 or H: Return to Home (from any view)
-            KeyCode::Char('0') => {
+            KeyCode::Char('0') if !self.in_text_input_mode() => {
                 self.set_mode(TuiMode::Home);
                 return;
             }
-            KeyCode::Char('H') => {
+            KeyCode::Char('H') if !self.in_text_input_mode() => {
                 self.set_mode(TuiMode::Home);
                 return;
             }
@@ -3836,7 +4133,10 @@ impl App {
             // r: Refresh current view (per spec Section 3.3)
             // Don't intercept when in text input mode
             // Exempt Sources view: 'r' there means Rescan, not global refresh
-            KeyCode::Char('r') if !self.in_text_input_mode() && self.mode != TuiMode::Sources => {
+            KeyCode::Char('r')
+                if !self.in_text_input_mode()
+                    && !(self.mode == TuiMode::Ingest && self.ingest_tab == IngestTab::Sources) =>
+            {
                 self.refresh_current_view();
                 return;
             }
@@ -3856,11 +4156,6 @@ impl App {
             // Don't intercept when in text input mode
             KeyCode::Char(',') if !self.in_text_input_mode() => {
                 self.navigate_to_mode(TuiMode::Settings);
-                return;
-            }
-            // Esc: Close help overlay first, then handle other escapes
-            KeyCode::Esc if self.show_help => {
-                self.show_help = false;
                 return;
             }
             _ => {}
@@ -3898,7 +4193,9 @@ impl App {
                 }
             }
 
-            if key.code == KeyCode::Left && self.mode != TuiMode::Discover {
+            if key.code == KeyCode::Left
+                && !(self.mode == TuiMode::Ingest && self.ingest_tab != IngestTab::Sources)
+            {
                 self.shell_focus = ShellFocus::Rail;
                 self.nav_selected = Self::nav_index_for_mode(self.mode);
                 return;
@@ -3908,16 +4205,21 @@ impl App {
         // Mode-specific keys (Main Focus)
         match self.mode {
             TuiMode::Home => self.handle_home_key(key),
-            TuiMode::Discover => self.handle_discover_key(key),
-            TuiMode::Jobs => self.handle_jobs_key(key),
-            TuiMode::Sources => self.handle_sources_key(key),
-            TuiMode::Approvals => self.handle_approvals_key(key),
-            TuiMode::ParserBench => self.handle_parser_bench_key(key),
+            TuiMode::Ingest => match self.ingest_tab {
+                IngestTab::Sources => self.handle_sources_key(key),
+                _ => self.handle_discover_key(key),
+            },
+            TuiMode::Run => match self.run_tab {
+                RunTab::Jobs => self.handle_jobs_key(key),
+                RunTab::Outputs => self.handle_catalog_key(key),
+            },
+            TuiMode::Review => match self.review_tab {
+                ReviewTab::Triage => self.handle_triage_key(key),
+                ReviewTab::Approvals => self.handle_approvals_key(key),
+                ReviewTab::Sessions => self.handle_sessions_key(key),
+            },
             TuiMode::Query => self.handle_query_key(key),
             TuiMode::Settings => self.handle_settings_key(key),
-            TuiMode::Sessions => self.handle_sessions_key(key),
-            TuiMode::Triage => self.handle_triage_key(key),
-            TuiMode::Catalog => self.handle_catalog_key(key),
         }
     }
 
@@ -4189,21 +4491,17 @@ impl App {
         self.query_state.table_browser.selected_index = 0;
         self.query_state.table_browser.error = None;
 
-        let (backend, db_path) = self.resolve_db_target();
+        let db_path = query_catalog_path();
         if !db_path.exists() {
-            self.query_state.table_browser.error = Some("Database not found".to_string());
+            self.query_state.table_browser.error = Some("Query catalog not found".to_string());
             return;
         }
 
-        let conn = match App::open_db_readonly_with(backend, &db_path) {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
-                self.query_state.table_browser.error = Some("Database not available".to_string());
-                return;
-            }
+        let conn = match DbConnection::open_duckdb_readonly(&db_path) {
+            Ok(conn) => conn,
             Err(err) => {
                 self.query_state.table_browser.error =
-                    Some(format!("Database open failed: {}", err));
+                    Some(format!("Query catalog open failed: {}", err));
                 return;
             }
         };
@@ -4317,16 +4615,15 @@ impl App {
         self.query_state.view_state = QueryViewState::Executing;
         self.query_state.executing = true;
 
-        let (backend, db_path) = self.resolve_db_target();
+        let db_path = query_catalog_path();
         let (tx, rx) = mpsc::sync_channel(1);
         self.pending_query = Some(rx);
 
         std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let result = match App::open_db_readonly_with(backend, &db_path) {
-                Ok(Some(conn)) => App::run_query_with_conn(&conn, &sql),
-                Ok(None) => Err("Database not available".to_string()),
-                Err(err) => Err(format!("Database open failed: {}", err)),
+            let result = match DbConnection::open_duckdb_readonly(&db_path) {
+                Ok(conn) => App::run_query_with_conn(&conn, &sql),
+                Err(err) => Err(format!("Query catalog open failed: {}", err)),
             };
             let elapsed_ms = start.elapsed().as_millis() as u64;
             let _ = tx.send(QueryExecutionResult {
@@ -4451,7 +4748,7 @@ impl App {
                                     self.sessions_state.sessions_loaded = false;
                                     self.sessions_state.view_state = SessionsViewState::SessionList;
                                     self.sessions_state.active_session = None;
-                                    self.navigate_to_mode(TuiMode::Sessions);
+                                    self.set_review_tab(ReviewTab::Sessions);
                                 }
                                 Err(err) => {
                                     tracing::error!("{}", err);
@@ -4462,14 +4759,15 @@ impl App {
                             self.command_palette.close();
                             // Handle slash commands
                             match cmd.as_str() {
-                                "/jobs" => self.navigate_to_mode(TuiMode::Jobs),
-                                "/approve" => self.navigate_to_mode(TuiMode::Approvals),
+                                "/jobs" => self.set_run_tab(RunTab::Jobs),
+                                "/approve" => self.set_review_tab(ReviewTab::Approvals),
                                 "/query" => self.navigate_to_mode(TuiMode::Query),
                                 "/workspace" => self.open_workspace_switcher(),
                                 "/quarantine" => self.open_triage(None),
                                 "/catalog" | "/pipelines" => self.open_catalog(None),
                                 "/scan" => {
-                                    self.navigate_to_mode(TuiMode::Discover);
+                                    self.navigate_to_mode(TuiMode::Ingest);
+                                    self.set_ingest_tab(IngestTab::Select);
                                     self.transition_discover_state(DiscoverViewState::EnteringPath);
                                 }
                                 "/help" => {
@@ -4656,7 +4954,7 @@ impl App {
     fn apply_active_workspace(&mut self, workspace: Workspace) {
         let name = workspace.name.clone();
         let id = workspace.id;
-        let was_discover = self.mode == TuiMode::Discover;
+        let was_ingest = self.mode == TuiMode::Ingest && self.ingest_tab != IngestTab::Sources;
         self.reset_workspace_scoped_state();
         self.active_workspace = Some(workspace);
         if let Err(err) = context::set_active_workspace(&id) {
@@ -4666,7 +4964,7 @@ impl App {
         } else {
             self.set_global_status(format!("Switched workspace to {}", name), false);
         }
-        if was_discover {
+        if was_ingest {
             self.enter_discover_mode();
         }
     }
@@ -5062,12 +5360,26 @@ impl App {
                             );
                         }
 
-                        if let Some(token) = self.scan_cancel_token.take() {
+                        if self.control_connected {
+                            if let (Some(scan_id), Some(control_addr)) =
+                                (self.current_scan_id.clone(), self.control_addr.clone())
+                            {
+                                std::thread::spawn(move || {
+                                    if let Ok(client) = ControlClient::connect_with_timeout(
+                                        &control_addr,
+                                        Duration::from_millis(200),
+                                    ) {
+                                        let _ = client.cancel_scan(scan_id);
+                                    }
+                                });
+                            }
+                        } else if let Some(token) = self.scan_cancel_token.take() {
                             token.cancel();
                         }
 
                         self.pending_scan = None;
                         self.current_scan_job_id = None;
+                        self.current_scan_id = None;
                         self.discover.scanning_path = None;
                         self.discover.scan_progress = None;
                         self.discover.scan_start_time = None;
@@ -5082,11 +5394,11 @@ impl App {
                         self.discover.status_message =
                             Some(("Scan running in background...".to_string(), false));
                     }
-                    // Navigate to Jobs while scan continues in background
-                    KeyCode::Char('4') => {
+                    // Navigate to Run (Jobs) while scan continues in background
+                    KeyCode::Char('2') => {
                         // Don't cancel - scan continues, just switch view
                         self.discover.view_state = DiscoverViewState::Files;
-                        self.set_mode(TuiMode::Jobs);
+                        self.set_run_tab(RunTab::Jobs);
                         self.discover.status_message =
                             Some(("Scan running in background...".to_string(), false));
                     }
@@ -6273,7 +6585,7 @@ impl App {
             KeyCode::Char('d') => {
                 // Delete selected rule (TODO: add confirmation)
                 if !self.discover.rules.is_empty() {
-                    if self.db_read_only {
+                    if self.db_read_only && !self.control_connected {
                         self.discover.status_message = Some((
                             "Database is read-only; cannot delete rules".to_string(),
                             true,
@@ -6318,7 +6630,7 @@ impl App {
                     }
                 };
                 if let Some(rule) = self.discover.rules.get_mut(self.discover.selected_rule) {
-                    if self.db_read_only {
+                    if self.db_read_only && !self.control_connected {
                         self.discover.status_message = Some((
                             "Database is read-only; cannot update rules".to_string(),
                             true,
@@ -6694,7 +7006,7 @@ impl App {
 
             // Ctrl+S: Save rule
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.db_read_only {
+                if self.db_read_only && !self.control_connected {
                     self.discover.status_message =
                         Some(("Database is read-only; cannot save rules".to_string(), true));
                     return;
@@ -7050,7 +7362,7 @@ impl App {
 
             // 't' applies manual tag to preview (selection-aware)
             KeyCode::Char('t') if builder.focus == RuleBuilderFocus::FileList => {
-                if self.db_read_only {
+                if self.db_read_only && !self.control_connected {
                     self.discover.status_message =
                         Some(("Database is read-only; cannot apply tags".to_string(), true));
                     return;
@@ -7207,7 +7519,7 @@ impl App {
 
     /// Create a source from a directory path
     fn create_source(&mut self, path: &str, name: &str) {
-        if self.db_read_only {
+        if self.db_read_only && !self.control_connected {
             self.discover.status_message = Some((
                 "Database is read-only; cannot create sources".to_string(),
                 true,
@@ -7288,7 +7600,7 @@ impl App {
     }
 
     fn update_source_name(&mut self, source_id: &SourceId, new_name: &str) {
-        if self.db_read_only {
+        if self.db_read_only && !self.control_connected {
             self.discover.status_message = Some((
                 "Database is read-only; cannot rename sources".to_string(),
                 true,
@@ -7333,7 +7645,7 @@ impl App {
     }
 
     fn update_source_path(&mut self, source_id: &SourceId, new_path: &str) {
-        if self.db_read_only {
+        if self.db_read_only && !self.control_connected {
             self.discover.status_message = Some((
                 "Database is read-only; cannot edit sources".to_string(),
                 true,
@@ -7382,7 +7694,7 @@ impl App {
     }
 
     fn delete_source(&mut self, source_id: &SourceId) {
-        if self.db_read_only {
+        if self.db_read_only && !self.control_connected {
             self.discover.status_message = Some((
                 "Database is read-only; cannot delete sources".to_string(),
                 true,
@@ -7419,7 +7731,7 @@ impl App {
         rule_id: Option<TaggingRuleId>,
         show_message: bool,
     ) -> bool {
-        if self.db_read_only {
+        if self.db_read_only && !self.control_connected {
             self.discover.status_message =
                 Some(("Database is read-only; cannot apply tags".to_string(), true));
             return false;
@@ -8143,7 +8455,7 @@ impl App {
     /// Returns the number of files tagged
     /// Also queues DB writes for persistence
     fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> usize {
-        if self.db_read_only {
+        if self.db_read_only && !self.control_connected {
             self.discover.status_message = Some((
                 "Database is read-only; cannot apply rules".to_string(),
                 true,
@@ -8354,6 +8666,88 @@ impl App {
             }
         };
 
+        if self.control_connected {
+            let control_addr = match self.control_addr.clone() {
+                Some(addr) => addr,
+                None => {
+                    self.discover.tags = vec![TagInfo {
+                        name: "All files".to_string(),
+                        count: 0,
+                        is_special: true,
+                    }];
+                    self.discover.available_tags.clear();
+                    return;
+                }
+            };
+            let client = match ControlClient::connect_with_timeout(
+                &control_addr,
+                Duration::from_millis(500),
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    self.report_db_error("Tags load failed", err);
+                    self.discover.tags = vec![TagInfo {
+                        name: "All files".to_string(),
+                        count: 0,
+                        is_special: true,
+                    }];
+                    self.discover.available_tags.clear();
+                    return;
+                }
+            };
+            let stats = match client.list_tags(workspace_id, source_id) {
+                Ok(stats) => stats,
+                Err(err) => {
+                    self.report_db_error("Tags load failed", err);
+                    self.discover.tags = vec![TagInfo {
+                        name: "All files".to_string(),
+                        count: 0,
+                        is_special: true,
+                    }];
+                    self.discover.available_tags.clear();
+                    return;
+                }
+            };
+
+            let mut tags = Vec::new();
+            let total_count = stats.total_files.max(0) as usize;
+            tags.push(TagInfo {
+                name: "All files".to_string(),
+                count: total_count,
+                is_special: true,
+            });
+
+            let mut available_tags = Vec::new();
+            for entry in stats.tags {
+                if entry.count <= 0 {
+                    continue;
+                }
+                available_tags.push(entry.tag.clone());
+                tags.push(TagInfo {
+                    name: entry.tag,
+                    count: entry.count as usize,
+                    is_special: false,
+                });
+            }
+
+            if stats.untagged_files > 0 {
+                tags.push(TagInfo {
+                    name: "untagged".to_string(),
+                    count: stats.untagged_files as usize,
+                    is_special: true,
+                });
+            }
+
+            self.discover.available_tags = available_tags;
+            self.discover.tags = tags;
+            if let Some(selected_tag) = self.discover.selected_tag {
+                if selected_tag >= self.discover.tags.len() {
+                    self.discover.selected_tag = None;
+                }
+            }
+            return;
+        }
+
         let conn = match self.open_db_readonly() {
             Ok(Some(conn)) => conn,
             Ok(None) => {
@@ -8487,52 +8881,43 @@ impl App {
                 // Mark stats as needing refresh - will trigger reload on next tick
                 self.home.stats_loaded = false;
             }
-            TuiMode::Discover => {
-                // Mark data as needing refresh - will trigger reload on next tick
-                self.discover.data_loaded = false;
-                self.discover.db_filtered = false;
-                self.refresh_tags_list();
-            }
-            TuiMode::ParserBench => {
-                // Reload parsers from disk
-                self.parser_bench.parsers_loaded = false;
-                self.load_parsers();
-            }
-            TuiMode::Jobs => {
-                // Mark jobs as needing refresh - will trigger reload on next tick
-                self.jobs_state.jobs_loaded = false;
-                self.last_jobs_poll = None;
-                // Reset view state
-                self.jobs_state.selected_index = 0;
-                self.jobs_state.section_focus = JobsListSection::Actionable;
-                self.jobs_state.actionable_index = 0;
-                self.jobs_state.ready_index = 0;
-                self.jobs_state.pinned_job_id = None;
-            }
-            TuiMode::Sources => {
-                // Mark sources as needing refresh - will trigger reload on next tick
-                self.discover.sources_loaded = false;
-            }
-            TuiMode::Settings => {
-                // Settings don't need refresh - they're always current
-            }
-            TuiMode::Approvals => {
-                // Mark approvals as needing refresh - will trigger reload on next tick
-                self.approvals_state.approvals_loaded = false;
-            }
-            TuiMode::Query => {
-                // Query doesn't need refresh
-            }
-            TuiMode::Sessions => {
-                // Mark sessions as needing refresh
-                self.sessions_state.sessions_loaded = false;
-            }
-            TuiMode::Triage => {
-                self.triage_state.loaded = false;
-            }
-            TuiMode::Catalog => {
-                self.catalog_state.loaded = false;
-            }
+            TuiMode::Ingest => match self.ingest_tab {
+                IngestTab::Sources => {
+                    self.discover.sources_loaded = false;
+                }
+                _ => {
+                    self.discover.data_loaded = false;
+                    self.discover.db_filtered = false;
+                    self.refresh_tags_list();
+                }
+            },
+            TuiMode::Run => match self.run_tab {
+                RunTab::Jobs => {
+                    self.jobs_state.jobs_loaded = false;
+                    self.last_jobs_poll = None;
+                    self.jobs_state.selected_index = 0;
+                    self.jobs_state.section_focus = JobsListSection::Actionable;
+                    self.jobs_state.actionable_index = 0;
+                    self.jobs_state.ready_index = 0;
+                    self.jobs_state.pinned_job_id = None;
+                }
+                RunTab::Outputs => {
+                    self.catalog_state.loaded = false;
+                }
+            },
+            TuiMode::Review => match self.review_tab {
+                ReviewTab::Approvals => {
+                    self.approvals_state.approvals_loaded = false;
+                }
+                ReviewTab::Sessions => {
+                    self.sessions_state.sessions_loaded = false;
+                }
+                ReviewTab::Triage => {
+                    self.triage_state.loaded = false;
+                }
+            },
+            TuiMode::Query => {}
+            TuiMode::Settings => {}
         }
     }
 
@@ -8548,18 +8933,18 @@ impl App {
             return true;
         }
         match self.mode {
-            TuiMode::Discover => {
-                // Check glob explorer filtering state
+            TuiMode::Ingest => {
+                if self.ingest_tab == IngestTab::Sources {
+                    return self.sources_state.editing;
+                }
                 if let Some(ref explorer) = self.discover.glob_explorer {
                     if matches!(explorer.phase, GlobExplorerPhase::Filtering) {
                         return true;
                     }
                 }
-                // Check sources/tags dropdown filtering
                 if self.discover.sources_filtering || self.discover.tags_filtering {
                     return true;
                 }
-                // Check Rule Builder text input fields (Pattern, Tag, ExcludeInput, ExtractionEdit)
                 if self.discover.view_state == DiscoverViewState::RuleBuilder {
                     if let Some(ref builder) = self.discover.rule_builder {
                         use super::extraction::RuleBuilderFocus;
@@ -8574,7 +8959,6 @@ impl App {
                         }
                     }
                 }
-                // All other text input states are in the view_state enum
                 matches!(
                     self.discover.view_state,
                     DiscoverViewState::Filtering
@@ -8586,13 +8970,14 @@ impl App {
                         | DiscoverViewState::RuleCreation
                         | DiscoverViewState::SourcesDropdown
                         | DiscoverViewState::TagsDropdown
-                        | DiscoverViewState::SourceEdit // Added for Sources Manager
+                        | DiscoverViewState::SourceEdit
                 )
             }
-            TuiMode::ParserBench => self.parser_bench.is_filtering,
-            TuiMode::Sources => self.sources_state.editing,
-            TuiMode::Approvals => {
-                self.approvals_state.view_state == ApprovalsViewState::ConfirmReject
+            TuiMode::Review => {
+                matches!(
+                    self.review_tab,
+                    ReviewTab::Approvals
+                ) && self.approvals_state.view_state == ApprovalsViewState::ConfirmReject
             }
             TuiMode::Query => self.query_state.view_state == QueryViewState::Editing,
             _ => false,
@@ -8602,6 +8987,18 @@ impl App {
     /// Public wrapper for text input mode detection (for state exploration).
     pub fn is_text_input_mode(&self) -> bool {
         self.in_text_input_mode()
+    }
+
+    /// Human-readable label for the current task/tab.
+    pub fn view_label(&self) -> String {
+        match self.mode {
+            TuiMode::Home => "Home".to_string(),
+            TuiMode::Ingest => format!("Ingest / {}", self.ingest_tab.label()),
+            TuiMode::Run => format!("Run / {}", self.run_tab.label()),
+            TuiMode::Review => format!("Review / {}", self.review_tab.label()),
+            TuiMode::Query => "Query".to_string(),
+            TuiMode::Settings => "Settings".to_string(),
+        }
     }
 
     /// Compute a topology-level UI signature for deterministic exploration.
@@ -9262,6 +9659,11 @@ impl App {
     fn scan_directory(&mut self, path: &str) {
         use std::path::Path;
 
+        if self.control_connected {
+            self.scan_directory_control(path);
+            return;
+        }
+
         if self.db_read_only {
             self.discover.status_message = Some((
                 "Database is read-only due to schema health check".to_string(),
@@ -9325,7 +9727,7 @@ impl App {
             .config
             .database
             .clone()
-            .unwrap_or_else(crate::cli::config::active_db_path);
+            .unwrap_or_else(crate::cli::config::state_store_path);
 
         let source_path = path_display;
         let scan_job_id = job_id; // Capture for async block
@@ -9467,6 +9869,7 @@ impl App {
             // Validation passed - notify TUI that scan is starting
             let _ = tui_tx.send(TuiScanResult::Started {
                 job_id: scan_job_id,
+                scan_id: None,
             });
 
             // Create progress channel that sends directly to TUI
@@ -9591,6 +9994,148 @@ impl App {
                     }
                     let _ = tui_tx.send(TuiScanResult::Error(format!("Scan failed: {}", e)));
                 }
+            }
+        });
+    }
+
+    fn scan_directory_control(&mut self, path: &str) {
+        use std::path::Path;
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.discover.status_message = Some((
+                    "Control API address not configured".to_string(),
+                    true,
+                ));
+                return;
+            }
+        };
+
+        let path_input = Path::new(path);
+        let expanded_path = scan_path::expand_scan_path(path_input);
+        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+            self.discover.scan_error = Some(err.to_string());
+            return;
+        }
+
+        let canonical_path = scan_path::canonicalize_scan_path(&expanded_path);
+        let path_display = canonical_path.display().to_string();
+
+        self.discover.scanning_path = Some(path_display.clone());
+        self.discover.scan_progress = Some(ScoutProgress {
+            dirs_scanned: 0,
+            files_found: 0,
+            files_persisted: 0,
+            current_dir: Some("Initializing...".to_string()),
+            elapsed_ms: 0,
+            files_per_sec: 0.0,
+            stalled: false,
+        });
+        self.discover.scan_start_time = Some(std::time::Instant::now());
+        self.discover.view_state = DiscoverViewState::Scanning;
+        self.discover.scan_error = None;
+
+        let (tui_tx, tui_rx) = mpsc::sync_channel::<TuiScanResult>(256);
+        self.pending_scan = Some(tui_rx);
+
+        let job_id = self.add_scan_job(&path_display);
+        self.current_scan_job_id = Some(job_id);
+        self.current_scan_id = None;
+        self.scan_cancel_token = None;
+
+        let workspace_id = self.active_workspace_id();
+        self.discover.status_message = None;
+
+        let scan_job_id = job_id;
+        std::thread::spawn(move || {
+            let client = match ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(500)) {
+                Ok(client) => client,
+                Err(err) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "Control API unavailable: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            let scan_id = match client.start_scan(workspace_id, path_display.clone()) {
+                Ok(id) => id,
+                Err(err) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "Failed to start scan: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            let _ = tui_tx.send(TuiScanResult::Started {
+                job_id: scan_job_id,
+                scan_id: Some(scan_id.clone()),
+            });
+
+            loop {
+                match client.get_scan(scan_id.clone()) {
+                    Ok(Some(status)) => {
+                        if let Some(progress) = status.progress.as_ref() {
+                            let tui_progress = ScoutProgress {
+                                dirs_scanned: progress.dirs_scanned as usize,
+                                files_found: progress.files_found as usize,
+                                files_persisted: progress.files_persisted as usize,
+                                current_dir: progress.current_dir.clone(),
+                                elapsed_ms: progress.elapsed_ms,
+                                files_per_sec: progress.files_per_sec,
+                                stalled: progress.stalled,
+                            };
+                            let _ = tui_tx.send(TuiScanResult::Progress(tui_progress));
+                        }
+
+                        match status.state {
+                            casparian_sentinel::ScanState::Completed => {
+                                let persisted = status.files_persisted.unwrap_or(0) as usize;
+                                let _ = tui_tx.send(TuiScanResult::Complete {
+                                    source_path: status.source_path.clone(),
+                                    files_persisted: persisted,
+                                });
+                                break;
+                            }
+                            casparian_sentinel::ScanState::Failed => {
+                                let _ = tui_tx.send(TuiScanResult::Error(
+                                    status
+                                        .error
+                                        .unwrap_or_else(|| "Scan failed".to_string()),
+                                ));
+                                break;
+                            }
+                            casparian_sentinel::ScanState::Cancelled => {
+                                let _ = tui_tx.send(TuiScanResult::Error(
+                                    status
+                                        .error
+                                        .unwrap_or_else(|| "Scan cancelled".to_string()),
+                                ));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tui_tx.send(TuiScanResult::Error(
+                            "Scan not found in control plane".to_string(),
+                        ));
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = tui_tx.send(TuiScanResult::Error(format!(
+                            "Failed to query scan status: {}",
+                            err
+                        )));
+                        break;
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(250));
             }
         });
     }
@@ -10710,6 +11255,40 @@ impl App {
             return;
         }
 
+        if self.control_connected {
+            let workspace_id = match self.active_workspace_id() {
+                Some(id) => id,
+                None => return,
+            };
+            let control_addr = match self.control_addr.clone() {
+                Some(addr) => addr,
+                None => {
+                    self.discover.sources_loaded = true;
+                    return;
+                }
+            };
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.pending_sources_load = Some(rx);
+            std::thread::spawn(move || {
+                let result: Result<Vec<SourceInfo>, String> = (|| {
+                    let client = ControlClient::connect_with_timeout(
+                        &control_addr,
+                        Duration::from_millis(500),
+                    )
+                    .map_err(|err| format!("Control API unavailable: {}", err))?;
+                    let sources = client
+                        .list_sources(workspace_id)
+                        .map_err(|err| format!("Sources query failed: {}", err))?;
+                    Ok(sources
+                        .into_iter()
+                        .map(SourceInfo::from_control)
+                        .collect())
+                })();
+                let _ = tx.send(result);
+            });
+            return;
+        }
+
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
             None => return,
@@ -10784,6 +11363,34 @@ impl App {
     fn start_jobs_load(&mut self) {
         // Skip if already loading
         if self.pending_jobs_load.is_some() {
+            return;
+        }
+
+        if self.control_connected {
+            let control_addr = match self.control_addr.clone() {
+                Some(addr) => addr,
+                None => {
+                    self.jobs_state.jobs_loaded = true;
+                    return;
+                }
+            };
+
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.pending_jobs_load = Some(rx);
+            std::thread::spawn(move || {
+                let result: Result<Vec<JobInfo>, String> = (|| {
+                    let client = ControlClient::connect_with_timeout(
+                        &control_addr,
+                        Duration::from_millis(500),
+                    )
+                    .map_err(|err| format!("Control API unavailable: {}", err))?;
+                    let jobs = client
+                        .list_jobs(None, Some(100), None)
+                        .map_err(|err| format!("Jobs query failed: {}", err))?;
+                    Ok(jobs.into_iter().map(App::job_from_control).collect())
+                })();
+                let _ = tx.send(result);
+            });
             return;
         }
 
@@ -11149,6 +11756,39 @@ impl App {
     fn start_approvals_load(&mut self) {
         // Skip if already loading
         if self.pending_approvals_load.is_some() {
+            return;
+        }
+
+        if self.control_connected {
+            let control_addr = match self.control_addr.clone() {
+                Some(addr) => addr,
+                None => {
+                    self.approvals_state.approvals_loaded = true;
+                    return;
+                }
+            };
+
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.pending_approvals_load = Some(rx);
+
+            std::thread::spawn(move || {
+                let result: Result<Vec<ApprovalInfo>, String> = (|| {
+                    let client = ControlClient::connect_with_timeout(
+                        &control_addr,
+                        Duration::from_millis(500),
+                    )
+                    .map_err(|err| format!("Control API unavailable: {}", err))?;
+                    let approvals = client
+                        .list_approvals(None, Some(100), None)
+                        .map_err(|err| format!("Approvals query failed: {}", err))?;
+                    Ok(approvals
+                        .into_iter()
+                        .map(ApprovalInfo::from_control)
+                        .collect())
+                })();
+
+                let _ = tx.send(result);
+            });
             return;
         }
 
@@ -11603,6 +12243,10 @@ impl App {
 
     /// Persist pending writes to the database
     fn persist_pending_writes(&mut self) {
+        if self.control_connected {
+            self.persist_pending_writes_control();
+            return;
+        }
         if self.db_read_only {
             return;
         }
@@ -11768,6 +12412,157 @@ impl App {
         }
     }
 
+    fn persist_pending_writes_control(&mut self) {
+        if self.pending_control_writes.is_some() {
+            return;
+        }
+        if self.discover.pending_tag_writes.is_empty()
+            && self.discover.pending_rule_writes.is_empty()
+            && self.discover.pending_rule_updates.is_empty()
+            && self.discover.pending_rule_deletes.is_empty()
+            && self.discover.pending_source_creates.is_empty()
+            && self.discover.pending_source_updates.is_empty()
+            && self.discover.pending_source_deletes.is_empty()
+            && self.discover.pending_source_touch.is_none()
+        {
+            return;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.discover
+                    .status_message
+                    .replace(("Control API not configured".to_string(), true));
+                return;
+            }
+        };
+
+        let tag_writes = std::mem::take(&mut self.discover.pending_tag_writes);
+        let rule_writes = std::mem::take(&mut self.discover.pending_rule_writes);
+        let rule_updates = std::mem::take(&mut self.discover.pending_rule_updates);
+        let rule_deletes = std::mem::take(&mut self.discover.pending_rule_deletes);
+        let source_creates = std::mem::take(&mut self.discover.pending_source_creates);
+        let source_updates = std::mem::take(&mut self.discover.pending_source_updates);
+        let source_deletes = std::mem::take(&mut self.discover.pending_source_deletes);
+        let source_touch = std::mem::take(&mut self.discover.pending_source_touch);
+
+        let sources_changed = !source_creates.is_empty()
+            || !source_updates.is_empty()
+            || !source_deletes.is_empty()
+            || source_touch.is_some();
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_control_writes = Some(rx);
+
+        std::thread::spawn(move || {
+            let mut error: Option<String> = None;
+            let client = match ControlClient::connect_with_timeout(
+                &control_addr,
+                Duration::from_millis(500),
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    let _ = tx.send(ControlWriteResult {
+                        sources_changed,
+                        error: Some(format!("Control API unavailable: {}", err)),
+                    });
+                    return;
+                }
+            };
+
+            for source in source_creates {
+                let source_info = ScoutSourceInfo {
+                    id: source.id,
+                    workspace_id: source.workspace_id,
+                    name: source.name,
+                    source_type: source.source_type,
+                    path: source.path,
+                    exec_path: source.exec_path,
+                    enabled: source.enabled,
+                    poll_interval_secs: source.poll_interval_secs,
+                    file_count: 0,
+                };
+                if let Err(err) = client.upsert_source(source_info) {
+                    if error.is_none() {
+                        error = Some(format!("Source create failed: {}", err));
+                    }
+                }
+            }
+
+            for update in source_updates {
+                if let Err(err) = client.update_source(update.id, update.name, update.path) {
+                    if error.is_none() {
+                        error = Some(format!("Source update failed: {}", err));
+                    }
+                }
+            }
+
+            for delete in source_deletes {
+                if let Err(err) = client.delete_source(delete.id) {
+                    if error.is_none() {
+                        error = Some(format!("Source delete failed: {}", err));
+                    }
+                }
+            }
+
+            if let Some(source_id) = source_touch {
+                if let Err(err) = client.touch_source(source_id) {
+                    if error.is_none() {
+                        error = Some(format!("Source touch failed: {}", err));
+                    }
+                }
+            }
+
+            for write in tag_writes {
+                if let Err(err) = client.apply_tag(
+                    write.workspace_id,
+                    write.file_id,
+                    write.tag,
+                    write.tag_source,
+                    write.rule_id,
+                ) {
+                    if error.is_none() {
+                        error = Some(format!("Tag write failed: {}", err));
+                    }
+                }
+            }
+
+            for write in rule_writes {
+                if let Err(err) =
+                    client.create_rule(write.id, write.workspace_id, write.pattern, write.tag)
+                {
+                    if error.is_none() {
+                        error = Some(format!("Rule create failed: {}", err));
+                    }
+                }
+            }
+
+            for update in rule_updates {
+                if let Err(err) =
+                    client.update_rule_enabled(update.id, update.workspace_id, update.enabled)
+                {
+                    if error.is_none() {
+                        error = Some(format!("Rule update failed: {}", err));
+                    }
+                }
+            }
+
+            for delete in rule_deletes {
+                if let Err(err) = client.delete_rule(delete.id, delete.workspace_id) {
+                    if error.is_none() {
+                        error = Some(format!("Rule delete failed: {}", err));
+                    }
+                }
+            }
+
+            let _ = tx.send(ControlWriteResult {
+                sources_changed,
+                error,
+            });
+        });
+    }
+
     /// Load tagging rules for the Rules Manager dialog
     fn load_rules_for_manager(&mut self) {
         let workspace_id = match self.active_workspace_id() {
@@ -11777,6 +12572,42 @@ impl App {
                 return;
             }
         };
+
+        if self.control_connected {
+            let control_addr = match self.control_addr.clone() {
+                Some(addr) => addr,
+                None => return,
+            };
+            let client = match ControlClient::connect_with_timeout(
+                &control_addr,
+                Duration::from_millis(500),
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    self.discover
+                        .status_message
+                        .replace((format!("Rules load failed: {}", err), true));
+                    return;
+                }
+            };
+            match client.list_rules(workspace_id) {
+                Ok(rules) => {
+                    self.discover.rules =
+                        rules.into_iter().map(RuleInfo::from_control).collect();
+                    if self.discover.selected_rule >= self.discover.rules.len()
+                        && !self.discover.rules.is_empty()
+                    {
+                        self.discover.selected_rule = 0;
+                    }
+                }
+                Err(err) => {
+                    self.discover
+                        .status_message
+                        .replace((format!("Rules load failed: {}", err), true));
+                }
+            }
+            return;
+        }
 
         let conn = match self.open_db_readonly() {
             Ok(Some(conn)) => conn,
@@ -12274,21 +13105,32 @@ impl App {
         }
 
         // Call backend to persist the approval
-        let (_, db_path) = self.resolve_db_target();
         let approval_id_owned = approval_id.to_string();
-
-        std::thread::spawn(move || {
-            if let Ok(conn) = casparian_db::DbConnection::open_duckdb(&db_path) {
-                let storage = ApiStorage::new(conn);
-                if let Err(e) = storage.init_schema() {
-                    tracing::error!("Failed to init schema for approval: {}", e);
-                    return;
-                }
-                if let Err(e) = storage.approve(&approval_id_owned, None) {
-                    tracing::error!("Failed to approve {}: {}", approval_id_owned, e);
-                }
+        if self.control_connected {
+            if let Some(control_addr) = self.control_addr.clone() {
+                std::thread::spawn(move || {
+                    if let Ok(client) =
+                        ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(500))
+                    {
+                        let _ = client.approve(&approval_id_owned);
+                    }
+                });
             }
-        });
+        } else {
+            let (backend, db_path) = self.resolve_db_target();
+            std::thread::spawn(move || {
+                if let Ok(Some(conn)) = App::open_db_write_with(backend, &db_path) {
+                    let storage = ApiStorage::new(conn);
+                    if let Err(e) = storage.init_schema() {
+                        tracing::error!("Failed to init schema for approval: {}", e);
+                        return;
+                    }
+                    if let Err(e) = storage.approve(&approval_id_owned, None) {
+                        tracing::error!("Failed to approve {}: {}", approval_id_owned, e);
+                    }
+                }
+            });
+        }
 
         // Mark approvals as needing refresh to pick up any job_id changes
         self.approvals_state.approvals_loaded = false;
@@ -12307,22 +13149,34 @@ impl App {
         }
 
         // Call backend to persist the rejection
-        let (_, db_path) = self.resolve_db_target();
         let approval_id_owned = approval_id.to_string();
         let reason_owned = reason.clone();
-
-        std::thread::spawn(move || {
-            if let Ok(conn) = casparian_db::DbConnection::open_duckdb(&db_path) {
-                let storage = ApiStorage::new(conn);
-                if let Err(e) = storage.init_schema() {
-                    tracing::error!("Failed to init schema for rejection: {}", e);
-                    return;
-                }
-                if let Err(e) = storage.reject(&approval_id_owned, None, reason_owned.as_deref()) {
-                    tracing::error!("Failed to reject {}: {}", approval_id_owned, e);
-                }
+        if self.control_connected {
+            if let Some(control_addr) = self.control_addr.clone() {
+                std::thread::spawn(move || {
+                    if let Ok(client) =
+                        ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(500))
+                    {
+                        let reason = reason_owned.as_deref().unwrap_or("");
+                        let _ = client.reject(&approval_id_owned, reason);
+                    }
+                });
             }
-        });
+        } else {
+            let (backend, db_path) = self.resolve_db_target();
+            std::thread::spawn(move || {
+                if let Ok(Some(conn)) = App::open_db_write_with(backend, &db_path) {
+                    let storage = ApiStorage::new(conn);
+                    if let Err(e) = storage.init_schema() {
+                        tracing::error!("Failed to init schema for rejection: {}", e);
+                        return;
+                    }
+                    if let Err(e) = storage.reject(&approval_id_owned, None, reason_owned.as_deref()) {
+                        tracing::error!("Failed to reject {}: {}", approval_id_owned, e);
+                    }
+                }
+            });
+        }
 
         // Mark approvals as needing refresh
         self.approvals_state.approvals_loaded = false;
@@ -12483,9 +13337,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Esc => {
-                self.set_mode(TuiMode::Home);
-            }
+            KeyCode::Esc => {}
             _ => {}
         }
     }
@@ -13026,7 +13878,7 @@ impl App {
             }
             // Jump to Jobs view
             KeyCode::Char('j') => {
-                self.navigate_to_mode(TuiMode::Jobs);
+                self.set_run_tab(RunTab::Jobs);
             }
             // Jump to Query view with a template
             KeyCode::Char('q') => {
@@ -13045,7 +13897,7 @@ impl App {
             }
             // Jump to Discover view
             KeyCode::Char('d') => {
-                self.navigate_to_mode(TuiMode::Discover);
+                self.set_ingest_tab(IngestTab::Select);
             }
             // Back to session list
             KeyCode::Esc => {
@@ -13144,7 +13996,7 @@ impl App {
             KeyCode::Char('j') => {
                 if let Some(job_id) = self.triage_selected_job_id() {
                     self.select_job_by_id(job_id);
-                    self.navigate_to_mode(TuiMode::Jobs);
+                    self.set_run_tab(RunTab::Jobs);
                 }
             }
             KeyCode::Char('y') => {
@@ -13274,7 +14126,7 @@ impl App {
         self.triage_state.selected_index = 0;
         self.triage_state.loaded = false;
         self.triage_state.status_message = None;
-        self.navigate_to_mode(TuiMode::Triage);
+        self.set_review_tab(ReviewTab::Triage);
     }
 
     fn handle_catalog_key(&mut self, key: KeyEvent) {
@@ -13325,7 +14177,7 @@ impl App {
         self.catalog_state.selected_index = 0;
         self.catalog_state.loaded = false;
         self.catalog_state.status_message = None;
-        self.navigate_to_mode(TuiMode::Catalog);
+        self.set_run_tab(RunTab::Outputs);
     }
 
     /// Periodic tick for updates
@@ -13344,6 +14196,29 @@ impl App {
 
         // Persist any queued writes regardless of current view.
         self.persist_pending_writes();
+
+        if let Some(ref mut rx) = self.pending_control_writes {
+            match rx.try_recv() {
+                Ok(result) => {
+                    if let Some(err) = result.error {
+                        self.discover
+                            .status_message
+                            .replace((err, true));
+                    }
+                    if result.sources_changed {
+                        self.discover.sources_loaded = false;
+                        self.pending_sources_load = None;
+                        self.home.stats_loaded = false;
+                        self.pending_stats_load = None;
+                    }
+                    self.pending_control_writes = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_control_writes = None;
+                }
+            }
+        }
 
         // Preload sources on startup (any mode) so they're ready when user goes to Discover
         // This prevents "no sources" on first open
@@ -13407,7 +14282,8 @@ impl App {
                             builder.source_id = Some(source_id);
                         }
                     }
-                    if self.mode == TuiMode::Discover
+                    if self.mode == TuiMode::Ingest
+                        && self.ingest_tab != IngestTab::Sources
                         && self.discover.selected_source_id.is_none()
                         && matches!(
                             self.discover.view_state,
@@ -13437,11 +14313,11 @@ impl App {
             }
         }
 
-        // Jobs/Home: Trigger load on first visit, poll while in Jobs view
-        if matches!(self.mode, TuiMode::Jobs | TuiMode::Home) {
-            const JOBS_POLL_INTERVAL_MS: u64 = 2000; // Poll every 2 seconds when in Jobs view
+        // Jobs/Home: Trigger load on first visit, poll while in Run view
+        if matches!(self.mode, TuiMode::Run | TuiMode::Home) {
+            const JOBS_POLL_INTERVAL_MS: u64 = 2000; // Poll every 2 seconds when in Run view
 
-            let should_load = if self.mode == TuiMode::Jobs {
+            let should_load = if self.mode == TuiMode::Run {
                 if !self.jobs_state.jobs_loaded {
                     true
                 } else if let Some(last_poll) = self.last_jobs_poll {
@@ -13490,8 +14366,9 @@ impl App {
             }
         }
 
-        // Approvals: Load when entering Approvals mode or when refresh requested
-        if self.mode == TuiMode::Approvals
+        // Approvals: Load when entering Review/Approvals tab or when refresh requested
+        if self.mode == TuiMode::Review
+            && self.review_tab == ReviewTab::Approvals
             && !self.approvals_state.approvals_loaded
             && self.pending_approvals_load.is_none()
         {
@@ -13523,23 +14400,26 @@ impl App {
             }
         }
 
-        // Sessions: Load when entering Sessions mode or when refresh requested
-        if self.mode == TuiMode::Sessions
+        // Sessions: Load when entering Review/Sessions tab or when refresh requested
+        if self.mode == TuiMode::Review
+            && self.review_tab == ReviewTab::Sessions
             && !self.sessions_state.sessions_loaded
             && self.pending_sessions_load.is_none()
         {
             self.start_sessions_load();
         }
 
-        // Triage: Load when entering Triage mode or when refresh requested
-        if self.mode == TuiMode::Triage
+        // Triage: Load when entering Review/Triage tab or when refresh requested
+        if self.mode == TuiMode::Review
+            && self.review_tab == ReviewTab::Triage
             && !self.triage_state.loaded
             && self.pending_triage_load.is_none()
         {
             self.start_triage_load();
         }
 
-        if self.mode == TuiMode::Catalog
+        if self.mode == TuiMode::Run
+            && self.run_tab == RunTab::Outputs
             && !self.catalog_state.loaded
             && self.pending_catalog_load.is_none()
         {
@@ -14080,8 +14960,10 @@ impl App {
             }
         }
 
-        // Load Scout data if in Discover mode (but NOT while scanning - don't block progress updates)
-        if self.mode == TuiMode::Discover && self.discover.view_state != DiscoverViewState::Scanning
+        // Load Scout data if in Ingest (non-Sources) (but NOT while scanning - don't block progress updates)
+        if self.mode == TuiMode::Ingest
+            && self.ingest_tab != IngestTab::Sources
+            && self.discover.view_state != DiscoverViewState::Scanning
         {
             // Load files for selected source (also reloads tags when source changes)
             // Cache loading is non-blocking to avoid freezing UI on large sources
@@ -14162,11 +15044,12 @@ impl App {
                 match rx.try_recv() {
                     Ok(result) => {
                         match result {
-                            TuiScanResult::Started { job_id } => {
+                            TuiScanResult::Started { job_id, scan_id } => {
                                 // Validation passed, scan is actually starting
+                                self.current_scan_id = scan_id;
                                 self.discover.status_message = Some((
                                     format!(
-                                        "Scan started (Job #{}) - press [3] to view Jobs",
+                                        "Scan started (Job #{}) - press [2] to view Jobs",
                                         job_id
                                     ),
                                     false,
@@ -14211,18 +15094,29 @@ impl App {
                                 let final_file_count = files_persisted;
 
                                 let workspace_id = self.active_workspace_id();
-                                let source_id =
-                                    match (self.open_scout_db_for_writes(), workspace_id) {
-                                        (Some(db), Some(workspace_id)) => {
-                                            match db.get_source_by_path(&workspace_id, &source_path)
-                                            {
-                                                Ok(Some(source)) => Some(source.id),
-                                                Ok(None) => None,
-                                                Err(_) => None,
-                                            }
-                                        }
-                                        _ => None,
-                                    };
+                                let source_id = match workspace_id {
+                                    Some(workspace_id) => {
+                                        let conn = match self.open_db_readonly() {
+                                            Ok(Some(conn)) => Some(conn),
+                                            _ => None,
+                                        };
+                                        conn.and_then(|conn| {
+                                            let row = conn
+                                                .query_optional(
+                                                    "SELECT id FROM scout_sources WHERE workspace_id = ? AND path = ?",
+                                                    &[
+                                                        DbValue::Text(workspace_id.to_string()),
+                                                        DbValue::Text(source_path.clone()),
+                                                    ],
+                                                )
+                                                .ok()
+                                                .flatten();
+                                            row.and_then(|row| row.get::<i64>(0).ok())
+                                                .and_then(|id| SourceId::try_from(id).ok())
+                                        })
+                                    }
+                                    None => None,
+                                };
 
                                 // Trigger sources reload (non-blocking, handled by tick())
                                 self.discover.sources_loaded = false;
@@ -14331,6 +15225,7 @@ impl App {
             }
             if scan_complete {
                 self.current_scan_job_id = None;
+                self.current_scan_id = None;
                 self.scan_cancel_token = None;
             } else {
                 self.pending_scan = Some(rx);
@@ -14373,11 +15268,6 @@ impl App {
         }
 
         // TODO: Poll job status, refresh metrics
-
-        // Load parsers if in ParserBench mode
-        if self.mode == TuiMode::ParserBench && !self.parser_bench.parsers_loaded {
-            self.load_parsers();
-        }
     }
 
     // =========================================================================
@@ -14661,21 +15551,28 @@ mod tests {
         let mut app = App::new(test_args(), None);
         assert!(matches!(app.mode, TuiMode::Home));
 
-        // Key '1' should switch to Discover (per spec)
+        // Key '1' should switch to Ingest
         app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, TuiMode::Discover));
-        app.discover.view_state = DiscoverViewState::Files;
+        assert!(matches!(app.mode, TuiMode::Ingest));
+        assert!(matches!(app.ingest_tab, IngestTab::Select));
 
-        // Key '2' should switch to Parser Bench even from Discover
+        // Key '2' should switch to Run
         app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, TuiMode::ParserBench));
+        assert!(matches!(app.mode, TuiMode::Run));
 
-        // Return Home, then use 'P' to switch to Parser Bench
-        app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, TuiMode::Home));
+        // Key '3' should switch to Review
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, TuiMode::Review));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE));
-        assert!(matches!(app.mode, TuiMode::ParserBench));
+        // Key '4' should switch to Query
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, TuiMode::Query));
+        // Leave query editing so global nav applies.
+        app.query_state.view_state = QueryViewState::ViewingResults;
+
+        // Key '5' should switch to Settings
+        app.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, TuiMode::Settings));
 
         // Key '0' should return to Home (per spec)
         app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE));
@@ -14722,15 +15619,16 @@ mod tests {
     }
 
     #[test]
-    fn test_esc_returns_home_from_jobs() {
+    fn test_esc_does_not_leave_run_jobs() {
         let mut app = App::new(test_args(), None);
-        // Start in Jobs mode
-        app.mode = TuiMode::Jobs;
+        // Start in Run/Jobs tab
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        // Esc returns to Home when no dialog is open
-        assert!(matches!(app.mode, TuiMode::Home));
+        // Esc does not change task when no dialog is open
+        assert!(matches!(app.mode, TuiMode::Run));
     }
 
     #[test]
@@ -14739,7 +15637,7 @@ mod tests {
         let temp_dir = tempfile::TempDir::new().unwrap();
         std::env::set_var("CASPARIAN_HOME", temp_dir.path());
 
-        let db_path = temp_dir.path().join("casparian_flow.duckdb");
+        let db_path = temp_dir.path().join("state.sqlite");
         let db = ScoutDatabase::open(&db_path).unwrap();
         let ws_alpha = db.create_workspace("alpha").unwrap();
         let ws_bravo = db.create_workspace("bravo").unwrap();
@@ -14765,14 +15663,15 @@ mod tests {
     #[test]
     fn test_jobs_pipeline_toggle_is_not_captured_globally() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Jobs;
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
         app.jobs_state.view_state = JobsViewState::JobList;
         app.jobs_state.show_pipeline = false;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
 
         assert!(app.jobs_state.show_pipeline);
-        assert!(matches!(app.mode, TuiMode::Jobs));
+        assert!(matches!(app.mode, TuiMode::Run));
     }
 
     // =========================================================================
@@ -14927,7 +15826,8 @@ mod tests {
     #[test]
     fn test_jobs_navigation_bounds() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Jobs;
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
         app.jobs_state.jobs = create_test_jobs();
         app.jobs_state.selected_index = 0;
 
@@ -14949,7 +15849,8 @@ mod tests {
     #[test]
     fn test_jobs_navigation_respects_filter() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Jobs;
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
         app.jobs_state.jobs = create_test_jobs();
 
         // Filter to show only Pending and Failed (2 jobs total won't work, let's just use Pending)
@@ -14975,7 +15876,8 @@ mod tests {
         use std::time::Instant;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Set up sources (in-memory, no DB)
         app.discover.sources = (0..100)
@@ -15022,7 +15924,8 @@ mod tests {
         use std::time::Instant;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::Files;
 
         // Set up large file list (in-memory)
@@ -15064,7 +15967,8 @@ mod tests {
         use std::time::Instant;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Jobs;
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
 
         // Set up large jobs list (in-memory)
         app.jobs_state.jobs = (0..1000)
@@ -15128,7 +16032,8 @@ mod tests {
         use std::time::Instant;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Set up sources
         app.discover.sources = (0..100)
@@ -15200,7 +16105,8 @@ mod tests {
     #[test]
     fn test_jobs_empty_list_navigation() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Jobs;
+        app.mode = TuiMode::Run;
+        app.run_tab = RunTab::Jobs;
         // Empty jobs list
         app.jobs_state.jobs = vec![];
         app.jobs_state.selected_index = 0;
@@ -15265,7 +16171,8 @@ mod tests {
     #[test]
     fn test_discover_filter_mode() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.filter.is_empty());
@@ -15289,7 +16196,8 @@ mod tests {
     #[test]
     fn test_discover_filter_esc_cancels() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         app.discover.view_state = DiscoverViewState::Filtering;
         app.discover.filter = "test".to_string();
@@ -15299,13 +16207,14 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.filter.is_empty());
         // Still in Discover mode
-        assert!(matches!(app.mode, TuiMode::Discover));
+        assert!(matches!(app.mode, TuiMode::Ingest));
     }
 
     #[test]
     fn test_discover_tag_dialog() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         app.discover.selected = 1; // Select orders.csv
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
@@ -15325,7 +16234,8 @@ mod tests {
     #[test]
     fn test_discover_tag_dialog_esc_cancels() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         app.discover.view_state = DiscoverViewState::Tagging;
         app.discover.tag_input = "partial".to_string();
@@ -15335,13 +16245,14 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.tag_input.is_empty());
         // Still in Discover mode
-        assert!(matches!(app.mode, TuiMode::Discover));
+        assert!(matches!(app.mode, TuiMode::Ingest));
     }
 
     #[test]
     fn test_discover_scan_path_dialog() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
@@ -15359,7 +16270,8 @@ mod tests {
     #[test]
     fn test_discover_scan_path_esc_cancels() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::EnteringPath;
         app.discover.scan_path_input = "/some/path".to_string();
 
@@ -15368,13 +16280,14 @@ mod tests {
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
         assert!(app.discover.scan_path_input.is_empty());
         // Still in Discover mode
-        assert!(matches!(app.mode, TuiMode::Discover));
+        assert!(matches!(app.mode, TuiMode::Ingest));
     }
 
     #[test]
     fn test_discover_bulk_tag_dialog() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
@@ -15388,7 +16301,8 @@ mod tests {
     #[test]
     fn test_discover_bulk_tag_toggle_save_as_rule() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         app.discover.view_state = DiscoverViewState::BulkTagging;
         assert!(!app.discover.bulk_tag_save_as_rule);
@@ -15405,7 +16319,8 @@ mod tests {
     #[test]
     fn test_discover_bulk_tag_esc_cancels() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::BulkTagging;
         app.discover.bulk_tag_input = "batch".to_string();
         app.discover.bulk_tag_save_as_rule = true;
@@ -15416,13 +16331,14 @@ mod tests {
         assert!(app.discover.bulk_tag_input.is_empty());
         assert!(!app.discover.bulk_tag_save_as_rule);
         // Still in Discover mode
-        assert!(matches!(app.mode, TuiMode::Discover));
+        assert!(matches!(app.mode, TuiMode::Ingest));
     }
 
     #[test]
     fn test_discover_create_source_on_directory() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         app.discover.selected = 2; // Select archives directory
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
@@ -15442,7 +16358,8 @@ mod tests {
     #[test]
     fn test_discover_create_source_esc_cancels() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::CreatingSource;
         app.discover.source_name_input = "my_source".to_string();
         app.discover.pending_source_path = Some("/data/archives".to_string());
@@ -15453,13 +16370,14 @@ mod tests {
         assert!(app.discover.source_name_input.is_empty());
         assert!(app.discover.pending_source_path.is_none());
         // Still in Discover mode
-        assert!(matches!(app.mode, TuiMode::Discover));
+        assert!(matches!(app.mode, TuiMode::Ingest));
     }
 
     #[test]
     fn test_discover_esc_no_view_change_when_no_dialog() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         // No dialogs open - view_state should be Files
         assert_eq!(app.discover.view_state, DiscoverViewState::Files);
 
@@ -15471,7 +16389,8 @@ mod tests {
     #[test]
     fn test_discover_navigation_with_files() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
         app.discover.selected = 0;
 
@@ -15495,7 +16414,8 @@ mod tests {
     #[test]
     fn test_discover_filter_glob_pattern() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         // Use realistic absolute paths like real scans produce
         app.discover.files = vec![
             FileInfo {
@@ -15567,7 +16487,8 @@ mod tests {
     #[test]
     fn test_discover_filter_substring_still_works() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.files = create_test_files();
 
         // Simple substring filter (no glob chars)
@@ -15585,7 +16506,8 @@ mod tests {
     #[test]
     fn test_discover_backspace_in_dialogs() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Test backspace in scan path
         app.discover.view_state = DiscoverViewState::EnteringPath;
@@ -15615,7 +16537,8 @@ mod tests {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Create a temp directory with some files
         let temp_dir = TempDir::new().unwrap();
@@ -15648,7 +16571,8 @@ mod tests {
     #[test]
     fn test_scan_invalid_path_shows_error() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Open scan dialog with invalid path
         app.discover.view_state = DiscoverViewState::EnteringPath;
@@ -15682,7 +16606,8 @@ mod tests {
         use tempfile::NamedTempFile;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Create a temp file (not a directory)
         let temp_file = NamedTempFile::new().unwrap();
@@ -15719,7 +16644,8 @@ mod tests {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Create a temp directory
         let temp_dir = TempDir::new().unwrap();
@@ -15761,7 +16687,8 @@ mod tests {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Verify no jobs initially
         assert!(app.jobs_state.jobs.is_empty(), "Should start with no jobs");
@@ -15798,7 +16725,8 @@ mod tests {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Create a temp directory
         let temp_dir = TempDir::new().unwrap();
@@ -15834,7 +16762,8 @@ mod tests {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Create a temp directory with some files
         let temp_dir = TempDir::new().unwrap();
@@ -15877,7 +16806,8 @@ mod tests {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Create a temp directory with some files
         let temp_dir = TempDir::new().unwrap();
@@ -15931,7 +16861,8 @@ mod tests {
         use tempfile::TempDir;
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Create a temp directory with some files
         let temp_dir = TempDir::new().unwrap();
@@ -15989,7 +16920,8 @@ mod tests {
     #[test]
     fn test_scan_home_tilde_expansion() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         // Test ~ expansion - should not fail immediately
         app.discover.view_state = DiscoverViewState::EnteringPath;
@@ -16019,7 +16951,8 @@ mod tests {
     fn test_large_file_list_navigation_performance() {
         // Test that navigating a large file list is O(1) not O(n)
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::Files;
 
         // Create a simulated large file list (100K files)
@@ -16057,7 +16990,8 @@ mod tests {
     #[test]
     fn test_selection_bounds_with_large_list() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::Files;
 
         // Create a large file list
@@ -16177,7 +17111,8 @@ mod tests {
     #[test]
     fn test_filter_with_large_list() {
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::Files;
 
         // Create a large file list with varied filenames
@@ -16276,7 +17211,8 @@ mod tests {
         }
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
         app.discover.view_state = DiscoverViewState::Files;
 
         // Trigger scan
@@ -16325,7 +17261,8 @@ mod tests {
         }
 
         let mut app = App::new(test_args(), None);
-        app.mode = TuiMode::Discover;
+        app.mode = TuiMode::Ingest;
+        app.ingest_tab = IngestTab::Select;
 
         let path = temp_dir.path().to_string_lossy().to_string();
         app.scan_directory(&path);

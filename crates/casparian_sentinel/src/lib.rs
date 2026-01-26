@@ -14,7 +14,10 @@ pub mod db;
 pub mod metrics;
 pub mod sentinel;
 
-pub use control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo, DEFAULT_CONTROL_ADDR};
+pub use control::{
+    ControlRequest, ControlResponse, JobInfo, QueueStatsInfo, ScoutRuleInfo, ScoutScanProgress,
+    ScoutScanStatus, ScoutSourceInfo, ScoutTagCount, ScoutTagStats, ScanState, DEFAULT_CONTROL_ADDR,
+};
 pub use control_client::ControlClient;
 pub use db::api_storage::ApiStorage;
 pub use db::expected_outputs::{ExpectedOutputs, OutputSpec};
@@ -38,12 +41,16 @@ pub struct SentinelArgs {
     )]
     pub bind: String,
 
-    /// Database connection string
+    /// State store URL (sqlite:/... | postgres://... | sqlserver://...)
     #[arg(
         long,
-        default_value_t = casparian_protocol::defaults::DEFAULT_DB_URL.to_string()
+        default_value_t = casparian_protocol::defaults::DEFAULT_STATE_STORE_URL.to_string()
     )]
-    pub database: String,
+    pub state_store: String,
+
+    /// Query catalog path (DuckDB file over Parquet)
+    #[arg(long)]
+    pub query_catalog: Option<std::path::PathBuf>,
 
     /// Maximum number of workers (default 4, hard cap 8)
     #[arg(long, default_value_t = 4)]

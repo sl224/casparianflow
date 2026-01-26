@@ -1,6 +1,6 @@
 //! Perf command - benchmarking helpers for scan throughput.
 
-use crate::cli::config::active_db_path;
+use crate::cli::config::state_store_path;
 use crate::cli::error::HelpfulError;
 use crate::cli::workspace;
 use casparian::scout::scan_path;
@@ -198,7 +198,7 @@ fn run_scan(
     }
     let scan_path = scan_path::canonicalize_scan_path(&expanded_path);
 
-    let db_path = db_override.unwrap_or_else(active_db_path);
+    let db_path = db_override.unwrap_or_else(state_store_path);
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)?;
     }

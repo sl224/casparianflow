@@ -1,6 +1,6 @@
 //! Database-backed storage for MCP jobs and approvals.
 //!
-//! Uses casparian_sentinel's ApiStorage for DuckDB persistence.
+//! Uses casparian_sentinel's ApiStorage for state store persistence.
 //! This replaces the file-based JSON storage for production use.
 
 use anyhow::{Context, Result};
@@ -31,7 +31,7 @@ impl DbJobStore {
         Ok(Self { storage })
     }
 
-    /// Open from a database URL (e.g., "duckdb://~/.casparian_flow/casparian_flow.duckdb").
+    /// Open from a database URL (e.g., "sqlite:~/.casparian_flow/state.sqlite").
     pub fn open(db_url: &str) -> Result<Self> {
         let storage = ApiStorage::open(db_url)?;
         storage.init_schema().context("Failed to init schema")?;

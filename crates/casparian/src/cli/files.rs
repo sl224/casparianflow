@@ -312,7 +312,7 @@ fn find_source<'a>(sources: &'a [Source], input: &str) -> Option<&'a Source> {
 
 /// Get the active database path
 fn get_db_path() -> PathBuf {
-    crate::cli::config::active_db_path()
+    crate::cli::config::state_store_path()
 }
 
 /// Validate status filter

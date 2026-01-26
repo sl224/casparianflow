@@ -26,6 +26,7 @@ use casparian_protocol::http_types::{
     JobProgress as ApiJobProgress, JobResult as ApiJobResult,
 };
 use casparian_protocol::{ApiJobId, JobId, ProcessingStatus};
+use casparian_scout::types::{SourceId, SourceType, TagSource, TaggingRuleId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 use crate::db::{IntentState, Session, SessionId};
@@ -133,6 +134,67 @@ pub enum ControlRequest {
     },
     /// Cancel a session
     CancelSession { session_id: SessionId },
+    // =====================================================================
+    // Scout (Sources / Rules / Tags / Scans)
+    // =====================================================================
+    /// List sources for a workspace
+    ListSources { workspace_id: WorkspaceId },
+    /// Create or update a source
+    UpsertSource { source: ScoutSourceInfo },
+    /// Update a source name/path
+    UpdateSource {
+        source_id: SourceId,
+        name: Option<String>,
+        path: Option<String>,
+    },
+    /// Delete a source
+    DeleteSource { source_id: SourceId },
+    /// Touch source for MRU ordering
+    TouchSource { source_id: SourceId },
+    /// List tagging rules for a workspace
+    ListRules { workspace_id: WorkspaceId },
+    /// Create a tagging rule
+    CreateRule {
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        pattern: String,
+        tag: String,
+    },
+    /// Update a rule (enabled flag)
+    UpdateRuleEnabled {
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        enabled: bool,
+    },
+    /// Delete a rule
+    DeleteRule {
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+    },
+    /// List tags + counts for a workspace/source
+    ListTags {
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+    },
+    /// Apply a tag to a file (manual or rule-based)
+    ApplyTag {
+        workspace_id: WorkspaceId,
+        file_id: i64,
+        tag: String,
+        tag_source: TagSource,
+        rule_id: Option<TaggingRuleId>,
+    },
+    /// Start a filesystem scan
+    StartScan {
+        workspace_id: Option<WorkspaceId>,
+        path: String,
+    },
+    /// Get scan status
+    GetScan { scan_id: String },
+    /// List scans
+    ListScans { limit: Option<usize> },
+    /// Cancel a running scan
+    CancelScan { scan_id: String },
     /// Ping/health check
     Ping,
 }
@@ -171,6 +233,26 @@ pub enum ControlResponse {
     SessionCreated { session_id: SessionId },
     /// Result of session update
     SessionResult { success: bool, message: String },
+    /// List of sources
+    Sources(Vec<ScoutSourceInfo>),
+    /// Source mutation result
+    SourceResult { success: bool, message: String },
+    /// List of rules
+    Rules(Vec<ScoutRuleInfo>),
+    /// Rule mutation result
+    RuleResult { success: bool, message: String },
+    /// Tag stats (counts + totals)
+    TagStats(ScoutTagStats),
+    /// Tag mutation result
+    TagResult { success: bool, message: String },
+    /// Scan started
+    ScanStarted { scan_id: String },
+    /// Scan status
+    ScanStatus(Option<ScoutScanStatus>),
+    /// List of scans
+    Scans(Vec<ScoutScanStatus>),
+    /// Scan mutation result
+    ScanResult { success: bool, message: String },
     /// Pong response
     Pong,
     /// Error response
@@ -203,6 +285,91 @@ pub struct QueueStatsInfo {
     pub failed: i64,
     pub aborted: i64,
     pub total: i64,
+}
+
+// ============================================================================
+// Scout types
+// ============================================================================
+
+/// Source summary for Control API (includes file_count).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutSourceInfo {
+    pub id: SourceId,
+    pub workspace_id: WorkspaceId,
+    pub name: String,
+    pub source_type: SourceType,
+    pub path: String,
+    pub exec_path: Option<String>,
+    pub enabled: bool,
+    pub poll_interval_secs: u64,
+    pub file_count: i64,
+}
+
+/// Tagging rule summary for Control API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutRuleInfo {
+    pub id: TaggingRuleId,
+    pub workspace_id: WorkspaceId,
+    pub pattern: String,
+    pub tag: String,
+    pub priority: i32,
+    pub enabled: bool,
+}
+
+/// Tag stats summary for Control API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutTagStats {
+    pub total_files: i64,
+    pub untagged_files: i64,
+    pub tags: Vec<ScoutTagCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutTagCount {
+    pub tag: String,
+    pub count: i64,
+}
+
+/// Scan lifecycle state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Scan progress snapshot for Control API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutScanProgress {
+    pub dirs_scanned: u64,
+    pub files_found: u64,
+    pub files_persisted: u64,
+    pub current_dir: Option<String>,
+    pub elapsed_ms: u64,
+    pub files_per_sec: f64,
+    pub stalled: bool,
+}
+
+/// Scan status for Control API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutScanStatus {
+    pub scan_id: String,
+    pub workspace_id: WorkspaceId,
+    pub source_path: String,
+    pub source_id: Option<SourceId>,
+    pub state: ScanState,
+    pub progress: Option<ScoutScanProgress>,
+    pub files_persisted: Option<u64>,
+    pub error: Option<String>,
 }
 
 impl ControlResponse {

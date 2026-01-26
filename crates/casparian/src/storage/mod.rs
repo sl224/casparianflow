@@ -5,11 +5,11 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use casparian::storage::DuckDbPipelineStore;
+//! use casparian::storage::PipelineStore;
 //! use std::path::Path;
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     let store = DuckDbPipelineStore::open(Path::new("./data.duckdb"))?;
+//!     let store = PipelineStore::open(Path::new("./state.sqlite"))?;
 //!
 //!     let pipeline = store.get_latest_pipeline("daily_report")?;
 //!     println!("Latest pipeline: {:?}", pipeline);
@@ -17,10 +17,10 @@
 //! }
 //! ```
 
-mod duckdb;
+mod pipeline_store;
 mod types;
 
-pub use duckdb::DuckDbPipelineStore;
+pub use pipeline_store::PipelineStore;
 pub use types::{
     Pipeline, PipelineRun, SelectionFilters, SelectionResolution, SelectionSnapshot, WatermarkField,
 };

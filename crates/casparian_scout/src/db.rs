@@ -13,7 +13,9 @@ use super::types::{
     TaggingRule, TaggingRuleId, UpsertResult, Workspace, WorkspaceId,
 };
 use casparian_ai_types::DraftStatus;
-use casparian_db::{BackendError, DbConnection, DbValue};
+use casparian_db::{DbConnection, DbValue};
+#[cfg(feature = "duckdb")]
+use casparian_db::BackendError;
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::sync::Arc;
@@ -506,13 +508,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_scout_file_tags_workspace_file_tag ON sco
 }
 
 fn column_exists(conn: &DbConnection, table: &str, column: &str) -> Result<bool> {
-    let rows = conn
-        .query_all(
-            "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
-            &[DbValue::from(table), DbValue::from(column)],
-        )
-        ?;
-    Ok(!rows.is_empty())
+    conn.column_exists(table, column)
+        .map_err(ScoutError::Database)
 }
 
 /// Convert milliseconds since epoch to DateTime
@@ -572,16 +569,9 @@ pub struct Database {
 impl Database {
     /// Open or create a database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
-        #[cfg(feature = "duckdb")]
-        let conn = DbConnection::open_duckdb(path)?;
-        #[cfg(not(feature = "duckdb"))]
-        {
-            return Err(super::error::ScoutError::Config(
-                "DuckDB feature not enabled".to_string(),
-            ));
-        }
+        let conn = DbConnection::open_sqlite(path)?;
 
-        let schema_sql = schema_sql(true);
+        let schema_sql = schema_sql(false);
         conn.execute_batch(&schema_sql)?;
         Self::validate_schema(&conn)?;
 
@@ -619,7 +609,7 @@ impl Database {
         } else {
             return Err(ScoutError::Config(format!(
                 "Database schema for 'scout_files' is missing columns: {}. \
-Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and restart.",
+Delete the database (default: ~/.casparian_flow/state.sqlite) and restart.",
                 missing.join(", ")
             )));
         }
@@ -638,7 +628,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
         Err(ScoutError::Config(format!(
             "Database schema for 'scout_sources' is missing columns: {}. \
-Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and restart.",
+Delete the database (default: ~/.casparian_flow/state.sqlite) and restart.",
             source_missing.join(", ")
         )))
     }
@@ -646,9 +636,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// Create an in-memory database (for testing).
     pub fn open_in_memory() -> Result<Self> {
         let temp_dir = Arc::new(TempDir::new()?);
-        let db_path = temp_dir.path().join("scout.duckdb");
-        let conn = DbConnection::open_duckdb(&db_path)?;
-        let schema_sql = schema_sql(true);
+        let db_path = temp_dir.path().join("scout.sqlite");
+        let conn = DbConnection::open_sqlite(&db_path)?;
+        let schema_sql = schema_sql(false);
         conn.execute_batch(&schema_sql)?;
         Self::validate_schema(&conn)?;
         Ok(Self {
@@ -1628,6 +1618,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let stats = self.conn.transaction(move |tx| {
                 let mut stats = BatchUpsertResult::default();
 
+                let existing_by_uid = Self::query_existing_files_by_uid_tx(tx, &source_id, &files)?;
+                Self::apply_rename_updates_tx(tx, &files, &existing_by_uid, now)?;
+
                 // Query existing files to determine new vs changed vs unchanged
                 // Note: This SELECT also needs chunking for large batches
                 let existing = if compute_stats {
@@ -1889,6 +1882,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
         #[cfg(not(feature = "duckdb"))]
         {
+            let _ = compute_stats;
             let _ = tag;
             let _ = files;
             Err(super::error::ScoutError::Config(
@@ -1934,6 +1928,87 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         }
 
         Ok(existing)
+    }
+
+    fn query_existing_files_by_uid_tx(
+        tx: &mut casparian_db::DbTransaction<'_>,
+        source_id: &SourceId,
+        files: &[ScannedFile],
+    ) -> std::result::Result<
+        std::collections::HashMap<String, (String, i64, i64)>,
+        casparian_db::BackendError,
+    > {
+        let mut existing = std::collections::HashMap::with_capacity(files.len());
+
+        const SELECT_CHUNK_SIZE: usize = 500;
+        for chunk in files.chunks(SELECT_CHUNK_SIZE) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let query = format!(
+                "SELECT file_uid, path, size, mtime FROM scout_files WHERE source_id = ? AND file_uid IN ({})",
+                placeholders
+            );
+
+            let mut params = Vec::with_capacity(chunk.len() + 1);
+            params.push(DbValue::from(source_id.as_i64()));
+            for file in chunk {
+                params.push(DbValue::from(file.file_uid.as_str()));
+            }
+
+            let rows = tx.query_all(&query, &params)?;
+            for row in rows {
+                let file_uid: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let size: i64 = row.get(2)?;
+                let mtime: i64 = row.get(3)?;
+                existing.insert(file_uid, (path, size, mtime));
+            }
+        }
+
+        Ok(existing)
+    }
+
+    fn apply_rename_updates_tx(
+        tx: &mut casparian_db::DbTransaction<'_>,
+        files: &[ScannedFile],
+        existing_by_uid: &std::collections::HashMap<String, (String, i64, i64)>,
+        now: i64,
+    ) -> std::result::Result<(), casparian_db::BackendError> {
+        for file in files {
+            if let Some((existing_path, _, _)) = existing_by_uid.get(file.file_uid.as_str()) {
+                if existing_path != &file.path {
+                    tx.execute(
+                        r#"
+                        UPDATE scout_files SET
+                            workspace_id = ?,
+                            path = ?,
+                            rel_path = ?,
+                            parent_path = ?,
+                            name = ?,
+                            extension = ?,
+                            is_dir = ?,
+                            file_uid = ?,
+                            last_seen_at = ?
+                        WHERE source_id = ? AND file_uid = ?
+                        "#,
+                        &[
+                            DbValue::from(file.workspace_id.to_string()),
+                            file.path.as_str().into(),
+                            file.rel_path.as_str().into(),
+                            file.parent_path.as_str().into(),
+                            file.name.as_str().into(),
+                            file.extension.as_deref().into(),
+                            (file.is_dir as i64).into(),
+                            DbValue::from(file.file_uid.as_str()),
+                            now.into(),
+                            file.source_id.as_i64().into(),
+                            DbValue::from(file.file_uid.as_str()),
+                        ],
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Bulk insert a chunk of files using multi-row VALUES

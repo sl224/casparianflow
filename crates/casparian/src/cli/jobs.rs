@@ -5,7 +5,7 @@
 use crate::cli::config;
 use crate::cli::error::HelpfulError;
 use crate::cli::output::{format_number_signed, print_table_colored};
-use casparian_db::{DbConnection, DbTimestamp, DbValue};
+use casparian_db::{DbConnection, DbValue};
 use casparian_protocol::{JobId, ProcessingStatus};
 use chrono::SecondsFormat;
 use comfy_table::Color;
@@ -112,7 +112,8 @@ pub fn run(args: JobsArgs) -> anyhow::Result<()> {
 }
 
 fn run_with_db(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
-    let conn = DbConnection::open_duckdb_readonly(db_path).map_err(|e| {
+    let db_url = format!("sqlite:{}", db_path.display());
+    let conn = DbConnection::open_from_url_readonly(&db_url).map_err(|e| {
         HelpfulError::new("Failed to connect to database")
             .with_context(format!("Database: {}", db_path.display()))
             .with_suggestion(format!("Error: {}", e))
@@ -180,7 +181,7 @@ fn run_with_db(args: JobsArgs, db_path: &PathBuf) -> anyhow::Result<()> {
 
 /// Get the database path
 pub fn get_db_path() -> anyhow::Result<PathBuf> {
-    Ok(config::active_db_path())
+    Ok(config::state_store_path())
 }
 
 /// Build status filter from command flags
@@ -220,11 +221,7 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
 /// Get queue statistics
 
 pub(crate) fn table_exists(conn: &DbConnection, table: &str) -> anyhow::Result<bool> {
-    let row = conn.query_optional(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
-        &[DbValue::from(table)],
-    )?;
-    Ok(row.is_some())
+    Ok(conn.table_exists(table)?)
 }
 
 pub(crate) fn column_exists(
@@ -232,13 +229,7 @@ pub(crate) fn column_exists(
     table: &str,
     column: &str,
 ) -> anyhow::Result<bool> {
-    let row = conn
-        .query_optional(
-            "SELECT 1 FROM information_schema.columns WHERE table_schema = 'main' AND table_name = ? AND column_name = ?",
-            &[DbValue::from(table), DbValue::from(column)],
-        )
-        ?;
-    Ok(row.is_some())
+    Ok(conn.column_exists(table, column)?)
 }
 
 fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
@@ -465,8 +456,8 @@ fn get_jobs(
                 plugin_name: row.get(2)?,
                 status,
                 priority: row.get(4)?,
-                claim_time: format_db_timestamp(row.get::<Option<DbTimestamp>>(5).ok().flatten()),
-                end_time: format_db_timestamp(row.get::<Option<DbTimestamp>>(6).ok().flatten()),
+                claim_time: format_db_timestamp(row.get::<Option<i64>>(5).ok().flatten()),
+                end_time: format_db_timestamp(row.get::<Option<i64>>(6).ok().flatten()),
                 error_message: row.get::<Option<String>>(7).ok().flatten(),
                 result_summary: row.get::<Option<String>>(8).ok().flatten(),
                 retry_count: row.get(9)?,
@@ -687,8 +678,9 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
-fn format_db_timestamp(ts: Option<DbTimestamp>) -> Option<String> {
-    ts.map(|value| value.as_chrono().to_rfc3339_opts(SecondsFormat::Secs, true))
+fn format_db_timestamp(ts: Option<i64>) -> Option<String> {
+    ts.and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
 /// Format a datetime string for display

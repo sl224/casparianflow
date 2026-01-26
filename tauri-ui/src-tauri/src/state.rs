@@ -1,7 +1,7 @@
 //! Application state for Tauri commands.
 //!
 //! Stores the database path and creates connections on-demand.
-//! This avoids thread-safety issues with DuckDB's Rc-based connection.
+//! This avoids thread-safety issues with Rc-based connections.
 
 use anyhow::{Context, Result};
 use casparian_db::DbConnection;
@@ -17,9 +17,9 @@ const DEFAULT_CONTROL_ADDR: &str = casparian_protocol::defaults::DEFAULT_CONTROL
 /// Application state shared across Tauri commands.
 ///
 /// Only stores the database path. Connections are created on-demand
-/// because DuckDB's DbConnection uses Rc internally and isn't Send.
+/// because DbConnection uses Rc internally and isn't Send.
 pub struct AppState {
-    /// Path to the DuckDB database file.
+    /// Path to the state store database file.
     pub db_path: String,
     /// Tape recording state (shared across commands).
     tape: SharedTapeState,
@@ -45,13 +45,13 @@ impl AppState {
         // Ensure directory exists
         std::fs::create_dir_all(&db_dir).context("Failed to create database directory")?;
 
-        let db_path = db_dir.join("casparian_flow.duckdb");
+        let db_path = db_dir.join("state.sqlite");
         Ok(db_path.to_string_lossy().to_string())
     }
 
     /// Get the database URL.
     pub fn db_url(&self) -> String {
-        format!("duckdb:{}", self.db_path)
+        format!("sqlite:{}", self.db_path)
     }
 
     /// Open a new API storage connection.
@@ -67,13 +67,13 @@ impl AppState {
 
     /// Open a read-only connection for query operations.
     pub fn open_readonly_connection(&self) -> Result<DbConnection> {
-        DbConnection::open_duckdb_readonly(std::path::Path::new(&self.db_path))
+        DbConnection::open_sqlite_readonly(std::path::Path::new(&self.db_path))
             .context("Failed to open read-only connection")
     }
 
     /// Open a read-write connection for mutation operations (when control API unavailable).
     pub fn open_rw_connection(&self) -> Result<DbConnection> {
-        DbConnection::open_duckdb(std::path::Path::new(&self.db_path))
+        DbConnection::open_sqlite(std::path::Path::new(&self.db_path))
             .context("Failed to open read-write connection")
     }
 

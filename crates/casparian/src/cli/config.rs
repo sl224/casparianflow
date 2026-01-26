@@ -8,16 +8,19 @@ use std::sync::Once;
 
 static CREATE_DIR_WARNED: Once = Once::new();
 
-/// Database backend type
+/// State store backend type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbBackend {
-    /// DuckDB - columnar OLAP (v1 default)
+    /// SQLite - embedded transactional store (local default)
+    Sqlite,
+    /// DuckDB - query catalog backend (local SQL)
     DuckDb,
 }
 
 impl DbBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
+            DbBackend::Sqlite => "sqlite",
             DbBackend::DuckDb => "duckdb",
         }
     }
@@ -31,7 +34,7 @@ pub fn casparian_home() -> PathBuf {
     dirs::home_dir()
         .expect(
             "Could not determine home directory (HOME not set). \
-Set CASPARIAN_HOME or pass --db-path, or export HOME.",
+Set CASPARIAN_HOME or pass --state-store, or export HOME.",
         )
         .join(".casparian_flow")
 }
@@ -43,34 +46,59 @@ pub fn ensure_casparian_home() -> std::io::Result<PathBuf> {
     Ok(home)
 }
 
-/// Get the DuckDB database path: ~/.casparian_flow/casparian_flow.duckdb
-pub fn default_duckdb_path() -> PathBuf {
+/// Get the state store path: ~/.casparian_flow/state.sqlite
+pub fn default_state_store_path() -> PathBuf {
     let home = casparian_home();
     if let Err(err) = std::fs::create_dir_all(&home) {
         CREATE_DIR_WARNED.call_once(|| {
             eprintln!(
-                "Warning: failed to create Casparian home directory {}: {}. Set CASPARIAN_HOME or use --db-path.",
+                "Warning: failed to create Casparian home directory {}: {}. Set CASPARIAN_HOME or use --state-store.",
                 home.display(),
                 err
             );
         });
     }
-    home.join("casparian_flow.duckdb")
+    home.join("state.sqlite")
 }
 
-/// Determine the active database backend.
+/// Get the query catalog path: ~/.casparian_flow/query.duckdb
+pub fn default_query_catalog_path() -> PathBuf {
+    let home = casparian_home();
+    if let Err(err) = std::fs::create_dir_all(&home) {
+        CREATE_DIR_WARNED.call_once(|| {
+            eprintln!(
+                "Warning: failed to create Casparian home directory {}: {}. Set CASPARIAN_HOME or use --query-catalog.",
+                home.display(),
+                err
+            );
+        });
+    }
+    home.join("query.duckdb")
+}
+
+/// Determine the state store backend.
 ///
 /// Priority:
-/// 1. If config.toml specifies `database.backend`, use that
-/// 2. Default to DuckDB when available, otherwise SQLite
+/// 1. If config.toml specifies `state_store.backend`, use that
+/// 2. Default to SQLite for local mode
 pub fn default_db_backend() -> DbBackend {
-    // v1: DuckDB-only
-    DbBackend::DuckDb
+    // pre-v1: SQLite default for state store
+    DbBackend::Sqlite
 }
 
-/// Get the active database path based on detected backend.
-pub fn active_db_path() -> PathBuf {
-    default_duckdb_path()
+/// Get the state store path based on detected backend.
+pub fn state_store_path() -> PathBuf {
+    default_state_store_path()
+}
+
+/// Get the state store URL (sqlite: path).
+pub fn state_store_url() -> String {
+    format!("sqlite:{}", state_store_path().display())
+}
+
+/// Get the query catalog path.
+pub fn query_catalog_path() -> PathBuf {
+    default_query_catalog_path()
 }
 
 /// Get output directory: ~/.casparian_flow/output
@@ -112,8 +140,8 @@ pub struct ConfigArgs {
 pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
     let home = casparian_home();
     let backend = default_db_backend();
-    let active_db = active_db_path();
-    let duckdb_db = default_duckdb_path();
+    let state_store = state_store_path();
+    let query_catalog = default_query_catalog_path();
     let output = output_dir();
     let venvs = venvs_dir();
     let parsers = parsers_dir();
@@ -121,11 +149,15 @@ pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
     if args.json {
         let config = serde_json::json!({
             "home": home.to_string_lossy(),
-            "database": {
+            "state_store": {
                 "backend": backend.as_str(),
-                "active_path": active_db.to_string_lossy(),
-                "duckdb_path": duckdb_db.to_string_lossy(),
-                "duckdb_exists": duckdb_db.exists(),
+                "path": state_store.to_string_lossy(),
+                "exists": state_store.exists(),
+            },
+            "query_catalog": {
+                "backend": DbBackend::DuckDb.as_str(),
+                "path": query_catalog.to_string_lossy(),
+                "exists": query_catalog.exists(),
             },
             "output": {
                 "path": output.to_string_lossy(),
@@ -147,16 +179,17 @@ pub fn run(args: ConfigArgs) -> anyhow::Result<()> {
         println!();
         println!("Home:     {}", home.display());
         println!();
-        println!("Database Backend: {}", backend.as_str());
-        println!("  Active:  {}", active_db.display());
+        println!("State Store Backend: {}", backend.as_str());
         println!(
-            "  DuckDB:  {} ({})",
-            duckdb_db.display(),
-            if duckdb_db.exists() {
-                "exists"
-            } else {
-                "not found"
-            }
+            "  Path:   {} ({})",
+            state_store.display(),
+            if state_store.exists() { "exists" } else { "not found" }
+        );
+        println!();
+        println!(
+            "Query Catalog (DuckDB): {} ({})",
+            query_catalog.display(),
+            if query_catalog.exists() { "exists" } else { "not found" }
         );
         println!();
         println!("Output:   {}", output.display());

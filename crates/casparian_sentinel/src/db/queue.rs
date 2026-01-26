@@ -3,7 +3,8 @@
 //! Uses DbConnection for all queries to keep DB backend swappable.
 
 use anyhow::{Context, Result};
-use casparian_db::{BackendError, DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
+use casparian_db::{BackendError, DbConnection, DbValue, UnifiedDbRow};
+use chrono::Utc;
 use casparian_protocol::types::{ObservedDataType, SchemaMismatch};
 use casparian_protocol::{JobId, JobStatus, PluginStatus, ProcessingStatus, RuntimeKind, SinkMode};
 use serde::Serialize;
@@ -69,8 +70,8 @@ pub struct JobQueue {
     conn: DbConnection,
 }
 
-fn now_ts() -> DbTimestamp {
-    DbTimestamp::now()
+fn now_millis() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
 fn column_list(columns: &[&str]) -> String {
@@ -123,11 +124,11 @@ impl JobQueue {
             .map(|mode| format!("'{}'", mode.as_str()))
             .collect::<Vec<_>>()
             .join(",");
-        let create_sql = format!(
-            r#"
-            CREATE SEQUENCE IF NOT EXISTS seq_cf_processing_queue;
+        let create_sql = if self.conn.backend_name() == "SQLite" {
+            format!(
+                r#"
             CREATE TABLE IF NOT EXISTS cf_processing_queue (
-                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_processing_queue'),
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_id BIGINT NOT NULL,
                 pipeline_run_id TEXT,
                 plugin_name TEXT NOT NULL,
@@ -143,9 +144,9 @@ impl JobQueue {
                 priority INTEGER DEFAULT 0,
                 worker_host TEXT,
                 worker_pid INTEGER,
-                claim_time TIMESTAMP,
-                scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                end_time TIMESTAMP,
+                claim_time INTEGER,
+                scheduled_at INTEGER NOT NULL,
+                end_time INTEGER,
                 result_summary TEXT,
                 error_message TEXT,
                 retry_count INTEGER DEFAULT 0,
@@ -172,17 +173,79 @@ impl JobQueue {
                     CHECK (status IN ('success', 'partial_success', 'no_data')),
                 rows BIGINT NOT NULL DEFAULT 0,
                 job_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS ix_materializations_file ON cf_output_materializations(file_id);
             CREATE INDEX IF NOT EXISTS ix_materializations_plugin ON cf_output_materializations(plugin_name);
             CREATE INDEX IF NOT EXISTS ix_materializations_target ON cf_output_materializations(output_target_key);
         "#,
-            default_status = ProcessingStatus::Queued.as_str(),
-            status_values = status_values,
-            completion_values = completion_values,
-            sink_mode_values = sink_mode_values
-        );
+                default_status = ProcessingStatus::Queued.as_str(),
+                status_values = status_values,
+                completion_values = completion_values,
+                sink_mode_values = sink_mode_values
+            )
+        } else {
+            format!(
+                r#"
+            CREATE SEQUENCE IF NOT EXISTS seq_cf_processing_queue;
+            CREATE TABLE IF NOT EXISTS cf_processing_queue (
+                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_processing_queue'),
+                file_id BIGINT NOT NULL,
+                pipeline_run_id TEXT,
+                plugin_name TEXT NOT NULL,
+                input_file TEXT,
+                config_overrides TEXT,
+                parser_version TEXT,
+                parser_fingerprint TEXT,
+                sink_config_json TEXT,
+                status TEXT NOT NULL DEFAULT '{default_status}'
+                    CHECK (status IN ({status_values})),
+                completion_status TEXT DEFAULT NULL
+                    CHECK (completion_status IS NULL OR completion_status IN ({completion_values})),
+                priority INTEGER DEFAULT 0,
+                worker_host TEXT,
+                worker_pid INTEGER,
+                claim_time BIGINT,
+                scheduled_at BIGINT NOT NULL,
+                end_time BIGINT,
+                result_summary TEXT,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                quarantine_rows BIGINT DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS ix_queue_pop ON cf_processing_queue(status, priority, id);
+
+            CREATE TABLE IF NOT EXISTS cf_output_materializations (
+                materialization_key TEXT PRIMARY KEY,
+                output_target_key TEXT NOT NULL,
+                file_id BIGINT NOT NULL,
+                file_mtime BIGINT NOT NULL,
+                file_size BIGINT NOT NULL,
+                plugin_name TEXT NOT NULL,
+                parser_version TEXT,
+                parser_fingerprint TEXT,
+                output_name TEXT NOT NULL,
+                sink_uri TEXT NOT NULL,
+                sink_mode TEXT NOT NULL
+                    CHECK (sink_mode IN ({sink_mode_values})),
+                table_name TEXT,
+                schema_hash TEXT,
+                status TEXT NOT NULL
+                    CHECK (status IN ('success', 'partial_success', 'no_data')),
+                rows BIGINT NOT NULL DEFAULT 0,
+                job_id BIGINT,
+                created_at BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_materializations_file ON cf_output_materializations(file_id);
+            CREATE INDEX IF NOT EXISTS ix_materializations_plugin ON cf_output_materializations(plugin_name);
+            CREATE INDEX IF NOT EXISTS ix_materializations_target ON cf_output_materializations(output_target_key);
+        "#,
+                default_status = ProcessingStatus::Queued.as_str(),
+                status_values = status_values,
+                completion_values = completion_values,
+                sink_mode_values = sink_mode_values
+            )
+        };
 
         self.conn
             .execute_batch(&create_sql)
@@ -217,11 +280,11 @@ impl JobQueue {
             .map(|mode| format!("'{}'", mode.as_str()))
             .collect::<Vec<_>>()
             .join(",");
-        let create_sql = format!(
-            r#"
-            CREATE SEQUENCE IF NOT EXISTS seq_cf_plugin_manifest;
+        let create_sql = if self.conn.backend_name() == "SQLite" {
+            format!(
+                r#"
             CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
-                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_plugin_manifest'),
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 plugin_name TEXT NOT NULL,
                 version TEXT NOT NULL,
                 runtime_kind TEXT NOT NULL CHECK (runtime_kind IN ({runtime_kind_values})),
@@ -233,8 +296,8 @@ impl JobQueue {
                 status TEXT NOT NULL DEFAULT '{default_status}'
                     CHECK (status IN ({plugin_status_values})),
                 validation_error TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                deployed_at TIMESTAMP,
+                created_at INTEGER NOT NULL,
+                deployed_at INTEGER,
                 env_hash TEXT NOT NULL,
                 artifact_hash TEXT NOT NULL,
                 manifest_json TEXT NOT NULL,
@@ -255,8 +318,70 @@ impl JobQueue {
                 hash TEXT PRIMARY KEY,
                 lockfile_content TEXT NOT NULL,
                 size_mb DOUBLE,
-                last_used TIMESTAMP,
-                created_at TIMESTAMP
+                last_used INTEGER,
+                created_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS cf_topic_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plugin_name TEXT NOT NULL,
+                topic_name TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'append' CHECK (mode IN ({sink_mode_values})),
+                quarantine_allow BOOLEAN,
+                quarantine_max_pct DOUBLE,
+                quarantine_max_count BIGINT,
+                quarantine_dir TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_topic_lookup ON cf_topic_config(plugin_name, topic_name);
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_topic_unique ON cf_topic_config(plugin_name, topic_name);
+        "#,
+                default_status = PluginStatus::Pending.as_str(),
+                plugin_status_values = plugin_status_values,
+                runtime_kind_values = runtime_kind_values,
+                sink_mode_values = sink_mode_values
+            )
+        } else {
+            format!(
+                r#"
+            CREATE SEQUENCE IF NOT EXISTS seq_cf_plugin_manifest;
+            CREATE TABLE IF NOT EXISTS cf_plugin_manifest (
+                id BIGINT PRIMARY KEY DEFAULT nextval('seq_cf_plugin_manifest'),
+                plugin_name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                runtime_kind TEXT NOT NULL CHECK (runtime_kind IN ({runtime_kind_values})),
+                entrypoint TEXT NOT NULL,
+                platform_os TEXT,
+                platform_arch TEXT,
+                source_code TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '{default_status}'
+                    CHECK (status IN ({plugin_status_values})),
+                validation_error TEXT,
+                created_at BIGINT NOT NULL,
+                deployed_at BIGINT,
+                env_hash TEXT NOT NULL,
+                artifact_hash TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                schema_artifacts_json TEXT NOT NULL,
+                outputs_json TEXT NOT NULL,
+                publisher_name TEXT,
+                publisher_email TEXT,
+                azure_oid TEXT,
+                system_requirements TEXT,
+                signature_verified BOOLEAN DEFAULT false,
+                signer_id TEXT,
+                UNIQUE(plugin_name, version, runtime_kind, platform_os, platform_arch),
+                UNIQUE(source_hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS cf_plugin_environment (
+                hash TEXT PRIMARY KEY,
+                lockfile_content TEXT NOT NULL,
+                size_mb DOUBLE,
+                last_used BIGINT,
+                created_at BIGINT
             );
 
             CREATE SEQUENCE IF NOT EXISTS seq_cf_topic_config;
@@ -274,11 +399,12 @@ impl JobQueue {
             CREATE INDEX IF NOT EXISTS ix_topic_lookup ON cf_topic_config(plugin_name, topic_name);
             CREATE UNIQUE INDEX IF NOT EXISTS ux_topic_unique ON cf_topic_config(plugin_name, topic_name);
         "#,
-            default_status = PluginStatus::Pending.as_str(),
-            plugin_status_values = plugin_status_values,
-            runtime_kind_values = runtime_kind_values,
-            sink_mode_values = sink_mode_values
-        );
+                default_status = PluginStatus::Pending.as_str(),
+                plugin_status_values = plugin_status_values,
+                runtime_kind_values = runtime_kind_values,
+                sink_mode_values = sink_mode_values
+            )
+        };
 
         self.conn
             .execute_batch(&create_sql)
@@ -364,7 +490,7 @@ impl JobQueue {
 
     /// Claim a job by setting status to RUNNING.
     pub fn claim_job(&self, job_id: i64) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn.execute(
             "UPDATE cf_processing_queue SET status = ?, claim_time = ? WHERE id = ?",
             &[
@@ -420,7 +546,7 @@ impl JobQueue {
     /// Peek at the next job without claiming it.
     pub fn peek_job(&self) -> Result<Option<ProcessingJob>> {
         let has_health = self.table_exists("cf_parser_health")?;
-        let now = now_ts();
+        let now = now_millis();
         let (query, params) = if has_health {
             (
                 format!(
@@ -468,7 +594,7 @@ impl JobQueue {
     /// Atomically pop a job from the queue.
     pub fn pop_job(&self) -> Result<Option<ProcessingJob>> {
         let has_health = self.table_exists("cf_parser_health")?;
-        let now = now_ts();
+        let now = now_millis();
         let (query, params) = if has_health {
             (
                 format!(
@@ -529,46 +655,11 @@ impl JobQueue {
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
-        let (query, params) = match self.conn.backend_name() {
-            "DuckDB" => (
-                "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?"
-                    .to_string(),
-                vec![DbValue::from(table), DbValue::from(column)],
-            ),
-            "SQLite" => (
-                format!(
-                    "SELECT 1 FROM pragma_table_info('{}') WHERE name = ?",
-                    table.replace('\'', "''")
-                ),
-                vec![DbValue::from(column)],
-            ),
-            _ => (
-                "SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = ?"
-                    .to_string(),
-                vec![DbValue::from(table), DbValue::from(column)],
-            ),
-        };
-
-        Ok(self.conn.query_optional(&query, &params)?.is_some())
+        Ok(self.conn.column_exists(table, column)?)
     }
 
     fn table_exists(&self, table: &str) -> Result<bool> {
-        let (query, params) = match self.conn.backend_name() {
-            "DuckDB" => (
-                "SELECT 1 FROM information_schema.tables WHERE table_name = ?".to_string(),
-                vec![DbValue::from(table)],
-            ),
-            "SQLite" => (
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?".to_string(),
-                vec![DbValue::from(table)],
-            ),
-            _ => (
-                "SELECT 1 FROM information_schema.tables WHERE table_name = ?".to_string(),
-                vec![DbValue::from(table)],
-            ),
-        };
-
-        Ok(self.conn.query_optional(&query, &params)?.is_some())
+        Ok(self.conn.table_exists(table)?)
     }
 
     fn require_columns(&self, table: &str, columns: &[&str]) -> Result<()> {
@@ -585,7 +676,7 @@ impl JobQueue {
 
         anyhow::bail!(
             "Database schema for '{}' is missing columns: {}. \
-Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and restart.",
+Delete the state store (default: ~/.casparian_flow/state.sqlite) and restart.",
             table,
             missing.join(", ")
         );
@@ -601,7 +692,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         summary: &str,
         quarantine_rows: Option<i64>,
     ) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         if let Some(rows) = quarantine_rows {
             self.conn.execute(
                 r#"
@@ -715,9 +806,10 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     schema_hash,
                     status,
                     rows,
-                    job_id
+                    job_id,
+                    created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(materialization_key) DO NOTHING
                 "#,
             &[
@@ -749,6 +841,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 DbValue::from(record.status.as_str()),
                 DbValue::from(record.rows),
                 DbValue::from(record.job_id),
+                DbValue::from(now_millis()),
             ],
         )?;
         Ok(())
@@ -758,7 +851,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     ///
     /// `completion_status` should be one of: FAILED, REJECTED
     pub fn fail_job(&self, job_id: i64, completion_status: &str, error: &str) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn.execute(
             r#"
                 UPDATE cf_processing_queue
@@ -781,7 +874,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
 
     /// Mark job as aborted with outcome details.
     pub fn abort_job(&self, job_id: i64, error: &str) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn.execute(
             r#"
                 UPDATE cf_processing_queue
@@ -838,7 +931,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                 "#,
             &[
                 DbValue::from(ProcessingStatus::Queued.as_str()),
-                DbValue::from(now_ts()),
+                DbValue::from(now_millis()),
                 DbValue::from(job_id),
             ],
         )?;
@@ -850,7 +943,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     pub fn defer_job(
         &self,
         job_id: i64,
-        scheduled_at: DbTimestamp,
+        scheduled_at: i64,
         reason: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
@@ -883,7 +976,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         job_id: i64,
         next_retry_count: i32,
         error: &str,
-        scheduled_at: DbTimestamp,
+        scheduled_at: i64,
     ) -> Result<()> {
         self.conn.execute(
             r#"
@@ -953,7 +1046,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     plugin_name TEXT NOT NULL,
                     error_message TEXT,
                     retry_count INTEGER NOT NULL,
-                    moved_at TIMESTAMP NOT NULL,
+                    moved_at BIGINT NOT NULL,
                     reason TEXT
                 );
 
@@ -963,9 +1056,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     successful_executions INTEGER NOT NULL DEFAULT 0,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     last_failure_reason TEXT,
-                    paused_at TIMESTAMP,
-                    created_at TIMESTAMP NOT NULL,
-                    updated_at TIMESTAMP NOT NULL
+                    paused_at BIGINT,
+                    created_at BIGINT NOT NULL,
+                    updated_at BIGINT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cf_quarantine (
@@ -974,7 +1067,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     row_index BIGINT NOT NULL,
                     error_reason TEXT NOT NULL,
                     raw_data BLOB,
-                    created_at TIMESTAMP NOT NULL
+                    created_at BIGINT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cf_job_schema_mismatch (
@@ -988,7 +1081,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     actual_type TEXT,
                     expected_index INTEGER,
                     actual_index INTEGER,
-                    created_at TIMESTAMP NOT NULL
+                    created_at BIGINT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS ix_schema_mismatch_job
@@ -1004,7 +1097,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     plugin_name TEXT NOT NULL,
                     error_message TEXT,
                     retry_count INTEGER NOT NULL,
-                    moved_at TIMESTAMP NOT NULL,
+                    moved_at INTEGER NOT NULL,
                     reason TEXT
                 );
 
@@ -1014,9 +1107,9 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     successful_executions INTEGER NOT NULL DEFAULT 0,
                     consecutive_failures INTEGER NOT NULL DEFAULT 0,
                     last_failure_reason TEXT,
-                    paused_at TIMESTAMP,
-                    created_at TIMESTAMP NOT NULL,
-                    updated_at TIMESTAMP NOT NULL
+                    paused_at INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cf_quarantine (
@@ -1025,7 +1118,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     row_index INTEGER NOT NULL,
                     error_reason TEXT NOT NULL,
                     raw_data BLOB,
-                    created_at TIMESTAMP NOT NULL
+                    created_at INTEGER NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cf_job_schema_mismatch (
@@ -1039,7 +1132,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
                     actual_type TEXT,
                     expected_index INTEGER,
                     actual_index INTEGER,
-                    created_at TIMESTAMP NOT NULL
+                    created_at INTEGER NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS ix_schema_mismatch_job
@@ -1055,7 +1148,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     pub fn record_schema_mismatch(&self, job_id: i64, mismatch: &SchemaMismatch) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
 
         for name in &mismatch.missing_columns {
             self.insert_schema_mismatch_row(
@@ -1140,7 +1233,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         actual_type: Option<&str>,
         expected_index: Option<i64>,
         actual_index: Option<i64>,
-        created_at: DbTimestamp,
+        created_at: i64,
     ) -> Result<()> {
         self.conn
             .execute(
@@ -1190,7 +1283,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         let plugin_name: String = row.get_by_name("plugin_name")?;
         let retry_count: i32 = row.get_by_name("retry_count")?;
 
-        let now = now_ts();
+        let now = now_millis();
         let full_error = format!("{}: {}", reason.as_str(), error);
         self.conn
             .execute(
@@ -1223,7 +1316,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             &[
                 DbValue::from(ProcessingStatus::Failed.as_str()),
                 DbValue::from(JobStatus::Failed.as_str()),
-                DbValue::from(now_ts()),
+                DbValue::from(now_millis()),
                 DbValue::from(full_error.as_str()),
                 DbValue::from(job_id),
             ],
@@ -1280,14 +1373,15 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             .conn
             .query_one(
                 r#"
-                INSERT INTO cf_processing_queue (file_id, plugin_name, status)
-                VALUES (?, ?, ?)
+                INSERT INTO cf_processing_queue (file_id, plugin_name, status, scheduled_at)
+                VALUES (?, ?, ?, ?)
                 RETURNING id
                 "#,
                 &[
                     DbValue::from(file_id.unwrap_or_default()),
                     DbValue::from(plugin_name),
                     DbValue::from(ProcessingStatus::Queued.as_str()),
+                    DbValue::from(now_millis()),
                 ],
             )?
             .get_by_name::<i64>("id")?;
@@ -1308,7 +1402,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     pub fn record_parser_success(&self, parser_name: &str) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn
             .execute(
                 r#"
@@ -1332,7 +1426,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     pub fn record_parser_failure(&self, parser_name: &str, reason: &str) -> Result<i32> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn
             .execute(
                 r#"
@@ -1360,7 +1454,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     pub fn pause_parser(&self, parser_name: &str) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn.execute(
             "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
             &[
@@ -1373,7 +1467,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     }
 
     pub fn resume_parser(&self, parser_name: &str) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn.execute(
             "UPDATE cf_parser_health SET paused_at = NULL, updated_at = ? WHERE parser_name = ?",
             &[DbValue::from(now), DbValue::from(parser_name)],
@@ -1387,7 +1481,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
             &[DbValue::from(parser_name)],
         )?;
         Ok(row
-            .and_then(|r| r.get_by_name::<Option<DbTimestamp>>("paused_at").ok())
+            .and_then(|r| r.get_by_name::<Option<i64>>("paused_at").ok())
             .flatten()
             .is_some())
     }
@@ -1424,7 +1518,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
         error: &str,
         raw: Option<&[u8]>,
     ) -> Result<()> {
-        let now = now_ts();
+        let now = now_millis();
         self.conn.execute(
             r#"
                 INSERT INTO cf_quarantine (job_id, row_index, error_reason, raw_data, created_at)
@@ -1574,7 +1668,7 @@ Delete the database (default: ~/.casparian_flow/casparian_flow.duckdb) and resta
     /// was already in a terminal state.
     pub fn cancel_job(&self, job_id: JobId) -> Result<bool> {
         let job_id_i64 = job_id.to_i64().context("job_id exceeds i64::MAX")?;
-        let now = now_ts();
+        let now = now_millis();
 
         // Only cancel jobs that are in cancellable states
         let affected = self.conn.execute(
@@ -1658,9 +1752,9 @@ pub struct Job {
     /// Number of retry attempts
     pub retry_count: i32,
     /// When the job was created/scheduled
-    pub created_at: Option<DbTimestamp>,
+    pub created_at: Option<i64>,
     /// When the job was last updated (claimed, completed, etc.)
-    pub updated_at: Option<DbTimestamp>,
+    pub updated_at: Option<i64>,
     /// Error message if job failed
     pub error_message: Option<String>,
     /// Completion outcome (SUCCESS, FAILED, PARTIAL_SUCCESS, etc.)
@@ -1709,7 +1803,7 @@ impl Job {
             retry_count: row.get_by_name("retry_count")?,
             created_at: row.get_by_name("scheduled_at")?,
             updated_at: row.get_by_name("end_time").ok().flatten().or_else(|| {
-                row.get_by_name::<Option<DbTimestamp>>("claim_time")
+                row.get_by_name::<Option<i64>>("claim_time")
                     .ok()
                     .flatten()
             }),
@@ -1740,8 +1834,8 @@ mod tests {
             .conn
             .query_scalar::<i64>(
                 r#"
-                INSERT INTO cf_processing_queue (file_id, plugin_name, status, priority)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO cf_processing_queue (file_id, plugin_name, status, priority, scheduled_at)
+                VALUES (?, ?, ?, ?, ?)
                 RETURNING id
                 "#,
                 &[
@@ -1749,6 +1843,7 @@ mod tests {
                     DbValue::from(plugin_name),
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                     DbValue::from(0i32),
+                    DbValue::from(now_millis()),
                 ],
             )
             .unwrap()

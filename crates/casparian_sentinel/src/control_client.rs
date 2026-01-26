@@ -2,7 +2,9 @@
 //!
 //! A simple synchronous client for communicating with the Sentinel Control API.
 
-use crate::control::{ControlRequest, ControlResponse};
+use crate::control::{
+    ControlRequest, ControlResponse, ScoutRuleInfo, ScoutScanStatus, ScoutSourceInfo, ScoutTagStats,
+};
 use crate::db::{IntentState, Session, SessionId};
 use anyhow::{Context, Result};
 use casparian_protocol::http_types::{Approval, ApprovalStatus};
@@ -10,6 +12,7 @@ use casparian_protocol::http_types::{
     HttpJobStatus, HttpJobType, Job as ApiJob, JobProgress as ApiJobProgress,
     JobResult as ApiJobResult,
 };
+use casparian_scout::types::{SourceId, TagSource, TaggingRuleId, WorkspaceId};
 use std::time::Duration;
 use zmq::{Context as ZmqContext, Socket};
 
@@ -522,6 +525,231 @@ impl ControlClient {
                 anyhow::bail!("CancelSession failed [{}]: {}", code, message)
             }
             _ => anyhow::bail!("Unexpected response to CancelSession"),
+        }
+    }
+
+    // =====================================================================
+    // Scout operations (sources / rules / tags / scans)
+    // =====================================================================
+
+    /// List sources for a workspace.
+    pub fn list_sources(&self, workspace_id: WorkspaceId) -> Result<Vec<ScoutSourceInfo>> {
+        match self.request(ControlRequest::ListSources { workspace_id })? {
+            ControlResponse::Sources(sources) => Ok(sources),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ListSources failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ListSources"),
+        }
+    }
+
+    /// Create or update a source.
+    pub fn upsert_source(&self, source: ScoutSourceInfo) -> Result<(bool, String)> {
+        match self.request(ControlRequest::UpsertSource { source })? {
+            ControlResponse::SourceResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("UpsertSource failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to UpsertSource"),
+        }
+    }
+
+    /// Update a source name/path.
+    pub fn update_source(
+        &self,
+        source_id: SourceId,
+        name: Option<String>,
+        path: Option<String>,
+    ) -> Result<(bool, String)> {
+        match self.request(ControlRequest::UpdateSource {
+            source_id,
+            name,
+            path,
+        })? {
+            ControlResponse::SourceResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("UpdateSource failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to UpdateSource"),
+        }
+    }
+
+    /// Delete a source.
+    pub fn delete_source(&self, source_id: SourceId) -> Result<(bool, String)> {
+        match self.request(ControlRequest::DeleteSource { source_id })? {
+            ControlResponse::SourceResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("DeleteSource failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to DeleteSource"),
+        }
+    }
+
+    /// Touch source for MRU ordering.
+    pub fn touch_source(&self, source_id: SourceId) -> Result<(bool, String)> {
+        match self.request(ControlRequest::TouchSource { source_id })? {
+            ControlResponse::SourceResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("TouchSource failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to TouchSource"),
+        }
+    }
+
+    /// List tagging rules for a workspace.
+    pub fn list_rules(&self, workspace_id: WorkspaceId) -> Result<Vec<ScoutRuleInfo>> {
+        match self.request(ControlRequest::ListRules { workspace_id })? {
+            ControlResponse::Rules(rules) => Ok(rules),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ListRules failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ListRules"),
+        }
+    }
+
+    /// Create a tagging rule.
+    pub fn create_rule(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        pattern: String,
+        tag: String,
+    ) -> Result<(bool, String)> {
+        match self.request(ControlRequest::CreateRule {
+            rule_id,
+            workspace_id,
+            pattern,
+            tag,
+        })? {
+            ControlResponse::RuleResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("CreateRule failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to CreateRule"),
+        }
+    }
+
+    /// Update rule enabled flag.
+    pub fn update_rule_enabled(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        enabled: bool,
+    ) -> Result<(bool, String)> {
+        match self.request(ControlRequest::UpdateRuleEnabled {
+            rule_id,
+            workspace_id,
+            enabled,
+        })? {
+            ControlResponse::RuleResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("UpdateRuleEnabled failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to UpdateRuleEnabled"),
+        }
+    }
+
+    /// Delete a rule.
+    pub fn delete_rule(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+    ) -> Result<(bool, String)> {
+        match self.request(ControlRequest::DeleteRule {
+            rule_id,
+            workspace_id,
+        })? {
+            ControlResponse::RuleResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("DeleteRule failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to DeleteRule"),
+        }
+    }
+
+    /// List tag stats for a workspace/source.
+    pub fn list_tags(&self, workspace_id: WorkspaceId, source_id: SourceId) -> Result<ScoutTagStats> {
+        match self.request(ControlRequest::ListTags {
+            workspace_id,
+            source_id,
+        })? {
+            ControlResponse::TagStats(stats) => Ok(stats),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ListTags failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ListTags"),
+        }
+    }
+
+    /// Apply a tag to a file.
+    pub fn apply_tag(
+        &self,
+        workspace_id: WorkspaceId,
+        file_id: i64,
+        tag: String,
+        tag_source: TagSource,
+        rule_id: Option<TaggingRuleId>,
+    ) -> Result<(bool, String)> {
+        match self.request(ControlRequest::ApplyTag {
+            workspace_id,
+            file_id,
+            tag,
+            tag_source,
+            rule_id,
+        })? {
+            ControlResponse::TagResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ApplyTag failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ApplyTag"),
+        }
+    }
+
+    /// Start a scan for a given path.
+    pub fn start_scan(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        path: String,
+    ) -> Result<String> {
+        match self.request(ControlRequest::StartScan { workspace_id, path })? {
+            ControlResponse::ScanStarted { scan_id } => Ok(scan_id),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("StartScan failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to StartScan"),
+        }
+    }
+
+    /// Get scan status by ID.
+    pub fn get_scan(&self, scan_id: String) -> Result<Option<ScoutScanStatus>> {
+        match self.request(ControlRequest::GetScan { scan_id })? {
+            ControlResponse::ScanStatus(status) => Ok(status),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("GetScan failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to GetScan"),
+        }
+    }
+
+    /// List scan statuses.
+    pub fn list_scans(&self, limit: Option<usize>) -> Result<Vec<ScoutScanStatus>> {
+        match self.request(ControlRequest::ListScans { limit })? {
+            ControlResponse::Scans(scans) => Ok(scans),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ListScans failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ListScans"),
+        }
+    }
+
+    /// Cancel a scan.
+    pub fn cancel_scan(&self, scan_id: String) -> Result<(bool, String)> {
+        match self.request(ControlRequest::CancelScan { scan_id })? {
+            ControlResponse::ScanResult { success, message } => Ok((success, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("CancelScan failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to CancelScan"),
         }
     }
 }

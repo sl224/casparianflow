@@ -47,6 +47,7 @@ impl LicenseTier {
     pub fn allows(&self, db_type: DatabaseType) -> bool {
         match db_type {
             DatabaseType::DuckDb => true,
+            DatabaseType::Sqlite => true,
         }
     }
 }

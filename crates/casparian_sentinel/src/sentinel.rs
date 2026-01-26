@@ -8,35 +8,45 @@ use casparian_protocol::http_types::{
     ApprovalOperation, ApprovalStatus, JobProgress as ApiJobProgress, JobResult as ApiJobResult,
 };
 use casparian_protocol::types::{
-    self, ArtifactV1, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, RuntimeKind,
-    SchemaColumnSpec, SchemaDefinition, SinkConfig, SinkMode,
+    self, ArtifactV1, DispatchCommand, IdentifyPayload, JobReceipt, JobStatus, ParsedSinkUri,
+    RuntimeKind, SchemaColumnSpec, SchemaDefinition, SinkConfig, SinkMode, SinkScheme,
 };
 use casparian_protocol::{
     defaults, materialization_key, metrics, output_target_key, schema_hash, table_name_with_schema,
     ApiJobId, JobId, Message, OpCode, PipelineRunStatus, PluginStatus, ProcessingStatus,
     WorkerStatus,
 };
+use casparian_scout::{
+    scan_path, Database as ScoutDatabase, ScanCancelToken, ScanConfig, ScanProgress,
+    Scanner as ScoutScanner, Source as ScoutSource, SourceId, SourceType, TagSource, TaggingRuleId,
+    WorkspaceId,
+};
 use casparian_schema::approval::derive_scope_id;
 use casparian_schema::{
     build_outputs_json, locked_schema_from_definition, SchemaContract, SchemaStorage,
 };
 use casparian_security::signing::compute_artifact_hash;
-use chrono::Duration as ChronoDuration;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 use zmq::{Context as ZmqContext, Socket};
 
-use crate::control::{ControlRequest, ControlResponse, JobInfo, QueueStatsInfo};
+use crate::control::{
+    ControlRequest, ControlResponse, JobInfo, QueueStatsInfo, ScanState, ScoutRuleInfo,
+    ScoutScanProgress, ScoutScanStatus, ScoutSourceInfo, ScoutTagCount, ScoutTagStats,
+};
 use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
 use crate::db::{
     ensure_schema_version, models::*, ApiStorage, ExpectedOutputs, IntentState, JobQueue,
     SessionId, SessionStorage, SCHEMA_VERSION,
 };
 use crate::metrics::METRICS;
-use casparian_db::{DbConnection, DbTimestamp, DbValue, UnifiedDbRow};
+use casparian_db::{DbConnection, DbValue, UnifiedDbRow};
 
 /// Workers are considered stale after this many seconds without heartbeat
 const WORKER_TIMEOUT_SECS: f64 = 60.0;
@@ -121,6 +131,50 @@ impl DispatchQueryResult {
     }
 }
 
+// ============================================================================
+// Scout scan tracking (control API)
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct ScanJobState {
+    scan_id: String,
+    workspace_id: WorkspaceId,
+    source_path: String,
+    source_id: Option<SourceId>,
+    state: ScanState,
+    progress: Option<ScanProgress>,
+    files_persisted: Option<u64>,
+    error: Option<String>,
+    cancel_token: Option<ScanCancelToken>,
+}
+
+impl ScanJobState {
+    fn to_status(&self) -> ScoutScanStatus {
+        ScoutScanStatus {
+            scan_id: self.scan_id.clone(),
+            workspace_id: self.workspace_id,
+            source_path: self.source_path.clone(),
+            source_id: self.source_id,
+            state: self.state.clone(),
+            progress: self.progress.as_ref().map(scan_progress_to_api),
+            files_persisted: self.files_persisted,
+            error: self.error.clone(),
+        }
+    }
+}
+
+fn scan_progress_to_api(progress: &ScanProgress) -> ScoutScanProgress {
+    ScoutScanProgress {
+        dirs_scanned: progress.dirs_scanned as u64,
+        files_found: progress.files_found as u64,
+        files_persisted: progress.files_persisted as u64,
+        current_dir: progress.current_dir.clone(),
+        elapsed_ms: progress.elapsed_ms,
+        files_per_sec: progress.files_per_sec,
+        stalled: progress.stalled,
+    }
+}
+
 fn resolve_dispatch_path(scan_root: &str, exec_root: Option<&str>, rel_path: &str) -> String {
     let root = exec_root
         .map(str::trim)
@@ -200,11 +254,13 @@ impl ConnectedWorker {
 /// Sentinel configuration
 pub struct SentinelConfig {
     pub bind_addr: String,
-    pub database_url: String,
+    pub state_store_url: String,
     pub max_workers: usize,
     /// Optional control API bind address (e.g., "ipc:///tmp/casparian_control.sock" or "tcp://127.0.0.1:5556")
     /// If None, control API is disabled.
     pub control_addr: Option<String>,
+    /// DuckDB query catalog path (local SQL over Parquet)
+    pub query_catalog_path: std::path::PathBuf,
 }
 
 /// Main Sentinel control plane
@@ -221,6 +277,9 @@ pub struct Sentinel {
     schema_storage: SchemaStorage,
     topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
     topic_map_last_refresh: f64,
+    query_catalog_path: std::path::PathBuf,
+    state_store_path: Option<std::path::PathBuf>,
+    scan_jobs: Arc<Mutex<HashMap<String, ScanJobState>>>,
     running: bool,
     last_cleanup: f64, // Last time we ran stale worker cleanup
     /// Jobs orphaned by stale workers - need to be failed asynchronously
@@ -239,11 +298,11 @@ impl Sentinel {
             config.max_workers.min(HARD_MAX_WORKERS)
         };
 
-        let conn = DbConnection::open_from_url(&config.database_url)
-            .context("Failed to connect to database")?;
+        let conn = DbConnection::open_from_url(&config.state_store_url)
+            .context("Failed to connect to state store")?;
         if ensure_schema_version(&conn, SCHEMA_VERSION)? {
             warn!(
-                "Database schema reset (pre-v1). Delete ~/.casparian_flow/casparian_flow.duckdb if this was unexpected."
+                "State store schema reset (pre-v1). Delete ~/.casparian_flow/state.sqlite if this was unexpected."
             );
         }
 
@@ -325,6 +384,8 @@ impl Sentinel {
             None
         };
 
+        let state_store_path = sqlite_path_from_url(&config.state_store_url);
+
         Ok(Self {
             context,
             socket,
@@ -337,6 +398,9 @@ impl Sentinel {
             schema_storage,
             topic_map,
             topic_map_last_refresh: current_time(),
+            query_catalog_path: config.query_catalog_path,
+            state_store_path,
+            scan_jobs: Arc::new(Mutex::new(HashMap::new())),
             running: false,
             last_cleanup: current_time(),
             orphaned_jobs: Vec::new(),
@@ -384,6 +448,17 @@ impl Sentinel {
         }
 
         Ok(map)
+    }
+
+    fn sqlite_state_store_path(&self) -> Result<&std::path::Path> {
+        self.state_store_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Scout operations require sqlite state store"))
+    }
+
+    fn scout_db(&self) -> Result<ScoutDatabase> {
+        let path = self.sqlite_state_store_path()?;
+        ScoutDatabase::open(path).context("Failed to open scout state store")
     }
 
     fn resolve_sinks_for_plugin(
@@ -741,6 +816,52 @@ impl Sentinel {
             self.queue.insert_output_materialization(&record)?;
         }
 
+        if let Err(err) = self.update_query_catalog_for_outputs(&sinks, &output_rows) {
+            warn!("Failed to update query catalog: {}", err);
+        }
+
+        Ok(())
+    }
+
+    fn update_query_catalog_for_outputs(
+        &self,
+        sinks: &[SinkConfig],
+        output_rows: &HashMap<String, i64>,
+    ) -> Result<()> {
+        if output_rows.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(parent) = self.query_catalog_path.parent() {
+            std::fs::create_dir_all(parent).context("Failed to create query catalog directory")?;
+        }
+
+        let catalog_conn = DbConnection::open_duckdb(&self.query_catalog_path)
+            .context("Failed to open query catalog")?;
+        catalog_conn.execute("CREATE SCHEMA IF NOT EXISTS outputs", &[])?;
+
+        for output_name in output_rows.keys() {
+            let Some(sink) = Self::select_sink_for_output(sinks, output_name) else {
+                continue;
+            };
+            let parsed = ParsedSinkUri::parse(&sink.uri)
+                .map_err(|err| anyhow::anyhow!("Failed to parse sink URI '{}': {}", sink.uri, err))?;
+            if parsed.scheme != SinkScheme::Parquet {
+                continue;
+            }
+
+            let pattern = parsed
+                .path
+                .join(format!("{}_*.parquet", output_name));
+            let view_name = format!("outputs.{}", quote_ident(output_name));
+            let path_literal = escape_sql_literal(&pattern.to_string_lossy());
+            let sql = format!(
+                "CREATE OR REPLACE VIEW {} AS SELECT * FROM parquet_scan('{}')",
+                view_name, path_literal
+            );
+            catalog_conn.execute(&sql, &[])?;
+        }
+
         Ok(())
     }
 
@@ -1024,6 +1145,48 @@ impl Sentinel {
                 target_state,
             } => self.handle_advance_session(session_id, target_state),
             ControlRequest::CancelSession { session_id } => self.handle_cancel_session(session_id),
+            ControlRequest::ListSources { workspace_id } => self.handle_list_sources(workspace_id),
+            ControlRequest::UpsertSource { source } => self.handle_upsert_source(&source),
+            ControlRequest::UpdateSource {
+                source_id,
+                name,
+                path,
+            } => self.handle_update_source(source_id, name.as_deref(), path.as_deref()),
+            ControlRequest::DeleteSource { source_id } => self.handle_delete_source(source_id),
+            ControlRequest::TouchSource { source_id } => self.handle_touch_source(source_id),
+            ControlRequest::ListRules { workspace_id } => self.handle_list_rules(workspace_id),
+            ControlRequest::CreateRule {
+                rule_id,
+                workspace_id,
+                pattern,
+                tag,
+            } => self.handle_create_rule(rule_id, workspace_id, &pattern, &tag),
+            ControlRequest::UpdateRuleEnabled {
+                rule_id,
+                workspace_id,
+                enabled,
+            } => self.handle_update_rule_enabled(rule_id, workspace_id, enabled),
+            ControlRequest::DeleteRule {
+                rule_id,
+                workspace_id,
+            } => self.handle_delete_rule(rule_id, workspace_id),
+            ControlRequest::ListTags {
+                workspace_id,
+                source_id,
+            } => self.handle_list_tags(workspace_id, source_id),
+            ControlRequest::ApplyTag {
+                workspace_id: _,
+                file_id,
+                tag,
+                tag_source,
+                rule_id,
+            } => self.handle_apply_tag(file_id, &tag, tag_source, rule_id.as_ref()),
+            ControlRequest::StartScan { workspace_id, path } => {
+                self.handle_start_scan(workspace_id, &path)
+            }
+            ControlRequest::GetScan { scan_id } => self.handle_get_scan(&scan_id),
+            ControlRequest::ListScans { limit } => self.handle_list_scans(limit),
+            ControlRequest::CancelScan { scan_id } => self.handle_cancel_scan(&scan_id),
             ControlRequest::Ping => ControlResponse::Pong,
         }
     }
@@ -1493,6 +1656,651 @@ impl Sentinel {
         }
     }
 
+    // =====================================================================
+    // Scout control handlers (sources / rules / tags / scans)
+    // =====================================================================
+
+    fn handle_list_sources(&self, workspace_id: WorkspaceId) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let rows = match db.conn().query_all(
+            "SELECT id, name, source_type, path, exec_path, poll_interval_secs, enabled, file_count \
+             FROM scout_sources WHERE workspace_id = ? AND enabled = 1 ORDER BY updated_at DESC",
+            &[DbValue::from(workspace_id.to_string())],
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Sources query failed: {}", e))
+            }
+        };
+
+        let mut sources = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id_i64: i64 = match row.get(0) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let id = match SourceId::try_from(id_i64) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let name: String = match row.get(1) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let source_type_raw: String = match row.get(2) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let source_type: SourceType = match serde_json::from_str(&source_type_raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    return ControlResponse::error(
+                        "DB_ERROR",
+                        format!("Invalid source_type JSON: {}", e),
+                    )
+                }
+            };
+            let path: String = match row.get(3) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let exec_path: Option<String> = row.get(4).ok().flatten();
+            let poll_interval_secs: i64 = match row.get(5) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let enabled_raw: i64 = match row.get(6) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let file_count: i64 = match row.get(7) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+
+            sources.push(ScoutSourceInfo {
+                id,
+                workspace_id,
+                name,
+                source_type,
+                path,
+                exec_path,
+                enabled: enabled_raw != 0,
+                poll_interval_secs: poll_interval_secs.max(0) as u64,
+                file_count,
+            });
+        }
+
+        ControlResponse::Sources(sources)
+    }
+
+    fn handle_upsert_source(&self, source: &ScoutSourceInfo) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let source_row = ScoutSource {
+            workspace_id: source.workspace_id,
+            id: source.id,
+            name: source.name.clone(),
+            source_type: source.source_type.clone(),
+            path: source.path.clone(),
+            exec_path: source.exec_path.clone(),
+            poll_interval_secs: source.poll_interval_secs,
+            enabled: source.enabled,
+        };
+
+        match db.upsert_source(&source_row) {
+            Ok(()) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source upserted".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source upsert failed: {}", e)),
+        }
+    }
+
+    fn handle_update_source(
+        &self,
+        source_id: SourceId,
+        name: Option<&str>,
+        path: Option<&str>,
+    ) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let mut source = match db.get_source(&source_id) {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                return ControlResponse::SourceResult {
+                    success: false,
+                    message: "Source not found".to_string(),
+                }
+            }
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Source load failed: {}", e))
+            }
+        };
+
+        if let Some(name) = name {
+            source.name = name.to_string();
+        }
+        if let Some(path) = path {
+            source.path = path.to_string();
+        }
+
+        match db.upsert_source(&source) {
+            Ok(()) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source updated".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source update failed: {}", e)),
+        }
+    }
+
+    fn handle_delete_source(&self, source_id: SourceId) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        match db.delete_source(&source_id) {
+            Ok(true) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source deleted".to_string(),
+            },
+            Ok(false) => ControlResponse::SourceResult {
+                success: false,
+                message: "Source not found".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source delete failed: {}", e)),
+        }
+    }
+
+    fn handle_touch_source(&self, source_id: SourceId) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        match db.touch_source(&source_id) {
+            Ok(()) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source touched".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source touch failed: {}", e)),
+        }
+    }
+
+    fn handle_list_rules(&self, workspace_id: WorkspaceId) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        match db.list_tagging_rules(&workspace_id) {
+            Ok(rules) => {
+                let mapped = rules
+                    .into_iter()
+                    .map(|rule| ScoutRuleInfo {
+                        id: rule.id,
+                        workspace_id: rule.workspace_id,
+                        pattern: rule.pattern,
+                        tag: rule.tag,
+                        priority: rule.priority,
+                        enabled: rule.enabled,
+                    })
+                    .collect();
+                ControlResponse::Rules(mapped)
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rules load failed: {}", e)),
+        }
+    }
+
+    fn handle_create_rule(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        pattern: &str,
+        tag: &str,
+    ) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let name = format!("{} → {}", pattern, tag);
+        let rule = casparian_scout::types::TaggingRule {
+            id: rule_id,
+            name,
+            workspace_id,
+            pattern: pattern.to_string(),
+            tag: tag.to_string(),
+            priority: 100,
+            enabled: true,
+        };
+
+        match db.upsert_tagging_rule(&rule) {
+            Ok(()) => ControlResponse::RuleResult {
+                success: true,
+                message: "Rule created".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rule create failed: {}", e)),
+        }
+    }
+
+    fn handle_update_rule_enabled(
+        &self,
+        rule_id: TaggingRuleId,
+        _workspace_id: WorkspaceId,
+        enabled: bool,
+    ) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let mut rule = match db.get_tagging_rule(&rule_id) {
+            Ok(Some(rule)) => rule,
+            Ok(None) => {
+                return ControlResponse::RuleResult {
+                    success: false,
+                    message: "Rule not found".to_string(),
+                }
+            }
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Rule load failed: {}", e))
+            }
+        };
+
+        rule.enabled = enabled;
+
+        match db.upsert_tagging_rule(&rule) {
+            Ok(()) => ControlResponse::RuleResult {
+                success: true,
+                message: "Rule updated".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rule update failed: {}", e)),
+        }
+    }
+
+    fn handle_delete_rule(
+        &self,
+        rule_id: TaggingRuleId,
+        _workspace_id: WorkspaceId,
+    ) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        match db.delete_tagging_rule(&rule_id) {
+            Ok(true) => ControlResponse::RuleResult {
+                success: true,
+                message: "Rule deleted".to_string(),
+            },
+            Ok(false) => ControlResponse::RuleResult {
+                success: false,
+                message: "Rule not found".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rule delete failed: {}", e)),
+        }
+    }
+
+    fn handle_list_tags(&self, workspace_id: WorkspaceId, source_id: SourceId) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let total_files = match db.conn().query_scalar::<i64>(
+            "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ?",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(source_id.as_i64()),
+            ],
+        ) {
+            Ok(count) => count,
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Tags query failed: {}", e))
+            }
+        };
+
+        let rows = match db.conn().query_all(
+            "SELECT t.tag, COUNT(*) AS count \
+             FROM scout_file_tags t \
+             JOIN scout_files f ON f.id = t.file_id AND f.workspace_id = t.workspace_id \
+             WHERE f.workspace_id = ? AND f.source_id = ? \
+             GROUP BY t.tag \
+             ORDER BY count DESC, t.tag",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(source_id.as_i64()),
+            ],
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Tags query failed: {}", e))
+            }
+        };
+
+        let mut tags = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tag: String = match row.get(0) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            let count: i64 = match row.get(1) {
+                Ok(v) => v,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            };
+            if count > 0 {
+                tags.push(ScoutTagCount { tag, count });
+            }
+        }
+
+        let untagged_files = match db.conn().query_scalar::<i64>(
+            "SELECT COUNT(*) \
+             FROM scout_files f \
+             LEFT JOIN scout_file_tags t \
+                ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
+             WHERE f.workspace_id = ? AND f.source_id = ? AND t.file_id IS NULL",
+            &[
+                DbValue::from(workspace_id.to_string()),
+                DbValue::from(source_id.as_i64()),
+            ],
+        ) {
+            Ok(count) => count,
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Tags query failed: {}", e))
+            }
+        };
+
+        ControlResponse::TagStats(ScoutTagStats {
+            total_files,
+            untagged_files,
+            tags,
+        })
+    }
+
+    fn handle_apply_tag(
+        &self,
+        file_id: i64,
+        tag: &str,
+        tag_source: TagSource,
+        rule_id: Option<&TaggingRuleId>,
+    ) -> ControlResponse {
+        let db = match self.scout_db() {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let result = match tag_source {
+            TagSource::Manual => db.tag_file(file_id, tag),
+            TagSource::Rule => {
+                let Some(rule_id) = rule_id else {
+                    return ControlResponse::TagResult {
+                        success: false,
+                        message: "Rule-based tag missing rule_id".to_string(),
+                    };
+                };
+                db.tag_file_by_rule(file_id, tag, rule_id)
+            }
+        };
+
+        match result {
+            Ok(()) => ControlResponse::TagResult {
+                success: true,
+                message: "Tag applied".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Tag apply failed: {}", e)),
+        }
+    }
+
+    fn handle_start_scan(
+        &mut self,
+        workspace_id: Option<WorkspaceId>,
+        path: &str,
+    ) -> ControlResponse {
+        let state_store_path = match self.state_store_path.clone() {
+            Some(path) => path,
+            None => {
+                return ControlResponse::error(
+                    "DB_ERROR",
+                    "Scan requires sqlite state store".to_string(),
+                )
+            }
+        };
+
+        let input_path = std::path::Path::new(path);
+        let expanded_path = scan_path::expand_scan_path(input_path);
+        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+            return ControlResponse::error("INVALID_PATH", err.to_string());
+        }
+        let canonical_path = scan_path::canonicalize_scan_path(&expanded_path);
+        let path_display = canonical_path.display().to_string();
+
+        let db = match ScoutDatabase::open(&state_store_path) {
+            Ok(db) => db,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let workspace_id = match workspace_id {
+            Some(id) => match db.get_workspace(&id) {
+                Ok(Some(_)) => id,
+                Ok(None) => {
+                    return ControlResponse::error(
+                        "NOT_FOUND",
+                        "Workspace not found".to_string(),
+                    )
+                }
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            },
+            None => match db.ensure_default_workspace() {
+                Ok(ws) => ws.id,
+                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+            },
+        };
+
+        let scan_id = Uuid::new_v4().to_string();
+        let cancel_token = ScanCancelToken::new();
+
+        {
+            let mut jobs = self.scan_jobs.lock().unwrap();
+            jobs.insert(
+                scan_id.clone(),
+                ScanJobState {
+                    scan_id: scan_id.clone(),
+                    workspace_id,
+                    source_path: path_display.clone(),
+                    source_id: None,
+                    state: ScanState::Pending,
+                    progress: None,
+                    files_persisted: None,
+                    error: None,
+                    cancel_token: Some(cancel_token.clone()),
+                },
+            );
+        }
+
+        let scan_jobs = self.scan_jobs.clone();
+        let scan_id_for_thread = scan_id.clone();
+        let workspace_id_for_thread = workspace_id;
+        let path_display_for_thread = path_display.clone();
+        let state_store_path_for_thread = state_store_path.clone();
+        let cancel_token_for_thread = cancel_token.clone();
+        std::thread::spawn(move || {
+            let db = match ScoutDatabase::open(&state_store_path_for_thread) {
+                Ok(db) => db,
+                Err(e) => {
+                    let mut jobs = scan_jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                        job.state = ScanState::Failed;
+                        job.error = Some(format!("Failed to open state store: {}", e));
+                    }
+                    return;
+                }
+            };
+
+            let source = match db.get_source_by_path(&workspace_id_for_thread, &path_display_for_thread) {
+                Ok(Some(existing)) => existing,
+                Ok(None) => {
+                    let source_name = std::path::Path::new(&path_display_for_thread)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path_display_for_thread.clone());
+
+                    if let Ok(Some(name_conflict)) =
+                        db.get_source_by_name(&workspace_id_for_thread, &source_name)
+                    {
+                        let mut jobs = scan_jobs.lock().unwrap();
+                        if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                            job.state = ScanState::Failed;
+                            job.error = Some(format!(
+                                "A source named '{}' already exists at '{}'.",
+                                source_name, name_conflict.path
+                            ));
+                        }
+                        return;
+                    }
+
+                    if let Err(err) =
+                        db.check_source_overlap(&workspace_id_for_thread, std::path::Path::new(&path_display_for_thread))
+                    {
+                        let mut jobs = scan_jobs.lock().unwrap();
+                        if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                            job.state = ScanState::Failed;
+                            job.error = Some(err.to_string());
+                        }
+                        return;
+                    }
+
+                    let source_id = SourceId::new();
+                    let new_source = ScoutSource {
+                        workspace_id: workspace_id_for_thread,
+                        id: source_id,
+                        name: source_name,
+                        source_type: SourceType::Local,
+                        path: path_display_for_thread.clone(),
+                        exec_path: None,
+                        poll_interval_secs: 0,
+                        enabled: true,
+                    };
+
+                    if let Err(e) = db.upsert_source(&new_source) {
+                        let mut jobs = scan_jobs.lock().unwrap();
+                        if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                            job.state = ScanState::Failed;
+                            job.error = Some(format!("Failed to save source: {}", e));
+                        }
+                        return;
+                    }
+                    new_source
+                }
+                Err(e) => {
+                    let mut jobs = scan_jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                        job.state = ScanState::Failed;
+                        job.error = Some(format!("Database error: {}", e));
+                    }
+                    return;
+                }
+            };
+
+            {
+                let mut jobs = scan_jobs.lock().unwrap();
+                if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                    job.state = ScanState::Running;
+                    job.source_id = Some(source.id);
+                }
+            }
+
+            let (progress_tx, progress_rx) = mpsc::channel::<ScanProgress>();
+            let progress_jobs = scan_jobs.clone();
+            let progress_scan_id = scan_id_for_thread.clone();
+            let progress_handle = std::thread::spawn(move || {
+                while let Ok(progress) = progress_rx.recv() {
+                    let mut jobs = progress_jobs.lock().unwrap();
+                    if let Some(job) = jobs.get_mut(&progress_scan_id) {
+                        job.progress = Some(progress);
+                    }
+                }
+            });
+
+            let scan_config = ScanConfig::default();
+            let scanner = ScoutScanner::with_config(db, scan_config);
+            let scan_result =
+                scanner.scan_with_cancel(&source, Some(progress_tx), None, Some(cancel_token_for_thread));
+            drop(scanner);
+            let _ = progress_handle.join();
+
+            let mut jobs = scan_jobs.lock().unwrap();
+            if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
+                match scan_result {
+                    Ok(result) => {
+                        job.state = ScanState::Completed;
+                        job.files_persisted = Some(result.stats.files_persisted);
+                        job.error = None;
+                    }
+                    Err(e) => {
+                        if matches!(e, casparian_scout::error::ScoutError::Cancelled) {
+                            job.state = ScanState::Cancelled;
+                            job.error = Some("Scan cancelled".to_string());
+                        } else {
+                            job.state = ScanState::Failed;
+                            job.error = Some(format!("Scan failed: {}", e));
+                        }
+                    }
+                }
+            }
+        });
+
+        ControlResponse::ScanStarted { scan_id }
+    }
+
+    fn handle_get_scan(&self, scan_id: &str) -> ControlResponse {
+        let jobs = self.scan_jobs.lock().unwrap();
+        let status = jobs.get(scan_id).map(|job| job.to_status());
+        ControlResponse::ScanStatus(status)
+    }
+
+    fn handle_list_scans(&self, limit: Option<usize>) -> ControlResponse {
+        let jobs = self.scan_jobs.lock().unwrap();
+        let mut scans: Vec<ScoutScanStatus> = jobs.values().map(|job| job.to_status()).collect();
+        if let Some(limit) = limit {
+            if scans.len() > limit {
+                scans.truncate(limit);
+            }
+        }
+        ControlResponse::Scans(scans)
+    }
+
+    fn handle_cancel_scan(&self, scan_id: &str) -> ControlResponse {
+        let mut jobs = self.scan_jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(scan_id) {
+            if let Some(token) = job.cancel_token.as_ref() {
+                token.cancel();
+            }
+            job.state = ScanState::Cancelled;
+            job.error = Some("Scan cancelled".to_string());
+            return ControlResponse::ScanResult {
+                success: true,
+                message: "Scan cancelled".to_string(),
+            };
+        }
+
+        ControlResponse::ScanResult {
+            success: false,
+            message: "Scan not found".to_string(),
+        }
+    }
+
     /// Convert Job to JobInfo for API responses
     fn job_to_info(job: crate::db::queue::Job) -> JobInfo {
         JobInfo {
@@ -1502,8 +2310,8 @@ impl Sentinel {
             status: job.status,
             priority: job.priority,
             retry_count: job.retry_count,
-            created_at: job.created_at.map(|t| t.to_rfc3339()),
-            updated_at: job.updated_at.map(|t| t.to_rfc3339()),
+            created_at: job.created_at.map(millis_to_rfc3339),
+            updated_at: job.updated_at.map(millis_to_rfc3339),
             error_message: job.error_message,
             parser_version: job.parser_version,
             pipeline_run_id: job.pipeline_run_id,
@@ -1763,7 +2571,7 @@ impl Sentinel {
                 );
                 METRICS.inc_jobs_rejected();
                 // Use defer_job (not requeue_job) to avoid incrementing retry_count
-                let scheduled_at = DbTimestamp::now();
+                let scheduled_at = now_millis();
                 self.queue
                     .defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
             }
@@ -1905,11 +2713,12 @@ impl Sentinel {
             r#"
                 UPDATE cf_pipeline_runs
                 SET status = ?,
-                    started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
+                    started_at = COALESCE(started_at, ?)
                 WHERE id = ?
                 "#,
             &[
                 DbValue::from(PipelineRunStatus::Running.as_str()),
+                DbValue::from(now_millis()),
                 DbValue::from(run_id),
             ],
         )?;
@@ -1951,9 +2760,10 @@ impl Sentinel {
         if failed > 0 {
             self.conn
                 .execute(
-                    "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = ?",
                     &[
                         DbValue::from(PipelineRunStatus::Failed.as_str()),
+                        DbValue::from(now_millis()),
                         DbValue::from(run_id),
                     ],
                 )
@@ -1969,9 +2779,10 @@ impl Sentinel {
         if completed > 0 {
             self.conn
                 .execute(
-                    "UPDATE cf_pipeline_runs SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = ?",
                     &[
                         DbValue::from(PipelineRunStatus::Completed.as_str()),
+                        DbValue::from(now_millis()),
                         DbValue::from(run_id),
                     ],
                 )
@@ -1982,21 +2793,7 @@ impl Sentinel {
     }
 
     fn table_exists(&self, table: &str) -> Result<bool> {
-        let (query, param) = match self.conn.backend_name() {
-            "DuckDB" => (
-                "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
-                DbValue::from(table),
-            ),
-            "SQLite" => (
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
-                DbValue::from(table),
-            ),
-            _ => (
-                "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
-                DbValue::from(table),
-            ),
-        };
-        Ok(self.conn.query_optional(query, &[param])?.is_some())
+        Ok(self.conn.table_exists(table)?)
     }
 
     /// Assign a job to a worker.
@@ -2333,7 +3130,7 @@ impl Sentinel {
 
         // 3. Execute all DB operations in a transaction
         self.conn.execute("BEGIN TRANSACTION", &[])?;
-        let now = DbTimestamp::now();
+        let now = now_millis();
 
         // 3a. Upsert the plugin environment (lockfile)
         if !cmd.lockfile_content.is_empty() {
@@ -2349,9 +3146,9 @@ impl Sentinel {
                         DbValue::from(cmd.env_hash.as_str()),
                         DbValue::from(cmd.lockfile_content.as_str()),
                         DbValue::from(cmd.lockfile_content.len() as f64 / 1_000_000.0),
-                        DbValue::from(now.clone()),
-                        DbValue::from(now.clone()),
-                        DbValue::from(now.clone()),
+                        DbValue::from(now),
+                        DbValue::from(now),
+                        DbValue::from(now),
                     ],
                 )
 
@@ -2416,8 +3213,8 @@ impl Sentinel {
                 DbValue::from(outputs_json.as_str()),
                 DbValue::from(false),
                 DbValue::Null,
-                DbValue::from(now.clone()),
-                DbValue::from(now.clone()),
+                DbValue::from(now),
+                DbValue::from(now),
                 DbValue::from(cmd.publisher_name.as_str()),
                 publisher_email,
                 azure_oid,
@@ -2593,10 +3390,8 @@ Delete the database to republish.",
                 "Scheduling retry with exponential backoff"
             );
 
-            let now = DbTimestamp::now();
-            let scheduled_at =
-                DbTimestamp::from_unix_millis(now.unix_millis() + (backoff_secs as i64 * 1_000))
-                    .unwrap_or_else(|_| now.clone());
+            let now = now_millis();
+            let scheduled_at = now + (backoff_secs as i64 * 1_000);
             self.queue
                 .schedule_retry(job_id, retry_count + 1, error, scheduled_at)?;
 
@@ -2647,13 +3442,13 @@ Delete the database to republish.",
             // Check threshold
             if h.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
                 // Trip the circuit breaker
-                let now = DbTimestamp::now();
+                let now = now_millis();
                 self.conn
                     .execute(
                         "UPDATE cf_parser_health SET paused_at = ?, updated_at = ? WHERE parser_name = ?",
                         &[
-                            DbValue::from(now.clone()),
-                            DbValue::from(now.clone()),
+                            DbValue::from(now),
+                            DbValue::from(now),
                             DbValue::from(parser_name),
                         ],
                     )
@@ -2673,7 +3468,7 @@ Delete the database to republish.",
 
     /// Record successful execution (resets consecutive failures).
     fn record_success(&self, parser_name: &str) -> Result<()> {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         self.conn
             .execute(
                 r#"
@@ -2687,9 +3482,9 @@ Delete the database to republish.",
                 "#,
                 &[
                     DbValue::from(parser_name),
-                    DbValue::from(now.clone()),
-                    DbValue::from(now.clone()),
-                    DbValue::from(now.clone()),
+                    DbValue::from(now),
+                    DbValue::from(now),
+                    DbValue::from(now),
                 ],
             )
             ?;
@@ -2703,7 +3498,7 @@ Delete the database to republish.",
 
     /// Record failed execution (increments consecutive failures).
     fn record_failure(&self, parser_name: &str, reason: &str) -> Result<()> {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         self.conn
             .execute(
                 r#"
@@ -2718,10 +3513,10 @@ Delete the database to republish.",
                 &[
                     DbValue::from(parser_name),
                     DbValue::from(reason),
-                    DbValue::from(now.clone()),
-                    DbValue::from(now.clone()),
+                    DbValue::from(now),
+                    DbValue::from(now),
                     DbValue::from(reason),
-                    DbValue::from(now.clone()),
+                    DbValue::from(now),
                 ],
             )
             ?;
@@ -2768,6 +3563,25 @@ fn current_time() -> f64 {
         .as_secs_f64()
 }
 
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("SystemTime before UNIX_EPOCH - check system clock")
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+fn sqlite_path_from_url(url: &str) -> Option<std::path::PathBuf> {
+    url.strip_prefix("sqlite:").map(std::path::PathBuf::from)
+}
+
+fn millis_to_rfc3339(millis: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .unwrap_or_else(|| Utc::now())
+        .to_rfc3339()
+}
+
 /// Compute SHA256 hash of content, returning hex string
 fn compute_sha256(content: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -2775,10 +3589,18 @@ fn compute_sha256(content: &str) -> String {
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
 }
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use casparian_db::{DbConnection, DbTimestamp, DbValue};
+    use casparian_db::{DbConnection, DbValue};
 
     #[test]
     fn test_join_root_and_rel_posix() {
@@ -2818,7 +3640,7 @@ mod tests {
         version: &str,
         outputs_json: &str,
     ) {
-        let now = DbTimestamp::now();
+        let now = now_millis();
         let source_hash = format!("hash_{}_{}", plugin_name, version);
         conn.execute(
             r#"
@@ -2835,7 +3657,7 @@ mod tests {
                 DbValue::from(version),
                 DbValue::from(source_hash.as_str()),
                 DbValue::from(outputs_json),
-                DbValue::from(now.clone()),
+                DbValue::from(now),
                 DbValue::from(now),
             ],
         )

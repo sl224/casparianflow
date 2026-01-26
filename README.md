@@ -18,7 +18,7 @@ reliably produce tables you can trust—and you can prove how you got them.
 2. **Validates** against schema contracts (authoritative in Rust, not Python)
 3. **Quarantines** invalid rows with error context (no silent coercion)
 4. **Tracks lineage** per-row: source hash, job id, timestamp, parser version
-5. **Outputs** clean, queryable datasets (DuckDB, Parquet)
+5. **Outputs** clean, queryable datasets (Parquet default + SQL sinks)
 
 **Trust primitives:**
 - Same inputs + same parser bundle hash → identical outputs (reproducibility)
@@ -42,13 +42,17 @@ cargo build --release
 FIX_TZ=America/New_York ./target/release/casparian run \
   parsers/fix/fix_parser.py \
   tests/fixtures/fix/mixed_messages.fix \
-  --sink duckdb://./output/fix_demo.duckdb
+  --sink parquet://./output/
 
 # Start the system (Sentinel + Worker)
+# Defaults: SQLite state store + Parquet outputs + DuckDB query catalog
 ./target/release/casparian start
 
 # Interactive TUI
 ./target/release/casparian tui
+
+# Local SQL (DuckDB query catalog over Parquet)
+duckdb ~/.casparian_flow/query.duckdb
 ```
 
 ## FIX Protocol Demo
@@ -117,7 +121,7 @@ Worker execution is non-interactive (no `pdb`).
 │         FRONTENDS (Clients)             │
 │     CLI / TUI / Tauri UI / MCP          │
 │   • Mutations via Control API (IPC)     │
-│   • Read-only DB for queries            │
+│   • Read-only query catalog for SQL     │
 └─────────────────────────────────────────┘
                     │
                     ▼
@@ -139,7 +143,7 @@ Worker execution is non-interactive (no `pdb`).
                     ▼
 ┌─────────────────────────────────────────┐
 │           PERSISTENCE                   │
-│   DuckDB / Parquet / CSV sinks          │
+│   State store + output sinks + catalog  │
 └─────────────────────────────────────────┘
 ```
 
@@ -155,7 +159,7 @@ See **[ARCHITECTURE.md](ARCHITECTURE.md)** for detailed system design.
 | `casparian_sinks` | Sink abstractions + lineage |
 | `casparian_sinks_duckdb` | DuckDB sink implementation |
 | `casparian_protocol` | Binary protocol + types + idempotency |
-| `casparian_db` | DuckDB connection + locking |
+| `casparian_db` | DB connection abstraction (SQLite/DuckDB) |
 | `casparian_tape` | Event recording for replay/debugging |
 | `casparian_backtest` | Multi-file validation |
 | `casparian_schema` | Schema contract storage |

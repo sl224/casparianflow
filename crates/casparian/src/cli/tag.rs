@@ -32,7 +32,7 @@ pub struct UntagArgs {
 
 /// Get the default database path
 fn get_db_path() -> PathBuf {
-    crate::cli::config::active_db_path()
+    crate::cli::config::state_store_path()
 }
 
 /// Open database connection with helpful error
@@ -613,8 +613,8 @@ mod tests {
     const SOURCE_ID: i64 = 1;
 
     fn create_test_db(dir: &TempDir) -> (DbConnection, WorkspaceId) {
-        let db_path = dir.path().join("test.duckdb");
-        let conn = DbConnection::open_duckdb(&db_path).unwrap();
+        let db_path = dir.path().join("test.sqlite");
+        let conn = DbConnection::open_sqlite(&db_path).unwrap();
         let workspace_id = WorkspaceId::new();
 
         // Create schema

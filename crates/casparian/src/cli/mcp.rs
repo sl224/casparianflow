@@ -42,8 +42,8 @@ pub enum McpAction {
         #[arg(long)]
         audit_log: Option<PathBuf>,
 
-        /// Database path (default: ~/.casparian_flow/casparian_flow.duckdb)
-        #[arg(long)]
+        /// State store path (default: ~/.casparian_flow/state.sqlite)
+        #[arg(long = "state-store")]
         database: Option<PathBuf>,
 
         /// Default output directory (default: ~/.casparian_flow/output)
@@ -160,7 +160,7 @@ fn run_serve(
     let audit_log_path =
         Some(audit_log.unwrap_or_else(|| config::casparian_home().join("mcp_audit.ndjson")));
 
-    let db_path = database.unwrap_or_else(config::active_db_path);
+    let db_path = database.unwrap_or_else(config::state_store_path);
     let mcp_config = McpServerConfig {
         server_name: "casparian-mcp".to_string(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -169,6 +169,7 @@ fn run_serve(
         max_rows,
         audit_log_path,
         db_path,
+        query_catalog_path: config::query_catalog_path(),
         control_addr,
         standalone_db_writer,
     };
@@ -189,7 +190,7 @@ fn run_approve(
     use super::config;
     use casparian_mcp::approvals::{ApprovalId, ApprovalManager};
 
-    let db_path = config::active_db_path();
+    let db_path = config::state_store_path();
     let manager = if standalone_db_writer {
         ApprovalManager::new(db_path)?
     } else {
@@ -224,7 +225,7 @@ fn run_list(
     use super::config;
     use casparian_mcp::approvals::ApprovalManager;
 
-    let db_path = config::active_db_path();
+    let db_path = config::state_store_path();
     let manager = if standalone_db_writer {
         ApprovalManager::new(db_path)?
     } else {

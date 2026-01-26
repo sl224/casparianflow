@@ -9,7 +9,7 @@ use chrono::Utc;
 use clap::Args;
 use serde::{Deserialize, Serialize};
 
-use super::app::{App, DiscoverViewState, TuiMode};
+use super::app::{App, DiscoverViewState, IngestTab, TuiMode};
 use super::flow::{FlowKey, FlowKeyCode, FlowModifiers};
 use super::snapshot::{buffer_to_plain_text, normalize_for_snapshot, render_app_to_buffer};
 use super::snapshot_states::snapshot_cases;
@@ -191,12 +191,13 @@ fn default_alphabet() -> Vec<FlowKey> {
     push_unique(&mut keys, key_char('0'));
     push_unique(&mut keys, key_char('H'));
     push_unique(&mut keys, key_char('1'));
+    push_unique(&mut keys, key_char('2'));
     push_unique(&mut keys, key_char('3'));
     push_unique(&mut keys, key_char('4'));
     push_unique(&mut keys, key_char('5'));
-    push_unique(&mut keys, key_char('6'));
-    push_unique(&mut keys, key_char('7'));
     push_unique(&mut keys, key_char(','));
+    push_unique(&mut keys, key_char('['));
+    push_unique(&mut keys, key_char(']'));
 
     push_unique(&mut keys, key_char('?'));
     push_unique(&mut keys, key_char('I'));
@@ -210,7 +211,7 @@ fn default_alphabet() -> Vec<FlowKey> {
 }
 
 fn discover_keys(app: &App) -> Vec<FlowKey> {
-    if app.mode != TuiMode::Discover {
+    if app.mode != TuiMode::Ingest || app.ingest_tab == IngestTab::Sources {
         return Vec::new();
     }
 
@@ -244,6 +245,9 @@ fn allowed_keys(app: &App, alphabet: &[FlowKey]) -> Vec<FlowKey> {
             key_code(FlowKeyCode::Up),
             key_code(FlowKeyCode::Down),
         ];
+    }
+    if app.show_help {
+        return vec![key_code(FlowKeyCode::Esc), key_char('?')];
     }
     if app.jobs_drawer_open || app.sources_drawer_open {
         return vec![

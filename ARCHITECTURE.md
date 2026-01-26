@@ -58,8 +58,9 @@
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    PERSISTENCE                                  │
-│         • Control-plane DB (DuckDB): jobs, catalog, contracts   │
-│         • Output stores: DuckDB, Parquet, CSV sinks             │
+│         • State store (SQLite default; Postgres/SQLServer opt)  │
+│         • Output sinks (Parquet default; Postgres/SQLServer opt)│
+│         • Query catalog (DuckDB views over Parquet)             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,11 +95,15 @@ Supports **true cancellation**:
 
 ### Frontends
 CLI/TUI/Tauri/MCP are **clients** of the Control API.
-Query console uses **read-only** DB connections.
+Query console uses **read-only** query catalog connections.
 No silent fallback to RW DB access.
 
 ### Pre-v1 schema resets
-Schema changes are destructive pre-v1. On schema version bumps, delete `~/.casparian_flow/casparian_flow.duckdb` (or your custom `--db-path`) and restart.
+Schema changes are destructive pre-v1. On schema version bumps:
+- Delete `~/.casparian_flow/state.sqlite` for the state store.
+- Delete `~/.casparian_flow/query.duckdb` if you want a fresh query catalog.
+- Remove or replace output Parquet files as needed.
+Then restart.
 
 ---
 
@@ -193,7 +198,7 @@ These invariants MUST hold. Violations are bugs.
    Update job status
 
 7. QUERY
-   SQL on DuckDB outputs
+   SQL on DuckDB query catalog (views over Parquet)
 ```
 
 ---
