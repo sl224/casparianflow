@@ -7265,14 +7265,14 @@ fn draw_query_table_browser_overlay(frame: &mut Frame, area: Rect, app: &App) {
         .tables
         .iter()
         .enumerate()
-        .map(|(idx, name)| {
+        .map(|(idx, table)| {
             let is_selected = idx == app.query_state.table_browser.selected_index;
             let style = if is_selected {
                 Style::default().fg(Color::White).bold().bg(Color::DarkGray)
             } else {
                 Style::default().fg(Color::Gray)
             };
-            ratatui::widgets::ListItem::new(name.as_str()).style(style)
+            ratatui::widgets::ListItem::new(table.name.as_str()).style(style)
         })
         .collect();
 
@@ -8426,9 +8426,9 @@ mod tests {
         TuiArgs {
             database: Some(
                 std::env::temp_dir()
-                    .join(format!("casparian_test_{}.duckdb", uuid::Uuid::new_v4())),
+                    .join(format!("casparian_test_{}.sqlite", uuid::Uuid::new_v4())),
             ),
-            standalone_writer: false,
+            standalone_writer: true,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,
@@ -8565,7 +8565,8 @@ mod tests {
             .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        assert!(content.contains("Scope"));
+        assert!(content.contains("[Select]"));
+        assert!(content.contains("Source:"));
     }
 
 }

@@ -2114,9 +2114,16 @@ pub struct QueryResults {
     pub scroll_x: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct TableBrowserEntry {
+    pub schema: String,
+    pub name: String,
+    pub insert_text: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TableBrowserState {
-    pub tables: Vec<String>,
+    pub tables: Vec<TableBrowserEntry>,
     pub selected_index: usize,
     pub loaded: bool,
     pub error: Option<String>,
@@ -4610,8 +4617,14 @@ impl App {
         show_message: bool,
     ) -> bool {
         if self.mutations_blocked() {
-            self.discover.status_message =
-                Some(("Database is read-only; cannot apply tags".to_string(), true));
+            let message = BackendRouter::new(
+                self.control_addr.clone(),
+                self.config.standalone_writer,
+                self.db_read_only,
+            )
+            .blocked_message("apply tags");
+            self.discover.scan_error = Some(message.clone());
+            self.discover.status_message = Some((message, true));
             return false;
         }
         let workspace_id = match self.active_workspace_id() {
@@ -5305,13 +5318,17 @@ impl App {
             }
         }
     }
-    fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> usize {
+    fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> Option<(TaggingRuleId, usize)> {
         if self.mutations_blocked() {
-            self.discover.status_message = Some((
-                "Database is read-only; cannot apply rules".to_string(),
-                true,
-            ));
-            return 0;
+            let message = BackendRouter::new(
+                self.control_addr.clone(),
+                self.config.standalone_writer,
+                self.db_read_only,
+            )
+            .blocked_message("apply rules");
+            self.discover.scan_error = Some(message.clone());
+            self.discover.status_message = Some((message, true));
+            return None;
         }
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
@@ -5320,7 +5337,7 @@ impl App {
                     "No workspace selected; cannot apply rules".to_string(),
                     true,
                 ));
-                return 0;
+                return None;
             }
         };
 
@@ -5333,7 +5350,7 @@ impl App {
                 None => {
                     self.discover.status_message =
                         Some(("No source selected; cannot apply rules".to_string(), true));
-                    return 0;
+                    return None;
                 }
             }
         };
@@ -5345,13 +5362,13 @@ impl App {
                     "No Scout database found; cannot apply rules".to_string(),
                     true,
                 ));
-                return 0;
+                return None;
             }
             Err(err) => {
                 self.discover
                     .status_message
                     .replace((format!("Database open failed: {}", err), true));
-                return 0;
+                return None;
             }
         };
 
@@ -5367,7 +5384,7 @@ impl App {
                 self.discover
                     .status_message
                     .replace((format!("Rule apply query failed: {}", err), true));
-                return 0;
+                return None;
             }
         };
 
@@ -5379,7 +5396,7 @@ impl App {
                     self.discover
                         .status_message
                         .replace((format!("Rule apply parse failed: {}", err), true));
-                    return 0;
+                    return None;
                 }
             };
             let path: String = match row.get(1) {
@@ -5388,7 +5405,7 @@ impl App {
                     self.discover
                         .status_message
                         .replace((format!("Rule apply parse failed: {}", err), true));
-                    return 0;
+                    return None;
                 }
             };
             let rel_path: String = match row.get(2) {
@@ -5397,7 +5414,7 @@ impl App {
                     self.discover
                         .status_message
                         .replace((format!("Rule apply parse failed: {}", err), true));
-                    return 0;
+                    return None;
                 }
             };
             let size: i64 = match row.get(3) {
@@ -5406,7 +5423,7 @@ impl App {
                     self.discover
                         .status_message
                         .replace((format!("Rule apply parse failed: {}", err), true));
-                    return 0;
+                    return None;
                 }
             };
 
@@ -5432,7 +5449,7 @@ impl App {
                 self.discover
                     .status_message
                     .replace((format!("Invalid rule pattern '{}': {}", pattern, err), true));
-                return 0;
+                return None;
             }
         };
 
@@ -5448,7 +5465,7 @@ impl App {
                 self.discover
                     .status_message
                     .replace((format!("Rule apply tag lookup failed: {}", err), true));
-                return 0;
+                return None;
             }
         };
         let mut tagged_ids = HashSet::new();
@@ -5481,7 +5498,7 @@ impl App {
             tag: tag.to_string(),
         });
 
-        tagged_count
+        Some((rule_id, tagged_count))
     }
     fn refresh_tags_list(&mut self) {
         let workspace_id = match self.active_workspace_id() {
@@ -6002,7 +6019,24 @@ impl App {
             format!("%{}%", raw)
         };
 
-        Some(("f.rel_path ILIKE ?".to_string(), DbValue::Text(like)))
+        Some((
+            "LOWER(f.rel_path) LIKE LOWER(?)".to_string(),
+            DbValue::Text(like),
+        ))
+    }
+
+    fn discover_rule_pattern_from_filter(&self) -> Option<String> {
+        let raw = self.discover.filter.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let is_glob = raw.contains('*') || raw.contains('?') || raw.contains('[');
+        if is_glob {
+            Some(patterns::normalize_glob_pattern(raw))
+        } else {
+            Some(format!("*{}*", raw))
+        }
     }
 
     fn set_discover_page_offset(&mut self, offset: usize) {
@@ -6493,6 +6527,7 @@ impl App {
                 self.db_read_only,
             )
             .blocked_message("start scan");
+            self.discover.scan_error = Some(message.clone());
             self.discover.status_message = Some((message.clone(), true));
             self.set_global_status_for(message, true, Duration::from_secs(8));
             return;
@@ -8104,6 +8139,11 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             let _ = tx.send(result);
         });
     }
+
+    fn millis_to_local(ms: i64) -> Option<DateTime<Local>> {
+        Local.timestamp_millis_opt(ms).single()
+    }
+
     fn start_jobs_load(&mut self) {
         // Skip if already loading
         if self.pending_jobs_load.is_some() {
@@ -8294,10 +8334,10 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     let status_str: String = row
                         .get(3)
                         .map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let claim_time: Option<String> = row
+                    let claim_time: Option<i64> = row
                         .get(4)
                         .map_err(|e| format!("Jobs parse failed: {}", e))?;
-                    let end_time: Option<String> = row
+                    let end_time: Option<i64> = row
                         .get(5)
                         .map_err(|e| format!("Jobs parse failed: {}", e))?;
                     let result_summary: Option<String> = row
@@ -8324,13 +8364,11 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                         JobStatus::from_db_status(&status_str, completion_status.as_deref());
 
                     let started_at = claim_time
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Local))
+                        .and_then(Self::millis_to_local)
                         .unwrap_or_else(Local::now);
 
                     let completed_at = end_time
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&Local));
+                        .and_then(Self::millis_to_local);
 
                     let failures = if let Some(ref err) = error_message {
                         vec![JobFailure {
@@ -8598,21 +8636,19 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     let summary: String = row
                         .get(4)
                         .map_err(|e| format!("Approvals parse failed: {}", e))?;
-                    let created_at_str: String = row
+                    let created_at_ms: i64 = row
                         .get(5)
                         .map_err(|e| format!("Approvals parse failed: {}", e))?;
-                    let expires_at_str: String = row
+                    let expires_at_ms: i64 = row
                         .get(6)
                         .map_err(|e| format!("Approvals parse failed: {}", e))?;
                     let job_id: Option<i64> = row.get(7).ok();
 
                     // Parse timestamps
-                    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                        .map(|dt| dt.with_timezone(&Local))
-                        .unwrap_or_else(|_| Local::now());
-                    let expires_at = chrono::DateTime::parse_from_rfc3339(&expires_at_str)
-                        .map(|dt| dt.with_timezone(&Local))
-                        .unwrap_or_else(|_| Local::now());
+                    let created_at =
+                        Self::millis_to_local(created_at_ms).unwrap_or_else(Local::now);
+                    let expires_at =
+                        Self::millis_to_local(expires_at_ms).unwrap_or_else(Local::now);
 
                     // Parse operation JSON to extract plugin_ref, input_dir, file_count
                     let (plugin_ref, input_dir, file_count) = if let Ok(op) =
@@ -8729,10 +8765,9 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             return;
         }
         if self.mutations_blocked() {
-            self.set_global_status(
-                "Sentinel not reachable; changes are not saved (use --standalone-writer to allow local writes)",
-                true,
-            );
+            let message = "Sentinel not reachable; changes are not saved (use --standalone-writer to allow local writes)".to_string();
+            self.discover.scan_error = Some(message.clone());
+            self.set_global_status(message, true);
             return;
         }
 
@@ -10532,9 +10567,9 @@ mod tests {
         TuiArgs {
             database: Some(
                 std::env::temp_dir()
-                    .join(format!("casparian_test_{}.duckdb", uuid::Uuid::new_v4())),
+                    .join(format!("casparian_test_{}.sqlite", uuid::Uuid::new_v4())),
             ),
-            standalone_writer: false,
+            standalone_writer: true,
             record_flow: None,
             record_redaction: RecordRedaction::Plaintext,
             record_checkpoint_every: None,

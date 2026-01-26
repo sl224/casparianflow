@@ -216,8 +216,8 @@ impl App {
                 {
                     self.query_state
                         .sql_input
-                        .insert_str(self.query_state.cursor_position, table.as_str());
-                    self.query_state.cursor_position += table.len();
+                        .insert_str(self.query_state.cursor_position, table.insert_text.as_str());
+                    self.query_state.cursor_position += table.insert_text.len();
                 }
                 self.query_state.view_state = QueryViewState::Editing;
             }
@@ -290,9 +290,9 @@ impl App {
         };
 
         let rows = match conn.query_all(
-            "SELECT table_name FROM information_schema.tables \
+            "SELECT table_schema, table_name FROM information_schema.tables \
              WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-             ORDER BY table_name",
+             ORDER BY table_schema, table_name",
             &[],
         ) {
             Ok(rows) => rows,
@@ -303,9 +303,20 @@ impl App {
         };
 
         for row in rows {
-            if let Ok(name) = row.get::<String>(0) {
-                self.query_state.table_browser.tables.push(name);
-            }
+            let schema = match row.get::<String>(0) {
+                Ok(schema) => schema,
+                Err(_) => continue,
+            };
+            let name = match row.get::<String>(1) {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            let insert_text = format!("{}.{}", quote_ident(&schema), quote_ident(&name));
+            self.query_state.table_browser.tables.push(TableBrowserEntry {
+                schema,
+                name,
+                insert_text,
+            });
         }
         self.query_state.table_browser.loaded = true;
     }
@@ -471,4 +482,9 @@ impl App {
         }
     }
 
+}
+
+fn quote_ident(ident: &str) -> String {
+    let escaped = ident.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
 }

@@ -1737,7 +1737,7 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
         }
     }
 
-    /// Cancel a queued or running job.
+    /// Cancel a queued or pending job.
     ///
     /// Only jobs in QUEUED or PENDING status can be cancelled. Jobs that are already
     /// RUNNING, COMPLETED, or FAILED are not affected.

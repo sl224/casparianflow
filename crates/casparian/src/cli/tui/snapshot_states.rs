@@ -20,8 +20,8 @@ use super::app::{
     QueryViewState, QueueStats, ReviewTab, RuleDialogFocus, RuleId, RuleInfo, RunTab,
     SavedQueriesState, SavedQueryEntry, SchemaMismatchRow, SessionInfo, SessionsViewState,
     SettingsCategory, SettingsState, SinkOutput, SinkStats, SourceInfo, SuggestedFix,
-    TableBrowserState, TagInfo, ThroughputSample, TriageTab, TuiMode, ViolationSummary,
-    ViolationType, WorkspaceSwitcherMode,
+    TableBrowserEntry, TableBrowserState, TagInfo, ThroughputSample, TriageTab, TuiMode,
+    ViolationSummary, ViolationType, WorkspaceSwitcherMode,
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
@@ -2498,12 +2498,18 @@ fn sample_query_results() -> QueryResults {
     }
 }
 
-fn sample_query_tables() -> Vec<String> {
+fn sample_query_tables() -> Vec<TableBrowserEntry> {
+    let schema = "main";
+    let make_entry = |name: &str| TableBrowserEntry {
+        schema: schema.to_string(),
+        name: name.to_string(),
+        insert_text: format!("\"{}\".\"{}\"", schema, name),
+    };
     vec![
-        "scout_files".to_string(),
-        "scout_jobs".to_string(),
-        "scout_file_tags".to_string(),
-        "scout_rules".to_string(),
+        make_entry("scout_files"),
+        make_entry("scout_jobs"),
+        make_entry("scout_file_tags"),
+        make_entry("scout_rules"),
     ]
 }
 

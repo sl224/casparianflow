@@ -602,6 +602,19 @@ impl Database {
 
     /// Open an existing database with a busy timeout, skipping schema work.
     pub fn open_existing_with_busy_timeout(path: &Path, busy_timeout_ms: u64) -> Result<Self> {
+        if !path.exists() {
+            return Err(ScoutError::Config(format!(
+                "Scout database not initialized at {} (run init/open_with_init first)",
+                path.display()
+            )));
+        }
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() == 0 {
+            return Err(ScoutError::Config(format!(
+                "Scout database not initialized at {} (file is empty; run init/open_with_init first)",
+                path.display()
+            )));
+        }
         let conn = DbConnection::open_sqlite_with_busy_timeout(path, busy_timeout_ms)?;
         Self::from_conn_with_init(conn, false)
     }

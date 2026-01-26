@@ -49,7 +49,7 @@ pub enum JobAction {
         #[arg(long)]
         topic: Option<String>,
     },
-    /// Cancel a pending or running job
+    /// Cancel a queued or pending job
     Cancel {
         /// Job ID to cancel
         id: String,

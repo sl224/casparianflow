@@ -164,26 +164,88 @@ impl App {
                     TextInputResult::Committed => {
                         let tag = self.discover.bulk_tag_input.trim().to_string();
                         if !tag.is_empty() {
+                            if self.mutations_blocked() {
+                                let message = BackendRouter::new(
+                                    self.control_addr.clone(),
+                                    self.config.standalone_writer,
+                                    self.db_read_only,
+                                )
+                                .blocked_message("apply tags");
+                                self.discover.scan_error = Some(message.clone());
+                                self.discover.status_message = Some((message, true));
+                                self.discover.view_state = DiscoverViewState::Files;
+                                self.discover.bulk_tag_input.clear();
+                                self.discover.bulk_tag_save_as_rule = false;
+                                return;
+                            }
+                            let workspace_id = match self.active_workspace_id() {
+                                Some(id) => id,
+                                None => {
+                                    let message =
+                                        "No workspace selected; cannot apply tags".to_string();
+                                    self.discover.scan_error = Some(message.clone());
+                                    self.discover.status_message = Some((message, true));
+                                    self.discover.view_state = DiscoverViewState::Files;
+                                    self.discover.bulk_tag_input.clear();
+                                    self.discover.bulk_tag_save_as_rule = false;
+                                    return;
+                                }
+                            };
+
                             let file_ids: Vec<i64> =
                                 self.filtered_files().iter().map(|f| f.file_id).collect();
-                            let count = file_ids.len();
+                            let mut tagged_count = 0;
                             for file_id in file_ids {
-                                self.queue_tag_for_file(
+                                if self.queue_tag_for_file(
                                     file_id,
                                     &tag,
                                     TagSource::Manual,
                                     None,
                                     false,
-                                );
+                                ) {
+                                    tagged_count += 1;
+                                }
                             }
-                            let rule_msg = if self.discover.bulk_tag_save_as_rule {
-                                " (rule saved)"
-                            } else {
-                                ""
-                            };
+
+                            let mut rule_suffix = String::new();
+                            let mut rule_error = false;
+                            if self.discover.bulk_tag_save_as_rule {
+                                match self.discover_rule_pattern_from_filter() {
+                                    Some(pattern) => {
+                                        let rule_id = TaggingRuleId::new();
+                                        self.discover
+                                            .pending_rule_writes
+                                            .push(PendingRuleWrite {
+                                                id: rule_id,
+                                                workspace_id,
+                                                pattern: pattern.clone(),
+                                                tag: tag.clone(),
+                                            });
+                                        self.discover.rules.push(RuleInfo {
+                                            id: RuleId::new(rule_id),
+                                            pattern,
+                                            tag: tag.clone(),
+                                            priority: 100,
+                                            enabled: true,
+                                        });
+                                        rule_suffix.push_str(" (rule saved)");
+                                    }
+                                    None => {
+                                        let message =
+                                            "Save as rule requires a filter pattern (press /)"
+                                                .to_string();
+                                        self.discover.scan_error = Some(message.clone());
+                                        rule_suffix.push_str(" (rule not saved: add a filter)");
+                                        rule_error = true;
+                                    }
+                                }
+                            }
                             self.discover.status_message = Some((
-                                format!("Tagged {} files with '{}'{}", count, tag, rule_msg),
-                                false,
+                                format!(
+                                    "Tagged {} files with '{}'{}",
+                                    tagged_count, tag, rule_suffix
+                                ),
+                                rule_error,
                             ));
                         }
                         self.discover.view_state = DiscoverViewState::Files;
@@ -267,9 +329,13 @@ impl App {
                     let tag = self.discover.rule_tag_input.trim().to_string();
                     let pattern = self.discover.rule_pattern_input.trim().to_string();
                     if !tag.is_empty() && !pattern.is_empty() {
-                        let tagged_count = self.apply_rule_to_files(&pattern, &tag);
+                        let Some((rule_id, tagged_count)) =
+                            self.apply_rule_to_files(&pattern, &tag)
+                        else {
+                            return;
+                        };
                         self.discover.rules.push(RuleInfo {
-                            id: RuleId::unsaved(),
+                            id: RuleId::new(rule_id),
                             pattern: pattern.clone(),
                             tag: tag.clone(),
                             priority: 100,
@@ -1178,6 +1244,17 @@ impl App {
     fn handle_publishing_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Enter => {
+                if self.mutations_blocked() {
+                    let message = BackendRouter::new(
+                        self.control_addr.clone(),
+                        self.config.standalone_writer,
+                        self.db_read_only,
+                    )
+                    .blocked_message("publish rules");
+                    self.discover.scan_error = Some(message.clone());
+                    self.discover.status_message = Some((message, true));
+                    return;
+                }
                 // Confirm publish - save to DB and start job
                 if let Some(ref mut explorer) = self.discover.glob_explorer {
                     if let Some(ref mut publish_state) = explorer.publish_state {
@@ -2006,8 +2083,9 @@ impl App {
             // Ctrl+S: Save rule
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if mutations_blocked {
-                    self.discover.status_message =
-                        Some((blocked_message("save rules"), true));
+                    let message = blocked_message("save rules");
+                    self.discover.scan_error = Some(message.clone());
+                    self.discover.status_message = Some((message, true));
                     return;
                 }
                 let workspace_id = match active_workspace_id {
@@ -2362,8 +2440,9 @@ impl App {
             // 't' applies manual tag to preview (selection-aware)
             KeyCode::Char('t') if builder.focus == RuleBuilderFocus::FileList => {
                 if mutations_blocked {
-                    self.discover.status_message =
-                        Some((blocked_message("apply tags"), true));
+                    let message = blocked_message("apply tags");
+                    self.discover.scan_error = Some(message.clone());
+                    self.discover.status_message = Some((message, true));
                     return;
                 }
                 if builder.tag.trim().is_empty() {
