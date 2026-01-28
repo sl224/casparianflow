@@ -603,7 +603,10 @@ fn print_job_details(job: &Job, failure: &Option<JobFailure>, timeline: &JobTime
             job.id
         );
         println!("  casparian preview {}   # Inspect the file", job.file_path);
-    } else if job.status == ProcessingStatus::Queued || job.status == ProcessingStatus::Running {
+    } else if job.status == ProcessingStatus::Queued
+        || job.status == ProcessingStatus::Dispatching
+        || job.status == ProcessingStatus::Running
+    {
         println!(
             "  casparian job cancel {}           # Cancel this job",
             job.id

@@ -78,12 +78,9 @@ pub async fn job_list(
             .collect()
     } else {
         let conn = state
-            .open_rw_connection()
+            .open_readonly_connection()
             .map_err(|e| CommandError::Database(e.to_string()))?;
         let queue = JobQueue::new(conn);
-        queue
-            .init_queue_schema()
-            .map_err(|e| CommandError::Database(e.to_string()))?;
         let jobs = queue
             .list_jobs(status_filter, limit, 0)
             .map_err(|e| CommandError::Database(e.to_string()))?;
@@ -139,12 +136,9 @@ pub async fn job_status(job_id: String, state: State<'_, AppState>) -> CommandRe
     }
 
     let conn = state
-        .open_rw_connection()
+        .open_readonly_connection()
         .map_err(|e| CommandError::Database(e.to_string()))?;
     let queue = JobQueue::new(conn);
-    queue
-        .init_queue_schema()
-        .map_err(|e| CommandError::Database(e.to_string()))?;
     let job = queue
         .get_job(JobId::new(id))
         .map_err(|e| CommandError::Database(e.to_string()))?
@@ -207,40 +201,19 @@ pub async fn job_cancel(
                 CommandError::Internal(format!("Control API error: {}", e))
             })?
     } else {
-        // Fall back to direct DB (limited - can only update status, not stop worker)
-        tracing::debug!(
-            "Cancelling job {} via direct DB (sentinel not available)",
-            job_id
-        );
-        let conn = state
-            .open_rw_connection()
-            .map_err(|e| CommandError::Database(e.to_string()))?;
-        let queue = JobQueue::new(conn);
-        queue
-            .init_queue_schema()
-            .map_err(|e| CommandError::Database(e.to_string()))?;
-        let cancelled = queue
-            .cancel_job(JobId::new(id))
-            .map_err(|e| {
-                if let Some((event_id, correlation_id)) = &tape_ids {
-                    if let Ok(tape) = state.tape().read() {
-                        tape.emit_error(
-                            correlation_id,
-                            event_id,
-                            &e.to_string(),
-                            serde_json::json!({"status": "failed", "job_id": job_id, "via": "direct_db"}),
-                        );
-                    }
-                }
-                CommandError::Database(e.to_string())
-            })?;
-
-        let msg = if cancelled {
-            "Cancelled (DB only - worker may still be running)"
-        } else {
-            "Job not in cancellable state"
-        };
-        (cancelled, msg.to_string())
+        if let Some((event_id, correlation_id)) = &tape_ids {
+            if let Ok(tape) = state.tape().read() {
+                tape.emit_error(
+                    correlation_id,
+                    event_id,
+                    "Sentinel is not running; cannot cancel jobs",
+                    serde_json::json!({"status": "failed", "job_id": job_id, "via": "control_api"}),
+                );
+            }
+        }
+        return Err(CommandError::Internal(
+            "Sentinel must be running to cancel jobs".to_string(),
+        ));
     };
 
     let status = if cancelled { "cancelled" } else { "unchanged" };

@@ -208,7 +208,9 @@ pub enum HttpJobStatus {
 impl From<ProcessingStatus> for HttpJobStatus {
     fn from(status: ProcessingStatus) -> Self {
         match status {
-            ProcessingStatus::Pending | ProcessingStatus::Queued => HttpJobStatus::Queued,
+            ProcessingStatus::Pending
+            | ProcessingStatus::Queued
+            | ProcessingStatus::Dispatching => HttpJobStatus::Queued,
             ProcessingStatus::Running | ProcessingStatus::Staged => HttpJobStatus::Running,
             ProcessingStatus::Completed => HttpJobStatus::Completed,
             ProcessingStatus::Aborted => HttpJobStatus::Cancelled,

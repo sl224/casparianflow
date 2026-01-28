@@ -29,6 +29,7 @@ pub struct JobsArgs {
 fn status_color(status: ProcessingStatus) -> Color {
     match status {
         ProcessingStatus::Queued => Color::Yellow,
+        ProcessingStatus::Dispatching => Color::Grey,
         ProcessingStatus::Running => Color::Cyan,
         ProcessingStatus::Staged => Color::Blue,
         ProcessingStatus::Completed => Color::Green,
@@ -191,6 +192,7 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
     if args.pending {
         statuses.push(ProcessingStatus::Queued.as_str());
         statuses.push(ProcessingStatus::Pending.as_str());
+        statuses.push(ProcessingStatus::Dispatching.as_str());
     }
     if args.running {
         statuses.push(ProcessingStatus::Running.as_str());
@@ -207,6 +209,7 @@ fn build_status_filter(args: &JobsArgs) -> Vec<&'static str> {
     if statuses.is_empty() {
         statuses.extend(&[
             ProcessingStatus::Queued.as_str(),
+            ProcessingStatus::Dispatching.as_str(),
             ProcessingStatus::Running.as_str(),
             ProcessingStatus::Completed.as_str(),
             ProcessingStatus::Failed.as_str(),
@@ -243,7 +246,8 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
         SELECT
             COUNT(*) as total,
             COALESCE(SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END), 0) as queued,
-            COALESCE(SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END), 0) as running,
+            COALESCE(SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END), 0)
+                + COALESCE(SUM(CASE WHEN status = '{dispatching}' THEN 1 ELSE 0 END), 0) as running,
             COALESCE(SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END), 0) as completed,
             COALESCE(SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END), 0) as failed,
             COALESCE(SUM(CASE WHEN status = '{aborted}' THEN 1 ELSE 0 END), 0) as aborted
@@ -251,6 +255,7 @@ fn get_queue_stats(conn: &DbConnection) -> anyhow::Result<QueueStats> {
         "#,
             queued = ProcessingStatus::Queued.as_str(),
             running = ProcessingStatus::Running.as_str(),
+            dispatching = ProcessingStatus::Dispatching.as_str(),
             completed = ProcessingStatus::Completed.as_str(),
             failed = ProcessingStatus::Failed.as_str(),
             aborted = ProcessingStatus::Aborted.as_str(),
@@ -713,6 +718,13 @@ mod tests {
             ProcessingStatus::Running
         );
         assert_eq!(
+            ProcessingStatus::Dispatching
+                .as_str()
+                .parse::<ProcessingStatus>()
+                .unwrap(),
+            ProcessingStatus::Dispatching
+        );
+        assert_eq!(
             ProcessingStatus::Completed
                 .as_str()
                 .parse::<ProcessingStatus>()
@@ -774,6 +786,7 @@ mod tests {
         let filter = build_status_filter(&args);
         assert!(filter.contains(&ProcessingStatus::Queued.as_str()));
         assert!(filter.contains(&ProcessingStatus::Pending.as_str()));
+        assert!(filter.contains(&ProcessingStatus::Dispatching.as_str()));
         assert!(!filter.contains(&ProcessingStatus::Running.as_str()));
     }
 

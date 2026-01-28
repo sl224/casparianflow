@@ -38,6 +38,13 @@ use casparian::scout::{
     RuleApplyRule, ScanCancelToken, ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source,
     SourceId, SourceType, TagSource, TaggingRuleId, Workspace, WorkspaceId,
 };
+
+fn dev_allow_offline_write() -> bool {
+    std::env::var("CASPARIAN_DEV_ALLOW_DIRECT_DB_WRITE")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
 use casparian::telemetry::{scan_config_telemetry, TelemetryRecorder};
 use casparian_protocol::telemetry as protocol_telemetry;
 use uuid::Uuid;
@@ -1274,7 +1281,9 @@ impl JobStatus {
             completion_status.and_then(|status| status.parse::<ProtocolJobStatus>().ok());
 
         match queue_status {
-            Some(ProcessingStatus::Pending) | Some(ProcessingStatus::Queued) => JobStatus::Pending,
+            Some(ProcessingStatus::Pending)
+            | Some(ProcessingStatus::Queued)
+            | Some(ProcessingStatus::Dispatching) => JobStatus::Pending,
             Some(ProcessingStatus::Running) | Some(ProcessingStatus::Staged) => JobStatus::Running,
             Some(ProcessingStatus::Skipped) => JobStatus::Completed,
             Some(ProcessingStatus::Aborted) => JobStatus::Cancelled,
@@ -3460,6 +3469,13 @@ impl App {
             self.discover.status_message = Some((warn, true));
             return false;
         }
+        if !dev_allow_offline_write() {
+            let warn = "Standalone writer disabled; set CASPARIAN_DEV_ALLOW_DIRECT_DB_WRITE=1."
+                .to_string();
+            self.db_health_warning = Some(warn.clone());
+            self.discover.status_message = Some((warn, true));
+            return false;
+        }
         if !dev_allow_destructive_reset() {
             let warn = "Destructive reset disabled; set CASPARIAN_DEV_ALLOW_RESET=1 to allow."
                 .to_string();
@@ -3622,7 +3638,7 @@ impl App {
             .as_deref()
             .map(Self::probe_control_addr)
             .unwrap_or(false);
-        Self {
+        let mut app = Self {
             running: true,
             mode: TuiMode::Home,
             ingest_tab: IngestTab::Select,
@@ -3695,7 +3711,25 @@ impl App {
             db_read_only: false,
             db_health_checked: false,
             db_health_warning: None,
+        };
+
+        if app.config.standalone_writer {
+            if dev_allow_offline_write() {
+                app.set_global_status_for(
+                    "OFFLINE WRITE MODE (dev only)",
+                    true,
+                    Duration::from_secs(60 * 60 * 24),
+                );
+            } else {
+                app.set_global_status_for(
+                    "Standalone writer disabled; set CASPARIAN_DEV_ALLOW_DIRECT_DB_WRITE=1",
+                    true,
+                    Duration::from_secs(8),
+                );
+            }
         }
+
+        app
     }
 
     /// Enter Discover mode with Rule Builder initialized immediately.
@@ -3766,7 +3800,11 @@ impl App {
     }
 
     fn open_db_write(&self) -> Result<Option<DbConnection>, BackendError> {
-        if self.db_read_only || self.control_connected || !self.config.standalone_writer {
+        if self.db_read_only
+            || self.control_connected
+            || !self.config.standalone_writer
+            || !dev_allow_offline_write()
+        {
             return Ok(None);
         }
         let (backend, path) = self.resolve_db_target();
@@ -3774,7 +3812,11 @@ impl App {
     }
 
     fn open_scout_db_for_writes(&mut self) -> Option<ScoutDatabase> {
-        if self.db_read_only || self.control_connected || !self.config.standalone_writer {
+        if self.db_read_only
+            || self.control_connected
+            || !self.config.standalone_writer
+            || !dev_allow_offline_write()
+        {
             return None;
         }
         let (_backend, path) = self.resolve_db_target();
@@ -3980,7 +4022,7 @@ impl App {
     fn mutations_blocked(&self) -> bool {
         BackendRouter::new(
             self.control_addr.clone(),
-            self.config.standalone_writer,
+            self.config.standalone_writer && dev_allow_offline_write(),
             self.db_read_only,
         )
         .mutations_blocked(self.control_connected)
@@ -8252,6 +8294,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     CASE q.status
                         WHEN '{running}' THEN 1
                         WHEN '{staged}' THEN 1
+                        WHEN '{dispatching}' THEN 1
                         WHEN '{queued}' THEN 2
                         WHEN '{pending}' THEN 2
                         WHEN '{failed}' THEN 3
@@ -8266,6 +8309,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                         quarantine_join = quarantine_join,
                         running = ProcessingStatus::Running.as_str(),
                         staged = ProcessingStatus::Staged.as_str(),
+                        dispatching = ProcessingStatus::Dispatching.as_str(),
                         queued = ProcessingStatus::Queued.as_str(),
                         pending = ProcessingStatus::Pending.as_str(),
                         failed = ProcessingStatus::Failed.as_str(),
@@ -8293,6 +8337,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     CASE q.status
                         WHEN '{running}' THEN 1
                         WHEN '{staged}' THEN 1
+                        WHEN '{dispatching}' THEN 1
                         WHEN '{queued}' THEN 2
                         WHEN '{pending}' THEN 2
                         WHEN '{failed}' THEN 3
@@ -8307,6 +8352,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                         quarantine_join = quarantine_join,
                         running = ProcessingStatus::Running.as_str(),
                         staged = ProcessingStatus::Staged.as_str(),
+                        dispatching = ProcessingStatus::Dispatching.as_str(),
                         queued = ProcessingStatus::Queued.as_str(),
                         pending = ProcessingStatus::Pending.as_str(),
                         failed = ProcessingStatus::Failed.as_str(),
@@ -8507,7 +8553,9 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                         if let Ok(queue_status) = status.parse::<ProcessingStatus>() {
                             match queue_status {
                                 ProcessingStatus::Running => stats.running_jobs = count as usize,
-                                ProcessingStatus::Queued => stats.pending_jobs = count as usize,
+                                ProcessingStatus::Queued | ProcessingStatus::Dispatching => {
+                                    stats.pending_jobs = count as usize
+                                }
                                 ProcessingStatus::Failed | ProcessingStatus::Aborted => {
                                     stats.failed_jobs = count as usize
                                 }

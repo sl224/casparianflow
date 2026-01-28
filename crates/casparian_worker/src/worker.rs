@@ -206,6 +206,7 @@ const KILL_GRACE_PERIOD_SECS: u64 = 3;
 struct ActiveJob {
     handle: JoinHandle<()>,
     cancel_token: CancellationToken,
+    lease_token: Option<String>,
 }
 
 /// Worker configuration (plain data)
@@ -498,7 +499,7 @@ impl Worker {
         }
 
         let shutdown_timeout = Duration::from_secs(DEFAULT_SHUTDOWN_TIMEOUT_SECS);
-        let mut timed_out_jobs = Vec::new();
+        let mut timed_out_jobs: Vec<(JobId, Option<String>)> = Vec::new();
 
         // Wait for all job handles to complete (with per-job timeout)
         for (job_id, active_job) in self.active_jobs.drain() {
@@ -517,7 +518,7 @@ impl Worker {
                         "Job {} timed out during shutdown ({}s), aborting",
                         job_id, DEFAULT_SHUTDOWN_TIMEOUT_SECS
                     );
-                    timed_out_jobs.push(job_id);
+                    timed_out_jobs.push((job_id, active_job.lease_token.clone()));
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -525,7 +526,7 @@ impl Worker {
         }
 
         // Send explicit Aborted receipts for timed-out jobs so sentinel receives terminal receipts
-        for job_id in &timed_out_jobs {
+        for (job_id, lease_token) in &timed_out_jobs {
             warn!(
                 "Shutdown: sending ABORTED receipt for timed-out job {}",
                 job_id
@@ -540,6 +541,7 @@ impl Worker {
                 )),
                 diagnostics: None,
                 source_hash: None, // Not available for timed-out jobs
+                lease_token: lease_token.clone(),
             };
             if let Err(e) = send_message(&self.socket, OpCode::Conclude, *job_id, &receipt) {
                 error!(
@@ -550,10 +552,11 @@ impl Worker {
         }
 
         if !timed_out_jobs.is_empty() {
+            let job_ids: Vec<JobId> = timed_out_jobs.iter().map(|(job_id, _)| *job_id).collect();
             info!(
                 "Shutdown: sent ABORTED receipts for {} timed-out jobs: {:?}",
                 timed_out_jobs.len(),
-                timed_out_jobs
+                job_ids
             );
         }
 
@@ -561,7 +564,10 @@ impl Worker {
         // Jobs send results via result_tx, we must receive and forward them
         let mut concluded_count = 0;
         while let Ok(result) = self.result_rx.try_recv() {
-            if timed_out_jobs.contains(&result.job_id) {
+            if timed_out_jobs
+                .iter()
+                .any(|(job_id, _)| *job_id == result.job_id)
+            {
                 debug!(
                     "Shutdown: skipping CONCLUDE for timed-out job {} (already aborted)",
                     result.job_id
@@ -612,6 +618,7 @@ impl Worker {
                         error_message: Some("Worker at capacity".to_string()),
                         diagnostics: None,
                         source_hash: None, // Not computed before rejection
+                        lease_token: cmd.lease_token.clone(),
                     };
                     send_message(&self.socket, OpCode::Conclude, job_id, &receipt)?;
                     return Ok(());
@@ -623,6 +630,15 @@ impl Worker {
                     cmd.plugin_name,
                     self.active_jobs.len() + 1
                 );
+
+                let lease_token = cmd.lease_token.clone();
+                if let Some(token) = lease_token.clone() {
+                    let ack = types::DispatchAckPayload {
+                        lease_token: token,
+                        worker_id: Some(self.config.worker_id.clone()),
+                    };
+                    send_message(&self.socket, OpCode::DispatchAck, job_id, &ack)?;
+                }
 
                 // Create cancellation token for this job
                 let cancel_token = CancellationToken::new();
@@ -652,6 +668,7 @@ impl Worker {
                     ActiveJob {
                         handle,
                         cancel_token,
+                        lease_token,
                     },
                 );
             }
@@ -1223,6 +1240,7 @@ fn execute_job(
     shim_path: PathBuf,
     cancel_token: CancellationToken,
 ) -> types::JobReceipt {
+    let lease_token = cmd.lease_token.clone();
     let span = tracing::info_span!(
         "worker.execute_job",
         job_id = %job_id,
@@ -1244,6 +1262,7 @@ fn execute_job(
             error_message: Some("Job cancelled before execution".to_string()),
             diagnostics: None,
             source_hash: None,
+            lease_token: lease_token.clone(),
         };
         let duration_ms = start.elapsed().as_millis() as u64;
         span.record("duration_ms", &duration_ms);
@@ -1280,6 +1299,7 @@ fn execute_job(
                 error_message: None,
                 diagnostics: None,
                 source_hash: Some(source_hash),
+                lease_token: lease_token.clone(),
             };
             let duration_ms = start.elapsed().as_millis() as u64;
             span.record("duration_ms", &duration_ms);
@@ -1306,6 +1326,7 @@ fn execute_job(
                 error_message: Some(reason),
                 diagnostics: None,
                 source_hash: Some(source_hash),
+                lease_token: lease_token.clone(),
             };
             let duration_ms = start.elapsed().as_millis() as u64;
             span.record("duration_ms", &duration_ms);
@@ -1320,6 +1341,7 @@ fn execute_job(
                 error_message: Some("Job cancelled during execution".to_string()),
                 diagnostics: None,
                 source_hash,
+                lease_token: lease_token.clone(),
             };
             let duration_ms = start.elapsed().as_millis() as u64;
             span.record("duration_ms", &duration_ms);
@@ -1358,6 +1380,7 @@ fn execute_job(
                 diagnostics,
                 // Hash unavailable on early failure (e.g., file not found, venv setup failure)
                 source_hash: None,
+                lease_token: lease_token.clone(),
             };
             let duration_ms = start.elapsed().as_millis() as u64;
             span.record("duration_ms", &duration_ms);
@@ -2255,6 +2278,7 @@ mod tests {
             file_path: "/tmp/input.csv".to_string(),
             sinks,
             file_id: 1,
+            lease_token: None,
             runtime_kind: types::RuntimeKind::PythonShim,
             entrypoint: "test_plugin.py:Handler".to_string(),
             platform_os: None,

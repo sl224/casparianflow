@@ -151,6 +151,8 @@ pub enum ProcessingStatus {
     Pending,
     /// Job is queued and ready for a worker
     Queued,
+    /// Job has been leased for dispatch but not yet acknowledged by a worker
+    Dispatching,
     /// Job is currently being processed by a worker
     Running,
     /// Job data written but awaiting finalization (used by `casparian run`)
@@ -169,6 +171,7 @@ impl ProcessingStatus {
     pub const ALL: &'static [ProcessingStatus] = &[
         ProcessingStatus::Pending,
         ProcessingStatus::Queued,
+        ProcessingStatus::Dispatching,
         ProcessingStatus::Running,
         ProcessingStatus::Staged,
         ProcessingStatus::Completed,
@@ -181,6 +184,7 @@ impl ProcessingStatus {
         match self {
             ProcessingStatus::Pending => "PENDING",
             ProcessingStatus::Queued => "QUEUED",
+            ProcessingStatus::Dispatching => "DISPATCHING",
             ProcessingStatus::Running => "RUNNING",
             ProcessingStatus::Staged => "STAGED",
             ProcessingStatus::Completed => "COMPLETED",
@@ -195,6 +199,7 @@ impl ProcessingStatus {
         match self {
             ProcessingStatus::Pending => "pending",
             ProcessingStatus::Queued => "queued",
+            ProcessingStatus::Dispatching => "dispatching",
             ProcessingStatus::Running => "running",
             ProcessingStatus::Staged => "staged",
             ProcessingStatus::Completed => "complete",
@@ -215,7 +220,10 @@ impl ProcessingStatus {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self, ProcessingStatus::Running | ProcessingStatus::Staged)
+        matches!(
+            self,
+            ProcessingStatus::Dispatching | ProcessingStatus::Running | ProcessingStatus::Staged
+        )
     }
 }
 
@@ -232,6 +240,7 @@ impl FromStr for ProcessingStatus {
         match s.to_uppercase().as_str() {
             "PENDING" => Ok(ProcessingStatus::Pending),
             "QUEUED" => Ok(ProcessingStatus::Queued),
+            "DISPATCHING" | "DISPATCH" => Ok(ProcessingStatus::Dispatching),
             "RUNNING" => Ok(ProcessingStatus::Running),
             "STAGED" => Ok(ProcessingStatus::Staged),
             "COMPLETED" | "COMPLETE" => Ok(ProcessingStatus::Completed),
@@ -1099,6 +1108,8 @@ pub struct DispatchCommand {
     pub file_path: String,
     pub sinks: Vec<SinkConfig>,
     pub file_id: i64, // Required for lineage restoration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
 
     // Runtime selection + entrypoint
     pub runtime_kind: RuntimeKind,
@@ -1322,11 +1333,22 @@ pub struct JobReceipt {
     /// and correlating outputs with specific input versions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_token: Option<String>,
 }
 
 // ============================================================================
 // OpCode.IDENTIFY (Worker -> Sentinel)
 // ============================================================================
+
+/// Payload for OpCode.DISPATCH_ACK.
+/// Worker -> Sentinel: "I accepted this dispatch lease."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchAckPayload {
+    pub lease_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+}
 
 /// Payload for OpCode.IDENTIFY.
 /// Worker -> Sentinel: Handshake with capabilities (informational only in v1).
@@ -1748,6 +1770,7 @@ mod tests {
             error_message: None,
             diagnostics: None,
             source_hash: Some("abc123def456".to_string()),
+            lease_token: None,
         };
 
         let json = serde_json::to_string(&receipt).unwrap();
@@ -1772,6 +1795,7 @@ mod tests {
             error_message: None,
             diagnostics: None,
             source_hash: Some("abcd1234".to_string()),
+            lease_token: None,
         };
         let json = serde_json::to_string(&receipt_with_hash).unwrap();
         assert!(json.contains("source_hash"));
@@ -1785,6 +1809,7 @@ mod tests {
             error_message: Some("error".to_string()),
             diagnostics: None,
             source_hash: None,
+            lease_token: None,
         };
         let json = serde_json::to_string(&receipt_no_hash).unwrap();
         assert!(!json.contains("source_hash"));

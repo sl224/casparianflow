@@ -45,6 +45,7 @@ pub use types::{
     DeployResponse,
     DetectionConfidence,
     DispatchCommand,
+    DispatchAckPayload,
     ErrorPayload,
     HeartbeatPayload,
     HeartbeatStatus,
@@ -151,6 +152,9 @@ pub enum OpCode {
     // Sentinel -> Worker (Command)
     Dispatch = 2, // "Process this file. Here is your sink configuration."
 
+    // Worker -> Sentinel (Dispatch ACK)
+    DispatchAck = 8, // "I accepted this dispatch lease."
+
     // Sentinel -> Worker (Abort)
     Abort = 3, // "Cancel this job."
 
@@ -178,6 +182,7 @@ impl OpCode {
             0 => Ok(OpCode::Unknown),
             1 => Ok(OpCode::Identify),
             2 => Ok(OpCode::Dispatch),
+            8 => Ok(OpCode::DispatchAck),
             3 => Ok(OpCode::Abort),
             4 => Ok(OpCode::Heartbeat),
             5 => Ok(OpCode::Conclude),
@@ -355,6 +360,7 @@ mod tests {
         for opcode in [
             OpCode::Identify,
             OpCode::Dispatch,
+            OpCode::DispatchAck,
             OpCode::Heartbeat,
             OpCode::Conclude,
         ] {

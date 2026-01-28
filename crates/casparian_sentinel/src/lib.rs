@@ -10,6 +10,8 @@
 
 pub mod control;
 pub mod control_client;
+mod catalog_executor;
+mod sqlite_executor;
 pub mod db;
 pub mod metrics;
 pub mod sentinel;

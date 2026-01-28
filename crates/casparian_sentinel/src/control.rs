@@ -6,8 +6,8 @@
 //!
 //! # Protocol
 //!
-//! Uses ZMQ REP socket with JSON request/response protocol:
-//! - Request: JSON-encoded `ControlRequest`
+//! Uses ZMQ ROUTER socket with JSON request/response protocol:
+//! - Request: JSON-encoded `ControlRequest` (ROUTER identity frames handled by sentinel)
 //! - Response: JSON-encoded `ControlResponse`
 //!
 //! # Supported Operations

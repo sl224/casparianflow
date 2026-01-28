@@ -118,8 +118,218 @@ pub struct StateStoreQueueSession {
 }
 
 impl StateStoreQueueSession {
-    pub fn claim_jobs(&self, limit: usize) -> Result<Vec<ProcessingJob>> {
-        self.queue.claim_jobs(limit)
+    pub fn lease_jobs_for_dispatch(
+        &self,
+        limit: usize,
+        now: i64,
+        ttl_ms: i64,
+    ) -> Result<Vec<ProcessingJob>> {
+        self.queue.lease_jobs_for_dispatch(limit, now, ttl_ms)
+    }
+
+    pub fn set_dispatch_lease(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        lease_owner: &str,
+    ) -> Result<bool> {
+        self.queue
+            .set_dispatch_lease(job_id, lease_token, lease_owner)
+    }
+
+    pub fn ack_dispatch(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        lease_owner: &str,
+        now: i64,
+    ) -> Result<bool> {
+        self.queue
+            .ack_dispatch(job_id, lease_token, lease_owner, now)
+    }
+
+    pub fn requeue_expired_dispatches(&self, now: i64) -> Result<usize> {
+        self.queue.requeue_expired_dispatches(now)
+    }
+
+    pub fn complete_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        completion_status: &str,
+        summary: &str,
+        quarantine_rows: Option<i64>,
+    ) -> Result<bool> {
+        self.queue.complete_job_if_token_matches(
+            job_id,
+            lease_token,
+            completion_status,
+            summary,
+            quarantine_rows,
+        )
+    }
+
+    pub fn complete_job(
+        &self,
+        job_id: i64,
+        completion_status: &str,
+        summary: &str,
+        quarantine_rows: Option<i64>,
+    ) -> Result<()> {
+        self.queue
+            .complete_job(job_id, completion_status, summary, quarantine_rows)
+    }
+
+    pub fn fail_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        completion_status: &str,
+        error: &str,
+    ) -> Result<bool> {
+        self.queue
+            .fail_job_if_token_matches(job_id, lease_token, completion_status, error)
+    }
+
+    pub fn fail_job(&self, job_id: i64, completion_status: &str, error: &str) -> Result<()> {
+        self.queue.fail_job(job_id, completion_status, error)
+    }
+
+    pub fn abort_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        error: &str,
+    ) -> Result<bool> {
+        self.queue
+            .abort_job_if_token_matches(job_id, lease_token, error)
+    }
+
+    pub fn abort_job(&self, job_id: i64, error: &str) -> Result<()> {
+        self.queue.abort_job(job_id, error)
+    }
+
+    pub fn list_running_jobs_by_owner(&self, lease_owner: &str) -> Result<Vec<i64>> {
+        self.queue.list_running_jobs_by_owner(lease_owner)
+    }
+
+    pub fn list_running_jobs_with_owner(&self) -> Result<Vec<(i64, Option<String>)>> {
+        self.queue.list_running_jobs_with_owner()
+    }
+
+    pub fn load_file_generation(&self, file_id: i64) -> Result<Option<(i64, i64)>> {
+        self.queue.load_file_generation(file_id)
+    }
+
+    pub fn get_dispatch_metadata(&self, job_id: i64) -> Result<Option<DispatchMetadata>> {
+        self.queue.get_dispatch_metadata(job_id)
+    }
+
+    pub fn record_dispatch_metadata(
+        &self,
+        job_id: i64,
+        parser_version: &str,
+        parser_fingerprint: &str,
+        sink_config_json: &str,
+    ) -> Result<()> {
+        self.queue
+            .record_dispatch_metadata(job_id, parser_version, parser_fingerprint, sink_config_json)
+    }
+
+    pub fn insert_output_materialization(
+        &self,
+        record: &OutputMaterialization,
+    ) -> Result<()> {
+        self.queue.insert_output_materialization(record)
+    }
+
+    pub fn record_schema_mismatch(
+        &self,
+        job_id: i64,
+        mismatch: &casparian_protocol::types::SchemaMismatch,
+    ) -> Result<()> {
+        self.queue.record_schema_mismatch(job_id, mismatch)
+    }
+
+    pub fn defer_job(&self, job_id: i64, scheduled_at: i64, reason: Option<&str>) -> Result<()> {
+        self.queue.defer_job(job_id, scheduled_at, reason)
+    }
+
+    pub fn schedule_retry(
+        &self,
+        job_id: i64,
+        next_retry_count: i32,
+        error: &str,
+        scheduled_at: i64,
+    ) -> Result<()> {
+        self.queue
+            .schedule_retry(job_id, next_retry_count, error, scheduled_at)
+    }
+
+    pub fn move_to_dead_letter(
+        &self,
+        job_id: i64,
+        error: &str,
+        reason: DeadLetterReason,
+    ) -> Result<()> {
+        self.queue.move_to_dead_letter(job_id, error, reason)
+    }
+
+    pub fn record_parser_success(&self, parser_name: &str) -> Result<()> {
+        self.queue.record_parser_success(parser_name)
+    }
+
+    pub fn record_parser_failure(&self, parser_name: &str, reason: &str) -> Result<i32> {
+        self.queue.record_parser_failure(parser_name, reason)
+    }
+
+    pub fn pause_parser(&self, parser_name: &str) -> Result<()> {
+        self.queue.pause_parser(parser_name)
+    }
+
+    pub fn get_parser_health(&self, parser_name: &str) -> Result<Option<ParserHealth>> {
+        self.queue.get_parser_health(parser_name)
+    }
+
+    pub fn update_pipeline_run_status_for_job(&self, job_id: i64) -> Result<()> {
+        self.queue.update_pipeline_run_status_for_job(job_id)
+    }
+
+    pub fn set_pipeline_run_running(&self, run_id: &str) -> Result<()> {
+        self.queue.set_pipeline_run_running(run_id)
+    }
+
+    pub fn update_pipeline_run_status(&self, run_id: &str) -> Result<()> {
+        self.queue.update_pipeline_run_status(run_id)
+    }
+
+    pub fn list_jobs(
+        &self,
+        status: Option<ProcessingStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Job>> {
+        let limit = usize::try_from(limit.max(0))
+            .map_err(|_| anyhow::anyhow!("list_jobs limit exceeds usize::MAX"))?;
+        let offset = usize::try_from(offset.max(0))
+            .map_err(|_| anyhow::anyhow!("list_jobs offset exceeds usize::MAX"))?;
+        self.queue.list_jobs(status, limit, offset)
+    }
+
+    pub fn get_job(&self, job_id: JobId) -> Result<Option<Job>> {
+        self.queue.get_job(job_id)
+    }
+
+    pub fn cancel_job(&self, job_id: JobId) -> Result<bool> {
+        self.queue.cancel_job(job_id)
+    }
+
+    pub fn count_jobs_by_status(&self) -> Result<HashMap<ProcessingStatus, i64>> {
+        self.queue.count_jobs_by_status()
+    }
+
+    pub fn load_dispatch_data(&self, plugin_name: &str, file_id: i64) -> Result<DispatchData> {
+        self.queue.load_dispatch_data(plugin_name, file_id)
     }
 }
 
@@ -174,7 +384,7 @@ pub struct DispatchData {
 }
 
 impl DispatchData {
-    fn from_row(row: &UnifiedDbRow) -> Result<Self> {
+    pub(crate) fn from_row(row: &UnifiedDbRow) -> Result<Self> {
         let runtime_str: String = row.get_by_name("runtime_kind")?;
         let runtime_kind = runtime_str
             .parse::<RuntimeKind>()

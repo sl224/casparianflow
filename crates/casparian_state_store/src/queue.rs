@@ -6,10 +6,13 @@ use anyhow::{Context, Result};
 use casparian_db::{BackendError, DbConnection, DbValue, UnifiedDbRow};
 use chrono::Utc;
 use casparian_protocol::types::{ObservedDataType, SchemaMismatch};
-use casparian_protocol::{JobId, JobStatus, PluginStatus, ProcessingStatus, RuntimeKind, SinkMode};
+use casparian_protocol::{
+    JobId, JobStatus, PipelineRunStatus, PluginStatus, ProcessingStatus, RuntimeKind, SinkMode,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 
+use crate::DispatchData;
 use super::models::{
     DeadLetterJob, DeadLetterReason, ParserHealth, ProcessingJob, QuarantinedRow,
     QuarantinedRowSummary, DEAD_LETTER_COLUMNS, PARSER_HEALTH_COLUMNS, PROCESSING_JOB_COLUMNS,
@@ -19,6 +22,8 @@ use super::schema_version::{ensure_schema_version, SCHEMA_VERSION};
 
 /// Maximum number of retries before a job is marked as permanently failed
 pub const MAX_RETRY_COUNT: i32 = 3;
+/// Default lease TTL for queue helpers that don't accept a TTL parameter.
+const DEFAULT_DISPATCH_LEASE_TTL_MS: i64 = 60_000;
 
 /// Job details needed for processing
 #[derive(Debug, Clone)]
@@ -145,6 +150,10 @@ impl JobQueue {
                 worker_host TEXT,
                 worker_pid INTEGER,
                 claim_time INTEGER,
+                lease_token TEXT,
+                lease_owner TEXT,
+                lease_expires_at INTEGER,
+                dispatch_ack_at INTEGER,
                 scheduled_at INTEGER NOT NULL,
                 end_time INTEGER,
                 result_summary TEXT,
@@ -206,6 +215,10 @@ impl JobQueue {
                 worker_host TEXT,
                 worker_pid INTEGER,
                 claim_time BIGINT,
+                lease_token TEXT,
+                lease_owner TEXT,
+                lease_expires_at BIGINT,
+                dispatch_ack_at BIGINT,
                 scheduled_at BIGINT NOT NULL,
                 end_time BIGINT,
                 result_summary TEXT,
@@ -259,6 +272,10 @@ impl JobQueue {
                 "parser_version",
                 "parser_fingerprint",
                 "sink_config_json",
+                "lease_token",
+                "lease_owner",
+                "lease_expires_at",
+                "dispatch_ack_at",
             ],
         )?;
         Ok(())
@@ -475,18 +492,29 @@ impl JobQueue {
         }))
     }
 
-    /// Claim a job by setting status to RUNNING.
-    pub fn claim_job(&self, job_id: i64) -> Result<()> {
-        let now = now_millis();
-        self.conn.execute(
-            "UPDATE cf_processing_queue SET status = ?, claim_time = ? WHERE id = ?",
+    /// Mark a specific job as leased for dispatch.
+    pub fn lease_job_for_dispatch(&self, job_id: i64, now: i64, ttl_ms: i64) -> Result<bool> {
+        let lease_expires_at = now.saturating_add(ttl_ms);
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET status = ?,
+                    claim_time = ?,
+                    lease_expires_at = ?,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    dispatch_ack_at = NULL
+                WHERE id = ? AND status = ?
+                "#,
             &[
-                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(ProcessingStatus::Dispatching.as_str()),
                 DbValue::from(now),
+                DbValue::from(lease_expires_at),
                 DbValue::from(job_id),
+                DbValue::from(ProcessingStatus::Queued.as_str()),
             ],
         )?;
-        Ok(())
+        Ok(affected > 0)
     }
 
     /// Get plugin source code and env_hash from manifest.
@@ -582,12 +610,18 @@ impl JobQueue {
     pub fn pop_job(&self) -> Result<Option<ProcessingJob>> {
         let has_health = self.table_exists("cf_parser_health")?;
         let now = now_millis();
+        let lease_expires_at = now.saturating_add(DEFAULT_DISPATCH_LEASE_TTL_MS);
         let (query, params) = if has_health {
             (
                 format!(
                     r#"
                 UPDATE cf_processing_queue
-                SET status = ?, claim_time = ?
+                SET status = ?,
+                    claim_time = ?,
+                    lease_expires_at = ?,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    dispatch_ack_at = NULL
                 WHERE id = (
                     SELECT q.id
                     FROM cf_processing_queue q
@@ -603,8 +637,9 @@ impl JobQueue {
                     columns = column_list(PROCESSING_JOB_COLUMNS)
                 ),
                 vec![
-                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(ProcessingStatus::Dispatching.as_str()),
                     DbValue::from(now.clone()),
+                    DbValue::from(lease_expires_at),
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                     DbValue::from(now),
                 ],
@@ -614,7 +649,12 @@ impl JobQueue {
                 format!(
                     r#"
                 UPDATE cf_processing_queue
-                SET status = ?, claim_time = ?
+                SET status = ?,
+                    claim_time = ?,
+                    lease_expires_at = ?,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    dispatch_ack_at = NULL
                 WHERE id = (
                     SELECT id
                     FROM cf_processing_queue
@@ -628,8 +668,9 @@ impl JobQueue {
                     columns = column_list(PROCESSING_JOB_COLUMNS)
                 ),
                 vec![
-                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(ProcessingStatus::Dispatching.as_str()),
                     DbValue::from(now.clone()),
+                    DbValue::from(lease_expires_at),
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                     DbValue::from(now),
                 ],
@@ -641,16 +682,21 @@ impl JobQueue {
         Ok(row.map(|row| ProcessingJob::from_row(&row)).transpose()?)
     }
 
-    /// Atomically claim up to `limit` jobs from the queue.
-    pub fn claim_jobs(&self, limit: usize) -> Result<Vec<ProcessingJob>> {
+    /// Atomically lease up to `limit` jobs from the queue for dispatch.
+    pub fn lease_jobs_for_dispatch(
+        &self,
+        limit: usize,
+        now: i64,
+        ttl_ms: i64,
+    ) -> Result<Vec<ProcessingJob>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let limit: i64 = limit
             .try_into()
-            .context("claim_jobs limit overflow")?;
+            .context("lease_jobs_for_dispatch limit overflow")?;
         let has_health = self.table_exists("cf_parser_health")?;
-        let now = now_millis();
+        let lease_expires_at = now.saturating_add(ttl_ms);
 
         let (query, params) = if has_health {
             (
@@ -667,7 +713,12 @@ impl JobQueue {
                     LIMIT ?
                 )
                 UPDATE cf_processing_queue
-                SET status = ?, claim_time = ?
+                SET status = ?,
+                    claim_time = ?,
+                    lease_expires_at = ?,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    dispatch_ack_at = NULL
                 WHERE id IN (SELECT id FROM to_claim)
                 RETURNING {columns}
                 "#,
@@ -677,8 +728,9 @@ impl JobQueue {
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                     DbValue::from(now),
                     DbValue::from(limit),
-                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(ProcessingStatus::Dispatching.as_str()),
                     DbValue::from(now),
+                    DbValue::from(lease_expires_at),
                 ],
             )
         } else {
@@ -694,7 +746,12 @@ impl JobQueue {
                     LIMIT ?
                 )
                 UPDATE cf_processing_queue
-                SET status = ?, claim_time = ?
+                SET status = ?,
+                    claim_time = ?,
+                    lease_expires_at = ?,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    dispatch_ack_at = NULL
                 WHERE id IN (SELECT id FROM to_claim)
                 RETURNING {columns}
                 "#,
@@ -704,8 +761,9 @@ impl JobQueue {
                     DbValue::from(ProcessingStatus::Queued.as_str()),
                     DbValue::from(now),
                     DbValue::from(limit),
-                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(ProcessingStatus::Dispatching.as_str()),
                     DbValue::from(now),
+                    DbValue::from(lease_expires_at),
                 ],
             )
         };
@@ -717,6 +775,79 @@ impl JobQueue {
             .collect::<Result<Vec<_>, _>>()?;
         jobs.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
         Ok(jobs)
+    }
+
+    /// Persist the lease token/owner for a dispatching job.
+    pub fn set_dispatch_lease(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        lease_owner: &str,
+    ) -> Result<bool> {
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET lease_token = ?, lease_owner = ?
+                WHERE id = ? AND status = ?
+                "#,
+            &[
+                DbValue::from(lease_token),
+                DbValue::from(lease_owner),
+                DbValue::from(job_id),
+                DbValue::from(ProcessingStatus::Dispatching.as_str()),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Acknowledge a dispatch lease and transition to RUNNING.
+    pub fn ack_dispatch(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        lease_owner: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET status = ?,
+                    dispatch_ack_at = ?,
+                    lease_owner = ?
+                WHERE id = ? AND status = ? AND lease_token = ?
+                "#,
+            &[
+                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(now),
+                DbValue::from(lease_owner),
+                DbValue::from(job_id),
+                DbValue::from(ProcessingStatus::Dispatching.as_str()),
+                DbValue::from(lease_token),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Requeue dispatches whose lease has expired.
+    pub fn requeue_expired_dispatches(&self, now: i64) -> Result<usize> {
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET status = ?,
+                    claim_time = NULL,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    dispatch_ack_at = NULL
+                WHERE status = ? AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                "#,
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(ProcessingStatus::Dispatching.as_str()),
+                DbValue::from(now),
+            ],
+        )?;
+        Ok(affected as usize)
     }
 
     fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
@@ -852,6 +983,81 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
         .transpose()
     }
 
+    /// Load full dispatch data for a job (file path + plugin manifest).
+    pub fn load_dispatch_data(&self, plugin_name: &str, file_id: i64) -> Result<DispatchData> {
+        let row = self.conn.query_optional(
+            r#"
+                SELECT
+                    sf.rel_path as rel_path,
+                    ss.path as scan_root,
+                    ss.exec_path as exec_root,
+                    pm.source_code,
+                    pm.version as parser_version,
+                    pm.env_hash,
+                    pm.artifact_hash,
+                    pm.runtime_kind,
+                    pm.entrypoint,
+                    pm.platform_os,
+                    pm.platform_arch,
+                    pm.signature_verified,
+                    pm.signer_id
+                FROM scout_files sf
+                JOIN scout_sources ss ON ss.id = sf.source_id
+                JOIN cf_plugin_manifest pm ON pm.plugin_name = ? AND pm.status IN (?, ?)
+                WHERE sf.id = ?
+                ORDER BY pm.created_at DESC
+                LIMIT 1
+                "#,
+            &[
+                DbValue::from(plugin_name),
+                DbValue::from(PluginStatus::Active.as_str()),
+                DbValue::from(PluginStatus::Deployed.as_str()),
+                DbValue::from(file_id),
+            ],
+        )?;
+        let row = row.ok_or_else(|| anyhow::anyhow!("Dispatch data missing"))?;
+        DispatchData::from_row(&row)
+    }
+
+    /// Load scout file mtime/size for generation checks.
+    pub fn load_file_generation(&self, file_id: i64) -> Result<Option<(i64, i64)>> {
+        let row = self.conn.query_optional(
+            "SELECT mtime, size FROM scout_files WHERE id = ?",
+            &[DbValue::from(file_id)],
+        )?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mtime: i64 = row.get_by_name("mtime")?;
+        let size: i64 = row.get_by_name("size")?;
+        Ok(Some((mtime, size)))
+    }
+
+    /// Update pipeline run status for a specific job.
+    pub fn update_pipeline_run_status_for_job(&self, job_id: i64) -> Result<()> {
+        let run_id = self
+            .conn
+            .query_optional(
+                "SELECT pipeline_run_id FROM cf_processing_queue WHERE id = ?",
+                &[DbValue::from(job_id)],
+            )?
+            .and_then(|row| row.get_by_name::<String>("pipeline_run_id").ok());
+        let Some(run_id) = run_id else {
+            return Ok(());
+        };
+        update_pipeline_run_status(&self.conn, &run_id)
+    }
+
+    /// Mark a pipeline run as running.
+    pub fn set_pipeline_run_running(&self, run_id: &str) -> Result<()> {
+        set_pipeline_run_running(&self.conn, run_id)
+    }
+
+    /// Update a pipeline run status based on queued job states.
+    pub fn update_pipeline_run_status(&self, run_id: &str) -> Result<()> {
+        update_pipeline_run_status(&self.conn, run_id)
+    }
+
     /// Record a completed output materialization (idempotent insert).
     pub fn insert_output_materialization(&self, record: &OutputMaterialization) -> Result<()> {
         self.conn.execute(
@@ -961,6 +1167,124 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
         Ok(())
     }
 
+    /// Mark job as complete if the lease token matches.
+    pub fn complete_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        completion_status: &str,
+        summary: &str,
+        quarantine_rows: Option<i64>,
+    ) -> Result<bool> {
+        let now = now_millis();
+        let (query, params) = if let Some(rows) = quarantine_rows {
+            (
+                r#"
+                    UPDATE cf_processing_queue
+                    SET status = ?,
+                        completion_status = ?,
+                        end_time = ?,
+                        result_summary = ?,
+                        quarantine_rows = ?
+                    WHERE id = ? AND status = ? AND lease_token = ?
+                    "#,
+                vec![
+                    DbValue::from(ProcessingStatus::Completed.as_str()),
+                    DbValue::from(completion_status),
+                    DbValue::from(now),
+                    DbValue::from(summary),
+                    DbValue::from(rows),
+                    DbValue::from(job_id),
+                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(lease_token),
+                ],
+            )
+        } else {
+            (
+                r#"
+                    UPDATE cf_processing_queue
+                    SET status = ?,
+                        completion_status = ?,
+                        end_time = ?,
+                        result_summary = ?
+                    WHERE id = ? AND status = ? AND lease_token = ?
+                    "#,
+                vec![
+                    DbValue::from(ProcessingStatus::Completed.as_str()),
+                    DbValue::from(completion_status),
+                    DbValue::from(now),
+                    DbValue::from(summary),
+                    DbValue::from(job_id),
+                    DbValue::from(ProcessingStatus::Running.as_str()),
+                    DbValue::from(lease_token),
+                ],
+            )
+        };
+        let affected = self.conn.execute(query, &params)?;
+        Ok(affected > 0)
+    }
+
+    /// Mark job as failed if the lease token matches.
+    pub fn fail_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        completion_status: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let now = now_millis();
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET status = ?,
+                    completion_status = ?,
+                    end_time = ?,
+                    error_message = ?
+                WHERE id = ? AND status = ? AND lease_token = ?
+                "#,
+            &[
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+                DbValue::from(completion_status),
+                DbValue::from(now),
+                DbValue::from(error),
+                DbValue::from(job_id),
+                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(lease_token),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Mark job as aborted if the lease token matches.
+    pub fn abort_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let now = now_millis();
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET status = ?,
+                    completion_status = ?,
+                    end_time = ?,
+                    error_message = ?
+                WHERE id = ? AND status = ? AND lease_token = ?
+                "#,
+            &[
+                DbValue::from(ProcessingStatus::Aborted.as_str()),
+                DbValue::from(JobStatus::Aborted.as_str()),
+                DbValue::from(now),
+                DbValue::from(error),
+                DbValue::from(job_id),
+                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(lease_token),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
     /// Requeue a job.
     /// Clears terminal fields (completion_status, end_time, result_summary, error_message)
     /// when transitioning back to QUEUED state.
@@ -988,6 +1312,10 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
                 SET status = ?,
                     completion_status = NULL,
                     claim_time = NULL,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    dispatch_ack_at = NULL,
                     end_time = NULL,
                     result_summary = NULL,
                     error_message = NULL,
@@ -1018,6 +1346,10 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
                 SET status = ?,
                     completion_status = NULL,
                     claim_time = NULL,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    dispatch_ack_at = NULL,
                     end_time = NULL,
                     result_summary = NULL,
                     scheduled_at = ?,
@@ -1051,6 +1383,10 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
                     completion_status = NULL,
                     retry_count = ?,
                     claim_time = NULL,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    dispatch_ack_at = NULL,
                     end_time = NULL,
                     result_summary = NULL,
                     scheduled_at = ?,
@@ -1075,13 +1411,15 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
                 r#"
                 SELECT
                     SUM(CASE WHEN status = '{queued}' THEN 1 ELSE 0 END) AS queued,
-                    SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END) AS running,
+                    SUM(CASE WHEN status = '{running}' THEN 1 ELSE 0 END)
+                        + SUM(CASE WHEN status = '{dispatching}' THEN 1 ELSE 0 END) AS running,
                     SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END) AS completed,
                     SUM(CASE WHEN status = '{failed}' THEN 1 ELSE 0 END) AS failed
                 FROM cf_processing_queue
                 "#,
                 queued = ProcessingStatus::Queued.as_str(),
                 running = ProcessingStatus::Running.as_str(),
+                dispatching = ProcessingStatus::Dispatching.as_str(),
                 completed = ProcessingStatus::Completed.as_str(),
                 failed = ProcessingStatus::Failed.as_str(),
             ),
@@ -1737,9 +2075,9 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
         }
     }
 
-    /// Cancel a queued or pending job.
+    /// Cancel a queued, pending, or dispatching job.
     ///
-    /// Only jobs in QUEUED or PENDING status can be cancelled. Jobs that are already
+    /// Only jobs in QUEUED, PENDING, or DISPATCHING status can be cancelled. Jobs that are already
     /// RUNNING, COMPLETED, or FAILED are not affected.
     ///
     /// Returns `true` if the job was cancelled, `false` if it was not found or
@@ -1756,7 +2094,7 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
                 completion_status = ?,
                 end_time = ?,
                 error_message = ?
-            WHERE id = ? AND status IN (?, ?)
+            WHERE id = ? AND status IN (?, ?, ?)
             "#,
             &[
                 DbValue::from(ProcessingStatus::Aborted.as_str()),
@@ -1766,6 +2104,7 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
                 DbValue::from(job_id_i64),
                 DbValue::from(ProcessingStatus::Queued.as_str()),
                 DbValue::from(ProcessingStatus::Pending.as_str()),
+                DbValue::from(ProcessingStatus::Dispatching.as_str()),
             ],
         )?;
 
@@ -1797,6 +2136,133 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
 
         Ok(counts)
     }
+
+    /// List running job ids for a specific lease owner.
+    pub fn list_running_jobs_by_owner(&self, lease_owner: &str) -> Result<Vec<i64>> {
+        let rows = self.conn.query_all(
+            r#"
+                SELECT id
+                FROM cf_processing_queue
+                WHERE status = ? AND lease_owner = ?
+                "#,
+            &[
+                DbValue::from(ProcessingStatus::Running.as_str()),
+                DbValue::from(lease_owner),
+            ],
+        )?;
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.get_by_name("id")?;
+            jobs.push(id);
+        }
+        Ok(jobs)
+    }
+
+    /// List running job ids with their lease owner (if any).
+    pub fn list_running_jobs_with_owner(&self) -> Result<Vec<(i64, Option<String>)>> {
+        let rows = self.conn.query_all(
+            r#"
+                SELECT id, lease_owner
+                FROM cf_processing_queue
+                WHERE status = ?
+                "#,
+            &[DbValue::from(ProcessingStatus::Running.as_str())],
+        )?;
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.get_by_name("id")?;
+            let lease_owner: Option<String> = row.get_by_name("lease_owner")?;
+            jobs.push((id, lease_owner));
+        }
+        Ok(jobs)
+    }
+}
+
+fn table_exists(conn: &DbConnection, table: &str) -> Result<bool> {
+    Ok(conn.table_exists(table)?)
+}
+
+fn set_pipeline_run_running(conn: &DbConnection, run_id: &str) -> Result<()> {
+    if !table_exists(conn, "cf_pipeline_runs")? {
+        return Ok(());
+    }
+    conn.execute(
+        r#"
+            UPDATE cf_pipeline_runs
+            SET status = ?,
+                started_at = COALESCE(started_at, ?)
+            WHERE id = ?
+            "#,
+        &[
+            DbValue::from(PipelineRunStatus::Running.as_str()),
+            DbValue::from(now_millis()),
+            DbValue::from(run_id),
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_pipeline_run_status(conn: &DbConnection, run_id: &str) -> Result<()> {
+    if !table_exists(conn, "cf_pipeline_runs")? {
+        return Ok(());
+    }
+
+    let row = conn.query_optional(
+        &format!(
+            r#"
+            SELECT
+                SUM(CASE WHEN status IN ('{failed}', '{aborted}') THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN status IN ('{queued}', '{running}') THEN 1 ELSE 0 END) AS active,
+                SUM(CASE WHEN status = '{completed}' THEN 1 ELSE 0 END) AS completed
+            FROM cf_processing_queue
+            WHERE pipeline_run_id = ?
+            "#,
+            failed = ProcessingStatus::Failed.as_str(),
+            aborted = ProcessingStatus::Aborted.as_str(),
+            queued = ProcessingStatus::Queued.as_str(),
+            running = ProcessingStatus::Running.as_str(),
+            completed = ProcessingStatus::Completed.as_str(),
+        ),
+        &[DbValue::from(run_id)],
+    )?;
+
+    let Some(row) = row else {
+        return Ok(());
+    };
+
+    let failed: i64 = row.get_by_name("failed").unwrap_or(0);
+    let active: i64 = row.get_by_name("active").unwrap_or(0);
+    let completed: i64 = row.get_by_name("completed").unwrap_or(0);
+
+    if failed > 0 {
+        conn.execute(
+            "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = ?",
+            &[
+                DbValue::from(PipelineRunStatus::Failed.as_str()),
+                DbValue::from(now_millis()),
+                DbValue::from(run_id),
+            ],
+        )?;
+        return Ok(());
+    }
+
+    if active > 0 {
+        set_pipeline_run_running(conn, run_id)?;
+        return Ok(());
+    }
+
+    if completed > 0 {
+        conn.execute(
+            "UPDATE cf_pipeline_runs SET status = ?, completed_at = ? WHERE id = ?",
+            &[
+                DbValue::from(PipelineRunStatus::Completed.as_str()),
+                DbValue::from(now_millis()),
+                DbValue::from(run_id),
+            ],
+        )?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1991,14 +2457,14 @@ mod tests {
     }
 
     #[test]
-    fn test_claim_jobs_batching_updates_status() {
+    fn test_lease_jobs_batching_updates_status() {
         let queue = setup_queue();
 
         let id_high = enqueue_test_job_with_priority(&queue, "parser_high", 1, 10);
         let id_mid = enqueue_test_job_with_priority(&queue, "parser_mid", 2, 5);
         let id_low = enqueue_test_job_with_priority(&queue, "parser_low", 3, 0);
 
-        let claimed = queue.claim_jobs(2).unwrap();
+        let claimed = queue.lease_jobs_for_dispatch(2, now_millis(), 5_000).unwrap();
         assert_eq!(claimed.len(), 2);
         assert_eq!(claimed[0].id, id_high);
         assert_eq!(claimed[1].id, id_mid);
@@ -2009,12 +2475,12 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].id, id_low);
 
-        let running = queue
-            .list_jobs(Some(ProcessingStatus::Running), 10, 0)
+        let dispatching = queue
+            .list_jobs(Some(ProcessingStatus::Dispatching), 10, 0)
             .unwrap();
-        let running_ids: Vec<i64> = running.iter().map(|job| job.id).collect();
-        assert!(running_ids.contains(&id_high));
-        assert!(running_ids.contains(&id_mid));
+        let dispatching_ids: Vec<i64> = dispatching.iter().map(|job| job.id).collect();
+        assert!(dispatching_ids.contains(&id_high));
+        assert!(dispatching_ids.contains(&id_mid));
     }
 
     #[test]

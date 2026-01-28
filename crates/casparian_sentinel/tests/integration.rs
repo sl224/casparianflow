@@ -99,6 +99,7 @@ fn test_conclude_message() {
         error_message: None,
         diagnostics: None,
         source_hash: Some("abc123def456".to_string()),
+        lease_token: None,
     };
 
     let payload = serde_json::to_vec(&receipt).unwrap();
@@ -874,6 +875,7 @@ fn test_full_worker_lifecycle_message_flow() {
             schema: None,
         }],
         file_id: 1,
+        lease_token: None,
         runtime_kind: RuntimeKind::PythonShim,
         entrypoint: "test_parser.py:Handler".to_string(),
         platform_os: None,

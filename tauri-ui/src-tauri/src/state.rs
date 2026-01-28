@@ -71,8 +71,17 @@ impl AppState {
             .context("Failed to open read-only connection")
     }
 
-    /// Open a read-write connection for mutation operations (when control API unavailable).
+    /// Open a read-write connection for mutation operations (dev-only).
     pub fn open_rw_connection(&self) -> Result<DbConnection> {
+        if std::env::var("CASPARIAN_DEV_ALLOW_DIRECT_DB_WRITE")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            anyhow::bail!(
+                "Direct DB writes are disabled. Start Sentinel or set CASPARIAN_DEV_ALLOW_DIRECT_DB_WRITE=1 (dev only)."
+            );
+        }
         DbConnection::open_sqlite(std::path::Path::new(&self.db_path))
             .context("Failed to open read-write connection")
     }

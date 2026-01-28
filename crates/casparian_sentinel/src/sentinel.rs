@@ -27,7 +27,7 @@ use casparian_security::signing::compute_artifact_hash;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
@@ -38,12 +38,13 @@ use crate::control::{
     ControlRequest, ControlResponse, JobInfo, QueueStatsInfo, ScanState, ScoutRuleInfo,
     ScoutScanProgress, ScoutScanStatus, ScoutSourceInfo, ScoutTagCount, ScoutTagStats,
 };
+use crate::catalog_executor::{CatalogExecutor, CatalogIntent};
+use crate::sqlite_executor::{SqliteContext, SqliteExecutor};
 use crate::db::queue::{OutputMaterialization, MAX_RETRY_COUNT};
 use crate::db::{
     models::*, IntentState, SessionId,
 };
 use crate::metrics::METRICS;
-use casparian_db::DbConnection;
 use casparian_state_store::{DispatchData, StateStore, StateStoreQueueSession};
 
 /// Workers are considered stale after this many seconds without heartbeat
@@ -58,6 +59,12 @@ const DISPATCH_BACKOFF_BASE_MS: u64 = 50;
 const DISPATCH_BACKOFF_MAX_MS: u64 = 1_000;
 /// Dispatch backoff jitter cap (ms)
 const DISPATCH_BACKOFF_JITTER_MS: u64 = 50;
+/// Dispatch lease TTL in milliseconds.
+const DISPATCH_LEASE_TTL_MS: i64 = 30_000;
+/// How often to sweep expired dispatch leases (seconds).
+const DISPATCH_LEASE_SWEEP_SECS: f64 = 5.0;
+/// Grace period for worker reconnects after sentinel restart (seconds).
+const RECONNECT_GRACE_SECS: f64 = 60.0;
 
 // ============================================================================
 // Circuit Breaker & Retry Constants
@@ -93,6 +100,56 @@ struct ScanJobState {
     files_persisted: Option<u64>,
     error: Option<String>,
     cancel_token: Option<ScanCancelToken>,
+}
+
+#[derive(Debug)]
+enum ScanEvent {
+    Started { scan_id: String, source_id: SourceId },
+    Progress { scan_id: String, progress: ScanProgress },
+    Completed { scan_id: String, files_persisted: u64 },
+    Failed { scan_id: String, error: String },
+    Cancelled { scan_id: String },
+}
+
+struct PendingControlReply {
+    identity: Vec<u8>,
+    rx: mpsc::Receiver<anyhow::Result<ControlResponse>>,
+}
+
+struct PendingDispatch {
+    identity: Vec<u8>,
+    worker_id: String,
+    requested_at: Instant,
+    rx: mpsc::Receiver<anyhow::Result<Option<DispatchPlan>>>,
+}
+
+struct PendingConclude {
+    job_id: i64,
+    started_at: Instant,
+    rx: mpsc::Receiver<anyhow::Result<ConcludeOutcome>>,
+}
+
+struct PendingCancelJob {
+    identity: Vec<u8>,
+    job_id: JobId,
+    rx: mpsc::Receiver<anyhow::Result<bool>>,
+}
+
+struct DispatchPlan {
+    job_id_db: i64,
+    job_id: JobId,
+    plugin_name: String,
+    pipeline_run_id: Option<String>,
+    lease_token: String,
+    command: DispatchCommand,
+}
+
+enum ConcludeOutcome {
+    Stale { job_id: i64 },
+    Completed { job_id: i64, artifacts: Vec<ArtifactV1> },
+    Failed { job_id: i64, retried: bool },
+    Rejected { job_id: i64 },
+    Aborted { job_id: i64 },
 }
 
 impl ScanJobState {
@@ -183,6 +240,7 @@ pub struct ConnectedWorker {
     /// v1 assumes a homogeneous worker pool, so this is informational only.
     pub capabilities: Vec<String>,
     pub current_job_id: Option<JobId>,
+    pub current_lease_token: Option<String>,
     pub worker_id: String,
 }
 
@@ -193,6 +251,7 @@ impl ConnectedWorker {
             last_seen: current_time(),
             capabilities,
             current_job_id: None,
+            current_lease_token: None,
             worker_id,
         }
     }
@@ -214,21 +273,30 @@ pub struct SentinelConfig {
 pub struct Sentinel {
     context: ZmqContext,
     socket: Socket,
-    /// Optional control API socket (REP pattern)
+    /// Optional control API socket (ROUTER pattern)
     control_socket: Option<Socket>,
     workers: HashMap<Vec<u8>, ConnectedWorker>,
     state_store: Arc<StateStore>,
-    queue_session: StateStoreQueueSession,
-    schema_storage: SchemaStorage,
-    topic_map: HashMap<String, Vec<SinkConfig>>, // Cache: plugin_name -> sinks
-    topic_map_last_refresh: f64,
+    sqlite_executor: SqliteExecutor,
     query_catalog_path: std::path::PathBuf,
+    catalog_executor: CatalogExecutor,
     state_store_path: Option<std::path::PathBuf>,
-    scan_jobs: Arc<Mutex<HashMap<String, ScanJobState>>>,
+    scan_jobs: HashMap<String, ScanJobState>,
+    scan_event_tx: mpsc::Sender<ScanEvent>,
+    scan_event_rx: mpsc::Receiver<ScanEvent>,
+    pending_control_replies: Vec<PendingControlReply>,
+    pending_dispatches: Vec<PendingDispatch>,
+    pending_concludes: Vec<PendingConclude>,
+    pending_cancel_jobs: Vec<PendingCancelJob>,
+    pending_dispatch_sweep: Option<mpsc::Receiver<anyhow::Result<usize>>>,
     running: bool,
     last_cleanup: f64, // Last time we ran stale worker cleanup
+    last_dispatch_lease_sweep: f64,
     /// Jobs orphaned by stale workers - need to be failed asynchronously
-    orphaned_jobs: Vec<JobId>,
+    orphaned_jobs: Vec<(JobId, Option<String>)>,
+    startup_grace_deadline: Option<f64>,
+    seen_worker_ids: HashSet<String>,
+    reconciled_workers: HashSet<String>,
     dispatch_backoff_ms: u64,
     dispatch_cooldown_until: Option<Instant>,
     max_workers: usize,
@@ -247,18 +315,31 @@ impl Sentinel {
             .context("Failed to connect to state store")?;
         state_store.init()?;
 
-        let queue_session = state_store
-            .session_fast()
-            .context("Failed to open state store fast session")?;
-
         let state_store = Arc::new(state_store);
+        let sqlite_executor =
+            SqliteExecutor::start(state_store.clone()).context("Failed to start sqlite executor")?;
+        let now = now_millis();
+        if let Ok(requeued) =
+            sqlite_executor.call(move |_, queue, _| queue.requeue_expired_dispatches(now))
+        {
+            if requeued > 0 {
+                info!("Requeued {} expired dispatch leases on startup", requeued);
+            }
+        }
 
-        let schema_storage =
-            state_store.schema_storage().context("Failed to initialize schema storage")?;
-
-        // Load topic configs into memory after schema is present.
-        let topic_map = Self::load_topic_configs(state_store.routing())?;
-        info!("Loaded {} plugin topic configs", topic_map.len());
+        let _ = sqlite_executor.execute(|state_store, _queue, ctx| {
+            match Sentinel::load_topic_configs(state_store.routing()) {
+                Ok(new_map) => {
+                    ctx.topic_map = new_map;
+                    ctx.topic_map_last_refresh = current_time();
+                    info!("Loaded {} plugin topic configs", ctx.topic_map.len());
+                }
+                Err(e) => {
+                    warn!("Failed to load topic configs on startup: {}", e);
+                }
+            }
+            Ok(())
+        });
 
         // Destructive Initialization for IPC sockets (Unix only)
         // Unlink stale socket files to prevent "Address in use" errors
@@ -282,9 +363,11 @@ impl Sentinel {
             .bind(&config.bind_addr)
             .context("Failed to bind ROUTER socket")?;
         socket
-            .set_rcvtimeo(100)
-            .context("Failed to set socket receive timeout")?;
-
+            .set_router_mandatory(true)
+            .context("Failed to set ROUTER_MANDATORY")?;
+        socket
+            .set_sndtimeo(50)
+            .context("Failed to set socket send timeout")?;
         info!("Sentinel bound to {}", config.bind_addr);
 
         // Optionally create control API socket
@@ -305,14 +388,11 @@ impl Sentinel {
             }
 
             let ctrl_socket = context
-                .socket(zmq::REP)
-                .context("Failed to create control REP socket")?;
+                .socket(zmq::ROUTER)
+                .context("Failed to create control ROUTER socket")?;
             ctrl_socket
                 .bind(control_addr)
                 .with_context(|| format!("Failed to bind control socket to {}", control_addr))?;
-            ctrl_socket
-                .set_rcvtimeo(10) // Short timeout to not block main loop
-                .context("Failed to set control socket timeout")?;
             info!("Control API bound to {}", control_addr);
             Some(ctrl_socket)
         } else {
@@ -320,6 +400,9 @@ impl Sentinel {
         };
 
         let state_store_path = sqlite_path_from_url(&config.state_store_url);
+        let catalog_executor = CatalogExecutor::start(config.query_catalog_path.clone());
+
+        let (scan_event_tx, scan_event_rx) = mpsc::channel();
 
         Ok(Self {
             context,
@@ -327,16 +410,25 @@ impl Sentinel {
             control_socket,
             workers: HashMap::new(),
             state_store,
-            queue_session,
-            schema_storage,
-            topic_map,
-            topic_map_last_refresh: current_time(),
+            sqlite_executor,
             query_catalog_path: config.query_catalog_path,
+            catalog_executor,
             state_store_path,
-            scan_jobs: Arc::new(Mutex::new(HashMap::new())),
+            scan_jobs: HashMap::new(),
+            scan_event_tx,
+            scan_event_rx,
+            pending_control_replies: Vec::new(),
+            pending_dispatches: Vec::new(),
+            pending_concludes: Vec::new(),
+            pending_cancel_jobs: Vec::new(),
+            pending_dispatch_sweep: None,
             running: false,
             last_cleanup: current_time(),
+            last_dispatch_lease_sweep: current_time(),
             orphaned_jobs: Vec::new(),
+            startup_grace_deadline: Some(current_time() + RECONNECT_GRACE_SECS),
+            seen_worker_ids: HashSet::new(),
+            reconciled_workers: HashSet::new(),
             dispatch_backoff_ms: 0,
             dispatch_cooldown_until: None,
             max_workers,
@@ -392,22 +484,6 @@ impl Sentinel {
         sinks
     }
 
-    fn refresh_topic_configs_if_stale(&mut self) {
-        let now = current_time();
-        if now - self.topic_map_last_refresh < TOPIC_CACHE_TTL_SECS {
-            return;
-        }
-
-        match Self::load_topic_configs(self.state_store.routing()) {
-            Ok(new_map) => {
-                self.topic_map = new_map;
-                self.topic_map_last_refresh = now;
-            }
-            Err(e) => {
-                warn!("Failed to refresh topic configs: {}", e);
-            }
-        }
-    }
 
     fn schema_definition_from_contract(
         contract: &SchemaContract,
@@ -516,20 +592,6 @@ impl Sentinel {
         Ok(())
     }
 
-    fn apply_contract_overrides(
-        &self,
-        plugin_name: &str,
-        parser_version: &str,
-        sinks: Vec<SinkConfig>,
-    ) -> Result<Vec<SinkConfig>> {
-        Self::apply_contract_overrides_with_storage(
-            self.state_store.routing(),
-            &self.schema_storage,
-            plugin_name,
-            parser_version,
-            sinks,
-        )
-    }
 
     fn is_default_sink(topic: &str) -> bool {
         topic == "*" || topic == defaults::DEFAULT_SINK_TOPIC
@@ -551,12 +613,14 @@ impl Sentinel {
         None
     }
 
-    fn load_file_generation(&self, file_id: i64) -> Result<Option<(i64, i64)>> {
-        self.state_store.queue().load_file_generation(file_id)
-    }
-
-    fn record_materializations_for_job(&self, job_id: i64, receipt: &JobReceipt) -> Result<()> {
-        let Some(dispatch) = self.state_store.queue().get_dispatch_metadata(job_id)? else {
+    fn record_materializations_for_job_with_context(
+        state_store: &StateStore,
+        queue: &casparian_state_store::StateStoreQueueSession,
+        context: &mut SqliteContext,
+        job_id: i64,
+        receipt: &JobReceipt,
+    ) -> Result<()> {
+        let Some(dispatch) = queue.get_dispatch_metadata(job_id)? else {
             return Ok(());
         };
 
@@ -574,7 +638,7 @@ impl Sentinel {
             })
             .unwrap_or_else(|| "unknown".to_string());
 
-        let Some((file_mtime, file_size)) = self.load_file_generation(dispatch.file_id)? else {
+        let Some((file_mtime, file_size)) = queue.load_file_generation(dispatch.file_id)? else {
             warn!("Missing scout_files entry for file_id {}", dispatch.file_id);
             return Ok(());
         };
@@ -582,8 +646,26 @@ impl Sentinel {
         let sinks: Vec<SinkConfig> = if let Some(json) = dispatch.sink_config_json.as_deref() {
             serde_json::from_str(json)?
         } else {
-            let resolved = Self::resolve_sinks_for_plugin(&self.topic_map, &dispatch.plugin_name);
-            self.apply_contract_overrides(&dispatch.plugin_name, &parser_version, resolved)?
+            let now = current_time();
+            if now - context.topic_map_last_refresh > TOPIC_CACHE_TTL_SECS {
+                match Self::load_topic_configs(state_store.routing()) {
+                    Ok(new_map) => {
+                        context.topic_map = new_map;
+                        context.topic_map_last_refresh = now;
+                    }
+                    Err(e) => {
+                        warn!("Failed to refresh topic configs: {}", e);
+                    }
+                }
+            }
+            let resolved = Self::resolve_sinks_for_plugin(&context.topic_map, &dispatch.plugin_name);
+            Self::apply_contract_overrides_with_storage(
+                state_store.routing(),
+                &context.schema_storage,
+                &dispatch.plugin_name,
+                &parser_version,
+                resolved,
+            )?
         };
 
         let mut output_rows: HashMap<String, i64> = HashMap::new();
@@ -673,7 +755,7 @@ impl Sentinel {
                 rows: *rows,
                 job_id,
             };
-            self.state_store.queue().insert_output_materialization(&record)?;
+            queue.insert_output_materialization(&record)?;
         }
 
         for sink in sinks
@@ -717,20 +799,13 @@ impl Sentinel {
                 rows: 0,
                 job_id,
             };
-            self.state_store.queue().insert_output_materialization(&record)?;
+            queue.insert_output_materialization(&record)?;
         }
-
-        if let Err(err) = self.update_query_catalog_for_artifacts(&receipt.artifacts) {
-            warn!("Failed to update query catalog: {}", err);
-        }
-
         Ok(())
     }
 
     fn update_query_catalog_for_artifacts(&self, artifacts: &[ArtifactV1]) -> Result<()> {
         let mut views: HashMap<String, std::path::PathBuf> = HashMap::new();
-        let mut has_quarantine = false;
-
         for artifact in artifacts {
             let (output_name, sink_uri, is_quarantine) = match artifact {
                 ArtifactV1::Output {
@@ -775,7 +850,6 @@ impl Sentinel {
             let safe_name = safe_output_id(output_name);
             let pattern = base_dir.join(format!("{}_*.parquet", safe_name));
             let view_name = if is_quarantine {
-                has_quarantine = true;
                 format!("quarantine.{}", quote_ident(output_name))
             } else {
                 format!("outputs.{}", quote_ident(output_name))
@@ -787,25 +861,14 @@ impl Sentinel {
             return Ok(());
         }
 
-        if let Some(parent) = self.query_catalog_path.parent() {
-            std::fs::create_dir_all(parent).context("Failed to create query catalog directory")?;
-        }
-
-        let catalog_conn = DbConnection::open_duckdb(&self.query_catalog_path)
-            .context("Failed to open query catalog")?;
-        catalog_conn.execute("CREATE SCHEMA IF NOT EXISTS outputs", &[])?;
-        if has_quarantine {
-            catalog_conn.execute("CREATE SCHEMA IF NOT EXISTS quarantine", &[])?;
-        }
-
-        for (view_name, pattern) in views {
-            let path_literal = escape_sql_literal(&pattern.to_string_lossy());
-            let sql = format!(
-                "CREATE OR REPLACE VIEW {} AS SELECT * FROM parquet_scan('{}')",
-                view_name, path_literal
-            );
-            catalog_conn.execute(&sql, &[])?;
-        }
+        let intents = views
+            .into_iter()
+            .map(|(view_name, parquet_glob)| CatalogIntent {
+                view_name,
+                parquet_glob,
+            })
+            .collect::<Vec<_>>();
+        self.catalog_executor.submit(intents);
 
         Ok(())
     }
@@ -841,33 +904,84 @@ impl Sentinel {
                 }
             }
 
-            // Receive message with timeout
-            match self.recv_message() {
-                Ok(Some((identity, msg))) => {
-                    if let Err(e) = self.handle_message(identity, msg) {
-                        error!("Error handling message: {}", e);
+            // Poll sockets to avoid sequential blocking.
+            let (worker_ready, control_ready) = {
+                let mut items = vec![self.socket.as_poll_item(zmq::POLLIN)];
+                let mut control_index = None;
+                if let Some(control_socket) = &self.control_socket {
+                    control_index = Some(items.len());
+                    items.push(control_socket.as_poll_item(zmq::POLLIN));
+                }
+
+                if let Err(e) = zmq::poll(&mut items, 50) {
+                    error!("Poll error: {}", e);
+                }
+
+                let worker_ready = items.get(0).map(|item| item.is_readable()).unwrap_or(false);
+                let control_ready = control_index
+                    .and_then(|idx| items.get(idx))
+                    .map(|item| item.is_readable())
+                    .unwrap_or(false);
+                (worker_ready, control_ready)
+            };
+
+            if worker_ready {
+                loop {
+                    match self.recv_message() {
+                        Ok(Some((identity, msg))) => {
+                            if let Err(e) = self.handle_message(identity, msg) {
+                                error!("Error handling message: {}", e);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("Recv error: {}", e);
+                            break;
+                        }
                     }
-                }
-                Ok(None) => {
-                    // Timeout - no message
-                }
-                Err(e) => {
-                    error!("Recv error: {}", e);
                 }
             }
 
-            // Handle control API requests (non-blocking)
-            if let Err(e) = self.handle_control_requests() {
-                error!("Control API error: {}", e);
+            if control_ready {
+                loop {
+                    match self.handle_control_requests() {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(e) => {
+                            error!("Control API error: {}", e);
+                            break;
+                        }
+                    }
+                }
             }
+
+            self.drain_scan_events();
+            if let Err(err) = self.drain_pending_control_replies() {
+                warn!("Failed to send control replies: {}", err);
+            }
+            if let Err(err) = self.drain_pending_cancel_jobs() {
+                warn!("Failed to send cancel responses: {}", err);
+            }
+            self.drain_pending_dispatches();
+            self.drain_pending_concludes();
+            self.drain_pending_dispatch_sweep();
 
             // Periodic cleanup of stale workers
             self.cleanup_stale_workers();
 
+            // Periodic sweep of expired dispatch leases
+            self.sweep_expired_dispatches();
+
+            // Reconcile running jobs after restart grace period
+            if let Err(err) = self.reconcile_missing_workers_after_grace() {
+                warn!("Restart reconciliation failed: {}", err);
+            }
+
             // Fail any orphaned jobs from stale workers
             if !self.orphaned_jobs.is_empty() {
-                let jobs_to_fail: Vec<JobId> = std::mem::take(&mut self.orphaned_jobs);
-                for job_id in jobs_to_fail {
+                let jobs_to_fail: Vec<(JobId, Option<String>)> =
+                    std::mem::take(&mut self.orphaned_jobs);
+                for (job_id, lease_token) in jobs_to_fail {
                     let job_id_db = match job_id.to_i64() {
                         Ok(value) => value,
                         Err(err) => {
@@ -878,23 +992,38 @@ impl Sentinel {
                             continue;
                         }
                     };
-                    if let Err(e) = self.state_store.queue().fail_job(
-                        job_id_db,
-                        JobStatus::Failed.as_str(),
-                        "Worker became unresponsive (stale heartbeat)",
-                    ) {
-                        error!("Failed to mark orphaned job {} as failed: {}", job_id, e);
-                    } else {
+                    let lease_token = lease_token.clone();
+                    self.sqlite_executor.execute(move |_, queue, _| {
+                        let updated = if let Some(token) = lease_token.as_deref() {
+                            queue.fail_job_if_token_matches(
+                                job_id_db,
+                                token,
+                                JobStatus::Failed.as_str(),
+                                "Worker became unresponsive (stale heartbeat)",
+                            )?
+                        } else {
+                            queue.fail_job(
+                                job_id_db,
+                                JobStatus::Failed.as_str(),
+                                "Worker became unresponsive (stale heartbeat)",
+                            )?;
+                            true
+                        };
+                        if !updated {
+                            warn!("Stale orphaned job {} ignored", job_id_db);
+                            return Ok(());
+                        }
                         info!(
                             "Marked orphaned job {} as {}",
-                            job_id,
+                            job_id_db,
                             ProcessingStatus::Failed.as_str()
                         );
                         METRICS.inc_jobs_failed();
-                    }
+                        Ok(())
+                    })?;
                 }
             }
-
+ 
             // Dispatch loop (assign jobs to idle workers)
             if let Err(e) = self.dispatch_loop() {
                 error!("Dispatch error: {}", e);
@@ -902,6 +1031,407 @@ impl Sentinel {
         }
 
         info!("Sentinel stopped");
+        Ok(())
+    }
+
+    fn drain_scan_events(&mut self) {
+        while let Ok(event) = self.scan_event_rx.try_recv() {
+            match event {
+                ScanEvent::Started { scan_id, source_id } => {
+                    if let Some(job) = self.scan_jobs.get_mut(&scan_id) {
+                        job.state = ScanState::Running;
+                        job.source_id = Some(source_id);
+                    }
+                }
+                ScanEvent::Progress { scan_id, progress } => {
+                    if let Some(job) = self.scan_jobs.get_mut(&scan_id) {
+                        job.progress = Some(progress);
+                    }
+                }
+                ScanEvent::Completed {
+                    scan_id,
+                    files_persisted,
+                } => {
+                    if let Some(job) = self.scan_jobs.get_mut(&scan_id) {
+                        job.state = ScanState::Completed;
+                        job.files_persisted = Some(files_persisted);
+                        job.error = None;
+                    }
+                }
+                ScanEvent::Failed { scan_id, error } => {
+                    if let Some(job) = self.scan_jobs.get_mut(&scan_id) {
+                        job.state = ScanState::Failed;
+                        job.error = Some(error);
+                    }
+                }
+                ScanEvent::Cancelled { scan_id } => {
+                    if let Some(job) = self.scan_jobs.get_mut(&scan_id) {
+                        job.state = ScanState::Cancelled;
+                        job.error = Some("Scan cancelled".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    fn drain_pending_control_replies(&mut self) -> Result<()> {
+        if self.pending_control_replies.is_empty() {
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < self.pending_control_replies.len() {
+            match self.pending_control_replies[index].rx.try_recv() {
+                Ok(result) => {
+                    let pending = self.pending_control_replies.swap_remove(index);
+                    let response = match result {
+                        Ok(response) => response,
+                        Err(err) => {
+                            ControlResponse::error("DB_ERROR", format!("DB error: {}", err))
+                        }
+                    };
+                    self.send_control_response(pending.identity, response)?;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("Control response channel disconnected");
+                    self.pending_control_replies.swap_remove(index);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_pending_cancel_jobs(&mut self) -> Result<()> {
+        if self.pending_cancel_jobs.is_empty() {
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < self.pending_cancel_jobs.len() {
+            match self.pending_cancel_jobs[index].rx.try_recv() {
+                Ok(result) => {
+                    let pending = self.pending_cancel_jobs.swap_remove(index);
+                    let response = match result {
+                        Ok(true) => {
+                            info!("Job {} cancelled via control API", pending.job_id);
+                            ControlResponse::CancelResult {
+                                success: true,
+                                message: "Job cancelled".to_string(),
+                            }
+                        }
+                        Ok(false) => {
+                            let mut aborted = false;
+                            let mut abort_error = None;
+                            for (identity, worker) in &self.workers {
+                                if worker.current_job_id == Some(pending.job_id) {
+                                    if let Err(e) =
+                                        self.send_abort_to_worker(identity.clone(), pending.job_id)
+                                    {
+                                        warn!(
+                                            "Failed to send abort for job {}: {}",
+                                            pending.job_id, e
+                                        );
+                                        abort_error = Some(format!("Failed to send abort: {}", e));
+                                    } else {
+                                        aborted = true;
+                                    }
+                                    break;
+                                }
+                            }
+                            if let Some(error) = abort_error {
+                                ControlResponse::CancelResult {
+                                    success: false,
+                                    message: error,
+                                }
+                            } else if aborted {
+                                ControlResponse::CancelResult {
+                                    success: true,
+                                    message: "Abort signal sent to worker".to_string(),
+                                }
+                            } else {
+                                ControlResponse::CancelResult {
+                                    success: false,
+                                    message: "Job not found or already completed".to_string(),
+                                }
+                            }
+                        }
+                        Err(err) => ControlResponse::error(
+                            "DB_ERROR",
+                            format!("Failed to cancel job: {}", err),
+                        ),
+                    };
+                    self.send_control_response(pending.identity, response)?;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("Cancel job response channel disconnected");
+                    self.pending_cancel_jobs.swap_remove(index);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_pending_dispatch_sweep(&mut self) {
+        let Some(rx) = &self.pending_dispatch_sweep else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                match result {
+                    Ok(count) if count > 0 => {
+                        info!("Requeued {} expired dispatch leases", count);
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!("Failed to sweep expired dispatch leases: {}", err);
+                    }
+                }
+                self.pending_dispatch_sweep = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                warn!("Dispatch lease sweep channel disconnected");
+                self.pending_dispatch_sweep = None;
+            }
+        }
+    }
+
+    fn drain_pending_dispatches(&mut self) {
+        if self.pending_dispatches.is_empty() {
+            return;
+        }
+        let mut index = 0;
+        let mut processed_any = false;
+        let mut dispatched_any = false;
+        while index < self.pending_dispatches.len() {
+            match self.pending_dispatches[index].rx.try_recv() {
+                Ok(result) => {
+                    processed_any = true;
+                    let pending = self.pending_dispatches.swap_remove(index);
+                    match result {
+                        Ok(Some(plan)) => {
+                            if let Some(worker) = self.workers.get(&pending.identity) {
+                                if worker.status != WorkerStatus::Idle {
+                                    warn!(
+                                        "Dispatch plan for busy worker {}; requeueing job {}",
+                                        worker.worker_id, plan.job_id_db
+                                    );
+                                    let job_id_db = plan.job_id_db;
+                                    let _ = self.sqlite_executor.execute(move |_, queue, _| {
+                                        queue.defer_job(
+                                            job_id_db,
+                                            now_millis(),
+                                            Some("dispatch_worker_busy"),
+                                        )?;
+                                        Ok(())
+                                    });
+                                } else {
+                                    match self.send_dispatch_plan(pending.identity.clone(), plan) {
+                                        Ok(true) => dispatched_any = true,
+                                        Ok(false) => {}
+                                        Err(err) => {
+                                            warn!("Dispatch send failed: {}", err);
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "Dispatch plan for unknown worker; requeueing job {}",
+                                    plan.job_id_db
+                                );
+                                let job_id_db = plan.job_id_db;
+                                let _ = self.sqlite_executor.execute(move |_, queue, _| {
+                                    queue.defer_job(
+                                        job_id_db,
+                                        now_millis(),
+                                        Some("dispatch_worker_missing"),
+                                    )?;
+                                    Ok(())
+                                });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!("Dispatch preparation failed: {}", err);
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("Dispatch preparation channel disconnected");
+                    processed_any = true;
+                    self.pending_dispatches.swap_remove(index);
+                }
+            }
+        }
+        if processed_any {
+            if dispatched_any {
+                self.dispatch_backoff_ms = 0;
+                self.dispatch_cooldown_until = None;
+            } else {
+                self.schedule_dispatch_backoff();
+            }
+        }
+    }
+
+    fn drain_pending_concludes(&mut self) {
+        if self.pending_concludes.is_empty() {
+            return;
+        }
+        let mut index = 0;
+        while index < self.pending_concludes.len() {
+            match self.pending_concludes[index].rx.try_recv() {
+                Ok(result) => {
+                    let pending = self.pending_concludes.swap_remove(index);
+                    METRICS.record_conclude_time(pending.started_at);
+                    match result {
+                        Ok(outcome) => match outcome {
+                            ConcludeOutcome::Stale { job_id } => {
+                                warn!("Stale CONCLUDE ignored for job {}", job_id);
+                            }
+                            ConcludeOutcome::Completed { job_id, artifacts } => {
+                                info!(
+                                    "Job {} completed: {} artifacts",
+                                    job_id,
+                                    artifacts.len()
+                                );
+                                METRICS.inc_jobs_completed();
+                                if let Err(err) = self.update_query_catalog_for_artifacts(&artifacts)
+                                {
+                                    warn!("Failed to update query catalog: {}", err);
+                                }
+                            }
+                            ConcludeOutcome::Failed { job_id, retried } => {
+                                if retried {
+                                    METRICS.inc_jobs_retried();
+                                } else {
+                                    METRICS.inc_jobs_failed();
+                                }
+                                warn!("Job {} failed", job_id);
+                            }
+                            ConcludeOutcome::Rejected { job_id } => {
+                                METRICS.inc_jobs_rejected();
+                                warn!("Job {} rejected by worker", job_id);
+                            }
+                            ConcludeOutcome::Aborted { job_id } => {
+                                METRICS.inc_jobs_aborted();
+                                warn!("Job {} aborted", job_id);
+                            }
+                        },
+                        Err(err) => {
+                            warn!("Conclude processing failed: {}", err);
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    warn!("Conclude response channel disconnected");
+                    self.pending_concludes.swap_remove(index);
+                }
+            }
+        }
+    }
+
+    fn sweep_expired_dispatches(&mut self) {
+        let now = current_time();
+        if now - self.last_dispatch_lease_sweep < DISPATCH_LEASE_SWEEP_SECS {
+            return;
+        }
+        self.last_dispatch_lease_sweep = now;
+        let now_ms = now_millis();
+        if self.pending_dispatch_sweep.is_some() {
+            return;
+        }
+        match self
+            .sqlite_executor
+            .submit(move |_, queue, _| queue.requeue_expired_dispatches(now_ms))
+        {
+            Ok(rx) => self.pending_dispatch_sweep = Some(rx),
+            Err(err) => warn!("Failed to schedule dispatch lease sweep: {}", err),
+        }
+    }
+
+    fn reconcile_running_jobs_for_worker(
+        &mut self,
+        worker_id: &str,
+        active_job_ids: &[JobId],
+    ) -> Result<()> {
+        let mut active_set = HashSet::new();
+        for job_id in active_job_ids {
+            match job_id.to_i64() {
+                Ok(id) => {
+                    active_set.insert(id);
+                }
+                Err(err) => {
+                    warn!("Heartbeat job id {} not representable: {}", job_id, err);
+                }
+            }
+        }
+        let worker_id = worker_id.to_string();
+        self.sqlite_executor.execute(move |_, queue, _| {
+            let db_jobs = queue.list_running_jobs_by_owner(&worker_id)?;
+            let db_jobs_set: HashSet<i64> = db_jobs.iter().copied().collect();
+            let now = now_millis();
+            for job_id in &db_jobs {
+                if !active_set.contains(job_id) {
+                    warn!(
+                        "Requeueing job {} after restart; worker {} did not report it",
+                        job_id, worker_id
+                    );
+                    let _ = queue.defer_job(*job_id, now, Some("lost_on_restart"));
+                }
+            }
+
+            for active_job in active_set {
+                if !db_jobs_set.contains(&active_job) {
+                    warn!(
+                        "Worker {} reported active job {} not present in DB",
+                        worker_id, active_job
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn reconcile_missing_workers_after_grace(&mut self) -> Result<()> {
+        let Some(deadline) = self.startup_grace_deadline else {
+            return Ok(());
+        };
+        let now = current_time();
+        if now < deadline {
+            return Ok(());
+        }
+        self.startup_grace_deadline = None;
+
+        let seen_worker_ids = self.seen_worker_ids.clone();
+        self.sqlite_executor.execute(move |_, queue, _| {
+            let jobs = queue.list_running_jobs_with_owner()?;
+            let now_ms = now_millis();
+            for (job_id, owner) in jobs {
+                let missing = owner
+                    .as_deref()
+                    .map(|id| !seen_worker_ids.contains(id))
+                    .unwrap_or(true);
+                if missing {
+                    warn!(
+                        "Requeueing job {} after restart; worker {:?} did not reconnect",
+                        job_id, owner
+                    );
+                    let _ = queue.defer_job(job_id, now_ms, Some("worker_missing_after_restart"));
+                }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -920,15 +1450,22 @@ impl Sentinel {
         let before_count = self.workers.len();
 
         // Collect stale workers and their current jobs before removing
-        let stale_workers: Vec<(Vec<u8>, String, Option<JobId>)> = self
+        let stale_workers: Vec<(Vec<u8>, String, Option<JobId>, Option<String>)> = self
             .workers
             .iter()
             .filter(|(_, w)| w.last_seen < cutoff)
-            .map(|(id, w)| (id.clone(), w.worker_id.clone(), w.current_job_id))
+            .map(|(id, w)| {
+                (
+                    id.clone(),
+                    w.worker_id.clone(),
+                    w.current_job_id,
+                    w.current_lease_token.clone(),
+                )
+            })
             .collect();
 
         // Remove stale workers and queue their jobs for failure
-        for (id, worker_id, job_id) in stale_workers {
+        for (id, worker_id, job_id, lease_token) in stale_workers {
             if self.workers.remove(&id).is_some() {
                 warn!(
                     "Removing stale worker [{}]: last seen {:.0}s ago",
@@ -943,7 +1480,7 @@ impl Sentinel {
                         "Job {} orphaned by stale worker [{}] - will be failed",
                         jid, worker_id
                     );
-                    self.orphaned_jobs.push(jid);
+                    self.orphaned_jobs.push((jid, lease_token));
                 }
             }
         }
@@ -965,23 +1502,24 @@ impl Sentinel {
     // Control API Handling
     // ========================================================================
 
-    /// Handle control API requests (non-blocking)
-    fn handle_control_requests(&mut self) -> Result<()> {
+    /// Handle at most one control API request (non-blocking).
+    /// Returns true if a request was handled.
+    fn handle_control_requests(&mut self) -> Result<bool> {
         if self.control_socket.is_none() {
-            return Ok(());
+            return Ok(false);
         }
 
-        // Try to receive a control request (non-blocking due to short timeout)
+        // Try to receive a control request (non-blocking).
         // Use take/put pattern to satisfy borrow checker
         let control_socket = self.control_socket.take().unwrap();
-        let request_bytes = match control_socket.recv_bytes(0) {
-            Ok(bytes) => {
+        let multipart = match control_socket.recv_multipart(zmq::DONTWAIT) {
+            Ok(parts) => {
                 self.control_socket = Some(control_socket);
-                bytes
+                parts
             }
             Err(zmq::Error::EAGAIN) => {
                 self.control_socket = Some(control_socket);
-                return Ok(()); // No request waiting
+                return Ok(false); // No request waiting
             }
             Err(e) => {
                 self.control_socket = Some(control_socket);
@@ -989,247 +1527,90 @@ impl Sentinel {
             }
         };
 
-        // Parse and handle the request
-        let response = match serde_json::from_slice::<ControlRequest>(&request_bytes) {
-            Ok(request) => self.handle_control_request(request),
-            Err(e) => ControlResponse::error("PARSE_ERROR", format!("Invalid request: {}", e)),
+        let (identity, request_bytes) = match multipart.len() {
+            3 if multipart[1].is_empty() => (multipart[0].clone(), multipart[2].clone()),
+            2 => (multipart[0].clone(), multipart[1].clone()),
+            count => {
+                warn!(
+                    "Invalid control request frames (expected 2/3, got {})",
+                    count
+                );
+                return Ok(false);
+            }
         };
 
-        // Send response
-        let response_bytes = serde_json::to_vec(&response)?;
-        let control_socket = self.control_socket.as_ref().unwrap();
-        control_socket
-            .send(&response_bytes, 0)
-            .context("Failed to send control response")?;
+        // Parse and handle the request
+        match serde_json::from_slice::<ControlRequest>(&request_bytes) {
+            Ok(request) => {
+                self.handle_control_request(identity, request)?;
+            }
+            Err(e) => {
+                self.send_control_response(
+                    identity,
+                    ControlResponse::error("PARSE_ERROR", format!("Invalid request: {}", e)),
+                )?;
+            }
+        }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Handle a single control request
-    fn handle_control_request(&mut self, request: ControlRequest) -> ControlResponse {
+    fn handle_control_request(
+        &mut self,
+        identity: Vec<u8>,
+        request: ControlRequest,
+    ) -> Result<()> {
         match request {
-            ControlRequest::ListJobs {
-                status,
-                limit,
-                offset,
-            } => self.handle_list_jobs(status, limit.unwrap_or(100), offset.unwrap_or(0)),
-            ControlRequest::GetJob { job_id } => self.handle_get_job(job_id),
-            ControlRequest::CancelJob { job_id } => self.handle_cancel_job(job_id),
-            ControlRequest::GetQueueStats => self.handle_get_queue_stats(),
-            ControlRequest::CreateApiJob {
-                job_type,
-                plugin_name,
-                plugin_version,
-                input_dir,
-                output,
-                approval_id,
-                spec_json,
-            } => self.handle_create_api_job(
-                job_type,
-                &plugin_name,
-                plugin_version.as_deref(),
-                &input_dir,
-                output.as_deref(),
-                approval_id.as_deref(),
-                spec_json.as_deref(),
-            ),
-            ControlRequest::GetApiJob { job_id } => self.handle_get_api_job(job_id),
-            ControlRequest::ListApiJobs {
-                status,
-                limit,
-                offset,
-            } => self.handle_list_api_jobs(status, limit, offset),
-            ControlRequest::UpdateApiJobStatus { job_id, status } => {
-                self.handle_update_api_job_status(job_id, status)
+            ControlRequest::Ping => {
+                self.send_control_response(identity, ControlResponse::Pong)?;
             }
-            ControlRequest::UpdateApiJobProgress { job_id, progress } => {
-                self.handle_update_api_job_progress(job_id, progress)
-            }
-            ControlRequest::UpdateApiJobResult { job_id, result } => {
-                self.handle_update_api_job_result(job_id, result)
-            }
-            ControlRequest::UpdateApiJobError { job_id, error } => {
-                self.handle_update_api_job_error(job_id, &error)
-            }
-            ControlRequest::CancelApiJob { job_id } => self.handle_cancel_api_job(job_id),
-            ControlRequest::ListApprovals {
-                status,
-                limit,
-                offset,
-            } => self.handle_list_approvals(status, limit, offset),
-            ControlRequest::CreateApproval {
-                approval_id,
-                operation,
-                summary,
-                expires_in_seconds,
-            } => self.handle_create_approval(&approval_id, operation, &summary, expires_in_seconds),
-            ControlRequest::GetApproval { approval_id } => self.handle_get_approval(&approval_id),
-            ControlRequest::Approve { approval_id } => self.handle_approve(&approval_id),
-            ControlRequest::Reject {
-                approval_id,
-                reason,
-            } => self.handle_reject(&approval_id, &reason),
-            ControlRequest::SetApprovalJobId {
-                approval_id,
-                job_id,
-            } => self.handle_set_approval_job_id(&approval_id, job_id),
-            ControlRequest::ExpireApprovals => self.handle_expire_approvals(),
-            ControlRequest::CreateSession {
-                intent_text,
-                input_dir,
-            } => self.handle_create_session(&intent_text, input_dir.as_deref()),
-            ControlRequest::GetSession { session_id } => self.handle_get_session(session_id),
-            ControlRequest::ListSessions { state, limit } => {
-                self.handle_list_sessions(state, limit)
-            }
-            ControlRequest::ListSessionsNeedingInput { limit } => {
-                self.handle_list_sessions_needing_input(limit)
-            }
-            ControlRequest::AdvanceSession {
-                session_id,
-                target_state,
-            } => self.handle_advance_session(session_id, target_state),
-            ControlRequest::CancelSession { session_id } => self.handle_cancel_session(session_id),
-            ControlRequest::ListSources { workspace_id } => self.handle_list_sources(workspace_id),
-            ControlRequest::UpsertSource { source } => self.handle_upsert_source(&source),
-            ControlRequest::UpdateSource {
-                source_id,
-                name,
-                path,
-            } => self.handle_update_source(source_id, name.as_deref(), path.as_deref()),
-            ControlRequest::DeleteSource { source_id } => self.handle_delete_source(source_id),
-            ControlRequest::TouchSource { source_id } => self.handle_touch_source(source_id),
-            ControlRequest::ListRules { workspace_id } => self.handle_list_rules(workspace_id),
-            ControlRequest::CreateRule {
-                rule_id,
-                workspace_id,
-                pattern,
-                tag,
-            } => self.handle_create_rule(rule_id, workspace_id, &pattern, &tag),
-            ControlRequest::UpdateRuleEnabled {
-                rule_id,
-                workspace_id,
-                enabled,
-            } => self.handle_update_rule_enabled(rule_id, workspace_id, enabled),
-            ControlRequest::DeleteRule {
-                rule_id,
-                workspace_id,
-            } => self.handle_delete_rule(rule_id, workspace_id),
-            ControlRequest::ListTags {
-                workspace_id,
-                source_id,
-            } => self.handle_list_tags(workspace_id, source_id),
-            ControlRequest::ApplyTag {
-                workspace_id: _,
-                file_id,
-                tag,
-                tag_source,
-                rule_id,
-            } => self.handle_apply_tag(file_id, &tag, tag_source, rule_id.as_ref()),
             ControlRequest::StartScan { workspace_id, path } => {
-                self.handle_start_scan(workspace_id, &path)
+                let response = self.handle_start_scan(workspace_id, &path);
+                self.send_control_response(identity, response)?;
             }
-            ControlRequest::GetScan { scan_id } => self.handle_get_scan(&scan_id),
-            ControlRequest::ListScans { limit } => self.handle_list_scans(limit),
-            ControlRequest::CancelScan { scan_id } => self.handle_cancel_scan(&scan_id),
-            ControlRequest::Ping => ControlResponse::Pong,
+            ControlRequest::GetScan { scan_id } => {
+                let response = self.handle_get_scan(&scan_id);
+                self.send_control_response(identity, response)?;
+            }
+            ControlRequest::ListScans { limit } => {
+                let response = self.handle_list_scans(limit);
+                self.send_control_response(identity, response)?;
+            }
+            ControlRequest::CancelScan { scan_id } => {
+                let response = self.handle_cancel_scan(&scan_id);
+                self.send_control_response(identity, response)?;
+            }
+            ControlRequest::CancelJob { job_id } => {
+                let rx = self
+                    .sqlite_executor
+                    .submit(move |_, queue, _| queue.cancel_job(job_id))?;
+                self.pending_cancel_jobs.push(PendingCancelJob {
+                    identity,
+                    job_id,
+                    rx,
+                });
+            }
+            request => {
+                let rx = self.sqlite_executor.submit(move |state_store, queue, ctx| {
+                    Ok(handle_control_request_db(state_store, queue, ctx, request))
+                })?;
+                self.pending_control_replies.push(PendingControlReply { identity, rx });
+            }
         }
+        Ok(())
     }
 
-    /// Handle ListJobs request
-    fn handle_list_jobs(
-        &self,
-        status: Option<ProcessingStatus>,
-        limit: i64,
-        offset: i64,
-    ) -> ControlResponse {
-        let limit = limit.max(0);
-        let offset = offset.max(0);
-        match self.state_store.queue().list_jobs(status, limit, offset) {
-            Ok(jobs) => {
-                let job_infos: Vec<JobInfo> = jobs.into_iter().map(Self::job_to_info).collect();
-                ControlResponse::Jobs(job_infos)
-            }
-            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list jobs: {}", e)),
-        }
-    }
-
-    /// Handle GetJob request
-    fn handle_get_job(&self, job_id: JobId) -> ControlResponse {
-        match self.state_store.queue().get_job(job_id) {
-            Ok(Some(job)) => ControlResponse::Job(Some(Self::job_to_info(job))),
-            Ok(None) => ControlResponse::Job(None),
-            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get job: {}", e)),
-        }
-    }
-
-    /// Handle CancelJob request
-    fn handle_cancel_job(&mut self, job_id: JobId) -> ControlResponse {
-        // First, try to cancel in the database (for queued jobs)
-        match self.state_store.queue().cancel_job(job_id) {
-            Ok(true) => {
-                info!("Job {} cancelled via control API", job_id);
-                return ControlResponse::CancelResult {
-                    success: true,
-                    message: "Job cancelled".to_string(),
-                };
-            }
-            Ok(false) => {
-                // Job might be running - try to abort via worker
-            }
-            Err(e) => {
-                return ControlResponse::error("DB_ERROR", format!("Failed to cancel job: {}", e));
-            }
-        }
-
-        // Check if job is running on a worker
-        for (identity, worker) in &self.workers {
-            if worker.current_job_id == Some(job_id) {
-                // Send abort to worker
-                if let Err(e) = self.send_abort_to_worker(identity.clone(), job_id) {
-                    warn!("Failed to send abort for job {}: {}", job_id, e);
-                    return ControlResponse::CancelResult {
-                        success: false,
-                        message: format!("Failed to send abort: {}", e),
-                    };
-                }
-                info!("Abort sent to worker for job {}", job_id);
-                return ControlResponse::CancelResult {
-                    success: true,
-                    message: "Abort signal sent to worker".to_string(),
-                };
-            }
-        }
-
-        // Job not found in queue or running
-        ControlResponse::CancelResult {
-            success: false,
-            message: "Job not found or already completed".to_string(),
-        }
-    }
-
-    /// Handle GetQueueStats request
-    fn handle_get_queue_stats(&self) -> ControlResponse {
-        match self.state_store.queue().count_jobs_by_status() {
-            Ok(counts) => {
-                let queued = *counts.get(&ProcessingStatus::Queued).unwrap_or(&0);
-                let running = *counts.get(&ProcessingStatus::Running).unwrap_or(&0);
-                let completed = *counts.get(&ProcessingStatus::Completed).unwrap_or(&0);
-                let failed = *counts.get(&ProcessingStatus::Failed).unwrap_or(&0);
-                let aborted = *counts.get(&ProcessingStatus::Aborted).unwrap_or(&0);
-                let total = queued + running + completed + failed + aborted;
-
-                ControlResponse::QueueStats(QueueStatsInfo {
-                    queued,
-                    running,
-                    completed,
-                    failed,
-                    aborted,
-                    total,
-                })
-            }
-            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get stats: {}", e)),
-        }
+    fn send_control_response(&self, identity: Vec<u8>, response: ControlResponse) -> Result<()> {
+        let Some(control_socket) = self.control_socket.as_ref() else {
+            warn!("Control response dropped: control socket not available");
+            return Ok(());
+        };
+        let response_bytes = serde_json::to_vec(&response)?;
+        control_socket
+            .send_multipart(&[identity.as_slice(), &[], &response_bytes], 0)
+            .context("Failed to send control response")?;
+        Ok(())
     }
 
     /// Handle CreateApiJob request
@@ -1879,60 +2260,63 @@ impl Sentinel {
         let canonical_path = scan_path::canonicalize_scan_path(&expanded_path);
         let path_display = canonical_path.display().to_string();
 
-        let scout = self.state_store.scout();
-        let workspace_id = match workspace_id {
-            Some(id) => match scout.get_workspace(&id) {
-                Ok(Some(_)) => id,
-                Ok(None) => {
-                    return ControlResponse::error(
-                        "NOT_FOUND",
-                        "Workspace not found".to_string(),
-                    )
-                }
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            },
-            None => match scout.ensure_default_workspace() {
-                Ok(ws) => ws.id,
-                Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
-            },
+        let workspace_id = match self
+            .sqlite_executor
+            .call(move |state_store, _queue, _ctx| {
+            let scout = state_store.scout();
+            let workspace_id = match workspace_id {
+                Some(id) => match scout.get_workspace(&id) {
+                    Ok(Some(_)) => id,
+                    Ok(None) => {
+                        anyhow::bail!("Workspace not found");
+                    }
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                },
+                None => match scout.ensure_default_workspace() {
+                    Ok(ws) => ws.id,
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                },
+            };
+            Ok(workspace_id)
+        }) {
+            Ok(id) => id,
+            Err(err) => {
+                return ControlResponse::error("DB_ERROR", err.to_string());
+            }
         };
 
         let scan_id = Uuid::new_v4().to_string();
         let cancel_token = ScanCancelToken::new();
 
-        {
-            let mut jobs = self.scan_jobs.lock().unwrap();
-            jobs.insert(
-                scan_id.clone(),
-                ScanJobState {
-                    scan_id: scan_id.clone(),
-                    workspace_id,
-                    source_path: path_display.clone(),
-                    source_id: None,
-                    state: ScanState::Pending,
-                    progress: None,
-                    files_persisted: None,
-                    error: None,
-                    cancel_token: Some(cancel_token.clone()),
-                },
-            );
-        }
+        self.scan_jobs.insert(
+            scan_id.clone(),
+            ScanJobState {
+                scan_id: scan_id.clone(),
+                workspace_id,
+                source_path: path_display.clone(),
+                source_id: None,
+                state: ScanState::Pending,
+                progress: None,
+                files_persisted: None,
+                error: None,
+                cancel_token: Some(cancel_token.clone()),
+            },
+        );
 
-        let scan_jobs = self.scan_jobs.clone();
         let scan_id_for_thread = scan_id.clone();
         let workspace_id_for_thread = workspace_id;
         let path_display_for_thread = path_display.clone();
         let state_store_for_thread = self.state_store.clone();
         let cancel_token_for_thread = cancel_token.clone();
+        let scan_event_tx = self.scan_event_tx.clone();
         std::thread::spawn(move || {
             let session = match state_store_for_thread.session_bulk() {
                 Ok(session) => session,
                 Err(e) => {
-                    let mut jobs = scan_jobs.lock().unwrap();
-                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                        job.state = ScanState::Failed;
-                        job.error = Some(format!("Failed to open scout session: {}", e));
-                    }
+                    let _ = scan_event_tx.send(ScanEvent::Failed {
+                        scan_id: scan_id_for_thread.clone(),
+                        error: format!("Failed to open scout session: {}", e),
+                    });
                     return;
                 }
             };
@@ -1951,14 +2335,13 @@ impl Sentinel {
                     if let Ok(Some(name_conflict)) =
                         scout.get_source_by_name(&workspace_id_for_thread, &source_name)
                     {
-                        let mut jobs = scan_jobs.lock().unwrap();
-                        if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                            job.state = ScanState::Failed;
-                            job.error = Some(format!(
+                        let _ = scan_event_tx.send(ScanEvent::Failed {
+                            scan_id: scan_id_for_thread.clone(),
+                            error: format!(
                                 "A source named '{}' already exists at '{}'.",
                                 source_name, name_conflict.path
-                            ));
-                        }
+                            ),
+                        });
                         return;
                     }
 
@@ -1967,11 +2350,10 @@ impl Sentinel {
                         std::path::Path::new(&path_display_for_thread),
                     )
                     {
-                        let mut jobs = scan_jobs.lock().unwrap();
-                        if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                            job.state = ScanState::Failed;
-                            job.error = Some(err.to_string());
-                        }
+                        let _ = scan_event_tx.send(ScanEvent::Failed {
+                            scan_id: scan_id_for_thread.clone(),
+                            error: err.to_string(),
+                        });
                         return;
                     }
 
@@ -1988,42 +2370,37 @@ impl Sentinel {
                     };
 
                     if let Err(e) = scout.upsert_source(&new_source) {
-                        let mut jobs = scan_jobs.lock().unwrap();
-                        if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                            job.state = ScanState::Failed;
-                            job.error = Some(format!("Failed to save source: {}", e));
-                        }
+                        let _ = scan_event_tx.send(ScanEvent::Failed {
+                            scan_id: scan_id_for_thread.clone(),
+                            error: format!("Failed to save source: {}", e),
+                        });
                         return;
                     }
                     new_source
                 }
                 Err(e) => {
-                    let mut jobs = scan_jobs.lock().unwrap();
-                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                        job.state = ScanState::Failed;
-                        job.error = Some(format!("Database error: {}", e));
-                    }
+                    let _ = scan_event_tx.send(ScanEvent::Failed {
+                        scan_id: scan_id_for_thread.clone(),
+                        error: format!("Database error: {}", e),
+                    });
                     return;
                 }
             };
 
-            {
-                let mut jobs = scan_jobs.lock().unwrap();
-                if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                    job.state = ScanState::Running;
-                    job.source_id = Some(source.id);
-                }
-            }
+            let _ = scan_event_tx.send(ScanEvent::Started {
+                scan_id: scan_id_for_thread.clone(),
+                source_id: source.id,
+            });
 
             let (progress_tx, progress_rx) = mpsc::channel::<ScanProgress>();
-            let progress_jobs = scan_jobs.clone();
+            let progress_event_tx = scan_event_tx.clone();
             let progress_scan_id = scan_id_for_thread.clone();
             let progress_handle = std::thread::spawn(move || {
                 while let Ok(progress) = progress_rx.recv() {
-                    let mut jobs = progress_jobs.lock().unwrap();
-                    if let Some(job) = jobs.get_mut(&progress_scan_id) {
-                        job.progress = Some(progress);
-                    }
+                    let _ = progress_event_tx.send(ScanEvent::Progress {
+                        scan_id: progress_scan_id.clone(),
+                        progress,
+                    });
                 }
             });
 
@@ -2031,11 +2408,10 @@ impl Sentinel {
             let scanner = match session.scanner(scan_config) {
                 Ok(scanner) => scanner,
                 Err(e) => {
-                    let mut jobs = scan_jobs.lock().unwrap();
-                    if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                        job.state = ScanState::Failed;
-                        job.error = Some(format!("Failed to start scanner: {}", e));
-                    }
+                    let _ = scan_event_tx.send(ScanEvent::Failed {
+                        scan_id: scan_id_for_thread.clone(),
+                        error: format!("Failed to start scanner: {}", e),
+                    });
                     return;
                 }
             };
@@ -2048,22 +2424,23 @@ impl Sentinel {
             drop(scanner);
             let _ = progress_handle.join();
 
-            let mut jobs = scan_jobs.lock().unwrap();
-            if let Some(job) = jobs.get_mut(&scan_id_for_thread) {
-                match scan_result {
-                    Ok(result) => {
-                        job.state = ScanState::Completed;
-                        job.files_persisted = Some(result.stats.files_persisted);
-                        job.error = None;
-                    }
-                    Err(e) => {
-                        if matches!(e, casparian_scout::error::ScoutError::Cancelled) {
-                            job.state = ScanState::Cancelled;
-                            job.error = Some("Scan cancelled".to_string());
-                        } else {
-                            job.state = ScanState::Failed;
-                            job.error = Some(format!("Scan failed: {}", e));
-                        }
+            match scan_result {
+                Ok(result) => {
+                    let _ = scan_event_tx.send(ScanEvent::Completed {
+                        scan_id: scan_id_for_thread.clone(),
+                        files_persisted: result.stats.files_persisted,
+                    });
+                }
+                Err(e) => {
+                    if matches!(e, casparian_scout::error::ScoutError::Cancelled) {
+                        let _ = scan_event_tx.send(ScanEvent::Cancelled {
+                            scan_id: scan_id_for_thread.clone(),
+                        });
+                    } else {
+                        let _ = scan_event_tx.send(ScanEvent::Failed {
+                            scan_id: scan_id_for_thread.clone(),
+                            error: format!("Scan failed: {}", e),
+                        });
                     }
                 }
             }
@@ -2073,14 +2450,13 @@ impl Sentinel {
     }
 
     fn handle_get_scan(&self, scan_id: &str) -> ControlResponse {
-        let jobs = self.scan_jobs.lock().unwrap();
-        let status = jobs.get(scan_id).map(|job| job.to_status());
+        let status = self.scan_jobs.get(scan_id).map(|job| job.to_status());
         ControlResponse::ScanStatus(status)
     }
 
     fn handle_list_scans(&self, limit: Option<usize>) -> ControlResponse {
-        let jobs = self.scan_jobs.lock().unwrap();
-        let mut scans: Vec<ScoutScanStatus> = jobs.values().map(|job| job.to_status()).collect();
+        let mut scans: Vec<ScoutScanStatus> =
+            self.scan_jobs.values().map(|job| job.to_status()).collect();
         if let Some(limit) = limit {
             if scans.len() > limit {
                 scans.truncate(limit);
@@ -2089,9 +2465,8 @@ impl Sentinel {
         ControlResponse::Scans(scans)
     }
 
-    fn handle_cancel_scan(&self, scan_id: &str) -> ControlResponse {
-        let mut jobs = self.scan_jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(scan_id) {
+    fn handle_cancel_scan(&mut self, scan_id: &str) -> ControlResponse {
+        if let Some(job) = self.scan_jobs.get_mut(scan_id) {
             if let Some(token) = job.cancel_token.as_ref() {
                 token.cancel();
             }
@@ -2144,7 +2519,7 @@ impl Sentinel {
     ///
     /// ROUTER receives multipart message: [identity, header, payload]
     fn recv_message(&mut self) -> Result<Option<(Vec<u8>, Message)>> {
-        let multipart = match self.socket.recv_multipart(0) {
+        let multipart = match self.socket.recv_multipart(zmq::DONTWAIT) {
             Ok(parts) => parts,
             Err(zmq::Error::EAGAIN) => return Ok(None),
             Err(e) => return Err(anyhow::anyhow!("ZMQ error: {}", e)),
@@ -2182,6 +2557,11 @@ impl Sentinel {
                 self.register_worker(identity, payload)?;
             }
 
+            OpCode::DispatchAck => {
+                let payload: types::DispatchAckPayload = serde_json::from_slice(&msg.payload)?;
+                self.handle_dispatch_ack(identity, msg.header.job_id, payload)?;
+            }
+
             OpCode::Conclude => {
                 let receipt: JobReceipt = serde_json::from_slice(&msg.payload)?;
                 self.handle_conclude(identity, msg.header.job_id, receipt)?;
@@ -2193,18 +2573,8 @@ impl Sentinel {
             }
 
             OpCode::Heartbeat => {
-                if let Some(worker) = self.workers.get_mut(&identity) {
-                    worker.last_seen = current_time();
-                } else {
-                    // Heartbeat from unknown identity - could be a worker that was cleaned up
-                    // or a misconfigured client. Log for debugging.
-                    debug!(
-                        "Received heartbeat from unknown identity ({} bytes, first byte: 0x{:02x}). \
-                        Worker may have been cleaned up for being stale.",
-                        identity.len(),
-                        identity.first().copied().unwrap_or(0)
-                    );
-                }
+                let payload: types::HeartbeatPayload = serde_json::from_slice(&msg.payload)?;
+                self.handle_heartbeat(identity, payload)?;
             }
 
             OpCode::Deploy => {
@@ -2260,8 +2630,98 @@ impl Sentinel {
 
         let worker = ConnectedWorker::new(worker_id.clone(), capabilities);
         self.workers.insert(identity, worker);
+        self.seen_worker_ids.insert(worker_id.clone());
         METRICS.inc_workers_registered();
         info!("Worker registered: {}", worker_id);
+        Ok(())
+    }
+
+    fn handle_dispatch_ack(
+        &mut self,
+        identity: Vec<u8>,
+        job_id: JobId,
+        payload: types::DispatchAckPayload,
+    ) -> Result<()> {
+        let Some(worker) = self.workers.get_mut(&identity) else {
+            warn!("Dispatch ACK from unknown worker identity");
+            return Ok(());
+        };
+        worker.last_seen = current_time();
+
+        if let Some(payload_worker_id) = payload.worker_id.as_deref() {
+            if payload_worker_id != worker.worker_id {
+                warn!(
+                    "Dispatch ACK worker_id mismatch: payload={} expected={}",
+                    payload_worker_id, worker.worker_id
+                );
+            }
+        }
+
+        if worker.current_job_id != Some(job_id) {
+            warn!(
+                "Dispatch ACK for job {} does not match worker state {:?}",
+                job_id, worker.current_job_id
+            );
+            return Ok(());
+        }
+
+        if worker.current_lease_token.as_deref() != Some(payload.lease_token.as_str()) {
+            warn!(
+                "Dispatch ACK lease token mismatch for job {}",
+                job_id
+            );
+            return Ok(());
+        }
+
+        let job_id_db = job_id.to_i64().map_err(|err| {
+            anyhow::anyhow!(
+                "Job ID {} is not representable in storage: {}",
+                job_id,
+                err
+            )
+        })?;
+        let lease_token = payload.lease_token.clone();
+        let worker_id = worker.worker_id.clone();
+        self.sqlite_executor.execute(move |_, queue, _| {
+            let now = now_millis();
+            let acked = queue.ack_dispatch(job_id_db, &lease_token, &worker_id, now)?;
+            if !acked {
+                warn!("Stale dispatch ACK ignored for job {}", job_id_db);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn handle_heartbeat(
+        &mut self,
+        identity: Vec<u8>,
+        payload: types::HeartbeatPayload,
+    ) -> Result<()> {
+        if let Some(worker) = self.workers.get_mut(&identity) {
+            worker.last_seen = current_time();
+            worker.status = match payload.status {
+                types::HeartbeatStatus::Idle => WorkerStatus::Idle,
+                types::HeartbeatStatus::Busy | types::HeartbeatStatus::Alive => WorkerStatus::Busy,
+            };
+            self.seen_worker_ids.insert(worker.worker_id.clone());
+            if self.startup_grace_deadline.is_some()
+                && !self.reconciled_workers.contains(&worker.worker_id)
+            {
+                let worker_id = worker.worker_id.clone();
+                self.reconciled_workers.insert(worker_id.clone());
+                self.reconcile_running_jobs_for_worker(&worker_id, &payload.active_job_ids)?;
+            }
+        } else {
+            // Heartbeat from unknown identity - could be a worker that was cleaned up
+            // or a misconfigured client. Log for debugging.
+            debug!(
+                "Received heartbeat from unknown identity ({} bytes, first byte: 0x{:02x}). \
+                        Worker may have been cleaned up for being stale.",
+                identity.len(),
+                identity.first().copied().unwrap_or(0)
+            );
+        }
         Ok(())
     }
 
@@ -2282,6 +2742,7 @@ impl Sentinel {
         if let Some(worker) = self.workers.get_mut(&identity) {
             worker.status = WorkerStatus::Idle;
             worker.current_job_id = None;
+            worker.current_lease_token = None;
             worker.last_seen = current_time();
         }
 
@@ -2295,119 +2756,16 @@ impl Sentinel {
             )
         })?;
 
-        if let Some(diagnostics) = receipt.diagnostics.as_ref() {
-            if let Some(mismatch) = diagnostics.schema_mismatch.as_ref() {
-                if let Err(err) = self.state_store.queue().record_schema_mismatch(job_id, mismatch) {
-                    warn!(
-                        "Failed to persist schema mismatch for job {}: {}",
-                        job_id, err
-                    );
-                }
-            }
-        }
-
-        if let Err(err) = self
-            .state_store
-            .artifacts()
-            .insert_job_artifacts(job_id, &receipt.artifacts)
-        {
-            warn!("Failed to persist artifacts for job {}: {}", job_id, err);
-        }
-
-        // Get plugin_name for health tracking (need to look up from job)
-        let plugin_name = self.get_job_plugin_name(job_id);
-
         let conclude_start = Instant::now();
-        match receipt.status {
-            JobStatus::Success | JobStatus::PartialSuccess | JobStatus::CompletedWithWarnings => {
-                info!(
-                    "Job {} completed: {} artifacts",
-                    job_id,
-                    receipt.artifacts.len()
-                );
-                // Map protocol JobStatus to completion_status string using enum helpers
-                let (completion_status, summary) = match receipt.status {
-                    JobStatus::Success => (JobStatus::Success.as_str(), "Success"),
-                    JobStatus::PartialSuccess => {
-                        (JobStatus::PartialSuccess.as_str(), "Partial success")
-                    }
-                    JobStatus::CompletedWithWarnings => (
-                        JobStatus::CompletedWithWarnings.as_str(),
-                        "Completed with warnings",
-                    ),
-                    other => unreachable!("Non-success status in success branch: {:?}", other),
-                };
-                let quarantine_rows = receipt.metrics.get(metrics::QUARANTINE_ROWS).copied();
-                self.state_store.queue()
-                    .complete_job(job_id, completion_status, summary, quarantine_rows)?;
-                METRICS.inc_jobs_completed();
-
-                if let Err(err) = self.record_materializations_for_job(job_id, &receipt) {
-                    warn!(
-                        "Failed to record materializations for job {}: {}",
-                        job_id, err
-                    );
-                }
-
-                // Record success for circuit breaker
-                if let Some(ref parser) = plugin_name {
-                    self.record_success(parser)?;
-                }
-            }
-            JobStatus::Failed => {
-                let error = receipt
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "Unknown error".to_string());
-
-                // Check if error is transient (from receipt metrics)
-                let is_transient = receipt
-                    .metrics
-                    .get("is_transient")
-                    .map(|v| *v == 1)
-                    .unwrap_or(true); // Default to transient (conservative)
-
-                // Get current retry count
-                let retry_count = self.get_job_retry_count(job_id).unwrap_or(0);
-
-                // Record failure for circuit breaker
-                if let Some(ref parser) = plugin_name {
-                    self.record_failure(parser, &error)?;
-                }
-
-                // Apply retry logic
-                self.handle_job_failure(job_id, &error, is_transient, retry_count)?;
-            }
-            JobStatus::Rejected => {
-                // Worker was at capacity - defer the job without incrementing retry count.
-                // Capacity rejections are not failures; they should not count toward dead-letter limits.
-                warn!(
-                    "Job {} rejected by worker (at capacity), deferring for retry",
-                    job_id
-                );
-                METRICS.inc_jobs_rejected();
-                // Use defer_job (not requeue_job) to avoid incrementing retry_count
-                let scheduled_at = now_millis();
-                self.state_store.queue()
-                    .defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
-            }
-            JobStatus::Aborted => {
-                let error = receipt
-                    .error_message
-                    .unwrap_or_else(|| "Aborted".to_string());
-                warn!("Job {} aborted: {}", job_id, error);
-                self.state_store.queue().abort_job(job_id, &error)?;
-                METRICS.inc_jobs_aborted();
-            }
-        }
-
-        METRICS.record_conclude_time(conclude_start);
-        if let Err(err) = self.update_pipeline_run_status_for_job(job_id) {
-            warn!(
-                "Failed to update pipeline run status for job {}: {}",
-                job_id, err
-            );
-        }
+        let receipt_for_db = receipt;
+        let rx = self.sqlite_executor.submit(move |state_store, queue, ctx| {
+            process_conclude_db(state_store, queue, ctx, job_id, receipt_for_db)
+        })?;
+        self.pending_concludes.push(PendingConclude {
+            job_id,
+            started_at: conclude_start,
+            rx,
+        });
         Ok(())
     }
 
@@ -2423,10 +2781,16 @@ impl Sentinel {
             error!("Traceback:\n{}", trace);
         }
 
+        let lease_token = self
+            .workers
+            .get(&identity)
+            .and_then(|worker| worker.current_lease_token.clone());
+
         // Mark worker as idle
         if let Some(worker) = self.workers.get_mut(&identity) {
             worker.status = WorkerStatus::Idle;
             worker.current_job_id = None;
+            worker.current_lease_token = None;
             worker.last_seen = current_time();
         }
 
@@ -2435,14 +2799,30 @@ impl Sentinel {
             anyhow::anyhow!("Job ID {} is not representable in storage: {}", job_id, err)
         })?;
 
-        self.state_store.queue()
-            .fail_job(job_id, JobStatus::Failed.as_str(), &err.message)?;
-        if let Err(err) = self.update_pipeline_run_status_for_job(job_id) {
-            warn!(
-                "Failed to update pipeline run status for job {}: {}",
-                job_id, err
-            );
-        }
+        let error_message = err.message.clone();
+        self.sqlite_executor.execute(move |_, queue, _| {
+            if let Some(token) = lease_token.as_deref() {
+                let updated = queue.fail_job_if_token_matches(
+                    job_id,
+                    token,
+                    JobStatus::Failed.as_str(),
+                    &error_message,
+                )?;
+                if !updated {
+                    warn!("Stale ERR ignored for job {}", job_id);
+                    return Ok(());
+                }
+            } else {
+                queue.fail_job(job_id, JobStatus::Failed.as_str(), &error_message)?;
+            }
+            if let Err(err) = queue.update_pipeline_run_status_for_job(job_id) {
+                warn!(
+                    "Failed to update pipeline run status for job {}: {}",
+                    job_id, err
+                );
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -2458,7 +2838,7 @@ impl Sentinel {
         let idle_identities: Vec<Vec<u8>> = self
             .workers
             .iter()
-            .filter(|(_, w)| w.status == WorkerStatus::Idle)
+            .filter(|(id, w)| w.status == WorkerStatus::Idle && !self.is_dispatch_pending(id))
             .map(|(id, _)| id.clone())
             .collect();
 
@@ -2466,77 +2846,47 @@ impl Sentinel {
             return Ok(());
         }
 
-        let claimed_jobs = self.queue_session.claim_jobs(idle_identities.len())?;
-        if claimed_jobs.is_empty() {
-            self.schedule_dispatch_backoff();
-            return Ok(());
-        }
-
-        let mut dispatched_any = false;
-
-        // Dispatch jobs to ALL idle workers (batch dispatch)
-        for (identity, job) in idle_identities.into_iter().zip(claimed_jobs) {
-            if self.assign_job(identity, job)? {
-                dispatched_any = true;
-            }
-        }
-
-        if dispatched_any {
-            self.dispatch_backoff_ms = 0;
-            self.dispatch_cooldown_until = None;
-        } else {
-            self.schedule_dispatch_backoff();
+        let now = now_millis();
+        for identity in idle_identities {
+            let Some(worker) = self.workers.get(&identity) else {
+                continue;
+            };
+            let worker_id = worker.worker_id.clone();
+            let worker_id_for_task = worker_id.clone();
+            let rx = self.sqlite_executor.submit(move |state_store, queue, ctx| {
+                Sentinel::prepare_dispatch_plan(
+                    state_store,
+                    queue,
+                    ctx,
+                    now,
+                    DISPATCH_LEASE_TTL_MS,
+                    &worker_id_for_task,
+                )
+            })?;
+            self.pending_dispatches.push(PendingDispatch {
+                identity,
+                worker_id,
+                requested_at: Instant::now(),
+                rx,
+            });
         }
 
         Ok(())
     }
 
-    fn schedule_dispatch_backoff(&mut self) {
-        let next = if self.dispatch_backoff_ms == 0 {
-            DISPATCH_BACKOFF_BASE_MS
-        } else {
-            (self.dispatch_backoff_ms * 2).min(DISPATCH_BACKOFF_MAX_MS)
+    fn prepare_dispatch_plan(
+        state_store: &StateStore,
+        queue: &StateStoreQueueSession,
+        context: &mut SqliteContext,
+        now_ms: i64,
+        ttl_ms: i64,
+        worker_id: &str,
+    ) -> Result<Option<DispatchPlan>> {
+        let mut leased_jobs = queue.lease_jobs_for_dispatch(1, now_ms, ttl_ms)?;
+        let Some(job) = leased_jobs.pop() else {
+            return Ok(None);
         };
-        self.dispatch_backoff_ms = next;
 
-        let jitter_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64 % DISPATCH_BACKOFF_JITTER_MS)
-            .unwrap_or(0);
-        self.dispatch_cooldown_until =
-            Some(Instant::now() + Duration::from_millis(next + jitter_ms));
-    }
-
-    fn update_pipeline_run_status_for_job(&self, job_id: i64) -> Result<()> {
-        self.state_store
-            .queue()
-            .update_pipeline_run_status_for_job(job_id)
-    }
-
-    fn set_pipeline_run_running(&self, run_id: &str) -> Result<()> {
-        self.state_store.queue().set_pipeline_run_running(run_id)
-    }
-
-    fn update_pipeline_run_status(&self, run_id: &str) -> Result<()> {
-        self.state_store.queue().update_pipeline_run_status(run_id)
-    }
-
-    /// Assign a job to a worker.
-    /// Returns true when a DISPATCH was sent.
-    fn assign_job(&mut self, identity: Vec<u8>, job: ProcessingJob) -> Result<bool> {
-        let span = tracing::info_span!(
-            "sentinel.dispatch_job",
-            job_id = job.id,
-            file_id = job.file_id,
-            plugin = %job.plugin_name,
-            pipeline_run_id = %job.pipeline_run_id.as_deref().unwrap_or("none"),
-            duration_ms = tracing::field::Empty
-        );
-        let _guard = span.enter();
-        let dispatch_start = Instant::now();
-
-        // Validate job.id is non-negative before casting to u64
-        // Negative IDs would wrap to huge values, corrupting protocol messages
         if job.id < 0 {
             anyhow::bail!(
                 "Job ID {} is negative - this indicates database corruption",
@@ -2546,28 +2896,27 @@ impl Sentinel {
         let job_id = JobId::try_from(job.id)
             .map_err(|err| anyhow::anyhow!("Invalid job id from queue ({}): {}", job.id, err))?;
 
-        info!("Assigning job {} to worker", job.id);
-
-        self.refresh_topic_configs_if_stale();
-
-        // Get sink configs from cache (per-output routing supported)
-        let configured_count = self
-            .topic_map
-            .get(&job.plugin_name)
-            .map(|configs| configs.len())
-            .unwrap_or(0);
-        let sinks = Self::resolve_sinks_for_plugin(&self.topic_map, &job.plugin_name);
-        if configured_count > 0 {
-            debug!(
-                "Using {} sink configs for plugin '{}'",
-                configured_count, job.plugin_name
-            );
+        let lease_token = Uuid::new_v4().to_string();
+        if !queue.set_dispatch_lease(job.id, &lease_token, worker_id)? {
+            warn!("Failed to set dispatch lease for job {}", job.id);
+            queue.defer_job(job.id, now_ms, Some("dispatch_lease_mismatch"))?;
+            return Ok(None);
         }
 
-        // Load file path and manifest in single query (was 4 queries, now 1)
-        let dispatch_data = self
-            .state_store
-            .queue()
+        let now = current_time();
+        if now - context.topic_map_last_refresh > TOPIC_CACHE_TTL_SECS {
+            match Self::load_topic_configs(state_store.routing()) {
+                Ok(new_map) => {
+                    context.topic_map = new_map;
+                    context.topic_map_last_refresh = now;
+                }
+                Err(e) => {
+                    warn!("Failed to refresh topic configs: {}", e);
+                }
+            }
+        }
+
+        let dispatch_data = queue
             .load_dispatch_data(&job.plugin_name, job.file_id)
             .context("Failed to load dispatch data")?;
         let DispatchData {
@@ -2630,15 +2979,19 @@ impl Sentinel {
             }
         }
 
-        let sinks = self.apply_contract_overrides(&job.plugin_name, &parser_version, sinks)?;
+        let sinks = Self::resolve_sinks_for_plugin(&context.topic_map, &job.plugin_name);
+        let sinks = Self::apply_contract_overrides_with_storage(
+            state_store.routing(),
+            &context.schema_storage,
+            &job.plugin_name,
+            &parser_version,
+            sinks,
+        )?;
 
         let sink_config_json = serde_json::to_string(&sinks)?;
-        if let Err(err) = self.state_store.queue().record_dispatch_metadata(
-            job.id,
-            &parser_version,
-            &artifact_hash,
-            &sink_config_json,
-        ) {
+        if let Err(err) =
+            queue.record_dispatch_metadata(job.id, &parser_version, &artifact_hash, &sink_config_json)
+        {
             warn!(
                 "Failed to persist dispatch metadata for job {}: {}",
                 job.id, err
@@ -2651,6 +3004,7 @@ impl Sentinel {
             file_path,
             sinks,
             file_id: job.file_id,
+            lease_token: Some(lease_token.clone()),
             runtime_kind,
             entrypoint,
             platform_os,
@@ -2662,24 +3016,91 @@ impl Sentinel {
             artifact_hash,
         };
 
-        let payload = serde_json::to_vec(&cmd)?;
-        let msg = Message::new(OpCode::Dispatch, job_id, payload)?;
+        Ok(Some(DispatchPlan {
+            job_id_db: job.id,
+            job_id,
+            plugin_name: job.plugin_name.clone(),
+            pipeline_run_id: job.pipeline_run_id.clone(),
+            lease_token,
+            command: cmd,
+        }))
+    }
+
+    fn schedule_dispatch_backoff(&mut self) {
+        let next = if self.dispatch_backoff_ms == 0 {
+            DISPATCH_BACKOFF_BASE_MS
+        } else {
+            (self.dispatch_backoff_ms * 2).min(DISPATCH_BACKOFF_MAX_MS)
+        };
+        self.dispatch_backoff_ms = next;
+
+        let jitter_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 % DISPATCH_BACKOFF_JITTER_MS)
+            .unwrap_or(0);
+        self.dispatch_cooldown_until =
+            Some(Instant::now() + Duration::from_millis(next + jitter_ms));
+    }
+
+    fn is_dispatch_pending(&self, identity: &[u8]) -> bool {
+        self.pending_dispatches
+            .iter()
+            .any(|pending| pending.identity == identity)
+    }
+
+    /// Send a prepared dispatch command to a worker.
+    /// Returns true when a DISPATCH was sent.
+    fn send_dispatch_plan(&mut self, identity: Vec<u8>, plan: DispatchPlan) -> Result<bool> {
+        let span = tracing::info_span!(
+            "sentinel.dispatch_job",
+            job_id = plan.job_id_db,
+            file_id = plan.command.file_id,
+            plugin = %plan.plugin_name,
+            pipeline_run_id = %plan.pipeline_run_id.as_deref().unwrap_or("none"),
+            duration_ms = tracing::field::Empty
+        );
+        let _guard = span.enter();
+        let dispatch_start = Instant::now();
+
+        let payload = serde_json::to_vec(&plan.command)?;
+        let msg = Message::new(OpCode::Dispatch, plan.job_id, payload)?;
         let (header, body) = msg.pack()?;
 
         // Send DISPATCH message as multipart [identity, header, body]
         let frames = [identity.as_slice(), header.as_ref(), body.as_slice()];
-        self.socket.send_multipart(&frames, 0)?;
-
-        if let Some(run_id) = job.pipeline_run_id.as_deref() {
-            if let Err(err) = self.set_pipeline_run_running(run_id) {
-                warn!("Failed to set pipeline run {} running: {}", run_id, err);
+        match self.socket.send_multipart(&frames, zmq::DONTWAIT) {
+            Ok(()) => {}
+            Err(err) => {
+                warn!("Dispatch send failed for job {}: {}", plan.job_id_db, err);
+                let job_id_db = plan.job_id_db;
+                let _ = self.sqlite_executor.execute(move |_, queue, _| {
+                    queue.defer_job(job_id_db, now_millis(), Some("dispatch_send_failed"))?;
+                    Ok(())
+                });
+                if let Some(worker) = self.workers.get_mut(&identity) {
+                    worker.status = WorkerStatus::Idle;
+                    worker.current_job_id = None;
+                    worker.current_lease_token = None;
+                }
+                return Ok(false);
             }
+        }
+
+        if let Some(run_id) = plan.pipeline_run_id.as_deref() {
+            let run_id = run_id.to_string();
+            let _ = self.sqlite_executor.execute(move |_, queue, _| {
+                if let Err(err) = queue.set_pipeline_run_running(&run_id) {
+                    warn!("Failed to set pipeline run {} running: {}", run_id, err);
+                }
+                Ok(())
+            });
         }
 
         // Mark worker as busy
         if let Some(worker) = self.workers.get_mut(&identity) {
             worker.status = WorkerStatus::Busy;
-            worker.current_job_id = Some(job_id);
+            worker.current_job_id = Some(plan.job_id);
+            worker.current_lease_token = Some(plan.lease_token.clone());
         }
 
         METRICS.inc_jobs_dispatched();
@@ -2687,7 +3108,7 @@ impl Sentinel {
         let duration_ms = dispatch_start.elapsed().as_millis() as u64;
         span.record("duration_ms", &duration_ms);
         METRICS.record_dispatch_time(dispatch_start);
-        info!("Dispatched job {} ({})", job.id, job.plugin_name);
+        info!("Dispatched job {} ({})", plan.job_id_db, plan.plugin_name);
         Ok(true)
     }
 
@@ -2858,7 +3279,10 @@ impl Sentinel {
             contracts: contracts.clone(),
         };
 
-        self.state_store.routing().deploy_plugin(request)?;
+        self.sqlite_executor.call(move |state_store, _queue, _ctx| {
+            state_store.routing().deploy_plugin(request)?;
+            Ok(())
+        })?;
 
         info!(
             "Deployed {} v{} (env: {}, artifact: {})",
@@ -2868,26 +3292,28 @@ impl Sentinel {
             &cmd.artifact_hash[..12.min(cmd.artifact_hash.len())]
         );
 
-        // 5. Refresh topic_map cache (new plugins may have topic configs)
-        // This ensures newly deployed plugins get their sink configs immediately
-        match Self::load_topic_configs(self.state_store.routing()) {
-            Ok(new_map) => {
-                let old_count = self.topic_map.len();
-                self.topic_map = new_map;
-                self.topic_map_last_refresh = current_time();
-                if self.topic_map.len() != old_count {
-                    info!(
-                        "Refreshed topic configs: {} -> {} plugins",
-                        old_count,
-                        self.topic_map.len()
-                    );
+        // 5. Refresh topic configs in sqlite executor (new plugins may have topic configs)
+        // This ensures newly deployed plugins get their sink configs immediately.
+        let _ = self.sqlite_executor.execute(|state_store, _queue, ctx| {
+            match Sentinel::load_topic_configs(state_store.routing()) {
+                Ok(new_map) => {
+                    let old_count = ctx.topic_map.len();
+                    ctx.topic_map = new_map;
+                    ctx.topic_map_last_refresh = current_time();
+                    if ctx.topic_map.len() != old_count {
+                        info!(
+                            "Refreshed topic configs: {} -> {} plugins",
+                            old_count,
+                            ctx.topic_map.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to refresh topic configs after deploy: {}", e);
                 }
             }
-            Err(e) => {
-                warn!("Failed to refresh topic configs after deploy: {}", e);
-                // Non-fatal: existing configs still work, new ones use defaults
-            }
-        }
+            Ok(())
+        });
 
         // 6. Send success response
         let response = types::DeployResponse {
@@ -2937,130 +3363,1060 @@ impl Sentinel {
         self.running = false;
     }
 
-    // ========================================================================
-    // Circuit Breaker & Retry Logic
-    // ========================================================================
+}
 
-    /// Handle a job failure with retry logic.
-    ///
-    /// - For transient errors with retries remaining: schedule retry with exponential backoff
-    /// - For permanent errors or max retries exceeded: move to dead letter queue
-    fn handle_job_failure(
+struct ControlDbHandler<'a> {
+    state_store: &'a StateStore,
+    queue: &'a StateStoreQueueSession,
+}
+
+impl<'a> ControlDbHandler<'a> {
+    fn handle_list_jobs(
         &self,
-        job_id: i64,
-        error: &str,
-        is_transient: bool,
-        retry_count: i32,
-    ) -> Result<()> {
-        if is_transient && retry_count < MAX_RETRY_COUNT {
-            // Exponential backoff: 4^retry_count seconds (4, 16, 64)
-            let backoff_secs = BACKOFF_BASE_SECS.pow(retry_count as u32 + 1);
-            info!(
-                job_id,
-                retry_count = retry_count + 1,
-                backoff_secs,
-                "Scheduling retry with exponential backoff"
-            );
+        status: Option<ProcessingStatus>,
+        limit: i64,
+        offset: i64,
+    ) -> ControlResponse {
+        let limit = limit.max(0);
+        let offset = offset.max(0);
+        match self.queue.list_jobs(status, limit, offset) {
+            Ok(jobs) => {
+                let job_infos: Vec<JobInfo> = jobs.into_iter().map(Sentinel::job_to_info).collect();
+                ControlResponse::Jobs(job_infos)
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list jobs: {}", e)),
+        }
+    }
 
-            let now = now_millis();
-            let scheduled_at = now + (backoff_secs as i64 * 1_000);
-            self.state_store.queue()
-                .schedule_retry(job_id, retry_count + 1, error, scheduled_at)?;
+    fn handle_get_job(&self, job_id: JobId) -> ControlResponse {
+        match self.queue.get_job(job_id) {
+            Ok(Some(job)) => ControlResponse::Job(Some(Sentinel::job_to_info(job))),
+            Ok(None) => ControlResponse::Job(None),
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get job: {}", e)),
+        }
+    }
 
-            METRICS.inc_jobs_retried();
-        } else {
-            // Move to dead letter queue
-            let reason = if is_transient {
-                DeadLetterReason::MaxRetriesExceeded
-            } else {
-                DeadLetterReason::PermanentError
+    fn handle_get_queue_stats(&self) -> ControlResponse {
+        match self.queue.count_jobs_by_status() {
+            Ok(counts) => {
+                let queued = *counts.get(&ProcessingStatus::Queued).unwrap_or(&0);
+                let running = *counts.get(&ProcessingStatus::Running).unwrap_or(&0);
+                let dispatching = *counts.get(&ProcessingStatus::Dispatching).unwrap_or(&0);
+                let completed = *counts.get(&ProcessingStatus::Completed).unwrap_or(&0);
+                let failed = *counts.get(&ProcessingStatus::Failed).unwrap_or(&0);
+                let aborted = *counts.get(&ProcessingStatus::Aborted).unwrap_or(&0);
+                let total = queued + running + dispatching + completed + failed + aborted;
+
+                ControlResponse::QueueStats(QueueStatsInfo {
+                    queued,
+                    running: running + dispatching,
+                    completed,
+                    failed,
+                    aborted,
+                    total,
+                })
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to get stats: {}", e)),
+        }
+    }
+
+    fn handle_create_api_job(
+        &self,
+        job_type: casparian_protocol::HttpJobType,
+        plugin_name: &str,
+        plugin_version: Option<&str>,
+        input_dir: &str,
+        output: Option<&str>,
+        approval_id: Option<&str>,
+        spec_json: Option<&str>,
+    ) -> ControlResponse {
+        match self.state_store.api().create_job(
+            job_type,
+            plugin_name,
+            plugin_version,
+            input_dir,
+            output,
+            approval_id,
+            spec_json,
+        ) {
+            Ok(job_id) => ControlResponse::ApiJobCreated { job_id },
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to create API job: {}", e))
+            }
+        }
+    }
+
+    fn handle_get_api_job(&self, job_id: ApiJobId) -> ControlResponse {
+        match self.state_store.api().get_job(job_id) {
+            Ok(job) => ControlResponse::ApiJob(job),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to get API job {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    fn handle_list_api_jobs(
+        &self,
+        status: Option<casparian_protocol::HttpJobStatus>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        let offset = offset.unwrap_or(0).max(0) as usize;
+        match self
+            .state_store
+            .api()
+            .list_jobs(status, limit.saturating_add(offset))
+        {
+            Ok(jobs) => {
+                let jobs = jobs
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                ControlResponse::ApiJobs(jobs)
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list API jobs: {}", e)),
+        }
+    }
+
+    fn handle_update_api_job_status(
+        &self,
+        job_id: ApiJobId,
+        status: casparian_protocol::HttpJobStatus,
+    ) -> ControlResponse {
+        match self.state_store.api().update_job_status(job_id, status) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Status updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job status {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    fn handle_update_api_job_progress(
+        &self,
+        job_id: ApiJobId,
+        progress: ApiJobProgress,
+    ) -> ControlResponse {
+        match self.state_store.api().update_job_progress(
+            job_id,
+            &progress.phase,
+            progress.items_done,
+            progress.items_total,
+            progress.message.as_deref(),
+        ) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Progress updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job progress {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    fn handle_update_api_job_result(
+        &self,
+        job_id: ApiJobId,
+        result: ApiJobResult,
+    ) -> ControlResponse {
+        match self.state_store.api().update_job_result(job_id, &result) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Result updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job result {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    fn handle_update_api_job_error(&self, job_id: ApiJobId, error: &str) -> ControlResponse {
+        match self.state_store.api().update_job_error(job_id, error) {
+            Ok(()) => ControlResponse::ApiJobResult {
+                success: true,
+                message: "Error updated".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to update API job error {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    fn handle_cancel_api_job(&self, job_id: ApiJobId) -> ControlResponse {
+        match self.state_store.api().cancel_job(job_id) {
+            Ok(success) => ControlResponse::ApiJobResult {
+                success,
+                message: if success {
+                    "Job cancelled".to_string()
+                } else {
+                    "Job not found".to_string()
+                },
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to cancel API job {}: {}", job_id, e),
+            ),
+        }
+    }
+
+    fn handle_list_approvals(
+        &self,
+        status: Option<ApprovalStatus>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        let offset = offset.unwrap_or(0).max(0) as usize;
+        match self.state_store.api().list_approvals(status) {
+            Ok(approvals) => {
+                let approvals = approvals
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                ControlResponse::Approvals(approvals)
+            }
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to list approvals: {}", e))
+            }
+        }
+    }
+
+    fn handle_create_approval(
+        &self,
+        approval_id: &str,
+        operation: ApprovalOperation,
+        summary: &str,
+        expires_in_seconds: i64,
+    ) -> ControlResponse {
+        let expires_in = ChronoDuration::seconds(expires_in_seconds.max(0));
+        match self
+            .state_store
+            .api()
+            .create_approval(approval_id, &operation, summary, expires_in)
+        {
+            Ok(()) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval created".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to create approval {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    fn handle_get_approval(&self, approval_id: &str) -> ControlResponse {
+        match self.state_store.api().get_approval(approval_id) {
+            Ok(approval) => ControlResponse::Approval(approval),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to get approval {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    fn handle_approve(&self, approval_id: &str) -> ControlResponse {
+        match self.state_store.api().approve(approval_id, None) {
+            Ok(true) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval accepted".to_string(),
+            },
+            Ok(false) => ControlResponse::ApprovalResult {
+                success: false,
+                message: "Approval not found or not pending".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to approve {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    fn handle_reject(&self, approval_id: &str, reason: &str) -> ControlResponse {
+        match self.state_store.api().reject(approval_id, None, Some(reason)) {
+            Ok(true) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval rejected".to_string(),
+            },
+            Ok(false) => ControlResponse::ApprovalResult {
+                success: false,
+                message: "Approval not found or not pending".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to reject {}: {}", approval_id, e),
+            ),
+        }
+    }
+
+    fn handle_set_approval_job_id(&self, approval_id: &str, job_id: ApiJobId) -> ControlResponse {
+        match self.state_store.api().link_approval_to_job(approval_id, job_id) {
+            Ok(()) => ControlResponse::ApprovalResult {
+                success: true,
+                message: "Approval linked to job".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!(
+                    "Failed to link approval {} to job {}: {}",
+                    approval_id, job_id, e
+                ),
+            ),
+        }
+    }
+
+    fn handle_expire_approvals(&self) -> ControlResponse {
+        match self.state_store.api().expire_approvals() {
+            Ok(count) => ControlResponse::ApprovalResult {
+                success: true,
+                message: format!("Expired {} approvals", count),
+            },
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to expire approvals: {}", e))
+            }
+        }
+    }
+
+    fn handle_create_session(&self, intent_text: &str, input_dir: Option<&str>) -> ControlResponse {
+        match self.state_store.sessions().create_session(intent_text, input_dir) {
+            Ok(session_id) => ControlResponse::SessionCreated { session_id },
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Failed to create session: {}", e))
+            }
+        }
+    }
+
+    fn handle_get_session(&self, session_id: SessionId) -> ControlResponse {
+        match self.state_store.sessions().get_session(session_id) {
+            Ok(session) => ControlResponse::Session(session),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to get session {}: {}", session_id, e),
+            ),
+        }
+    }
+
+    fn handle_list_sessions(
+        &self,
+        state: Option<IntentState>,
+        limit: Option<i64>,
+    ) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        match self.state_store.sessions().list_sessions(state, limit) {
+            Ok(sessions) => ControlResponse::Sessions(sessions),
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Failed to list sessions: {}", e)),
+        }
+    }
+
+    fn handle_list_sessions_needing_input(&self, limit: Option<i64>) -> ControlResponse {
+        let limit = limit.unwrap_or(100).max(0) as usize;
+        match self.state_store.sessions().list_sessions_needing_input(limit) {
+            Ok(sessions) => ControlResponse::Sessions(sessions),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to list sessions needing input: {}", e),
+            ),
+        }
+    }
+
+    fn handle_advance_session(
+        &self,
+        session_id: SessionId,
+        target_state: IntentState,
+    ) -> ControlResponse {
+        match self
+            .state_store
+            .sessions()
+            .update_session_state(session_id, target_state)
+        {
+            Ok(true) => ControlResponse::SessionResult {
+                success: true,
+                message: "Session advanced".to_string(),
+            },
+            Ok(false) => ControlResponse::SessionResult {
+                success: false,
+                message: "Session not found".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to advance session {}: {}", session_id, e),
+            ),
+        }
+    }
+
+    fn handle_cancel_session(&self, session_id: SessionId) -> ControlResponse {
+        match self.state_store.sessions().cancel_session(session_id) {
+            Ok(true) => ControlResponse::SessionResult {
+                success: true,
+                message: "Session cancelled".to_string(),
+            },
+            Ok(false) => ControlResponse::SessionResult {
+                success: false,
+                message: "Session not found".to_string(),
+            },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Failed to cancel session {}: {}", session_id, e),
+            ),
+        }
+    }
+
+    fn handle_list_sources(&self, workspace_id: WorkspaceId) -> ControlResponse {
+        let records = match self.state_store.scout().list_sources_with_counts(workspace_id) {
+            Ok(records) => records,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        let sources = records
+            .into_iter()
+            .map(|record| {
+                let source = record.source;
+                ScoutSourceInfo {
+                    id: source.id,
+                    workspace_id: source.workspace_id,
+                    name: source.name,
+                    source_type: source.source_type,
+                    path: source.path,
+                    exec_path: source.exec_path,
+                    enabled: source.enabled,
+                    poll_interval_secs: source.poll_interval_secs,
+                    file_count: record.file_count,
+                }
+            })
+            .collect();
+
+        ControlResponse::Sources(sources)
+    }
+
+    fn handle_upsert_source(&self, source: &ScoutSourceInfo) -> ControlResponse {
+        let source_row = ScoutSource {
+            workspace_id: source.workspace_id,
+            id: source.id,
+            name: source.name.clone(),
+            source_type: source.source_type.clone(),
+            path: source.path.clone(),
+            exec_path: source.exec_path.clone(),
+            poll_interval_secs: source.poll_interval_secs,
+            enabled: source.enabled,
+        };
+
+        match self.state_store.scout().upsert_source(&source_row) {
+            Ok(()) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source upserted".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source upsert failed: {}", e)),
+        }
+    }
+
+    fn handle_update_source(
+        &self,
+        source_id: SourceId,
+        name: Option<&str>,
+        path: Option<&str>,
+    ) -> ControlResponse {
+        let mut source = match self.state_store.scout().get_source(&source_id) {
+            Ok(Some(source)) => source,
+            Ok(None) => {
+                return ControlResponse::SourceResult {
+                    success: false,
+                    message: "Source not found".to_string(),
+                }
+            }
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Source load failed: {}", e))
+            }
+        };
+
+        if let Some(name) = name {
+            source.name = name.to_string();
+        }
+        if let Some(path) = path {
+            source.path = path.to_string();
+        }
+
+        match self.state_store.scout().upsert_source(&source) {
+            Ok(()) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source updated".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source update failed: {}", e)),
+        }
+    }
+
+    fn handle_delete_source(&self, source_id: SourceId) -> ControlResponse {
+        match self.state_store.scout().delete_source(&source_id) {
+            Ok(true) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source deleted".to_string(),
+            },
+            Ok(false) => ControlResponse::SourceResult {
+                success: false,
+                message: "Source not found".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source delete failed: {}", e)),
+        }
+    }
+
+    fn handle_touch_source(&self, source_id: SourceId) -> ControlResponse {
+        match self.state_store.scout().touch_source(&source_id) {
+            Ok(()) => ControlResponse::SourceResult {
+                success: true,
+                message: "Source touched".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Source touch failed: {}", e)),
+        }
+    }
+
+    fn handle_list_rules(&self, workspace_id: WorkspaceId) -> ControlResponse {
+        match self.state_store.scout().list_tagging_rules(&workspace_id) {
+            Ok(rules) => {
+                let mapped = rules
+                    .into_iter()
+                    .map(|rule| ScoutRuleInfo {
+                        id: rule.id,
+                        workspace_id: rule.workspace_id,
+                        pattern: rule.pattern,
+                        tag: rule.tag,
+                        priority: rule.priority,
+                        enabled: rule.enabled,
+                    })
+                    .collect();
+                ControlResponse::Rules(mapped)
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rules load failed: {}", e)),
+        }
+    }
+
+    fn handle_create_rule(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        pattern: &str,
+        tag: &str,
+    ) -> ControlResponse {
+        let name = format!("{} → {}", pattern, tag);
+        let rule = casparian_scout::types::TaggingRule {
+            id: rule_id,
+            name,
+            workspace_id,
+            pattern: pattern.to_string(),
+            tag: tag.to_string(),
+            priority: 100,
+            enabled: true,
+        };
+
+        match self.state_store.scout().upsert_tagging_rule(&rule) {
+            Ok(()) => ControlResponse::RuleResult {
+                success: true,
+                message: "Rule created".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rule create failed: {}", e)),
+        }
+    }
+
+    fn handle_update_rule_enabled(
+        &self,
+        rule_id: TaggingRuleId,
+        _workspace_id: WorkspaceId,
+        enabled: bool,
+    ) -> ControlResponse {
+        let mut rule = match self.state_store.scout().get_tagging_rule(&rule_id) {
+            Ok(Some(rule)) => rule,
+            Ok(None) => {
+                return ControlResponse::RuleResult {
+                    success: false,
+                    message: "Rule not found".to_string(),
+                }
+            }
+            Err(e) => {
+                return ControlResponse::error("DB_ERROR", format!("Rule load failed: {}", e))
+            }
+        };
+
+        rule.enabled = enabled;
+
+        match self.state_store.scout().upsert_tagging_rule(&rule) {
+            Ok(()) => ControlResponse::RuleResult {
+                success: true,
+                message: "Rule updated".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rule update failed: {}", e)),
+        }
+    }
+
+    fn handle_delete_rule(
+        &self,
+        rule_id: TaggingRuleId,
+        _workspace_id: WorkspaceId,
+    ) -> ControlResponse {
+        match self.state_store.scout().delete_tagging_rule(&rule_id) {
+            Ok(true) => ControlResponse::RuleResult {
+                success: true,
+                message: "Rule deleted".to_string(),
+            },
+            Ok(false) => ControlResponse::RuleResult {
+                success: false,
+                message: "Rule not found".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rule delete failed: {}", e)),
+        }
+    }
+
+    fn handle_list_tags(&self, workspace_id: WorkspaceId, source_id: SourceId) -> ControlResponse {
+        let stats = match self.state_store.scout().tag_stats(workspace_id, source_id) {
+            Ok(stats) => stats,
+            Err(e) => return ControlResponse::error("DB_ERROR", e.to_string()),
+        };
+
+        ControlResponse::TagStats(ScoutTagStats {
+            total_files: stats.total_files,
+            untagged_files: stats.untagged_files,
+            tags: stats
+                .tags
+                .into_iter()
+                .map(|tag| ScoutTagCount {
+                    tag: tag.tag,
+                    count: tag.count,
+                })
+                .collect(),
+        })
+    }
+
+    fn handle_apply_tag(
+        &self,
+        file_id: i64,
+        tag: &str,
+        tag_source: TagSource,
+        rule_id: Option<&TaggingRuleId>,
+    ) -> ControlResponse {
+        let result = match tag_source {
+            TagSource::Manual => self.state_store.scout().tag_file(file_id, tag),
+            TagSource::Rule => {
+                let Some(rule_id) = rule_id else {
+                    return ControlResponse::TagResult {
+                        success: false,
+                        message: "Rule-based tag missing rule_id".to_string(),
+                    };
+                };
+                self.state_store.scout().tag_file_by_rule(file_id, tag, rule_id)
+            }
+        };
+
+        match result {
+            Ok(()) => ControlResponse::TagResult {
+                success: true,
+                message: "Tag applied".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Tag apply failed: {}", e)),
+        }
+    }
+}
+
+fn handle_control_request_db(
+    state_store: &StateStore,
+    queue: &StateStoreQueueSession,
+    _context: &mut SqliteContext,
+    request: ControlRequest,
+) -> ControlResponse {
+    let handler = ControlDbHandler { state_store, queue };
+    match request {
+        ControlRequest::ListJobs {
+            status,
+            limit,
+            offset,
+        } => handler.handle_list_jobs(status, limit.unwrap_or(100), offset.unwrap_or(0)),
+        ControlRequest::GetJob { job_id } => handler.handle_get_job(job_id),
+        ControlRequest::GetQueueStats => handler.handle_get_queue_stats(),
+        ControlRequest::CreateApiJob {
+            job_type,
+            plugin_name,
+            plugin_version,
+            input_dir,
+            output,
+            approval_id,
+            spec_json,
+        } => handler.handle_create_api_job(
+            job_type,
+            &plugin_name,
+            plugin_version.as_deref(),
+            &input_dir,
+            output.as_deref(),
+            approval_id.as_deref(),
+            spec_json.as_deref(),
+        ),
+        ControlRequest::GetApiJob { job_id } => handler.handle_get_api_job(job_id),
+        ControlRequest::ListApiJobs {
+            status,
+            limit,
+            offset,
+        } => handler.handle_list_api_jobs(status, limit, offset),
+        ControlRequest::UpdateApiJobStatus { job_id, status } => {
+            handler.handle_update_api_job_status(job_id, status)
+        }
+        ControlRequest::UpdateApiJobProgress { job_id, progress } => {
+            handler.handle_update_api_job_progress(job_id, progress)
+        }
+        ControlRequest::UpdateApiJobResult { job_id, result } => {
+            handler.handle_update_api_job_result(job_id, result)
+        }
+        ControlRequest::UpdateApiJobError { job_id, error } => {
+            handler.handle_update_api_job_error(job_id, &error)
+        }
+        ControlRequest::CancelApiJob { job_id } => handler.handle_cancel_api_job(job_id),
+        ControlRequest::ListApprovals {
+            status,
+            limit,
+            offset,
+        } => handler.handle_list_approvals(status, limit, offset),
+        ControlRequest::CreateApproval {
+            approval_id,
+            operation,
+            summary,
+            expires_in_seconds,
+        } => handler.handle_create_approval(&approval_id, operation, &summary, expires_in_seconds),
+        ControlRequest::GetApproval { approval_id } => handler.handle_get_approval(&approval_id),
+        ControlRequest::Approve { approval_id } => handler.handle_approve(&approval_id),
+        ControlRequest::Reject {
+            approval_id,
+            reason,
+        } => handler.handle_reject(&approval_id, &reason),
+        ControlRequest::SetApprovalJobId {
+            approval_id,
+            job_id,
+        } => handler.handle_set_approval_job_id(&approval_id, job_id),
+        ControlRequest::ExpireApprovals => handler.handle_expire_approvals(),
+        ControlRequest::CreateSession {
+            intent_text,
+            input_dir,
+        } => handler.handle_create_session(&intent_text, input_dir.as_deref()),
+        ControlRequest::GetSession { session_id } => handler.handle_get_session(session_id),
+        ControlRequest::ListSessions { state, limit } => handler.handle_list_sessions(state, limit),
+        ControlRequest::ListSessionsNeedingInput { limit } => {
+            handler.handle_list_sessions_needing_input(limit)
+        }
+        ControlRequest::AdvanceSession {
+            session_id,
+            target_state,
+        } => handler.handle_advance_session(session_id, target_state),
+        ControlRequest::CancelSession { session_id } => handler.handle_cancel_session(session_id),
+        ControlRequest::ListSources { workspace_id } => handler.handle_list_sources(workspace_id),
+        ControlRequest::UpsertSource { source } => handler.handle_upsert_source(&source),
+        ControlRequest::UpdateSource {
+            source_id,
+            name,
+            path,
+        } => handler.handle_update_source(source_id, name.as_deref(), path.as_deref()),
+        ControlRequest::DeleteSource { source_id } => handler.handle_delete_source(source_id),
+        ControlRequest::TouchSource { source_id } => handler.handle_touch_source(source_id),
+        ControlRequest::ListRules { workspace_id } => handler.handle_list_rules(workspace_id),
+        ControlRequest::CreateRule {
+            rule_id,
+            workspace_id,
+            pattern,
+            tag,
+        } => handler.handle_create_rule(rule_id, workspace_id, &pattern, &tag),
+        ControlRequest::UpdateRuleEnabled {
+            rule_id,
+            workspace_id,
+            enabled,
+        } => handler.handle_update_rule_enabled(rule_id, workspace_id, enabled),
+        ControlRequest::DeleteRule {
+            rule_id,
+            workspace_id,
+        } => handler.handle_delete_rule(rule_id, workspace_id),
+        ControlRequest::ListTags {
+            workspace_id,
+            source_id,
+        } => handler.handle_list_tags(workspace_id, source_id),
+        ControlRequest::ApplyTag {
+            workspace_id: _,
+            file_id,
+            tag,
+            tag_source,
+            rule_id,
+        } => handler.handle_apply_tag(file_id, &tag, tag_source, rule_id.as_ref()),
+        ControlRequest::Ping
+        | ControlRequest::StartScan { .. }
+        | ControlRequest::GetScan { .. }
+        | ControlRequest::ListScans { .. }
+        | ControlRequest::CancelScan { .. }
+        | ControlRequest::CancelJob { .. } => ControlResponse::error(
+            "INVALID_REQUEST",
+            "Request must be handled by reactor".to_string(),
+        ),
+    }
+}
+
+fn process_conclude_db(
+    state_store: &StateStore,
+    queue: &StateStoreQueueSession,
+    context: &mut SqliteContext,
+    job_id: i64,
+    receipt: JobReceipt,
+) -> Result<ConcludeOutcome> {
+    if let Some(diagnostics) = receipt.diagnostics.as_ref() {
+        if let Some(mismatch) = diagnostics.schema_mismatch.as_ref() {
+            if let Err(err) = queue.record_schema_mismatch(job_id, mismatch) {
+                warn!(
+                    "Failed to persist schema mismatch for job {}: {}",
+                    job_id, err
+                );
+            }
+        }
+    }
+
+    if let Err(err) = state_store
+        .artifacts()
+        .insert_job_artifacts(job_id, &receipt.artifacts)
+    {
+        warn!("Failed to persist artifacts for job {}: {}", job_id, err);
+    }
+
+    let job_info = JobId::try_from(job_id)
+        .ok()
+        .and_then(|id| queue.get_job(id).ok().flatten());
+    let plugin_name = job_info.as_ref().map(|job| job.plugin_name.as_str());
+    let retry_count = job_info.as_ref().map(|job| job.retry_count).unwrap_or(0);
+    let lease_token = receipt.lease_token.clone();
+
+    match receipt.status {
+        JobStatus::Success | JobStatus::PartialSuccess | JobStatus::CompletedWithWarnings => {
+            let (completion_status, summary) = match receipt.status {
+                JobStatus::Success => (JobStatus::Success.as_str(), "Success"),
+                JobStatus::PartialSuccess => (JobStatus::PartialSuccess.as_str(), "Partial success"),
+                JobStatus::CompletedWithWarnings => (
+                    JobStatus::CompletedWithWarnings.as_str(),
+                    "Completed with warnings",
+                ),
+                other => unreachable!("Non-success status in success branch: {:?}", other),
             };
+            let quarantine_rows = receipt.metrics.get(metrics::QUARANTINE_ROWS).copied();
+            let updated = if let Some(token) = lease_token.as_deref() {
+                queue.complete_job_if_token_matches(
+                    job_id,
+                    token,
+                    completion_status,
+                    summary,
+                    quarantine_rows,
+                )?
+            } else {
+                warn!(
+                    "Legacy CONCLUDE without lease_token for job {}; accepting",
+                    job_id
+                );
+                queue.complete_job(job_id, completion_status, summary, quarantine_rows)?;
+                true
+            };
+            if !updated {
+                return Ok(ConcludeOutcome::Stale { job_id });
+            }
+
+            if let Err(err) = Sentinel::record_materializations_for_job_with_context(
+                state_store,
+                queue,
+                context,
+                job_id,
+                &receipt,
+            ) {
+                warn!(
+                    "Failed to record materializations for job {}: {}",
+                    job_id, err
+                );
+            }
+
+            if let Some(parser) = plugin_name {
+                if let Err(err) = record_success_db(queue, parser) {
+                    warn!("Failed to record parser success for {}: {}", parser, err);
+                }
+            }
+
+            if let Err(err) = queue.update_pipeline_run_status_for_job(job_id) {
+                warn!(
+                    "Failed to update pipeline run status for job {}: {}",
+                    job_id, err
+                );
+            }
+
+            Ok(ConcludeOutcome::Completed {
+                job_id,
+                artifacts: receipt.artifacts,
+            })
+        }
+        JobStatus::Failed => {
+            let error = receipt
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "Unknown error".to_string());
+            let is_transient = receipt
+                .metrics
+                .get("is_transient")
+                .map(|v| *v == 1)
+                .unwrap_or(true);
+
+            if let Some(parser) = plugin_name {
+                if let Err(err) = record_failure_db(queue, parser, &error) {
+                    warn!("Failed to record parser failure for {}: {}", parser, err);
+                }
+            }
+
+            if let Some(token) = lease_token.as_deref() {
+                let updated = queue.fail_job_if_token_matches(
+                    job_id,
+                    token,
+                    JobStatus::Failed.as_str(),
+                    &error,
+                )?;
+                if !updated {
+                    return Ok(ConcludeOutcome::Stale { job_id });
+                }
+            } else {
+                warn!(
+                    "Legacy CONCLUDE without lease_token for job {}; accepting",
+                    job_id
+                );
+                queue.fail_job(job_id, JobStatus::Failed.as_str(), &error)?;
+            }
+
+            let retried = handle_job_failure_db(queue, job_id, &error, is_transient, retry_count)?;
+            if let Err(err) = queue.update_pipeline_run_status_for_job(job_id) {
+                warn!(
+                    "Failed to update pipeline run status for job {}: {}",
+                    job_id, err
+                );
+            }
+            Ok(ConcludeOutcome::Failed { job_id, retried })
+        }
+        JobStatus::Rejected => {
+            warn!(
+                "Job {} rejected by worker (at capacity), deferring for retry",
+                job_id
+            );
+            let scheduled_at = now_millis();
+            queue.defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
+            if let Err(err) = queue.update_pipeline_run_status_for_job(job_id) {
+                warn!(
+                    "Failed to update pipeline run status for job {}: {}",
+                    job_id, err
+                );
+            }
+            Ok(ConcludeOutcome::Rejected { job_id })
+        }
+        JobStatus::Aborted => {
+            let error = receipt
+                .error_message
+                .unwrap_or_else(|| "Aborted".to_string());
+            warn!("Job {} aborted: {}", job_id, error);
+            if let Some(token) = lease_token.as_deref() {
+                let updated = queue.abort_job_if_token_matches(job_id, token, &error)?;
+                if !updated {
+                    return Ok(ConcludeOutcome::Stale { job_id });
+                }
+            } else {
+                warn!(
+                    "Legacy CONCLUDE without lease_token for job {}; accepting",
+                    job_id
+                );
+                queue.abort_job(job_id, &error)?;
+            }
+            if let Err(err) = queue.update_pipeline_run_status_for_job(job_id) {
+                warn!(
+                    "Failed to update pipeline run status for job {}: {}",
+                    job_id, err
+                );
+            }
+            Ok(ConcludeOutcome::Aborted { job_id })
+        }
+    }
+}
+
+fn record_success_db(queue: &StateStoreQueueSession, parser_name: &str) -> Result<()> {
+    queue.record_parser_success(parser_name)?;
+    debug!(
+        parser = parser_name,
+        "Recorded success, reset consecutive_failures"
+    );
+    Ok(())
+}
+
+fn record_failure_db(queue: &StateStoreQueueSession, parser_name: &str, reason: &str) -> Result<()> {
+    queue.record_parser_failure(parser_name, reason)?;
+    debug!(parser = parser_name, reason = reason, "Recorded failure");
+    check_circuit_breaker_db(queue, parser_name)?;
+    Ok(())
+}
+
+fn check_circuit_breaker_db(queue: &StateStoreQueueSession, parser_name: &str) -> Result<bool> {
+    let health = queue.get_parser_health(parser_name)?;
+    if let Some(h) = health {
+        if h.is_paused() {
+            warn!(parser = parser_name, "Parser is paused (circuit open)");
+            return Ok(false);
+        }
+
+        if h.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
+            queue.pause_parser(parser_name)?;
 
             warn!(
-                "Job {} moving to dead letter queue: {} (retries: {}/{})",
-                job_id,
-                reason.as_str(),
-                retry_count,
-                MAX_RETRY_COUNT
+                parser = parser_name,
+                consecutive_failures = h.consecutive_failures,
+                "Circuit breaker tripped - parser paused"
             );
-
-            self.state_store.queue().move_to_dead_letter(job_id, error, reason)?;
-            METRICS.inc_jobs_failed();
+            return Ok(false);
         }
-
-        Ok(())
     }
 
-    /// Check if parser is healthy (circuit breaker not tripped).
-    ///
-    /// Returns true if parser can accept jobs, false if paused.
-    pub fn check_circuit_breaker(&self, parser_name: &str) -> Result<bool> {
-        let health = self.state_store.queue().get_parser_health(parser_name)?;
-        if let Some(h) = health {
-            // Already paused
-            if h.is_paused() {
-                warn!(parser = parser_name, "Parser is paused (circuit open)");
-                return Ok(false);
-            }
+    Ok(true)
+}
 
-            // Check threshold
-            if h.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD {
-                // Trip the circuit breaker
-                self.state_store.queue().pause_parser(parser_name)?;
-
-                warn!(
-                    parser = parser_name,
-                    consecutive_failures = h.consecutive_failures,
-                    "Circuit breaker tripped - parser paused"
-                );
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Record successful execution (resets consecutive failures).
-    fn record_success(&self, parser_name: &str) -> Result<()> {
-        self.state_store.queue().record_parser_success(parser_name)?;
-
-        debug!(
-            parser = parser_name,
-            "Recorded success, reset consecutive_failures"
+fn handle_job_failure_db(
+    queue: &StateStoreQueueSession,
+    job_id: i64,
+    error: &str,
+    is_transient: bool,
+    retry_count: i32,
+) -> Result<bool> {
+    if is_transient && retry_count < MAX_RETRY_COUNT {
+        let backoff_secs = BACKOFF_BASE_SECS.pow(retry_count as u32 + 1);
+        info!(
+            job_id,
+            retry_count = retry_count + 1,
+            backoff_secs,
+            "Scheduling retry with exponential backoff"
         );
-        Ok(())
+
+        let now = now_millis();
+        let scheduled_at = now + (backoff_secs as i64 * 1_000);
+        queue.schedule_retry(job_id, retry_count + 1, error, scheduled_at)?;
+        return Ok(true);
     }
 
-    /// Record failed execution (increments consecutive failures).
-    fn record_failure(&self, parser_name: &str, reason: &str) -> Result<()> {
-        self.state_store.queue().record_parser_failure(parser_name, reason)?;
+    let reason = if is_transient {
+        DeadLetterReason::MaxRetriesExceeded
+    } else {
+        DeadLetterReason::PermanentError
+    };
 
-        debug!(parser = parser_name, reason = reason, "Recorded failure");
-        self.check_circuit_breaker(parser_name)?;
-        Ok(())
-    }
+    warn!(
+        "Job {} moving to dead letter queue: {} (retries: {}/{})",
+        job_id,
+        reason.as_str(),
+        retry_count,
+        MAX_RETRY_COUNT
+    );
 
-    /// Get plugin name for a job (for health tracking).
-    fn get_job_plugin_name(&self, job_id: i64) -> Option<String> {
-        let job_id = JobId::try_from(job_id).ok()?;
-        self.state_store
-            .queue()
-            .get_job(job_id)
-            .ok()
-            .flatten()
-            .map(|job| job.plugin_name)
-    }
-
-    /// Get retry count for a job.
-    fn get_job_retry_count(&self, job_id: i64) -> Option<i32> {
-        let job_id = JobId::try_from(job_id).ok()?;
-        self.state_store
-            .queue()
-            .get_job(job_id)
-            .ok()
-            .flatten()
-            .map(|job| job.retry_count)
-    }
+    queue.move_to_dead_letter(job_id, error, reason)?;
+    Ok(false)
 }
 
 /// Get current Unix timestamp
