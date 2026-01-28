@@ -25,8 +25,7 @@ use super::app::{
 };
 use super::extraction::{
     BacktestSummary, FieldSource, FieldType, FileResultsState, FileTestResult, FolderMatch,
-    MatchedFile, NamingScheme, PathArchetype, PatternSeed, ResultFilter, RuleBuilderField,
-    RuleBuilderFocus, RuleBuilderState, SuggestionSection, SynonymConfidence, SynonymSuggestion,
+    MatchedFile, ResultFilter, RuleBuilderField, RuleBuilderFocus, RuleBuilderState, RuleCandidate,
 };
 use super::flow_record::RecordRedaction;
 use super::TuiArgs;
@@ -948,7 +947,7 @@ fn case_discover_suggestions_help_overlay() -> App {
     app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     let mut builder = sample_rule_builder_with_suggestions();
-    builder.suggestions_help_open = true;
+    builder.candidate_preview_open = true;
     app.discover.rule_builder = Some(builder);
     app
 }
@@ -959,9 +958,8 @@ fn case_discover_suggestions_detail_overlay() -> App {
     app.ingest_tab = IngestTab::Select;
     app.discover.view_state = DiscoverViewState::RuleBuilder;
     let mut builder = sample_rule_builder_with_suggestions();
-    builder.suggestions_section = SuggestionSection::Synonyms;
-    builder.selected_synonym = 1;
-    builder.suggestions_detail_open = true;
+    builder.selected_candidate = 1;
+    builder.candidate_preview_open = true;
     app.discover.rule_builder = Some(builder);
     app
 }
@@ -2316,67 +2314,60 @@ fn sample_rule_builder_basic() -> RuleBuilderState {
 fn sample_rule_builder_with_suggestions() -> RuleBuilderState {
     let mut builder = sample_rule_builder_basic();
     builder.focus = RuleBuilderFocus::Suggestions;
-    builder.suggestions_section = SuggestionSection::Structures;
-    builder.pattern_seeds = vec![
-        PatternSeed {
-            pattern: "**/*.csv".to_string(),
-            match_count: 612,
-            is_extension: true,
+    builder.rule_candidates = vec![
+        RuleCandidate {
+            label: "reports/<date:date>_<region>/*.csv".to_string(),
+            custom_pattern: "reports/<date:date>_<region>/*.csv".to_string(),
+            glob_pattern: "reports/*_*/*.csv".to_string(),
+            fields: vec![
+                RuleBuilderField {
+                    name: "date".to_string(),
+                    source: FieldSource::Filename,
+                    field_type: FieldType::Date,
+                    pattern: None,
+                    sample_values: vec![],
+                    enabled: true,
+                },
+                RuleBuilderField {
+                    name: "region".to_string(),
+                    source: FieldSource::Filename,
+                    field_type: FieldType::String,
+                    pattern: None,
+                    sample_values: vec![],
+                    enabled: true,
+                },
+            ],
+            example_path: "reports/2024/Q4/report_2024-10-01_us.csv".to_string(),
+            estimated_count: 128,
         },
-        PatternSeed {
-            pattern: "**/reports/**/*.csv".to_string(),
-            match_count: 128,
-            is_extension: false,
-        },
-    ];
-    builder.path_archetypes = vec![
-        PathArchetype {
-            template: "reports/<year>/<quarter>/".to_string(),
-            file_count: 412,
-            folder_count: 12,
-            sample_paths: vec!["reports/2024/Q4/report_2024-10-01_us.csv".to_string()],
-            depth: 3,
-        },
-        PathArchetype {
-            template: "exports/<region>/<date>/".to_string(),
-            file_count: 200,
-            folder_count: 8,
-            sample_paths: vec!["exports/us-east/2024-09-30/summary.csv".to_string()],
-            depth: 3,
-        },
-    ];
-    builder.naming_schemes = vec![
-        NamingScheme {
-            template: "report_<date>_<region>.csv".to_string(),
-            file_count: 128,
-            example: "report_2024-09-30_us.csv".to_string(),
-            fields: vec!["date".to_string(), "region".to_string()],
-        },
-        NamingScheme {
-            template: "summary_<date>.csv".to_string(),
-            file_count: 84,
-            example: "summary_2024-10-01.csv".to_string(),
-            fields: vec!["date".to_string()],
-        },
-    ];
-    builder.synonym_suggestions = vec![
-        SynonymSuggestion {
-            short_form: "rpt".to_string(),
-            canonical_form: "report".to_string(),
-            confidence: SynonymConfidence::High,
-            reason: "Abbreviation match".to_string(),
-            score: 92,
-            applied: false,
-        },
-        SynonymSuggestion {
-            short_form: "acct".to_string(),
-            canonical_form: "account".to_string(),
-            confidence: SynonymConfidence::Medium,
-            reason: "Edit distance".to_string(),
-            score: 71,
-            applied: false,
+        RuleCandidate {
+            label: "exports/<region>/<date:date>/summary.csv".to_string(),
+            custom_pattern: "exports/<region>/<date:date>/summary.csv".to_string(),
+            glob_pattern: "exports/*/*/summary.csv".to_string(),
+            fields: vec![
+                RuleBuilderField {
+                    name: "region".to_string(),
+                    source: FieldSource::Segment(1),
+                    field_type: FieldType::String,
+                    pattern: None,
+                    sample_values: vec![],
+                    enabled: true,
+                },
+                RuleBuilderField {
+                    name: "date".to_string(),
+                    source: FieldSource::Segment(2),
+                    field_type: FieldType::Date,
+                    pattern: None,
+                    sample_values: vec![],
+                    enabled: true,
+                },
+            ],
+            example_path: "exports/us-east/2024-09-30/summary.csv".to_string(),
+            estimated_count: 64,
         },
     ];
+    builder.sampled_paths_count = 200;
+    builder.selected_candidate = 0;
     builder
 }
 

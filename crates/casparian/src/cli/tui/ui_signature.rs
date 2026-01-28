@@ -78,8 +78,7 @@ impl UiSignature {
                         .map(|builder| RuleBuilderSignature {
                             focus: RuleBuilderFocusKey::from(builder.focus.clone()),
                             file_results: FileResultsKind::from(&builder.file_results),
-                            suggestions_help_open: builder.suggestions_help_open,
-                            suggestions_detail_open: builder.suggestions_detail_open,
+                            candidate_preview_open: builder.candidate_preview_open,
                             manual_tag_confirm_open: builder.manual_tag_confirm_open,
                             confirm_exit_open: builder.confirm_exit_open,
                         })
@@ -226,12 +225,8 @@ impl UiSignature {
                     builder.file_results.as_str()
                 ));
                 parts.push(format!(
-                    "rule_builder.help={}",
-                    bool_key(builder.suggestions_help_open)
-                ));
-                parts.push(format!(
-                    "rule_builder.detail={}",
-                    bool_key(builder.suggestions_detail_open)
+                    "rule_builder.preview={}",
+                    bool_key(builder.candidate_preview_open)
                 ));
                 parts.push(format!(
                     "rule_builder.manual_confirm={}",
@@ -340,8 +335,7 @@ pub struct DiscoverSignature {
 pub struct RuleBuilderSignature {
     pub focus: RuleBuilderFocusKey,
     pub file_results: FileResultsKind,
-    pub suggestions_help_open: bool,
-    pub suggestions_detail_open: bool,
+    pub candidate_preview_open: bool,
     pub manual_tag_confirm_open: bool,
     pub confirm_exit_open: bool,
 }

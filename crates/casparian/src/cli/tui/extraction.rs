@@ -1185,6 +1185,23 @@ pub struct NamingScheme {
     pub fields: Vec<String>,
 }
 
+/// A suggested rule candidate derived from sampled paths
+#[derive(Debug, Clone)]
+pub struct RuleCandidate {
+    /// Human-readable label (typically the custom pattern)
+    pub label: String,
+    /// Custom pattern with placeholders (e.g., "ops/mission_<mission_id>/<date>/*.csv")
+    pub custom_pattern: String,
+    /// Glob pattern with placeholders replaced by `*`
+    pub glob_pattern: String,
+    /// Inferred extraction fields
+    pub fields: Vec<RuleBuilderField>,
+    /// Representative example path
+    pub example_path: String,
+    /// Estimated match count from the sample
+    pub estimated_count: usize,
+}
+
 /// A grouped set of structural variants representing the same intent.
 #[derive(Debug, Clone)]
 pub struct VariantGroup {
@@ -1301,6 +1318,8 @@ pub struct RuleBuilderState {
     pub naming_schemes: Vec<NamingScheme>,
     /// Synonym suggestions - detected abbreviation mappings
     pub synonym_suggestions: Vec<SynonymSuggestion>,
+    /// Suggested rule candidates (top dataset shapes)
+    pub rule_candidates: Vec<RuleCandidate>,
     /// Selected pattern seed index
     pub selected_pattern_seed: usize,
     /// Selected path archetype index
@@ -1309,16 +1328,22 @@ pub struct RuleBuilderState {
     pub selected_naming_scheme: usize,
     /// Selected synonym suggestion index
     pub selected_synonym: usize,
+    /// Selected rule candidate index
+    pub selected_candidate: usize,
     /// Schema evaluation state
     pub eval_state: EvalState,
     /// Total match count
     pub match_count: usize,
+    /// Sampled path count from last eval
+    pub sampled_paths_count: usize,
     /// Selected suggestions subsection
     pub suggestions_section: SuggestionSection,
     /// Whether suggestions help modal is open
     pub suggestions_help_open: bool,
     /// Whether suggestions detail modal is open
     pub suggestions_detail_open: bool,
+    /// Whether candidate preview modal is open
+    pub candidate_preview_open: bool,
     /// Variant groups for structural suggestions
     pub variant_groups: Vec<VariantGroup>,
     /// Selected preview files (by relative path)
@@ -1353,6 +1378,8 @@ pub struct RuleBuilderState {
     // --- Debouncing ---
     /// When pattern was last modified
     pub pattern_changed_at: Option<std::time::Instant>,
+    /// Cache key for last sample eval request
+    pub last_sample_eval_key: Option<String>,
 
     // --- Streaming state ---
     /// Whether a streaming search is in progress
@@ -1392,15 +1419,19 @@ impl Default for RuleBuilderState {
             path_archetypes: Vec::new(),
             naming_schemes: Vec::new(),
             synonym_suggestions: Vec::new(),
+            rule_candidates: Vec::new(),
             selected_pattern_seed: 0,
             selected_archetype: 0,
             selected_naming_scheme: 0,
             selected_synonym: 0,
+            selected_candidate: 0,
             eval_state: EvalState::Idle,
             match_count: 0,
+            sampled_paths_count: 0,
             suggestions_section: SuggestionSection::Patterns,
             suggestions_help_open: false,
             suggestions_detail_open: false,
+            candidate_preview_open: false,
             variant_groups: Vec::new(),
             selected_preview_files: HashSet::new(),
             manual_tag_confirm_open: false,
@@ -1422,6 +1453,7 @@ impl Default for RuleBuilderState {
 
             // Debouncing
             pattern_changed_at: None,
+            last_sample_eval_key: None,
 
             // Streaming state
             is_streaming: false,
@@ -1932,21 +1964,30 @@ static DATE_YYYY_MM_DD: LazyLock<Regex> =
 static DATE_YYYYMMDD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{8}$").unwrap());
 static DATE_YYYY_MM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{4}[-/]\d{2}$").unwrap());
 static DATE_YYYY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{4}$").unwrap());
+static DATETIME_YYYYMMDD_HHMMSS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d{8}[_-]\d{6}$").unwrap());
 static UUID_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
         .unwrap()
 });
 static INTEGER_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d{2,}$").unwrap());
+static HEX_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-fA-F]{8,}$").unwrap());
 
 /// Normalized token type for schema extraction
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NormalizedToken {
     /// Date-like token (YYYY-MM-DD, YYYYMMDD, etc.)
     Date,
+    /// Datetime-like token (YYYYMMDD_HHMMSS or YYYYMMDD-HHMMSS)
+    DateTime,
     /// UUID-like token
     Uuid,
     /// Integer sequence (2+ digits)
     Integer,
+    /// Hex-like token (long hex strings)
+    Hex,
+    /// Mixed alphanumeric code token
+    Code,
     /// Literal token (preserved as-is)
     Literal(String),
 }
@@ -1956,8 +1997,11 @@ impl NormalizedToken {
     pub fn placeholder(&self) -> &str {
         match self {
             NormalizedToken::Date => "<date>",
+            NormalizedToken::DateTime => "<datetime>",
             NormalizedToken::Uuid => "<uuid>",
             NormalizedToken::Integer => "<n>",
+            NormalizedToken::Hex => "<hex>",
+            NormalizedToken::Code => "<code>",
             NormalizedToken::Literal(s) => s.as_str(),
         }
     }
@@ -1971,6 +2015,15 @@ impl NormalizedToken {
 /// - Preserve delimiters `_` `-` `.`
 pub fn normalize_token(token: &str) -> NormalizedToken {
     let token_lower = token.to_lowercase();
+
+    // Check for datetime patterns (YYYYMMDD_HHMMSS or YYYYMMDD-HHMMSS)
+    if DATETIME_YYYYMMDD_HHMMSS.is_match(&token_lower) {
+        if let Ok(year) = token_lower[0..4].parse::<u32>() {
+            if (1900..=2100).contains(&year) {
+                return NormalizedToken::DateTime;
+            }
+        }
+    }
 
     // Check for date patterns
     if DATE_YYYY_MM_DD.is_match(token) {
@@ -2006,6 +2059,20 @@ pub fn normalize_token(token: &str) -> NormalizedToken {
         return NormalizedToken::Integer;
     }
 
+    // Check for hex-like tokens (must include at least one hex letter)
+    if HEX_PATTERN.is_match(token) {
+        if token_lower.chars().any(|c| matches!(c, 'a'..='f')) {
+            return NormalizedToken::Hex;
+        }
+    }
+
+    // Check for mixed alphanumeric codes (letters + digits, length >= 4)
+    let has_alpha = token_lower.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = token_lower.chars().any(|c| c.is_ascii_digit());
+    if token_lower.len() >= 4 && has_alpha && has_digit {
+        return NormalizedToken::Code;
+    }
+
     // Preserve as literal
     NormalizedToken::Literal(token_lower)
 }
@@ -2032,7 +2099,7 @@ pub fn normalize_path(path: &str) -> String {
             // This prevents date strings like "2024-01-15" from being split into parts
             let whole_segment_normalized = normalize_token(segment);
             match whole_segment_normalized {
-                NormalizedToken::Date | NormalizedToken::Uuid => {
+                NormalizedToken::Date | NormalizedToken::DateTime | NormalizedToken::Uuid => {
                     return whole_segment_normalized.placeholder().to_string();
                 }
                 _ => {}
@@ -2089,7 +2156,12 @@ fn template_token_kind(token: &str) -> TemplateToken {
         return TemplateToken::Variable;
     }
     match normalize_token(token) {
-        NormalizedToken::Date | NormalizedToken::Uuid | NormalizedToken::Integer => {
+        NormalizedToken::Date
+        | NormalizedToken::DateTime
+        | NormalizedToken::Uuid
+        | NormalizedToken::Integer
+        | NormalizedToken::Hex
+        | NormalizedToken::Code => {
             TemplateToken::Variable
         }
         NormalizedToken::Literal(lit) => TemplateToken::Literal(lit),
@@ -2112,8 +2184,11 @@ fn filename_template_class(filename: &str) -> (String, Option<String>) {
     for norm in normalized {
         match norm {
             NormalizedToken::Date => template_parts.push("<date>".to_string()),
+            NormalizedToken::DateTime => template_parts.push("<datetime>".to_string()),
             NormalizedToken::Uuid => template_parts.push("<uuid>".to_string()),
             NormalizedToken::Integer => template_parts.push("<n>".to_string()),
+            NormalizedToken::Hex => template_parts.push("<hex>".to_string()),
+            NormalizedToken::Code => template_parts.push("<code>".to_string()),
             NormalizedToken::Literal(s) => template_parts.push(s),
         }
     }
@@ -2514,20 +2589,12 @@ pub fn extract_naming_schemes(paths: &[String], top_n: usize) -> Vec<NamingSchem
 
         for (i, norm) in normalized.iter().enumerate() {
             match norm {
-                NormalizedToken::Date => {
-                    template_parts.push("<date>".to_string());
-                    fields.push(format!("field_{}", i));
-                }
-                NormalizedToken::Uuid => {
-                    template_parts.push("<uuid>".to_string());
-                    fields.push(format!("field_{}", i));
-                }
-                NormalizedToken::Integer => {
-                    template_parts.push("<n>".to_string());
-                    fields.push(format!("field_{}", i));
-                }
                 NormalizedToken::Literal(s) => {
                     template_parts.push(s.clone());
+                }
+                _ => {
+                    template_parts.push(norm.placeholder().to_string());
+                    fields.push(format!("field_{}", i));
                 }
             }
         }
@@ -2796,6 +2863,328 @@ pub fn detect_synonyms(paths: &[String], min_sample_count: usize) -> Vec<Synonym
     suggestions
 }
 
+#[derive(Debug, Clone)]
+enum SegmentPart {
+    Token(String),
+    Separator(String),
+}
+
+fn split_segment_with_separators(segment: &str) -> Vec<SegmentPart> {
+    let mut parts = Vec::new();
+    let mut buffer = String::new();
+    let mut is_sep: Option<bool> = None;
+
+    for ch in segment.chars() {
+        let current_is_sep = matches!(ch, '_' | '-' | '.');
+        match is_sep {
+            None => {
+                buffer.push(ch);
+                is_sep = Some(current_is_sep);
+            }
+            Some(prev_is_sep) => {
+                if prev_is_sep == current_is_sep {
+                    buffer.push(ch);
+                } else {
+                    let part = if prev_is_sep {
+                        SegmentPart::Separator(buffer.clone())
+                    } else {
+                        SegmentPart::Token(buffer.clone())
+                    };
+                    parts.push(part);
+                    buffer.clear();
+                    buffer.push(ch);
+                    is_sep = Some(current_is_sep);
+                }
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        let part = if is_sep.unwrap_or(false) {
+            SegmentPart::Separator(buffer)
+        } else {
+            SegmentPart::Token(buffer)
+        };
+        parts.push(part);
+    }
+
+    parts
+}
+
+fn sanitize_field_name(name: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in name.chars().enumerate() {
+        let c = ch.to_ascii_lowercase();
+        let valid = if i == 0 {
+            c.is_ascii_lowercase() || c == '_'
+        } else {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'
+        };
+        if valid {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    let first = out.chars().next().unwrap_or('_');
+    if !first.is_ascii_lowercase() && first != '_' {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn unique_field_name(base: &str, used: &mut HashMap<String, usize>) -> String {
+    let entry = used.entry(base.to_string()).or_insert(0);
+    *entry += 1;
+    if *entry == 1 {
+        base.to_string()
+    } else {
+        format!("{}_{}", base, *entry)
+    }
+}
+
+fn placeholder_type_hint(kind: &NormalizedToken) -> Option<&'static str> {
+    match kind {
+        NormalizedToken::Date | NormalizedToken::DateTime => Some("date"),
+        NormalizedToken::Uuid => Some("uuid"),
+        NormalizedToken::Integer => Some("int"),
+        _ => None,
+    }
+}
+
+fn field_type_for_token(kind: &NormalizedToken) -> FieldType {
+    match kind {
+        NormalizedToken::Date | NormalizedToken::DateTime => FieldType::Date,
+        NormalizedToken::Uuid => FieldType::Uuid,
+        NormalizedToken::Integer => FieldType::Integer,
+        _ => FieldType::String,
+    }
+}
+
+fn placeholder_base_name(kind: &NormalizedToken, context: Option<&str>) -> String {
+    let context = context.map(sanitize_field_name);
+    match kind {
+        NormalizedToken::Date => context
+            .as_ref()
+            .map(|c| format!("{}_date", c))
+            .unwrap_or_else(|| "date".to_string()),
+        NormalizedToken::DateTime => context
+            .as_ref()
+            .map(|c| format!("{}_datetime", c))
+            .unwrap_or_else(|| "datetime".to_string()),
+        NormalizedToken::Uuid => context
+            .as_ref()
+            .map(|c| format!("{}_uuid", c))
+            .unwrap_or_else(|| "uuid".to_string()),
+        NormalizedToken::Integer => context
+            .as_ref()
+            .map(|c| format!("{}_id", c))
+            .unwrap_or_else(|| "id".to_string()),
+        NormalizedToken::Hex | NormalizedToken::Code => context
+            .as_ref()
+            .map(|c| format!("{}_code", c))
+            .unwrap_or_else(|| "code".to_string()),
+        NormalizedToken::Literal(_) => context.unwrap_or_else(|| "value".to_string()),
+    }
+}
+
+fn nearest_literal_context(kinds: &[NormalizedToken], idx: usize) -> Option<&str> {
+    if idx > 0 {
+        for j in (0..idx).rev() {
+            if let NormalizedToken::Literal(ref lit) = kinds[j] {
+                return Some(lit.as_str());
+            }
+        }
+    }
+    for j in idx + 1..kinds.len() {
+        if let NormalizedToken::Literal(ref lit) = kinds[j] {
+            return Some(lit.as_str());
+        }
+    }
+    None
+}
+
+fn format_placeholder(name: &str, type_hint: Option<&'static str>) -> String {
+    if let Some(hint) = type_hint {
+        format!("<{}:{}>", name, hint)
+    } else {
+        format!("<{}>", name)
+    }
+}
+
+fn build_custom_pattern_from_path(path: &str) -> String {
+    let mut used_names: HashMap<String, usize> = HashMap::new();
+    let mut segments_out = Vec::new();
+
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            segments_out.push(String::new());
+            continue;
+        }
+
+        let whole_kind = normalize_token(segment);
+        if !matches!(whole_kind, NormalizedToken::Literal(_)) {
+            let base = placeholder_base_name(&whole_kind, None);
+            let unique = unique_field_name(&sanitize_field_name(&base), &mut used_names);
+            let placeholder = format_placeholder(&unique, placeholder_type_hint(&whole_kind));
+            segments_out.push(placeholder);
+            continue;
+        }
+
+        let parts = split_segment_with_separators(segment);
+        let tokens: Vec<String> = parts
+            .iter()
+            .filter_map(|part| match part {
+                SegmentPart::Token(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let kinds: Vec<NormalizedToken> = tokens.iter().map(|t| normalize_token(t)).collect();
+
+        let mut token_idx = 0usize;
+        let mut seg_out = String::new();
+        for part in parts {
+            match part {
+                SegmentPart::Separator(sep) => seg_out.push_str(&sep),
+                SegmentPart::Token(token) => {
+                    let kind = kinds.get(token_idx).cloned().unwrap_or_else(|| {
+                        NormalizedToken::Literal(token.to_lowercase())
+                    });
+                    if matches!(kind, NormalizedToken::Literal(_)) {
+                        seg_out.push_str(&token);
+                    } else {
+                        let context = nearest_literal_context(&kinds, token_idx);
+                        let base = placeholder_base_name(&kind, context);
+                        let unique = unique_field_name(&sanitize_field_name(&base), &mut used_names);
+                        let placeholder = format_placeholder(&unique, placeholder_type_hint(&kind));
+                        seg_out.push_str(&placeholder);
+                    }
+                    token_idx = token_idx.saturating_add(1);
+                }
+            }
+        }
+        segments_out.push(seg_out);
+    }
+
+    segments_out.join("/")
+}
+
+fn field_source_for_placeholder(pattern: &str, segment_index: usize) -> FieldSource {
+    let segments: Vec<&str> = pattern.split('/').collect();
+    let has_globstar = segments.iter().any(|s| *s == "**");
+    if has_globstar {
+        let only_leading = segments.first().map(|s| *s == "**").unwrap_or(false)
+            && !segments.iter().skip(1).any(|s| *s == "**");
+        if only_leading {
+            let from_end = segments.len().saturating_sub(segment_index);
+            return FieldSource::Segment(-(from_end as i32));
+        }
+        return FieldSource::RelPath;
+    }
+    FieldSource::Segment(segment_index as i32)
+}
+
+fn fields_from_parsed_pattern(pattern: &str, parsed: &ParsedGlobPattern) -> Vec<RuleBuilderField> {
+    let mut fields = Vec::new();
+    for placeholder in &parsed.placeholders {
+        let segment_index = pattern[..placeholder.position].matches('/').count();
+        let source = field_source_for_placeholder(pattern, segment_index);
+        let field_type = placeholder
+            .type_hint
+            .as_deref()
+            .map(normalize_type_hint)
+            .unwrap_or(FieldType::String);
+
+        fields.push(RuleBuilderField {
+            name: placeholder.name.clone(),
+            source,
+            field_type,
+            pattern: None,
+            sample_values: Vec::new(),
+            enabled: true,
+        });
+    }
+    fields
+}
+
+/// Sync extraction fields from the current custom pattern (if present).
+pub fn sync_extractions_from_custom_pattern(
+    builder: &mut RuleBuilderState,
+) -> Result<(), GlobParseError> {
+    if !(builder.pattern.contains('<') && builder.pattern.contains('>')) {
+        builder.extractions.clear();
+        return Ok(());
+    }
+
+    let parsed = parse_custom_glob(&builder.pattern)?;
+    let mut new_fields = fields_from_parsed_pattern(&builder.pattern, &parsed);
+
+    let mut existing: HashMap<String, RuleBuilderField> = builder
+        .extractions
+        .drain(..)
+        .map(|f| (f.name.clone(), f))
+        .collect();
+
+    for field in &mut new_fields {
+        if let Some(old) = existing.remove(&field.name) {
+            field.enabled = old.enabled;
+            field.pattern = old.pattern;
+            field.sample_values = old.sample_values;
+        }
+    }
+
+    builder.extractions = new_fields;
+    Ok(())
+}
+
+/// Extract suggested rule candidates from paths.
+pub fn extract_rule_candidates(paths: &[String], top_n: usize) -> Vec<RuleCandidate> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    let mut groups: HashMap<String, Vec<&String>> = HashMap::new();
+    for path in paths {
+        let template = normalize_path(path);
+        groups.entry(template).or_default().push(path);
+    }
+
+    let mut candidates = Vec::new();
+    for (_template, group_paths) in groups {
+        let example = group_paths
+            .first()
+            .cloned()
+            .cloned()
+            .unwrap_or_default();
+        if example.is_empty() {
+            continue;
+        }
+        let custom_pattern = build_custom_pattern_from_path(&example);
+        let parsed = match parse_custom_glob(&custom_pattern) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+
+        let fields = fields_from_parsed_pattern(&custom_pattern, &parsed);
+        let label = custom_pattern.clone();
+        candidates.push(RuleCandidate {
+            label,
+            custom_pattern,
+            glob_pattern: parsed.glob_pattern,
+            fields,
+            example_path: example,
+            estimated_count: group_paths.len(),
+        });
+    }
+
+    candidates.sort_by(|a, b| b.estimated_count.cmp(&a.estimated_count));
+    candidates.truncate(top_n);
+    candidates
+}
+
 /// Analyze paths and populate schema-first UI fields in RuleBuilderState.
 ///
 /// This is the main entry point for the schema-first analysis.
@@ -2805,6 +3194,7 @@ pub fn analyze_paths_for_schema_ui(state: &mut RuleBuilderState, paths: &[String
     state.naming_schemes = extract_naming_schemes(paths, top_n);
     state.synonym_suggestions = detect_synonyms(paths, 30); // min 30 paths for synonym detection
     state.variant_groups = group_variant_archetypes(&state.path_archetypes);
+    state.rule_candidates = extract_rule_candidates(paths, top_n);
 }
 
 #[cfg(test)]
@@ -3008,6 +3398,16 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_token_datetime_hex_code() {
+        assert_eq!(
+            normalize_token("20250113_141336"),
+            NormalizedToken::DateTime
+        );
+        assert_eq!(normalize_token("deadbeefcafebabe"), NormalizedToken::Hex);
+        assert_eq!(normalize_token("run42a"), NormalizedToken::Code);
+    }
+
+    #[test]
     fn test_normalize_token_uuid() {
         assert_eq!(
             normalize_token("550e8400-e29b-41d4-a716-446655440000"),
@@ -3182,6 +3582,38 @@ mod tests {
             !state.naming_schemes.is_empty(),
             "naming_schemes should not be empty - paths have variable numeric parts in filenames"
         );
+        assert!(
+            !state.rule_candidates.is_empty(),
+            "rule_candidates should not be empty for structured paths"
+        );
         // Synonyms may or may not be found depending on path content
+    }
+
+    #[test]
+    fn test_extract_rule_candidates_basic() {
+        let paths = vec![
+            "ops/mission_001/2024-01-01/report.csv".to_string(),
+            "ops/mission_002/2024-01-02/report.csv".to_string(),
+            "ops/mission_003/2024-01-03/report.csv".to_string(),
+        ];
+
+        let candidates = extract_rule_candidates(&paths, 5);
+        assert!(!candidates.is_empty());
+        let candidate = &candidates[0];
+        assert!(candidate.custom_pattern.contains('<'));
+        assert!(!candidate.fields.is_empty());
+        assert!(!candidate.glob_pattern.is_empty());
+    }
+
+    #[test]
+    fn test_sync_extractions_from_custom_pattern() {
+        let mut builder = RuleBuilderState::default();
+        builder.pattern = "**/mission_<id:int>/<date:date>/*.csv".to_string();
+        sync_extractions_from_custom_pattern(&mut builder).expect("sync ok");
+        assert_eq!(builder.extractions.len(), 2);
+        assert_eq!(builder.extractions[0].name, "id");
+        assert_eq!(builder.extractions[0].field_type, FieldType::Integer);
+        assert_eq!(builder.extractions[1].name, "date");
+        assert_eq!(builder.extractions[1].field_type, FieldType::Date);
     }
 }

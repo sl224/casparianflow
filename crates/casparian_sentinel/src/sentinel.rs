@@ -35,8 +35,10 @@ use uuid::Uuid;
 use zmq::{Context as ZmqContext, Socket};
 
 use crate::control::{
-    ControlRequest, ControlResponse, JobInfo, QueueStatsInfo, ScanState, ScoutRuleInfo,
-    ScoutScanProgress, ScoutScanStatus, ScoutSourceInfo, ScoutTagCount, ScoutTagStats,
+    ControlRequest, ControlResponse, JobInfo, QueueStatsInfo, ScanState, ScoutFileInfo,
+    ScoutFilesPage, ScoutFolderEntry, ScoutPatternMatch, ScoutPatternQueryResult, ScoutRuleInfo,
+    ScoutScanProgress, ScoutScanStatus, ScoutSourceInfo, ScoutTagCount, ScoutTagFilter,
+    ScoutTagStats,
 };
 use crate::catalog_executor::{CatalogExecutor, CatalogIntent};
 use crate::sqlite_executor::{SqliteContext, SqliteExecutor};
@@ -63,6 +65,8 @@ const DISPATCH_BACKOFF_JITTER_MS: u64 = 50;
 const DISPATCH_LEASE_TTL_MS: i64 = 30_000;
 /// How often to sweep expired dispatch leases (seconds).
 const DISPATCH_LEASE_SWEEP_SECS: f64 = 5.0;
+/// Delay before retrying transient dispatch preparation failures.
+const DISPATCH_PREP_RETRY_MS: i64 = 10_000;
 /// Grace period for worker reconnects after sentinel restart (seconds).
 const RECONNECT_GRACE_SECS: f64 = 60.0;
 
@@ -2600,16 +2604,6 @@ impl Sentinel {
 
     /// Register a worker from IDENTIFY message
     fn register_worker(&mut self, identity: Vec<u8>, payload: IdentifyPayload) -> Result<()> {
-        if self.workers.len() >= self.max_workers {
-            let message = format!(
-                "Worker registration rejected: max_workers {} reached",
-                self.max_workers
-            );
-            warn!("{}", message);
-            self.send_error(&identity, &message)?;
-            return Ok(());
-        }
-
         // Generate a unique worker_id from the full identity if not provided
         // Use first 8 bytes of identity hash to avoid collisions from using only identity[0]
         let worker_id = payload.worker_id.unwrap_or_else(|| {
@@ -2625,6 +2619,31 @@ impl Sentinel {
 
         // Vec instead of HashSet - linear scan is faster for small N
         let capabilities: Vec<String> = payload.capabilities;
+
+        if let Some(existing) = self.workers.get_mut(&identity) {
+            existing.last_seen = current_time();
+            if existing.worker_id != worker_id {
+                warn!(
+                    "Worker identity reused with new worker_id (old={}, new={})",
+                    existing.worker_id, worker_id
+                );
+                existing.worker_id = worker_id.clone();
+            }
+            existing.capabilities = capabilities;
+            self.seen_worker_ids.insert(worker_id.clone());
+            info!("Worker re-identified: {}", worker_id);
+            return Ok(());
+        }
+
+        if self.workers.len() >= self.max_workers {
+            let message = format!(
+                "Worker registration rejected: max_workers {} reached",
+                self.max_workers
+            );
+            warn!("{}", message);
+            self.send_error(&identity, &message)?;
+            return Ok(());
+        }
 
         info!("Worker joined [{}]", worker_id);
 
@@ -2903,6 +2922,53 @@ impl Sentinel {
             return Ok(None);
         }
 
+        let fail_dispatch = |message: &str| -> Result<Option<DispatchPlan>> {
+            warn!(
+                "Dispatch prep failed for job {} (fatal): {}",
+                job.id, message
+            );
+            let updated = queue.fail_job_if_token_matches_dispatching(
+                job.id,
+                &lease_token,
+                JobStatus::Failed.as_str(),
+                message,
+            )?;
+            if !updated {
+                warn!("Stale dispatch failure ignored for job {}", job.id);
+            }
+            if let Err(err) = queue.update_pipeline_run_status_for_job(job.id) {
+                warn!(
+                    "Failed to update pipeline run status for job {}: {}",
+                    job.id, err
+                );
+            }
+            Ok(None)
+        };
+
+        let defer_dispatch = |message: &str| -> Result<Option<DispatchPlan>> {
+            warn!(
+                "Dispatch prep failed for job {} (transient): {}",
+                job.id, message
+            );
+            let scheduled_at = now_ms.saturating_add(DISPATCH_PREP_RETRY_MS);
+            let updated = queue.defer_job_if_token_matches(
+                job.id,
+                &lease_token,
+                scheduled_at,
+                Some(message),
+            )?;
+            if !updated {
+                warn!("Stale dispatch defer ignored for job {}", job.id);
+            }
+            if let Err(err) = queue.update_pipeline_run_status_for_job(job.id) {
+                warn!(
+                    "Failed to update pipeline run status for job {}: {}",
+                    job.id, err
+                );
+            }
+            Ok(None)
+        };
+
         let now = current_time();
         if now - context.topic_map_last_refresh > TOPIC_CACHE_TTL_SECS {
             match Self::load_topic_configs(state_store.routing()) {
@@ -2916,9 +2982,16 @@ impl Sentinel {
             }
         }
 
-        let dispatch_data = queue
-            .load_dispatch_data(&job.plugin_name, job.file_id)
-            .context("Failed to load dispatch data")?;
+        let dispatch_data = match queue.load_dispatch_data(&job.plugin_name, job.file_id) {
+            Ok(data) => data,
+            Err(err) => {
+                let msg = format!(
+                    "Dispatch data missing for plugin '{}': {}",
+                    job.plugin_name, err
+                );
+                return fail_dispatch(&msg);
+            }
+        };
         let DispatchData {
             rel_path,
             scan_root,
@@ -2938,10 +3011,12 @@ impl Sentinel {
         let file_path = resolve_dispatch_path(&scan_root, exec_root.as_deref(), &rel_path);
 
         if entrypoint.trim().is_empty() {
-            anyhow::bail!("Missing entrypoint for plugin '{}'", job.plugin_name);
+            let msg = format!("Missing entrypoint for plugin '{}'", job.plugin_name);
+            return fail_dispatch(&msg);
         }
         if artifact_hash.trim().is_empty() {
-            anyhow::bail!("Missing artifact_hash for plugin '{}'", job.plugin_name);
+            let msg = format!("Missing artifact_hash for plugin '{}'", job.plugin_name);
+            return fail_dispatch(&msg);
         }
 
         let env_hash = if env_hash.trim().is_empty() {
@@ -2958,10 +3033,12 @@ impl Sentinel {
         match runtime_kind {
             RuntimeKind::PythonShim => {
                 if env_hash.is_none() {
-                    anyhow::bail!("Missing env_hash for plugin '{}'", job.plugin_name);
+                    let msg = format!("Missing env_hash for plugin '{}'", job.plugin_name);
+                    return fail_dispatch(&msg);
                 }
                 if source_code.is_none() {
-                    anyhow::bail!("Missing source_code for plugin '{}'", job.plugin_name);
+                    let msg = format!("Missing source_code for plugin '{}'", job.plugin_name);
+                    return fail_dispatch(&msg);
                 }
             }
             RuntimeKind::NativeExec => {
@@ -2971,24 +3048,37 @@ impl Sentinel {
                     .map(|value| value.trim())
                     .unwrap_or("");
                 if platform_os.is_empty() || platform_arch.is_empty() {
-                    anyhow::bail!(
+                    let msg = format!(
                         "Missing platform_os/platform_arch for native plugin '{}'",
                         job.plugin_name
                     );
+                    return fail_dispatch(&msg);
                 }
             }
         }
 
         let sinks = Self::resolve_sinks_for_plugin(&context.topic_map, &job.plugin_name);
-        let sinks = Self::apply_contract_overrides_with_storage(
+        let sinks = match Self::apply_contract_overrides_with_storage(
             state_store.routing(),
             &context.schema_storage,
             &job.plugin_name,
             &parser_version,
             sinks,
-        )?;
+        ) {
+            Ok(sinks) => sinks,
+            Err(err) => {
+                let msg = format!("Failed to apply contract overrides: {}", err);
+                return defer_dispatch(&msg);
+            }
+        };
 
-        let sink_config_json = serde_json::to_string(&sinks)?;
+        let sink_config_json = match serde_json::to_string(&sinks) {
+            Ok(json) => json,
+            Err(err) => {
+                let msg = format!("Failed to serialize sink config: {}", err);
+                return defer_dispatch(&msg);
+            }
+        };
         if let Err(err) =
             queue.record_dispatch_metadata(job.id, &parser_version, &artifact_hash, &sink_config_json)
         {
@@ -4021,6 +4111,206 @@ impl<'a> ControlDbHandler<'a> {
             Err(e) => ControlResponse::error("DB_ERROR", format!("Tag apply failed: {}", e)),
         }
     }
+
+    fn handle_get_source_by_path(
+        &self,
+        workspace_id: WorkspaceId,
+        path: &str,
+    ) -> ControlResponse {
+        match self.state_store.scout().get_source_by_path(&workspace_id, path) {
+            Ok(Some(source)) => ControlResponse::Source(Some(ScoutSourceInfo {
+                id: source.id,
+                workspace_id: source.workspace_id,
+                name: source.name,
+                source_type: source.source_type,
+                path: source.path,
+                exec_path: source.exec_path,
+                enabled: source.enabled,
+                poll_interval_secs: source.poll_interval_secs,
+                file_count: 0,
+            })),
+            Ok(None) => ControlResponse::Source(None),
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Source lookup failed: {}", e),
+            ),
+        }
+    }
+
+    fn handle_list_files(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        tag_filter: ScoutTagFilter,
+        path_filter: Option<String>,
+        limit: usize,
+        offset: usize,
+    ) -> ControlResponse {
+        let store_filter = match tag_filter {
+            ScoutTagFilter::All => casparian_state_store::ScoutFileTagFilter::All,
+            ScoutTagFilter::Untagged => casparian_state_store::ScoutFileTagFilter::Untagged,
+            ScoutTagFilter::Tag(tag) => casparian_state_store::ScoutFileTagFilter::Tag(tag),
+        };
+
+        match self
+            .state_store
+            .scout()
+            .list_files_page(workspace_id, source_id, store_filter, path_filter, limit, offset)
+        {
+            Ok(page) => {
+                let files = page
+                    .files
+                    .into_iter()
+                    .map(|file| ScoutFileInfo {
+                        id: file.id,
+                        path: file.path,
+                        rel_path: file.rel_path,
+                        size: file.size,
+                        mtime: file.mtime,
+                        is_dir: file.is_dir,
+                        tags: file.tags,
+                    })
+                    .collect();
+                ControlResponse::FilesPage(ScoutFilesPage {
+                    total_count: page.total_count,
+                    files,
+                })
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("List files failed: {}", e)),
+        }
+    }
+
+    fn handle_list_folders(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        prefix: &str,
+        glob_pattern: Option<String>,
+    ) -> ControlResponse {
+        match self
+            .state_store
+            .scout()
+            .list_folder_entries(workspace_id, source_id, prefix, glob_pattern.as_deref())
+        {
+            Ok((entries, total_count)) => {
+                let mapped = entries
+                    .into_iter()
+                    .map(|entry| ScoutFolderEntry {
+                        name: entry.name,
+                        file_count: entry.file_count,
+                        is_file: entry.is_file,
+                    })
+                    .collect();
+                ControlResponse::FolderEntries {
+                    entries: mapped,
+                    total_count,
+                }
+            }
+            Err(e) => {
+                ControlResponse::error("DB_ERROR", format!("Folder query failed: {}", e))
+            }
+        }
+    }
+
+    fn handle_pattern_query(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: &str,
+        limit: usize,
+        offset: usize,
+    ) -> ControlResponse {
+        match self
+            .state_store
+            .scout()
+            .pattern_query(workspace_id, source_id, glob_pattern, limit, offset)
+        {
+            Ok(result) => {
+                let files = result
+                    .files
+                    .into_iter()
+                    .map(|file| ScoutPatternMatch {
+                        rel_path: file.rel_path,
+                        size: file.size,
+                        mtime: file.mtime,
+                    })
+                    .collect();
+                ControlResponse::PatternQueryResult(ScoutPatternQueryResult {
+                    total_count: result.total_count,
+                    files,
+                })
+            }
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Pattern query failed: {}", e)),
+        }
+    }
+
+    fn handle_sample_paths_for_eval(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: &str,
+    ) -> ControlResponse {
+        match self
+            .state_store
+            .scout()
+            .sample_paths_for_eval(workspace_id, source_id, glob_pattern)
+        {
+            Ok(paths) => ControlResponse::SamplePaths { paths },
+            Err(e) => ControlResponse::error(
+                "DB_ERROR",
+                format!("Sample eval query failed: {}", e),
+            ),
+        }
+    }
+
+    fn handle_apply_tag_to_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        rel_paths: Vec<String>,
+        tag: &str,
+        tag_source: TagSource,
+    ) -> ControlResponse {
+        let result = self.state_store.scout().apply_tag_to_paths(
+            workspace_id,
+            source_id,
+            &rel_paths,
+            tag,
+            tag_source,
+            None,
+        );
+
+        match result {
+            Ok(count) => ControlResponse::TagApplyResult {
+                success: true,
+                tagged_count: count,
+                message: "Tags applied".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Tag apply failed: {}", e)),
+        }
+    }
+
+    fn handle_apply_rule_to_source(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        pattern: &str,
+        tag: &str,
+    ) -> ControlResponse {
+        match self
+            .state_store
+            .scout()
+            .apply_rule_to_source(rule_id, workspace_id, source_id, pattern, tag)
+        {
+            Ok(count) => ControlResponse::RuleApplyResult {
+                success: true,
+                tagged_count: count,
+                message: "Rule applied".to_string(),
+            },
+            Err(e) => ControlResponse::error("DB_ERROR", format!("Rule apply failed: {}", e)),
+        }
+    }
 }
 
 fn handle_control_request_db(
@@ -4139,6 +4429,48 @@ fn handle_control_request_db(
             workspace_id,
             source_id,
         } => handler.handle_list_tags(workspace_id, source_id),
+        ControlRequest::GetSourceByPath { workspace_id, path } => {
+            handler.handle_get_source_by_path(workspace_id, &path)
+        }
+        ControlRequest::ListFiles {
+            workspace_id,
+            source_id,
+            tag_filter,
+            path_filter,
+            limit,
+            offset,
+        } => handler.handle_list_files(
+            workspace_id,
+            source_id,
+            tag_filter,
+            path_filter,
+            limit,
+            offset,
+        ),
+        ControlRequest::ListFolders {
+            workspace_id,
+            source_id,
+            prefix,
+            glob_pattern,
+        } => handler.handle_list_folders(workspace_id, source_id, &prefix, glob_pattern),
+        ControlRequest::PatternQuery {
+            workspace_id,
+            source_id,
+            glob_pattern,
+            limit,
+            offset,
+        } => handler.handle_pattern_query(
+            workspace_id,
+            source_id,
+            &glob_pattern,
+            limit,
+            offset,
+        ),
+        ControlRequest::SamplePathsForEval {
+            workspace_id,
+            source_id,
+            glob_pattern,
+        } => handler.handle_sample_paths_for_eval(workspace_id, source_id, &glob_pattern),
         ControlRequest::ApplyTag {
             workspace_id: _,
             file_id,
@@ -4146,6 +4478,32 @@ fn handle_control_request_db(
             tag_source,
             rule_id,
         } => handler.handle_apply_tag(file_id, &tag, tag_source, rule_id.as_ref()),
+        ControlRequest::ApplyTagToPaths {
+            workspace_id,
+            source_id,
+            rel_paths,
+            tag,
+            tag_source,
+        } => handler.handle_apply_tag_to_paths(
+            workspace_id,
+            source_id,
+            rel_paths,
+            &tag,
+            tag_source,
+        ),
+        ControlRequest::ApplyRuleToSource {
+            rule_id,
+            workspace_id,
+            source_id,
+            pattern,
+            tag,
+        } => handler.handle_apply_rule_to_source(
+            rule_id,
+            workspace_id,
+            source_id,
+            &pattern,
+            &tag,
+        ),
         ControlRequest::Ping
         | ControlRequest::StartScan { .. }
         | ControlRequest::GetScan { .. }
@@ -4303,7 +4661,23 @@ fn process_conclude_db(
                 job_id
             );
             let scheduled_at = now_millis();
-            queue.defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
+            if let Some(token) = lease_token.as_deref() {
+                let updated = queue.defer_job_if_token_matches(
+                    job_id,
+                    token,
+                    scheduled_at,
+                    Some("capacity_rejection"),
+                )?;
+                if !updated {
+                    return Ok(ConcludeOutcome::Stale { job_id });
+                }
+            } else {
+                warn!(
+                    "Legacy CONCLUDE Rejected without lease_token for job {}; accepting",
+                    job_id
+                );
+                queue.defer_job(job_id, scheduled_at, Some("capacity_rejection"))?;
+            }
             if let Err(err) = queue.update_pipeline_run_status_for_job(job_id) {
                 warn!(
                     "Failed to update pipeline run status for job {}: {}",

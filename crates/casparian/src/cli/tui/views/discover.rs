@@ -329,26 +329,9 @@ impl App {
                     let tag = self.discover.rule_tag_input.trim().to_string();
                     let pattern = self.discover.rule_pattern_input.trim().to_string();
                     if !tag.is_empty() && !pattern.is_empty() {
-                        let Some((rule_id, tagged_count)) =
-                            self.apply_rule_to_files(&pattern, &tag)
-                        else {
+                        if self.apply_rule_to_files(&pattern, &tag).is_none() {
                             return;
-                        };
-                        self.discover.rules.push(RuleInfo {
-                            id: RuleId::new(rule_id),
-                            pattern: pattern.clone(),
-                            tag: tag.clone(),
-                            priority: 100,
-                            enabled: true,
-                        });
-                        self.refresh_tags_list();
-                        self.discover.status_message = Some((
-                            format!(
-                                "Created rule: {} → {} ({} files tagged)",
-                                pattern, tag, tagged_count
-                            ),
-                            false,
-                        ));
+                        }
                     } else if tag.is_empty() && !pattern.is_empty() {
                         self.discover.status_message =
                             Some(("Please enter a tag name".to_string(), true));
@@ -1843,7 +1826,6 @@ impl App {
     /// Focus cycles: Pattern → Excludes → Tag → Extractions → Options → Suggestions → FileList
     fn handle_rule_builder_key(&mut self, key: KeyEvent) {
         use extraction::RuleBuilderFocus;
-        use extraction::SuggestionSection;
 
         // Capture the current pattern before handling the key
         let pattern_before = self
@@ -1874,85 +1856,115 @@ impl App {
             }
         };
         let mut refresh_needed = false;
+        let mut refresh_pattern: Option<String> = None;
+        let mut switch_to_label = false;
+        let mut skip_main_handling = false;
+        let mut pattern_after = builder.pattern.clone();
+        let mut pattern_debounced = builder.pattern_changed_at.is_some();
+        let mut pending_manual_tag: Option<(Vec<String>, String, bool)> = None;
+        let mut pending_sample_eval = false;
+        let mut pending_full_eval = false;
+        let mut return_after_action = false;
 
-        if builder.suggestions_help_open || builder.suggestions_detail_open {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
-                    builder.suggestions_help_open = false;
-                    builder.suggestions_detail_open = false;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if builder.confirm_exit_open {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    builder.confirm_exit_open = false;
-                    builder.dirty = false;
-                    self.set_mode(TuiMode::Home);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    builder.confirm_exit_open = false;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if builder.manual_tag_confirm_open {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let (tag, paths) = {
-                        builder.manual_tag_confirm_open = false;
-                        (
-                            builder.tag.clone(),
-                            Self::rule_builder_preview_paths_from(builder, false),
-                        )
-                    };
-                    if !tag.is_empty() && !paths.is_empty() {
-                        let tagged = self.apply_manual_tag_to_paths(&paths, &tag);
-                        self.discover.status_message =
-                            Some((format!("Tagged {} files with '{}'", tagged, tag), false));
-                        if let Some(builder) = self.discover.rule_builder.as_mut() {
-                            builder.selected_preview_files.clear();
-                        }
-                    }
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    builder.manual_tag_confirm_open = false;
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        if builder.source_id.is_none() {
+        if builder.candidate_preview_open {
+            skip_main_handling = true;
             match key.code {
                 KeyCode::Esc => {
-                    self.set_mode(TuiMode::Home);
+                    builder.candidate_preview_open = false;
                 }
-                KeyCode::Char('S') => {
-                    self.transition_discover_state(DiscoverViewState::SourcesDropdown);
-                    self.discover.sources_filter.clear();
-                    self.discover.sources_filtering = false;
-                    self.discover.preview_source = Some(self.discover.selected_source_index());
+                KeyCode::Char('a') | KeyCode::Enter => {
+                    if let Some(candidate) =
+                        builder.rule_candidates.get(builder.selected_candidate).cloned()
+                    {
+                        builder.pattern = candidate.custom_pattern.clone();
+                        builder.extractions = candidate.fields.clone();
+                        builder.pattern_error = None;
+                        builder.dirty = true;
+                        builder.focus = RuleBuilderFocus::Tag;
+                        builder.candidate_preview_open = false;
+                        builder.selected_preview_files.clear();
+                        builder.pattern_changed_at = Some(std::time::Instant::now());
+                        refresh_pattern = Some(candidate.custom_pattern);
+                        switch_to_label = true;
+                    } else {
+                        builder.candidate_preview_open = false;
+                    }
                 }
-                KeyCode::Char('s') => {
-                    self.transition_discover_state(DiscoverViewState::EnteringPath);
-                    self.discover.scan_path_input.clear();
-                    self.discover.scan_error = None;
-                }
-                _ => {
-                    self.discover.status_message =
-                        Some(("Select a source before building rules".to_string(), true));
-                }
+                _ => {}
             }
-            return;
+            pattern_after = builder.pattern.clone();
+            pattern_debounced = builder.pattern_changed_at.is_some();
         }
 
-        match key.code {
+        if !skip_main_handling {
+            if builder.confirm_exit_open {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        builder.confirm_exit_open = false;
+                        builder.dirty = false;
+                        self.set_mode(TuiMode::Home);
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        builder.confirm_exit_open = false;
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            if builder.manual_tag_confirm_open {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        let (tag, paths) = {
+                            builder.manual_tag_confirm_open = false;
+                            (
+                                builder.tag.clone(),
+                                Self::rule_builder_preview_paths_from(builder, false),
+                            )
+                        };
+                        if !tag.is_empty() && !paths.is_empty() {
+                            pending_manual_tag = Some((paths, tag, true));
+                        }
+                        return_after_action = true;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        builder.manual_tag_confirm_open = false;
+                        return_after_action = true;
+                    }
+                    _ => {}
+                }
+                skip_main_handling = true;
+            }
+
+            if !skip_main_handling {
+                if builder.source_id.is_none() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            self.set_mode(TuiMode::Home);
+                        }
+                        KeyCode::Char('S') => {
+                            self.transition_discover_state(DiscoverViewState::SourcesDropdown);
+                            self.discover.sources_filter.clear();
+                            self.discover.sources_filtering = false;
+                            self.discover.preview_source =
+                                Some(self.discover.selected_source_index());
+                        }
+                        KeyCode::Char('s') => {
+                            self.transition_discover_state(DiscoverViewState::EnteringPath);
+                            self.discover.scan_path_input.clear();
+                            self.discover.scan_error = None;
+                        }
+                        _ => {
+                            self.discover.status_message = Some((
+                                "Select a source before building rules".to_string(),
+                                true,
+                            ));
+                        }
+                    }
+                    return;
+                }
+
+                match key.code {
             // Tab cycles focus (per spec Section 8)
             KeyCode::Tab => {
                 builder.focus = match builder.focus {
@@ -1962,7 +1974,13 @@ impl App {
                     RuleBuilderFocus::Tag => RuleBuilderFocus::Extractions,
                     RuleBuilderFocus::Extractions => RuleBuilderFocus::Options,
                     RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Options,
-                    RuleBuilderFocus::Options => RuleBuilderFocus::Suggestions,
+                    RuleBuilderFocus::Options => {
+                        if self.ingest_tab == IngestTab::Select {
+                            RuleBuilderFocus::Suggestions
+                        } else {
+                            RuleBuilderFocus::FileList
+                        }
+                    }
                     RuleBuilderFocus::Suggestions => RuleBuilderFocus::FileList,
                     RuleBuilderFocus::FileList => RuleBuilderFocus::Pattern,
                     RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
@@ -1980,7 +1998,13 @@ impl App {
                     RuleBuilderFocus::ExtractionEdit(_) => RuleBuilderFocus::Extractions,
                     RuleBuilderFocus::Options => RuleBuilderFocus::Extractions,
                     RuleBuilderFocus::Suggestions => RuleBuilderFocus::Options,
-                    RuleBuilderFocus::FileList => RuleBuilderFocus::Suggestions,
+                    RuleBuilderFocus::FileList => {
+                        if self.ingest_tab == IngestTab::Select {
+                            RuleBuilderFocus::Suggestions
+                        } else {
+                            RuleBuilderFocus::Options
+                        }
+                    }
                     RuleBuilderFocus::IgnorePicker => RuleBuilderFocus::FileList,
                 };
             }
@@ -2029,15 +2053,32 @@ impl App {
                         // Phase-aware Enter behavior
                         match &mut builder.file_results {
                             extraction::FileResultsState::Exploration {
-                                expanded_folder_indices,
+                                folder_matches,
                                 ..
                             } => {
-                                // Toggle folder expansion
-                                let idx = builder.selected_file;
-                                if expanded_folder_indices.contains(&idx) {
-                                    expanded_folder_indices.remove(&idx);
-                                } else {
-                                    expanded_folder_indices.insert(idx);
+                                if let Some(folder) = folder_matches.get(builder.selected_file) {
+                                    let folder_path = folder.path.trim_end_matches('/');
+                                    if !folder_path.is_empty()
+                                        && folder_path != "."
+                                        && folder_path != "./"
+                                    {
+                                        let pattern_suffix = if builder.pattern.starts_with("**/")
+                                        {
+                                            builder.pattern.trim_start_matches("**/").to_string()
+                                        } else if builder.pattern.starts_with("./") {
+                                            builder.pattern.trim_start_matches("./").to_string()
+                                        } else {
+                                            builder.pattern.clone()
+                                        };
+                                        let new_pattern =
+                                            format!("{}/{}", folder_path, pattern_suffix);
+                                        builder.pattern = new_pattern;
+                                        builder.pattern_changed_at =
+                                            Some(std::time::Instant::now());
+                                        builder.dirty = true;
+                                        builder.selected_file = 0;
+                                        refresh_needed = true;
+                                    }
                                 }
                             }
                             extraction::FileResultsState::ExtractionPreview { .. } => {
@@ -2054,6 +2095,7 @@ impl App {
                         if !pattern.is_empty() {
                             builder.add_exclude(pattern);
                             builder.dirty = true;
+                            builder.pattern_changed_at = Some(std::time::Instant::now());
                             refresh_needed = true;
                         }
                         builder.exclude_input.clear();
@@ -2068,13 +2110,16 @@ impl App {
                         if let Some(option) = builder.ignore_options.get(builder.ignore_selected) {
                             builder.add_exclude(option.pattern.clone());
                             builder.dirty = true;
+                            builder.pattern_changed_at = Some(std::time::Instant::now());
                             refresh_needed = true;
                         }
                         builder.ignore_options.clear();
                         builder.focus = RuleBuilderFocus::FileList;
                     }
                     RuleBuilderFocus::Suggestions => {
-                        builder.suggestions_detail_open = true;
+                        if !builder.rule_candidates.is_empty() {
+                            builder.candidate_preview_open = true;
+                        }
                     }
                     _ => {}
                 }
@@ -2097,17 +2142,41 @@ impl App {
                     }
                 };
                 if builder.can_save() {
-                    let _draft = builder.to_draft();
+                    let mut pattern_to_save = builder.pattern.clone();
+                    if builder.pattern.contains('<') && builder.pattern.contains('>') {
+                        match extraction::parse_custom_glob(&builder.pattern) {
+                            Ok(parsed) => {
+                                pattern_to_save = parsed.glob_pattern;
+                            }
+                            Err(err) => {
+                                self.discover.status_message = Some((
+                                    format!("Cannot save: {}", err.message),
+                                    true,
+                                ));
+                                return;
+                            }
+                        }
+                    }
                     if builder.source_id.is_some() {
                         let rule_id = TaggingRuleId::new();
                         self.discover.pending_rule_writes.push(PendingRuleWrite {
                             id: rule_id,
                             workspace_id,
-                            pattern: builder.pattern.clone(),
+                            pattern: pattern_to_save.clone(),
                             tag: builder.tag.clone(),
                         });
-                        self.discover.status_message =
-                            Some((format!("Rule '{}' saved", builder.tag), false));
+                        if pattern_to_save != builder.pattern {
+                            self.discover.status_message = Some((
+                                format!(
+                                    "Saved rule using glob: {}",
+                                    pattern_to_save
+                                ),
+                                false,
+                            ));
+                        } else {
+                            self.discover.status_message =
+                                Some((format!("Rule '{}' saved", builder.tag), false));
+                        }
                         builder.dirty = false;
                         // Stay in Rule Builder (it's the default view) - clear for next rule
                         builder.pattern = "**/*".to_string();
@@ -2206,12 +2275,10 @@ impl App {
                         builder.focus = RuleBuilderFocus::Suggestions;
                     }
                     RuleBuilderFocus::Suggestions => {
-                        builder.suggestions_section = match builder.suggestions_section {
-                            SuggestionSection::Patterns => SuggestionSection::Structures,
-                            SuggestionSection::Structures => SuggestionSection::Filenames,
-                            SuggestionSection::Filenames => SuggestionSection::Synonyms,
-                            SuggestionSection::Synonyms => SuggestionSection::Patterns,
-                        };
+                        if !builder.rule_candidates.is_empty() {
+                            builder.selected_candidate = (builder.selected_candidate + 1)
+                                .min(builder.rule_candidates.len().saturating_sub(1));
+                        }
                     }
                     _ => {}
                 }
@@ -2252,12 +2319,7 @@ impl App {
                         builder.focus = RuleBuilderFocus::Extractions;
                     }
                     RuleBuilderFocus::Suggestions => {
-                        builder.suggestions_section = match builder.suggestions_section {
-                            SuggestionSection::Patterns => SuggestionSection::Synonyms,
-                            SuggestionSection::Structures => SuggestionSection::Patterns,
-                            SuggestionSection::Filenames => SuggestionSection::Structures,
-                            SuggestionSection::Synonyms => SuggestionSection::Filenames,
-                        };
+                        builder.selected_candidate = builder.selected_candidate.saturating_sub(1);
                     }
                     RuleBuilderFocus::IgnorePicker => {
                         builder.ignore_selected = builder.ignore_selected.saturating_sub(1);
@@ -2272,7 +2334,23 @@ impl App {
             {
                 builder.remove_exclude(builder.selected_exclude);
                 builder.dirty = true;
+                builder.pattern_changed_at = Some(std::time::Instant::now());
                 refresh_needed = true;
+            }
+
+            // Apply suggested rule (from list)
+            KeyCode::Char('a') if builder.focus == RuleBuilderFocus::Suggestions => {
+                if let Some(candidate) = builder.rule_candidates.get(builder.selected_candidate).cloned() {
+                    builder.pattern = candidate.custom_pattern.clone();
+                    builder.extractions = candidate.fields.clone();
+                    builder.pattern_error = None;
+                    builder.dirty = true;
+                    builder.focus = RuleBuilderFocus::Tag;
+                    builder.pattern_changed_at = Some(std::time::Instant::now());
+                    builder.selected_preview_files.clear();
+                    refresh_pattern = Some(candidate.custom_pattern);
+                    switch_to_label = true;
+                }
             }
 
             // Filter toggle in FileList (only in BacktestResults phase)
@@ -2304,52 +2382,15 @@ impl App {
                 }
             }
 
-            // Suggestions list navigation
+            // Suggested rule list navigation
             KeyCode::Char('j') if builder.focus == RuleBuilderFocus::Suggestions => {
-                match builder.suggestions_section {
-                    SuggestionSection::Patterns => {
-                        if !builder.pattern_seeds.is_empty() {
-                            builder.selected_pattern_seed = (builder.selected_pattern_seed + 1)
-                                .min(builder.pattern_seeds.len().saturating_sub(1));
-                        }
-                    }
-                    SuggestionSection::Structures => {
-                        if !builder.path_archetypes.is_empty() {
-                            builder.selected_archetype = (builder.selected_archetype + 1)
-                                .min(builder.path_archetypes.len().saturating_sub(1));
-                        }
-                    }
-                    SuggestionSection::Filenames => {
-                        if !builder.naming_schemes.is_empty() {
-                            builder.selected_naming_scheme = (builder.selected_naming_scheme + 1)
-                                .min(builder.naming_schemes.len().saturating_sub(1));
-                        }
-                    }
-                    SuggestionSection::Synonyms => {
-                        if !builder.synonym_suggestions.is_empty() {
-                            builder.selected_synonym = (builder.selected_synonym + 1)
-                                .min(builder.synonym_suggestions.len().saturating_sub(1));
-                        }
-                    }
+                if !builder.rule_candidates.is_empty() {
+                    builder.selected_candidate = (builder.selected_candidate + 1)
+                        .min(builder.rule_candidates.len().saturating_sub(1));
                 }
             }
             KeyCode::Char('k') if builder.focus == RuleBuilderFocus::Suggestions => {
-                match builder.suggestions_section {
-                    SuggestionSection::Patterns => {
-                        builder.selected_pattern_seed =
-                            builder.selected_pattern_seed.saturating_sub(1);
-                    }
-                    SuggestionSection::Structures => {
-                        builder.selected_archetype = builder.selected_archetype.saturating_sub(1);
-                    }
-                    SuggestionSection::Filenames => {
-                        builder.selected_naming_scheme =
-                            builder.selected_naming_scheme.saturating_sub(1);
-                    }
-                    SuggestionSection::Synonyms => {
-                        builder.selected_synonym = builder.selected_synonym.saturating_sub(1);
-                    }
-                }
+                builder.selected_candidate = builder.selected_candidate.saturating_sub(1);
             }
 
             // 'b' backtest stub removed (no-op with guidance)
@@ -2432,11 +2473,6 @@ impl App {
                 builder.focus = RuleBuilderFocus::FileList;
             }
 
-            // Contextual help for suggestions section
-            KeyCode::Char('?') if builder.focus == RuleBuilderFocus::Suggestions => {
-                builder.suggestions_help_open = true;
-            }
-
             // 't' applies manual tag to preview (selection-aware)
             KeyCode::Char('t') if builder.focus == RuleBuilderFocus::FileList => {
                 if mutations_blocked {
@@ -2469,12 +2505,7 @@ impl App {
                     }
                     return;
                 }
-                let tagged = self.apply_manual_tag_to_paths(&selected, tag.as_str());
-                self.discover.status_message =
-                    Some((format!("Tagged {} files with '{}'", tagged, tag), false));
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.selected_preview_files.clear();
-                }
+                pending_manual_tag = Some((selected, tag, true));
             }
 
             // 's' opens scan dialog (when not in text input)
@@ -2507,7 +2538,7 @@ impl App {
                         | RuleBuilderFocus::ExcludeInput
                 ) =>
             {
-                self.run_sample_schema_eval();
+                pending_sample_eval = true;
             }
 
             // 'E' (shift+e) triggers full evaluation as background job (RULE_BUILDER_UI_PLAN.md)
@@ -2520,7 +2551,7 @@ impl App {
                         | RuleBuilderFocus::ExcludeInput
                 ) =>
             {
-                self.start_full_schema_eval();
+                pending_full_eval = true;
             }
 
             // Text input for Pattern, Tag, and ExcludeInput
@@ -2579,18 +2610,54 @@ impl App {
 
             _ => {}
         }
+            }
+            pattern_after = builder.pattern.clone();
+            pattern_debounced = builder.pattern_changed_at.is_some();
+        }
 
-        // If pattern changed, update matched files
-        let mut needs_refresh = refresh_needed;
-        if let Some(builder) = &self.discover.rule_builder {
-            if builder.pattern != pattern_before {
-                needs_refresh = true;
+        let _ = builder;
+
+        if let Some((paths, tag, clear_selection)) = pending_manual_tag.take() {
+            let requested = self.apply_manual_tag_to_paths(&paths, &tag);
+            if requested > 0 && clear_selection {
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    builder.selected_preview_files.clear();
+                }
             }
         }
+
+        if pending_sample_eval {
+            self.run_sample_schema_eval();
+        }
+        if pending_full_eval {
+            self.start_full_schema_eval();
+        }
+
+        if return_after_action {
+            return;
+        }
+
+        if let Some(pattern) = refresh_pattern {
+            if switch_to_label {
+                self.set_ingest_tab(IngestTab::Rules);
+            }
+            self.update_rule_builder_files(&pattern);
+            if let Some(builder) = self.discover.rule_builder.as_mut() {
+                builder.pattern_changed_at = None;
+            }
+            return;
+        }
+
+        if skip_main_handling {
+            return;
+        }
+
+        // If pattern changed, update matched files
+        let mut needs_refresh = refresh_needed || (pattern_after != pattern_before && !pattern_debounced);
         if needs_refresh {
-            if let Some(builder) = &self.discover.rule_builder {
-                let pattern = builder.pattern.clone();
-                self.update_rule_builder_files(&pattern);
+            self.update_rule_builder_files(&pattern_after);
+            if let Some(builder) = self.discover.rule_builder.as_mut() {
+                builder.pattern_changed_at = None;
             }
         }
     }

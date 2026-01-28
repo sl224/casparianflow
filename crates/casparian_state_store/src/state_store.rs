@@ -10,9 +10,12 @@ use casparian_protocol::{
     ArtifactV1, JobId, PipelineRunStatus, PluginStatus, ProcessingStatus, RuntimeKind,
 };
 use casparian_schema::{SchemaContract, SchemaStorage};
-use casparian_scout::{Database as ScoutDatabase, ScanConfig, Scanner as ScoutScanner};
+use casparian_scout::{
+    patterns, rule_apply::match_rules_to_files, rule_apply::RuleApplyFile,
+    rule_apply::RuleApplyRule, Database as ScoutDatabase, ScanConfig, Scanner as ScoutScanner,
+};
 use casparian_scout::types::{
-    Source, SourceId, SourceType, TaggingRule, TaggingRuleId, Workspace, WorkspaceId,
+    Source, SourceId, SourceType, TagSource, TaggingRule, TaggingRuleId, Workspace, WorkspaceId,
 };
 
 use crate::api_storage::ApiStorage;
@@ -191,6 +194,21 @@ impl StateStoreQueueSession {
             .fail_job_if_token_matches(job_id, lease_token, completion_status, error)
     }
 
+    pub fn fail_job_if_token_matches_dispatching(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        completion_status: &str,
+        error: &str,
+    ) -> Result<bool> {
+        self.queue.fail_job_if_token_matches_dispatching(
+            job_id,
+            lease_token,
+            completion_status,
+            error,
+        )
+    }
+
     pub fn fail_job(&self, job_id: i64, completion_status: &str, error: &str) -> Result<()> {
         self.queue.fail_job(job_id, completion_status, error)
     }
@@ -253,6 +271,17 @@ impl StateStoreQueueSession {
 
     pub fn defer_job(&self, job_id: i64, scheduled_at: i64, reason: Option<&str>) -> Result<()> {
         self.queue.defer_job(job_id, scheduled_at, reason)
+    }
+
+    pub fn defer_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        scheduled_at: i64,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        self.queue
+            .defer_job_if_token_matches(job_id, lease_token, scheduled_at, reason)
     }
 
     pub fn schedule_retry(
@@ -1372,6 +1401,50 @@ pub struct ScoutTagStats {
 }
 
 #[derive(Debug, Clone)]
+pub struct ScoutFileRecord {
+    pub id: i64,
+    pub path: String,
+    pub rel_path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub is_dir: bool,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoutFilesPage {
+    pub total_count: i64,
+    pub files: Vec<ScoutFileRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ScoutFileTagFilter {
+    All,
+    Untagged,
+    Tag(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoutFolderEntry {
+    pub name: String,
+    pub file_count: i64,
+    pub is_file: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoutPatternMatch {
+    pub rel_path: String,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoutPatternQueryResult {
+    pub total_count: i64,
+    pub files: Vec<ScoutPatternMatch>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ScoutSourceRecord {
     pub source: Source,
     pub file_count: i64,
@@ -1400,6 +1473,59 @@ pub trait ScoutStore: Send + Sync {
 
     fn tag_stats(&self, workspace_id: WorkspaceId, source_id: SourceId) -> Result<ScoutTagStats>;
 
+    fn list_files_page(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        tag_filter: ScoutFileTagFilter,
+        path_filter: Option<String>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ScoutFilesPage>;
+
+    fn list_folder_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        prefix: &str,
+        glob_pattern: Option<&str>,
+    ) -> Result<(Vec<ScoutFolderEntry>, i64)>;
+
+    fn pattern_query(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ScoutPatternQueryResult>;
+
+    fn sample_paths_for_eval(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: &str,
+    ) -> Result<Vec<String>>;
+
+    fn apply_tag_to_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        rel_paths: &[String],
+        tag: &str,
+        tag_source: TagSource,
+        rule_id: Option<&TaggingRuleId>,
+    ) -> Result<usize>;
+
+    fn apply_rule_to_source(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        pattern: &str,
+        tag: &str,
+    ) -> Result<usize>;
+
     fn ensure_default_workspace(&self) -> Result<Workspace>;
     fn get_workspace(&self, id: &WorkspaceId) -> Result<Option<Workspace>>;
 
@@ -1426,6 +1552,467 @@ impl SqliteScoutStore {
         ScoutDatabase::open_existing_with_busy_timeout(&self.path, self.busy_timeout_ms)
             .context("Failed to open scout state store")
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScoutPatternQuery {
+    extension: Option<String>,
+    path_pattern: Option<String>,
+}
+
+impl ScoutPatternQuery {
+    fn from_glob(pattern: &str) -> Self {
+        let extension = if pattern.contains("*.") {
+            pattern
+                .rsplit("*.")
+                .next()
+                .filter(|ext| !ext.contains('/') && !ext.contains('*'))
+                .map(|ext| ext.to_lowercase())
+        } else {
+            None
+        };
+
+        let path_pattern = if pattern.contains('/') || pattern.contains("**") {
+            let mut like = pattern
+                .replace("**/", "%")
+                .replace("**", "%")
+                .replace('*', "%")
+                .replace('?', "_");
+
+            if extension.is_some() {
+                if let Some(idx) = like.rfind("%.") {
+                    like = like[..idx].to_string();
+                    if like.is_empty() || like == "%" {
+                        return Self {
+                            extension,
+                            path_pattern: None,
+                        };
+                    }
+                    if !like.ends_with('%') {
+                        like.push('%');
+                    }
+                }
+            }
+
+            if like == "%" || like == "%%" || like.is_empty() {
+                None
+            } else {
+                Some(like)
+            }
+        } else {
+            None
+        };
+
+        Self {
+            extension,
+            path_pattern,
+        }
+    }
+
+    fn count_files(
+        &self,
+        conn: &DbConnection,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+    ) -> Result<i64> {
+        let (sql, params) = match (self.extension.as_deref(), self.path_pattern.as_deref()) {
+            (Some(ext), Some(path_pat)) => (
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ? AND extension = ? AND rel_path LIKE ?",
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                    DbValue::Text(ext.to_string()),
+                    DbValue::Text(path_pat.to_string()),
+                ],
+            ),
+            (Some(ext), None) => (
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ? AND extension = ?",
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                    DbValue::Text(ext.to_string()),
+                ],
+            ),
+            (None, Some(path_pat)) => (
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ? AND rel_path LIKE ?",
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                    DbValue::Text(path_pat.to_string()),
+                ],
+            ),
+            (None, None) => (
+                "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ?",
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                ],
+            ),
+        };
+
+        conn.query_scalar::<i64>(sql, &params)
+            .context("Pattern query count failed")
+    }
+
+    fn search_files(
+        &self,
+        conn: &DbConnection,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        let (sql, params) = match (self.extension.as_deref(), self.path_pattern.as_deref()) {
+            (Some(ext), Some(path_pat)) => (
+                r#"SELECT rel_path, size, mtime FROM scout_files
+                   WHERE workspace_id = ? AND source_id = ? AND extension = ? AND rel_path LIKE ?
+                   ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                    DbValue::Text(ext.to_string()),
+                    DbValue::Text(path_pat.to_string()),
+                    DbValue::Integer(limit as i64),
+                    DbValue::Integer(offset as i64),
+                ],
+            ),
+            (Some(ext), None) => (
+                r#"SELECT rel_path, size, mtime FROM scout_files
+                   WHERE workspace_id = ? AND source_id = ? AND extension = ?
+                   ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                    DbValue::Text(ext.to_string()),
+                    DbValue::Integer(limit as i64),
+                    DbValue::Integer(offset as i64),
+                ],
+            ),
+            (None, Some(path_pat)) => (
+                r#"SELECT rel_path, size, mtime FROM scout_files
+                   WHERE workspace_id = ? AND source_id = ? AND rel_path LIKE ?
+                   ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                    DbValue::Text(path_pat.to_string()),
+                    DbValue::Integer(limit as i64),
+                    DbValue::Integer(offset as i64),
+                ],
+            ),
+            (None, None) => (
+                r#"SELECT rel_path, size, mtime FROM scout_files
+                   WHERE workspace_id = ? AND source_id = ?
+                   ORDER BY mtime DESC LIMIT ? OFFSET ?"#,
+                vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                    DbValue::Integer(limit as i64),
+                    DbValue::Integer(offset as i64),
+                ],
+            ),
+        };
+
+        let rows = conn.query_all(sql, &params)?;
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rel_path: String = row.get(0)?;
+            let size: i64 = row.get(1)?;
+            let mtime: i64 = row.get(2)?;
+            results.push((rel_path, size, mtime));
+        }
+
+        Ok(results)
+    }
+}
+
+fn glob_to_like_pattern(glob: &str) -> String {
+    let mut result = String::with_capacity(glob.len() + 4);
+
+    let glob = glob.replace("**/", "");
+    let glob = glob.replace("**", "%");
+
+    let mut chars = glob.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => result.push('%'),
+            '?' => result.push('_'),
+            '%' => result.push('%'),
+            '_' => result.push_str("\\_"),
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    result.push(next);
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+
+    result
+}
+
+fn build_path_filter_clause(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let has_wildcards = raw.contains('*') || raw.contains('?');
+    let like = if has_wildcards {
+        let normalized = patterns::normalize_glob_pattern(raw);
+        let like = normalized
+            .replace("**/", "%")
+            .replace("**", "%")
+            .replace('*', "%")
+            .replace('?', "_");
+        if like.is_empty() || like == "%" || like == "%%" {
+            return None;
+        }
+        like
+    } else {
+        format!("%{}%", raw)
+    };
+
+    Some(like)
+}
+
+fn query_folder_counts(
+    conn: &DbConnection,
+    workspace_id: WorkspaceId,
+    source_id: SourceId,
+    prefix: &str,
+    glob_pattern: Option<&str>,
+) -> Result<Vec<(String, i64, bool)>> {
+    let prefix = prefix.trim_end_matches('/');
+
+    if let Some(pattern) = glob_pattern {
+        let like_pattern = glob_to_like_pattern(pattern);
+        let path_filter = if prefix.is_empty() {
+            like_pattern.clone()
+        } else {
+            format!("{}/%", prefix)
+        };
+        let prefix_len = if prefix.is_empty() {
+            0
+        } else {
+            prefix.len() as i64 + 1
+        };
+
+        let rows = conn.query_all(
+            r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') > 0
+                        THEN SUBSTR(rel_path, ? + 1, INSTR(SUBSTR(rel_path, ? + 1), '/') - 1)
+                        ELSE SUBSTR(rel_path, ? + 1)
+                    END AS item_name,
+                    COUNT(*) as file_count,
+                    MAX(CASE WHEN INSTR(SUBSTR(rel_path, ? + 1), '/') = 0 THEN 1 ELSE 0 END) as is_file
+                FROM scout_files
+                WHERE workspace_id = ? AND source_id = ?
+                  AND rel_path LIKE ?
+                  AND rel_path LIKE ?
+                  AND LENGTH(rel_path) > ?
+                GROUP BY item_name
+                ORDER BY file_count DESC
+                LIMIT 100
+                "#,
+            &[
+                DbValue::Integer(prefix_len),
+                DbValue::Integer(prefix_len),
+                DbValue::Integer(prefix_len),
+                DbValue::Integer(prefix_len),
+                DbValue::Integer(prefix_len),
+                DbValue::Text(workspace_id.to_string()),
+                DbValue::Integer(source_id.as_i64()),
+                DbValue::Text(path_filter),
+                DbValue::Text(like_pattern),
+                DbValue::Integer(prefix_len),
+            ],
+        )?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let name: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            let is_file_flag: i64 = row.get(2)?;
+            if !name.is_empty() {
+                results.push((name, count, is_file_flag != 0));
+            }
+        }
+
+        return Ok(results);
+    }
+
+    if prefix.is_empty() {
+        let cached_rows = conn.query_all(
+            "SELECT name, file_count, is_folder FROM scout_folders WHERE workspace_id = ? AND source_id = ? AND prefix = ? ORDER BY is_folder DESC, file_count DESC, name",
+            &[
+                DbValue::Text(workspace_id.to_string()),
+                DbValue::Integer(source_id.as_i64()),
+                DbValue::Text(prefix.to_string()),
+            ],
+        )?;
+
+        if !cached_rows.is_empty() {
+            let mut results = Vec::new();
+            for row in cached_rows {
+                let name: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                let is_folder: i64 = row.get(2)?;
+                results.push((name, count, is_folder == 0));
+            }
+            return Ok(results);
+        }
+    }
+
+    let files = conn.query_all(
+        "SELECT name, size FROM scout_files WHERE workspace_id = ? AND source_id = ? AND parent_path = ? ORDER BY name LIMIT 200",
+        &[
+            DbValue::Text(workspace_id.to_string()),
+            DbValue::Integer(source_id.as_i64()),
+            DbValue::Text(prefix.to_string()),
+        ],
+    )?;
+
+    let mut results: Vec<(String, i64, bool)> = Vec::new();
+
+    let subfolders = if prefix.is_empty() {
+        conn.query_all(
+            r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(parent_path, '/') > 0 THEN SUBSTR(parent_path, 1, INSTR(parent_path, '/') - 1)
+                        ELSE parent_path
+                    END AS folder_name,
+                    COUNT(*) as file_count
+                FROM scout_files
+                WHERE workspace_id = ? AND source_id = ? AND parent_path != ''
+                GROUP BY folder_name
+                ORDER BY file_count DESC
+                LIMIT 200
+                "#,
+            &[
+                DbValue::Text(workspace_id.to_string()),
+                DbValue::Integer(source_id.as_i64()),
+            ],
+        )?
+    } else {
+        let folder_prefix = format!("{}/", prefix);
+        conn.query_all(
+            r#"
+                SELECT
+                    CASE
+                        WHEN INSTR(SUBSTR(parent_path, LENGTH(?) + 1), '/') > 0
+                        THEN SUBSTR(parent_path, LENGTH(?) + 1, INSTR(SUBSTR(parent_path, LENGTH(?) + 1), '/') - 1)
+                        ELSE SUBSTR(parent_path, LENGTH(?) + 1)
+                    END AS folder_name,
+                    COUNT(*) as file_count
+                FROM scout_files
+                WHERE workspace_id = ? AND source_id = ? AND parent_path LIKE ? || '%' AND parent_path != ?
+                GROUP BY folder_name
+                ORDER BY file_count DESC
+                LIMIT 200
+                "#,
+            &[
+                DbValue::Text(folder_prefix.clone()),
+                DbValue::Text(folder_prefix.clone()),
+                DbValue::Text(folder_prefix.clone()),
+                DbValue::Text(folder_prefix.clone()),
+                DbValue::Text(workspace_id.to_string()),
+                DbValue::Integer(source_id.as_i64()),
+                DbValue::Text(folder_prefix.clone()),
+                DbValue::Text(prefix.to_string()),
+            ],
+        )?
+    };
+
+    for row in subfolders {
+        let name: String = row.get(0)?;
+        let count: i64 = row.get(1)?;
+        if !name.is_empty() {
+            results.push((name, count, false));
+        }
+    }
+
+    for row in files {
+        let name: String = row.get(0)?;
+        if !name.is_empty() {
+            results.push((name, 1, true));
+        }
+    }
+
+    Ok(results)
+}
+
+fn sample_paths_for_eval(
+    conn: &DbConnection,
+    workspace_id: WorkspaceId,
+    source_id: SourceId,
+    glob_pattern: &str,
+    is_match: &dyn Fn(&str) -> bool,
+) -> Result<Vec<String>> {
+    let query = ScoutPatternQuery::from_glob(glob_pattern);
+
+    let mut where_sql = String::from("workspace_id = ? AND source_id = ?");
+    let mut base_params: Vec<DbValue> = vec![
+        DbValue::Text(workspace_id.to_string()),
+        DbValue::Integer(source_id.as_i64()),
+    ];
+
+    if let Some(ext) = query.extension.as_deref() {
+        where_sql.push_str(" AND extension = ?");
+        base_params.push(DbValue::Text(ext.to_string()));
+    }
+    if let Some(path_pat) = query.path_pattern.as_deref() {
+        where_sql.push_str(" AND rel_path LIKE ?");
+        base_params.push(DbValue::Text(path_pat.to_string()));
+    }
+
+    let prefix_query = format!(
+        "SELECT CASE WHEN INSTR(rel_path, '/') > 0 THEN SUBSTR(rel_path, 1, INSTR(rel_path, '/') - 1) ELSE rel_path END AS prefix, COUNT(*) as cnt \
+         FROM scout_files WHERE {} GROUP BY prefix ORDER BY cnt DESC LIMIT 50",
+        where_sql
+    );
+
+    let prefix_rows = conn.query_all(&prefix_query, &base_params)?;
+
+    let mut samples: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for row in prefix_rows {
+        let prefix: String = row.get(0)?;
+        if prefix.is_empty() {
+            continue;
+        }
+
+        let mut params = base_params.clone();
+        let prefix_like = format!("{}/%", prefix);
+        params.push(DbValue::Text(prefix.clone()));
+        params.push(DbValue::Text(prefix_like));
+
+        let paths_query = format!(
+            "SELECT rel_path FROM scout_files WHERE {} AND (rel_path = ? OR rel_path LIKE ?) LIMIT 50",
+            where_sql
+        );
+
+        let rows = conn.query_all(&paths_query, &params)?;
+
+        for row in rows {
+            let rel_path: String = row.get(0)?;
+            if !is_match(&rel_path) {
+                continue;
+            }
+            if seen.insert(rel_path.clone()) {
+                samples.push(rel_path);
+                if samples.len() >= 200 {
+                    return Ok(samples);
+                }
+            }
+        }
+    }
+
+    Ok(samples)
 }
 
 impl ScoutStore for SqliteScoutStore {
@@ -1598,6 +2185,327 @@ impl ScoutStore for SqliteScoutStore {
             untagged_files,
             tags,
         })
+    }
+
+    fn list_files_page(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        tag_filter: ScoutFileTagFilter,
+        path_filter: Option<String>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ScoutFilesPage> {
+        let db = self.open_db()?;
+        let conn = db.conn();
+
+        let mut join_clause = String::new();
+        let mut where_clauses = vec![
+            "f.workspace_id = ?".to_string(),
+            "f.source_id = ?".to_string(),
+        ];
+        let mut params: Vec<DbValue> = vec![
+            DbValue::Text(workspace_id.to_string()),
+            DbValue::Integer(source_id.as_i64()),
+        ];
+
+        match tag_filter {
+            ScoutFileTagFilter::All => {}
+            ScoutFileTagFilter::Untagged => {
+                join_clause =
+                    "LEFT JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id"
+                        .to_string();
+                where_clauses.push("t.file_id IS NULL".to_string());
+            }
+            ScoutFileTagFilter::Tag(tag) => {
+                join_clause =
+                    "JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id"
+                        .to_string();
+                where_clauses.push("t.tag = ?".to_string());
+                params.push(DbValue::Text(tag));
+            }
+        }
+
+        if let Some(filter) = path_filter.as_deref() {
+            if let Some(like) = build_path_filter_clause(filter) {
+                where_clauses.push("LOWER(f.rel_path) LIKE LOWER(?)".to_string());
+                params.push(DbValue::Text(like));
+            }
+        }
+
+        let where_sql = where_clauses.join(" AND ");
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM scout_files f {} WHERE {}",
+            join_clause, where_sql
+        );
+        let total_count = conn
+            .query_scalar::<i64>(&count_sql, &params)?
+            .max(0);
+
+        let limit = limit.max(1) as i64;
+        let offset = offset as i64;
+        let mut page_params = params.clone();
+        page_params.push(DbValue::Integer(limit));
+        page_params.push(DbValue::Integer(offset));
+
+        let query = format!(
+            "SELECT f.id, f.path, f.rel_path, f.size, f.mtime, f.is_dir \
+             FROM scout_files f {} \
+             WHERE {} \
+             ORDER BY f.rel_path ASC, f.id ASC \
+             LIMIT ? OFFSET ?",
+            join_clause, where_sql
+        );
+
+        let rows = conn.query_all(&query, &page_params)?;
+        let mut files: Vec<ScoutFileRecord> = Vec::with_capacity(rows.len());
+        let mut file_ids: Vec<i64> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let file_id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            let rel_path: String = row.get(2)?;
+            let size: i64 = row.get(3)?;
+            let mtime: i64 = row.get(4)?;
+            let is_dir: i64 = row.get(5)?;
+
+            file_ids.push(file_id);
+            files.push(ScoutFileRecord {
+                id: file_id,
+                path,
+                rel_path,
+                size: size.max(0) as u64,
+                mtime,
+                is_dir: is_dir != 0,
+                tags: Vec::new(),
+            });
+        }
+
+        let mut tags_by_file: HashMap<i64, Vec<String>> = HashMap::new();
+        if !file_ids.is_empty() {
+            let placeholders = std::iter::repeat("?")
+                .take(file_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT file_id, tag FROM scout_file_tags WHERE workspace_id = ? AND file_id IN ({})",
+                placeholders
+            );
+            let mut tag_params: Vec<DbValue> = Vec::with_capacity(file_ids.len() + 1);
+            tag_params.push(DbValue::Text(workspace_id.to_string()));
+            tag_params.extend(file_ids.iter().map(|id| DbValue::Integer(*id)));
+
+            if let Ok(tag_rows) = conn.query_all(&query, &tag_params) {
+                for row in tag_rows {
+                    let file_id: i64 = row.get(0)?;
+                    let tag: String = row.get(1)?;
+                    tags_by_file.entry(file_id).or_default().push(tag);
+                }
+            }
+        }
+
+        for file in &mut files {
+            if let Some(tags) = tags_by_file.remove(&file.id) {
+                file.tags = tags;
+            }
+        }
+
+        Ok(ScoutFilesPage { total_count, files })
+    }
+
+    fn list_folder_entries(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        prefix: &str,
+        glob_pattern: Option<&str>,
+    ) -> Result<(Vec<ScoutFolderEntry>, i64)> {
+        let db = self.open_db()?;
+        let rows = query_folder_counts(db.conn(), workspace_id, source_id, prefix, glob_pattern)?;
+
+        let mut total_count = 0i64;
+        let entries: Vec<ScoutFolderEntry> = rows
+            .into_iter()
+            .map(|(name, count, is_file)| {
+                total_count = total_count.saturating_add(count.max(0));
+                ScoutFolderEntry {
+                    name,
+                    file_count: count,
+                    is_file,
+                }
+            })
+            .collect();
+
+        Ok((entries, total_count))
+    }
+
+    fn pattern_query(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ScoutPatternQueryResult> {
+        let db = self.open_db()?;
+        let conn = db.conn();
+        let query = ScoutPatternQuery::from_glob(glob_pattern);
+        let total_count = query.count_files(conn, workspace_id, source_id)?.max(0);
+        let results = query.search_files(conn, workspace_id, source_id, limit, offset)?;
+
+        let files = results
+            .into_iter()
+            .map(|(rel_path, size, mtime)| ScoutPatternMatch {
+                rel_path,
+                size,
+                mtime,
+            })
+            .collect();
+
+        Ok(ScoutPatternQueryResult { total_count, files })
+    }
+
+    fn sample_paths_for_eval(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: &str,
+    ) -> Result<Vec<String>> {
+        let db = self.open_db()?;
+        let normalized = patterns::normalize_glob_pattern(glob_pattern);
+        let matcher =
+            patterns::build_matcher(&normalized).map_err(|err| anyhow::anyhow!(err))?;
+        let is_match = |path: &str| matcher.is_match(path);
+        sample_paths_for_eval(db.conn(), workspace_id, source_id, &normalized, &is_match)
+            .context("Sample eval query failed")
+    }
+
+    fn apply_tag_to_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        rel_paths: &[String],
+        tag: &str,
+        tag_source: TagSource,
+        rule_id: Option<&TaggingRuleId>,
+    ) -> Result<usize> {
+        if rel_paths.is_empty() {
+            return Ok(0);
+        }
+
+        let db = self.open_db()?;
+        let conn = db.conn();
+
+        let placeholders = std::iter::repeat("?")
+            .take(rel_paths.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT id, rel_path FROM scout_files WHERE workspace_id = ? AND source_id = ? AND rel_path IN ({})",
+            placeholders
+        );
+        let mut params: Vec<DbValue> = Vec::with_capacity(rel_paths.len() + 2);
+        params.push(DbValue::Text(workspace_id.to_string()));
+        params.push(DbValue::Integer(source_id.as_i64()));
+        params.extend(rel_paths.iter().cloned().map(DbValue::Text));
+
+        let rows = conn.query_all(&query, &params)?;
+        let mut tagged = 0usize;
+        for row in rows {
+            let file_id: i64 = row.get(0)?;
+            match tag_source {
+                TagSource::Manual => {
+                    db.tag_file(file_id, tag)?;
+                }
+                TagSource::Rule => {
+                    let Some(rule_id) = rule_id else {
+                        anyhow::bail!("Rule-based tag missing rule_id");
+                    };
+                    db.tag_file_by_rule(file_id, tag, rule_id)?;
+                }
+            }
+            tagged += 1;
+        }
+
+        Ok(tagged)
+    }
+
+    fn apply_rule_to_source(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        pattern: &str,
+        tag: &str,
+    ) -> Result<usize> {
+        let db = self.open_db()?;
+        let conn = db.conn();
+
+        let rule_name = format!("{} → {}", pattern, tag);
+        let rule = TaggingRule {
+            id: rule_id,
+            name: rule_name,
+            workspace_id,
+            pattern: pattern.to_string(),
+            tag: tag.to_string(),
+            priority: 100,
+            enabled: true,
+        };
+        db.upsert_tagging_rule(&rule)?;
+
+        let rows = conn.query_all(
+            "SELECT id, path, rel_path, size FROM scout_files WHERE workspace_id = ? AND source_id = ? ORDER BY rel_path",
+            &[
+                DbValue::Text(workspace_id.to_string()),
+                DbValue::Integer(source_id.as_i64()),
+            ],
+        )?;
+
+        let mut files: Vec<RuleApplyFile> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            let rel_path: String = row.get(2)?;
+            let size: i64 = row.get(3)?;
+            files.push(RuleApplyFile {
+                id,
+                path,
+                rel_path,
+                size,
+            });
+        }
+
+        let rules = vec![RuleApplyRule {
+            id: rule_id,
+            pattern: pattern.to_string(),
+            tag: tag.to_string(),
+            priority: 100,
+        }];
+
+        let (matches, _summary) = match_rules_to_files(&files, &rules)?;
+
+        let tagged_rows = conn.query_all(
+            "SELECT file_id FROM scout_file_tags WHERE workspace_id = ? AND tag = ?",
+            &[
+                DbValue::Text(workspace_id.to_string()),
+                DbValue::Text(tag.to_string()),
+            ],
+        )?;
+        let mut tagged_ids = std::collections::HashSet::new();
+        for row in tagged_rows {
+            let file_id: i64 = row.get(0)?;
+            tagged_ids.insert(file_id);
+        }
+
+        let mut tagged_count = 0usize;
+        for matched in matches {
+            if tagged_ids.contains(&matched.file_id) {
+                continue;
+            }
+            db.tag_file_by_rule(matched.file_id, tag, &rule_id)?;
+            tagged_count += 1;
+        }
+
+        Ok(tagged_count)
     }
 
     fn ensure_default_workspace(&self) -> Result<Workspace> {

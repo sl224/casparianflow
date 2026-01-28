@@ -176,6 +176,41 @@ pub enum ControlRequest {
         workspace_id: WorkspaceId,
         source_id: SourceId,
     },
+    /// Lookup a source by path
+    GetSourceByPath {
+        workspace_id: WorkspaceId,
+        path: String,
+    },
+    /// List files for a source with filters and pagination
+    ListFiles {
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        tag_filter: ScoutTagFilter,
+        path_filter: Option<String>,
+        limit: usize,
+        offset: usize,
+    },
+    /// List folder entries under a prefix (for folder explorer)
+    ListFolders {
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        prefix: String,
+        glob_pattern: Option<String>,
+    },
+    /// Query files by glob pattern (count + samples)
+    PatternQuery {
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: String,
+        limit: usize,
+        offset: usize,
+    },
+    /// Sample paths for schema eval
+    SamplePathsForEval {
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: String,
+    },
     /// Apply a tag to a file (manual or rule-based)
     ApplyTag {
         workspace_id: WorkspaceId,
@@ -183,6 +218,22 @@ pub enum ControlRequest {
         tag: String,
         tag_source: TagSource,
         rule_id: Option<TaggingRuleId>,
+    },
+    /// Apply a tag to files by relative path
+    ApplyTagToPaths {
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        rel_paths: Vec<String>,
+        tag: String,
+        tag_source: TagSource,
+    },
+    /// Apply a tagging rule to a source (create rule + tag matches)
+    ApplyRuleToSource {
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        pattern: String,
+        tag: String,
     },
     /// Start a filesystem scan
     StartScan {
@@ -235,16 +286,41 @@ pub enum ControlResponse {
     SessionResult { success: bool, message: String },
     /// List of sources
     Sources(Vec<ScoutSourceInfo>),
+    /// Single source (None if not found)
+    Source(Option<ScoutSourceInfo>),
     /// Source mutation result
     SourceResult { success: bool, message: String },
     /// List of rules
     Rules(Vec<ScoutRuleInfo>),
     /// Rule mutation result
     RuleResult { success: bool, message: String },
+    /// Files page (count + files)
+    FilesPage(ScoutFilesPage),
+    /// Folder entries for explorer
+    FolderEntries {
+        entries: Vec<ScoutFolderEntry>,
+        total_count: i64,
+    },
+    /// Pattern query result
+    PatternQueryResult(ScoutPatternQueryResult),
+    /// Sample paths for schema eval
+    SamplePaths { paths: Vec<String> },
     /// Tag stats (counts + totals)
     TagStats(ScoutTagStats),
     /// Tag mutation result
     TagResult { success: bool, message: String },
+    /// Tag apply result with count
+    TagApplyResult {
+        success: bool,
+        tagged_count: usize,
+        message: String,
+    },
+    /// Rule apply result with count
+    RuleApplyResult {
+        success: bool,
+        tagged_count: usize,
+        message: String,
+    },
     /// Scan started
     ScanStarted { scan_id: String },
     /// Scan status
@@ -334,6 +410,15 @@ pub struct ScoutTagCount {
     pub count: i64,
 }
 
+/// Tag filter for file queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "value")]
+pub enum ScoutTagFilter {
+    All,
+    Untagged,
+    Tag(String),
+}
+
 /// Scan lifecycle state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -370,6 +455,53 @@ pub struct ScoutScanStatus {
     pub progress: Option<ScoutScanProgress>,
     pub files_persisted: Option<u64>,
     pub error: Option<String>,
+}
+
+/// File info for Control API (includes tags).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutFileInfo {
+    pub id: i64,
+    pub path: String,
+    pub rel_path: String,
+    pub size: u64,
+    pub mtime: i64,
+    pub is_dir: bool,
+    pub tags: Vec<String>,
+}
+
+/// Paged file results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutFilesPage {
+    pub total_count: i64,
+    pub files: Vec<ScoutFileInfo>,
+}
+
+/// Folder entry for explorer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutFolderEntry {
+    pub name: String,
+    pub file_count: i64,
+    pub is_file: bool,
+}
+
+/// Pattern match sample.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutPatternMatch {
+    pub rel_path: String,
+    pub size: i64,
+    pub mtime: i64,
+}
+
+/// Pattern query result (count + sample matches).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoutPatternQueryResult {
+    pub total_count: i64,
+    pub files: Vec<ScoutPatternMatch>,
 }
 
 impl ControlResponse {

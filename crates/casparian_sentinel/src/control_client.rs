@@ -3,7 +3,8 @@
 //! A simple synchronous client for communicating with the Sentinel Control API.
 
 use crate::control::{
-    ControlRequest, ControlResponse, ScoutRuleInfo, ScoutScanStatus, ScoutSourceInfo, ScoutTagStats,
+    ControlRequest, ControlResponse, ScoutFilesPage, ScoutFolderEntry, ScoutPatternQueryResult,
+    ScoutRuleInfo, ScoutScanStatus, ScoutSourceInfo, ScoutTagFilter, ScoutTagStats,
 };
 use crate::db::{IntentState, Session, SessionId};
 use anyhow::{Context, Result};
@@ -543,6 +544,21 @@ impl ControlClient {
         }
     }
 
+    /// Lookup a source by path.
+    pub fn get_source_by_path(
+        &self,
+        workspace_id: WorkspaceId,
+        path: String,
+    ) -> Result<Option<ScoutSourceInfo>> {
+        match self.request(ControlRequest::GetSourceByPath { workspace_id, path })? {
+            ControlResponse::Source(source) => Ok(source),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("GetSourceByPath failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to GetSourceByPath"),
+        }
+    }
+
     /// Create or update a source.
     pub fn upsert_source(&self, source: ScoutSourceInfo) -> Result<(bool, String)> {
         match self.request(ControlRequest::UpsertSource { source })? {
@@ -604,6 +620,101 @@ impl ControlClient {
                 anyhow::bail!("ListRules failed [{}]: {}", code, message)
             }
             _ => anyhow::bail!("Unexpected response to ListRules"),
+        }
+    }
+
+    /// List files with filters and pagination.
+    pub fn list_files(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        tag_filter: ScoutTagFilter,
+        path_filter: Option<String>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ScoutFilesPage> {
+        match self.request(ControlRequest::ListFiles {
+            workspace_id,
+            source_id,
+            tag_filter,
+            path_filter,
+            limit,
+            offset,
+        })? {
+            ControlResponse::FilesPage(page) => Ok(page),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ListFiles failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ListFiles"),
+        }
+    }
+
+    /// List folder entries for a prefix.
+    pub fn list_folders(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        prefix: String,
+        glob_pattern: Option<String>,
+    ) -> Result<(Vec<ScoutFolderEntry>, i64)> {
+        match self.request(ControlRequest::ListFolders {
+            workspace_id,
+            source_id,
+            prefix,
+            glob_pattern,
+        })? {
+            ControlResponse::FolderEntries {
+                entries,
+                total_count,
+            } => Ok((entries, total_count)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ListFolders failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ListFolders"),
+        }
+    }
+
+    /// Run a pattern query (count + sample matches).
+    pub fn pattern_query(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: String,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ScoutPatternQueryResult> {
+        match self.request(ControlRequest::PatternQuery {
+            workspace_id,
+            source_id,
+            glob_pattern,
+            limit,
+            offset,
+        })? {
+            ControlResponse::PatternQueryResult(result) => Ok(result),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("PatternQuery failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to PatternQuery"),
+        }
+    }
+
+    /// Sample paths for schema evaluation.
+    pub fn sample_paths_for_eval(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        glob_pattern: String,
+    ) -> Result<Vec<String>> {
+        match self.request(ControlRequest::SamplePathsForEval {
+            workspace_id,
+            source_id,
+            glob_pattern,
+        })? {
+            ControlResponse::SamplePaths { paths } => Ok(paths),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("SamplePathsForEval failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to SamplePathsForEval"),
         }
     }
 
@@ -702,6 +813,62 @@ impl ControlClient {
                 anyhow::bail!("ApplyTag failed [{}]: {}", code, message)
             }
             _ => anyhow::bail!("Unexpected response to ApplyTag"),
+        }
+    }
+
+    /// Apply a tag to multiple files by relative path.
+    pub fn apply_tag_to_paths(
+        &self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        rel_paths: Vec<String>,
+        tag: String,
+        tag_source: TagSource,
+    ) -> Result<(bool, usize, String)> {
+        match self.request(ControlRequest::ApplyTagToPaths {
+            workspace_id,
+            source_id,
+            rel_paths,
+            tag,
+            tag_source,
+        })? {
+            ControlResponse::TagApplyResult {
+                success,
+                tagged_count,
+                message,
+            } => Ok((success, tagged_count, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ApplyTagToPaths failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ApplyTagToPaths"),
+        }
+    }
+
+    /// Apply a tagging rule to a source (create rule + tag matches).
+    pub fn apply_rule_to_source(
+        &self,
+        rule_id: TaggingRuleId,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        pattern: String,
+        tag: String,
+    ) -> Result<(bool, usize, String)> {
+        match self.request(ControlRequest::ApplyRuleToSource {
+            rule_id,
+            workspace_id,
+            source_id,
+            pattern,
+            tag,
+        })? {
+            ControlResponse::RuleApplyResult {
+                success,
+                tagged_count,
+                message,
+            } => Ok((success, tagged_count, message)),
+            ControlResponse::Error { code, message } => {
+                anyhow::bail!("ApplyRuleToSource failed [{}]: {}", code, message)
+            }
+            _ => anyhow::bail!("Unexpected response to ApplyRuleToSource"),
         }
     }
 

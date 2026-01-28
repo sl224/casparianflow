@@ -27,6 +27,8 @@ pub use schema_version::{ensure_schema_version, SCHEMA_VERSION};
 pub use sessions::SessionStorage;
 pub use state_store::{
     ApiStore, ArtifactStore, DispatchData, JobArtifactRecord, PluginDeployRequest, QueueStore,
-    RoutingStore, ScoutStore, ScoutTagCount, ScoutTagStats, SessionStore, StateStore,
-    StateStoreBackend, StateStoreQueueSession, StateStoreScoutSession, StateStoreUrl,
+    RoutingStore, ScoutFileRecord, ScoutFileTagFilter, ScoutFilesPage, ScoutFolderEntry,
+    ScoutPatternMatch, ScoutPatternQueryResult, ScoutStore, ScoutTagCount, ScoutTagStats,
+    SessionStore, StateStore, StateStoreBackend, StateStoreQueueSession, StateStoreScoutSession,
+    StateStoreUrl,
 };

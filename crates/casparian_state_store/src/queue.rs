@@ -1366,6 +1366,74 @@ or set CASPARIAN_DEV_ALLOW_RESET=1 to allow destructive reset (pre-v1 only).",
         Ok(())
     }
 
+    /// Defer a job if the lease token matches and status is DISPATCHING.
+    /// Clears terminal fields when transitioning back to QUEUED state.
+    pub fn defer_job_if_token_matches(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        scheduled_at: i64,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET status = ?,
+                    completion_status = NULL,
+                    claim_time = NULL,
+                    lease_token = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    dispatch_ack_at = NULL,
+                    end_time = NULL,
+                    result_summary = NULL,
+                    scheduled_at = ?,
+                    error_message = ?
+                WHERE id = ? AND status = ? AND lease_token = ?
+                "#,
+            &[
+                DbValue::from(ProcessingStatus::Queued.as_str()),
+                DbValue::from(scheduled_at),
+                DbValue::from(reason),
+                DbValue::from(job_id),
+                DbValue::from(ProcessingStatus::Dispatching.as_str()),
+                DbValue::from(lease_token),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Mark job as failed if the lease token matches and status is DISPATCHING.
+    pub fn fail_job_if_token_matches_dispatching(
+        &self,
+        job_id: i64,
+        lease_token: &str,
+        completion_status: &str,
+        error: &str,
+    ) -> Result<bool> {
+        let now = now_millis();
+        let affected = self.conn.execute(
+            r#"
+                UPDATE cf_processing_queue
+                SET status = ?,
+                    completion_status = ?,
+                    end_time = ?,
+                    error_message = ?
+                WHERE id = ? AND status = ? AND lease_token = ?
+                "#,
+            &[
+                DbValue::from(ProcessingStatus::Failed.as_str()),
+                DbValue::from(completion_status),
+                DbValue::from(now),
+                DbValue::from(error),
+                DbValue::from(job_id),
+                DbValue::from(ProcessingStatus::Dispatching.as_str()),
+                DbValue::from(lease_token),
+            ],
+        )?;
+        Ok(affected > 0)
+    }
+
     /// Schedule a retry for a failed job with backoff.
     /// Clears terminal fields (except error_message which stores the retry reason)
     /// when transitioning back to QUEUED state.

@@ -193,10 +193,12 @@ fn parse_bridge_retryable(message: &str) -> Option<bool> {
 // ============================================================================
 
 /// Maximum concurrent jobs per worker
-const MAX_CONCURRENT_JOBS: usize = 4;
+const MAX_CONCURRENT_JOBS: usize = 1;
 
 /// Heartbeat interval (seconds) - worker sends heartbeat to Sentinel
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+/// Identify interval (seconds) - re-sends IDENTIFY so sentinel restarts can re-register
+const IDENTIFY_INTERVAL_SECS: u64 = 30;
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Grace period before SIGKILL after SIGTERM (seconds)
@@ -280,6 +282,31 @@ struct JobResult {
 }
 
 impl Worker {
+    fn compute_heartbeat_status(&self) -> HeartbeatStatus {
+        let active_job_count = self.active_jobs.len();
+        if active_job_count == 0 {
+            HeartbeatStatus::Idle
+        } else if active_job_count >= MAX_CONCURRENT_JOBS {
+            HeartbeatStatus::Busy
+        } else {
+            HeartbeatStatus::Alive
+        }
+    }
+
+    fn send_identify(&self) -> Result<()> {
+        let capabilities = if self.config.capabilities.is_empty() {
+            vec!["*".to_string()]
+        } else {
+            self.config.capabilities.clone()
+        };
+        let identify = types::IdentifyPayload {
+            capabilities,
+            worker_id: Some(self.config.worker_id.clone()),
+        };
+        send_message(&self.socket, OpCode::Identify, JobId::new(0), &identify)?;
+        Ok(())
+    }
+
     /// Connect to sentinel and create worker.
     /// Returns (Worker, ShutdownHandle) - call run() on Worker, use handle for shutdown.
     pub fn connect(config: WorkerConfig) -> WorkerResult<(Self, WorkerHandle)> {
@@ -366,6 +393,7 @@ impl Worker {
         info!("Entering event loop...");
 
         let mut last_heartbeat = Instant::now();
+        let mut last_identify = Instant::now();
 
         loop {
             // Clean up completed jobs
@@ -400,13 +428,16 @@ impl Worker {
                 }
             }
 
+            if last_identify.elapsed() >= Duration::from_secs(IDENTIFY_INTERVAL_SECS) {
+                if let Err(e) = self.send_identify() {
+                    warn!("Failed to send IDENTIFY: {}", e);
+                }
+                last_identify = Instant::now();
+            }
+
             if last_heartbeat.elapsed() >= Duration::from_secs(HEARTBEAT_INTERVAL_SECS) {
                 let active_job_ids: Vec<JobId> = self.active_jobs.keys().copied().collect();
-                let status = if active_job_ids.is_empty() {
-                    HeartbeatStatus::Idle
-                } else {
-                    HeartbeatStatus::Busy
-                };
+                let status = self.compute_heartbeat_status();
                 let payload = types::HeartbeatPayload {
                     status,
                     active_job_count: active_job_ids.len(),
@@ -677,14 +708,7 @@ impl Worker {
                 debug!("Received HEARTBEAT, replying...");
                 let active_job_ids: Vec<JobId> = self.active_jobs.keys().copied().collect();
                 let active_job_count = self.active_jobs.len();
-
-                let status = if active_job_count == 0 {
-                    HeartbeatStatus::Idle
-                } else if active_job_count >= MAX_CONCURRENT_JOBS {
-                    HeartbeatStatus::Busy // At capacity
-                } else {
-                    HeartbeatStatus::Alive // Working but can accept more
-                };
+                let status = self.compute_heartbeat_status();
 
                 let payload = types::HeartbeatPayload {
                     status,

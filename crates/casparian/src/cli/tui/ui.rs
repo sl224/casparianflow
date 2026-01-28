@@ -768,7 +768,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             .discover
             .rule_builder
             .as_ref()
-            .map(|builder| builder.suggestions_help_open || builder.suggestions_detail_open)
+            .map(|builder| builder.candidate_preview_open)
             .unwrap_or(false);
 
     if global_modal_active {
@@ -784,11 +784,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 
     if let Some(builder) = &app.discover.rule_builder {
-        if builder.suggestions_help_open {
-            draw_suggestions_help_overlay(frame, area, builder);
-        }
-        if builder.suggestions_detail_open {
-            draw_suggestions_detail_overlay(frame, area, builder);
+        if builder.candidate_preview_open {
+            draw_candidate_preview_overlay(frame, area, builder);
         }
     }
 
@@ -1967,7 +1964,9 @@ fn draw_discover_screen(frame: &mut Frame, app: &App, area: Rect) {
         .discover
         .rule_builder
         .as_ref()
-        .map(|builder| builder.manual_tag_confirm_open || builder.confirm_exit_open)
+        .map(|builder| {
+            builder.manual_tag_confirm_open || builder.confirm_exit_open || builder.candidate_preview_open
+        })
         .unwrap_or(false);
 
     if modal_active {
@@ -3089,7 +3088,7 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut header_text = format!(
-        " [Select] [Rules] [Validate]  |  Source: {}  |  Matches: {}  |  {}",
+        " [Sources] [Scope] [Label] [Test]  |  Source: {}  |  Matches: {}  |  {}",
         source_name, match_count, file_range
     );
     if let Some(msg) = error_hint {
@@ -3112,7 +3111,7 @@ fn draw_rule_builder_screen(frame: &mut Frame, app: &App, area: Rect) {
 
     // Left panel: Tab-specific rule config
     match app.ingest_tab {
-        IngestTab::Select => draw_rule_builder_left_panel_select(frame, builder, h_chunks[0]),
+        IngestTab::Select => draw_rule_builder_left_panel_select(frame, app, builder, h_chunks[0]),
         IngestTab::Rules | IngestTab::Sources => {
             draw_rule_builder_left_panel(frame, builder, h_chunks[0])
         }
@@ -3210,7 +3209,7 @@ fn draw_rule_builder_left_panel(
             Constraint::Length(3), // Tag
             Constraint::Length(5), // Extractions
             Constraint::Length(3), // Options
-            Constraint::Min(8),    // Schema Suggestions (new)
+            Constraint::Min(1),    // Spacer
         ])
         .split(area);
 
@@ -3501,13 +3500,13 @@ fn draw_rule_builder_left_panel(
     .block(options_block);
     frame.render_widget(options_para, left_chunks[4]);
 
-    // --- SCHEMA SUGGESTIONS (new per RULE_BUILDER_UI_PLAN.md) ---
-    draw_schema_suggestions(frame, builder, left_chunks[5]);
+    // Spacer (no-op)
 }
 
-/// Simplified left panel for Select tab (pattern + excludes + selection summary)
+/// Simplified left panel for Scope tab (pattern + excludes + suggested rules)
 fn draw_rule_builder_left_panel_select(
     frame: &mut Frame,
+    app: &App,
     builder: &super::extraction::RuleBuilderState,
     area: Rect,
 ) {
@@ -3518,7 +3517,8 @@ fn draw_rule_builder_left_panel_select(
         .constraints([
             Constraint::Length(3), // Pattern
             Constraint::Length(4), // Excludes
-            Constraint::Min(6),    // Selection summary
+            Constraint::Min(8),    // Suggested rules
+            Constraint::Length(6), // Summary
         ])
         .split(area);
 
@@ -3635,21 +3635,47 @@ fn draw_rule_builder_left_panel_select(
         .block(excludes_block);
     frame.render_widget(excludes_para, left_chunks[1]);
 
-    // --- SELECTION summary ---
+    // --- SUGGESTED RULES ---
+    draw_rule_candidates_panel(frame, builder, left_chunks[2]);
+
+    // --- SUMMARY ---
     let summary_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
-            " SELECTION ",
+            " SUMMARY ",
             Style::default().fg(Color::DarkGray),
         ));
-    let summary_inner = summary_block.inner(left_chunks[2]);
-    frame.render_widget(summary_block, left_chunks[2]);
+    let summary_inner = summary_block.inner(left_chunks[3]);
+    frame.render_widget(summary_block, left_chunks[3]);
 
+    let source_files = app
+        .discover
+        .selected_source()
+        .map(|s| s.file_count)
+        .unwrap_or(0);
+    let last_indexed = app
+        .discover
+        .glob_explorer
+        .as_ref()
+        .and_then(|g| g.minutes_since_scan)
+        .map(|mins| format!("{:.0}m ago", mins))
+        .unwrap_or_else(|| "unknown".to_string());
+    let sampled = if builder.sampled_paths_count > 0 {
+        format!(
+            "{} files → {} shapes",
+            builder.sampled_paths_count,
+            builder.rule_candidates.len()
+        )
+    } else {
+        "—".to_string()
+    };
     let lines = vec![
         Line::from(format!(" Matches: {}", builder.match_count)),
-        Line::from(" Focus: pattern + excludes"),
-        Line::from(" [s] scan source  [Enter] drill-down"),
+        Line::from(format!(" Source files: {}", source_files)),
+        Line::from(format!(" Last indexed: {}", last_indexed)),
+        Line::from(format!(" Sampled: {}", sampled)),
+        Line::from(" Use [ and ] to switch steps"),
     ];
     let para = Paragraph::new(lines)
         .style(Style::default().fg(Color::Gray))
@@ -3760,228 +3786,80 @@ fn draw_rule_builder_left_panel_validate(
     frame.render_widget(para, summary_inner);
 }
 
-/// Draw schema suggestions panel (RULE_BUILDER_UI_PLAN.md)
-/// Shows pattern seeds, path archetypes, naming schemes, and synonym suggestions.
-fn draw_schema_suggestions(
+/// Draw suggested rule candidates (scope step)
+fn draw_rule_candidates_panel(
     frame: &mut Frame,
     builder: &super::extraction::RuleBuilderState,
     area: Rect,
 ) {
     use super::extraction::RuleBuilderFocus;
-    use super::extraction::SuggestionSection;
-    use super::extraction::SynonymConfidence;
+
+    let focused = builder.focus == RuleBuilderFocus::Suggestions;
+    let title = if focused {
+        " SUGGESTED RULES [Enter: preview, a: apply] "
+    } else {
+        " SUGGESTED RULES "
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            " SUGGESTIONS ",
-            Style::default().fg(Color::DarkGray),
-        ));
+        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Build content lines
     let mut lines: Vec<Line> = Vec::new();
 
-    let suggestions_focused = builder.focus == RuleBuilderFocus::Suggestions;
-    let header_line = |label: &str, selected: bool, show_help: bool| -> Line<'static> {
-        let mut spans = Vec::new();
-        if selected {
-            spans.push(Span::styled("▸ ", Style::default().fg(Color::Cyan).bold()));
+    if builder.rule_candidates.is_empty() {
+        let hint = if builder.match_count == 0 {
+            "  Type a pattern to find matches"
         } else {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(
-            label.to_string(),
-            Style::default().fg(Color::Yellow).bold(),
-        ));
-        if selected && show_help {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled("[?]", Style::default().fg(Color::DarkGray)));
-        }
-        Line::from(spans)
-    };
-
-    // Pattern Seeds (show top 3)
-    if !builder.pattern_seeds.is_empty() {
-        lines.push(header_line(
-            "Detected Patterns",
-            builder.suggestions_section == SuggestionSection::Patterns,
-            suggestions_focused,
-        ));
-        for (idx, seed) in builder.pattern_seeds.iter().take(3).enumerate() {
-            let selected = suggestions_focused
-                && builder.suggestions_section == SuggestionSection::Patterns
-                && idx == builder.selected_pattern_seed;
-            let pattern_style = if selected {
-                Style::default().fg(Color::Cyan).bold()
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(&seed.pattern, pattern_style),
-                Span::styled(
-                    format!(" ({})", seed.match_count),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-    }
-
-    // Path Archetypes (show top 2)
-    if !builder.path_archetypes.is_empty() && lines.len() < inner.height as usize - 2 {
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
-        }
-        lines.push(header_line(
-            "Detected Structures",
-            builder.suggestions_section == SuggestionSection::Structures,
-            suggestions_focused,
-        ));
-        let archetypes: Vec<_> = builder.path_archetypes.iter().take(2).collect();
-        let display_paths: Vec<String> = archetypes
-            .iter()
-            .map(|arch| {
-                arch.sample_paths
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| arch.template.clone())
-            })
-            .collect();
-        let max_meta_width = archetypes
-            .iter()
-            .map(|arch| format!(" ({} files)", arch.file_count).chars().count())
-            .max()
-            .unwrap_or(0) as u16;
-        let max_template_width = inner
-            .width
-            .saturating_sub(2)
-            .saturating_sub(max_meta_width)
-            .max(10) as usize;
-        let formatted_paths = format_path_list(&display_paths, max_template_width, 3);
-
-        for (idx, (arch, template)) in archetypes
-            .into_iter()
-            .zip(formatted_paths.into_iter())
-            .enumerate()
-        {
-            let selected = suggestions_focused
-                && builder.suggestions_section == SuggestionSection::Structures
-                && idx == builder.selected_archetype;
-            let template_style = if selected {
-                Style::default().fg(Color::Green).bold()
-            } else {
-                Style::default().fg(Color::Green)
-            };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(template, template_style),
-                Span::styled(
-                    format!(" ({} files)", arch.file_count),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-    }
-
-    // Naming Schemes (show top 2)
-    if !builder.naming_schemes.is_empty() && lines.len() < inner.height as usize - 2 {
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
-        }
-        lines.push(header_line(
-            "Detected Filenames",
-            builder.suggestions_section == SuggestionSection::Filenames,
-            suggestions_focused,
-        ));
-        let max_meta_width = builder
-            .naming_schemes
-            .iter()
-            .take(2)
-            .map(|scheme| format!(" ({})", scheme.file_count).chars().count())
-            .max()
-            .unwrap_or(0) as u16;
-        let max_template_width = inner
-            .width
-            .saturating_sub(2)
-            .saturating_sub(max_meta_width)
-            .max(10) as usize;
-        for (idx, scheme) in builder.naming_schemes.iter().take(2).enumerate() {
-            let template = if scheme.template.chars().count() > max_template_width {
-                truncate_start(&scheme.template, max_template_width)
-            } else {
-                scheme.template.clone()
-            };
-            let selected = suggestions_focused
-                && builder.suggestions_section == SuggestionSection::Filenames
-                && idx == builder.selected_naming_scheme;
-            let template_style = if selected {
-                Style::default().fg(Color::Magenta).bold()
-            } else {
-                Style::default().fg(Color::Magenta)
-            };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(template, template_style),
-                Span::styled(
-                    format!(" ({})", scheme.file_count),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-    }
-
-    // Synonym Suggestions (show top 2)
-    if !builder.synonym_suggestions.is_empty() && lines.len() < inner.height as usize - 2 {
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
-        }
-        lines.push(header_line(
-            "Detected Synonyms",
-            builder.suggestions_section == SuggestionSection::Synonyms,
-            suggestions_focused,
-        ));
-        for (idx, syn) in builder.synonym_suggestions.iter().take(2).enumerate() {
-            let conf_style = match syn.confidence {
-                SynonymConfidence::High => Style::default().fg(Color::Green),
-                SynonymConfidence::Medium => Style::default().fg(Color::Yellow),
-                SynonymConfidence::Low => Style::default().fg(Color::DarkGray),
-            };
-            let selected = suggestions_focused
-                && builder.suggestions_section == SuggestionSection::Synonyms
-                && idx == builder.selected_synonym;
-            let token_style = if selected {
-                Style::default().fg(Color::White).bold()
-            } else {
-                Style::default().fg(Color::White)
-            };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(&syn.short_form, token_style),
-                Span::raw(" → "),
-                Span::styled(&syn.canonical_form, token_style),
-                Span::raw(" "),
-                Span::styled(
-                    match syn.confidence {
-                        SynonymConfidence::High => "●",
-                        SynonymConfidence::Medium => "◐",
-                        SynonymConfidence::Low => "○",
-                    },
-                    conf_style,
-                ),
-            ]));
-        }
-    }
-
-    // Show placeholder if no suggestions
-    if lines.is_empty() {
+            "  Sampling matches to suggest rules..."
+        };
         lines.push(Line::from(Span::styled(
-            "  Scan files to see suggestions",
+            hint,
             Style::default().fg(Color::DarkGray).italic(),
         )));
+    } else {
+        let max_display = inner.height.saturating_sub(1) as usize;
+        let start =
+            centered_scroll_offset(builder.selected_candidate, max_display, builder.rule_candidates.len());
+
+        for (idx, candidate) in builder
+            .rule_candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(max_display)
+        {
+            let selected = focused && idx == builder.selected_candidate;
+            let prefix = if selected { "► " } else { "  " };
+            let count_str = format!("({})", candidate.estimated_count);
+            let available_width = inner.width.saturating_sub(6 + count_str.len() as u16) as usize;
+            let display = if candidate.label.chars().count() > available_width {
+                truncate_start(&candidate.label, available_width.max(4))
+            } else {
+                candidate.label.clone()
+            };
+
+            let name_style = if selected {
+                Style::default().fg(Color::White).bold()
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let count_style = if selected {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw(prefix),
+                Span::styled(display, name_style),
+                Span::styled(format!(" {}", count_str), count_style),
+            ]));
+        }
     }
 
     let para = Paragraph::new(lines).style(Style::default());
@@ -4044,7 +3922,7 @@ fn draw_rule_builder_right_panel_rules(
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " Preview results in Select/Validate tabs",
+        " Preview results in Scope/Test tabs",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -4088,7 +3966,7 @@ fn draw_rule_builder_right_panel(
                 )
             } else {
                 format!(
-                    " FOLDERS  {} folders ({} files)  [Enter] drill down",
+                    " FOLDERS  {} folders ({} files)  [Enter] narrow to folder",
                     folder_count, file_count
                 )
             }
@@ -6345,159 +6223,64 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(help_paragraph, help_area);
 }
 
-fn draw_suggestions_help_overlay(
+fn draw_candidate_preview_overlay(
     frame: &mut Frame,
     area: Rect,
     builder: &super::extraction::RuleBuilderState,
 ) {
-    use super::extraction::SuggestionSection;
+    use super::extraction::{extract_field_values, parse_custom_glob};
 
-    let help_text = match builder.suggestions_section {
-        SuggestionSection::Patterns => vec![
-            "Detected Patterns".to_string(),
-            "".to_string(),
-            "Quick glob seeds based on common extensions".to_string(),
-            "or filename patterns in the scanned data.".to_string(),
-        ],
-        SuggestionSection::Structures => vec![
-            "Detected Structures".to_string(),
-            "".to_string(),
-            "Repeated folder layouts inferred from paths.".to_string(),
-            "Use these to scope scans or rules precisely.".to_string(),
-        ],
-        SuggestionSection::Filenames => vec![
-            "Detected Filenames".to_string(),
-            "".to_string(),
-            "Common filename templates extracted from files.".to_string(),
-            "Useful for precise match rules or extraction.".to_string(),
-        ],
-        SuggestionSection::Synonyms => vec![
-            "Detected Synonyms".to_string(),
-            "".to_string(),
-            "Token normalizations for consistent tagging.".to_string(),
-            "Example: env → environment.".to_string(),
-        ],
+    let candidate = match builder.rule_candidates.get(builder.selected_candidate) {
+        Some(candidate) => candidate,
+        None => return,
     };
 
-    let dialog_area = render_centered_dialog(frame, area, 62, 9);
+    let dialog_area = render_centered_dialog(frame, area, 90, 14);
     let block = Block::default()
-        .title(" Suggestions Help ")
+        .title(" Apply Suggested Rule ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .border_type(BorderType::Rounded);
     let inner = block.inner(dialog_area);
     frame.render_widget(block, dialog_area);
 
-    let lines = help_text.into_iter().map(Line::from).collect::<Vec<_>>();
-    let para = Paragraph::new(lines).style(Style::default().fg(Color::White));
-    frame.render_widget(para, inner);
-}
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("Pattern: {}", candidate.custom_pattern));
+    lines.push(String::new());
+    if candidate.fields.is_empty() {
+        lines.push("Fields: (none)".to_string());
+    } else {
+        lines.push("Fields:".to_string());
+        for field in candidate.fields.iter().take(6) {
+            lines.push(format!("  {} ({})", field.name, field.field_type.display_name()));
+        }
+    }
 
-fn draw_suggestions_detail_overlay(
-    frame: &mut Frame,
-    area: Rect,
-    builder: &super::extraction::RuleBuilderState,
-) {
-    use super::extraction::SuggestionSection;
-
-    let (title, detail_lines) = match builder.suggestions_section {
-        SuggestionSection::Patterns => {
-            let idx = builder
-                .selected_pattern_seed
-                .min(builder.pattern_seeds.len().saturating_sub(1));
-            if let Some(seed) = builder.pattern_seeds.get(idx) {
-                (
-                    "Pattern Details",
-                    vec![
-                        format!("Pattern: {}", seed.pattern),
-                        format!("Matches: {}", seed.match_count),
-                    ],
-                )
-            } else {
-                (
-                    "Pattern Details",
-                    vec!["No pattern suggestions available.".to_string()],
-                )
+    lines.push(String::new());
+    lines.push(format!("Example: {}", candidate.example_path));
+    match parse_custom_glob(&candidate.custom_pattern) {
+        Ok(parsed) => {
+            let values = extract_field_values(&candidate.example_path, &parsed);
+            if !values.is_empty() {
+                lines.push("Extracted:".to_string());
+                for field in candidate.fields.iter().take(6) {
+                    if let Some(value) = values.get(&field.name) {
+                        lines.push(format!("  {} = {}", field.name, value));
+                    }
+                }
             }
         }
-        SuggestionSection::Structures => {
-            let idx = builder
-                .selected_archetype
-                .min(builder.path_archetypes.len().saturating_sub(1));
-            if let Some(arch) = builder.path_archetypes.get(idx) {
-                let sample = arch
-                    .sample_paths
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| arch.template.clone());
-                (
-                    "Structure Details",
-                    vec![
-                        format!("Template: {}", arch.template),
-                        format!("Sample: {}", sample),
-                        format!("Files: {}", arch.file_count),
-                    ],
-                )
-            } else {
-                (
-                    "Structure Details",
-                    vec!["No structure suggestions available.".to_string()],
-                )
-            }
-        }
-        SuggestionSection::Filenames => {
-            let idx = builder
-                .selected_naming_scheme
-                .min(builder.naming_schemes.len().saturating_sub(1));
-            if let Some(scheme) = builder.naming_schemes.get(idx) {
-                (
-                    "Filename Details",
-                    vec![
-                        format!("Template: {}", scheme.template),
-                        format!("Example: {}", scheme.example),
-                        format!("Files: {}", scheme.file_count),
-                    ],
-                )
-            } else {
-                (
-                    "Filename Details",
-                    vec!["No filename suggestions available.".to_string()],
-                )
-            }
-        }
-        SuggestionSection::Synonyms => {
-            let idx = builder
-                .selected_synonym
-                .min(builder.synonym_suggestions.len().saturating_sub(1));
-            if let Some(syn) = builder.synonym_suggestions.get(idx) {
-                (
-                    "Synonym Details",
-                    vec![format!("{} → {}", syn.short_form, syn.canonical_form)],
-                )
-            } else {
-                (
-                    "Synonym Details",
-                    vec!["No synonym suggestions available.".to_string()],
-                )
-            }
-        }
-    };
-
-    let dialog_area = render_centered_dialog(frame, area, 80, 9);
-    let block = Block::default()
-        .title(format!(" {} ", title))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .border_type(BorderType::Rounded);
-    let inner = block.inner(dialog_area);
-    frame.render_widget(block, dialog_area);
+        Err(_) => {}
+    }
+    lines.push(String::new());
+    lines.push("[a] Apply   [Esc] Cancel".to_string());
 
     let mut wrapped = Vec::new();
-    for line in detail_lines {
+    for line in lines {
         wrapped.extend(wrap_text(&line, inner.width.saturating_sub(2) as usize));
     }
-    let lines = wrapped.into_iter().map(Line::from).collect::<Vec<_>>();
-    let para = Paragraph::new(lines).style(Style::default().fg(Color::White));
+    let rendered = wrapped.into_iter().map(Line::from).collect::<Vec<_>>();
+    let para = Paragraph::new(rendered).style(Style::default().fg(Color::White));
     frame.render_widget(para, inner);
 }
 
@@ -8565,7 +8348,7 @@ mod tests {
             .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
             .collect();
 
-        assert!(content.contains("[Select]"));
+        assert!(content.contains("[Scope]"));
         assert!(content.contains("Source:"));
     }
 

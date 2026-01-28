@@ -20,6 +20,7 @@ use casparian_sentinel::{
     ApiStorage, ControlClient, JobInfo as ControlJobInfo, ScoutRuleInfo, ScoutSourceInfo,
     DEFAULT_CONTROL_ADDR,
 };
+use casparian_sentinel::control::ScoutTagFilter;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
@@ -34,9 +35,9 @@ use crate::cli::config::{
 use crate::cli::scan::classify_scan_error;
 use crate::cli::context;
 use casparian::scout::{
-    match_rules_to_files, patterns, scan_path, Database as ScoutDatabase, RuleApplyFile,
-    RuleApplyRule, ScanCancelToken, ScanProgress as ScoutProgress, Scanner as ScoutScanner, Source,
-    SourceId, SourceType, TagSource, TaggingRuleId, Workspace, WorkspaceId,
+    patterns, scan_path, Database as ScoutDatabase, ScanCancelToken, ScanProgress as ScoutProgress,
+    Scanner as ScoutScanner, Source, SourceId, SourceType, TagSource, TaggingRuleId, Workspace,
+    WorkspaceId,
 };
 
 fn dev_allow_offline_write() -> bool {
@@ -113,9 +114,9 @@ impl IngestTab {
     pub fn label(self) -> &'static str {
         match self {
             IngestTab::Sources => "Sources",
-            IngestTab::Select => "Select",
-            IngestTab::Rules => "Rules",
-            IngestTab::Validate => "Validate",
+            IngestTab::Select => "Scope",
+            IngestTab::Rules => "Label",
+            IngestTab::Validate => "Test",
         }
     }
 }
@@ -2627,6 +2628,7 @@ pub enum SchemaEvalResult {
         path_archetypes: Vec<super::extraction::PathArchetype>,
         naming_schemes: Vec<super::extraction::NamingScheme>,
         synonym_suggestions: Vec<super::extraction::SynonymSuggestion>,
+        rule_candidates: Vec<super::extraction::RuleCandidate>,
         paths_analyzed: usize,
     },
     /// Schema eval failed
@@ -2641,6 +2643,7 @@ pub enum SampleEvalResult {
         path_archetypes: Vec<super::extraction::PathArchetype>,
         naming_schemes: Vec<super::extraction::NamingScheme>,
         synonym_suggestions: Vec<super::extraction::SynonymSuggestion>,
+        rule_candidates: Vec<super::extraction::RuleCandidate>,
         paths_analyzed: usize,
     },
     Error(String),
@@ -2991,6 +2994,8 @@ pub struct DiscoverState {
     pub source_name_input: String,
     /// Directory path for the source being created
     pub pending_source_path: Option<String>,
+    /// Source path to select after sources reload (e.g., after scan completion)
+    pub pending_select_source_path: Option<String>,
     /// Tag input for bulk tagging (used in BulkTagging state)
     pub bulk_tag_input: String,
     /// Whether to save bulk tag as a rule
@@ -3054,6 +3059,8 @@ pub struct DiscoverState {
     // --- Rule Builder (v3.0 consolidation) ---
     /// Rule Builder state (Some = builder active)
     pub rule_builder: Option<super::extraction::RuleBuilderState>,
+    /// Whether we've applied the default inspector collapse for Discover
+    pub inspector_defaulted: bool,
 
     // --- Sources Manager dialog (spec v1.7) ---
     /// Selected source in Sources Manager list (separate from main selection)
@@ -3251,6 +3258,8 @@ pub struct App {
     pending_glob_search: Option<mpsc::Receiver<GlobSearchResult>>,
     /// Pending Rule Builder pattern search (async database query for **/*.ext patterns)
     pending_rule_builder_search: Option<mpsc::Receiver<RuleBuilderSearchResult>>,
+    /// Pending Rule Builder extraction preview
+    pending_rule_builder_preview: Option<mpsc::Receiver<RuleBuilderPreviewResult>>,
     /// Cancellation token for pending glob search (set to true to cancel)
     glob_search_cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Pending SQL query execution
@@ -3259,6 +3268,10 @@ pub struct App {
     pending_folder_query: Option<mpsc::Receiver<FolderQueryMessage>>,
     /// Pending sources load (non-blocking DB query)
     pending_sources_load: Option<mpsc::Receiver<Result<Vec<SourceInfo>, String>>>,
+    /// Pending files load (control-plane query)
+    pending_files_load: Option<mpsc::Receiver<FilesLoadMessage>>,
+    /// Pending tags load (control-plane query)
+    pending_tags_load: Option<mpsc::Receiver<Result<TagsLoadMessage, String>>>,
     /// Pending jobs load (non-blocking DB query)
     pending_jobs_load: Option<mpsc::Receiver<Result<Vec<JobInfo>, String>>>,
     /// Pending home stats load (non-blocking DB query)
@@ -3273,6 +3286,10 @@ pub struct App {
     pending_catalog_load: Option<mpsc::Receiver<Result<CatalogData, String>>>,
     /// Pending control write flush (non-blocking Control API calls)
     pending_control_writes: Option<mpsc::Receiver<ControlWriteResult>>,
+    /// Pending manual tag apply by paths (control-plane)
+    pending_tag_apply: Option<mpsc::Receiver<Result<TagApplyResult, String>>>,
+    /// Pending rule apply to source (control-plane)
+    pending_rule_apply: Option<mpsc::Receiver<Result<RuleApplyResult, String>>>,
     /// Last time jobs were polled (for incremental updates)
     last_jobs_poll: Option<std::time::Instant>,
     /// Profiler for frame timing and zone breakdown (F12 toggle)
@@ -3298,6 +3315,41 @@ enum CacheLoadMessage {
     },
     /// Error during loading
     Error(String),
+}
+
+/// Files load message (paged results).
+enum FilesLoadMessage {
+    Complete {
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        page_offset: usize,
+        total_count: usize,
+        files: Vec<FileInfo>,
+    },
+    Error(String),
+}
+
+/// Tags load message.
+struct TagsLoadMessage {
+    workspace_id: WorkspaceId,
+    source_id: SourceId,
+    tags: Vec<TagInfo>,
+    available_tags: Vec<String>,
+}
+
+/// Result for manual tag apply by paths.
+struct TagApplyResult {
+    tag: String,
+    paths: Vec<String>,
+    tagged_count: usize,
+}
+
+/// Result for rule apply to source.
+struct RuleApplyResult {
+    rule_id: TaggingRuleId,
+    pattern: String,
+    tag: String,
+    tagged_count: usize,
 }
 
 /// Message for on-demand folder queries
@@ -3374,6 +3426,14 @@ struct RuleBuilderSearchResult {
     error: Option<String>,
 }
 
+/// Result of background Rule Builder extraction preview
+struct RuleBuilderPreviewResult {
+    preview_files: Vec<super::extraction::ExtractionPreviewFile>,
+    total_count: usize,
+    pattern: String,
+    error: Option<String>,
+}
+
 struct ControlWriteResult {
     sources_changed: bool,
     error: Option<String>,
@@ -3383,6 +3443,10 @@ struct ControlWriteResult {
 impl App {
     fn check_db_health_once(&mut self) {
         if self.db_health_checked {
+            return;
+        }
+        if self.control_connected {
+            self.db_health_checked = true;
             return;
         }
         self.db_health_checked = true;
@@ -3537,6 +3601,10 @@ impl App {
     fn set_ingest_tab(&mut self, tab: IngestTab) {
         self.ingest_tab = tab;
         self.set_mode(TuiMode::Ingest);
+        if !self.discover.inspector_defaulted {
+            self.inspector_collapsed = true;
+            self.discover.inspector_defaulted = true;
+        }
         if self.ingest_tab != IngestTab::Sources {
             self.ensure_rule_builder_ready();
             if let Some(builder) = self.discover.rule_builder.as_mut() {
@@ -3550,6 +3618,11 @@ impl App {
                                 | RuleBuilderFocus::ExcludeInput
                                 | RuleBuilderFocus::FileList
                         ) {
+                            builder.focus = RuleBuilderFocus::Pattern;
+                        }
+                    }
+                    IngestTab::Rules => {
+                        if matches!(builder.focus, RuleBuilderFocus::Suggestions) {
                             builder.focus = RuleBuilderFocus::Pattern;
                         }
                     }
@@ -3694,10 +3767,13 @@ impl App {
             tick_count: 0,
             pending_glob_search: None,
             pending_rule_builder_search: None,
+            pending_rule_builder_preview: None,
             glob_search_cancelled: None,
             pending_query: None,
             pending_folder_query: None,
             pending_sources_load: None,
+            pending_files_load: None,
+            pending_tags_load: None,
             pending_jobs_load: None,
             pending_stats_load: None,
             pending_approvals_load: None,
@@ -3705,6 +3781,8 @@ impl App {
             pending_triage_load: None,
             pending_catalog_load: None,
             pending_control_writes: None,
+            pending_tag_apply: None,
+            pending_rule_apply: None,
             last_jobs_poll: None,
             #[cfg(feature = "profiling")]
             profiler: casparian_profiler::Profiler::new(250), // 250ms frame budget
@@ -3746,6 +3824,1912 @@ impl App {
         // Stay in RuleBuilder view; dropdowns open only on explicit user action.
     }
 
+    fn refresh_current_view(&mut self) {
+        match self.mode {
+            TuiMode::Home => {
+                // Mark stats as needing refresh - will trigger reload on next tick
+                self.home.stats_loaded = false;
+            }
+            TuiMode::Ingest => match self.ingest_tab {
+                IngestTab::Sources => {
+                    self.discover.sources_loaded = false;
+                }
+                _ => {
+                    self.discover.data_loaded = false;
+                    self.discover.db_filtered = false;
+                    self.refresh_tags_list();
+                }
+            },
+            TuiMode::Run => match self.run_tab {
+                RunTab::Jobs => {
+                    self.jobs_state.jobs_loaded = false;
+                    self.last_jobs_poll = None;
+                    self.jobs_state.selected_index = 0;
+                    self.jobs_state.section_focus = JobsListSection::Actionable;
+                    self.jobs_state.actionable_index = 0;
+                    self.jobs_state.ready_index = 0;
+                    self.jobs_state.pinned_job_id = None;
+                }
+                RunTab::Outputs => {
+                    self.catalog_state.loaded = false;
+                }
+            },
+            TuiMode::Review => match self.review_tab {
+                ReviewTab::Approvals => {
+                    self.approvals_state.approvals_loaded = false;
+                }
+                ReviewTab::Sessions => {
+                    self.sessions_state.sessions_loaded = false;
+                }
+                ReviewTab::Triage => {
+                    self.triage_state.loaded = false;
+                }
+            },
+            TuiMode::Query => {}
+            TuiMode::Settings => {}
+        }
+    }
+
+    fn in_text_input_mode(&self) -> bool {
+        // Command palette is always a text input mode when visible
+        if self.command_palette.visible {
+            return true;
+        }
+        if self.workspace_switcher.visible
+            && self.workspace_switcher.mode == WorkspaceSwitcherMode::Creating
+        {
+            return true;
+        }
+        match self.mode {
+            TuiMode::Ingest => {
+                if self.ingest_tab == IngestTab::Sources {
+                    return self.sources_state.editing;
+                }
+                if let Some(ref explorer) = self.discover.glob_explorer {
+                    if matches!(explorer.phase, GlobExplorerPhase::Filtering) {
+                        return true;
+                    }
+                }
+                if self.discover.sources_filtering || self.discover.tags_filtering {
+                    return true;
+                }
+                if self.discover.view_state == DiscoverViewState::RuleBuilder {
+                    if let Some(ref builder) = self.discover.rule_builder {
+                        use super::extraction::RuleBuilderFocus;
+                        if matches!(
+                            builder.focus,
+                            RuleBuilderFocus::Pattern
+                                | RuleBuilderFocus::Tag
+                                | RuleBuilderFocus::ExcludeInput
+                                | RuleBuilderFocus::ExtractionEdit(_)
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+                matches!(
+                    self.discover.view_state,
+                    DiscoverViewState::Filtering
+                        | DiscoverViewState::EnteringPath
+                        | DiscoverViewState::ScanConfirm
+                        | DiscoverViewState::Tagging
+                        | DiscoverViewState::CreatingSource
+                        | DiscoverViewState::BulkTagging
+                        | DiscoverViewState::RuleCreation
+                        | DiscoverViewState::SourcesDropdown
+                        | DiscoverViewState::TagsDropdown
+                        | DiscoverViewState::SourceEdit
+                )
+            }
+            TuiMode::Review => {
+                matches!(
+                    self.review_tab,
+                    ReviewTab::Approvals
+                ) && self.approvals_state.view_state == ApprovalsViewState::ConfirmReject
+            }
+            TuiMode::Query => self.query_state.view_state == QueryViewState::Editing,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_text_input_mode(&self) -> bool {
+        self.in_text_input_mode()
+    }
+
+    pub(crate) fn view_label(&self) -> String {
+        match self.mode {
+            TuiMode::Home => "Home".to_string(),
+            TuiMode::Ingest => format!("Ingest/{}", self.ingest_tab.label()),
+            TuiMode::Run => format!("Run/{}", self.run_tab.label()),
+            TuiMode::Review => format!("Review/{}", self.review_tab.label()),
+            TuiMode::Query => "Query".to_string(),
+            TuiMode::Settings => "Settings".to_string(),
+        }
+    }
+
+    pub(crate) fn ui_signature(&self) -> UiSignature {
+        UiSignature::from_app(self)
+    }
+
+    pub(crate) fn ui_signature_key(&self) -> String {
+        self.ui_signature().key()
+    }
+
+    pub(crate) fn check_profiler_dump(&mut self) {
+        #[cfg(feature = "profiling")]
+        {
+            let _ = self.profiler.enabled;
+        }
+    }
+
+    fn active_discover_tag_filter(&self) -> DiscoverTagFilter {
+        let active_tag_idx = if self.discover.view_state == DiscoverViewState::TagsDropdown {
+            self.discover.preview_tag
+        } else {
+            self.discover.selected_tag
+        };
+
+        match active_tag_idx {
+            None => DiscoverTagFilter::All,
+            Some(idx) => match self.discover.tags.get(idx) {
+                Some(tag_info) if tag_info.name == "All files" => DiscoverTagFilter::All,
+                Some(tag_info) if tag_info.name == "untagged" => DiscoverTagFilter::Untagged,
+                Some(tag_info) => DiscoverTagFilter::Tag(tag_info.name.clone()),
+                None => DiscoverTagFilter::All,
+            },
+        }
+    }
+
+    fn discover_path_filter_clause(&self) -> Option<(String, DbValue)> {
+        let raw = self.discover.filter.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let has_wildcards = raw.contains('*') || raw.contains('?');
+        let like = if has_wildcards {
+            let normalized = patterns::normalize_glob_pattern(raw);
+            let like = normalized
+                .replace("**/", "%")
+                .replace("**", "%")
+                .replace('*', "%")
+                .replace('?', "_");
+            if like.is_empty() || like == "%" || like == "%%" {
+                return None;
+            }
+            like
+        } else {
+            format!("%{}%", raw)
+        };
+
+        Some((
+            "LOWER(f.rel_path) LIKE LOWER(?)".to_string(),
+            DbValue::Text(like),
+        ))
+    }
+
+    pub(crate) fn filtered_files(&self) -> Vec<&FileInfo> {
+        let mut files: Vec<&FileInfo> = self.discover.files.iter().collect();
+        if files.is_empty() {
+            return files;
+        }
+
+        let tag_filter = self.active_discover_tag_filter();
+        let raw_filter = self.discover.filter.trim();
+        let has_filter = !raw_filter.is_empty();
+
+        let (matcher, filter_lower) = if has_filter && (raw_filter.contains('*') || raw_filter.contains('?')) {
+            let normalized = patterns::normalize_glob_pattern(raw_filter);
+            (patterns::build_matcher(&normalized).ok(), String::new())
+        } else {
+            (None, raw_filter.to_lowercase())
+        };
+
+        files.retain(|file| {
+            let tag_ok = match &tag_filter {
+                DiscoverTagFilter::All => true,
+                DiscoverTagFilter::Untagged => file.tags.is_empty(),
+                DiscoverTagFilter::Tag(tag) => file.tags.iter().any(|t| t == tag),
+            };
+            if !tag_ok {
+                return false;
+            }
+            if !has_filter {
+                return true;
+            }
+            if let Some(ref matcher) = matcher {
+                matcher.is_match(&file.rel_path)
+            } else {
+                file.rel_path.to_lowercase().contains(&filter_lower)
+            }
+        });
+
+        files
+    }
+
+    pub(crate) fn discover_page_bounds(&self) -> (usize, usize, usize) {
+        let total = self.discover.total_files;
+        if total == 0 || self.discover.files.is_empty() {
+            return (0, 0, total);
+        }
+        let start = self.discover.page_offset + 1;
+        let end = (self.discover.page_offset + self.discover.files.len()).min(total);
+        (start, end, total)
+    }
+
+    fn discover_rule_pattern_from_filter(&self) -> Option<String> {
+        let raw = self.discover.filter.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let is_glob = raw.contains('*') || raw.contains('?') || raw.contains('[');
+        if is_glob {
+            Some(patterns::normalize_glob_pattern(raw))
+        } else {
+            Some(format!("*{}*", raw))
+        }
+    }
+
+    fn set_discover_page_offset(&mut self, offset: usize) {
+        self.discover.page_offset = offset;
+        self.discover.selected = 0;
+        self.discover.data_loaded = false;
+        self.discover.db_filtered = false;
+    }
+
+    fn discover_next_page(&mut self) {
+        let total = self.discover.total_files;
+        if total == 0 {
+            return;
+        }
+        let page_size = self.discover.page_size.max(1);
+        let max_offset = (total - 1) / page_size * page_size;
+        if self.discover.page_offset < max_offset {
+            let next = (self.discover.page_offset + page_size).min(max_offset);
+            self.set_discover_page_offset(next);
+        }
+    }
+
+    fn discover_prev_page(&mut self) {
+        let page_size = self.discover.page_size.max(1);
+        let prev = self.discover.page_offset.saturating_sub(page_size);
+        if prev != self.discover.page_offset {
+            self.set_discover_page_offset(prev);
+        }
+    }
+
+    fn discover_first_page(&mut self) {
+        if self.discover.page_offset != 0 {
+            self.set_discover_page_offset(0);
+        }
+    }
+
+    fn discover_last_page(&mut self) {
+        let total = self.discover.total_files;
+        if total == 0 {
+            return;
+        }
+        let page_size = self.discover.page_size.max(1);
+        let max_offset = (total - 1) / page_size * page_size;
+        if self.discover.page_offset != max_offset {
+            self.set_discover_page_offset(max_offset);
+        }
+    }
+
+    fn add_scan_job(&mut self, directory_path: &str) -> i64 {
+        // Generate unique job ID from timestamp
+        let job_id = chrono::Local::now().timestamp_millis();
+
+        let job = JobInfo {
+            id: job_id,
+            file_id: None,
+            job_type: JobType::Scan,
+            origin: JobOrigin::Ephemeral,
+            name: "scan".to_string(),
+            version: None,
+            status: JobStatus::Running,
+            started_at: chrono::Local::now(),
+            completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
+            items_total: 0,
+            items_processed: 0,
+            items_failed: 0,
+            output_path: Some(directory_path.to_string()),
+            output_size_bytes: None,
+            backtest: None,
+            failures: vec![],
+            violations: vec![],
+            top_violations_loaded: false,
+            selected_violation_index: 0,
+        };
+
+        // Add to front of list so it's visible immediately
+        self.jobs_state.push_job(job);
+
+        job_id
+    }
+
+    fn update_scan_job_status(
+        &mut self,
+        job_id: i64,
+        status: JobStatus,
+        error: Option<String>,
+        processed: Option<u32>,
+        total: Option<u32>,
+    ) {
+        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
+            job.status = status;
+            if let Some(value) = processed {
+                job.items_processed = value;
+            }
+            if let Some(value) = total {
+                job.items_total = value;
+            }
+            if matches!(
+                status,
+                JobStatus::Completed
+                    | JobStatus::PartialSuccess
+                    | JobStatus::Failed
+                    | JobStatus::Cancelled
+            ) {
+                job.completed_at = Some(chrono::Local::now());
+            }
+            if let Some(err) = error {
+                job.failures.push(JobFailure {
+                    file_path: "".to_string(),
+                    error: err,
+                    line: None,
+                });
+            }
+        }
+    }
+
+    fn add_schema_eval_job(&mut self, mode: SchemaEvalMode, paths_total: usize) -> i64 {
+        let job_id = chrono::Local::now().timestamp_millis();
+
+        let job = JobInfo {
+            id: job_id,
+            file_id: None,
+            job_type: JobType::SchemaEval,
+            origin: JobOrigin::Ephemeral,
+            name: match mode {
+                SchemaEvalMode::Sample => "schema-sample".to_string(),
+                SchemaEvalMode::Full => "schema-full".to_string(),
+            },
+            version: None,
+            status: JobStatus::Running,
+            started_at: chrono::Local::now(),
+            completed_at: None,
+            pipeline_run_id: None,
+            logical_date: None,
+            selection_snapshot_hash: None,
+            quarantine_rows: None,
+            items_total: paths_total as u32,
+            items_processed: 0,
+            items_failed: 0,
+            output_path: None,
+            output_size_bytes: None,
+            backtest: None,
+            failures: vec![],
+            violations: vec![],
+            top_violations_loaded: false,
+            selected_violation_index: 0,
+        };
+
+        self.jobs_state.push_job(job);
+        job_id
+    }
+
+    fn update_schema_eval_job(
+        &mut self,
+        job_id: i64,
+        status: JobStatus,
+        processed: u32,
+        error: Option<String>,
+    ) {
+        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
+            job.status = status;
+            job.items_processed = processed;
+            if matches!(
+                status,
+                JobStatus::Completed
+                    | JobStatus::PartialSuccess
+                    | JobStatus::Failed
+                    | JobStatus::Cancelled
+            ) {
+                job.completed_at = Some(chrono::Local::now());
+            }
+            if let Some(err) = error {
+                job.failures.push(JobFailure {
+                    file_path: "".to_string(),
+                    error: err,
+                    line: None,
+                });
+            }
+        }
+    }
+
+    fn set_schema_eval_job_total(&mut self, job_id: i64, total: u32) {
+        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
+            if job.items_total == 0 {
+                job.items_total = total;
+            }
+        }
+    }
+
+    fn run_sample_schema_eval(&mut self) {
+        let (source_id_raw, pattern, excludes, eval_running, last_key) =
+            match self.discover.rule_builder.as_ref() {
+                Some(builder) => (
+                    builder.source_id.clone(),
+                    builder.pattern.clone(),
+                    builder.excludes.clone(),
+                    matches!(
+                        builder.eval_state,
+                        super::extraction::EvalState::Running { .. }
+                    ),
+                    builder.last_sample_eval_key.clone(),
+                ),
+                None => return,
+            };
+
+        if eval_running || self.pending_schema_eval.is_some() || self.pending_sample_eval.is_some()
+        {
+            return;
+        }
+
+        let source_id = match source_id_raw {
+            Some(id) => id,
+            None => return,
+        };
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message = Some(("No workspace selected".to_string(), true));
+                return;
+            }
+        };
+
+        let sample_key = format!(
+            "{}|{}|{}",
+            source_id.as_i64(),
+            pattern.as_str(),
+            excludes.join("\u{1f}")
+        );
+        if last_key.as_deref() == Some(&sample_key) {
+            return;
+        }
+
+        if let Some(builder) = self.discover.rule_builder.as_mut() {
+            builder.last_sample_eval_key = Some(sample_key);
+        }
+
+        let (tx, rx) = mpsc::sync_channel::<SampleEvalResult>(16);
+        self.pending_sample_eval = Some(rx);
+
+        if !self.control_connected {
+            self.discover.status_message = Some((
+                "Sentinel not connected; cannot sample schema".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.discover.status_message = Some((
+                    "Control API address not configured".to_string(),
+                    true,
+                ));
+                return;
+            }
+        };
+
+        let exclude_patterns = excludes;
+
+        std::thread::spawn(move || {
+            let client = match ControlClient::connect_with_timeout(
+                &control_addr,
+                Duration::from_millis(500),
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    let _ = tx.send(SampleEvalResult::Error(format!(
+                        "Control API unavailable: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
+                Ok(p) => p,
+                Err(err) => {
+                    let _ = tx.send(SampleEvalResult::Error(err));
+                    return;
+                }
+            };
+
+            let mut paths =
+                match client.sample_paths_for_eval(workspace_id, source_id, glob_pattern) {
+                    Ok(paths) => paths,
+                    Err(err) => {
+                        let _ = tx.send(SampleEvalResult::Error(format!(
+                            "Sample eval request failed: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+            if paths.is_empty() {
+                let _ = tx.send(SampleEvalResult::Error("No files to analyze".to_string()));
+                return;
+            }
+
+            let exclude_matchers: Vec<globset::GlobMatcher> = exclude_patterns
+                .into_iter()
+                .filter_map(|pattern| {
+                    let glob = patterns::normalize_glob_pattern(&pattern);
+                    patterns::build_matcher(&glob).ok()
+                })
+                .collect();
+
+            if !exclude_matchers.is_empty() {
+                paths.retain(|path| !exclude_matchers.iter().any(|m| m.is_match(path)));
+            }
+            if paths.is_empty() {
+                let _ = tx.send(SampleEvalResult::Error("No files to analyze".to_string()));
+                return;
+            }
+
+            let mut state = super::extraction::RuleBuilderState::default();
+            super::extraction::analyze_paths_for_schema_ui(&mut state, &paths, 5);
+
+            let _ = tx.send(SampleEvalResult::Complete {
+                pattern: pattern.to_string(),
+                pattern_seeds: state.pattern_seeds,
+                path_archetypes: state.path_archetypes,
+                naming_schemes: state.naming_schemes,
+                synonym_suggestions: state.synonym_suggestions,
+                rule_candidates: state.rule_candidates,
+                paths_analyzed: paths.len(),
+            });
+        });
+    }
+
+    fn start_full_schema_eval(&mut self) {
+        let (pattern, source_id_raw, excludes, full_eval_running) =
+            match self.discover.rule_builder.as_ref() {
+                Some(builder) => (
+                    builder.pattern.clone(),
+                    builder.source_id.clone(),
+                    builder.excludes.clone(),
+                    matches!(
+                        builder.eval_state,
+                        super::extraction::EvalState::Running { .. }
+                    ),
+                ),
+                None => return,
+            };
+
+        if full_eval_running {
+            return;
+        }
+
+        let source_id = match source_id_raw {
+            Some(id) => id,
+            None => {
+                self.discover.status_message = Some(("No source selected".to_string(), true));
+                return;
+            }
+        };
+
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message = Some(("No workspace selected".to_string(), true));
+                return;
+            }
+        };
+
+        if !self.control_connected {
+            self.discover.status_message = Some((
+                "Sentinel not connected; cannot run full eval".to_string(),
+                true,
+            ));
+            return;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.discover.status_message = Some((
+                    "Control API address not configured".to_string(),
+                    true,
+                ));
+                return;
+            }
+        };
+
+        // Create job
+        let job_id = self.add_schema_eval_job(SchemaEvalMode::Full, 0);
+        self.current_schema_eval_job_id = Some(job_id);
+
+        // Mark as running
+        if let Some(builder) = self.discover.rule_builder.as_mut() {
+            builder.eval_state = super::extraction::EvalState::Running { progress: 0 };
+        }
+
+        // Channel for results
+        let (tx, rx) = mpsc::sync_channel::<SchemaEvalResult>(16);
+        self.pending_schema_eval = Some(rx);
+
+        let exclude_patterns = excludes;
+
+        std::thread::spawn(move || {
+            let _ = tx.send(SchemaEvalResult::Started { job_id });
+
+            let client = match ControlClient::connect_with_timeout(
+                &control_addr,
+                Duration::from_millis(500),
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    let _ = tx.send(SchemaEvalResult::Error(format!(
+                        "Control API unavailable: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
+                Ok(p) => p,
+                Err(err) => {
+                    let _ = tx.send(SchemaEvalResult::Error(err));
+                    return;
+                }
+            };
+            let matcher = match super::pattern_query::build_eval_matcher(&glob_pattern) {
+                Ok(m) => m,
+                Err(err) => {
+                    let _ = tx.send(SchemaEvalResult::Error(err));
+                    return;
+                }
+            };
+            let exclude_matchers: Vec<globset::GlobMatcher> = exclude_patterns
+                .into_iter()
+                .filter_map(|pattern| {
+                    let glob = patterns::normalize_glob_pattern(&pattern);
+                    patterns::build_matcher(&glob).ok()
+                })
+                .collect();
+
+            let mut offset = 0usize;
+            let batch_size = 1000usize;
+            let mut processed = 0usize;
+            let mut matched_paths: Vec<String> = Vec::new();
+            let mut total_candidates: Option<usize> = None;
+
+            loop {
+                let result = match client.pattern_query(
+                    workspace_id,
+                    source_id,
+                    glob_pattern.clone(),
+                    batch_size,
+                    offset,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let _ = tx.send(SchemaEvalResult::Error(format!(
+                            "Schema eval request failed: {}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+
+                if total_candidates.is_none() {
+                    let total = result.total_count.max(0) as usize;
+                    total_candidates = Some(total);
+                    let _ = tx.send(SchemaEvalResult::Progress {
+                        progress: 0,
+                        paths_analyzed: 0,
+                        total_paths: total,
+                    });
+                }
+
+                if result.files.is_empty() {
+                    break;
+                }
+
+                for file in result.files.iter() {
+                    if !matcher.is_match(&file.rel_path) {
+                        continue;
+                    }
+                    if exclude_matchers.iter().any(|m| m.is_match(&file.rel_path)) {
+                        continue;
+                    }
+                    matched_paths.push(file.rel_path.clone());
+                }
+
+                processed += result.files.len();
+                offset += result.files.len();
+
+                let total = total_candidates.unwrap_or(0);
+                if processed % 2000 == 0 || (total > 0 && processed >= total) {
+                    let progress = if total == 0 {
+                        100
+                    } else {
+                        ((processed.saturating_mul(100)) / total).min(99) as u8
+                    };
+                    let _ = tx.send(SchemaEvalResult::Progress {
+                        progress,
+                        paths_analyzed: processed,
+                        total_paths: total,
+                    });
+                }
+            }
+
+            if matched_paths.is_empty() {
+                let _ = tx.send(SchemaEvalResult::Error("No files to analyze".to_string()));
+                return;
+            }
+
+            let mut state = super::extraction::RuleBuilderState::default();
+            super::extraction::analyze_paths_for_schema_ui(&mut state, &matched_paths, 5);
+
+            let _ = tx.send(SchemaEvalResult::Complete {
+                job_id,
+                pattern: pattern.to_string(),
+                pattern_seeds: state.pattern_seeds,
+                path_archetypes: state.path_archetypes,
+                naming_schemes: state.naming_schemes,
+                synonym_suggestions: state.synonym_suggestions,
+                rule_candidates: state.rule_candidates,
+                paths_analyzed: matched_paths.len(),
+            });
+        });
+
+        self.discover.status_message = Some(("Full eval started...".to_string(), false));
+    }
+
+    fn is_risky_scan_path(&self, path: &str) -> bool {
+        use std::path::Path;
+
+        let input = Path::new(path);
+        let expanded = scan_path::expand_scan_path(input);
+        let canonical = scan_path::canonicalize_scan_path(&expanded);
+
+        if let Some(home) = dirs::home_dir() {
+            if canonical == home {
+                return true;
+            }
+        }
+
+        // Root on Unix or drive root on Windows
+        canonical.parent().is_none()
+    }
+
+    fn scan_directory(&mut self, path: &str) {
+        use std::path::Path;
+
+        if self.control_connected {
+            self.scan_directory_control(path);
+            return;
+        }
+
+        if self.mutations_blocked() {
+            let message = BackendRouter::new(
+                self.control_addr.clone(),
+                self.config.standalone_writer,
+                self.db_read_only,
+            )
+            .blocked_message("start scan");
+            self.discover.scan_error = Some(message.clone());
+            self.discover.status_message = Some((message.clone(), true));
+            self.set_global_status_for(message, true, Duration::from_secs(8));
+            return;
+        }
+
+        self.ensure_active_workspace();
+
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.status_message =
+                    Some(("No workspace available; cannot scan.".to_string(), true));
+                return;
+            }
+        };
+
+        let path_input = Path::new(path);
+
+        let expanded_path = scan_path::expand_scan_path(path_input);
+
+        // Path validation - synchronous (fast filesystem checks)
+        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+            self.discover.scan_error = Some(err.to_string());
+            return;
+        }
+
+        // Path is valid - enter scanning state and spawn background task
+        let path_display = expanded_path.display().to_string();
+        self.discover.scanning_path = Some(path_display.clone());
+        self.discover.scan_progress = Some(ScoutProgress {
+            dirs_scanned: 0,
+            files_found: 0,
+            files_persisted: 0,
+            current_dir: Some("Initializing...".to_string()),
+            elapsed_ms: 0,
+            files_per_sec: 0.0,
+            stalled: false,
+        });
+        self.discover.scan_start_time = Some(std::time::Instant::now());
+        self.discover.view_state = DiscoverViewState::Scanning;
+        self.discover.scan_error = None;
+
+        // Channel for TUI scan results
+        let (tui_tx, tui_rx) = mpsc::sync_channel::<TuiScanResult>(256);
+        self.pending_scan = Some(tui_rx);
+
+        // Create scan job for tracking in Jobs view
+        let job_id = self.add_scan_job(&path_display);
+        self.current_scan_job_id = Some(job_id);
+
+        // Don't show "Scan started" yet - wait for validation to pass
+        // The status will update to "Scan started" after validation succeeds
+        // or show an error message if validation fails
+        self.discover.status_message = None;
+
+        // Get database path
+        let db_path = self
+            .config
+            .database
+            .clone()
+            .unwrap_or_else(crate::cli::config::state_store_path);
+
+        let source_path = path_display;
+        let scan_job_id = job_id; // Capture for async block
+        let telemetry = self.telemetry.clone();
+        let cancel_token = ScanCancelToken::new();
+        self.scan_cancel_token = Some(cancel_token.clone());
+
+        std::thread::spawn(move || {
+            // Open database
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let db = match ScoutDatabase::open(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "Failed to open database: {}",
+                        e
+                    )));
+                    return;
+                }
+            };
+
+            // Check if source with this path already exists (rescan case)
+            let existing_source = match db.get_source_by_path(&workspace_id, &source_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Database error: {}", e)));
+                    return;
+                }
+            };
+
+            let source = if let Some(existing) = existing_source {
+                // Rescan existing source - use existing source record
+                existing
+            } else {
+                // New source - create record
+                let source_name = std::path::Path::new(&source_path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| source_path.clone());
+
+                // Check if a source with this name (but different path) already exists
+                if let Ok(Some(name_conflict)) = db.get_source_by_name(&workspace_id, &source_name)
+                {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "A source named '{}' already exists at '{}'. Use Sources Manager (M) to rename or delete it first.",
+                        source_name, name_conflict.path
+                    )));
+                    return;
+                }
+
+                // Check for overlapping sources (parent/child relationships)
+                // This prevents duplicate file tracking and conflicting tags
+                if let Err(e) =
+                    db.check_source_overlap(&workspace_id, std::path::Path::new(&source_path))
+                {
+                    let suggestion = match &e {
+                        casparian::scout::error::ScoutError::SourceIsChildOfExisting {
+                            existing_name,
+                            ..
+                        } => {
+                            format!(
+                                "Either delete source '{}' first, or use tagging rules to organize files within that source.",
+                                existing_name
+                            )
+                        }
+                        casparian::scout::error::ScoutError::SourceIsParentOfExisting {
+                            existing_name,
+                            ..
+                        } => {
+                            format!(
+                                "Either delete source '{}' first, or scan a non-overlapping directory.",
+                                existing_name
+                            )
+                        }
+                        _ => String::new(),
+                    };
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "{}\n\nSuggestion: {}",
+                        e, suggestion
+                    )));
+                    return;
+                }
+
+                // Create a new SourceId for the source
+                let source_id = SourceId::new();
+
+                let new_source = Source {
+                    workspace_id,
+                    id: source_id,
+                    name: source_name,
+                    source_type: SourceType::Local,
+                    path: source_path.clone(),
+                    exec_path: None,
+                    poll_interval_secs: 0,
+                    enabled: true,
+                };
+
+                // Insert new source
+                if let Err(e) = db.upsert_source(&new_source) {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "Failed to save source: {}",
+                        e
+                    )));
+                    return;
+                }
+
+                new_source
+            };
+
+            let scan_config = casparian::scout::ScanConfig::default();
+            let telemetry_start = std::time::Instant::now();
+            let telemetry_context = telemetry.as_ref().map(|recorder| {
+                let run_id = Uuid::new_v4().to_string();
+                let source_id = source.id.to_string();
+                let root_hash = Some(
+                    recorder
+                        .hasher()
+                        .hash_path(std::path::Path::new(&source.path)),
+                );
+                let payload = protocol_telemetry::ScanStarted {
+                    run_id: run_id.clone(),
+                    source_id: source_id.clone(),
+                    root_hash,
+                    started_at: chrono::Utc::now(),
+                    config: scan_config_telemetry(&scan_config),
+                };
+                let parent_id = recorder.emit_domain(
+                    protocol_telemetry::events::SCAN_START,
+                    Some(&run_id),
+                    None,
+                    &payload,
+                );
+                (run_id, source_id, parent_id)
+            });
+
+            // Validation passed - notify TUI that scan is starting
+            let _ = tui_tx.send(TuiScanResult::Started {
+                job_id: scan_job_id,
+                scan_id: None,
+            });
+
+            // Create progress channel that sends directly to TUI
+            // We wrap tui_tx in a channel adapter so scanner can use its existing interface
+            let (progress_tx, progress_rx) = mpsc::channel::<ScoutProgress>();
+
+            // Spawn a task to forward progress - use spawn_blocking context awareness
+            let tui_tx_progress = tui_tx.clone();
+            let telemetry_progress = telemetry.clone();
+            let telemetry_context_progress = telemetry_context.clone();
+            let forward_handle = std::thread::spawn(move || {
+                let mut last_emit = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(std::time::Instant::now);
+                while let Ok(progress) = progress_rx.recv() {
+                    let _ = tui_tx_progress.try_send(TuiScanResult::Progress(progress.clone()));
+
+                    if let (Some(recorder), Some((run_id, source_id, parent_id))) = (
+                        telemetry_progress.as_ref(),
+                        telemetry_context_progress.as_ref(),
+                    ) {
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_emit) >= std::time::Duration::from_secs(1) {
+                            last_emit = now;
+                            let payload = protocol_telemetry::ScanProgress {
+                                run_id: run_id.clone(),
+                                source_id: source_id.clone(),
+                                elapsed_ms: progress.elapsed_ms,
+                                files_found: progress.files_found,
+                                files_persisted: progress.files_persisted,
+                                dirs_scanned: progress.dirs_scanned,
+                                files_per_sec: progress.files_per_sec,
+                                stalled: progress.stalled,
+                            };
+                            recorder.emit_domain(
+                                protocol_telemetry::events::SCAN_PROGRESS,
+                                Some(run_id),
+                                parent_id.as_deref(),
+                                &payload,
+                            );
+                        }
+                    }
+                }
+            });
+
+            // Create scanner with default config
+            let scanner = ScoutScanner::with_config(db, scan_config.clone());
+
+            // Run the scan in a blocking task so it doesn't block the runtime
+            let scan_result = if let Some((run_id, _, _)) = telemetry_context.as_ref() {
+                let span = info_span!("scan.run", run_id = %run_id, source_id = %source.id);
+                let _guard = span.enter();
+                scanner.scan_with_cancel(&source, Some(progress_tx), None, Some(cancel_token))
+            } else {
+                scanner.scan_with_cancel(&source, Some(progress_tx), None, Some(cancel_token))
+            };
+            drop(scanner);
+
+            let _ = forward_handle.join();
+
+            match scan_result {
+                Ok(result) => {
+                    let persisted = result.stats.files_persisted as usize;
+                    let discovered = result.stats.files_discovered as usize;
+                    if let (Some(recorder), Some((run_id, source_id, _))) =
+                        (telemetry.as_ref(), telemetry_context.as_ref())
+                    {
+                        let payload = protocol_telemetry::ScanCompleted {
+                            run_id: run_id.clone(),
+                            source_id: source_id.clone(),
+                            duration_ms: result.stats.duration_ms,
+                            files_discovered: result.stats.files_discovered,
+                            files_persisted: result.stats.files_persisted,
+                            files_new: result.stats.files_new,
+                            files_changed: result.stats.files_changed,
+                            files_deleted: result.stats.files_deleted,
+                            dirs_scanned: result.stats.dirs_scanned,
+                            bytes_scanned: result.stats.bytes_scanned,
+                            errors: result.stats.errors,
+                        };
+                        recorder.emit_domain(
+                            protocol_telemetry::events::SCAN_COMPLETE,
+                            Some(run_id),
+                            None,
+                            &payload,
+                        );
+                    }
+                    if persisted == 0 && discovered > 0 {
+                        let _ = tui_tx.send(TuiScanResult::Error(
+                            "Scan completed but no files were persisted. Check database health or locks.".to_string(),
+                        ));
+                        return;
+                    }
+                    // Scan complete - TUI will load files from DB
+                    let _ = tui_tx.send(TuiScanResult::Complete {
+                        source_path,
+                        files_persisted: persisted,
+                    });
+                }
+                Err(e) => {
+                    if matches!(e, casparian::scout::error::ScoutError::Cancelled) {
+                        let _ = tui_tx.send(TuiScanResult::Error("Scan cancelled".to_string()));
+                        return;
+                    }
+                    if let (Some(recorder), Some((run_id, source_id, _))) =
+                        (telemetry.as_ref(), telemetry_context.as_ref())
+                    {
+                        let (error_class, io_kind) = classify_scan_error(&e);
+                        let payload = protocol_telemetry::ScanFailed {
+                            run_id: run_id.clone(),
+                            source_id: source_id.clone(),
+                            duration_ms: telemetry_start.elapsed().as_millis() as u64,
+                            error_class,
+                            io_kind,
+                        };
+                        recorder.emit_domain(
+                            protocol_telemetry::events::SCAN_FAIL,
+                            Some(run_id),
+                            None,
+                            &payload,
+                        );
+                    }
+                    let _ = tui_tx.send(TuiScanResult::Error(format!("Scan failed: {}", e)));
+                }
+            }
+        });
+    }
+
+    fn scan_directory_control(&mut self, path: &str) {
+        use std::path::Path;
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.discover.status_message = Some((
+                    "Control API address not configured".to_string(),
+                    true,
+                ));
+                return;
+            }
+        };
+
+        let path_input = Path::new(path);
+        let expanded_path = scan_path::expand_scan_path(path_input);
+        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
+            self.discover.scan_error = Some(err.to_string());
+            return;
+        }
+
+        let canonical_path = scan_path::canonicalize_scan_path(&expanded_path);
+        let path_display = canonical_path.display().to_string();
+
+        self.discover.scanning_path = Some(path_display.clone());
+        self.discover.scan_progress = Some(ScoutProgress {
+            dirs_scanned: 0,
+            files_found: 0,
+            files_persisted: 0,
+            current_dir: Some("Initializing...".to_string()),
+            elapsed_ms: 0,
+            files_per_sec: 0.0,
+            stalled: false,
+        });
+        self.discover.scan_start_time = Some(std::time::Instant::now());
+        self.discover.view_state = DiscoverViewState::Scanning;
+        self.discover.scan_error = None;
+
+        let (tui_tx, tui_rx) = mpsc::sync_channel::<TuiScanResult>(256);
+        self.pending_scan = Some(tui_rx);
+
+        let job_id = self.add_scan_job(&path_display);
+        self.current_scan_job_id = Some(job_id);
+        self.current_scan_id = None;
+        self.scan_cancel_token = None;
+
+        let workspace_id = self.active_workspace_id();
+        self.discover.status_message = None;
+
+        let scan_job_id = job_id;
+        std::thread::spawn(move || {
+            let client = match ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(500)) {
+                Ok(client) => client,
+                Err(err) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "Control API unavailable: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            let scan_id = match client.start_scan(workspace_id, path_display.clone()) {
+                Ok(id) => id,
+                Err(err) => {
+                    let _ = tui_tx.send(TuiScanResult::Error(format!(
+                        "Failed to start scan: {}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            let _ = tui_tx.send(TuiScanResult::Started {
+                job_id: scan_job_id,
+                scan_id: Some(scan_id.clone()),
+            });
+
+            loop {
+                match client.get_scan(scan_id.clone()) {
+                    Ok(Some(status)) => {
+                        if let Some(progress) = status.progress.as_ref() {
+                            let tui_progress = ScoutProgress {
+                                dirs_scanned: progress.dirs_scanned as usize,
+                                files_found: progress.files_found as usize,
+                                files_persisted: progress.files_persisted as usize,
+                                current_dir: progress.current_dir.clone(),
+                                elapsed_ms: progress.elapsed_ms,
+                                files_per_sec: progress.files_per_sec,
+                                stalled: progress.stalled,
+                            };
+                            let _ = tui_tx.send(TuiScanResult::Progress(tui_progress));
+                        }
+
+                        match status.state {
+                            casparian_sentinel::ScanState::Completed => {
+                                let persisted = status.files_persisted.unwrap_or(0) as usize;
+                                let _ = tui_tx.send(TuiScanResult::Complete {
+                                    source_path: status.source_path.clone(),
+                                    files_persisted: persisted,
+                                });
+                                break;
+                            }
+                            casparian_sentinel::ScanState::Failed => {
+                                let _ = tui_tx.send(TuiScanResult::Error(
+                                    status
+                                        .error
+                                        .unwrap_or_else(|| "Scan failed".to_string()),
+                                ));
+                                break;
+                            }
+                            casparian_sentinel::ScanState::Cancelled => {
+                                let _ = tui_tx.send(TuiScanResult::Error(
+                                    status
+                                        .error
+                                        .unwrap_or_else(|| "Scan cancelled".to_string()),
+                                ));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(None) => {
+                        let _ = tui_tx.send(TuiScanResult::Error(
+                            "Scan not found in control plane".to_string(),
+                        ));
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = tui_tx.send(TuiScanResult::Error(format!(
+                            "Failed to query scan status: {}",
+                            err
+                        )));
+                        break;
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+    }
+
+    fn list_directories(partial_path: &str) -> Vec<String> {
+        use std::path::Path;
+
+        let partial = if partial_path.starts_with("~") {
+            if let Some(home) = dirs::home_dir() {
+                let rest = partial_path.strip_prefix("~").unwrap_or("");
+                home.join(rest.trim_start_matches('/'))
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                partial_path.to_string()
+            }
+        } else {
+            partial_path.to_string()
+        };
+
+        let path = Path::new(&partial);
+
+        let (parent, prefix) = if partial.ends_with('/') || partial.ends_with('\\') {
+            // Path ends with separator - list contents of this directory
+            (path, "")
+        } else {
+            // Split into parent directory and prefix to match
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            let prefix = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            (parent, prefix)
+        };
+
+        // Read directory and filter
+        let mut suggestions = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                // Check if it's a directory
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+
+                // Skip hidden directories
+                if name_str.starts_with('.') {
+                    continue;
+                }
+
+                // Check prefix match (case-insensitive)
+                if name_str.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                    suggestions.push(format!("{}/", name_str));
+                }
+            }
+        }
+
+        // Sort alphabetically and limit to 8
+        suggestions.sort();
+        suggestions.truncate(8);
+        suggestions
+    }
+
+    fn update_path_suggestions(&mut self) {
+        self.discover.path_suggestions = Self::list_directories(&self.discover.scan_path_input);
+        self.discover.path_suggestion_idx = 0;
+    }
+
+    fn apply_path_suggestion(&mut self) {
+        if let Some(suggestion) = self
+            .discover
+            .path_suggestions
+            .get(self.discover.path_suggestion_idx)
+        {
+            let input = &self.discover.scan_path_input;
+
+            // Find the parent path (everything up to and including the last separator)
+            let parent = if input.ends_with('/') || input.ends_with('\\') {
+                input.clone()
+            } else if let Some(pos) = input.rfind(|c| c == '/' || c == '\\') {
+                input[..=pos].to_string()
+            } else {
+                String::new()
+            };
+
+            // Combine parent with suggestion
+            self.discover.scan_path_input = format!("{}{}", parent, suggestion);
+            self.update_path_suggestions();
+        }
+    }
+
+    fn load_scout_files(&mut self) {
+        self.discover.db_filtered = false;
+
+        if self.discover.pending_select_source_path.is_some() {
+            return;
+        }
+
+        // First check if we have a directly-set source ID (e.g., after scan completion)
+        // This handles the case where sources list hasn't loaded yet
+        let selected_source_id = if let Some(ref id) = self.discover.selected_source_id {
+            id.clone()
+        } else {
+            let source_idx = if self.discover.view_state == DiscoverViewState::SourcesDropdown {
+                self.discover
+                    .preview_source
+                    .unwrap_or_else(|| self.discover.selected_source_index())
+            } else {
+                self.discover.selected_source_index()
+            };
+
+            match self.discover.sources.get(source_idx) {
+                Some(source) => source.id.clone(),
+                None => {
+                    self.discover.files.clear();
+                    self.discover.selected = 0;
+                    self.discover.page_offset = 0;
+                    self.discover.total_files = 0;
+                    self.discover.data_loaded = true;
+                    self.discover.scan_error = if self.discover.sources.is_empty() {
+                        Some("No sources found. Press 's' to scan a folder.".to_string())
+                    } else {
+                        Some("Press 1 to select a source".to_string())
+                    };
+                    return;
+                }
+            }
+        };
+
+        let workspace_id = match self.active_workspace_id() {
+            Some(id) => id,
+            None => {
+                self.discover.scan_error = Some("No workspace selected.".to_string());
+                self.discover.page_offset = 0;
+                self.discover.total_files = 0;
+                self.discover.data_loaded = true;
+                return;
+            }
+        };
+
+        if !self.control_connected {
+            if self.config.standalone_writer || cfg!(test) {
+                self.load_scout_files_offline(workspace_id, selected_source_id);
+                return;
+            }
+            self.discover.scan_error =
+                Some("Sentinel not connected; cannot load files.".to_string());
+            self.discover.page_offset = 0;
+            self.discover.total_files = 0;
+            self.discover.data_loaded = true;
+            return;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.discover.scan_error =
+                    Some("Control API address not configured.".to_string());
+                self.discover.page_offset = 0;
+                self.discover.total_files = 0;
+                self.discover.data_loaded = true;
+                return;
+            }
+        };
+
+        if self.pending_files_load.is_some() {
+            return;
+        }
+
+        let tag_filter = match self.active_discover_tag_filter() {
+            DiscoverTagFilter::All => ScoutTagFilter::All,
+            DiscoverTagFilter::Untagged => ScoutTagFilter::Untagged,
+            DiscoverTagFilter::Tag(tag) => ScoutTagFilter::Tag(tag),
+        };
+        let path_filter = if self.discover.filter.trim().is_empty() {
+            None
+        } else {
+            Some(self.discover.filter.trim().to_string())
+        };
+        let page_size = self.discover.page_size.max(1);
+        let page_offset = self.discover.page_offset;
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_files_load = Some(rx);
+
+        std::thread::spawn(move || {
+            let result: Result<FilesLoadMessage, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
+
+                let page = client
+                    .list_files(
+                        workspace_id,
+                        selected_source_id,
+                        tag_filter,
+                        path_filter,
+                        page_size,
+                        page_offset,
+                    )
+                    .map_err(|err| format!("Files query failed: {}", err))?;
+
+                let files = page
+                    .files
+                    .into_iter()
+                    .map(|file| FileInfo {
+                        file_id: file.id,
+                        path: file.path,
+                        rel_path: file.rel_path,
+                        size: file.size,
+                        modified: Self::millis_to_local(file.mtime)
+                            .unwrap_or_else(Local::now),
+                        is_dir: file.is_dir,
+                        tags: file.tags,
+                    })
+                    .collect();
+
+                Ok(FilesLoadMessage::Complete {
+                    workspace_id,
+                    source_id: selected_source_id,
+                    page_offset,
+                    total_count: page.total_count.max(0) as usize,
+                    files,
+                })
+            })();
+
+            let msg = match result {
+                Ok(msg) => msg,
+                Err(err) => FilesLoadMessage::Error(err),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn load_scout_files_offline(&mut self, workspace_id: WorkspaceId, source_id: SourceId) {
+        if self.pending_files_load.is_some() {
+            return;
+        }
+
+        let tag_filter = self.active_discover_tag_filter();
+        let path_filter = self
+            .discover_path_filter_clause()
+            .and_then(|(clause, value)| match value {
+                DbValue::Text(text) => Some((clause, text)),
+                _ => None,
+            });
+        let page_size = self.discover.page_size.max(1);
+        let page_offset = self.discover.page_offset;
+        let (backend, db_path) = self.resolve_db_target();
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_files_load = Some(rx);
+
+        std::thread::spawn(move || {
+            let result: Result<FilesLoadMessage, String> = (|| {
+                let conn = match App::open_db_readonly_with(backend, &db_path) {
+                    Ok(Some(conn)) => conn,
+                    Ok(None) => return Err("Database not available".to_string()),
+                    Err(err) => return Err(format!("Database open failed: {}", err)),
+                };
+
+                let mut join_clause = String::new();
+                let mut where_clauses = vec![
+                    "f.workspace_id = ?".to_string(),
+                    "f.source_id = ?".to_string(),
+                ];
+                let mut params: Vec<DbValue> = vec![
+                    DbValue::Text(workspace_id.to_string()),
+                    DbValue::Integer(source_id.as_i64()),
+                ];
+
+                match tag_filter {
+                    DiscoverTagFilter::All => {}
+                    DiscoverTagFilter::Untagged => {
+                        join_clause = "LEFT JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id".to_string();
+                        where_clauses.push("t.file_id IS NULL".to_string());
+                    }
+                    DiscoverTagFilter::Tag(tag_name) => {
+                        join_clause = "JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id".to_string();
+                        where_clauses.push("t.tag = ?".to_string());
+                        params.push(DbValue::Text(tag_name));
+                    }
+                }
+
+                if let Some((clause, value)) = path_filter {
+                    where_clauses.push(clause);
+                    params.push(DbValue::Text(value));
+                }
+
+                let where_sql = where_clauses.join(" AND ");
+                let count_sql = format!(
+                    "SELECT COUNT(*) FROM scout_files f {} WHERE {}",
+                    join_clause, where_sql
+                );
+                let total_count = conn
+                    .query_scalar::<i64>(&count_sql, &params)
+                    .map_err(|err| format!("Query failed: {}", err))?
+                    .max(0) as usize;
+
+                let mut query_offset = page_offset;
+                if total_count == 0 {
+                    query_offset = 0;
+                } else {
+                    let max_offset = (total_count.saturating_sub(1) / page_size) * page_size;
+                    if query_offset > max_offset {
+                        query_offset = max_offset;
+                    }
+                }
+
+                let mut page_params = params.clone();
+                page_params.push(DbValue::Integer(page_size as i64));
+                page_params.push(DbValue::Integer(query_offset as i64));
+
+                let query = format!(
+                    "SELECT f.id, f.path, f.rel_path, f.size, f.mtime, f.is_dir \
+                     FROM scout_files f {} \
+                     WHERE {} \
+                     ORDER BY f.rel_path ASC, f.id ASC \
+                     LIMIT ? OFFSET ?",
+                    join_clause, where_sql
+                );
+
+                let rows = conn
+                    .query_all(&query, &page_params)
+                    .map_err(|err| format!("Query failed: {}", err))?;
+
+                let mut files: Vec<FileInfo> = Vec::with_capacity(rows.len());
+                let mut file_ids: Vec<i64> = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let file_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                    let path: String = row.get(1).map_err(|e| e.to_string())?;
+                    let rel_path: String = row.get(2).map_err(|e| e.to_string())?;
+                    let size: i64 = row.get(3).map_err(|e| e.to_string())?;
+                    let mtime_millis: i64 = row.get(4).map_err(|e| e.to_string())?;
+                    let is_dir: i64 = row.get(5).map_err(|e| e.to_string())?;
+
+                    let modified = App::millis_to_local(mtime_millis)
+                        .unwrap_or_else(Local::now);
+
+                    file_ids.push(file_id);
+                    files.push(FileInfo {
+                        file_id,
+                        path,
+                        rel_path,
+                        size: size as u64,
+                        modified,
+                        is_dir: is_dir != 0,
+                        tags: Vec::new(),
+                    });
+                }
+
+                let mut tags_by_file: HashMap<i64, Vec<String>> = HashMap::new();
+                if !file_ids.is_empty() {
+                    let placeholders = std::iter::repeat("?")
+                        .take(file_ids.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let query = format!(
+                        "SELECT file_id, tag FROM scout_file_tags WHERE workspace_id = ? AND file_id IN ({})",
+                        placeholders
+                    );
+                    let mut params: Vec<DbValue> = Vec::with_capacity(file_ids.len() + 1);
+                    params.push(DbValue::Text(workspace_id.to_string()));
+                    params.extend(file_ids.iter().map(|id| DbValue::Integer(*id)));
+
+                    if let Ok(tag_rows) = conn.query_all(&query, &params) {
+                        for row in tag_rows {
+                            let file_id: i64 = match row.get(0) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let tag: String = match row.get(1) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            tags_by_file.entry(file_id).or_default().push(tag);
+                        }
+                    }
+                }
+
+                for (idx, file) in files.iter_mut().enumerate() {
+                    if let Some(tags) = tags_by_file.remove(&file_ids[idx]) {
+                        file.tags = tags;
+                    }
+                }
+
+                Ok(FilesLoadMessage::Complete {
+                    workspace_id,
+                    source_id,
+                    page_offset: query_offset,
+                    total_count,
+                    files,
+                })
+            })();
+
+            let msg = match result {
+                Ok(msg) => msg,
+                Err(err) => FilesLoadMessage::Error(err),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    fn update_folders_from_cache(&mut self) {
+        // Note: profiling zone removed here to avoid borrow conflict with start_folder_query
+
+        if let Some(ref mut explorer) = self.discover.glob_explorer {
+            let prefix = explorer.current_prefix.clone();
+            let pattern = explorer.pattern.clone();
+
+            // Treat "**/*" and "**" as "show all" - use normal folder navigation
+            // Only do recursive search for specific patterns like "**/*.rs"
+            let is_match_all =
+                pattern == "**/*" || pattern == "**" || pattern == "*" || pattern.is_empty();
+
+            // Handle ** patterns with database query (not in-memory cache)
+            // Skip for "match all" patterns - just use folder navigation
+            if pattern.contains("**") && !is_match_all {
+                // Cancel any pending search
+                self.pending_glob_search = None;
+
+                let pattern_for_search = pattern.clone();
+
+                // Get source ID for query
+                let (workspace_id, source_id) =
+                    match (explorer.cache_workspace_id, explorer.cache_source_id) {
+                        (Some(workspace_id), Some(source_id)) => (workspace_id, source_id),
+                        _ => return,
+                    };
+
+                if !self.control_connected {
+                    explorer.folders =
+                        vec![FsEntry::loading("Sentinel not connected; cannot search")];
+                    return;
+                }
+
+                let control_addr = match self.control_addr.clone() {
+                    Some(addr) => addr,
+                    None => {
+                        explorer.folders =
+                            vec![FsEntry::loading("Control API address not configured")];
+                        return;
+                    }
+                };
+
+                // Show loading indicator immediately
+                let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
+                explorer.folders =
+                    vec![FsEntry::loading(&format!("{} Searching...", spinner_char))];
+
+                // Spawn async task for control query
+                let (tx, rx) = mpsc::sync_channel(1);
+                self.pending_glob_search = Some(rx);
+
+                std::thread::spawn(move || {
+                    let pattern_for_msg = pattern_for_search.clone();
+                    let result: Result<GlobSearchResult, String> = (|| {
+                        let client = ControlClient::connect_with_timeout(
+                            &control_addr,
+                            Duration::from_millis(500),
+                        )
+                        .map_err(|err| format!("Control API unavailable: {}", err))?;
+
+                        let glob_pattern = patterns::normalize_glob_pattern(&pattern_for_search);
+                        let result = client
+                            .pattern_query(workspace_id, source_id, glob_pattern, 100, 0)
+                            .map_err(|err| format!("Glob search failed: {}", err))?;
+
+                        let folders: Vec<FsEntry> = result
+                            .files
+                            .into_iter()
+                            .map(|file| {
+                                FsEntry::with_path(
+                                    file.rel_path.clone(),
+                                    Some(file.rel_path),
+                                    1,
+                                    true,
+                                )
+                            })
+                            .collect();
+
+                        Ok(GlobSearchResult {
+                            folders,
+                            total_count: result.total_count.max(0) as usize,
+                            pattern: pattern_for_msg.clone(),
+                            error: None,
+                        })
+                    })();
+
+                    let msg = match result {
+                        Ok(msg) => msg,
+                        Err(err) => GlobSearchResult {
+                            folders: vec![],
+                            total_count: 0,
+                            pattern: pattern_for_msg,
+                            error: Some(err),
+                        },
+                    };
+                    let _ = tx.send(msg);
+                });
+
+                return;
+            }
+
+            // Normal pattern: filter current level only
+            if let Some(cached_folders) = explorer.folder_cache.get(&prefix) {
+                let mut folders: Vec<FsEntry> = if pattern.is_empty() {
+                    cached_folders.clone()
+                } else {
+                    let pattern_lower = pattern.to_lowercase();
+                    cached_folders
+                        .iter()
+                        .filter(|f| {
+                            let name_lower = f.name().to_lowercase();
+                            Self::glob_match_name(&name_lower, &pattern_lower)
+                        })
+                        .cloned()
+                        .collect()
+                };
+
+                // Sort by file count descending (most matches first)
+                folders.sort_by(|a, b| b.file_count().cmp(&a.file_count()));
+
+                explorer.folders = folders.clone();
+                explorer.total_count =
+                    GlobFileCount::Exact(folders.iter().map(|f| f.file_count()).sum());
+                explorer.selected_folder = 0;
+            } else {
+                // Prefix not in cache - trigger async database query
+                let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
+                explorer.folders = vec![FsEntry::loading(&format!(
+                    "{} Loading {}...",
+                    spinner_char,
+                    if prefix.is_empty() { "root" } else { &prefix }
+                ))];
+            }
+        }
+
+        // Check if we need to start a folder query (outside the borrow scope)
+        // Always query DB if cache is empty, even with "**" patterns (need to populate cache first)
+        let needs_query = if let Some(ref explorer) = self.discover.glob_explorer {
+            let prefix = &explorer.current_prefix;
+            !explorer.folder_cache.contains_key(prefix)
+        } else {
+            false
+        };
+
+        if needs_query {
+            if let Some(ref explorer) = self.discover.glob_explorer {
+                if let (Some(source_id), Some(workspace_id)) =
+                    (explorer.cache_source_id, explorer.cache_workspace_id)
+                {
+                    let prefix = explorer.current_prefix.clone();
+                    let pattern = explorer.pattern.clone();
+                    self.start_folder_query(workspace_id, source_id, prefix, pattern);
+                }
+            }
+        }
+    }
+
+    fn start_folder_query(
+        &mut self,
+        workspace_id: WorkspaceId,
+        source_id: SourceId,
+        prefix: String,
+        glob_pattern: String,
+    ) {
+        // Skip if already loading
+        if self.pending_folder_query.is_some() {
+            return;
+        }
+
+        if !self.control_connected {
+            self.pending_folder_query = None;
+            return;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.pending_folder_query = None;
+                return;
+            }
+        };
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_folder_query = Some(rx);
+
+        let glob_opt = if glob_pattern.is_empty() {
+            None
+        } else {
+            Some(glob_pattern)
+        };
+
+        std::thread::spawn(move || {
+            let result: Result<FolderQueryMessage, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
+
+                let (entries, total_count) = client
+                    .list_folders(workspace_id, source_id, prefix.clone(), glob_opt)
+                    .map_err(|err| format!("Folder query failed: {}", err))?;
+
+                let folders: Vec<FsEntry> = entries
+                    .into_iter()
+                    .map(|entry| {
+                        FsEntry::new(entry.name, entry.file_count as usize, entry.is_file)
+                    })
+                    .collect();
+
+                Ok(FolderQueryMessage::Complete {
+                    workspace_id,
+                    prefix,
+                    folders,
+                    total_count: total_count.max(0) as usize,
+                })
+            })();
+
+            let msg = match result {
+                Ok(msg) => msg,
+                Err(err) => FolderQueryMessage::Error(err),
+            };
+            let _ = tx.send(msg);
+        });
+    }
     pub(super) fn resolve_db_target(&self) -> (DbBackend, std::path::PathBuf) {
         if let Some(ref path) = self.config.database {
             (DbBackend::Sqlite, path.clone())
@@ -4331,12 +6315,6 @@ impl App {
             // ?: Toggle help overlay (per spec Section 3.1)
             // Don't intercept when in text input mode
             KeyCode::Char('?') if !self.in_text_input_mode() => {
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    if builder.focus == super::extraction::RuleBuilderFocus::Suggestions {
-                        builder.suggestions_help_open = true;
-                        return;
-                    }
-                }
                 self.show_help = !self.show_help;
                 return;
             }
@@ -4803,67 +6781,84 @@ impl App {
             }
         };
 
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
+        if paths.is_empty() {
+            self.discover.status_message =
+                Some(("No preview results to tag".to_string(), true));
+            return 0;
+        }
+
+        if !self.control_connected {
+            self.discover.status_message = Some((
+                "Sentinel not connected; cannot apply tags".to_string(),
+                true,
+            ));
+            return 0;
+        }
+
+        if self.pending_tag_apply.is_some() {
+            self.discover.status_message =
+                Some(("Tagging already in progress".to_string(), true));
+            return 0;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
                 self.discover.status_message = Some((
-                    "No Scout database found; cannot apply tags".to_string(),
+                    "Control API address not configured".to_string(),
                     true,
                 ));
                 return 0;
             }
-            Err(err) => {
-                self.discover
-                    .status_message
-                    .replace((format!("Database open failed: {}", err), true));
-                return 0;
-            }
         };
 
-        let mut tagged = 0usize;
-        let mut missing = Vec::new();
-        for rel_path in paths {
-            let row = conn
-                .query_optional(
-                    "SELECT id FROM scout_files WHERE workspace_id = ? AND source_id = ? AND rel_path = ?",
-                    &[
-                        DbValue::Text(workspace_id.to_string()),
-                        DbValue::Integer(source_id.as_i64()),
-                        DbValue::Text(rel_path.clone()),
-                    ],
+        let requested = paths.len();
+        let paths_vec: Vec<String> = paths.to_vec();
+        let tag_string = tag.to_string();
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_tag_apply = Some(rx);
+
+        std::thread::spawn(move || {
+            let result: Result<TagApplyResult, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
                 )
-                .ok()
-                .flatten();
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
 
-            match row.and_then(|row| row.get::<i64>(0).ok()) {
-                Some(file_id) => {
-                    if self.queue_tag_for_file(file_id, tag, TagSource::Manual, None, false) {
-                        tagged += 1;
-                    }
+                let (success, tagged_count, message) = client
+                    .apply_tag_to_paths(
+                        workspace_id,
+                        source_id,
+                        paths_vec.clone(),
+                        tag_string.clone(),
+                        TagSource::Manual,
+                    )
+                    .map_err(|err| format!("Tag apply failed: {}", err))?;
+
+                if !success {
+                    return Err(message);
                 }
-                None => missing.push(rel_path.clone()),
-            }
-        }
 
-        if !missing.is_empty() {
-            let preview = missing
-                .iter()
-                .take(5)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.discover.status_message = Some((
-                format!(
-                    "Some preview files are missing in the database ({} missing). Example: {}",
-                    missing.len(),
-                    preview
-                ),
-                true,
-            ));
-        }
+                Ok(TagApplyResult {
+                    tag: tag_string,
+                    paths: paths_vec,
+                    tagged_count,
+                })
+            })();
 
-        tagged
+            let _ = tx.send(result);
+        });
+
+        self.discover.status_message = Some((
+            format!("Tagging {} files with '{}'", requested, tag),
+            false,
+        ));
+
+        requested
     }
+
     fn open_rule_creation_dialog(&mut self) {
         // Determine initial pattern from context
         let initial_pattern = if !self.discover.filter.is_empty() {
@@ -4923,9 +6918,14 @@ impl App {
         builder.selected_preview_files.clear();
         builder.manual_tag_confirm_open = false;
         builder.manual_tag_confirm_count = 0;
+        builder.rule_candidates.clear();
+        builder.selected_candidate = 0;
+        builder.candidate_preview_open = false;
+        builder.sampled_paths_count = 0;
 
         if pattern.is_empty() {
             builder.match_count = 0;
+            builder.last_sample_eval_key = None;
             builder.file_results = super::extraction::FileResultsState::Exploration {
                 folder_matches: Vec::new(),
                 expanded_folder_indices: std::collections::HashSet::new(),
@@ -4947,7 +6947,6 @@ impl App {
     }
     fn update_rule_builder_exploration(&mut self, pattern: &str) {
         use super::extraction::FolderMatch;
-        use super::pattern_query::PatternQuery;
 
         let (workspace_id, source_id) = match (
             self.active_workspace_id(),
@@ -4983,7 +6982,6 @@ impl App {
             }
         };
 
-        // Build glob matcher (validate)
         let glob_pattern = patterns::normalize_glob_pattern(pattern);
         if patterns::build_matcher(&glob_pattern).is_err() {
             if let Some(builder) = self.discover.rule_builder.as_mut() {
@@ -4998,7 +6996,6 @@ impl App {
             return;
         }
 
-        // Show loading indicator
         if let Some(builder) = self.discover.rule_builder.as_mut() {
             builder.match_count = 0;
             builder.is_streaming = true;
@@ -5010,7 +7007,6 @@ impl App {
             };
         }
 
-        let (backend, db_path) = self.resolve_db_target();
         let exclude_patterns = self
             .discover
             .rule_builder
@@ -5018,140 +7014,140 @@ impl App {
             .map(|b| b.excludes.clone())
             .unwrap_or_default();
 
-        // Spawn async database search
-        let pattern_for_msg = pattern.to_string();
+        let pattern_for_thread = pattern.to_string();
         let glob_pattern_for_query = glob_pattern.clone();
         let (tx, rx) = mpsc::sync_channel(1);
         self.pending_rule_builder_search = Some(rx);
 
-        std::thread::spawn(move || {
-            let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    let _ = tx.send(RuleBuilderSearchResult {
-                        folder_matches: vec![],
-                        total_count: 0,
-                        pattern: pattern_for_msg,
-                        error: Some("Database not available".to_string()),
-                    });
-                    return;
-                }
-                Err(err) => {
-                    let _ = tx.send(RuleBuilderSearchResult {
-                        folder_matches: vec![],
-                        total_count: 0,
-                        pattern: pattern_for_msg,
-                        error: Some(format!("Database open failed: {}", err)),
-                    });
-                    return;
-                }
-            };
-
-            let matcher = match patterns::build_matcher(&glob_pattern_for_query) {
-                Ok(m) => m,
-                Err(err) => {
-                    let _ = tx.send(RuleBuilderSearchResult {
-                        folder_matches: vec![],
-                        total_count: 0,
-                        pattern: pattern_for_msg,
-                        error: Some(format!("Invalid pattern: {}", err)),
-                    });
-                    return;
-                }
-            };
-
-            let exclude_matchers: Vec<globset::GlobMatcher> = exclude_patterns
-                .into_iter()
-                .filter_map(|pattern| {
-                    let glob = patterns::normalize_glob_pattern(&pattern);
-                    patterns::build_matcher(&glob).ok()
-                })
-                .collect();
-
-            let query = PatternQuery::from_glob(&glob_pattern_for_query);
-            let total_count = match query.count_files(&conn, workspace_id, source_id) {
-                Ok(count) => count as usize,
-                Err(err) => {
-                    let _ = tx.send(RuleBuilderSearchResult {
-                        folder_matches: vec![],
-                        total_count: 0,
-                        pattern: pattern_for_msg,
-                        error: Some(format!("Rule builder query failed: {}", err)),
-                    });
-                    return;
-                }
-            };
-
-            let results = match query.search_files(&conn, workspace_id, source_id, 1000, 0) {
-                Ok(results) => results,
-                Err(err) => {
-                    let _ = tx.send(RuleBuilderSearchResult {
-                        folder_matches: vec![],
-                        total_count: 0,
-                        pattern: pattern_for_msg,
-                        error: Some(format!("Rule builder query failed: {}", err)),
-                    });
-                    return;
-                }
-            };
-
-            // Group by parent folder
-            let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
-                std::collections::HashMap::new();
-
-            for (rel_path, _size, _mtime) in results {
-                if !matcher.is_match(&rel_path) {
-                    continue;
-                }
-                if exclude_matchers.iter().any(|m| m.is_match(&rel_path)) {
-                    continue;
-                }
-                // Extract parent folder from path
-                let folder = if let Some(idx) = rel_path.rfind('/') {
-                    rel_path[..idx].to_string()
-                } else {
-                    ".".to_string()
+        if !self.control_connected {
+            if let Some(builder) = self.discover.rule_builder.as_mut() {
+                builder.match_count = 0;
+                builder.pattern_error = Some("Sentinel not connected".to_string());
+                builder.file_results = super::extraction::FileResultsState::Exploration {
+                    folder_matches: Vec::new(),
+                    expanded_folder_indices: std::collections::HashSet::new(),
+                    detected_patterns: Vec::new(),
                 };
-                let filename = rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string();
-                let entry = folder_counts.entry(folder).or_insert((0, filename));
-                entry.0 += 1;
             }
+            return;
+        }
 
-            // Convert to FolderMatch
-            let mut folder_matches: Vec<FolderMatch> = folder_counts
-                .into_iter()
-                .map(|(path, (count, sample))| FolderMatch {
-                    path: if path == "." {
-                        "./".to_string()
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    builder.match_count = 0;
+                    builder.pattern_error =
+                        Some("Control API address not configured".to_string());
+                    builder.file_results = super::extraction::FileResultsState::Exploration {
+                        folder_matches: Vec::new(),
+                        expanded_folder_indices: std::collections::HashSet::new(),
+                        detected_patterns: Vec::new(),
+                    };
+                }
+                return;
+            }
+        };
+
+        std::thread::spawn(move || {
+            let pattern_for_msg = pattern_for_thread.clone();
+            let result: Result<RuleBuilderSearchResult, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
+
+                let matcher = patterns::build_matcher(&glob_pattern_for_query)
+                    .map_err(|err| format!("Invalid pattern: {}", err))?;
+
+                let exclude_matchers: Vec<globset::GlobMatcher> = exclude_patterns
+                    .into_iter()
+                    .filter_map(|pattern| {
+                        let glob = patterns::normalize_glob_pattern(&pattern);
+                        patterns::build_matcher(&glob).ok()
+                    })
+                    .collect();
+
+                let result = client
+                    .pattern_query(
+                        workspace_id,
+                        source_id,
+                        glob_pattern_for_query.clone(),
+                        1000,
+                        0,
+                    )
+                    .map_err(|err| format!("Rule builder query failed: {}", err))?;
+
+                let mut folder_counts: std::collections::HashMap<String, (usize, String)> =
+                    std::collections::HashMap::new();
+
+                for file in result.files {
+                    let rel_path = file.rel_path;
+                    if !matcher.is_match(&rel_path) {
+                        continue;
+                    }
+                    if exclude_matchers.iter().any(|m| m.is_match(&rel_path)) {
+                        continue;
+                    }
+                    let folder = if let Some(idx) = rel_path.rfind('/') {
+                        rel_path[..idx].to_string()
                     } else {
-                        format!("{}/", path)
-                    },
-                    count,
-                    sample_filename: sample,
-                    files: Vec::new(),
+                        ".".to_string()
+                    };
+                    let filename =
+                        rel_path.rsplit('/').next().unwrap_or(&rel_path).to_string();
+                    let entry = folder_counts.entry(folder).or_insert((0, filename));
+                    entry.0 += 1;
+                }
+
+                let mut folder_matches: Vec<FolderMatch> = folder_counts
+                    .into_iter()
+                    .map(|(path, (count, sample))| FolderMatch {
+                        path: if path == "." {
+                            "./".to_string()
+                        } else {
+                            format!("{}/", path)
+                        },
+                        count,
+                        sample_filename: sample,
+                        files: Vec::new(),
+                    })
+                    .collect();
+
+                folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
+
+                Ok(RuleBuilderSearchResult {
+                    folder_matches,
+                    total_count: result.total_count.max(0) as usize,
+                    pattern: pattern_for_msg.clone(),
+                    error: None,
                 })
-                .collect();
+            })();
 
-            folder_matches.sort_by(|a, b| b.count.cmp(&a.count));
-
-            let _ = tx.send(RuleBuilderSearchResult {
-                folder_matches,
-                total_count,
-                pattern: pattern_for_msg,
-                error: None,
-            });
+            let msg = match result {
+                Ok(msg) => msg,
+                Err(err) => RuleBuilderSearchResult {
+                    folder_matches: vec![],
+                    total_count: 0,
+                    pattern: pattern_for_msg,
+                    error: Some(err),
+                },
+            };
+            let _ = tx.send(msg);
         });
     }
-    fn update_rule_builder_extraction_preview(&mut self, pattern: &str) {
-        use super::extraction::{extract_field_values, parse_custom_glob, ExtractionPreviewFile};
-        use super::pattern_query::PatternQuery;
 
-        // Check rule_builder exists first (early return)
+    fn update_rule_builder_extraction_preview(&mut self, pattern: &str) {
+        use super::extraction::{
+            extract_field_values, parse_custom_glob, sync_extractions_from_custom_pattern,
+            ExtractionPreviewFile,
+        };
+
         if self.discover.rule_builder.is_none() {
             return;
         }
 
-        // Parse custom glob pattern (doesn't need folder_cache)
         let parsed = match parse_custom_glob(pattern) {
             Ok(p) => p,
             Err(e) => {
@@ -5166,22 +7162,26 @@ impl App {
             }
         };
 
-        // Build glob matcher
+        if let Some(builder) = self.discover.rule_builder.as_mut() {
+            if let Err(err) = sync_extractions_from_custom_pattern(builder) {
+                builder.pattern_error = Some(err.message);
+            } else {
+                builder.pattern_error = None;
+            }
+        }
+
         let glob_pattern = patterns::normalize_glob_pattern(&parsed.glob_pattern);
 
-        let matcher = match patterns::build_matcher(&glob_pattern) {
-            Ok(m) => m,
-            Err(_) => {
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.match_count = 0;
-                    builder.pattern_error = Some("Invalid glob pattern".to_string());
-                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
-                        preview_files: Vec::new(),
-                    };
-                }
-                return;
+        if patterns::build_matcher(&glob_pattern).is_err() {
+            if let Some(builder) = self.discover.rule_builder.as_mut() {
+                builder.match_count = 0;
+                builder.pattern_error = Some("Invalid glob pattern".to_string());
+                builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                    preview_files: Vec::new(),
+                };
             }
-        };
+            return;
+        }
 
         let (workspace_id, source_id) = match (
             self.active_workspace_id(),
@@ -5213,103 +7213,119 @@ impl App {
             }
         };
 
-        let exclude_matchers: Vec<globset::GlobMatcher> = self
+        if !self.control_connected {
+            if let Some(builder) = self.discover.rule_builder.as_mut() {
+                builder.match_count = 0;
+                builder.pattern_error = Some("Sentinel not connected".to_string());
+                builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                    preview_files: Vec::new(),
+                };
+            }
+            return;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                if let Some(builder) = self.discover.rule_builder.as_mut() {
+                    builder.match_count = 0;
+                    builder.pattern_error =
+                        Some("Control API address not configured".to_string());
+                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
+                        preview_files: Vec::new(),
+                    };
+                }
+                return;
+            }
+        };
+
+        if let Some(builder) = self.discover.rule_builder.as_mut() {
+            builder.match_count = 0;
+            builder.is_streaming = true;
+        }
+
+        let exclude_patterns = self
             .discover
             .rule_builder
             .as_ref()
             .map(|b| b.excludes.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|pattern| {
-                let glob = patterns::normalize_glob_pattern(&pattern);
-                patterns::build_matcher(&glob).ok()
-            })
-            .collect();
+            .unwrap_or_default();
 
-        let is_excluded = |path: &str| exclude_matchers.iter().any(|m| m.is_match(path));
+        let pattern_for_thread = pattern.to_string();
+        let glob_pattern_for_query = glob_pattern.clone();
+        let parsed_for_thread = parsed.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_rule_builder_preview = Some(rx);
 
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
-                self.report_db_error("Rule builder preview failed", "Database not available");
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.match_count = 0;
-                    builder.pattern_error = None;
-                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
-                        preview_files: Vec::new(),
-                    };
+        std::thread::spawn(move || {
+            let pattern_for_msg = pattern_for_thread.clone();
+            let result: Result<RuleBuilderPreviewResult, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
+
+                let matcher = patterns::build_matcher(&glob_pattern_for_query)
+                    .map_err(|err| format!("Invalid glob pattern: {}", err))?;
+
+                let exclude_matchers: Vec<globset::GlobMatcher> = exclude_patterns
+                    .into_iter()
+                    .filter_map(|pattern| {
+                        let glob = patterns::normalize_glob_pattern(&pattern);
+                        patterns::build_matcher(&glob).ok()
+                    })
+                    .collect();
+
+                let is_excluded = |path: &str| exclude_matchers.iter().any(|m| m.is_match(path));
+
+                let result = client
+                    .pattern_query(
+                        workspace_id,
+                        source_id,
+                        glob_pattern_for_query.clone(),
+                        2000,
+                        0,
+                    )
+                    .map_err(|err| format!("Rule builder query failed: {}", err))?;
+
+                let mut preview_files = Vec::new();
+                for file in result.files {
+                    let rel_path = file.rel_path;
+                    if matcher.is_match(&rel_path) && !is_excluded(&rel_path) {
+                        if preview_files.len() < 100 {
+                            let extractions = extract_field_values(&rel_path, &parsed_for_thread);
+                            preview_files.push(ExtractionPreviewFile {
+                                path: rel_path.clone(),
+                                relative_path: rel_path,
+                                extractions,
+                                warnings: Vec::new(),
+                            });
+                        }
+                    }
                 }
-                return;
-            }
-            Err(err) => {
-                self.report_db_error("Rule builder preview failed", err);
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.match_count = 0;
-                    builder.pattern_error = None;
-                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
-                        preview_files: Vec::new(),
-                    };
-                }
-                return;
-            }
-        };
 
-        let query = PatternQuery::from_glob(&glob_pattern);
-        let total_count = match query.count_files(&conn, workspace_id, source_id) {
-            Ok(count) => count.max(0) as usize,
-            Err(err) => {
-                self.report_db_error("Rule builder preview failed", err);
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.match_count = 0;
-                    builder.pattern_error = None;
-                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
-                        preview_files: Vec::new(),
-                    };
-                }
-                return;
-            }
-        };
+                Ok(RuleBuilderPreviewResult {
+                    preview_files,
+                    total_count: result.total_count.max(0) as usize,
+                    pattern: pattern_for_msg.clone(),
+                    error: None,
+                })
+            })();
 
-        let results = match query.search_files(&conn, workspace_id, source_id, 2000, 0) {
-            Ok(results) => results,
-            Err(err) => {
-                self.report_db_error("Rule builder preview failed", err);
-                if let Some(builder) = self.discover.rule_builder.as_mut() {
-                    builder.match_count = 0;
-                    builder.pattern_error = None;
-                    builder.file_results = super::extraction::FileResultsState::ExtractionPreview {
-                        preview_files: Vec::new(),
-                    };
-                }
-                return;
-            }
-        };
-
-        let mut preview_files = Vec::new();
-        for (rel_path, _size, _mtime) in results {
-            if matcher.is_match(&rel_path) && !is_excluded(&rel_path) {
-                if preview_files.len() < 100 {
-                    let extractions = extract_field_values(&rel_path, &parsed);
-                    preview_files.push(ExtractionPreviewFile {
-                        path: rel_path.clone(),
-                        relative_path: rel_path,
-                        extractions,
-                        warnings: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        // Convert to preview files with extractions
-        // Update builder with mutable borrow
-        if let Some(builder) = self.discover.rule_builder.as_mut() {
-            builder.pattern_error = None;
-            builder.match_count = total_count;
-            builder.file_results =
-                super::extraction::FileResultsState::ExtractionPreview { preview_files };
-            builder.selected_file = 0;
-        }
+            let msg = match result {
+                Ok(msg) => msg,
+                Err(err) => RuleBuilderPreviewResult {
+                    preview_files: Vec::new(),
+                    total_count: 0,
+                    pattern: pattern_for_msg,
+                    error: Some(err),
+                },
+            };
+            let _ = tx.send(msg);
+        });
     }
+
     fn close_rule_creation_dialog(&mut self) {
         self.return_to_previous_discover_state();
         self.discover.rule_pattern_input.clear();
@@ -5360,7 +7376,7 @@ impl App {
             }
         }
     }
-    fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> Option<(TaggingRuleId, usize)> {
+    fn apply_rule_to_files(&mut self, pattern: &str, tag: &str) -> Option<TaggingRuleId> {
         if self.mutations_blocked() {
             let message = BackendRouter::new(
                 self.control_addr.clone(),
@@ -5397,151 +7413,80 @@ impl App {
             }
         };
 
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
+        if !self.control_connected {
+            self.discover.status_message = Some((
+                "Sentinel not connected; cannot apply rules".to_string(),
+                true,
+            ));
+            return None;
+        }
+
+        if self.pending_rule_apply.is_some() {
+            self.discover.status_message =
+                Some(("Rule apply already in progress".to_string(), true));
+            return None;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
                 self.discover.status_message = Some((
-                    "No Scout database found; cannot apply rules".to_string(),
+                    "Control API address not configured".to_string(),
                     true,
                 ));
                 return None;
             }
-            Err(err) => {
-                self.discover
-                    .status_message
-                    .replace((format!("Database open failed: {}", err), true));
-                return None;
-            }
         };
-
-        let rows = match conn.query_all(
-            "SELECT id, path, rel_path, size FROM scout_files WHERE workspace_id = ? AND source_id = ? ORDER BY rel_path",
-            &[
-                DbValue::Text(workspace_id.to_string()),
-                DbValue::Integer(source_id.as_i64()),
-            ],
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                self.discover
-                    .status_message
-                    .replace((format!("Rule apply query failed: {}", err), true));
-                return None;
-            }
-        };
-
-        let mut files: Vec<RuleApplyFile> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: i64 = match row.get(0) {
-                Ok(v) => v,
-                Err(err) => {
-                    self.discover
-                        .status_message
-                        .replace((format!("Rule apply parse failed: {}", err), true));
-                    return None;
-                }
-            };
-            let path: String = match row.get(1) {
-                Ok(v) => v,
-                Err(err) => {
-                    self.discover
-                        .status_message
-                        .replace((format!("Rule apply parse failed: {}", err), true));
-                    return None;
-                }
-            };
-            let rel_path: String = match row.get(2) {
-                Ok(v) => v,
-                Err(err) => {
-                    self.discover
-                        .status_message
-                        .replace((format!("Rule apply parse failed: {}", err), true));
-                    return None;
-                }
-            };
-            let size: i64 = match row.get(3) {
-                Ok(v) => v,
-                Err(err) => {
-                    self.discover
-                        .status_message
-                        .replace((format!("Rule apply parse failed: {}", err), true));
-                    return None;
-                }
-            };
-
-            files.push(RuleApplyFile {
-                id,
-                path,
-                rel_path,
-                size,
-            });
-        }
 
         let rule_id = TaggingRuleId::new();
-        let rules = vec![RuleApplyRule {
-            id: rule_id,
-            pattern: pattern.to_string(),
-            tag: tag.to_string(),
-            priority: 100,
-        }];
+        let rule_id_for_thread = rule_id.clone();
+        let pattern_string = pattern.to_string();
+        let tag_string = tag.to_string();
 
-        let (matches, _summary) = match match_rules_to_files(&files, &rules) {
-            Ok(result) => result,
-            Err(err) => {
-                self.discover
-                    .status_message
-                    .replace((format!("Invalid rule pattern '{}': {}", pattern, err), true));
-                return None;
-            }
-        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_rule_apply = Some(rx);
 
-        let tagged_rows = match conn.query_all(
-            "SELECT file_id FROM scout_file_tags WHERE workspace_id = ? AND tag = ?",
-            &[
-                DbValue::Text(workspace_id.to_string()),
-                DbValue::Text(tag.to_string()),
-            ],
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                self.discover
-                    .status_message
-                    .replace((format!("Rule apply tag lookup failed: {}", err), true));
-                return None;
-            }
-        };
-        let mut tagged_ids = HashSet::new();
-        for row in tagged_rows {
-            if let Ok(file_id) = row.get::<i64>(0) {
-                tagged_ids.insert(file_id);
-            }
-        }
+        std::thread::spawn(move || {
+            let result: Result<RuleApplyResult, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
 
-        let mut tagged_count = 0;
-        for matched in matches {
-            if tagged_ids.contains(&matched.file_id) {
-                continue;
-            }
-            if self.queue_tag_for_file(
-                matched.file_id,
-                &matched.tag,
-                TagSource::Rule,
-                Some(rule_id),
-                false,
-            ) {
-                tagged_count += 1;
-            }
-        }
+                let (success, tagged_count, message) = client
+                    .apply_rule_to_source(
+                        rule_id_for_thread.clone(),
+                        workspace_id,
+                        source_id,
+                        pattern_string.clone(),
+                        tag_string.clone(),
+                    )
+                    .map_err(|err| format!("Rule apply failed: {}", err))?;
 
-        self.discover.pending_rule_writes.push(PendingRuleWrite {
-            id: rule_id,
-            workspace_id,
-            pattern: pattern.to_string(),
-            tag: tag.to_string(),
+                if !success {
+                    return Err(message);
+                }
+
+                Ok(RuleApplyResult {
+                    rule_id: rule_id_for_thread,
+                    pattern: pattern_string,
+                    tag: tag_string,
+                    tagged_count,
+                })
+            })();
+
+            let _ = tx.send(result);
         });
 
-        Some((rule_id, tagged_count))
+        self.discover.status_message = Some((
+            format!("Applying rule: {} → {}", pattern, tag),
+            false,
+        ));
+
+        Some(rule_id)
     }
+
     fn refresh_tags_list(&mut self) {
         let workspace_id = match self.active_workspace_id() {
             Some(id) => id,
@@ -5574,1823 +7519,88 @@ impl App {
             }
         };
 
-        if self.control_connected {
-            let control_addr = match self.control_addr.clone() {
-                Some(addr) => addr,
-                None => {
-                    self.discover.tags = vec![TagInfo {
-                        name: "All files".to_string(),
-                        count: 0,
-                        is_special: true,
-                    }];
-                    self.discover.available_tags.clear();
-                    return;
-                }
-            };
-            let client = match ControlClient::connect_with_timeout(
-                &control_addr,
-                Duration::from_millis(500),
-            ) {
-                Ok(client) => client,
-                Err(err) => {
-                    self.report_db_error("Tags load failed", err);
-                    self.discover.tags = vec![TagInfo {
-                        name: "All files".to_string(),
-                        count: 0,
-                        is_special: true,
-                    }];
-                    self.discover.available_tags.clear();
-                    return;
-                }
-            };
-            let stats = match client.list_tags(workspace_id, source_id) {
-                Ok(stats) => stats,
-                Err(err) => {
-                    self.report_db_error("Tags load failed", err);
-                    self.discover.tags = vec![TagInfo {
-                        name: "All files".to_string(),
-                        count: 0,
-                        is_special: true,
-                    }];
-                    self.discover.available_tags.clear();
-                    return;
-                }
-            };
-
-            let mut tags = Vec::new();
-            let total_count = stats.total_files.max(0) as usize;
-            tags.push(TagInfo {
+        if !self.control_connected {
+            self.discover.tags = vec![TagInfo {
                 name: "All files".to_string(),
-                count: total_count,
+                count: 0,
                 is_special: true,
-            });
-
-            let mut available_tags = Vec::new();
-            for entry in stats.tags {
-                if entry.count <= 0 {
-                    continue;
-                }
-                available_tags.push(entry.tag.clone());
-                tags.push(TagInfo {
-                    name: entry.tag,
-                    count: entry.count as usize,
-                    is_special: false,
-                });
-            }
-
-            if stats.untagged_files > 0 {
-                tags.push(TagInfo {
-                    name: "untagged".to_string(),
-                    count: stats.untagged_files as usize,
-                    is_special: true,
-                });
-            }
-
-            self.discover.available_tags = available_tags;
-            self.discover.tags = tags;
-            if let Some(selected_tag) = self.discover.selected_tag {
-                if selected_tag >= self.discover.tags.len() {
-                    self.discover.selected_tag = None;
-                }
-            }
+            }];
+            self.discover.available_tags.clear();
             return;
         }
-
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
-                self.discover.tags = vec![TagInfo {
-                    name: "All files".to_string(),
-                    count: 0,
-                    is_special: true,
-                }];
-                self.discover.available_tags.clear();
-                return;
-            }
-            Err(err) => {
-                self.report_db_error("Tags load failed", err);
-                self.discover.tags = vec![TagInfo {
-                    name: "All files".to_string(),
-                    count: 0,
-                    is_special: true,
-                }];
-                self.discover.available_tags.clear();
-                return;
-            }
-        };
-
-        let total_count = match conn.query_scalar::<i64>(
-            "SELECT COUNT(*) FROM scout_files WHERE workspace_id = ? AND source_id = ?",
-            &[
-                DbValue::Text(workspace_id.to_string()),
-                DbValue::Integer(source_id.as_i64()),
-            ],
-        ) {
-            Ok(count) => count.max(0) as usize,
-            Err(err) => {
-                self.report_db_error("Tags load failed", err);
-                return;
-            }
-        };
-
-        let rows = match conn.query_all(
-            "SELECT t.tag, COUNT(*) AS count \
-             FROM scout_file_tags t \
-             JOIN scout_files f ON f.id = t.file_id AND f.workspace_id = t.workspace_id \
-             WHERE f.workspace_id = ? AND f.source_id = ? \
-             GROUP BY t.tag \
-             ORDER BY count DESC, t.tag",
-            &[
-                DbValue::Text(workspace_id.to_string()),
-                DbValue::Integer(source_id.as_i64()),
-            ],
-        ) {
-            Ok(rows) => rows,
-            Err(err) => {
-                self.report_db_error("Tags load failed", err);
-                return;
-            }
-        };
-
-        let mut tags = Vec::new();
-        tags.push(TagInfo {
-            name: "All files".to_string(),
-            count: total_count,
-            is_special: true,
-        });
-
-        let mut available_tags = Vec::new();
-        for row in rows {
-            let tag: String = match row.get(0) {
-                Ok(value) => value,
-                Err(err) => {
-                    self.report_db_error("Tags load failed", err);
-                    return;
-                }
-            };
-            let count: i64 = match row.get(1) {
-                Ok(value) => value,
-                Err(err) => {
-                    self.report_db_error("Tags load failed", err);
-                    return;
-                }
-            };
-            let count = count.max(0) as usize;
-            if count == 0 {
-                continue;
-            }
-            available_tags.push(tag.clone());
-            tags.push(TagInfo {
-                name: tag,
-                count,
-                is_special: false,
-            });
-        }
-
-        let untagged_count = match conn.query_scalar::<i64>(
-            "SELECT COUNT(*) \
-             FROM scout_files f \
-             LEFT JOIN scout_file_tags t \
-                ON t.file_id = f.id AND t.workspace_id = f.workspace_id \
-             WHERE f.workspace_id = ? AND f.source_id = ? AND t.file_id IS NULL",
-            &[
-                DbValue::Text(workspace_id.to_string()),
-                DbValue::Integer(source_id.as_i64()),
-            ],
-        ) {
-            Ok(count) => count.max(0) as usize,
-            Err(err) => {
-                self.report_db_error("Tags load failed", err);
-                return;
-            }
-        };
-
-        if untagged_count > 0 {
-            tags.push(TagInfo {
-                name: "untagged".to_string(),
-                count: untagged_count,
-                is_special: true,
-            });
-        }
-
-        self.discover.available_tags = available_tags;
-        self.discover.tags = tags;
-        if let Some(selected_tag) = self.discover.selected_tag {
-            if selected_tag >= self.discover.tags.len() {
-                self.discover.selected_tag = None;
-            }
-        }
-    }
-    fn refresh_current_view(&mut self) {
-        match self.mode {
-            TuiMode::Home => {
-                // Mark stats as needing refresh - will trigger reload on next tick
-                self.home.stats_loaded = false;
-            }
-            TuiMode::Ingest => match self.ingest_tab {
-                IngestTab::Sources => {
-                    self.discover.sources_loaded = false;
-                }
-                _ => {
-                    self.discover.data_loaded = false;
-                    self.discover.db_filtered = false;
-                    self.refresh_tags_list();
-                }
-            },
-            TuiMode::Run => match self.run_tab {
-                RunTab::Jobs => {
-                    self.jobs_state.jobs_loaded = false;
-                    self.last_jobs_poll = None;
-                    self.jobs_state.selected_index = 0;
-                    self.jobs_state.section_focus = JobsListSection::Actionable;
-                    self.jobs_state.actionable_index = 0;
-                    self.jobs_state.ready_index = 0;
-                    self.jobs_state.pinned_job_id = None;
-                }
-                RunTab::Outputs => {
-                    self.catalog_state.loaded = false;
-                }
-            },
-            TuiMode::Review => match self.review_tab {
-                ReviewTab::Approvals => {
-                    self.approvals_state.approvals_loaded = false;
-                }
-                ReviewTab::Sessions => {
-                    self.sessions_state.sessions_loaded = false;
-                }
-                ReviewTab::Triage => {
-                    self.triage_state.loaded = false;
-                }
-            },
-            TuiMode::Query => {}
-            TuiMode::Settings => {}
-        }
-    }
-    fn in_text_input_mode(&self) -> bool {
-        // Command palette is always a text input mode when visible
-        if self.command_palette.visible {
-            return true;
-        }
-        if self.workspace_switcher.visible
-            && self.workspace_switcher.mode == WorkspaceSwitcherMode::Creating
-        {
-            return true;
-        }
-        match self.mode {
-            TuiMode::Ingest => {
-                if self.ingest_tab == IngestTab::Sources {
-                    return self.sources_state.editing;
-                }
-                if let Some(ref explorer) = self.discover.glob_explorer {
-                    if matches!(explorer.phase, GlobExplorerPhase::Filtering) {
-                        return true;
-                    }
-                }
-                if self.discover.sources_filtering || self.discover.tags_filtering {
-                    return true;
-                }
-                if self.discover.view_state == DiscoverViewState::RuleBuilder {
-                    if let Some(ref builder) = self.discover.rule_builder {
-                        use super::extraction::RuleBuilderFocus;
-                        if matches!(
-                            builder.focus,
-                            RuleBuilderFocus::Pattern
-                                | RuleBuilderFocus::Tag
-                                | RuleBuilderFocus::ExcludeInput
-                                | RuleBuilderFocus::ExtractionEdit(_)
-                        ) {
-                            return true;
-                        }
-                    }
-                }
-                matches!(
-                    self.discover.view_state,
-                    DiscoverViewState::Filtering
-                        | DiscoverViewState::EnteringPath
-                        | DiscoverViewState::ScanConfirm
-                        | DiscoverViewState::Tagging
-                        | DiscoverViewState::CreatingSource
-                        | DiscoverViewState::BulkTagging
-                        | DiscoverViewState::RuleCreation
-                        | DiscoverViewState::SourcesDropdown
-                        | DiscoverViewState::TagsDropdown
-                        | DiscoverViewState::SourceEdit
-                )
-            }
-            TuiMode::Review => {
-                matches!(
-                    self.review_tab,
-                    ReviewTab::Approvals
-                ) && self.approvals_state.view_state == ApprovalsViewState::ConfirmReject
-            }
-            TuiMode::Query => self.query_state.view_state == QueryViewState::Editing,
-            _ => false,
-        }
-    }
-
-    pub fn is_text_input_mode(&self) -> bool {
-        self.in_text_input_mode()
-    }
-
-    pub fn filtered_files(&self) -> Vec<&FileInfo> {
-        if self.discover.files.is_empty() {
-            return Vec::new();
-        }
-
-        let tag_filter = self.active_discover_tag_filter();
-        let filter_raw = self.discover.filter.trim();
-        let has_text_filter = !filter_raw.is_empty();
-        let has_tag_filter = !matches!(tag_filter, DiscoverTagFilter::All);
-
-        if !has_text_filter && !has_tag_filter {
-            return self.discover.files.iter().collect();
-        }
-
-        let use_glob = has_text_filter
-            && (filter_raw.contains('*') || filter_raw.contains('?') || filter_raw.contains('['));
-        let matcher = if use_glob {
-            let glob_pattern = patterns::normalize_glob_pattern(filter_raw);
-            patterns::build_matcher(&glob_pattern).ok()
-        } else {
-            None
-        };
-        let filter_lower = if has_text_filter && matcher.is_none() {
-            Some(filter_raw.to_lowercase())
-        } else {
-            None
-        };
-
-        self.discover
-            .files
-            .iter()
-            .filter(|file| match &tag_filter {
-                DiscoverTagFilter::All => true,
-                DiscoverTagFilter::Untagged => file.tags.is_empty(),
-                DiscoverTagFilter::Tag(tag) => file.tags.iter().any(|t| t == tag),
-            })
-            .filter(|file| {
-                if !has_text_filter {
-                    return true;
-                }
-                if let Some(matcher) = matcher.as_ref() {
-                    let rel = file.rel_path.trim_start_matches('/');
-                    let abs = file.path.trim_start_matches('/');
-                    matcher.is_match(rel) || matcher.is_match(abs)
-                } else if let Some(filter) = filter_lower.as_ref() {
-                    let rel = file.rel_path.to_lowercase();
-                    let abs = file.path.to_lowercase();
-                    rel.contains(filter) || abs.contains(filter)
-                } else {
-                    true
-                }
-            })
-            .collect()
-    }
-
-    pub fn discover_page_bounds(&self) -> (usize, usize, usize) {
-        let total = if self.discover.db_filtered {
-            self.discover.total_files
-        } else {
-            self.filtered_files().len()
-        };
-
-        if total == 0 {
-            return (0, 0, 0);
-        }
-
-        if self.discover.db_filtered {
-            let start = self.discover.page_offset + 1;
-            let end = (self.discover.page_offset + self.discover.files.len()).min(total);
-            (start, end, total)
-        } else {
-            (1, total, total)
-        }
-    }
-
-    pub fn view_label(&self) -> String {
-        match self.mode {
-            TuiMode::Home => "Home".to_string(),
-            TuiMode::Ingest => format!("Ingest/{}", self.ingest_tab.label()),
-            TuiMode::Run => format!("Run/{}", self.run_tab.label()),
-            TuiMode::Review => format!("Review/{}", self.review_tab.label()),
-            TuiMode::Query => "Query".to_string(),
-            TuiMode::Settings => "Settings".to_string(),
-        }
-    }
-
-    pub fn ui_signature(&self) -> UiSignature {
-        UiSignature::from_app(self)
-    }
-
-    pub fn ui_signature_key(&self) -> String {
-        self.ui_signature().key()
-    }
-
-    #[cfg(feature = "profiling")]
-    pub fn check_profiler_dump(&self) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        static DUMPED: AtomicBool = AtomicBool::new(false);
-        let Ok(spec) = std::env::var("CASPARIAN_TUI_PROFILE_DUMP") else {
-            return;
-        };
-        let spec = spec.trim();
-        if spec.is_empty() {
-            return;
-        }
-        if DUMPED.swap(true, Ordering::Relaxed) {
-            return;
-        }
-
-        let path = if spec == "1" || spec.eq_ignore_ascii_case("true") {
-            casparian_home().join("tui_profile_dump.txt")
-        } else {
-            std::path::PathBuf::from(spec)
-        };
-
-        let mut output = String::new();
-        output.push_str(&self.profiler.export_summary());
-        output.push('\n');
-        output.push_str("frames_tsv:\n");
-        output.push_str(&self.profiler.export_frames_tsv(120));
-        output.push_str("\nzones:\n");
-        output.push_str(&self.profiler.export_zones());
-
-        if let Err(err) = std::fs::write(&path, output) {
-            tracing::warn!(error = %err, path = %path.display(), "Profiler dump failed");
-        }
-    }
-
-    fn active_discover_tag_filter(&self) -> DiscoverTagFilter {
-        let active_tag_idx = if self.discover.view_state == DiscoverViewState::TagsDropdown {
-            self.discover.preview_tag
-        } else {
-            self.discover.selected_tag
-        };
-
-        match active_tag_idx {
-            None => DiscoverTagFilter::All,
-            Some(idx) => match self.discover.tags.get(idx) {
-                Some(tag_info) if tag_info.name == "All files" => DiscoverTagFilter::All,
-                Some(tag_info) if tag_info.name == "untagged" => DiscoverTagFilter::Untagged,
-                Some(tag_info) => DiscoverTagFilter::Tag(tag_info.name.clone()),
-                None => DiscoverTagFilter::All,
-            },
-        }
-    }
-
-    fn discover_path_filter_clause(&self) -> Option<(String, DbValue)> {
-        let raw = self.discover.filter.trim();
-        if raw.is_empty() {
-            return None;
-        }
-
-        let has_wildcards = raw.contains('*') || raw.contains('?');
-        let like = if has_wildcards {
-            let normalized = patterns::normalize_glob_pattern(raw);
-            let like = normalized
-                .replace("**/", "%")
-                .replace("**", "%")
-                .replace('*', "%")
-                .replace('?', "_");
-            if like.is_empty() || like == "%" || like == "%%" {
-                return None;
-            }
-            like
-        } else {
-            format!("%{}%", raw)
-        };
-
-        Some((
-            "LOWER(f.rel_path) LIKE LOWER(?)".to_string(),
-            DbValue::Text(like),
-        ))
-    }
-
-    fn discover_rule_pattern_from_filter(&self) -> Option<String> {
-        let raw = self.discover.filter.trim();
-        if raw.is_empty() {
-            return None;
-        }
-
-        let is_glob = raw.contains('*') || raw.contains('?') || raw.contains('[');
-        if is_glob {
-            Some(patterns::normalize_glob_pattern(raw))
-        } else {
-            Some(format!("*{}*", raw))
-        }
-    }
-
-    fn set_discover_page_offset(&mut self, offset: usize) {
-        self.discover.page_offset = offset;
-        self.discover.selected = 0;
-        self.discover.data_loaded = false;
-        self.discover.db_filtered = false;
-    }
-
-    fn discover_next_page(&mut self) {
-        let total = self.discover.total_files;
-        if total == 0 {
-            return;
-        }
-        let page_size = self.discover.page_size.max(1);
-        let max_offset = (total - 1) / page_size * page_size;
-        if self.discover.page_offset < max_offset {
-            let next = (self.discover.page_offset + page_size).min(max_offset);
-            self.set_discover_page_offset(next);
-        }
-    }
-
-    fn discover_prev_page(&mut self) {
-        let page_size = self.discover.page_size.max(1);
-        let prev = self.discover.page_offset.saturating_sub(page_size);
-        if prev != self.discover.page_offset {
-            self.set_discover_page_offset(prev);
-        }
-    }
-
-    fn discover_first_page(&mut self) {
-        if self.discover.page_offset != 0 {
-            self.set_discover_page_offset(0);
-        }
-    }
-
-    fn discover_last_page(&mut self) {
-        let total = self.discover.total_files;
-        if total == 0 {
-            return;
-        }
-        let page_size = self.discover.page_size.max(1);
-        let max_offset = (total - 1) / page_size * page_size;
-        if self.discover.page_offset != max_offset {
-            self.set_discover_page_offset(max_offset);
-        }
-    }
-    fn add_scan_job(&mut self, directory_path: &str) -> i64 {
-        // Generate unique job ID from timestamp
-        let job_id = chrono::Local::now().timestamp_millis();
-
-        let job = JobInfo {
-            id: job_id,
-            file_id: None,
-            job_type: JobType::Scan,
-            origin: JobOrigin::Ephemeral,
-            name: "scan".to_string(),
-            version: None,
-            status: JobStatus::Running,
-            started_at: chrono::Local::now(),
-            completed_at: None,
-            pipeline_run_id: None,
-            logical_date: None,
-            selection_snapshot_hash: None,
-            quarantine_rows: None,
-            items_total: 0,
-            items_processed: 0,
-            items_failed: 0,
-            output_path: Some(directory_path.to_string()),
-            output_size_bytes: None,
-            backtest: None,
-            failures: vec![],
-            violations: vec![],
-            top_violations_loaded: false,
-            selected_violation_index: 0,
-        };
-
-        // Add to front of list so it's visible immediately
-        self.jobs_state.push_job(job);
-
-        job_id
-    }
-    fn update_scan_job_status(
-        &mut self,
-        job_id: i64,
-        status: JobStatus,
-        error: Option<String>,
-        processed: Option<u32>,
-        total: Option<u32>,
-    ) {
-        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
-            job.status = status;
-            if let Some(value) = processed {
-                job.items_processed = value;
-            }
-            if let Some(value) = total {
-                job.items_total = value;
-            }
-            if matches!(
-                status,
-                JobStatus::Completed
-                    | JobStatus::PartialSuccess
-                    | JobStatus::Failed
-                    | JobStatus::Cancelled
-            ) {
-                job.completed_at = Some(chrono::Local::now());
-            }
-            if let Some(err) = error {
-                job.failures.push(JobFailure {
-                    file_path: "".to_string(),
-                    error: err,
-                    line: None,
-                });
-            }
-        }
-    }
-    fn add_schema_eval_job(&mut self, mode: SchemaEvalMode, paths_total: usize) -> i64 {
-        let job_id = chrono::Local::now().timestamp_millis();
-
-        let job = JobInfo {
-            id: job_id,
-            file_id: None,
-            job_type: JobType::SchemaEval,
-            origin: JobOrigin::Ephemeral,
-            name: match mode {
-                SchemaEvalMode::Sample => "schema-sample".to_string(),
-                SchemaEvalMode::Full => "schema-full".to_string(),
-            },
-            version: None,
-            status: JobStatus::Running,
-            started_at: chrono::Local::now(),
-            completed_at: None,
-            pipeline_run_id: None,
-            logical_date: None,
-            selection_snapshot_hash: None,
-            quarantine_rows: None,
-            items_total: paths_total as u32,
-            items_processed: 0,
-            items_failed: 0,
-            output_path: None,
-            output_size_bytes: None,
-            backtest: None,
-            failures: vec![],
-            violations: vec![],
-            top_violations_loaded: false,
-            selected_violation_index: 0,
-        };
-
-        self.jobs_state.push_job(job);
-        job_id
-    }
-    fn update_schema_eval_job(
-        &mut self,
-        job_id: i64,
-        status: JobStatus,
-        processed: u32,
-        error: Option<String>,
-    ) {
-        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
-            job.status = status;
-            job.items_processed = processed;
-            if matches!(
-                status,
-                JobStatus::Completed
-                    | JobStatus::PartialSuccess
-                    | JobStatus::Failed
-                    | JobStatus::Cancelled
-            ) {
-                job.completed_at = Some(chrono::Local::now());
-            }
-            if let Some(err) = error {
-                job.failures.push(JobFailure {
-                    file_path: "".to_string(),
-                    error: err,
-                    line: None,
-                });
-            }
-        }
-    }
-
-    fn set_schema_eval_job_total(&mut self, job_id: i64, total: u32) {
-        if let Some(job) = self.jobs_state.jobs.iter_mut().find(|j| j.id == job_id) {
-            if job.items_total == 0 {
-                job.items_total = total;
-            }
-        }
-    }
-    fn run_sample_schema_eval(&mut self) {
-        let (source_id_raw, pattern, eval_running) = match self.discover.rule_builder.as_ref() {
-            Some(builder) => (
-                builder.source_id.clone(),
-                builder.pattern.clone(),
-                matches!(
-                    builder.eval_state,
-                    super::extraction::EvalState::Running { .. }
-                ),
-            ),
-            None => return,
-        };
-
-        if eval_running || self.pending_schema_eval.is_some() || self.pending_sample_eval.is_some()
-        {
-            return;
-        }
-
-        let source_id = match source_id_raw {
-            Some(id) => id,
-            None => return,
-        };
-        let (backend, db_path) = self.resolve_db_target();
-
-        let workspace_id = match self.active_workspace_id() {
-            Some(id) => id,
-            None => {
-                self.discover.status_message = Some(("No workspace selected".to_string(), true));
-                return;
-            }
-        };
-
-        let (tx, rx) = mpsc::sync_channel::<SampleEvalResult>(16);
-        self.pending_sample_eval = Some(rx);
-
-        std::thread::spawn(move || {
-            let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    let _ = tx.send(SampleEvalResult::Error(
-                        "Database not available".to_string(),
-                    ));
-                    return;
-                }
-                Err(err) => {
-                    let _ = tx.send(SampleEvalResult::Error(format!(
-                        "Database open failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
-                Ok(p) => p,
-                Err(err) => {
-                    let _ = tx.send(SampleEvalResult::Error(err));
-                    return;
-                }
-            };
-            let matcher = match super::pattern_query::build_eval_matcher(&glob_pattern) {
-                Ok(m) => m,
-                Err(err) => {
-                    let _ = tx.send(SampleEvalResult::Error(err));
-                    return;
-                }
-            };
-
-            let paths = match super::pattern_query::sample_paths_for_eval(
-                &conn,
-                workspace_id,
-                source_id,
-                &glob_pattern,
-                &matcher,
-            ) {
-                Ok(paths) => paths,
-                Err(err) => {
-                    let _ = tx.send(SampleEvalResult::Error(format!(
-                        "Sample eval query failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
-            if paths.is_empty() {
-                let _ = tx.send(SampleEvalResult::Error("No files to analyze".to_string()));
-                return;
-            }
-
-            let mut state = super::extraction::RuleBuilderState::default();
-            super::extraction::analyze_paths_for_schema_ui(&mut state, &paths, 8);
-
-            let _ = tx.send(SampleEvalResult::Complete {
-                pattern: pattern.to_string(),
-                pattern_seeds: state.pattern_seeds,
-                path_archetypes: state.path_archetypes,
-                naming_schemes: state.naming_schemes,
-                synonym_suggestions: state.synonym_suggestions,
-                paths_analyzed: paths.len(),
-            });
-        });
-    }
-    fn start_full_schema_eval(&mut self) {
-        let (pattern, source_id_raw, full_eval_running) = match self.discover.rule_builder.as_ref()
-        {
-            Some(builder) => (
-                builder.pattern.clone(),
-                builder.source_id.clone(),
-                matches!(
-                    builder.eval_state,
-                    super::extraction::EvalState::Running { .. }
-                ),
-            ),
-            None => return,
-        };
-
-        if full_eval_running {
-            return;
-        }
-
-        let source_id = match source_id_raw {
-            Some(id) => id,
-            None => {
-                self.discover.status_message = Some(("No source selected".to_string(), true));
-                return;
-            }
-        };
-
-        let workspace_id = match self.active_workspace_id() {
-            Some(id) => id,
-            None => {
-                self.discover.status_message = Some(("No workspace selected".to_string(), true));
-                return;
-            }
-        };
-
-        // Create job
-        let job_id = self.add_schema_eval_job(SchemaEvalMode::Full, 0);
-        self.current_schema_eval_job_id = Some(job_id);
-
-        // Mark as running
-        if let Some(builder) = self.discover.rule_builder.as_mut() {
-            builder.eval_state = super::extraction::EvalState::Running { progress: 0 };
-        }
-
-        // Channel for results
-        let (tx, rx) = mpsc::sync_channel::<SchemaEvalResult>(16);
-        self.pending_schema_eval = Some(rx);
-
-        // Spawn background task
-        let (backend, db_path) = self.resolve_db_target();
-
-        std::thread::spawn(move || {
-            let _ = tx.send(SchemaEvalResult::Started { job_id });
-
-            let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    let _ = tx.send(SchemaEvalResult::Error(
-                        "Database not available".to_string(),
-                    ));
-                    return;
-                }
-                Err(err) => {
-                    let _ = tx.send(SchemaEvalResult::Error(format!(
-                        "Database open failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            let glob_pattern = match super::pattern_query::eval_glob_pattern(&pattern) {
-                Ok(p) => p,
-                Err(err) => {
-                    let _ = tx.send(SchemaEvalResult::Error(err));
-                    return;
-                }
-            };
-            let matcher = match super::pattern_query::build_eval_matcher(&glob_pattern) {
-                Ok(m) => m,
-                Err(err) => {
-                    let _ = tx.send(SchemaEvalResult::Error(err));
-                    return;
-                }
-            };
-
-            let query = super::pattern_query::PatternQuery::from_glob(&glob_pattern);
-            let total_candidates = match query.count_files(&conn, workspace_id, source_id) {
-                Ok(count) => count as usize,
-                Err(err) => {
-                    let _ = tx.send(SchemaEvalResult::Error(format!(
-                        "Schema eval query failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            let _ = tx.send(SchemaEvalResult::Progress {
-                progress: 0,
-                paths_analyzed: 0,
-                total_paths: total_candidates,
-            });
-
-            let mut offset = 0usize;
-            let batch_size = 1000usize;
-            let mut processed = 0usize;
-            let mut matched_paths: Vec<String> = Vec::new();
-
-            loop {
-                let results =
-                    match query.search_files(&conn, workspace_id, source_id, batch_size, offset) {
-                        Ok(results) => results,
-                        Err(err) => {
-                            let _ = tx.send(SchemaEvalResult::Error(format!(
-                                "Schema eval query failed: {}",
-                                err
-                            )));
-                            return;
-                        }
-                    };
-
-                if results.is_empty() {
-                    break;
-                }
-
-                for (rel_path, _size, _mtime) in results.iter() {
-                    if matcher.is_match(rel_path) {
-                        matched_paths.push(rel_path.clone());
-                    }
-                }
-
-                processed += results.len();
-                offset += results.len();
-
-                if processed % 2000 == 0 || processed >= total_candidates {
-                    let progress = if total_candidates == 0 {
-                        100
-                    } else {
-                        ((processed.saturating_mul(100)) / total_candidates).min(99) as u8
-                    };
-                    let _ = tx.send(SchemaEvalResult::Progress {
-                        progress,
-                        paths_analyzed: processed,
-                        total_paths: total_candidates,
-                    });
-                }
-            }
-
-            if matched_paths.is_empty() {
-                let _ = tx.send(SchemaEvalResult::Error("No files to analyze".to_string()));
-                return;
-            }
-
-            let mut state = super::extraction::RuleBuilderState::default();
-            super::extraction::analyze_paths_for_schema_ui(&mut state, &matched_paths, 8);
-
-            let _ = tx.send(SchemaEvalResult::Complete {
-                job_id,
-                pattern: pattern.to_string(),
-                pattern_seeds: state.pattern_seeds,
-                path_archetypes: state.path_archetypes,
-                naming_schemes: state.naming_schemes,
-                synonym_suggestions: state.synonym_suggestions,
-                paths_analyzed: matched_paths.len(),
-            });
-        });
-
-        self.discover.status_message = Some(("Full eval started...".to_string(), false));
-    }
-    fn is_risky_scan_path(&self, path: &str) -> bool {
-        use std::path::Path;
-
-        let input = Path::new(path);
-        let expanded = scan_path::expand_scan_path(input);
-        let canonical = scan_path::canonicalize_scan_path(&expanded);
-
-        if let Some(home) = dirs::home_dir() {
-            if canonical == home {
-                return true;
-            }
-        }
-
-        // Root on Unix or drive root on Windows
-        canonical.parent().is_none()
-    }
-
-    fn scan_directory(&mut self, path: &str) {
-        use std::path::Path;
-
-        if self.control_connected {
-            self.scan_directory_control(path);
-            return;
-        }
-
-        if self.mutations_blocked() {
-            let message = BackendRouter::new(
-                self.control_addr.clone(),
-                self.config.standalone_writer,
-                self.db_read_only,
-            )
-            .blocked_message("start scan");
-            self.discover.scan_error = Some(message.clone());
-            self.discover.status_message = Some((message.clone(), true));
-            self.set_global_status_for(message, true, Duration::from_secs(8));
-            return;
-        }
-
-        self.ensure_active_workspace();
-
-        let workspace_id = match self.active_workspace_id() {
-            Some(id) => id,
-            None => {
-                self.discover.status_message =
-                    Some(("No workspace available; cannot scan.".to_string(), true));
-                return;
-            }
-        };
-
-        let path_input = Path::new(path);
-
-        let expanded_path = scan_path::expand_scan_path(path_input);
-
-        // Path validation - synchronous (fast filesystem checks)
-        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
-            self.discover.scan_error = Some(err.to_string());
-            return;
-        }
-
-        // Path is valid - enter scanning state and spawn background task
-        let path_display = expanded_path.display().to_string();
-        self.discover.scanning_path = Some(path_display.clone());
-        self.discover.scan_progress = Some(ScoutProgress {
-            dirs_scanned: 0,
-            files_found: 0,
-            files_persisted: 0,
-            current_dir: Some("Initializing...".to_string()),
-            elapsed_ms: 0,
-            files_per_sec: 0.0,
-            stalled: false,
-        });
-        self.discover.scan_start_time = Some(std::time::Instant::now());
-        self.discover.view_state = DiscoverViewState::Scanning;
-        self.discover.scan_error = None;
-
-        // Channel for TUI scan results
-        let (tui_tx, tui_rx) = mpsc::sync_channel::<TuiScanResult>(256);
-        self.pending_scan = Some(tui_rx);
-
-        // Create scan job for tracking in Jobs view
-        let job_id = self.add_scan_job(&path_display);
-        self.current_scan_job_id = Some(job_id);
-
-        // Don't show "Scan started" yet - wait for validation to pass
-        // The status will update to "Scan started" after validation succeeds
-        // or show an error message if validation fails
-        self.discover.status_message = None;
-
-        // Get database path
-        let db_path = self
-            .config
-            .database
-            .clone()
-            .unwrap_or_else(crate::cli::config::state_store_path);
-
-        let source_path = path_display;
-        let scan_job_id = job_id; // Capture for async block
-        let telemetry = self.telemetry.clone();
-        let cancel_token = ScanCancelToken::new();
-        self.scan_cancel_token = Some(cancel_token.clone());
-
-        std::thread::spawn(move || {
-            // Open database
-            if let Some(parent) = db_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-
-            let db = match ScoutDatabase::open(&db_path) {
-                Ok(db) => db,
-                Err(e) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!(
-                        "Failed to open database: {}",
-                        e
-                    )));
-                    return;
-                }
-            };
-
-            // Check if source with this path already exists (rescan case)
-            let existing_source = match db.get_source_by_path(&workspace_id, &source_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!("Database error: {}", e)));
-                    return;
-                }
-            };
-
-            let source = if let Some(existing) = existing_source {
-                // Rescan existing source - use existing source record
-                existing
-            } else {
-                // New source - create record
-                let source_name = std::path::Path::new(&source_path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| source_path.clone());
-
-                // Check if a source with this name (but different path) already exists
-                if let Ok(Some(name_conflict)) = db.get_source_by_name(&workspace_id, &source_name)
-                {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!(
-                        "A source named '{}' already exists at '{}'. Use Sources Manager (M) to rename or delete it first.",
-                        source_name, name_conflict.path
-                    )));
-                    return;
-                }
-
-                // Check for overlapping sources (parent/child relationships)
-                // This prevents duplicate file tracking and conflicting tags
-                if let Err(e) =
-                    db.check_source_overlap(&workspace_id, std::path::Path::new(&source_path))
-                {
-                    let suggestion = match &e {
-                        casparian::scout::error::ScoutError::SourceIsChildOfExisting {
-                            existing_name,
-                            ..
-                        } => {
-                            format!(
-                                "Either delete source '{}' first, or use tagging rules to organize files within that source.",
-                                existing_name
-                            )
-                        }
-                        casparian::scout::error::ScoutError::SourceIsParentOfExisting {
-                            existing_name,
-                            ..
-                        } => {
-                            format!(
-                                "Either delete source '{}' first, or scan a non-overlapping directory.",
-                                existing_name
-                            )
-                        }
-                        _ => String::new(),
-                    };
-                    let _ = tui_tx.send(TuiScanResult::Error(format!(
-                        "{}\n\nSuggestion: {}",
-                        e, suggestion
-                    )));
-                    return;
-                }
-
-                // Create a new SourceId for the source
-                let source_id = SourceId::new();
-
-                let new_source = Source {
-                    workspace_id,
-                    id: source_id,
-                    name: source_name,
-                    source_type: SourceType::Local,
-                    path: source_path.clone(),
-                    exec_path: None,
-                    poll_interval_secs: 0,
-                    enabled: true,
-                };
-
-                // Insert new source
-                if let Err(e) = db.upsert_source(&new_source) {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!(
-                        "Failed to save source: {}",
-                        e
-                    )));
-                    return;
-                }
-
-                new_source
-            };
-
-            let scan_config = casparian::scout::ScanConfig::default();
-            let telemetry_start = std::time::Instant::now();
-            let telemetry_context = telemetry.as_ref().map(|recorder| {
-                let run_id = Uuid::new_v4().to_string();
-                let source_id = source.id.to_string();
-                let root_hash = Some(
-                    recorder
-                        .hasher()
-                        .hash_path(std::path::Path::new(&source.path)),
-                );
-                let payload = protocol_telemetry::ScanStarted {
-                    run_id: run_id.clone(),
-                    source_id: source_id.clone(),
-                    root_hash,
-                    started_at: chrono::Utc::now(),
-                    config: scan_config_telemetry(&scan_config),
-                };
-                let parent_id = recorder.emit_domain(
-                    protocol_telemetry::events::SCAN_START,
-                    Some(&run_id),
-                    None,
-                    &payload,
-                );
-                (run_id, source_id, parent_id)
-            });
-
-            // Validation passed - notify TUI that scan is starting
-            let _ = tui_tx.send(TuiScanResult::Started {
-                job_id: scan_job_id,
-                scan_id: None,
-            });
-
-            // Create progress channel that sends directly to TUI
-            // We wrap tui_tx in a channel adapter so scanner can use its existing interface
-            let (progress_tx, progress_rx) = mpsc::channel::<ScoutProgress>();
-
-            // Spawn a task to forward progress - use spawn_blocking context awareness
-            let tui_tx_progress = tui_tx.clone();
-            let telemetry_progress = telemetry.clone();
-            let telemetry_context_progress = telemetry_context.clone();
-            let forward_handle = std::thread::spawn(move || {
-                let mut last_emit = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(1))
-                    .unwrap_or_else(std::time::Instant::now);
-                while let Ok(progress) = progress_rx.recv() {
-                    let _ = tui_tx_progress.try_send(TuiScanResult::Progress(progress.clone()));
-
-                    if let (Some(recorder), Some((run_id, source_id, parent_id))) = (
-                        telemetry_progress.as_ref(),
-                        telemetry_context_progress.as_ref(),
-                    ) {
-                        let now = std::time::Instant::now();
-                        if now.duration_since(last_emit) >= std::time::Duration::from_secs(1) {
-                            last_emit = now;
-                            let payload = protocol_telemetry::ScanProgress {
-                                run_id: run_id.clone(),
-                                source_id: source_id.clone(),
-                                elapsed_ms: progress.elapsed_ms,
-                                files_found: progress.files_found,
-                                files_persisted: progress.files_persisted,
-                                dirs_scanned: progress.dirs_scanned,
-                                files_per_sec: progress.files_per_sec,
-                                stalled: progress.stalled,
-                            };
-                            recorder.emit_domain(
-                                protocol_telemetry::events::SCAN_PROGRESS,
-                                Some(run_id),
-                                parent_id.as_deref(),
-                                &payload,
-                            );
-                        }
-                    }
-                }
-            });
-
-            // Create scanner with default config
-            let scanner = ScoutScanner::with_config(db, scan_config.clone());
-
-            // Run the scan in a blocking task so it doesn't block the runtime
-            let scan_result = if let Some((run_id, _, _)) = telemetry_context.as_ref() {
-                let span = info_span!("scan.run", run_id = %run_id, source_id = %source.id);
-                let _guard = span.enter();
-                scanner.scan_with_cancel(&source, Some(progress_tx), None, Some(cancel_token))
-            } else {
-                scanner.scan_with_cancel(&source, Some(progress_tx), None, Some(cancel_token))
-            };
-            drop(scanner);
-
-            let _ = forward_handle.join();
-
-            match scan_result {
-                Ok(result) => {
-                    let persisted = result.stats.files_persisted as usize;
-                    let discovered = result.stats.files_discovered as usize;
-                    if let (Some(recorder), Some((run_id, source_id, _))) =
-                        (telemetry.as_ref(), telemetry_context.as_ref())
-                    {
-                        let payload = protocol_telemetry::ScanCompleted {
-                            run_id: run_id.clone(),
-                            source_id: source_id.clone(),
-                            duration_ms: result.stats.duration_ms,
-                            files_discovered: result.stats.files_discovered,
-                            files_persisted: result.stats.files_persisted,
-                            files_new: result.stats.files_new,
-                            files_changed: result.stats.files_changed,
-                            files_deleted: result.stats.files_deleted,
-                            dirs_scanned: result.stats.dirs_scanned,
-                            bytes_scanned: result.stats.bytes_scanned,
-                            errors: result.stats.errors,
-                        };
-                        recorder.emit_domain(
-                            protocol_telemetry::events::SCAN_COMPLETE,
-                            Some(run_id),
-                            None,
-                            &payload,
-                        );
-                    }
-                    if persisted == 0 && discovered > 0 {
-                        let _ = tui_tx.send(TuiScanResult::Error(
-                            "Scan completed but no files were persisted. Check database health or locks.".to_string(),
-                        ));
-                        return;
-                    }
-                    // Scan complete - TUI will load files from DB
-                    let _ = tui_tx.send(TuiScanResult::Complete {
-                        source_path,
-                        files_persisted: persisted,
-                    });
-                }
-                Err(e) => {
-                    if matches!(e, casparian::scout::error::ScoutError::Cancelled) {
-                        let _ = tui_tx.send(TuiScanResult::Error("Scan cancelled".to_string()));
-                        return;
-                    }
-                    if let (Some(recorder), Some((run_id, source_id, _))) =
-                        (telemetry.as_ref(), telemetry_context.as_ref())
-                    {
-                        let (error_class, io_kind) = classify_scan_error(&e);
-                        let payload = protocol_telemetry::ScanFailed {
-                            run_id: run_id.clone(),
-                            source_id: source_id.clone(),
-                            duration_ms: telemetry_start.elapsed().as_millis() as u64,
-                            error_class,
-                            io_kind,
-                        };
-                        recorder.emit_domain(
-                            protocol_telemetry::events::SCAN_FAIL,
-                            Some(run_id),
-                            None,
-                            &payload,
-                        );
-                    }
-                    let _ = tui_tx.send(TuiScanResult::Error(format!("Scan failed: {}", e)));
-                }
-            }
-        });
-    }
-
-    fn scan_directory_control(&mut self, path: &str) {
-        use std::path::Path;
 
         let control_addr = match self.control_addr.clone() {
             Some(addr) => addr,
             None => {
-                self.discover.status_message = Some((
-                    "Control API address not configured".to_string(),
-                    true,
-                ));
+                self.discover.tags = vec![TagInfo {
+                    name: "All files".to_string(),
+                    count: 0,
+                    is_special: true,
+                }];
+                self.discover.available_tags.clear();
                 return;
             }
         };
 
-        let path_input = Path::new(path);
-        let expanded_path = scan_path::expand_scan_path(path_input);
-        if let Err(err) = scan_path::validate_scan_path(&expanded_path) {
-            self.discover.scan_error = Some(err.to_string());
+        if self.pending_tags_load.is_some() {
             return;
         }
 
-        let canonical_path = scan_path::canonicalize_scan_path(&expanded_path);
-        let path_display = canonical_path.display().to_string();
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.pending_tags_load = Some(rx);
 
-        self.discover.scanning_path = Some(path_display.clone());
-        self.discover.scan_progress = Some(ScoutProgress {
-            dirs_scanned: 0,
-            files_found: 0,
-            files_persisted: 0,
-            current_dir: Some("Initializing...".to_string()),
-            elapsed_ms: 0,
-            files_per_sec: 0.0,
-            stalled: false,
-        });
-        self.discover.scan_start_time = Some(std::time::Instant::now());
-        self.discover.view_state = DiscoverViewState::Scanning;
-        self.discover.scan_error = None;
-
-        let (tui_tx, tui_rx) = mpsc::sync_channel::<TuiScanResult>(256);
-        self.pending_scan = Some(tui_rx);
-
-        let job_id = self.add_scan_job(&path_display);
-        self.current_scan_job_id = Some(job_id);
-        self.current_scan_id = None;
-        self.scan_cancel_token = None;
-
-        let workspace_id = self.active_workspace_id();
-        self.discover.status_message = None;
-
-        let scan_job_id = job_id;
         std::thread::spawn(move || {
-            let client = match ControlClient::connect_with_timeout(&control_addr, Duration::from_millis(500)) {
-                Ok(client) => client,
-                Err(err) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!(
-                        "Control API unavailable: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
+            let result: Result<TagsLoadMessage, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
+                let stats = client
+                    .list_tags(workspace_id, source_id)
+                    .map_err(|err| format!("Tags query failed: {}", err))?;
 
-            let scan_id = match client.start_scan(workspace_id, path_display.clone()) {
-                Ok(id) => id,
-                Err(err) => {
-                    let _ = tui_tx.send(TuiScanResult::Error(format!(
-                        "Failed to start scan: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
+                let mut tags = Vec::new();
+                let total_count = stats.total_files.max(0) as usize;
+                tags.push(TagInfo {
+                    name: "All files".to_string(),
+                    count: total_count,
+                    is_special: true,
+                });
 
-            let _ = tui_tx.send(TuiScanResult::Started {
-                job_id: scan_job_id,
-                scan_id: Some(scan_id.clone()),
-            });
-
-            loop {
-                match client.get_scan(scan_id.clone()) {
-                    Ok(Some(status)) => {
-                        if let Some(progress) = status.progress.as_ref() {
-                            let tui_progress = ScoutProgress {
-                                dirs_scanned: progress.dirs_scanned as usize,
-                                files_found: progress.files_found as usize,
-                                files_persisted: progress.files_persisted as usize,
-                                current_dir: progress.current_dir.clone(),
-                                elapsed_ms: progress.elapsed_ms,
-                                files_per_sec: progress.files_per_sec,
-                                stalled: progress.stalled,
-                            };
-                            let _ = tui_tx.send(TuiScanResult::Progress(tui_progress));
-                        }
-
-                        match status.state {
-                            casparian_sentinel::ScanState::Completed => {
-                                let persisted = status.files_persisted.unwrap_or(0) as usize;
-                                let _ = tui_tx.send(TuiScanResult::Complete {
-                                    source_path: status.source_path.clone(),
-                                    files_persisted: persisted,
-                                });
-                                break;
-                            }
-                            casparian_sentinel::ScanState::Failed => {
-                                let _ = tui_tx.send(TuiScanResult::Error(
-                                    status
-                                        .error
-                                        .unwrap_or_else(|| "Scan failed".to_string()),
-                                ));
-                                break;
-                            }
-                            casparian_sentinel::ScanState::Cancelled => {
-                                let _ = tui_tx.send(TuiScanResult::Error(
-                                    status
-                                        .error
-                                        .unwrap_or_else(|| "Scan cancelled".to_string()),
-                                ));
-                                break;
-                            }
-                            _ => {}
-                        }
+                let mut available_tags = Vec::new();
+                for entry in stats.tags {
+                    if entry.count <= 0 {
+                        continue;
                     }
-                    Ok(None) => {
-                        let _ = tui_tx.send(TuiScanResult::Error(
-                            "Scan not found in control plane".to_string(),
-                        ));
-                        break;
-                    }
-                    Err(err) => {
-                        let _ = tui_tx.send(TuiScanResult::Error(format!(
-                            "Failed to query scan status: {}",
-                            err
-                        )));
-                        break;
-                    }
+                    available_tags.push(entry.tag.clone());
+                    tags.push(TagInfo {
+                        name: entry.tag,
+                        count: entry.count as usize,
+                        is_special: false,
+                    });
                 }
 
-                std::thread::sleep(Duration::from_millis(250));
-            }
+                if stats.untagged_files > 0 {
+                    tags.push(TagInfo {
+                        name: "untagged".to_string(),
+                        count: stats.untagged_files as usize,
+                        is_special: true,
+                    });
+                }
+
+                Ok(TagsLoadMessage {
+                    workspace_id,
+                    source_id,
+                    tags,
+                    available_tags,
+                })
+            })();
+
+            let _ = tx.send(result);
         });
     }
-    fn list_directories(partial_path: &str) -> Vec<String> {
-        use std::path::Path;
 
-        let partial = if partial_path.starts_with("~") {
-            if let Some(home) = dirs::home_dir() {
-                let rest = partial_path.strip_prefix("~").unwrap_or("");
-                home.join(rest.trim_start_matches('/'))
-                    .to_string_lossy()
-                    .to_string()
-            } else {
-                partial_path.to_string()
-            }
-        } else {
-            partial_path.to_string()
-        };
-
-        let path = Path::new(&partial);
-
-        let (parent, prefix) = if partial.ends_with('/') || partial.ends_with('\\') {
-            // Path ends with separator - list contents of this directory
-            (path, "")
-        } else {
-            // Split into parent directory and prefix to match
-            let parent = path.parent().unwrap_or(Path::new("/"));
-            let prefix = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            (parent, prefix)
-        };
-
-        // Read directory and filter
-        let mut suggestions = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                // Check if it's a directory
-                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    continue;
-                }
-
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-
-                // Skip hidden directories
-                if name_str.starts_with('.') {
-                    continue;
-                }
-
-                // Check prefix match (case-insensitive)
-                if name_str.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                    suggestions.push(format!("{}/", name_str));
-                }
-            }
-        }
-
-        // Sort alphabetically and limit to 8
-        suggestions.sort();
-        suggestions.truncate(8);
-        suggestions
-    }
-    fn update_path_suggestions(&mut self) {
-        self.discover.path_suggestions = Self::list_directories(&self.discover.scan_path_input);
-        self.discover.path_suggestion_idx = 0;
-    }
-    fn apply_path_suggestion(&mut self) {
-        if let Some(suggestion) = self
-            .discover
-            .path_suggestions
-            .get(self.discover.path_suggestion_idx)
-        {
-            let input = &self.discover.scan_path_input;
-
-            // Find the parent path (everything up to and including the last separator)
-            let parent = if input.ends_with('/') || input.ends_with('\\') {
-                input.clone()
-            } else if let Some(pos) = input.rfind(|c| c == '/' || c == '\\') {
-                input[..=pos].to_string()
-            } else {
-                String::new()
-            };
-
-            // Combine parent with suggestion
-            self.discover.scan_path_input = format!("{}{}", parent, suggestion);
-            self.update_path_suggestions();
-        }
-    }
-    fn load_scout_files(&mut self) {
-        self.discover.db_filtered = false;
-        // First check if we have a directly-set source ID (e.g., after scan completion)
-        // This handles the case where sources list hasn't loaded yet
-        let selected_source_id = if let Some(ref id) = self.discover.selected_source_id {
-            id.clone()
-        } else {
-            // Fall back to looking up from sources list
-            let source_idx = if self.discover.view_state == DiscoverViewState::SourcesDropdown {
-                self.discover
-                    .preview_source
-                    .unwrap_or_else(|| self.discover.selected_source_index())
-            } else {
-                self.discover.selected_source_index()
-            };
-
-            match self.discover.sources.get(source_idx) {
-                Some(source) => source.id.clone(),
-                None => {
-                    // No source selected - show empty list with guidance
-                    self.discover.files.clear();
-                    self.discover.selected = 0;
-                    self.discover.page_offset = 0;
-                    self.discover.total_files = 0;
-                    self.discover.data_loaded = true;
-                    self.discover.scan_error = if self.discover.sources.is_empty() {
-                        Some("No sources found. Press 's' to scan a folder.".to_string())
-                    } else {
-                        Some("Press 1 to select a source".to_string())
-                    };
-                    return;
-                }
-            }
-        };
-
-        let workspace_id = match self.active_workspace_id() {
-            Some(id) => id,
-            None => {
-                self.discover.scan_error = Some("No workspace selected.".to_string());
-                self.discover.page_offset = 0;
-                self.discover.total_files = 0;
-                self.discover.data_loaded = true;
-                return;
-            }
-        };
-
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => {
-                self.discover.scan_error =
-                    Some("No Scout database found. Press 's' to scan a folder.".to_string());
-                self.discover.page_offset = 0;
-                self.discover.total_files = 0;
-                self.discover.data_loaded = true;
-                return;
-            }
-            Err(err) => {
-                self.discover.scan_error = Some(format!("Database open failed: {}", err));
-                self.discover.page_offset = 0;
-                self.discover.total_files = 0;
-                self.discover.data_loaded = true;
-                return;
-            }
-        };
-
-        let tag_filter = self.active_discover_tag_filter();
-        let mut join_clause = String::new();
-        let mut where_clauses = vec![
-            "f.workspace_id = ?".to_string(),
-            "f.source_id = ?".to_string(),
-        ];
-        let mut params: Vec<DbValue> = vec![
-            DbValue::Text(workspace_id.to_string()),
-            DbValue::Integer(selected_source_id.as_i64()),
-        ];
-
-        match tag_filter {
-            DiscoverTagFilter::All => {}
-            DiscoverTagFilter::Untagged => {
-                join_clause =
-                    "LEFT JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id"
-                        .to_string();
-                where_clauses.push("t.file_id IS NULL".to_string());
-            }
-            DiscoverTagFilter::Tag(tag_name) => {
-                join_clause =
-                    "JOIN scout_file_tags t ON t.file_id = f.id AND t.workspace_id = f.workspace_id"
-                        .to_string();
-                where_clauses.push("t.tag = ?".to_string());
-                params.push(DbValue::Text(tag_name));
-            }
-        }
-
-        if let Some((clause, value)) = self.discover_path_filter_clause() {
-            where_clauses.push(clause);
-            params.push(value);
-        }
-
-        let where_sql = where_clauses.join(" AND ");
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM scout_files f {} WHERE {}",
-            join_clause, where_sql
-        );
-        let total_count = match conn.query_scalar::<i64>(&count_sql, &params) {
-            Ok(count) => count.max(0) as usize,
-            Err(e) => {
-                self.discover.scan_error = Some(format!("Query failed: {}", e));
-                self.discover.data_loaded = true;
-                return;
-            }
-        };
-
-        self.discover.total_files = total_count;
-        let page_size = self.discover.page_size.max(1);
-        let mut page_offset = self.discover.page_offset;
-        if total_count == 0 {
-            page_offset = 0;
-        } else {
-            let max_offset = (total_count - 1) / page_size * page_size;
-            if page_offset > max_offset {
-                page_offset = max_offset;
-            }
-        }
-        self.discover.page_offset = page_offset;
-
-        let mut page_params = params.clone();
-        page_params.push(DbValue::Integer(page_size as i64));
-        page_params.push(DbValue::Integer(page_offset as i64));
-
-        let query = format!(
-            "SELECT f.id, f.path, f.rel_path, f.size, f.mtime, f.is_dir \
-             FROM scout_files f {} \
-             WHERE {} \
-             ORDER BY f.rel_path ASC, f.id ASC \
-             LIMIT ? OFFSET ?",
-            join_clause, where_sql
-        );
-
-        let rows = match conn.query_all(&query, &page_params) {
-            Ok(rows) => rows,
-            Err(e) => {
-                self.discover.scan_error = Some(format!("Query failed: {}", e));
-                self.discover.data_loaded = true;
-                return;
-            }
-        };
-
-        let mut files: Vec<FileInfo> = Vec::with_capacity(rows.len());
-        let mut file_ids: Vec<i64> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let file_id: i64 = match row.get(0) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.discover.scan_error = Some(format!("Query failed: {}", e));
-                    self.discover.data_loaded = true;
-                    return;
-                }
-            };
-            let path: String = match row.get(1) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.discover.scan_error = Some(format!("Query failed: {}", e));
-                    self.discover.data_loaded = true;
-                    return;
-                }
-            };
-            let rel_path: String = match row.get(2) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.discover.scan_error = Some(format!("Query failed: {}", e));
-                    self.discover.data_loaded = true;
-                    return;
-                }
-            };
-            let size: i64 = match row.get(3) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.discover.scan_error = Some(format!("Query failed: {}", e));
-                    self.discover.data_loaded = true;
-                    return;
-                }
-            };
-            let mtime_millis: i64 = match row.get(4) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.discover.scan_error = Some(format!("Query failed: {}", e));
-                    self.discover.data_loaded = true;
-                    return;
-                }
-            };
-            let is_dir: i64 = match row.get(5) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.discover.scan_error = Some(format!("Query failed: {}", e));
-                    self.discover.data_loaded = true;
-                    return;
-                }
-            };
-
-            let modified = chrono::DateTime::from_timestamp_millis(mtime_millis)
-                .map(|dt| dt.with_timezone(&chrono::Local))
-                .unwrap_or_else(chrono::Local::now);
-
-            file_ids.push(file_id);
-            files.push(FileInfo {
-                file_id,
-                path,
-                rel_path,
-                size: size as u64,
-                modified,
-                is_dir: is_dir != 0,
-                tags: Vec::new(),
-            });
-        }
-
-        let mut tags_by_file: HashMap<i64, Vec<String>> = HashMap::new();
-        if !file_ids.is_empty() {
-            let placeholders = std::iter::repeat("?")
-                .take(file_ids.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "SELECT file_id, tag FROM scout_file_tags WHERE workspace_id = ? AND file_id IN ({})",
-                placeholders
-            );
-            let mut params: Vec<DbValue> = Vec::with_capacity(file_ids.len() + 1);
-            params.push(DbValue::Text(workspace_id.to_string()));
-            params.extend(file_ids.iter().map(|id| DbValue::Integer(*id)));
-
-            if let Ok(tag_rows) = conn.query_all(&query, &params) {
-                for row in tag_rows {
-                    let file_id: i64 = match row.get(0) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    let tag: String = match row.get(1) {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                    tags_by_file.entry(file_id).or_default().push(tag);
-                }
-            }
-        }
-
-        for (idx, file) in files.iter_mut().enumerate() {
-            if let Some(tags) = tags_by_file.remove(&file_ids[idx]) {
-                file.tags = tags;
-            }
-        }
-
-        let mut available_tags = HashSet::new();
-        for file in &files {
-            for tag in &file.tags {
-                available_tags.insert(tag.clone());
-            }
-        }
-
-        self.discover.files = files;
-        self.discover.available_tags = available_tags.into_iter().collect();
-        self.discover.available_tags.sort();
-        self.discover.selected = 0;
-        self.discover.data_loaded = true;
-        self.discover.db_filtered = true;
-        self.discover.scan_error = None;
-        self.refresh_tags_list();
-    }
     fn start_cache_load(&mut self) {
         // Must have a source selected
         let source_id = match &self.discover.selected_source_id {
@@ -7402,12 +7612,19 @@ impl App {
             None => return,
         };
 
-        let source_id_str = source_id.to_string();
-
         // Skip if already loading
         if self.pending_cache_load.is_some() {
             return;
         }
+
+        if !self.control_connected {
+            return;
+        }
+
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => return,
+        };
 
         // Skip if cache is already loaded for this source
         if let Some(ref explorer) = self.discover.glob_explorer {
@@ -7425,7 +7642,6 @@ impl App {
         }
 
         // Skip if we're already tracking progress for this load
-        // (prevents timer reset when tick() calls us multiple times)
         if self.cache_load_progress.is_some() {
             return;
         }
@@ -7442,7 +7658,7 @@ impl App {
             .iter()
             .find(|s| s.id == source_id)
             .map(|s| s.name.clone())
-            .unwrap_or_else(|| source_id_str.clone());
+            .unwrap_or_else(|| source_id.to_string());
 
         // Set up channel and progress tracking
         let (tx, rx) = mpsc::sync_channel::<CacheLoadMessage>(1);
@@ -7456,408 +7672,74 @@ impl App {
             explorer.cache_workspace_id = Some(workspace_id);
         }
 
-        let (backend, db_path) = self.resolve_db_target();
-
-        // Spawn background task for database queries (live folder derivation)
-        let workspace_id_str = workspace_id.to_string();
         std::thread::spawn(move || {
-            let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    let _ = tx.send(CacheLoadMessage::Error(
-                        "Database not available".to_string(),
-                    ));
-                    return;
-                }
-                Err(err) => {
-                    let _ = tx.send(CacheLoadMessage::Error(format!(
-                        "Database open failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
+            let result: Result<CacheLoadMessage, String> = (|| {
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
 
-            let root_folders =
-                match App::query_folder_counts(&conn, workspace_id, source_id, "", None) {
-                    Ok(folders) => folders,
-                    Err(e) => {
-                        let _ = tx.send(CacheLoadMessage::Error(format!("Query error: {}", e)));
-                        return;
-                    }
-                };
+                let (folder_entries, _total_count) = client
+                    .list_folders(workspace_id, source_id, "".to_string(), None)
+                    .map_err(|err| format!("Folder query failed: {}", err))?;
 
-            let folder_infos: Vec<FsEntry> = root_folders
-                .into_iter()
-                .map(|(name, count, is_file)| FsEntry::new(name, count as usize, is_file))
-                .collect();
+                let stats = client
+                    .list_tags(workspace_id, source_id)
+                    .map_err(|err| format!("Tags query failed: {}", err))?;
 
-            let mut cache: HashMap<String, Vec<FsEntry>> = HashMap::new();
-            cache.insert(String::new(), folder_infos);
+                let folder_infos: Vec<FsEntry> = folder_entries
+                    .into_iter()
+                    .map(|entry| FsEntry::new(entry.name, entry.file_count as usize, entry.is_file))
+                    .collect();
 
-            let total_files: usize = match conn.query_scalar::<i64>(
-                "SELECT file_count FROM scout_sources WHERE id = ? AND workspace_id = ?",
-                &[
-                    DbValue::Integer(source_id.as_i64()),
-                    DbValue::Text(workspace_id_str.clone()),
-                ],
-            ) {
-                Ok(count) => count as usize,
-                Err(err) => {
-                    let _ = tx.send(CacheLoadMessage::Error(format!(
-                        "Cache load failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
+                let mut cache: HashMap<String, Vec<FsEntry>> = HashMap::new();
+                cache.insert(String::new(), folder_infos);
 
-            let tag_rows = match conn.query_all(
-                "SELECT ft.tag, COUNT(*) as count \
-                 FROM scout_file_tags ft \
-                 JOIN scout_files f ON f.id = ft.file_id \
-                 WHERE ft.workspace_id = ? AND f.workspace_id = ? AND f.source_id = ? \
-                 GROUP BY ft.tag \
-                 ORDER BY count DESC, ft.tag",
-                &[
-                    DbValue::Text(workspace_id_str.clone()),
-                    DbValue::Text(workspace_id_str.clone()),
-                    DbValue::Integer(source_id.as_i64()),
-                ],
-            ) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    let _ = tx.send(CacheLoadMessage::Error(format!(
-                        "Cache load failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            let untagged_count: i64 = match conn.query_scalar::<i64>(
-                "SELECT COUNT(*) \
-                 FROM scout_files f \
-                 LEFT JOIN scout_file_tags ft \
-                   ON ft.file_id = f.id AND ft.workspace_id = ? \
-                 WHERE f.workspace_id = ? AND f.source_id = ? AND ft.file_id IS NULL",
-                &[
-                    DbValue::Text(workspace_id_str.clone()),
-                    DbValue::Text(workspace_id_str.clone()),
-                    DbValue::Integer(source_id.as_i64()),
-                ],
-            ) {
-                Ok(count) => count,
-                Err(err) => {
-                    let _ = tx.send(CacheLoadMessage::Error(format!(
-                        "Cache load failed: {}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            // Build tags list
-            let mut tags: Vec<TagInfo> = Vec::new();
-            tags.push(TagInfo {
-                name: "All files".to_string(),
-                count: total_files,
-                is_special: true,
-            });
-            for row in tag_rows {
-                let tag_name: String = match row.get(0) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let count: i64 = match row.get(1) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                let mut tags = Vec::new();
+                let total_count = stats.total_files.max(0) as usize;
                 tags.push(TagInfo {
-                    name: tag_name,
-                    count: count as usize,
-                    is_special: false,
-                });
-            }
-            if untagged_count > 0 {
-                tags.push(TagInfo {
-                    name: "untagged".to_string(),
-                    count: untagged_count as usize,
+                    name: "All files".to_string(),
+                    count: total_count,
                     is_special: true,
                 });
-            }
 
-            let _ = tx.send(CacheLoadMessage::Complete {
-                workspace_id,
-                source_id,
-                total_files,
-                tags,
-                cache,
-            });
-        });
-    }
-
-fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Option<String>) {
-    use casparian::scout::error::ScoutError;
-    match err {
-        ScoutError::Io(io_err) => ("io_error".to_string(), Some(format!("{:?}", io_err.kind()))),
-        ScoutError::Database(_) => ("db_error".to_string(), None),
-        ScoutError::Walk(_) => ("walk_error".to_string(), None),
-        ScoutError::Json(_) => ("json_error".to_string(), None),
-        #[cfg(feature = "data-plane")]
-        ScoutError::Csv(_) => ("csv_error".to_string(), None),
-        #[cfg(feature = "data-plane")]
-        ScoutError::Arrow(_) => ("arrow_error".to_string(), None),
-        #[cfg(feature = "data-plane")]
-        ScoutError::Parquet(_) => ("parquet_error".to_string(), None),
-        ScoutError::Config(_) => ("config_error".to_string(), None),
-        ScoutError::SourceNotFound(_) => ("source_not_found".to_string(), None),
-        ScoutError::RouteNotFound(_) => ("route_not_found".to_string(), None),
-        ScoutError::FileNotFound(_) => ("file_not_found".to_string(), None),
-        ScoutError::UnsupportedFormat(_) => ("unsupported_format".to_string(), None),
-        ScoutError::SchemaInference(_) => ("schema_inference".to_string(), None),
-        ScoutError::Transform(_) => ("transform".to_string(), None),
-        ScoutError::Pattern(_) => ("pattern".to_string(), None),
-        ScoutError::Cancelled => ("cancelled".to_string(), None),
-        ScoutError::InvalidState(_) => ("invalid_state".to_string(), None),
-        ScoutError::Extractor(_) => ("extractor".to_string(), None),
-        ScoutError::SourceIsChildOfExisting { .. } => ("source_overlap".to_string(), None),
-        ScoutError::SourceIsParentOfExisting { .. } => ("source_overlap".to_string(), None),
-    }
-}
-    fn update_folders_from_cache(&mut self) {
-        // Note: profiling zone removed here to avoid borrow conflict with start_folder_query
-
-        if let Some(ref mut explorer) = self.discover.glob_explorer {
-            let prefix = explorer.current_prefix.clone();
-            let pattern = explorer.pattern.clone();
-
-            // Treat "**/*" and "**" as "show all" - use normal folder navigation
-            // Only do recursive search for specific patterns like "**/*.rs"
-            let is_match_all =
-                pattern == "**/*" || pattern == "**" || pattern == "*" || pattern.is_empty();
-
-            // Handle ** patterns with database query (not in-memory cache)
-            // Skip for "match all" patterns - just use folder navigation
-            if pattern.contains("**") && !is_match_all {
-                // Cancel any pending search
-                self.pending_glob_search = None;
-
-                // Parse pattern to extract extension and path filter
-                let query = super::pattern_query::PatternQuery::from_glob(&pattern);
-                let pattern_for_search = pattern.clone();
-
-                // Get source ID for query
-                let (workspace_id, source_id) =
-                    match (explorer.cache_workspace_id, explorer.cache_source_id) {
-                        (Some(workspace_id), Some(source_id)) => (workspace_id, source_id),
-                        _ => return,
-                    };
-
-                // Show loading indicator immediately
-                let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
-                explorer.folders =
-                    vec![FsEntry::loading(&format!("{} Searching...", spinner_char))];
-
-                let (backend, db_path) = self.resolve_db_target();
-
-                // Spawn async task for database query
-                let (tx, rx) = mpsc::sync_channel(1);
-                self.pending_glob_search = Some(rx);
-
-                std::thread::spawn(move || {
-                    let conn = match App::open_db_readonly_with(backend, &db_path) {
-                        Ok(Some(conn)) => conn,
-                        Ok(None) => {
-                            let _ = tx.send(GlobSearchResult {
-                                folders: vec![],
-                                total_count: 0,
-                                pattern: pattern_for_search,
-                                error: Some("Database not available".to_string()),
-                            });
-                            return;
-                        }
-                        Err(err) => {
-                            let _ = tx.send(GlobSearchResult {
-                                folders: vec![],
-                                total_count: 0,
-                                pattern: pattern_for_search,
-                                error: Some(format!("Database open failed: {}", err)),
-                            });
-                            return;
-                        }
-                    };
-
-                    let count = match query.count_files(&conn, workspace_id, source_id) {
-                        Ok(count) => count,
-                        Err(err) => {
-                            let _ = tx.send(GlobSearchResult {
-                                folders: vec![],
-                                total_count: 0,
-                                pattern: pattern_for_search,
-                                error: Some(format!("Glob search failed: {}", err)),
-                            });
-                            return;
-                        }
-                    };
-
-                    let results = match query.search_files(&conn, workspace_id, source_id, 100, 0) {
-                        Ok(results) => results,
-                        Err(err) => {
-                            let _ = tx.send(GlobSearchResult {
-                                folders: vec![],
-                                total_count: 0,
-                                pattern: pattern_for_search,
-                                error: Some(format!("Glob search failed: {}", err)),
-                            });
-                            return;
-                        }
-                    };
-
-                    // Convert to FsEntry for display
-                    let folders: Vec<FsEntry> = results
-                        .into_iter()
-                        .map(|(path, _size, _mtime)| {
-                            FsEntry::with_path(path.clone(), Some(path), 1, true)
-                        })
-                        .collect();
-
-                    let _ = tx.send(GlobSearchResult {
-                        folders,
-                        total_count: count as usize,
-                        pattern: pattern_for_search,
-                        error: None,
+                for entry in stats.tags {
+                    if entry.count <= 0 {
+                        continue;
+                    }
+                    tags.push(TagInfo {
+                        name: entry.tag,
+                        count: entry.count as usize,
+                        is_special: false,
                     });
-                });
-
-                return;
-            }
-
-            // Normal pattern: filter current level only
-            if let Some(cached_folders) = explorer.folder_cache.get(&prefix) {
-                let mut folders: Vec<FsEntry> = if pattern.is_empty() {
-                    cached_folders.clone()
-                } else {
-                    let pattern_lower = pattern.to_lowercase();
-                    cached_folders
-                        .iter()
-                        .filter(|f| {
-                            let name_lower = f.name().to_lowercase();
-                            Self::glob_match_name(&name_lower, &pattern_lower)
-                        })
-                        .cloned()
-                        .collect()
-                };
-
-                // Sort by file count descending (most matches first)
-                folders.sort_by(|a, b| b.file_count().cmp(&a.file_count()));
-
-                explorer.folders = folders.clone();
-                explorer.total_count =
-                    GlobFileCount::Exact(folders.iter().map(|f| f.file_count()).sum());
-                explorer.selected_folder = 0;
-            } else {
-                // Prefix not in cache - trigger async database query
-                let spinner_char = crate::cli::tui::ui::spinner_char(self.tick_count);
-                explorer.folders = vec![FsEntry::loading(&format!(
-                    "{} Loading {}...",
-                    spinner_char,
-                    if prefix.is_empty() { "root" } else { &prefix }
-                ))];
-            }
-        }
-
-        // Check if we need to start a folder query (outside the borrow scope)
-        // Always query DB if cache is empty, even with "**" patterns (need to populate cache first)
-        let needs_query = if let Some(ref explorer) = self.discover.glob_explorer {
-            let prefix = &explorer.current_prefix;
-            !explorer.folder_cache.contains_key(prefix)
-        } else {
-            false
-        };
-
-        if needs_query {
-            if let Some(ref explorer) = self.discover.glob_explorer {
-                if let (Some(source_id), Some(workspace_id)) =
-                    (explorer.cache_source_id, explorer.cache_workspace_id)
-                {
-                    let prefix = explorer.current_prefix.clone();
-                    let pattern = explorer.pattern.clone();
-                    self.start_folder_query(workspace_id, source_id, prefix, pattern);
                 }
-            }
-        }
-    }
-    fn start_folder_query(
-        &mut self,
-        workspace_id: WorkspaceId,
-        source_id: SourceId,
-        prefix: String,
-        glob_pattern: String,
-    ) {
-        // Skip if already loading
-        if self.pending_folder_query.is_some() {
-            return;
-        }
 
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.pending_folder_query = Some(rx);
-
-        let glob_opt = if glob_pattern.is_empty() {
-            None
-        } else {
-            Some(glob_pattern)
-        };
-
-        let (backend, db_path) = self.resolve_db_target();
-
-        std::thread::spawn(move || {
-            let conn = match App::open_db_readonly_with(backend, &db_path) {
-                Ok(Some(conn)) => conn,
-                Ok(None) => {
-                    let _ = tx.send(FolderQueryMessage::Error(
-                        "Database not available".to_string(),
-                    ));
-                    return;
+                if stats.untagged_files > 0 {
+                    tags.push(TagInfo {
+                        name: "untagged".to_string(),
+                        count: stats.untagged_files as usize,
+                        is_special: true,
+                    });
                 }
-                Err(err) => {
-                    let _ = tx.send(FolderQueryMessage::Error(format!(
-                        "Database open failed: {}",
-                        err
-                    )));
-                    return;
-                }
+
+                Ok(CacheLoadMessage::Complete {
+                    workspace_id,
+                    source_id,
+                    total_files: total_count,
+                    tags,
+                    cache,
+                })
+            })();
+
+            let msg = match result {
+                Ok(msg) => msg,
+                Err(err) => CacheLoadMessage::Error(err),
             };
-
-            let rows = match App::query_folder_counts(
-                &conn,
-                workspace_id,
-                source_id,
-                &prefix,
-                glob_opt.as_deref(),
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(FolderQueryMessage::Error(format!("Query error: {}", e)));
-                    return;
-                }
-            };
-
-            let folders: Vec<FsEntry> = rows
-                .into_iter()
-                .map(|(name, count, is_file)| FsEntry::new(name, count as usize, is_file))
-                .collect();
-
-            let total_count = folders.iter().map(|f| f.file_count()).sum();
-
-            let _ = tx.send(FolderQueryMessage::Complete {
-                workspace_id,
-                prefix,
-                folders,
-                total_count,
-            });
+            let _ = tx.send(msg);
         });
     }
+
     fn glob_match_name(name: &str, pattern: &str) -> bool {
         if pattern.starts_with("*.") {
             // *.ext -> ends with .ext
@@ -8078,35 +7960,75 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             return;
         }
 
-        if self.control_connected {
+        if !self.control_connected {
+            if !(self.config.standalone_writer || cfg!(test)) {
+                self.discover.sources_loaded = true;
+                return;
+            }
+
             let workspace_id = match self.active_workspace_id() {
                 Some(id) => id,
                 None => return,
             };
-            let control_addr = match self.control_addr.clone() {
-                Some(addr) => addr,
-                None => {
-                    self.discover.sources_loaded = true;
-                    return;
-                }
-            };
+
+            let (backend, db_path) = self.resolve_db_target();
+
+            if !db_path.exists() {
+                self.discover.sources_loaded = true;
+                return;
+            }
+
             let (tx, rx) = mpsc::sync_channel(1);
             self.pending_sources_load = Some(rx);
+
+            let workspace_id_str = workspace_id.to_string();
             std::thread::spawn(move || {
                 let result: Result<Vec<SourceInfo>, String> = (|| {
-                    let client = ControlClient::connect_with_timeout(
-                        &control_addr,
-                        Duration::from_millis(500),
-                    )
-                    .map_err(|err| format!("Control API unavailable: {}", err))?;
-                    let sources = client
-                        .list_sources(workspace_id)
+                    let conn = match App::open_db_readonly_with(backend, &db_path) {
+                        Ok(Some(conn)) => conn,
+                        Ok(None) => return Err("Database not available".to_string()),
+                        Err(err) => return Err(format!("Database open failed: {}", err)),
+                    };
+
+                    let query = r#"
+                    SELECT id, name, path, file_count
+                    FROM scout_sources
+                    WHERE enabled = 1 AND workspace_id = ?
+                    ORDER BY updated_at DESC
+                "#;
+
+                    let rows = conn
+                        .query_all(query, &[DbValue::Text(workspace_id_str)])
                         .map_err(|err| format!("Sources query failed: {}", err))?;
-                    Ok(sources
-                        .into_iter()
-                        .map(SourceInfo::from_control)
-                        .collect())
+
+                    let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let id_i64: i64 = row
+                            .get(0)
+                            .map_err(|e| format!("Sources parse failed: {}", e))?;
+                        let id = SourceId::try_from(id_i64)
+                            .map_err(|e| format!("Sources parse failed: {}", e))?;
+                        let name: String = row
+                            .get(1)
+                            .map_err(|e| format!("Sources parse failed: {}", e))?;
+                        let path: String = row
+                            .get(2)
+                            .map_err(|e| format!("Sources parse failed: {}", e))?;
+                        let file_count: i64 = row
+                            .get(3)
+                            .map_err(|e| format!("Sources parse failed: {}", e))?;
+
+                        sources.push(SourceInfo {
+                            id,
+                            name,
+                            path: std::path::PathBuf::from(path),
+                            file_count: file_count as usize,
+                        });
+                    }
+
+                    Ok(sources)
                 })();
+
                 let _ = tx.send(result);
             });
             return;
@@ -8116,68 +8038,30 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             Some(id) => id,
             None => return,
         };
-
-        let (backend, db_path) = self.resolve_db_target();
-
-        if !db_path.exists() {
-            self.discover.sources_loaded = true;
-            return;
-        }
-
+        let control_addr = match self.control_addr.clone() {
+            Some(addr) => addr,
+            None => {
+                self.discover.sources_loaded = true;
+                return;
+            }
+        };
         let (tx, rx) = mpsc::sync_channel(1);
         self.pending_sources_load = Some(rx);
-
-        // Spawn background task for DB query
-        let workspace_id_str = workspace_id.to_string();
         std::thread::spawn(move || {
             let result: Result<Vec<SourceInfo>, String> = (|| {
-                let conn = match App::open_db_readonly_with(backend, &db_path) {
-                    Ok(Some(conn)) => conn,
-                    Ok(None) => return Err("Database not available".to_string()),
-                    Err(err) => return Err(format!("Database open failed: {}", err)),
-                };
-
-                // Use denormalized file_count column (O(n) instead of O(n×m))
-                let query = r#"
-                    SELECT id, name, path, file_count
-                    FROM scout_sources
-                    WHERE enabled = 1 AND workspace_id = ?
-                    ORDER BY updated_at DESC
-                "#;
-
-                let rows = conn
-                    .query_all(query, &[DbValue::Text(workspace_id_str)])
+                let client = ControlClient::connect_with_timeout(
+                    &control_addr,
+                    Duration::from_millis(500),
+                )
+                .map_err(|err| format!("Control API unavailable: {}", err))?;
+                let sources = client
+                    .list_sources(workspace_id)
                     .map_err(|err| format!("Sources query failed: {}", err))?;
-
-                let mut sources: Vec<SourceInfo> = Vec::with_capacity(rows.len());
-                for row in rows {
-                    // id is BIGINT, read as i64 then convert to SourceId
-                    let id_i64: i64 = row
-                        .get(0)
-                        .map_err(|e| format!("Sources parse failed: {}", e))?;
-                    let id = SourceId::try_from(id_i64)
-                        .map_err(|e| format!("Sources parse failed: {}", e))?;
-                    let name: String = row
-                        .get(1)
-                        .map_err(|e| format!("Sources parse failed: {}", e))?;
-                    let path: String = row
-                        .get(2)
-                        .map_err(|e| format!("Sources parse failed: {}", e))?;
-                    let file_count: i64 = row
-                        .get(3)
-                        .map_err(|e| format!("Sources parse failed: {}", e))?;
-
-                    sources.push(SourceInfo {
-                        id,
-                        name,
-                        path: std::path::PathBuf::from(path),
-                        file_count: file_count as usize,
-                    });
-                }
-
-                Ok(sources)
+                Ok(sources
+                    .into_iter()
+                    .map(SourceInfo::from_control)
+                    .collect())
             })();
-
             let _ = tx.send(result);
         });
     }
@@ -9164,76 +9048,8 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             }
             return;
         }
-
-        let conn = match self.open_db_readonly() {
-            Ok(Some(conn)) => conn,
-            Ok(None) => return,
-            Err(err) => {
-                self.report_db_error("Rules load failed", err);
-                return;
-            }
-        };
-
-        let query = r#"
-            SELECT id, pattern, tag, priority, enabled
-            FROM scout_rules
-            WHERE workspace_id = ? AND kind = 'tagging'
-            ORDER BY priority DESC, name
-        "#;
-
-        let rows = match conn.query_all(query, &[DbValue::Text(workspace_id.to_string())]) {
-            Ok(rows) => rows,
-            Err(err) => {
-                self.report_db_error("Rules load failed", err);
-                return;
-            }
-        };
-
-        let mut rules: Vec<RuleInfo> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id_raw: String = match row.get(0) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let id = match TaggingRuleId::parse(&id_raw) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let pattern: String = match row.get(1) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let tag: String = match row.get(2) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let priority: i32 = match row.get(3) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let enabled_raw: i64 = match row.get(4) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let enabled = enabled_raw != 0;
-
-            rules.push(RuleInfo {
-                id: RuleId::new(id),
-                pattern,
-                tag,
-                priority,
-                enabled,
-            });
-        }
-
-        self.discover.rules = rules;
-
-        // Clamp selected rule if it's out of bounds
-        if self.discover.selected_rule >= self.discover.rules.len()
-            && !self.discover.rules.is_empty()
-        {
-            self.discover.selected_rule = 0;
-        }
+        self.discover.status_message =
+            Some(("Sentinel not connected; cannot load rules".to_string(), true));
     }
     /// Periodic tick for updates
     pub fn tick(&mut self) {
@@ -9334,6 +9150,23 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     self.discover.sources = sources;
                     self.discover.sources_loaded = true;
                     self.discover.validate_source_selection();
+                    if let Some(path) = self.discover.pending_select_source_path.take() {
+                        let selected = self
+                            .discover
+                            .sources
+                            .iter()
+                            .find(|source| source.path.to_string_lossy() == path)
+                            .map(|source| source.id);
+                        if let Some(selected_id) = selected {
+                            self.discover.selected_source_id = Some(selected_id);
+                            self.discover.data_loaded = false;
+                        } else {
+                            self.discover.status_message = Some((
+                                "Scan completed but source was not found".to_string(),
+                                true,
+                            ));
+                        }
+                    }
                     let drawer_count = self.sources_drawer_sources().len();
                     if drawer_count == 0 {
                         self.sources_drawer_selected = 0;
@@ -9365,6 +9198,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                 }
                 Ok(Err(err)) => {
                     self.discover.sources_loaded = true;
+                    self.discover.pending_select_source_path = None;
                     self.pending_sources_load = None;
                     self.report_db_error("Sources load failed", err);
                 }
@@ -9374,6 +9208,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // Channel closed, mark as loaded (empty sources)
                     self.discover.sources_loaded = true;
+                    self.discover.pending_select_source_path = None;
                     self.pending_sources_load = None;
                 }
             }
@@ -9620,6 +9455,20 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             self.update_folders_from_cache();
         }
 
+        // Debounced Rule Builder pattern search
+        if self.discover.view_state == DiscoverViewState::RuleBuilder {
+            if let Some(ref mut builder) = self.discover.rule_builder {
+                if let Some(changed_at) = builder.pattern_changed_at {
+                    let elapsed = changed_at.elapsed().as_millis();
+                    if elapsed >= DEBOUNCE_MS {
+                        let pattern = builder.pattern.clone();
+                        builder.pattern_changed_at = None;
+                        self.update_rule_builder_files(&pattern);
+                    }
+                }
+            }
+        }
+
         // Poll for pending glob search results (non-blocking recursive search)
         if let Some(ref mut rx) = self.pending_glob_search {
             match rx.try_recv() {
@@ -9743,6 +9592,54 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             }
         }
 
+        // Poll for pending Rule Builder extraction preview results
+        if let Some(ref mut rx) = self.pending_rule_builder_preview {
+            match rx.try_recv() {
+                Ok(result) => {
+                    let current_pattern = self
+                        .discover
+                        .rule_builder
+                        .as_ref()
+                        .map(|b| b.pattern.clone())
+                        .unwrap_or_default();
+
+                    if result.pattern == current_pattern {
+                        if let Some(err) = result.error {
+                            if let Some(ref mut builder) = self.discover.rule_builder {
+                                builder.file_results =
+                                    super::extraction::FileResultsState::ExtractionPreview {
+                                        preview_files: Vec::new(),
+                                    };
+                                builder.match_count = 0;
+                                builder.is_streaming = false;
+                                builder.pattern_error = Some(err.clone());
+                            }
+                            self.report_db_error("Rule builder preview failed", err);
+                        } else {
+                            if let Some(ref mut builder) = self.discover.rule_builder {
+                                builder.file_results =
+                                    super::extraction::FileResultsState::ExtractionPreview {
+                                        preview_files: result.preview_files,
+                                    };
+                                builder.match_count = result.total_count;
+                                builder.pattern_error = None;
+                                builder.is_streaming = false;
+                                builder.selected_file = 0;
+                            }
+                        }
+                    }
+                    self.pending_rule_builder_preview = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_rule_builder_preview = None;
+                    if let Some(ref mut builder) = self.discover.rule_builder {
+                        builder.is_streaming = false;
+                    }
+                }
+            }
+        }
+
         // Poll for pending schema eval results (background full eval job)
         if let Some(ref mut rx) = self.pending_schema_eval {
             match rx.try_recv() {
@@ -9776,6 +9673,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     path_archetypes,
                     naming_schemes,
                     synonym_suggestions,
+                    rule_candidates,
                     paths_analyzed,
                 }) => {
                     // Update Rule Builder state with results
@@ -9785,6 +9683,14 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                             builder.path_archetypes = path_archetypes;
                             builder.naming_schemes = naming_schemes;
                             builder.synonym_suggestions = synonym_suggestions;
+                            builder.rule_candidates = rule_candidates;
+                            if !builder.rule_candidates.is_empty() {
+                                builder.selected_candidate = builder
+                                    .selected_candidate
+                                    .min(builder.rule_candidates.len().saturating_sub(1));
+                            } else {
+                                builder.selected_candidate = 0;
+                            }
                         }
                         builder.eval_state = super::extraction::EvalState::Idle;
                     }
@@ -9862,6 +9768,7 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     path_archetypes,
                     naming_schemes,
                     synonym_suggestions,
+                    rule_candidates,
                     paths_analyzed,
                 }) => {
                     if let Some(ref mut builder) = self.discover.rule_builder {
@@ -9870,6 +9777,15 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                             builder.path_archetypes = path_archetypes;
                             builder.naming_schemes = naming_schemes;
                             builder.synonym_suggestions = synonym_suggestions;
+                            builder.rule_candidates = rule_candidates;
+                            if !builder.rule_candidates.is_empty() {
+                                builder.selected_candidate = builder
+                                    .selected_candidate
+                                    .min(builder.rule_candidates.len().saturating_sub(1));
+                            } else {
+                                builder.selected_candidate = 0;
+                            }
+                            builder.sampled_paths_count = paths_analyzed;
                             self.discover.status_message =
                                 Some((format!("Sample: {} paths analyzed", paths_analyzed), false));
                         }
@@ -9877,12 +9793,18 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                     self.pending_sample_eval = None;
                 }
                 Ok(SampleEvalResult::Error(err)) => {
+                    if let Some(builder) = self.discover.rule_builder.as_mut() {
+                        builder.last_sample_eval_key = None;
+                    }
                     self.discover.status_message =
                         Some((format!("Sample eval failed: {}", err), true));
                     self.pending_sample_eval = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(builder) = self.discover.rule_builder.as_mut() {
+                        builder.last_sample_eval_key = None;
+                    }
                     self.pending_sample_eval = None;
                 }
             }
@@ -10037,6 +9959,186 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
             }
         }
 
+        // Poll for files load results (paged files list)
+        if let Some(ref mut rx) = self.pending_files_load {
+            match rx.try_recv() {
+                Ok(FilesLoadMessage::Complete {
+                    workspace_id,
+                    source_id,
+                    page_offset,
+                    total_count,
+                    files,
+                }) => {
+                    if Some(workspace_id) != self.active_workspace_id() {
+                        self.pending_files_load = None;
+                        return;
+                    }
+                    if self.discover.selected_source_id != Some(source_id) {
+                        self.pending_files_load = None;
+                        return;
+                    }
+                    if page_offset != self.discover.page_offset {
+                        self.pending_files_load = None;
+                        return;
+                    }
+
+                    let page_size = self.discover.page_size.max(1);
+                    let max_offset = if total_count == 0 {
+                        0
+                    } else {
+                        (total_count.saturating_sub(1) / page_size) * page_size
+                    };
+                    if self.discover.page_offset > max_offset {
+                        self.discover.page_offset = max_offset;
+                        self.discover.data_loaded = false;
+                        self.pending_files_load = None;
+                        return;
+                    }
+
+                    let mut available_tags = HashSet::new();
+                    for file in &files {
+                        for tag in &file.tags {
+                            available_tags.insert(tag.clone());
+                        }
+                    }
+
+                    self.discover.files = files;
+                    self.discover.available_tags = available_tags.into_iter().collect();
+                    self.discover.available_tags.sort();
+                    self.discover.selected = 0;
+                    self.discover.total_files = total_count;
+                    self.discover.data_loaded = true;
+                    self.discover.db_filtered = true;
+                    self.discover.scan_error = None;
+                    self.refresh_tags_list();
+                    self.pending_files_load = None;
+                }
+                Ok(FilesLoadMessage::Error(err)) => {
+                    self.discover.scan_error = Some(err.clone());
+                    self.discover.data_loaded = true;
+                    self.pending_files_load = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_files_load = None;
+                }
+            }
+        }
+
+        // Poll for tags load results
+        if let Some(ref mut rx) = self.pending_tags_load {
+            match rx.try_recv() {
+                Ok(result) => {
+                    match result {
+                        Ok(message) => {
+                            if Some(message.workspace_id) != self.active_workspace_id() {
+                                self.pending_tags_load = None;
+                                return;
+                            }
+                            if self.discover.selected_source_id != Some(message.source_id) {
+                                self.pending_tags_load = None;
+                                return;
+                            }
+
+                            self.discover.tags = message.tags;
+                            self.discover.available_tags = message.available_tags;
+                            if let Some(selected_tag) = self.discover.selected_tag {
+                                if selected_tag >= self.discover.tags.len() {
+                                    self.discover.selected_tag = None;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.report_db_error("Tags load failed", err);
+                        }
+                    }
+                    self.pending_tags_load = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_tags_load = None;
+                }
+            }
+        }
+
+        // Poll for pending manual tag apply (rule builder preview tagging)
+        if let Some(ref mut rx) = self.pending_tag_apply {
+            match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    let mut path_set: HashSet<&String> = HashSet::new();
+                    for path in &result.paths {
+                        path_set.insert(path);
+                    }
+                    for file in &mut self.discover.files {
+                        if path_set.contains(&file.rel_path) {
+                            if !file.tags.contains(&result.tag) {
+                                file.tags.push(result.tag.clone());
+                            }
+                        }
+                    }
+                    if !self.discover.available_tags.contains(&result.tag) {
+                        self.discover.available_tags.push(result.tag.clone());
+                        self.discover.available_tags.sort();
+                    }
+                    self.discover.status_message = Some((
+                        format!("Tagged {} files with '{}'", result.tagged_count, result.tag),
+                        false,
+                    ));
+                    self.refresh_tags_list();
+                    if let Some(builder) = self.discover.rule_builder.as_mut() {
+                        builder.selected_preview_files.clear();
+                    }
+                    self.pending_tag_apply = None;
+                }
+                Ok(Err(err)) => {
+                    self.discover.status_message = Some((err, true));
+                    self.pending_tag_apply = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_tag_apply = None;
+                }
+            }
+        }
+
+        // Poll for pending rule apply results
+        if let Some(ref mut rx) = self.pending_rule_apply {
+            match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    let rule_id = RuleId::new(result.rule_id);
+                    if !self.discover.rules.iter().any(|rule| rule.id == rule_id) {
+                        self.discover.rules.push(RuleInfo {
+                            id: rule_id,
+                            pattern: result.pattern.clone(),
+                            tag: result.tag.clone(),
+                            priority: 100,
+                            enabled: true,
+                        });
+                        if self.discover.selected_rule >= self.discover.rules.len() {
+                            self.discover.selected_rule = self.discover.rules.len() - 1;
+                        }
+                    }
+                    self.refresh_tags_list();
+                    self.discover.status_message = Some((
+                        format!(
+                            "Created rule: {} → {} ({} files tagged)",
+                            result.pattern, result.tag, result.tagged_count
+                        ),
+                        false,
+                    ));
+                    self.pending_rule_apply = None;
+                }
+                Ok(Err(err)) => {
+                    self.discover.status_message = Some((err, true));
+                    self.pending_rule_apply = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_rule_apply = None;
+                }
+            }
+        }
+
         // Load Scout data if in Ingest (non-Sources) (but NOT while scanning - don't block progress updates)
         if self.mode == TuiMode::Ingest
             && self.ingest_tab != IngestTab::Sources
@@ -10170,52 +10272,11 @@ fn classify_scan_error(err: &casparian::scout::error::ScoutError) -> (String, Op
                                 // Use accurate count from scanner (not stale progress update)
                                 let final_file_count = files_persisted;
 
-                                let workspace_id = self.active_workspace_id();
-                                let source_id = match workspace_id {
-                                    Some(workspace_id) => {
-                                        let conn = match self.open_db_readonly() {
-                                            Ok(Some(conn)) => Some(conn),
-                                            _ => None,
-                                        };
-                                        conn.and_then(|conn| {
-                                            let row = conn
-                                                .query_optional(
-                                                    "SELECT id FROM scout_sources WHERE workspace_id = ? AND path = ?",
-                                                    &[
-                                                        DbValue::Text(workspace_id.to_string()),
-                                                        DbValue::Text(source_path.clone()),
-                                                    ],
-                                                )
-                                                .ok()
-                                                .flatten();
-                                            row.and_then(|row| row.get::<i64>(0).ok())
-                                                .and_then(|id| SourceId::try_from(id).ok())
-                                        })
-                                    }
-                                    None => None,
-                                };
-
                                 // Trigger sources reload (non-blocking, handled by tick())
+                                self.discover.pending_select_source_path =
+                                    Some(source_path.clone());
                                 self.discover.sources_loaded = false;
                                 self.start_sources_load();
-
-                                if let Some(source_id) = source_id {
-                                    // Select the newly scanned source
-                                    self.discover.selected_source_id = Some(source_id);
-
-                                    // Update rule builder with new source
-                                    if let Some(ref mut builder) = self.discover.rule_builder {
-                                        builder.source_id = Some(source_id);
-                                    }
-
-                                    // Load files for the new source (this sets data_loaded = true)
-                                    self.load_scout_files();
-                                } else {
-                                    self.discover.status_message = Some((
-                                        "Scan completed but source was not found".to_string(),
-                                        true,
-                                    ));
-                                }
 
                                 // Reset cache state to force reload for the new source
                                 // IMPORTANT: Must be AFTER load_scout_files() because it sets data_loaded=true

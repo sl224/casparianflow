@@ -260,6 +260,11 @@ impl App {
         self.pending_folder_query = None;
         self.pending_glob_search = None;
         self.pending_rule_builder_search = None;
+        self.pending_rule_builder_preview = None;
+        self.pending_sample_eval = None;
+        self.pending_schema_eval = None;
+        self.pending_tag_apply = None;
+        self.pending_rule_apply = None;
         self.cache_load_progress = None;
         self.last_cache_load_timing = None;
         self.glob_search_cancelled = None;
